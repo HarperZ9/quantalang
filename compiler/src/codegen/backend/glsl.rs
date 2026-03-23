@@ -243,6 +243,18 @@ impl GlslBackend {
             return Ok(());
         }
 
+        // Emit type annotations as comments if any parameter has them
+        let has_annotations = func.locals.iter().any(|l| l.is_param && !l.annotations.is_empty());
+        if has_annotations {
+            let mut ann_parts = Vec::new();
+            for local in func.locals.iter().filter(|l| l.is_param && !l.annotations.is_empty()) {
+                let name = local.name.as_ref().map(|n| n.to_string()).unwrap_or_default();
+                let anns: Vec<&str> = local.annotations.iter().map(|a| a.as_ref()).collect();
+                ann_parts.push(format!("{}: {}", name, anns.join(", ")));
+            }
+            self.writeln(&format!("// @annotations {}", ann_parts.join("; ")));
+        }
+
         let ret_ty = self.type_to_glsl(&func.sig.ret);
         let params: Vec<String> = func.sig.params.iter().enumerate().map(|(i, ty)| {
             let param_name = func.locals.iter()

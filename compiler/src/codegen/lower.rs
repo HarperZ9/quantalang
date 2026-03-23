@@ -311,6 +311,7 @@ impl<'ctx> MirLowerer<'ctx> {
                             ty: self.lower_ffi_type(&param.ty),
                             is_mut: false,
                             is_param: true,
+                            annotations: Vec::new(),
                         };
                         func.locals.push(local);
                     }

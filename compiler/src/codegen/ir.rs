@@ -391,6 +391,9 @@ pub struct MirLocal {
     pub is_mut: bool,
     /// Is this a function parameter?
     pub is_param: bool,
+    /// Type annotations (e.g., "ColorSpace:Linear", "Precision:Half").
+    /// Preserved from the source type system for shader output.
+    pub annotations: Vec<Arc<str>>,
 }
 
 impl MirLocal {
@@ -402,6 +405,7 @@ impl MirLocal {
             ty,
             is_mut: false,
             is_param: false,
+            annotations: Vec::new(),
         }
     }
 
@@ -413,6 +417,7 @@ impl MirLocal {
             ty,
             is_mut: false,
             is_param: false,
+            annotations: Vec::new(),
         }
     }
 }

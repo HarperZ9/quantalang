@@ -2045,6 +2045,7 @@ mod tests {
             ty: MirType::i32(),
             is_mut: false,
             is_param: true,
+            annotations: Vec::new(),
         };
         func.add_local(param);
 
@@ -2055,6 +2056,7 @@ mod tests {
             ty: MirType::i32(),
             is_mut: true,
             is_param: false,
+            annotations: Vec::new(),
         };
         func.add_local(result);
 

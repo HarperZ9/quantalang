@@ -1899,6 +1899,7 @@ mod tests {
             ty: MirType::i32(),
             is_mut: false,
             is_param: true,
+            annotations: Vec::new(),
         });
         func.add_local(MirLocal {
             id: LocalId(1),
@@ -1906,6 +1907,7 @@ mod tests {
             ty: MirType::i32(),
             is_mut: false,
             is_param: true,
+            annotations: Vec::new(),
         });
         func.add_local(MirLocal {
             id: LocalId(2),
@@ -1913,6 +1915,7 @@ mod tests {
             ty: MirType::i32(),
             is_mut: true,
             is_param: false,
+            annotations: Vec::new(),
         });
 
         let mut block = MirBlock::new(BlockId::ENTRY);
