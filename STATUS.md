@@ -18,17 +18,17 @@ The Effects Language -- algebraic effects as a first-class feature.
 - **Macro expansion**: Builtin macros, pattern matching, hygiene. Unit tests present.
 - **591 total `#[test]` annotations** (455 in compiler/src/, 136 in compiler/tests/).
 
-## What's Partial (has real code, not fully connected)
-- **x86-64 Backend** (1615 lines, 22 tests): Generates assembly and machine code from MIR. Implements `Backend` trait. Not wired into CLI -- no `--target` flag.
-- **ARM64 Backend** (1629 lines, 21 tests): Generates assembly and machine code from MIR. Implements `Backend` trait. Not wired into CLI.
-- **WASM Backend** (1866 lines, 11 tests): Generates WebAssembly binary from MIR with WASI support. Implements `Backend` trait. Not wired into CLI. No end-to-end .wasm execution test.
-- **LLVM Backend** (1915 lines, 11 tests): Generates LLVM IR text from MIR. Implements `Backend` trait. Not wired into CLI. Requires external LLVM tools.
-- **SPIR-V Backend** (1898 lines, 7 tests): Generates SPIR-V binary for Vulkan compute. Implements `Backend` trait. Not wired into CLI. No Vulkan validation test.
+## What's Partial (has real code, wired into CLI but not end-to-end verified)
+- **x86-64 Backend** (1615 lines, 22 tests): Generates assembly from MIR. Wired into CLI via `quantac build --target x86-64`. No linker integration yet — outputs .s assembly.
+- **ARM64 Backend** (1629 lines, 21 tests): Generates assembly from MIR. Wired into CLI via `quantac build --target arm64`. No linker integration yet — outputs .s assembly.
+- **WASM Backend** (1866 lines, 11 tests): Generates WebAssembly binary from MIR with WASI support. Wired into CLI via `quantac build --target wasm`. No end-to-end .wasm execution test.
+- **LLVM Backend** (1915 lines, 11 tests): Generates LLVM IR text from MIR. Wired into CLI via `quantac build --target llvm`. Optionally compiles to executable with clang. Requires external LLVM tools.
+- **SPIR-V Backend** (1898 lines, 7 tests): Generates SPIR-V binary for Vulkan compute. Wired into CLI via `quantac build --target spirv`. No Vulkan validation test.
 - **x86-64 Instruction Encoder** (2058 lines, 38 tests): Encodes x86-64 instructions to binary machine code. Works in isolation but no linker/loader to produce executables.
 - **ARM64 Instruction Encoder** (2161 lines, 32 tests): Encodes ARM64 instructions to binary. Same limitation.
-- **LSP Server** (6448 lines, 24 tests): Full LSP implementation with completion, hover, diagnostics, go-to-definition, symbols, code actions. JSON dispatch uses manual string matching (not serde_json). Only lifecycle messages are dispatched in the server loop. `run_server()` exists but no `quantac lsp` subcommand. Cannot serve a real VS Code session beyond initialize/shutdown.
-- **Formatter** (1631 lines, 11 tests): Code formatter with configurable style (indentation, line length, brace style, trailing commas, import organization). Pretty printer with document algebra. Not wired into CLI -- no `quantac fmt` subcommand.
-- **Package Manager** (3354 lines, 24 tests): Manifest parsing (Quanta.toml), semver version handling, lockfile generation, dependency resolution, registry client (targets registry.quantalang.org). Not wired into CLI. No registry exists.
+- **LSP Server** (6448 lines, 24 tests): Full LSP implementation with completion, hover, diagnostics, go-to-definition, symbols, code actions. Wired into CLI via `quantac lsp`. JSON dispatch uses manual string matching. Only lifecycle messages are dispatched in the server loop — cannot serve a full VS Code session yet.
+- **Formatter** (1631 lines, 11 tests): Code formatter with configurable style. Wired into CLI via `quantac fmt <file>`. Supports `--check` and `--write` flags.
+- **Package Manager** (3354 lines, 24 tests): Manifest parsing (Quanta.toml), semver, lockfile, dependency resolution. Wired into CLI via `quantac pkg`. No registry exists yet.
 - **Runtime: FFI** (1038 lines, 7 tests): Calling convention definitions, type layout, ABI classification. Not used by any code generation backend.
 - **Runtime: GC** (786 lines, 4 tests): Reference counting with cycle detection design. Not linked into compiled programs.
 - **Runtime: Async** (1216 lines, 6 tests): Work-stealing scheduler design. Not linked into compiled programs. No async/await syntax support.
@@ -47,16 +47,30 @@ The Effects Language -- algebraic effects as a first-class feature.
 
 ## What the CLI Actually Does Today
 ```
-quantac lex <file>       # Tokenize and print tokens
-quantac parse <file>     # Parse and print AST
-quantac check <file>     # Type-check
-quantac build [path]     # Compile to C, invoke C compiler, produce executable
-quantac run <file>       # Compile and run
-quantac repl             # Interactive REPL
-quantac version          # Print version
+quantac lex <file>          # Tokenize and print tokens
+quantac parse <file>        # Parse and print AST
+quantac check <file>        # Type-check
+quantac build [path]        # Compile to C, invoke C compiler, produce executable
+quantac build --target llvm # Compile to LLVM IR (.ll), optionally link with clang
+quantac build --target x86-64  # Compile to x86-64 assembly
+quantac build --target arm64   # Compile to AArch64 assembly
+quantac build --target wasm    # Compile to WebAssembly (.wasm)
+quantac build --target spirv   # Compile to SPIR-V binary (.spv)
+quantac build --target hlsl    # Compile to HLSL shader
+quantac build --target glsl    # Compile to GLSL shader
+quantac run <file>          # Compile and run (C backend)
+quantac repl                # Interactive REPL
+quantac lsp                 # Start Language Server Protocol server
+quantac fmt <file>          # Format QuantaLang source code
+quantac pkg init            # Initialize Quanta.toml manifest
+quantac pkg add <name>      # Add a dependency
+quantac pkg resolve         # Resolve dependencies and generate lockfile
+quantac pkg search <query>  # Search the package registry
+quantac watch [path]        # Watch files and recompile on change
+quantac version             # Print version
 ```
 
-There are no `lsp`, `fmt`, `pkg`, `test`, `doc`, or `lint` subcommands, despite those modules existing in the codebase.
+Not yet wired: `test`, `doc`, `lint` subcommands (modules exist but have no CLI integration).
 
 ## Summary
-QuantaLang has a **working compiler core** (lexer -> parser -> type checker -> MIR -> C backend -> executable) with 591 tests. It can compile and run real programs with variables, functions, control flow, pattern matching, recursion, and algebraic effects. Five additional backends (x86-64, ARM64, WASM, LLVM, SPIR-V) contain real, tested code but are not accessible from the CLI. The LSP, formatter, and package manager are implemented but not wired into the CLI. The self-hosted compiler and standard library (268,567 lines of `.quanta` code) represent an ambitious long-term vision but cannot be compiled or executed today.
+QuantaLang has a **working compiler core** (lexer -> parser -> type checker -> MIR -> C backend -> executable) with 591 tests. It can compile and run real programs with variables, functions, control flow, pattern matching, recursion, and algebraic effects. All 8 backends (C, LLVM, x86-64, ARM64, WASM, SPIR-V, HLSL, GLSL) are accessible from the CLI via `quantac build --target <target>`. The C backend is production-verified; LLVM can optionally link with clang; native/WASM backends output assembly/binary for external toolchain linking. The LSP (`quantac lsp`), formatter (`quantac fmt`), and package manager (`quantac pkg`) are wired into the CLI. The self-hosted compiler and standard library (268,567 lines of `.quanta` code) represent an ambitious long-term vision but cannot be compiled or executed today.

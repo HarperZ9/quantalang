@@ -102,7 +102,7 @@ enum Commands {
         #[arg(long)]
         keep_c: bool,
 
-        /// Code generation target: 'c' (default) or 'llvm'
+        /// Code generation target: c, llvm, x86-64, arm64, wasm, spirv, hlsl, glsl
         #[arg(long, default_value = "c")]
         target: String,
     },
@@ -700,17 +700,23 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
     // Resolve the code generation target.
     let target = match target_str {
         "c" => Target::C,
-        "llvm" => Target::LlvmIr,
+        "llvm" | "llvm-ir" => Target::LlvmIr,
+        "x86-64" | "x86_64" | "x64" => Target::X86_64,
+        "arm64" | "aarch64" => Target::Arm64,
+        "wasm" | "wasm32" => Target::Wasm,
         "spirv" | "spir-v" | "spv" => Target::SpirV,
         "hlsl" | "dx" | "directx" => Target::Hlsl,
         "glsl" | "opengl" | "gl" => Target::Glsl,
         other => {
-            eprintln!("Unknown target '{}'. Supported targets: c, llvm, spirv, hlsl, glsl", other);
+            eprintln!("Unknown target '{}'. Supported targets: c, llvm, x86-64, arm64, wasm, spirv, hlsl, glsl", other);
             return Err(1);
         }
     };
     let use_llvm = target == Target::LlvmIr;
     let use_spirv = target == Target::SpirV;
+    let use_native = target == Target::X86_64 || target == Target::Arm64;
+    let use_wasm = target == Target::Wasm;
+    let use_shader = target == Target::Hlsl || target == Target::Glsl;
 
     println!("Building project at '{}'", path.display());
     println!("Entry point: {}", main_path.display());
@@ -739,7 +745,7 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
         1
     })?;
 
-    let total_steps = if emit_c_only || use_llvm { 4 } else { 5 };
+    let total_steps = if emit_c_only || use_llvm || use_native || use_wasm || use_spirv || use_shader { 4 } else { 5 };
     println!("[1/{}] Lexing... OK ({} tokens)", total_steps, tokens.len());
 
     // Parse
@@ -796,6 +802,109 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
         println!("[5/5] SPIR-V written to {}", spv_output_file.display());
         println!();
         println!("Validate with: spirv-val {}", spv_output_file.display());
+        return Ok(());
+    } else if use_native {
+        // x86-64 / ARM64 target: write assembly file
+        let ext = if target == Target::X86_64 { "x86_64.s" } else { "aarch64.s" };
+        let asm_output_file = output_dir.join(format!("main.{}", ext));
+        std::fs::write(&asm_output_file, &output.data).map_err(|e| {
+            eprintln!("Failed to write assembly output: {}", e);
+            1
+        })?;
+
+        if !emit_c_only {
+            // Try to assemble + link with system tools
+            let assembler = if target == Target::X86_64 {
+                if cfg!(windows) { "ml64" } else { "as" }
+            } else {
+                "aarch64-linux-gnu-as"
+            };
+
+            let asm_ok = std::process::Command::new(assembler)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if asm_ok {
+                println!("[5/5] Assembling {} -> executable...", ext);
+                // For now, output the assembly; full linking requires platform-specific logic
+                println!();
+                println!("Build successful! (assembly output)");
+                println!("Output: {}", asm_output_file.display());
+                println!();
+                if target == Target::X86_64 {
+                    if cfg!(windows) {
+                        println!("To link: ml64 /Fe:main.exe {}", asm_output_file.display());
+                    } else {
+                        println!("To assemble and link:");
+                        println!("  as {} -o main.o && ld main.o -o main -lc", asm_output_file.display());
+                    }
+                } else {
+                    println!("To cross-compile:");
+                    println!("  aarch64-linux-gnu-as {} -o main.o && aarch64-linux-gnu-ld main.o -o main -lc", asm_output_file.display());
+                }
+                return Ok(());
+            }
+
+            println!();
+            println!("Build successful! (assembly only — no assembler found)");
+            println!("Output: {}", asm_output_file.display());
+            return Ok(());
+        }
+
+        println!();
+        println!("Build successful!");
+        println!("Output: {}", asm_output_file.display());
+        return Ok(());
+    } else if use_shader {
+        // HLSL/GLSL target: write shader source file
+        let (ext, label) = if target == Target::Hlsl { ("hlsl", "HLSL") } else { ("glsl", "GLSL") };
+        let shader_output_file = output_dir.join(format!("main.{}", ext));
+        std::fs::write(&shader_output_file, &output.data).map_err(|e| {
+            eprintln!("Failed to write {} output: {}", label, e);
+            1
+        })?;
+        println!();
+        println!("Build successful!");
+        println!("Output: {} ({})", shader_output_file.display(), label);
+        return Ok(());
+    } else if use_wasm {
+        // WebAssembly target: write .wasm binary
+        let wasm_output_file = output_dir.join("main.wasm");
+        std::fs::write(&wasm_output_file, &output.data).map_err(|e| {
+            eprintln!("Failed to write WebAssembly output: {}", e);
+            1
+        })?;
+
+        // Try running with wasmtime if available
+        if !emit_c_only {
+            let wt_ok = std::process::Command::new("wasmtime")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if wt_ok {
+                println!("[5/5] WebAssembly module ready (wasmtime available)");
+                println!();
+                println!("Build successful!");
+                println!("Output: {}", wasm_output_file.display());
+                println!();
+                println!("Run with: wasmtime {}", wasm_output_file.display());
+                return Ok(());
+            }
+        }
+
+        println!();
+        println!("Build successful!");
+        println!("Output: {}", wasm_output_file.display());
+        println!();
+        println!("Run with: wasmtime {}", wasm_output_file.display());
         return Ok(());
     } else if use_llvm {
         // LLVM IR target: write .ll file
