@@ -1,0 +1,728 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ LINTER — CLI Driver
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Command-line interface for quantalint.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::lint::cli
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::fs;
+use std::io::{self, Write};
+use crate::lint::config::{LintConfig, LintLevel, LintGroup, OutputFormat, ColorChoice, Edition};
+use crate::lint::rules::RuleRegistry;
+use crate::lint::checker::LintChecker;
+use crate::lint::diagnostic::{Diagnostic, DiagnosticEmitter, Severity};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+pub const CONFIG_FILE: &str = ".quantalint.toml";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLI OPTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// CLI arguments
+#[derive(Debug, Clone)]
+pub struct CliArgs {
+    /// Files/directories to lint
+    pub paths: Vec<PathBuf>,
+    
+    /// Allow specific lints
+    pub allow: Vec<String>,
+    
+    /// Warn on specific lints
+    pub warn: Vec<String>,
+    
+    /// Deny specific lints
+    pub deny: Vec<String>,
+    
+    /// Forbid specific lints
+    pub forbid: Vec<String>,
+    
+    /// Enable lint groups
+    pub enable_groups: Vec<LintGroup>,
+    
+    /// Disable lint groups
+    pub disable_groups: Vec<LintGroup>,
+    
+    /// Auto-fix applicable lints
+    pub fix: bool,
+    
+    /// Output format
+    pub format: Option<OutputFormat>,
+    
+    /// Color output
+    pub color: Option<ColorChoice>,
+    
+    /// Verbose output
+    pub verbose: bool,
+    
+    /// Quiet mode
+    pub quiet: bool,
+    
+    /// Config file path
+    pub config: Option<PathBuf>,
+    
+    /// List all lints
+    pub list_lints: bool,
+    
+    /// Explain a lint
+    pub explain: Option<String>,
+    
+    /// Maximum issues to report
+    pub max_issues: Option<usize>,
+    
+    /// Report file path
+    pub report: Option<PathBuf>,
+    
+    /// Show help
+    pub help: bool,
+    
+    /// Show version
+    pub version: bool,
+    
+    /// Workspace mode
+    pub workspace: bool,
+    
+    /// Exclude patterns
+    pub exclude: Vec<String>,
+    
+    /// Edition
+    pub edition: Option<Edition>,
+}
+
+impl Default for CliArgs {
+    fn default() -> Self {
+        CliArgs {
+            paths: Vec::new(),
+            allow: Vec::new(),
+            warn: Vec::new(),
+            deny: Vec::new(),
+            forbid: Vec::new(),
+            enable_groups: Vec::new(),
+            disable_groups: Vec::new(),
+            fix: false,
+            format: None,
+            color: None,
+            verbose: false,
+            quiet: false,
+            config: None,
+            list_lints: false,
+            explain: None,
+            max_issues: None,
+            report: None,
+            help: false,
+            version: false,
+            workspace: false,
+            exclude: Vec::new(),
+            edition: None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ARGUMENT PARSING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parse command-line arguments
+pub fn parse_args(args: &[String]) -> Result<CliArgs, String> {
+    let mut cli = CliArgs::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        
+        match arg.as_str() {
+            "-h" | "--help" => cli.help = true,
+            "-V" | "--version" => cli.version = true,
+            "-v" | "--verbose" => cli.verbose = true,
+            "-q" | "--quiet" => cli.quiet = true,
+            "--fix" => cli.fix = true,
+            "--workspace" | "-W" => cli.workspace = true,
+            "--list-lints" => cli.list_lints = true,
+            
+            "-A" | "--allow" => {
+                i += 1;
+                cli.allow.push(
+                    args.get(i).ok_or("missing value for --allow")?.clone()
+                );
+            }
+            
+            "-W" | "--warn" if !cli.workspace => {
+                i += 1;
+                cli.warn.push(
+                    args.get(i).ok_or("missing value for --warn")?.clone()
+                );
+            }
+            
+            "-D" | "--deny" => {
+                i += 1;
+                cli.deny.push(
+                    args.get(i).ok_or("missing value for --deny")?.clone()
+                );
+            }
+            
+            "-F" | "--forbid" => {
+                i += 1;
+                cli.forbid.push(
+                    args.get(i).ok_or("missing value for --forbid")?.clone()
+                );
+            }
+            
+            "--enable" => {
+                i += 1;
+                let group_str = args.get(i).ok_or("missing value for --enable")?;
+                let group = LintGroup::from_str(group_str)
+                    .ok_or_else(|| format!("unknown lint group: {}", group_str))?;
+                cli.enable_groups.push(group);
+            }
+            
+            "--disable" => {
+                i += 1;
+                let group_str = args.get(i).ok_or("missing value for --disable")?;
+                let group = LintGroup::from_str(group_str)
+                    .ok_or_else(|| format!("unknown lint group: {}", group_str))?;
+                cli.disable_groups.push(group);
+            }
+            
+            "--format" => {
+                i += 1;
+                let format_str = args.get(i).ok_or("missing value for --format")?;
+                cli.format = Some(
+                    OutputFormat::from_str(format_str)
+                        .ok_or_else(|| format!("unknown format: {}", format_str))?
+                );
+            }
+            
+            "--color" => {
+                i += 1;
+                let color_str = args.get(i).ok_or("missing value for --color")?;
+                cli.color = Some(parse_color_choice(color_str)?);
+            }
+            
+            "--config" | "-c" => {
+                i += 1;
+                cli.config = Some(PathBuf::from(
+                    args.get(i).ok_or("missing value for --config")?
+                ));
+            }
+            
+            "--explain" => {
+                i += 1;
+                cli.explain = Some(
+                    args.get(i).ok_or("missing value for --explain")?.clone()
+                );
+            }
+            
+            "--max-issues" => {
+                i += 1;
+                cli.max_issues = Some(
+                    args.get(i)
+                        .ok_or("missing value for --max-issues")?
+                        .parse()
+                        .map_err(|_| "invalid number for --max-issues")?
+                );
+            }
+            
+            "--report" => {
+                i += 1;
+                cli.report = Some(PathBuf::from(
+                    args.get(i).ok_or("missing value for --report")?
+                ));
+            }
+            
+            "--exclude" => {
+                i += 1;
+                cli.exclude.push(
+                    args.get(i).ok_or("missing value for --exclude")?.clone()
+                );
+            }
+            
+            "--edition" => {
+                i += 1;
+                let edition_str = args.get(i).ok_or("missing value for --edition")?;
+                cli.edition = Some(
+                    Edition::from_str(edition_str)
+                        .ok_or_else(|| format!("unknown edition: {}", edition_str))?
+                );
+            }
+            
+            _ if arg.starts_with('-') => {
+                // Check for combined short options like -vq
+                if arg.starts_with('-') && !arg.starts_with("--") {
+                    for c in arg[1..].chars() {
+                        match c {
+                            'v' => cli.verbose = true,
+                            'q' => cli.quiet = true,
+                            'h' => cli.help = true,
+                            'V' => cli.version = true,
+                            _ => return Err(format!("unknown option: -{}", c)),
+                        }
+                    }
+                } else {
+                    return Err(format!("unknown option: {}", arg));
+                }
+            }
+            
+            _ => {
+                // Positional argument (path)
+                cli.paths.push(PathBuf::from(arg));
+            }
+        }
+        
+        i += 1;
+    }
+    
+    // Default to current directory if no paths specified
+    if cli.paths.is_empty() && !cli.help && !cli.version && !cli.list_lints && cli.explain.is_none() {
+        cli.paths.push(PathBuf::from("."));
+    }
+    
+    Ok(cli)
+}
+
+fn parse_color_choice(s: &str) -> Result<ColorChoice, String> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(ColorChoice::Auto),
+        "always" | "yes" => Ok(ColorChoice::Always),
+        "never" | "no" => Ok(ColorChoice::Never),
+        _ => Err(format!("unknown color choice: {}", s)),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn print_help() {
+    println!(r#"quantalint - QuantaLang Linter
+
+USAGE:
+    quantalint [OPTIONS] [PATH]...
+
+ARGS:
+    <PATH>...    Files or directories to lint
+
+OPTIONS:
+    -h, --help              Show this help message
+    -V, --version           Show version
+    -v, --verbose           Verbose output
+    -q, --quiet             Only show errors
+    
+LINT CONTROL:
+    -A, --allow <LINT>      Allow a lint
+    -W, --warn <LINT>       Warn on a lint
+    -D, --deny <LINT>       Deny a lint (error)
+    -F, --forbid <LINT>     Forbid a lint (cannot override)
+    --enable <GROUP>        Enable a lint group
+    --disable <GROUP>       Disable a lint group
+    
+FIX:
+    --fix                   Auto-fix applicable lints
+    
+OUTPUT:
+    --format <FORMAT>       Output format (human, short, json, sarif, checkstyle)
+    --color <WHEN>          Color output (auto, always, never)
+    --report <FILE>         Write report to file
+    --max-issues <N>        Maximum issues to report
+    
+CONFIGURATION:
+    -c, --config <FILE>     Path to config file
+    --edition <YEAR>        Edition (2024, 2025)
+    --exclude <PATTERN>     Exclude files matching pattern
+    -W, --workspace         Lint all workspace packages
+    
+INFORMATION:
+    --list-lints            List all available lints
+    --explain <LINT>        Explain a specific lint
+
+LINT GROUPS:
+    correctness     Definite bugs and correctness issues
+    suspicious      Suspicious code patterns
+    style           Stylistic conventions
+    perf            Performance issues
+    complexity      Code complexity issues
+    pedantic        Very strict lints
+    security        Security vulnerabilities
+    documentation   Documentation quality
+    restriction     Disallowed patterns
+    deprecated      Deprecated APIs
+
+EXAMPLES:
+    quantalint                          Lint current directory
+    quantalint src/                     Lint specific directory
+    quantalint --fix                    Auto-fix issues
+    quantalint -D unused_variable       Deny unused variables
+    quantalint --format json            JSON output
+    quantalint --explain len_zero       Explain a lint
+"#);
+}
+
+fn print_version() {
+    println!("quantalint {}", VERSION);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN EXECUTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Run the linter
+pub fn run(args: &CliArgs) -> Result<i32, String> {
+    if args.help {
+        print_help();
+        return Ok(0);
+    }
+    
+    if args.version {
+        print_version();
+        return Ok(0);
+    }
+    
+    let registry = RuleRegistry::new();
+    
+    if args.list_lints {
+        list_lints(&registry);
+        return Ok(0);
+    }
+    
+    if let Some(ref lint) = args.explain {
+        explain_lint(&registry, lint);
+        return Ok(0);
+    }
+    
+    // Build configuration
+    let config = build_config(args)?;
+    
+    // Collect files
+    let files = collect_files(&args.paths, &config)?;
+    
+    if files.is_empty() {
+        if !args.quiet {
+            eprintln!("No files to lint");
+        }
+        return Ok(0);
+    }
+    
+    // Create checker
+    let checker = LintChecker::new(config.clone());
+    
+    // Create emitter
+    let format = config.output_format;
+    let color = config.color;
+    let mut emitter = DiagnosticEmitter::new(format, color);
+    
+    // Lint all files
+    let mut all_diagnostics = Vec::new();
+    let mut error_count = 0;
+    let mut warning_count = 0;
+    
+    for file in &files {
+        if args.verbose && !args.quiet {
+            eprintln!("Checking {}", file.display());
+        }
+        
+        match checker.check_file(file) {
+            Ok(diagnostics) => {
+                for d in &diagnostics {
+                    match d.severity {
+                        Severity::Error => error_count += 1,
+                        Severity::Warning => warning_count += 1,
+                        _ => {}
+                    }
+                }
+                
+                all_diagnostics.extend(diagnostics);
+                
+                // Check max issues limit
+                if config.max_issues > 0 && all_diagnostics.len() >= config.max_issues {
+                    break;
+                }
+            }
+            Err(e) => {
+                if !args.quiet {
+                    eprintln!("Error checking {}: {}", file.display(), e);
+                }
+            }
+        }
+    }
+    
+    // Emit diagnostics
+    if !all_diagnostics.is_empty() {
+        emitter.emit_all(&all_diagnostics);
+    }
+    
+    // Write report if requested
+    if let Some(ref report_path) = config.report_path {
+        write_report(&all_diagnostics, report_path, format)?;
+    }
+    
+    // Print summary
+    if !args.quiet {
+        eprintln!();
+        eprintln!(
+            "Checked {} files: {} errors, {} warnings",
+            files.len(), error_count, warning_count
+        );
+    }
+    
+    // Return exit code
+    Ok(if error_count > 0 { 1 } else { 0 })
+}
+
+fn build_config(args: &CliArgs) -> Result<LintConfig, String> {
+    // Start with defaults or load from file
+    let mut config = if let Some(ref path) = args.config {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("failed to read config: {}", e))?;
+        LintConfig::from_toml(&content)
+            .map_err(|_| "failed to parse config")?
+    } else {
+        // Look for config file in current directory
+        let config_path = PathBuf::from(CONFIG_FILE);
+        if config_path.exists() {
+            let content = fs::read_to_string(&config_path)
+                .map_err(|e| format!("failed to read config: {}", e))?;
+            LintConfig::from_toml(&content)
+                .map_err(|_| "failed to parse config")?
+        } else {
+            LintConfig::default()
+        }
+    };
+    
+    // Apply CLI overrides
+    for lint in &args.allow {
+        config.set_lint(lint, LintLevel::Allow);
+    }
+    
+    for lint in &args.warn {
+        config.set_lint(lint, LintLevel::Warn);
+    }
+    
+    for lint in &args.deny {
+        config.set_lint(lint, LintLevel::Deny);
+    }
+    
+    for lint in &args.forbid {
+        config.set_lint(lint, LintLevel::Forbid);
+    }
+    
+    for group in &args.enable_groups {
+        config.enable_group(*group);
+    }
+    
+    for group in &args.disable_groups {
+        config.disable_group(*group);
+    }
+    
+    config.fix = args.fix;
+    config.verbose = args.verbose;
+    config.quiet = args.quiet;
+    config.workspace = args.workspace;
+    
+    if let Some(format) = args.format {
+        config.output_format = format;
+    }
+    
+    if let Some(color) = args.color {
+        config.color = color;
+    }
+    
+    if let Some(max) = args.max_issues {
+        config.max_issues = max;
+    }
+    
+    if let Some(ref path) = args.report {
+        config.report_path = Some(path.clone());
+    }
+    
+    if let Some(edition) = args.edition {
+        config.edition = edition;
+    }
+    
+    config.exclude_files.extend(args.exclude.clone());
+    
+    Ok(config)
+}
+
+fn collect_files(paths: &[PathBuf], config: &LintConfig) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    
+    for path in paths {
+        if path.is_file() {
+            if is_quanta_file(path) && config.should_lint_file(&path.to_string_lossy()) {
+                files.push(path.clone());
+            }
+        } else if path.is_dir() {
+            collect_directory(path, &mut files, config)?;
+        }
+    }
+    
+    Ok(files)
+}
+
+fn collect_directory(dir: &Path, files: &mut Vec<PathBuf>, config: &LintConfig) -> Result<(), String> {
+    let entries = fs::read_dir(dir)
+        .map_err(|e| format!("failed to read directory {}: {}", dir.display(), e))?;
+    
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("failed to read entry: {}", e))?;
+        let path = entry.path();
+        
+        // Skip hidden files and directories
+        if path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with('.'))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        
+        if path.is_file() {
+            if is_quanta_file(&path) && config.should_lint_file(&path.to_string_lossy()) {
+                files.push(path);
+            }
+        } else if path.is_dir() {
+            collect_directory(&path, files, config)?;
+        }
+    }
+    
+    Ok(())
+}
+
+fn is_quanta_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e == "quanta")
+        .unwrap_or(false)
+}
+
+fn list_lints(registry: &RuleRegistry) {
+    println!("Available lints ({} total):\n", registry.len());
+    
+    let groups = [
+        LintGroup::Correctness,
+        LintGroup::Suspicious,
+        LintGroup::Style,
+        LintGroup::Perf,
+        LintGroup::Complexity,
+        LintGroup::Pedantic,
+        LintGroup::Security,
+        LintGroup::Documentation,
+        LintGroup::Restriction,
+        LintGroup::Deprecated,
+    ];
+    
+    for group in groups {
+        let rules = registry.group_rules(group);
+        if rules.is_empty() {
+            continue;
+        }
+        
+        println!("{}:", group.as_str());
+        println!("  {}\n", group.description());
+        
+        for rule in rules {
+            println!("  {} ({:?})", rule.name, rule.default_level);
+            println!("      {}", rule.description);
+        }
+        println!();
+    }
+}
+
+fn explain_lint(registry: &RuleRegistry, lint: &str) {
+    match registry.get(lint) {
+        Some(rule) => {
+            println!("{}\n", rule.name);
+            println!("Group: {}", rule.group.as_str());
+            println!("Default level: {:?}", rule.default_level);
+            println!("Fixable: {}\n", rule.fixable);
+            println!("Description:");
+            println!("  {}\n", rule.description);
+            
+            if let Some(ref bad) = rule.example_bad {
+                println!("Example (bad):");
+                println!("  {}\n", bad);
+            }
+            
+            if let Some(ref good) = rule.example_good {
+                println!("Example (good):");
+                println!("  {}\n", good);
+            }
+            
+            if let Some(ref url) = rule.docs_url {
+                println!("Documentation: {}", url);
+            }
+        }
+        None => {
+            eprintln!("Unknown lint: {}", lint);
+            eprintln!("Use --list-lints to see available lints");
+        }
+    }
+}
+
+fn write_report(diagnostics: &[Diagnostic], path: &Path, format: OutputFormat) -> Result<(), String> {
+    let file = fs::File::create(path)
+        .map_err(|e| format!("failed to create report file: {}", e))?;
+    
+    let mut emitter = DiagnosticEmitter::new(format, ColorChoice::Never)
+        .with_writer(file);
+    
+    emitter.emit_all(diagnostics);
+    
+    Ok(())
+}
+
+/// Main entry point
+pub fn main() -> Result<i32, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = parse_args(&args)?;
+    run(&cli)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_parse_args_empty() {
+        let args: Vec<String> = vec![];
+        let cli = parse_args(&args).unwrap();
+        assert_eq!(cli.paths.len(), 1); // defaults to "."
+    }
+    
+    #[test]
+    fn test_parse_args_options() {
+        let args = vec![
+            "--verbose".to_string(),
+            "--fix".to_string(),
+            "-D".to_string(),
+            "unused_variable".to_string(),
+        ];
+        let cli = parse_args(&args).unwrap();
+        assert!(cli.verbose);
+        assert!(cli.fix);
+        assert!(cli.deny.contains(&"unused_variable".to_string()));
+    }
+    
+    #[test]
+    fn test_is_quanta_file() {
+        assert!(is_quanta_file(Path::new("test.quanta")));
+        assert!(!is_quanta_file(Path::new("test.rs")));
+    }
+}

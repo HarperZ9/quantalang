@@ -1,0 +1,621 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Correlated Value Propagation
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Correlated Value Propagation:
+//   - Branch condition analysis
+//   - Predicate propagation
+//   - Phi value inference
+//   - Null/non-null tracking
+//   - Integer range refinement
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::cvp
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDICATES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A predicate derived from branch conditions
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Predicate {
+    /// Variable equals constant
+    Eq(String, i64),
+    /// Variable not equal to constant
+    Ne(String, i64),
+    /// Variable less than constant
+    Lt(String, i64),
+    /// Variable less than or equal
+    Le(String, i64),
+    /// Variable greater than constant
+    Gt(String, i64),
+    /// Variable greater than or equal
+    Ge(String, i64),
+    /// Variable is null
+    IsNull(String),
+    /// Variable is non-null
+    NonNull(String),
+    /// Two variables are equal
+    VarEq(String, String),
+    /// Two variables are not equal
+    VarNe(String, String),
+}
+
+impl Predicate {
+    /// Negate the predicate
+    pub fn negate(&self) -> Predicate {
+        match self {
+            Predicate::Eq(v, c) => Predicate::Ne(v.clone(), *c),
+            Predicate::Ne(v, c) => Predicate::Eq(v.clone(), *c),
+            Predicate::Lt(v, c) => Predicate::Ge(v.clone(), *c),
+            Predicate::Le(v, c) => Predicate::Gt(v.clone(), *c),
+            Predicate::Gt(v, c) => Predicate::Le(v.clone(), *c),
+            Predicate::Ge(v, c) => Predicate::Lt(v.clone(), *c),
+            Predicate::IsNull(v) => Predicate::NonNull(v.clone()),
+            Predicate::NonNull(v) => Predicate::IsNull(v.clone()),
+            Predicate::VarEq(a, b) => Predicate::VarNe(a.clone(), b.clone()),
+            Predicate::VarNe(a, b) => Predicate::VarEq(a.clone(), b.clone()),
+        }
+    }
+    
+    /// Get affected variable
+    pub fn variable(&self) -> &str {
+        match self {
+            Predicate::Eq(v, _) |
+            Predicate::Ne(v, _) |
+            Predicate::Lt(v, _) |
+            Predicate::Le(v, _) |
+            Predicate::Gt(v, _) |
+            Predicate::Ge(v, _) |
+            Predicate::IsNull(v) |
+            Predicate::NonNull(v) => v.as_str(),
+            Predicate::VarEq(a, _) |
+            Predicate::VarNe(a, _) => a.as_str(),
+        }
+    }
+}
+
+/// Predicate set for a block
+#[derive(Debug, Clone, Default)]
+pub struct PredicateSet {
+    predicates: BTreeSet<Predicate>,
+}
+
+impl PredicateSet {
+    pub fn new() -> Self {
+        PredicateSet { predicates: BTreeSet::new() }
+    }
+    
+    pub fn add(&mut self, pred: Predicate) {
+        self.predicates.insert(pred);
+    }
+    
+    pub fn contains(&self, pred: &Predicate) -> bool {
+        self.predicates.contains(pred)
+    }
+    
+    pub fn iter(&self) -> impl Iterator<Item = &Predicate> {
+        self.predicates.iter()
+    }
+    
+    /// Merge with another set (intersection for correlated info)
+    pub fn merge(&mut self, other: &PredicateSet) {
+        self.predicates = self.predicates.intersection(&other.predicates).cloned().collect();
+    }
+    
+    /// Get constant value if variable is constrained to single value
+    pub fn get_constant(&self, var: &str) -> Option<i64> {
+        for pred in &self.predicates {
+            if let Predicate::Eq(v, c) = pred {
+                if v == var {
+                    return Some(*c);
+                }
+            }
+        }
+        None
+    }
+    
+    /// Check if variable is known non-null
+    pub fn is_non_null(&self, var: &str) -> bool {
+        self.predicates.contains(&Predicate::NonNull(var.to_string()))
+    }
+    
+    /// Get range constraints
+    pub fn get_range(&self, var: &str) -> Option<(i64, i64)> {
+        let mut min = i64::MIN;
+        let mut max = i64::MAX;
+        
+        for pred in &self.predicates {
+            match pred {
+                Predicate::Eq(v, c) if v == var => {
+                    return Some((*c, *c));
+                }
+                Predicate::Ge(v, c) if v == var => {
+                    min = min.max(*c);
+                }
+                Predicate::Gt(v, c) if v == var => {
+                    min = min.max(*c + 1);
+                }
+                Predicate::Le(v, c) if v == var => {
+                    max = max.min(*c);
+                }
+                Predicate::Lt(v, c) if v == var => {
+                    max = max.min(*c - 1);
+                }
+                _ => {}
+            }
+        }
+        
+        if min <= max && (min != i64::MIN || max != i64::MAX) {
+            Some((min, max))
+        } else {
+            None
+        }
+    }
+}
+
+impl FromIterator<Predicate> for PredicateSet {
+    fn from_iter<I: IntoIterator<Item = Predicate>>(iter: I) -> Self {
+        PredicateSet {
+            predicates: iter.into_iter().collect(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONDITION ANALYZER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Analyzes branch conditions to extract predicates
+pub struct ConditionAnalyzer {
+    /// Predicates per block
+    block_predicates: BTreeMap<u32, PredicateSet>,
+}
+
+impl ConditionAnalyzer {
+    pub fn new() -> Self {
+        ConditionAnalyzer {
+            block_predicates: BTreeMap::new(),
+        }
+    }
+    
+    /// Analyze function and compute predicates
+    pub fn analyze(&mut self, func: &MirFunction) {
+        self.block_predicates.clear();
+        
+        // Initialize empty predicate sets
+        for block in &func.blocks {
+            self.block_predicates.insert(block.id, PredicateSet::new());
+        }
+        
+        // Process branches to propagate predicates
+        for block in &func.blocks {
+            self.process_terminator(block, func);
+        }
+        
+        // Fixed-point iteration for predicate propagation
+        let mut changed = true;
+        while changed {
+            changed = false;
+            
+            for block in &func.blocks {
+                let preds = self.get_predecessors(func, block.id);
+                
+                if preds.is_empty() {
+                    continue;
+                }
+                
+                // Merge predicates from all predecessors
+                let mut merged = self.block_predicates.get(&preds[0]).cloned()
+                    .unwrap_or_default();
+                
+                for &pred in &preds[1..] {
+                    if let Some(pred_set) = self.block_predicates.get(&pred) {
+                        merged.merge(pred_set);
+                    }
+                }
+                
+                let current = self.block_predicates.get(&block.id).unwrap();
+                
+                if merged.predicates != current.predicates {
+                    self.block_predicates.insert(block.id, merged);
+                    changed = true;
+                }
+            }
+        }
+    }
+    
+    fn process_terminator(&mut self, block: &MirBlock, func: &MirFunction) {
+        if let MirTerminator::Branch { cond, then_bb, else_bb } = &block.terminator {
+            // Extract predicate from condition
+            if let Some(pred) = self.extract_predicate(cond, func, block) {
+                // Add predicate to then branch
+                if let Some(set) = self.block_predicates.get_mut(then_bb) {
+                    set.add(pred.clone());
+                }
+                
+                // Add negated predicate to else branch
+                if let Some(set) = self.block_predicates.get_mut(else_bb) {
+                    set.add(pred.negate());
+                }
+            }
+        }
+    }
+    
+    fn extract_predicate(&self, cond: &MirOperand, func: &MirFunction, block: &MirBlock) -> Option<Predicate> {
+        if let MirOperand::Variable(cond_var) = cond {
+            // Find definition of condition
+            for stmt in block.statements.iter().rev() {
+                if let MirStatement::BinaryOp { dest, op, lhs, rhs } = stmt {
+                    if dest == cond_var {
+                        return self.binop_to_predicate(op, lhs, rhs);
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn binop_to_predicate(&self, op: &BinOp, lhs: &MirOperand, rhs: &MirOperand) -> Option<Predicate> {
+        match (lhs, rhs) {
+            (MirOperand::Variable(v), MirOperand::Constant(c)) => {
+                match op {
+                    BinOp::Eq => Some(Predicate::Eq(v.clone(), *c)),
+                    BinOp::Ne => Some(Predicate::Ne(v.clone(), *c)),
+                    BinOp::Lt => Some(Predicate::Lt(v.clone(), *c)),
+                    BinOp::Le => Some(Predicate::Le(v.clone(), *c)),
+                    BinOp::Gt => Some(Predicate::Gt(v.clone(), *c)),
+                    BinOp::Ge => Some(Predicate::Ge(v.clone(), *c)),
+                    _ => None,
+                }
+            }
+            (MirOperand::Variable(a), MirOperand::Variable(b)) => {
+                match op {
+                    BinOp::Eq => Some(Predicate::VarEq(a.clone(), b.clone())),
+                    BinOp::Ne => Some(Predicate::VarNe(a.clone(), b.clone())),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    
+    fn get_predecessors(&self, func: &MirFunction, block_id: u32) -> Vec<u32> {
+        let mut preds = Vec::new();
+        
+        for block in &func.blocks {
+            let succs = match &block.terminator {
+                MirTerminator::Goto(t) => vec![*t],
+                MirTerminator::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+                _ => vec![],
+            };
+            
+            if succs.contains(&block_id) {
+                preds.push(block.id);
+            }
+        }
+        
+        preds
+    }
+    
+    /// Get predicates for a block
+    pub fn get_predicates(&self, block_id: u32) -> Option<&PredicateSet> {
+        self.block_predicates.get(&block_id)
+    }
+}
+
+impl Default for ConditionAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CORRELATED VALUE PROPAGATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Correlated Value Propagation pass
+pub struct CVP {
+    /// Condition analyzer
+    condition_analyzer: ConditionAnalyzer,
+    /// Statistics
+    stats: CVPStats,
+}
+
+/// CVP statistics
+#[derive(Debug, Clone, Default)]
+pub struct CVPStats {
+    /// Predicates discovered
+    pub predicates_found: usize,
+    /// Values propagated
+    pub values_propagated: usize,
+    /// Comparisons simplified
+    pub comparisons_simplified: usize,
+    /// Branches eliminated
+    pub branches_eliminated: usize,
+    /// Null checks eliminated
+    pub null_checks_eliminated: usize,
+}
+
+impl CVP {
+    pub fn new() -> Self {
+        CVP {
+            condition_analyzer: ConditionAnalyzer::new(),
+            stats: CVPStats::default(),
+        }
+    }
+    
+    /// Run CVP on a function
+    pub fn run(&mut self, func: &mut MirFunction) -> &CVPStats {
+        self.stats = CVPStats::default();
+        
+        // Analyze conditions
+        self.condition_analyzer.analyze(func);
+        
+        // Count predicates
+        for (_, preds) in &self.condition_analyzer.block_predicates {
+            self.stats.predicates_found += preds.predicates.len();
+        }
+        
+        // Propagate values based on predicates
+        for block in &mut func.blocks {
+            self.propagate_in_block(block);
+        }
+        
+        // Simplify branches
+        self.simplify_branches(func);
+        
+        &self.stats
+    }
+    
+    fn propagate_in_block(&mut self, block: &mut MirBlock) {
+        let predicates = self.condition_analyzer.get_predicates(block.id)
+            .cloned()
+            .unwrap_or_default();
+        
+        for stmt in &mut block.statements {
+            match stmt {
+                MirStatement::BinaryOp { dest, op, lhs, rhs } => {
+                    // Check if we can simplify comparison
+                    if self.is_comparison(op) {
+                        if let Some(result) = self.evaluate_comparison(op, lhs, rhs, &predicates) {
+                            *stmt = MirStatement::Assign {
+                                dest: dest.clone(),
+                                value: MirOperand::Constant(result),
+                            };
+                            self.stats.comparisons_simplified += 1;
+                        }
+                    }
+                    
+                    // Substitute known values
+                    self.substitute_operand(lhs, &predicates);
+                    self.substitute_operand(rhs, &predicates);
+                }
+                MirStatement::Assign { value, .. } => {
+                    self.substitute_operand(value, &predicates);
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    fn is_comparison(&self, op: &BinOp) -> bool {
+        matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+    }
+    
+    fn evaluate_comparison(
+        &self,
+        op: &BinOp,
+        lhs: &MirOperand,
+        rhs: &MirOperand,
+        predicates: &PredicateSet,
+    ) -> Option<i64> {
+        if let MirOperand::Variable(v) = lhs {
+            if let MirOperand::Constant(c) = rhs {
+                // Check if predicate already constrains this
+                let pred = match op {
+                    BinOp::Eq => Predicate::Eq(v.clone(), *c),
+                    BinOp::Ne => Predicate::Ne(v.clone(), *c),
+                    BinOp::Lt => Predicate::Lt(v.clone(), *c),
+                    BinOp::Le => Predicate::Le(v.clone(), *c),
+                    BinOp::Gt => Predicate::Gt(v.clone(), *c),
+                    BinOp::Ge => Predicate::Ge(v.clone(), *c),
+                    _ => return None,
+                };
+                
+                if predicates.contains(&pred) {
+                    return Some(1); // True
+                }
+                
+                if predicates.contains(&pred.negate()) {
+                    return Some(0); // False
+                }
+                
+                // Check range constraints
+                if let Some((min, max)) = predicates.get_range(v) {
+                    match op {
+                        BinOp::Lt if max < *c => return Some(1),
+                        BinOp::Lt if min >= *c => return Some(0),
+                        BinOp::Ge if min >= *c => return Some(1),
+                        BinOp::Ge if max < *c => return Some(0),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn substitute_operand(&mut self, operand: &mut MirOperand, predicates: &PredicateSet) {
+        if let MirOperand::Variable(v) = operand {
+            if let Some(c) = predicates.get_constant(v) {
+                *operand = MirOperand::Constant(c);
+                self.stats.values_propagated += 1;
+            }
+        }
+    }
+    
+    fn simplify_branches(&mut self, func: &mut MirFunction) {
+        for block in &mut func.blocks {
+            if let MirTerminator::Branch { cond, then_bb, else_bb } = &block.terminator {
+                // Check if condition is known constant
+                if let MirOperand::Constant(c) = cond {
+                    let target = if *c != 0 { *then_bb } else { *else_bb };
+                    block.terminator = MirTerminator::Goto(target);
+                    self.stats.branches_eliminated += 1;
+                }
+            }
+        }
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &CVPStats {
+        &self.stats
+    }
+}
+
+impl Default for CVP {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand },
+    Store { ptr: MirOperand, value: MirOperand },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Return { value: Option<MirOperand> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_predicate_negate() {
+        let pred = Predicate::Eq("x".to_string(), 5);
+        assert_eq!(pred.negate(), Predicate::Ne("x".to_string(), 5));
+        
+        let pred = Predicate::Lt("x".to_string(), 10);
+        assert_eq!(pred.negate(), Predicate::Ge("x".to_string(), 10));
+    }
+    
+    #[test]
+    fn test_predicate_set_constant() {
+        let mut set = PredicateSet::new();
+        set.add(Predicate::Eq("x".to_string(), 42));
+        
+        assert_eq!(set.get_constant("x"), Some(42));
+        assert_eq!(set.get_constant("y"), None);
+    }
+    
+    #[test]
+    fn test_predicate_set_range() {
+        let mut set = PredicateSet::new();
+        set.add(Predicate::Ge("x".to_string(), 0));
+        set.add(Predicate::Lt("x".to_string(), 10));
+        
+        assert_eq!(set.get_range("x"), Some((0, 9)));
+    }
+    
+    #[test]
+    fn test_cvp() {
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::BinaryOp {
+                            dest: "cond".to_string(),
+                            op: BinOp::Eq,
+                            lhs: MirOperand::Variable("x".to_string()),
+                            rhs: MirOperand::Constant(5),
+                        },
+                    ],
+                    terminator: MirTerminator::Branch {
+                        cond: MirOperand::Variable("cond".to_string()),
+                        then_bb: 1,
+                        else_bb: 2,
+                    },
+                },
+                MirBlock {
+                    id: 1,
+                    statements: vec![
+                        // In this block, we know x == 5
+                        MirStatement::Assign {
+                            dest: "y".to_string(),
+                            value: MirOperand::Variable("x".to_string()),
+                        },
+                    ],
+                    terminator: MirTerminator::Return { value: None },
+                },
+                MirBlock {
+                    id: 2,
+                    statements: vec![],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let mut cvp = CVP::new();
+        cvp.run(&mut func);
+        
+        assert!(cvp.stats().predicates_found > 0);
+    }
+}

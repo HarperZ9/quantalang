@@ -1,0 +1,674 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ OBSERVABILITY — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Unified observability framework for QuantaLang:
+// - OpenTelemetry-compatible distributed tracing
+// - Metrics with Counter, Histogram, Gauge
+// - Structured logging with trace correlation
+// - OTLP export support
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang Observability
+//!
+//! Complete observability stack with tracing, metrics, and logging.
+//!
+//! ## Quick Start
+//!
+//! ```quanta
+//! use quantalang::observability::prelude::*;
+//!
+//! // Initialize observability
+//! let obs = Observability::builder()
+//!     .service_name("my-service")
+//!     .with_console_exporter()
+//!     .build();
+//!
+//! // Get a tracer
+//! let tracer = obs.tracer("my-component");
+//!
+//! // Create a span
+//! tracer.in_span("process_request", |span| {
+//!     span.set_attribute("user_id", "12345");
+//!     
+//!     // Get a logger (automatically correlated with trace)
+//!     let log = obs.logger("my-component");
+//!     log.info("Processing request");
+//!     
+//!     // Record metrics
+//!     let counter = obs.meter("my-component").counter("requests").build();
+//!     counter.increment();
+//!     
+//!     do_work()
+//! });
+//! ```
+
+module quantalang::observability
+
+// Submodules
+pub mod tracing;
+pub mod metrics;
+pub mod logging;
+
+// Re-exports from tracing
+pub use tracing::{
+    // Core types
+    TraceId, SpanId, SpanContext, TraceFlags, TraceState,
+    
+    // Span
+    Span, SpanData, SpanKind, SpanStatus, SpanEvent, SpanLink,
+    AttributeValue as TraceAttribute,
+    
+    // Tracer
+    Tracer, TracerProvider, TracerProviderBuilder,
+    SpanOptions, SpanBuilder,
+    
+    // Sampling
+    Sampler, SamplingResult, SamplingDecision,
+    AlwaysOnSampler, AlwaysOffSampler, TraceIdRatioSampler, ParentBasedSampler,
+    
+    // Processing
+    SpanProcessor, SimpleProcessor as SimpleSpanProcessor,
+    BatchProcessor as BatchSpanProcessor, BatchConfig as SpanBatchConfig,
+    SpanExporter, ConsoleExporter as ConsoleSpanExporter,
+    
+    // Context
+    current_span_context, set_current_span, SpanGuard,
+    
+    // Resource
+    Resource as TraceResource, InstrumentationScope,
+    
+    // Errors
+    TracingError,
+};
+
+// Re-exports from metrics
+pub use metrics::{
+    // Instruments
+    Counter, UpDownCounter, Gauge, Histogram, HistogramSnapshot,
+    ObservableCounter, ObservableGauge,
+    
+    // Builders
+    CounterBuilder, UpDownCounterBuilder, GaugeBuilder, HistogramBuilder,
+    
+    // Meter
+    Meter, MeterProvider, MeterProviderBuilder,
+    
+    // Attributes
+    AttributeSet, AttributeValue as MetricAttribute,
+    InstrumentKind, Temporality,
+    
+    // Export
+    MetricReader, PeriodicReader,
+    MetricExporter, MetricData, DataPoint,
+    ConsoleExporter as ConsoleMetricExporter,
+    
+    // Resource
+    Resource as MetricResource,
+    
+    // Errors
+    MetricsError,
+};
+
+// Re-exports from logging
+pub use logging::{
+    // Logger
+    Logger, LoggerProvider, LoggerProviderBuilder,
+    LogRecord, SourceLocation,
+    
+    // Levels
+    Level,
+    
+    // Values
+    Value as LogValue,
+    
+    // Processing
+    LogProcessor, SimpleProcessor as SimpleLogProcessor,
+    BatchProcessor as BatchLogProcessor, BatchConfig as LogBatchConfig,
+    
+    // Export
+    LogExporter, LogFormat,
+    ConsoleExporter as ConsoleLogExporter,
+    FileExporter as FileLogExporter,
+    
+    // Global
+    global_provider as global_log_provider, logger as global_logger,
+    init_global_provider as init_global_log_provider,
+    
+    // Errors
+    LoggingError,
+};
+
+use alloc::sync::Arc;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::time::Duration;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UNIFIED OBSERVABILITY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unified observability configuration
+pub struct Observability {
+    tracer_provider: Arc<TracerProvider>,
+    meter_provider: Arc<MeterProvider>,
+    logger_provider: Arc<LoggerProvider>,
+    resource: Resource,
+}
+
+impl Observability {
+    /// Create a builder
+    pub fn builder() -> ObservabilityBuilder {
+        ObservabilityBuilder::new()
+    }
+    
+    /// Get a tracer
+    pub fn tracer(&self, name: &str) -> Arc<Tracer> {
+        self.tracer_provider.tracer(name)
+    }
+    
+    /// Get a meter
+    pub fn meter(&self, name: &str) -> Arc<Meter> {
+        self.meter_provider.meter(name)
+    }
+    
+    /// Get a logger
+    pub fn logger(&self, name: &str) -> Logger {
+        self.logger_provider.logger(name)
+    }
+    
+    /// Get the tracer provider
+    pub fn tracer_provider(&self) -> &Arc<TracerProvider> {
+        &self.tracer_provider
+    }
+    
+    /// Get the meter provider
+    pub fn meter_provider(&self) -> &Arc<MeterProvider> {
+        &self.meter_provider
+    }
+    
+    /// Get the logger provider
+    pub fn logger_provider(&self) -> &Arc<LoggerProvider> {
+        &self.logger_provider
+    }
+    
+    /// Shutdown all providers
+    pub fn shutdown(&self) -> Result<(), ObservabilityError> {
+        self.tracer_provider.shutdown()
+            .map_err(|e| ObservabilityError::Tracing(e.to_string()))?;
+        self.meter_provider.shutdown()
+            .map_err(|e| ObservabilityError::Metrics(e.to_string()))?;
+        self.logger_provider.shutdown()
+            .map_err(|e| ObservabilityError::Logging(e.to_string()))?;
+        Ok(())
+    }
+    
+    /// Force flush all providers
+    pub fn force_flush(&self) -> Result<(), ObservabilityError> {
+        self.tracer_provider.force_flush()
+            .map_err(|e| ObservabilityError::Tracing(e.to_string()))?;
+        self.meter_provider.force_flush()
+            .map_err(|e| ObservabilityError::Metrics(e.to_string()))?;
+        self.logger_provider.force_flush()
+            .map_err(|e| ObservabilityError::Logging(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Unified resource for all signals
+#[derive(Debug, Clone)]
+pub struct Resource {
+    attributes: Vec<(String, String)>,
+}
+
+impl Resource {
+    pub fn new() -> Self {
+        Resource { attributes: Vec::new() }
+    }
+    
+    pub fn with_service(service_name: &str, service_version: &str) -> Self {
+        let mut r = Self::new();
+        r.attributes.push(("service.name".into(), service_name.into()));
+        r.attributes.push(("service.version".into(), service_version.into()));
+        r.attributes.push(("telemetry.sdk.name".into(), "quantalang".into()));
+        r.attributes.push(("telemetry.sdk.version".into(), VERSION.into()));
+        r.attributes.push(("telemetry.sdk.language".into(), "quanta".into()));
+        r
+    }
+    
+    pub fn add(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.attributes.push((key.into(), value.into()));
+    }
+    
+    pub fn to_trace_resource(&self) -> TraceResource {
+        TraceResource::new(
+            self.attributes.iter()
+                .map(|(k, v)| (k.clone(), TraceAttribute::String(v.clone())))
+                .collect()
+        )
+    }
+    
+    pub fn to_metric_resource(&self) -> MetricResource {
+        MetricResource::new(
+            self.attributes.iter()
+                .map(|(k, v)| (k.clone(), MetricAttribute::String(v.clone())))
+                .collect()
+        )
+    }
+    
+    pub fn to_log_attributes(&self) -> Vec<(String, LogValue)> {
+        self.attributes.iter()
+            .map(|(k, v)| (k.clone(), LogValue::String(v.clone())))
+            .collect()
+    }
+}
+
+impl Default for Resource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Observability builder
+pub struct ObservabilityBuilder {
+    service_name: String,
+    service_version: String,
+    resource_attributes: Vec<(String, String)>,
+    
+    // Tracing
+    trace_sampler: Option<Arc<dyn Sampler>>,
+    span_processors: Vec<Arc<dyn SpanProcessor>>,
+    
+    // Metrics
+    metric_readers: Vec<Arc<dyn MetricReader>>,
+    metric_interval: Duration,
+    
+    // Logging
+    log_processors: Vec<Arc<dyn LogProcessor>>,
+    log_level: Level,
+    
+    // Export targets
+    console_enabled: bool,
+    otlp_endpoint: Option<String>,
+}
+
+impl ObservabilityBuilder {
+    pub fn new() -> Self {
+        ObservabilityBuilder {
+            service_name: "unknown".into(),
+            service_version: "0.0.0".into(),
+            resource_attributes: Vec::new(),
+            trace_sampler: None,
+            span_processors: Vec::new(),
+            metric_readers: Vec::new(),
+            metric_interval: Duration::from_secs(60),
+            log_processors: Vec::new(),
+            log_level: Level::Info,
+            console_enabled: false,
+            otlp_endpoint: None,
+        }
+    }
+    
+    /// Set service name
+    pub fn service_name(mut self, name: impl Into<String>) -> Self {
+        self.service_name = name.into();
+        self
+    }
+    
+    /// Set service version
+    pub fn service_version(mut self, version: impl Into<String>) -> Self {
+        self.service_version = version.into();
+        self
+    }
+    
+    /// Add resource attribute
+    pub fn resource_attribute(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.resource_attributes.push((key.into(), value.into()));
+        self
+    }
+    
+    /// Set trace sampler
+    pub fn with_sampler(mut self, sampler: impl Sampler + 'static) -> Self {
+        self.trace_sampler = Some(Arc::new(sampler));
+        self
+    }
+    
+    /// Set sampling ratio
+    pub fn sample_ratio(mut self, ratio: f64) -> Self {
+        self.trace_sampler = Some(Arc::new(TraceIdRatioSampler::new(ratio)));
+        self
+    }
+    
+    /// Add span processor
+    pub fn with_span_processor(mut self, processor: impl SpanProcessor + 'static) -> Self {
+        self.span_processors.push(Arc::new(processor));
+        self
+    }
+    
+    /// Add metric reader
+    pub fn with_metric_reader(mut self, reader: impl MetricReader + 'static) -> Self {
+        self.metric_readers.push(Arc::new(reader));
+        self
+    }
+    
+    /// Set metric export interval
+    pub fn metric_interval(mut self, interval: Duration) -> Self {
+        self.metric_interval = interval;
+        self
+    }
+    
+    /// Add log processor
+    pub fn with_log_processor(mut self, processor: impl LogProcessor + 'static) -> Self {
+        self.log_processors.push(Arc::new(processor));
+        self
+    }
+    
+    /// Set minimum log level
+    pub fn log_level(mut self, level: Level) -> Self {
+        self.log_level = level;
+        self
+    }
+    
+    /// Enable console export for all signals
+    pub fn with_console_exporter(mut self) -> Self {
+        self.console_enabled = true;
+        self
+    }
+    
+    /// Set OTLP endpoint
+    pub fn with_otlp_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.otlp_endpoint = Some(endpoint.into());
+        self
+    }
+    
+    /// Build the observability instance
+    pub fn build(self) -> Observability {
+        // Build resource
+        let mut resource = Resource::with_service(&self.service_name, &self.service_version);
+        for (k, v) in self.resource_attributes {
+            resource.add(k, v);
+        }
+        
+        // Build tracer provider
+        let mut tracer_builder = TracerProviderBuilder::new()
+            .with_resource(resource.to_trace_resource());
+        
+        if let Some(sampler) = self.trace_sampler {
+            tracer_builder = tracer_builder.with_sampler(SamplerWrapper(sampler));
+        } else {
+            tracer_builder = tracer_builder.with_sampler(AlwaysOnSampler);
+        }
+        
+        for processor in self.span_processors {
+            tracer_builder = tracer_builder.with_processor(ProcessorWrapper(processor));
+        }
+        
+        if self.console_enabled {
+            tracer_builder = tracer_builder.with_processor(
+                SimpleSpanProcessor::new(ConsoleSpanExporter)
+            );
+        }
+        
+        let tracer_provider = tracer_builder.build();
+        
+        // Build meter provider
+        let mut meter_builder = MeterProviderBuilder::new()
+            .with_resource(resource.to_metric_resource());
+        
+        for reader in self.metric_readers {
+            meter_builder = meter_builder.with_reader(ReaderWrapper(reader));
+        }
+        
+        if self.console_enabled {
+            meter_builder = meter_builder.with_reader(
+                PeriodicReader::new(ConsoleMetricExporter, self.metric_interval)
+            );
+        }
+        
+        let meter_provider = meter_builder.build();
+        
+        // Build logger provider
+        let mut logger_builder = LoggerProviderBuilder::new()
+            .with_resource(resource.to_log_attributes())
+            .with_level(self.log_level);
+        
+        for processor in self.log_processors {
+            logger_builder = logger_builder.with_processor(LogProcessorWrapper(processor));
+        }
+        
+        if self.console_enabled {
+            logger_builder = logger_builder.with_processor(
+                SimpleLogProcessor::new(ConsoleLogExporter::new())
+            );
+        }
+        
+        let logger_provider = logger_builder.build();
+        
+        Observability {
+            tracer_provider,
+            meter_provider,
+            logger_provider,
+            resource,
+        }
+    }
+}
+
+impl Default for ObservabilityBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Wrapper types to implement traits for Arc
+struct SamplerWrapper(Arc<dyn Sampler>);
+impl Sampler for SamplerWrapper {
+    fn should_sample(
+        &self,
+        parent: Option<&SpanContext>,
+        trace_id: &TraceId,
+        name: &str,
+        kind: SpanKind,
+        attributes: &[(String, TraceAttribute)],
+        links: &[SpanLink],
+    ) -> SamplingResult {
+        self.0.should_sample(parent, trace_id, name, kind, attributes, links)
+    }
+    fn description(&self) -> &str { self.0.description() }
+}
+
+struct ProcessorWrapper(Arc<dyn SpanProcessor>);
+impl SpanProcessor for ProcessorWrapper {
+    fn on_start(&self, span: &Span) { self.0.on_start(span) }
+    fn on_end(&self, span: &Span) { self.0.on_end(span) }
+    fn shutdown(&self) -> Result<(), TracingError> { self.0.shutdown() }
+    fn force_flush(&self) -> Result<(), TracingError> { self.0.force_flush() }
+}
+
+struct ReaderWrapper(Arc<dyn MetricReader>);
+impl MetricReader for ReaderWrapper {
+    fn collect(&self) -> Result<(), MetricsError> { self.0.collect() }
+    fn shutdown(&self) -> Result<(), MetricsError> { self.0.shutdown() }
+    fn force_flush(&self) -> Result<(), MetricsError> { self.0.force_flush() }
+}
+
+struct LogProcessorWrapper(Arc<dyn LogProcessor>);
+impl LogProcessor for LogProcessorWrapper {
+    fn emit(&self, record: &LogRecord) { self.0.emit(record) }
+    fn shutdown(&self) -> Result<(), LoggingError> { self.0.shutdown() }
+    fn force_flush(&self) -> Result<(), LoggingError> { self.0.force_flush() }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONVENIENCE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create a simple observability instance with console output
+pub fn simple(service_name: &str) -> Observability {
+    Observability::builder()
+        .service_name(service_name)
+        .with_console_exporter()
+        .build()
+}
+
+/// Create a production observability instance
+pub fn production(service_name: &str, otlp_endpoint: &str) -> Observability {
+    Observability::builder()
+        .service_name(service_name)
+        .sample_ratio(0.1) // 10% sampling
+        .log_level(Level::Info)
+        .with_otlp_endpoint(otlp_endpoint)
+        .build()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSTRUMENTATION HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Instrument a function with tracing
+pub fn instrument<F, R>(tracer: &Tracer, name: &str, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    tracer.in_span(name, |_| f())
+}
+
+/// Time a function and record to histogram
+pub fn timed<F, R>(histogram: &Histogram, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    histogram.time(f)
+}
+
+/// Record an error to span and log
+pub fn record_error(span: &mut Span, logger: &Logger, error: &dyn std::error::Error) {
+    span.record_exception(error);
+    logger.error(error.to_string());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum ObservabilityError {
+    Tracing(String),
+    Metrics(String),
+    Logging(String),
+    Configuration(String),
+}
+
+impl std::fmt::Display for ObservabilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tracing(e) => write!(f, "tracing error: {}", e),
+            Self::Metrics(e) => write!(f, "metrics error: {}", e),
+            Self::Logging(e) => write!(f, "logging error: {}", e),
+            Self::Configuration(e) => write!(f, "configuration error: {}", e),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Common observability types
+pub mod prelude {
+    pub use super::{
+        // Main type
+        Observability, ObservabilityBuilder, Resource,
+        
+        // Tracing
+        Tracer, Span, SpanKind, SpanContext,
+        TraceId, SpanId,
+        
+        // Metrics
+        Meter, Counter, Histogram, Gauge,
+        AttributeSet,
+        
+        // Logging
+        Logger, Level,
+        
+        // Convenience
+        simple, production, instrument, timed,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_version() {
+        assert_eq!(VERSION, "1.0.0");
+    }
+    
+    #[test]
+    fn test_resource() {
+        let resource = Resource::with_service("test-service", "1.0.0");
+        assert!(!resource.attributes.is_empty());
+    }
+    
+    #[test]
+    fn test_builder() {
+        let obs = Observability::builder()
+            .service_name("test-service")
+            .service_version("1.0.0")
+            .log_level(Level::Debug)
+            .sample_ratio(0.5)
+            .build();
+        
+        // Verify we can get providers
+        let _tracer = obs.tracer("test");
+        let _meter = obs.meter("test");
+        let _logger = obs.logger("test");
+    }
+    
+    #[test]
+    fn test_simple() {
+        let obs = simple("test-service");
+        let logger = obs.logger("test");
+        logger.info("test message");
+    }
+    
+    #[test]
+    fn test_integration() {
+        let obs = Observability::builder()
+            .service_name("integration-test")
+            .with_console_exporter()
+            .build();
+        
+        let tracer = obs.tracer("test");
+        let meter = obs.meter("test");
+        let logger = obs.logger("test");
+        
+        let counter = meter.counter("requests")
+            .with_description("Request count")
+            .build();
+        
+        tracer.in_span("test-operation", |span| {
+            span.set_attribute("test", "value");
+            counter.increment();
+            logger.info("Inside span");
+        });
+    }
+}

@@ -1,0 +1,1279 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Link-Time Optimization (LTO)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Link-Time Optimization infrastructure:
+//   - Whole-program optimization
+//   - Cross-module inlining
+//   - Dead code elimination
+//   - Interprocedural optimization
+//   - ThinLTO support
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::lto
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::io::{Read, Write};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LTO MODES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// LTO mode selection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LtoMode {
+    /// No LTO
+    None,
+    /// Full LTO (monolithic)
+    Full,
+    /// ThinLTO (parallel, scalable)
+    Thin,
+    /// Fat LTO (embed both native and bitcode)
+    Fat,
+}
+
+impl LtoMode {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "none" | "off" | "false" => Some(LtoMode::None),
+            "full" | "on" | "true" => Some(LtoMode::Full),
+            "thin" => Some(LtoMode::Thin),
+            "fat" => Some(LtoMode::Fat),
+            _ => None,
+        }
+    }
+}
+
+/// LTO configuration
+#[derive(Debug, Clone)]
+pub struct LtoConfig {
+    pub mode: LtoMode,
+    /// Number of parallel jobs for ThinLTO
+    pub jobs: u32,
+    /// Cache directory for ThinLTO
+    pub cache_dir: Option<String>,
+    /// Maximum cache size in MB
+    pub cache_size_mb: u64,
+    /// Enable interprocedural optimization
+    pub enable_ipo: bool,
+    /// Enable whole-program devirtualization
+    pub enable_devirt: bool,
+    /// Enable cross-module inlining
+    pub enable_cross_module_inline: bool,
+    /// Inline threshold multiplier
+    pub inline_threshold: f32,
+    /// Export list for symbol visibility
+    pub exports: Vec<String>,
+    /// Preserve specific symbols
+    pub preserve_symbols: Vec<String>,
+}
+
+impl Default for LtoConfig {
+    fn default() -> Self {
+        LtoConfig {
+            mode: LtoMode::Thin,
+            jobs: num_cpus(),
+            cache_dir: None,
+            cache_size_mb: 1024,
+            enable_ipo: true,
+            enable_devirt: true,
+            enable_cross_module_inline: true,
+            inline_threshold: 1.5,
+            exports: Vec::new(),
+            preserve_symbols: Vec::new(),
+        }
+    }
+}
+
+fn num_cpus() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BITCODE SERIALIZATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Bitcode magic number
+const BITCODE_MAGIC: u32 = 0x514E5442; // "QNTB"
+
+/// Bitcode version
+const BITCODE_VERSION: u32 = 1;
+
+/// Serialized module for LTO
+#[derive(Debug, Clone)]
+pub struct BitcodeModule {
+    /// Module name
+    pub name: String,
+    /// Module hash for incremental
+    pub hash: u64,
+    /// Serialized IR
+    pub ir_data: Vec<u8>,
+    /// Symbol table
+    pub symbols: SymbolTable,
+    /// Module summary for ThinLTO
+    pub summary: Option<ModuleSummary>,
+}
+
+impl BitcodeModule {
+    pub fn new(name: impl Into<String>) -> Self {
+        BitcodeModule {
+            name: name.into(),
+            hash: 0,
+            ir_data: Vec::new(),
+            symbols: SymbolTable::new(),
+            summary: None,
+        }
+    }
+    
+    /// Serialize to bytes
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        
+        // Magic
+        data.extend_from_slice(&BITCODE_MAGIC.to_le_bytes());
+        
+        // Version
+        data.extend_from_slice(&BITCODE_VERSION.to_le_bytes());
+        
+        // Name
+        data.extend_from_slice(&(self.name.len() as u32).to_le_bytes());
+        data.extend_from_slice(self.name.as_bytes());
+        
+        // Hash
+        data.extend_from_slice(&self.hash.to_le_bytes());
+        
+        // IR data
+        data.extend_from_slice(&(self.ir_data.len() as u64).to_le_bytes());
+        data.extend_from_slice(&self.ir_data);
+        
+        // Symbols
+        let symbols_data = self.symbols.serialize();
+        data.extend_from_slice(&(symbols_data.len() as u64).to_le_bytes());
+        data.extend_from_slice(&symbols_data);
+        
+        // Summary (optional)
+        if let Some(summary) = &self.summary {
+            data.push(1); // Has summary
+            let summary_data = summary.serialize();
+            data.extend_from_slice(&(summary_data.len() as u64).to_le_bytes());
+            data.extend_from_slice(&summary_data);
+        } else {
+            data.push(0); // No summary
+        }
+        
+        data
+    }
+    
+    /// Deserialize from bytes
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        let mut cursor = 0;
+        
+        // Magic
+        if data.len() < 4 { return None; }
+        let magic = u32::from_le_bytes(data[0..4].try_into().ok()?);
+        if magic != BITCODE_MAGIC { return None; }
+        cursor += 4;
+        
+        // Version
+        let version = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?);
+        cursor += 4;
+        
+        // Name
+        let name_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        let name = String::from_utf8_lossy(&data[cursor..cursor+name_len]).to_string();
+        cursor += name_len;
+        
+        // Hash
+        let hash = u64::from_le_bytes(data[cursor..cursor+8].try_into().ok()?);
+        cursor += 8;
+        
+        // IR data
+        let ir_len = u64::from_le_bytes(data[cursor..cursor+8].try_into().ok()?) as usize;
+        cursor += 8;
+        let ir_data = data[cursor..cursor+ir_len].to_vec();
+        cursor += ir_len;
+        
+        // Symbols
+        let symbols_len = u64::from_le_bytes(data[cursor..cursor+8].try_into().ok()?) as usize;
+        cursor += 8;
+        let symbols = SymbolTable::deserialize(&data[cursor..cursor+symbols_len])?;
+        cursor += symbols_len;
+        
+        // Summary
+        let has_summary = data[cursor] == 1;
+        cursor += 1;
+        
+        let summary = if has_summary {
+            let summary_len = u64::from_le_bytes(data[cursor..cursor+8].try_into().ok()?) as usize;
+            cursor += 8;
+            ModuleSummary::deserialize(&data[cursor..cursor+summary_len])
+        } else {
+            None
+        };
+        
+        Some(BitcodeModule {
+            name,
+            hash,
+            ir_data,
+            symbols,
+            summary,
+        })
+    }
+}
+
+/// Symbol table for a module
+#[derive(Debug, Clone)]
+pub struct SymbolTable {
+    /// Defined symbols
+    pub definitions: Vec<SymbolDef>,
+    /// Referenced symbols
+    pub references: Vec<SymbolRef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SymbolDef {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub linkage: Linkage,
+    pub visibility: Visibility,
+    /// For ThinLTO: function summary
+    pub summary_ref: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SymbolRef {
+    pub name: String,
+    pub kind: SymbolKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolKind {
+    Function,
+    Global,
+    Alias,
+    IFunc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Linkage {
+    External,
+    Internal,
+    Private,
+    LinkOnce,
+    LinkOnceOdr,
+    Weak,
+    WeakOdr,
+    Common,
+    Appending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    Default,
+    Hidden,
+    Protected,
+}
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        SymbolTable {
+            definitions: Vec::new(),
+            references: Vec::new(),
+        }
+    }
+    
+    pub fn add_definition(&mut self, def: SymbolDef) {
+        self.definitions.push(def);
+    }
+    
+    pub fn add_reference(&mut self, name: impl Into<String>, kind: SymbolKind) {
+        self.references.push(SymbolRef { name: name.into(), kind });
+    }
+    
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        
+        // Definitions count
+        data.extend_from_slice(&(self.definitions.len() as u32).to_le_bytes());
+        
+        for def in &self.definitions {
+            // Name
+            data.extend_from_slice(&(def.name.len() as u32).to_le_bytes());
+            data.extend_from_slice(def.name.as_bytes());
+            
+            // Kind, linkage, visibility
+            data.push(def.kind as u8);
+            data.push(def.linkage as u8);
+            data.push(def.visibility as u8);
+            
+            // Summary ref
+            if let Some(idx) = def.summary_ref {
+                data.push(1);
+                data.extend_from_slice(&idx.to_le_bytes());
+            } else {
+                data.push(0);
+            }
+        }
+        
+        // References count
+        data.extend_from_slice(&(self.references.len() as u32).to_le_bytes());
+        
+        for r in &self.references {
+            data.extend_from_slice(&(r.name.len() as u32).to_le_bytes());
+            data.extend_from_slice(r.name.as_bytes());
+            data.push(r.kind as u8);
+        }
+        
+        data
+    }
+    
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        let mut cursor = 0;
+        
+        let def_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        
+        let mut definitions = Vec::with_capacity(def_count);
+        for _ in 0..def_count {
+            let name_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+            cursor += 4;
+            let name = String::from_utf8_lossy(&data[cursor..cursor+name_len]).to_string();
+            cursor += name_len;
+            
+            let kind = match data[cursor] {
+                0 => SymbolKind::Function,
+                1 => SymbolKind::Global,
+                2 => SymbolKind::Alias,
+                3 => SymbolKind::IFunc,
+                _ => return None,
+            };
+            cursor += 1;
+            
+            let linkage = match data[cursor] {
+                0 => Linkage::External,
+                1 => Linkage::Internal,
+                2 => Linkage::Private,
+                3 => Linkage::LinkOnce,
+                4 => Linkage::LinkOnceOdr,
+                5 => Linkage::Weak,
+                6 => Linkage::WeakOdr,
+                7 => Linkage::Common,
+                8 => Linkage::Appending,
+                _ => return None,
+            };
+            cursor += 1;
+            
+            let visibility = match data[cursor] {
+                0 => Visibility::Default,
+                1 => Visibility::Hidden,
+                2 => Visibility::Protected,
+                _ => return None,
+            };
+            cursor += 1;
+            
+            let has_summary = data[cursor] == 1;
+            cursor += 1;
+            
+            let summary_ref = if has_summary {
+                let idx = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?);
+                cursor += 4;
+                Some(idx)
+            } else {
+                None
+            };
+            
+            definitions.push(SymbolDef { name, kind, linkage, visibility, summary_ref });
+        }
+        
+        let ref_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        
+        let mut references = Vec::with_capacity(ref_count);
+        for _ in 0..ref_count {
+            let name_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+            cursor += 4;
+            let name = String::from_utf8_lossy(&data[cursor..cursor+name_len]).to_string();
+            cursor += name_len;
+            
+            let kind = match data[cursor] {
+                0 => SymbolKind::Function,
+                1 => SymbolKind::Global,
+                2 => SymbolKind::Alias,
+                3 => SymbolKind::IFunc,
+                _ => return None,
+            };
+            cursor += 1;
+            
+            references.push(SymbolRef { name, kind });
+        }
+        
+        Some(SymbolTable { definitions, references })
+    }
+}
+
+impl Default for SymbolTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THINLTO SUMMARY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Module summary for ThinLTO
+#[derive(Debug, Clone)]
+pub struct ModuleSummary {
+    /// Function summaries
+    pub functions: Vec<FunctionSummary>,
+    /// Global variable summaries
+    pub globals: Vec<GlobalSummary>,
+    /// Type ID summaries for devirtualization
+    pub type_ids: Vec<TypeIdSummary>,
+}
+
+impl ModuleSummary {
+    pub fn new() -> Self {
+        ModuleSummary {
+            functions: Vec::new(),
+            globals: Vec::new(),
+            type_ids: Vec::new(),
+        }
+    }
+    
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        
+        // Functions
+        data.extend_from_slice(&(self.functions.len() as u32).to_le_bytes());
+        for func in &self.functions {
+            data.extend_from_slice(&func.serialize());
+        }
+        
+        // Globals
+        data.extend_from_slice(&(self.globals.len() as u32).to_le_bytes());
+        for global in &self.globals {
+            data.extend_from_slice(&global.serialize());
+        }
+        
+        // Type IDs
+        data.extend_from_slice(&(self.type_ids.len() as u32).to_le_bytes());
+        for type_id in &self.type_ids {
+            data.extend_from_slice(&type_id.serialize());
+        }
+        
+        data
+    }
+    
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        let mut cursor = 0;
+        
+        // Functions
+        let func_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        
+        let mut functions = Vec::with_capacity(func_count);
+        for _ in 0..func_count {
+            let (func, consumed) = FunctionSummary::deserialize(&data[cursor..])?;
+            functions.push(func);
+            cursor += consumed;
+        }
+        
+        // Globals
+        let global_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        
+        let mut globals = Vec::with_capacity(global_count);
+        for _ in 0..global_count {
+            let (global, consumed) = GlobalSummary::deserialize(&data[cursor..])?;
+            globals.push(global);
+            cursor += consumed;
+        }
+        
+        // Type IDs
+        let type_id_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        
+        let mut type_ids = Vec::with_capacity(type_id_count);
+        for _ in 0..type_id_count {
+            let (type_id, consumed) = TypeIdSummary::deserialize(&data[cursor..])?;
+            type_ids.push(type_id);
+            cursor += consumed;
+        }
+        
+        Some(ModuleSummary { functions, globals, type_ids })
+    }
+}
+
+impl Default for ModuleSummary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Function summary for ThinLTO decisions
+#[derive(Debug, Clone)]
+pub struct FunctionSummary {
+    /// Function name
+    pub name: String,
+    /// Number of instructions (estimate)
+    pub instruction_count: u32,
+    /// Number of basic blocks
+    pub block_count: u32,
+    /// Call edges
+    pub calls: Vec<CallEdge>,
+    /// Reference edges
+    pub refs: Vec<String>,
+    /// Flags
+    pub flags: FunctionFlags,
+    /// Hot/cold from PGO
+    pub hotness: Option<Hotness>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallEdge {
+    pub callee: String,
+    pub kind: CallKind,
+    /// Profile count if available
+    pub count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallKind {
+    Direct,
+    Indirect,
+    Virtual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hotness {
+    Unknown,
+    Cold,
+    None,
+    Hot,
+    Critical,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FunctionFlags {
+    pub read_none: bool,
+    pub read_only: bool,
+    pub no_recurse: bool,
+    pub return_does_not_alias: bool,
+    pub no_inline: bool,
+    pub always_inline: bool,
+    pub no_unwind: bool,
+    pub may_throw: bool,
+    pub has_unknown_call: bool,
+    pub must_be_unreachable: bool,
+    pub live: bool,
+    pub is_entry: bool,
+}
+
+impl FunctionSummary {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        
+        // Name
+        data.extend_from_slice(&(self.name.len() as u32).to_le_bytes());
+        data.extend_from_slice(self.name.as_bytes());
+        
+        // Counts
+        data.extend_from_slice(&self.instruction_count.to_le_bytes());
+        data.extend_from_slice(&self.block_count.to_le_bytes());
+        
+        // Calls
+        data.extend_from_slice(&(self.calls.len() as u32).to_le_bytes());
+        for call in &self.calls {
+            data.extend_from_slice(&(call.callee.len() as u32).to_le_bytes());
+            data.extend_from_slice(call.callee.as_bytes());
+            data.push(call.kind as u8);
+            if let Some(count) = call.count {
+                data.push(1);
+                data.extend_from_slice(&count.to_le_bytes());
+            } else {
+                data.push(0);
+            }
+        }
+        
+        // Refs
+        data.extend_from_slice(&(self.refs.len() as u32).to_le_bytes());
+        for r in &self.refs {
+            data.extend_from_slice(&(r.len() as u32).to_le_bytes());
+            data.extend_from_slice(r.as_bytes());
+        }
+        
+        // Flags (packed as u32)
+        let flags_packed = 
+            (self.flags.read_none as u32) |
+            ((self.flags.read_only as u32) << 1) |
+            ((self.flags.no_recurse as u32) << 2) |
+            ((self.flags.return_does_not_alias as u32) << 3) |
+            ((self.flags.no_inline as u32) << 4) |
+            ((self.flags.always_inline as u32) << 5) |
+            ((self.flags.no_unwind as u32) << 6) |
+            ((self.flags.may_throw as u32) << 7) |
+            ((self.flags.has_unknown_call as u32) << 8) |
+            ((self.flags.must_be_unreachable as u32) << 9) |
+            ((self.flags.live as u32) << 10) |
+            ((self.flags.is_entry as u32) << 11);
+        data.extend_from_slice(&flags_packed.to_le_bytes());
+        
+        // Hotness
+        if let Some(h) = self.hotness {
+            data.push(1);
+            data.push(h as u8);
+        } else {
+            data.push(0);
+        }
+        
+        data
+    }
+    
+    pub fn deserialize(data: &[u8]) -> Option<(Self, usize)> {
+        let mut cursor = 0;
+        
+        // Name
+        let name_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        let name = String::from_utf8_lossy(&data[cursor..cursor+name_len]).to_string();
+        cursor += name_len;
+        
+        // Counts
+        let instruction_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?);
+        cursor += 4;
+        let block_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?);
+        cursor += 4;
+        
+        // Calls
+        let call_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        
+        let mut calls = Vec::with_capacity(call_count);
+        for _ in 0..call_count {
+            let callee_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+            cursor += 4;
+            let callee = String::from_utf8_lossy(&data[cursor..cursor+callee_len]).to_string();
+            cursor += callee_len;
+            
+            let kind = match data[cursor] {
+                0 => CallKind::Direct,
+                1 => CallKind::Indirect,
+                2 => CallKind::Virtual,
+                _ => return None,
+            };
+            cursor += 1;
+            
+            let count = if data[cursor] == 1 {
+                cursor += 1;
+                let c = u64::from_le_bytes(data[cursor..cursor+8].try_into().ok()?);
+                cursor += 8;
+                Some(c)
+            } else {
+                cursor += 1;
+                None
+            };
+            
+            calls.push(CallEdge { callee, kind, count });
+        }
+        
+        // Refs
+        let ref_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        
+        let mut refs = Vec::with_capacity(ref_count);
+        for _ in 0..ref_count {
+            let ref_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+            cursor += 4;
+            refs.push(String::from_utf8_lossy(&data[cursor..cursor+ref_len]).to_string());
+            cursor += ref_len;
+        }
+        
+        // Flags
+        let flags_packed = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?);
+        cursor += 4;
+        
+        let flags = FunctionFlags {
+            read_none: (flags_packed & 1) != 0,
+            read_only: (flags_packed & 2) != 0,
+            no_recurse: (flags_packed & 4) != 0,
+            return_does_not_alias: (flags_packed & 8) != 0,
+            no_inline: (flags_packed & 16) != 0,
+            always_inline: (flags_packed & 32) != 0,
+            no_unwind: (flags_packed & 64) != 0,
+            may_throw: (flags_packed & 128) != 0,
+            has_unknown_call: (flags_packed & 256) != 0,
+            must_be_unreachable: (flags_packed & 512) != 0,
+            live: (flags_packed & 1024) != 0,
+            is_entry: (flags_packed & 2048) != 0,
+        };
+        
+        // Hotness
+        let hotness = if data[cursor] == 1 {
+            cursor += 1;
+            let h = match data[cursor] {
+                0 => Hotness::Unknown,
+                1 => Hotness::Cold,
+                2 => Hotness::None,
+                3 => Hotness::Hot,
+                4 => Hotness::Critical,
+                _ => return None,
+            };
+            cursor += 1;
+            Some(h)
+        } else {
+            cursor += 1;
+            None
+        };
+        
+        Some((FunctionSummary {
+            name,
+            instruction_count,
+            block_count,
+            calls,
+            refs,
+            flags,
+            hotness,
+        }, cursor))
+    }
+}
+
+/// Global variable summary
+#[derive(Debug, Clone)]
+pub struct GlobalSummary {
+    pub name: String,
+    pub refs: Vec<String>,
+    pub is_live: bool,
+    pub is_const: bool,
+}
+
+impl GlobalSummary {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        
+        data.extend_from_slice(&(self.name.len() as u32).to_le_bytes());
+        data.extend_from_slice(self.name.as_bytes());
+        
+        data.extend_from_slice(&(self.refs.len() as u32).to_le_bytes());
+        for r in &self.refs {
+            data.extend_from_slice(&(r.len() as u32).to_le_bytes());
+            data.extend_from_slice(r.as_bytes());
+        }
+        
+        data.push(self.is_live as u8);
+        data.push(self.is_const as u8);
+        
+        data
+    }
+    
+    pub fn deserialize(data: &[u8]) -> Option<(Self, usize)> {
+        let mut cursor = 0;
+        
+        let name_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        let name = String::from_utf8_lossy(&data[cursor..cursor+name_len]).to_string();
+        cursor += name_len;
+        
+        let ref_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        
+        let mut refs = Vec::with_capacity(ref_count);
+        for _ in 0..ref_count {
+            let ref_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+            cursor += 4;
+            refs.push(String::from_utf8_lossy(&data[cursor..cursor+ref_len]).to_string());
+            cursor += ref_len;
+        }
+        
+        let is_live = data[cursor] != 0;
+        cursor += 1;
+        let is_const = data[cursor] != 0;
+        cursor += 1;
+        
+        Some((GlobalSummary { name, refs, is_live, is_const }, cursor))
+    }
+}
+
+/// Type ID summary for devirtualization
+#[derive(Debug, Clone)]
+pub struct TypeIdSummary {
+    pub name: String,
+    pub compatible_vtables: Vec<String>,
+}
+
+impl TypeIdSummary {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        
+        data.extend_from_slice(&(self.name.len() as u32).to_le_bytes());
+        data.extend_from_slice(self.name.as_bytes());
+        
+        data.extend_from_slice(&(self.compatible_vtables.len() as u32).to_le_bytes());
+        for v in &self.compatible_vtables {
+            data.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            data.extend_from_slice(v.as_bytes());
+        }
+        
+        data
+    }
+    
+    pub fn deserialize(data: &[u8]) -> Option<(Self, usize)> {
+        let mut cursor = 0;
+        
+        let name_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        let name = String::from_utf8_lossy(&data[cursor..cursor+name_len]).to_string();
+        cursor += name_len;
+        
+        let vtable_count = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+        cursor += 4;
+        
+        let mut compatible_vtables = Vec::with_capacity(vtable_count);
+        for _ in 0..vtable_count {
+            let v_len = u32::from_le_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+            cursor += 4;
+            compatible_vtables.push(String::from_utf8_lossy(&data[cursor..cursor+v_len]).to_string());
+            cursor += v_len;
+        }
+        
+        Some((TypeIdSummary { name, compatible_vtables }, cursor))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LTO PIPELINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// LTO pipeline manager
+pub struct LtoPipeline {
+    config: LtoConfig,
+    modules: Vec<BitcodeModule>,
+    combined_summary: Option<CombinedSummary>,
+}
+
+/// Combined summary for whole-program analysis
+#[derive(Debug, Clone)]
+pub struct CombinedSummary {
+    /// All function summaries indexed by name
+    pub functions: BTreeMap<String, (usize, FunctionSummary)>, // (module_idx, summary)
+    /// All global summaries
+    pub globals: BTreeMap<String, (usize, GlobalSummary)>,
+    /// Import decisions
+    pub imports: BTreeMap<usize, BTreeSet<String>>,
+    /// Export decisions
+    pub exports: BTreeSet<String>,
+    /// Dead symbols
+    pub dead: BTreeSet<String>,
+}
+
+impl LtoPipeline {
+    pub fn new(config: LtoConfig) -> Self {
+        LtoPipeline {
+            config,
+            modules: Vec::new(),
+            combined_summary: None,
+        }
+    }
+    
+    /// Add a module to the LTO pipeline
+    pub fn add_module(&mut self, module: BitcodeModule) {
+        self.modules.push(module);
+    }
+    
+    /// Run the LTO pipeline
+    pub fn run(&mut self) -> LtoResult {
+        match self.config.mode {
+            LtoMode::None => self.run_no_lto(),
+            LtoMode::Full => self.run_full_lto(),
+            LtoMode::Thin => self.run_thin_lto(),
+            LtoMode::Fat => self.run_fat_lto(),
+        }
+    }
+    
+    fn run_no_lto(&self) -> LtoResult {
+        // Just pass through modules unchanged
+        LtoResult {
+            modules: self.modules.clone(),
+            stats: LtoStats::default(),
+        }
+    }
+    
+    fn run_full_lto(&mut self) -> LtoResult {
+        let mut stats = LtoStats::default();
+        
+        // Merge all modules into one
+        let mut merged = self.merge_modules();
+        
+        // Run whole-program optimizations
+        self.run_whole_program_opts(&mut merged, &mut stats);
+        
+        LtoResult {
+            modules: vec![merged],
+            stats,
+        }
+    }
+    
+    fn run_thin_lto(&mut self) -> LtoResult {
+        let mut stats = LtoStats::default();
+        
+        // Phase 1: Build combined summary
+        self.build_combined_summary();
+        
+        // Phase 2: Compute import/export decisions
+        self.compute_import_export(&mut stats);
+        
+        // Phase 3: Process modules in parallel
+        let processed = self.process_modules_parallel(&mut stats);
+        
+        LtoResult {
+            modules: processed,
+            stats,
+        }
+    }
+    
+    fn run_fat_lto(&mut self) -> LtoResult {
+        // For fat LTO, we produce both full LTO and native code
+        // This allows link-time decision between LTO and non-LTO
+        self.run_full_lto()
+    }
+    
+    fn merge_modules(&self) -> BitcodeModule {
+        let mut merged = BitcodeModule::new("merged");
+        
+        for module in &self.modules {
+            // Merge IR data (would need actual IR merging logic)
+            merged.ir_data.extend_from_slice(&module.ir_data);
+            
+            // Merge symbol tables
+            for def in &module.symbols.definitions {
+                merged.symbols.definitions.push(def.clone());
+            }
+            for r in &module.symbols.references {
+                merged.symbols.references.push(r.clone());
+            }
+        }
+        
+        merged
+    }
+    
+    fn run_whole_program_opts(&self, module: &mut BitcodeModule, stats: &mut LtoStats) {
+        // Dead code elimination
+        let dead_count = self.eliminate_dead_code(module);
+        stats.dead_functions_eliminated = dead_count;
+        
+        // Cross-module inlining
+        if self.config.enable_cross_module_inline {
+            let inlined = self.run_cross_module_inlining(module);
+            stats.functions_inlined = inlined;
+        }
+        
+        // Devirtualization
+        if self.config.enable_devirt {
+            let devirt = self.run_devirtualization(module);
+            stats.calls_devirtualized = devirt;
+        }
+        
+        // IPO
+        if self.config.enable_ipo {
+            self.run_ipo(module, stats);
+        }
+    }
+    
+    fn eliminate_dead_code(&self, module: &mut BitcodeModule) -> u32 {
+        // Mark-and-sweep from exports
+        let mut live: BTreeSet<String> = BTreeSet::new();
+        
+        // Start with exports
+        for export in &self.config.exports {
+            live.insert(export.clone());
+        }
+        
+        // Add preserved symbols
+        for sym in &self.config.preserve_symbols {
+            live.insert(sym.clone());
+        }
+        
+        // Propagate liveness
+        let mut changed = true;
+        while changed {
+            changed = false;
+            
+            for def in &module.symbols.definitions {
+                if live.contains(&def.name) {
+                    // Would mark all referenced symbols as live
+                }
+            }
+        }
+        
+        // Count and remove dead symbols
+        let dead_count = module.symbols.definitions.iter()
+            .filter(|d| !live.contains(&d.name))
+            .count() as u32;
+        
+        module.symbols.definitions.retain(|d| live.contains(&d.name));
+        
+        dead_count
+    }
+    
+    fn run_cross_module_inlining(&self, module: &mut BitcodeModule) -> u32 {
+        // Would perform actual inlining based on cost model
+        0
+    }
+    
+    fn run_devirtualization(&self, module: &mut BitcodeModule) -> u32 {
+        // Would convert virtual calls to direct calls based on type analysis
+        0
+    }
+    
+    fn run_ipo(&self, module: &mut BitcodeModule, stats: &mut LtoStats) {
+        // Interprocedural constant propagation
+        // Interprocedural alias analysis
+        // Argument promotion
+    }
+    
+    fn build_combined_summary(&mut self) {
+        let mut combined = CombinedSummary {
+            functions: BTreeMap::new(),
+            globals: BTreeMap::new(),
+            imports: BTreeMap::new(),
+            exports: BTreeSet::new(),
+            dead: BTreeSet::new(),
+        };
+        
+        for (idx, module) in self.modules.iter().enumerate() {
+            if let Some(summary) = &module.summary {
+                for func in &summary.functions {
+                    combined.functions.insert(func.name.clone(), (idx, func.clone()));
+                }
+                for global in &summary.globals {
+                    combined.globals.insert(global.name.clone(), (idx, global.clone()));
+                }
+            }
+        }
+        
+        self.combined_summary = Some(combined);
+    }
+    
+    fn compute_import_export(&mut self, stats: &mut LtoStats) {
+        let combined = self.combined_summary.as_mut().unwrap();
+        
+        // Compute which functions should be imported to each module
+        for (func_name, (module_idx, func)) in &combined.functions {
+            // Check if function is hot and small enough to import
+            let should_import = func.instruction_count < 100 &&
+                func.hotness.map(|h| h == Hotness::Hot || h == Hotness::Critical).unwrap_or(false);
+            
+            if should_import {
+                // Add to import list of modules that call this function
+                for (caller_name, (caller_module, caller)) in &combined.functions {
+                    if *caller_module != *module_idx {
+                        if caller.calls.iter().any(|c| c.callee == *func_name) {
+                            combined.imports
+                                .entry(*caller_module)
+                                .or_insert_with(BTreeSet::new)
+                                .insert(func_name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Mark exports
+        for export in &self.config.exports {
+            combined.exports.insert(export.clone());
+        }
+    }
+    
+    fn process_modules_parallel(&self, stats: &mut LtoStats) -> Vec<BitcodeModule> {
+        // In a real implementation, this would use parallel processing
+        self.modules.clone()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LtoStats {
+    pub modules_processed: u32,
+    pub dead_functions_eliminated: u32,
+    pub dead_globals_eliminated: u32,
+    pub functions_inlined: u32,
+    pub calls_devirtualized: u32,
+    pub functions_imported: u32,
+    pub bytes_saved: u64,
+}
+
+pub struct LtoResult {
+    pub modules: Vec<BitcodeModule>,
+    pub stats: LtoStats,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THINLTO CACHE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// ThinLTO cache for incremental compilation
+pub struct ThinLtoCache {
+    path: String,
+    max_size: u64,
+    entries: BTreeMap<String, CacheEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    hash: u64,
+    size: u64,
+    last_access: u64,
+}
+
+impl ThinLtoCache {
+    pub fn new(path: impl Into<String>, max_size_mb: u64) -> Self {
+        ThinLtoCache {
+            path: path.into(),
+            max_size: max_size_mb * 1024 * 1024,
+            entries: BTreeMap::new(),
+        }
+    }
+    
+    pub fn get(&self, key: &str, expected_hash: u64) -> Option<Vec<u8>> {
+        let entry = self.entries.get(key)?;
+        if entry.hash != expected_hash {
+            return None;
+        }
+        
+        // Read from disk
+        let path = format!("{}/{}", self.path, key);
+        std::fs::read(&path).ok()
+    }
+    
+    pub fn put(&mut self, key: &str, hash: u64, data: &[u8]) {
+        // Evict if necessary
+        self.evict_if_needed(data.len() as u64);
+        
+        // Write to disk
+        let path = format!("{}/{}", self.path, key);
+        let _ = std::fs::create_dir_all(&self.path);
+        let _ = std::fs::write(&path, data);
+        
+        self.entries.insert(key.to_string(), CacheEntry {
+            hash,
+            size: data.len() as u64,
+            last_access: current_timestamp(),
+        });
+    }
+    
+    fn evict_if_needed(&mut self, needed: u64) {
+        let current_size: u64 = self.entries.values().map(|e| e.size).sum();
+        
+        if current_size + needed <= self.max_size {
+            return;
+        }
+        
+        // Evict oldest entries
+        let mut entries: Vec<_> = self.entries.iter().collect();
+        entries.sort_by_key(|(_, e)| e.last_access);
+        
+        let mut freed = 0;
+        for (key, entry) in entries {
+            if current_size - freed + needed <= self.max_size {
+                break;
+            }
+            
+            let path = format!("{}/{}", self.path, key);
+            let _ = std::fs::remove_file(&path);
+            freed += entry.size;
+        }
+        
+        self.entries.retain(|_, e| e.size > 0); // Simplified
+    }
+}
+
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_lto_mode_parse() {
+        assert_eq!(LtoMode::from_str("thin"), Some(LtoMode::Thin));
+        assert_eq!(LtoMode::from_str("full"), Some(LtoMode::Full));
+        assert_eq!(LtoMode::from_str("none"), Some(LtoMode::None));
+        assert_eq!(LtoMode::from_str("invalid"), None);
+    }
+    
+    #[test]
+    fn test_bitcode_roundtrip() {
+        let mut module = BitcodeModule::new("test");
+        module.hash = 12345;
+        module.ir_data = vec![1, 2, 3, 4, 5];
+        module.symbols.add_definition(SymbolDef {
+            name: "main".to_string(),
+            kind: SymbolKind::Function,
+            linkage: Linkage::External,
+            visibility: Visibility::Default,
+            summary_ref: None,
+        });
+        
+        let serialized = module.serialize();
+        let loaded = BitcodeModule::deserialize(&serialized).unwrap();
+        
+        assert_eq!(loaded.name, "test");
+        assert_eq!(loaded.hash, 12345);
+        assert_eq!(loaded.ir_data, vec![1, 2, 3, 4, 5]);
+        assert_eq!(loaded.symbols.definitions.len(), 1);
+    }
+    
+    #[test]
+    fn test_function_summary() {
+        let summary = FunctionSummary {
+            name: "test".to_string(),
+            instruction_count: 50,
+            block_count: 5,
+            calls: vec![
+                CallEdge { callee: "helper".to_string(), kind: CallKind::Direct, count: Some(100) }
+            ],
+            refs: vec!["global".to_string()],
+            flags: FunctionFlags::default(),
+            hotness: Some(Hotness::Hot),
+        };
+        
+        let serialized = summary.serialize();
+        let (loaded, _) = FunctionSummary::deserialize(&serialized).unwrap();
+        
+        assert_eq!(loaded.name, "test");
+        assert_eq!(loaded.instruction_count, 50);
+        assert_eq!(loaded.hotness, Some(Hotness::Hot));
+    }
+    
+    #[test]
+    fn test_lto_pipeline() {
+        let config = LtoConfig::default();
+        let mut pipeline = LtoPipeline::new(config);
+        
+        let module = BitcodeModule::new("test");
+        pipeline.add_module(module);
+        
+        let result = pipeline.run();
+        assert!(!result.modules.is_empty());
+    }
+}

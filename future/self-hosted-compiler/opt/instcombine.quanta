@@ -1,0 +1,884 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Instruction Combining
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Instruction combining optimizations:
+//   - Algebraic simplification
+//   - Pattern matching
+//   - Instruction fusion
+//   - Idiom recognition
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::instcombine
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSTRUCTION COMBINER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Instruction combiner
+pub struct InstCombine {
+    /// Worklist of instructions to process
+    worklist: Vec<(u32, usize)>,
+    /// Value definitions
+    defs: BTreeMap<String, (u32, usize)>,
+    /// Stats
+    stats: CombineStats,
+}
+
+/// Combine statistics
+#[derive(Debug, Default)]
+pub struct CombineStats {
+    pub instructions_combined: u32,
+    pub instructions_simplified: u32,
+    pub dead_instructions: u32,
+    pub constants_folded: u32,
+    pub patterns_matched: u32,
+}
+
+impl InstCombine {
+    pub fn new() -> Self {
+        InstCombine {
+            worklist: Vec::new(),
+            defs: BTreeMap::new(),
+            stats: CombineStats::default(),
+        }
+    }
+    
+    /// Run instruction combining
+    pub fn run(&mut self, func: &mut MirFunction) -> CombineStats {
+        // Build def map
+        self.build_def_map(func);
+        
+        // Initialize worklist with all instructions
+        for block in &func.blocks {
+            for (idx, _) in block.statements.iter().enumerate() {
+                self.worklist.push((block.id, idx));
+            }
+        }
+        
+        // Process worklist
+        while let Some((block_id, idx)) = self.worklist.pop() {
+            if let Some(block) = func.blocks.iter_mut().find(|b| b.id == block_id) {
+                if idx < block.statements.len() {
+                    if let Some(new_stmt) = self.combine_instruction(&block.statements[idx], func) {
+                        block.statements[idx] = new_stmt;
+                        self.stats.instructions_combined += 1;
+                        
+                        // Add users to worklist
+                        self.add_users_to_worklist(&block.statements[idx], func);
+                    }
+                }
+            }
+        }
+        
+        std::mem::take(&mut self.stats)
+    }
+    
+    fn build_def_map(&mut self, func: &MirFunction) {
+        self.defs.clear();
+        
+        for block in &func.blocks {
+            for (idx, stmt) in block.statements.iter().enumerate() {
+                if let Some(dest) = self.get_definition(stmt) {
+                    self.defs.insert(dest.to_string(), (block.id, idx));
+                }
+            }
+        }
+    }
+    
+    fn get_definition<'a>(&self, stmt: &'a MirStatement) -> Option<&'a str> {
+        match stmt {
+            MirStatement::Assign { dest, .. } |
+            MirStatement::BinaryOp { dest, .. } |
+            MirStatement::UnaryOp { dest, .. } |
+            MirStatement::Load { dest, .. } |
+            MirStatement::Phi { dest, .. } => Some(dest.as_str()),
+            MirStatement::Call { dest: Some(d), .. } => Some(d.as_str()),
+            _ => None,
+        }
+    }
+    
+    fn add_users_to_worklist(&mut self, stmt: &MirStatement, func: &MirFunction) {
+        // Find instructions that use the result
+        if let Some(dest) = self.get_definition(stmt) {
+            for block in &func.blocks {
+                for (idx, s) in block.statements.iter().enumerate() {
+                    if self.uses_variable(s, dest) {
+                        self.worklist.push((block.id, idx));
+                    }
+                }
+            }
+        }
+    }
+    
+    fn uses_variable(&self, stmt: &MirStatement, var: &str) -> bool {
+        match stmt {
+            MirStatement::Assign { value, .. } => self.operand_uses(value, var),
+            MirStatement::BinaryOp { lhs, rhs, .. } => {
+                self.operand_uses(lhs, var) || self.operand_uses(rhs, var)
+            }
+            MirStatement::UnaryOp { operand, .. } => self.operand_uses(operand, var),
+            MirStatement::Load { ptr, .. } => self.operand_uses(ptr, var),
+            MirStatement::Store { ptr, value, .. } => {
+                self.operand_uses(ptr, var) || self.operand_uses(value, var)
+            }
+            MirStatement::Call { args, .. } => args.iter().any(|a| self.operand_uses(a, var)),
+            MirStatement::Phi { incoming, .. } => {
+                incoming.iter().any(|(_, v)| self.operand_uses(v, var))
+            }
+            _ => false,
+        }
+    }
+    
+    fn operand_uses(&self, operand: &MirOperand, var: &str) -> bool {
+        matches!(operand, MirOperand::Variable(v) if v == var)
+    }
+    
+    fn combine_instruction(&mut self, stmt: &MirStatement, func: &MirFunction) -> Option<MirStatement> {
+        match stmt {
+            MirStatement::BinaryOp { dest, op, lhs, rhs } => {
+                self.combine_binary(dest, *op, lhs, rhs, func)
+            }
+            MirStatement::UnaryOp { dest, op, operand } => {
+                self.combine_unary(dest, *op, operand, func)
+            }
+            MirStatement::Assign { dest, value } => {
+                self.combine_assign(dest, value, func)
+            }
+            _ => None,
+        }
+    }
+    
+    fn combine_binary(
+        &mut self,
+        dest: &str,
+        op: BinOp,
+        lhs: &MirOperand,
+        rhs: &MirOperand,
+        func: &MirFunction,
+    ) -> Option<MirStatement> {
+        // Constant folding
+        if let (MirOperand::Constant(a), MirOperand::Constant(b)) = (lhs, rhs) {
+            if let Some(result) = self.fold_constants(op, *a, *b) {
+                self.stats.constants_folded += 1;
+                return Some(MirStatement::Assign {
+                    dest: dest.to_string(),
+                    value: MirOperand::Constant(result),
+                });
+            }
+        }
+        
+        // Identity and zero patterns
+        match op {
+            BinOp::Add => {
+                // x + 0 = x
+                if matches!(rhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                if matches!(lhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: rhs.clone(),
+                    });
+                }
+                
+                // x + x = x * 2 = x << 1
+                if lhs == rhs {
+                    self.stats.patterns_matched += 1;
+                    return Some(MirStatement::BinaryOp {
+                        dest: dest.to_string(),
+                        op: BinOp::Shl,
+                        lhs: lhs.clone(),
+                        rhs: MirOperand::Constant(1),
+                    });
+                }
+            }
+            
+            BinOp::Sub => {
+                // x - 0 = x
+                if matches!(rhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                
+                // x - x = 0
+                if lhs == rhs {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+            }
+            
+            BinOp::Mul => {
+                // x * 0 = 0
+                if matches!(lhs, MirOperand::Constant(0)) || matches!(rhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+                
+                // x * 1 = x
+                if matches!(rhs, MirOperand::Constant(1)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                if matches!(lhs, MirOperand::Constant(1)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: rhs.clone(),
+                    });
+                }
+                
+                // x * 2^n = x << n (strength reduction)
+                if let MirOperand::Constant(c) = rhs {
+                    if *c > 0 && (*c & (*c - 1)) == 0 {
+                        let shift = c.trailing_zeros() as i64;
+                        self.stats.patterns_matched += 1;
+                        return Some(MirStatement::BinaryOp {
+                            dest: dest.to_string(),
+                            op: BinOp::Shl,
+                            lhs: lhs.clone(),
+                            rhs: MirOperand::Constant(shift),
+                        });
+                    }
+                }
+            }
+            
+            BinOp::Div => {
+                // x / 1 = x
+                if matches!(rhs, MirOperand::Constant(1)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                
+                // 0 / x = 0
+                if matches!(lhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+                
+                // x / x = 1 (if x != 0)
+                if lhs == rhs {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(1),
+                    });
+                }
+                
+                // x / 2^n = x >> n (for unsigned)
+                if let MirOperand::Constant(c) = rhs {
+                    if *c > 0 && (*c & (*c - 1)) == 0 {
+                        let shift = c.trailing_zeros() as i64;
+                        self.stats.patterns_matched += 1;
+                        return Some(MirStatement::BinaryOp {
+                            dest: dest.to_string(),
+                            op: BinOp::Shr,
+                            lhs: lhs.clone(),
+                            rhs: MirOperand::Constant(shift),
+                        });
+                    }
+                }
+            }
+            
+            BinOp::Rem => {
+                // x % 1 = 0
+                if matches!(rhs, MirOperand::Constant(1)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+                
+                // 0 % x = 0
+                if matches!(lhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+                
+                // x % 2^n = x & (2^n - 1) (for unsigned)
+                if let MirOperand::Constant(c) = rhs {
+                    if *c > 0 && (*c & (*c - 1)) == 0 {
+                        let mask = c - 1;
+                        self.stats.patterns_matched += 1;
+                        return Some(MirStatement::BinaryOp {
+                            dest: dest.to_string(),
+                            op: BinOp::And,
+                            lhs: lhs.clone(),
+                            rhs: MirOperand::Constant(mask),
+                        });
+                    }
+                }
+            }
+            
+            BinOp::And => {
+                // x & 0 = 0
+                if matches!(lhs, MirOperand::Constant(0)) || matches!(rhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+                
+                // x & -1 = x
+                if matches!(rhs, MirOperand::Constant(-1)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                
+                // x & x = x
+                if lhs == rhs {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+            }
+            
+            BinOp::Or => {
+                // x | 0 = x
+                if matches!(rhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                if matches!(lhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: rhs.clone(),
+                    });
+                }
+                
+                // x | -1 = -1
+                if matches!(lhs, MirOperand::Constant(-1)) || matches!(rhs, MirOperand::Constant(-1)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(-1),
+                    });
+                }
+                
+                // x | x = x
+                if lhs == rhs {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+            }
+            
+            BinOp::Xor => {
+                // x ^ 0 = x
+                if matches!(rhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                
+                // x ^ x = 0
+                if lhs == rhs {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+                
+                // x ^ -1 = ~x (bitwise not)
+                if matches!(rhs, MirOperand::Constant(-1)) {
+                    self.stats.patterns_matched += 1;
+                    return Some(MirStatement::UnaryOp {
+                        dest: dest.to_string(),
+                        op: UnaryOp::Not,
+                        operand: lhs.clone(),
+                    });
+                }
+            }
+            
+            BinOp::Shl => {
+                // x << 0 = x
+                if matches!(rhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                
+                // 0 << x = 0
+                if matches!(lhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+            }
+            
+            BinOp::Shr => {
+                // x >> 0 = x
+                if matches!(rhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                
+                // 0 >> x = 0
+                if matches!(lhs, MirOperand::Constant(0)) {
+                    self.stats.instructions_simplified += 1;
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+            }
+            
+            _ => {}
+        }
+        
+        // Try combining with operand definitions
+        self.combine_with_defs(dest, op, lhs, rhs, func)
+    }
+    
+    fn combine_with_defs(
+        &mut self,
+        dest: &str,
+        op: BinOp,
+        lhs: &MirOperand,
+        rhs: &MirOperand,
+        func: &MirFunction,
+    ) -> Option<MirStatement> {
+        // Look for patterns like (x + a) + b = x + (a + b)
+        if let MirOperand::Variable(var) = lhs {
+            if let Some((block_id, idx)) = self.defs.get(var) {
+                if let Some(block) = func.blocks.iter().find(|b| b.id == *block_id) {
+                    if *idx < block.statements.len() {
+                        if let MirStatement::BinaryOp { op: op2, lhs: lhs2, rhs: rhs2, .. } = &block.statements[*idx] {
+                            // (x op a) op b patterns
+                            if *op2 == op {
+                                match op {
+                                    BinOp::Add => {
+                                        // (x + a) + b = x + (a + b)
+                                        if let (MirOperand::Constant(a), MirOperand::Constant(b)) = (rhs2, rhs) {
+                                            self.stats.patterns_matched += 1;
+                                            return Some(MirStatement::BinaryOp {
+                                                dest: dest.to_string(),
+                                                op: BinOp::Add,
+                                                lhs: lhs2.clone(),
+                                                rhs: MirOperand::Constant(a + b),
+                                            });
+                                        }
+                                    }
+                                    BinOp::Mul => {
+                                        // (x * a) * b = x * (a * b)
+                                        if let (MirOperand::Constant(a), MirOperand::Constant(b)) = (rhs2, rhs) {
+                                            self.stats.patterns_matched += 1;
+                                            return Some(MirStatement::BinaryOp {
+                                                dest: dest.to_string(),
+                                                op: BinOp::Mul,
+                                                lhs: lhs2.clone(),
+                                                rhs: MirOperand::Constant(a * b),
+                                            });
+                                        }
+                                    }
+                                    BinOp::And => {
+                                        // (x & a) & b = x & (a & b)
+                                        if let (MirOperand::Constant(a), MirOperand::Constant(b)) = (rhs2, rhs) {
+                                            self.stats.patterns_matched += 1;
+                                            return Some(MirStatement::BinaryOp {
+                                                dest: dest.to_string(),
+                                                op: BinOp::And,
+                                                lhs: lhs2.clone(),
+                                                rhs: MirOperand::Constant(a & b),
+                                            });
+                                        }
+                                    }
+                                    BinOp::Or => {
+                                        // (x | a) | b = x | (a | b)
+                                        if let (MirOperand::Constant(a), MirOperand::Constant(b)) = (rhs2, rhs) {
+                                            self.stats.patterns_matched += 1;
+                                            return Some(MirStatement::BinaryOp {
+                                                dest: dest.to_string(),
+                                                op: BinOp::Or,
+                                                lhs: lhs2.clone(),
+                                                rhs: MirOperand::Constant(a | b),
+                                            });
+                                        }
+                                    }
+                                    BinOp::Shl => {
+                                        // (x << a) << b = x << (a + b)
+                                        if let (MirOperand::Constant(a), MirOperand::Constant(b)) = (rhs2, rhs) {
+                                            let total = a + b;
+                                            if total < 64 {
+                                                self.stats.patterns_matched += 1;
+                                                return Some(MirStatement::BinaryOp {
+                                                    dest: dest.to_string(),
+                                                    op: BinOp::Shl,
+                                                    lhs: lhs2.clone(),
+                                                    rhs: MirOperand::Constant(total),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    BinOp::Shr => {
+                                        // (x >> a) >> b = x >> (a + b)
+                                        if let (MirOperand::Constant(a), MirOperand::Constant(b)) = (rhs2, rhs) {
+                                            let total = a + b;
+                                            if total < 64 {
+                                                self.stats.patterns_matched += 1;
+                                                return Some(MirStatement::BinaryOp {
+                                                    dest: dest.to_string(),
+                                                    op: BinOp::Shr,
+                                                    lhs: lhs2.clone(),
+                                                    rhs: MirOperand::Constant(total),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn combine_unary(
+        &mut self,
+        dest: &str,
+        op: UnaryOp,
+        operand: &MirOperand,
+        func: &MirFunction,
+    ) -> Option<MirStatement> {
+        // Constant folding
+        if let MirOperand::Constant(c) = operand {
+            let result = match op {
+                UnaryOp::Neg => Some(-c),
+                UnaryOp::Not => Some(!c),
+                UnaryOp::Abs => Some(c.abs()),
+            };
+            
+            if let Some(r) = result {
+                self.stats.constants_folded += 1;
+                return Some(MirStatement::Assign {
+                    dest: dest.to_string(),
+                    value: MirOperand::Constant(r),
+                });
+            }
+        }
+        
+        // Double negation: --x = x
+        if op == UnaryOp::Neg {
+            if let MirOperand::Variable(var) = operand {
+                if let Some((block_id, idx)) = self.defs.get(var) {
+                    if let Some(block) = func.blocks.iter().find(|b| b.id == *block_id) {
+                        if *idx < block.statements.len() {
+                            if let MirStatement::UnaryOp { op: UnaryOp::Neg, operand: inner, .. } = &block.statements[*idx] {
+                                self.stats.patterns_matched += 1;
+                                return Some(MirStatement::Assign {
+                                    dest: dest.to_string(),
+                                    value: inner.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Double not: ~~x = x
+        if op == UnaryOp::Not {
+            if let MirOperand::Variable(var) = operand {
+                if let Some((block_id, idx)) = self.defs.get(var) {
+                    if let Some(block) = func.blocks.iter().find(|b| b.id == *block_id) {
+                        if *idx < block.statements.len() {
+                            if let MirStatement::UnaryOp { op: UnaryOp::Not, operand: inner, .. } = &block.statements[*idx] {
+                                self.stats.patterns_matched += 1;
+                                return Some(MirStatement::Assign {
+                                    dest: dest.to_string(),
+                                    value: inner.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn combine_assign(
+        &mut self,
+        dest: &str,
+        value: &MirOperand,
+        func: &MirFunction,
+    ) -> Option<MirStatement> {
+        // Self-assignment: x = x
+        if let MirOperand::Variable(v) = value {
+            if v == dest {
+                self.stats.dead_instructions += 1;
+                return Some(MirStatement::Nop);
+            }
+        }
+        
+        None
+    }
+    
+    fn fold_constants(&self, op: BinOp, a: i64, b: i64) -> Option<i64> {
+        Some(match op {
+            BinOp::Add => a.wrapping_add(b),
+            BinOp::Sub => a.wrapping_sub(b),
+            BinOp::Mul => a.wrapping_mul(b),
+            BinOp::Div => {
+                if b == 0 { return None; }
+                a.wrapping_div(b)
+            }
+            BinOp::Rem => {
+                if b == 0 { return None; }
+                a.wrapping_rem(b)
+            }
+            BinOp::And => a & b,
+            BinOp::Or => a | b,
+            BinOp::Xor => a ^ b,
+            BinOp::Shl => {
+                if b < 0 || b >= 64 { return None; }
+                a.wrapping_shl(b as u32)
+            }
+            BinOp::Shr => {
+                if b < 0 || b >= 64 { return None; }
+                a.wrapping_shr(b as u32)
+            }
+            _ => return None,
+        })
+    }
+}
+
+impl Default for InstCombine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    UnaryOp { dest: String, op: UnaryOp, operand: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg,
+    Not,
+    Abs,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Return { value: Option<MirOperand> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_constant_folding() {
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::BinaryOp {
+                            dest: "x".to_string(),
+                            op: BinOp::Add,
+                            lhs: MirOperand::Constant(10),
+                            rhs: MirOperand::Constant(20),
+                        },
+                    ],
+                    terminator: MirTerminator::Return {
+                        value: Some(MirOperand::Variable("x".to_string())),
+                    },
+                },
+            ],
+        };
+        
+        let mut combiner = InstCombine::new();
+        let stats = combiner.run(&mut func);
+        
+        assert_eq!(stats.constants_folded, 1);
+        
+        if let MirStatement::Assign { value, .. } = &func.blocks[0].statements[0] {
+            assert_eq!(value, &MirOperand::Constant(30));
+        } else {
+            panic!("Expected assignment");
+        }
+    }
+    
+    #[test]
+    fn test_identity_simplification() {
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::Assign {
+                            dest: "a".to_string(),
+                            value: MirOperand::Constant(42),
+                        },
+                        MirStatement::BinaryOp {
+                            dest: "x".to_string(),
+                            op: BinOp::Add,
+                            lhs: MirOperand::Variable("a".to_string()),
+                            rhs: MirOperand::Constant(0),
+                        },
+                    ],
+                    terminator: MirTerminator::Return {
+                        value: Some(MirOperand::Variable("x".to_string())),
+                    },
+                },
+            ],
+        };
+        
+        let mut combiner = InstCombine::new();
+        let stats = combiner.run(&mut func);
+        
+        assert!(stats.instructions_simplified > 0);
+    }
+    
+    #[test]
+    fn test_strength_reduction() {
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::Assign {
+                            dest: "a".to_string(),
+                            value: MirOperand::Constant(42),
+                        },
+                        MirStatement::BinaryOp {
+                            dest: "x".to_string(),
+                            op: BinOp::Mul,
+                            lhs: MirOperand::Variable("a".to_string()),
+                            rhs: MirOperand::Constant(8),
+                        },
+                    ],
+                    terminator: MirTerminator::Return {
+                        value: Some(MirOperand::Variable("x".to_string())),
+                    },
+                },
+            ],
+        };
+        
+        let mut combiner = InstCombine::new();
+        let stats = combiner.run(&mut func);
+        
+        assert!(stats.patterns_matched > 0);
+        
+        // Should be converted to shift
+        if let MirStatement::BinaryOp { op, rhs, .. } = &func.blocks[0].statements[1] {
+            assert_eq!(*op, BinOp::Shl);
+            assert_eq!(rhs, &MirOperand::Constant(3));
+        } else {
+            panic!("Expected binary op");
+        }
+    }
+}

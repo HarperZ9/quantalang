@@ -1,0 +1,829 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ INCREMENTAL — Cache Storage
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Persistent cache storage for incremental compilation:
+// - On-disk artifact caching
+// - LRU eviction policy
+// - Compression support
+// - Integrity verification
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::incremental::cache
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::format;
+use alloc::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::fs::{self, File};
+use std::io::{Read, Write, BufReader, BufWriter};
+use std::time::{SystemTime, Duration, UNIX_EPOCH};
+
+use super::deps::{DepNodeId, Fingerprint, DepNodeKind};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CACHE CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cache configuration
+#[derive(Debug, Clone)]
+pub struct CacheConfig {
+    /// Cache directory
+    pub cache_dir: PathBuf,
+    
+    /// Maximum cache size in bytes
+    pub max_size: u64,
+    
+    /// Maximum number of entries
+    pub max_entries: usize,
+    
+    /// Entry TTL (time to live)
+    pub ttl: Duration,
+    
+    /// Compression enabled
+    pub compress: bool,
+    
+    /// Compression level (1-9)
+    pub compression_level: u32,
+    
+    /// Verify checksums on load
+    pub verify_checksums: bool,
+    
+    /// Parallel I/O
+    pub parallel_io: bool,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        CacheConfig {
+            cache_dir: PathBuf::from(".quanta/cache"),
+            max_size: 1024 * 1024 * 1024, // 1GB
+            max_entries: 100_000,
+            ttl: Duration::from_secs(7 * 24 * 60 * 60), // 1 week
+            compress: true,
+            compression_level: 6,
+            verify_checksums: true,
+            parallel_io: true,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CACHE ENTRY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cached artifact entry
+#[derive(Debug, Clone)]
+pub struct CacheEntry {
+    /// Entry key (dep node ID)
+    pub key: DepNodeId,
+    
+    /// Content fingerprint
+    pub fingerprint: Fingerprint,
+    
+    /// Dependencies
+    pub dependencies: Vec<DepNodeId>,
+    
+    /// Creation time
+    pub created: SystemTime,
+    
+    /// Last access time
+    pub accessed: SystemTime,
+    
+    /// Entry size in bytes
+    pub size: u64,
+    
+    /// Entry kind
+    pub kind: CacheEntryKind,
+}
+
+/// Kind of cached entry
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheEntryKind {
+    /// HIR (High-level IR)
+    Hir,
+    /// MIR (Mid-level IR)
+    Mir,
+    /// Optimized MIR
+    MirOptimized,
+    /// Object code
+    Object,
+    /// Metadata
+    Metadata,
+    /// Type information
+    TypeInfo,
+    /// Query result
+    QueryResult,
+}
+
+impl CacheEntryKind {
+    pub fn extension(&self) -> &'static str {
+        match self {
+            CacheEntryKind::Hir => "hir",
+            CacheEntryKind::Mir => "mir",
+            CacheEntryKind::MirOptimized => "mir.opt",
+            CacheEntryKind::Object => "o",
+            CacheEntryKind::Metadata => "meta",
+            CacheEntryKind::TypeInfo => "types",
+            CacheEntryKind::QueryResult => "query",
+        }
+    }
+    
+    pub fn subdirectory(&self) -> &'static str {
+        match self {
+            CacheEntryKind::Hir => "hir",
+            CacheEntryKind::Mir | CacheEntryKind::MirOptimized => "mir",
+            CacheEntryKind::Object => "obj",
+            CacheEntryKind::Metadata => "meta",
+            CacheEntryKind::TypeInfo => "types",
+            CacheEntryKind::QueryResult => "queries",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CACHE INDEX
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cache index for fast lookups
+pub struct CacheIndex {
+    /// Entry metadata
+    entries: BTreeMap<DepNodeId, CacheEntry>,
+    
+    /// Fingerprint to ID mapping
+    by_fingerprint: BTreeMap<Fingerprint, Vec<DepNodeId>>,
+    
+    /// Total cache size
+    total_size: u64,
+    
+    /// Index file path
+    index_path: PathBuf,
+    
+    /// Dirty flag (needs save)
+    dirty: bool,
+}
+
+impl CacheIndex {
+    /// Create new index
+    pub fn new(cache_dir: &Path) -> Self {
+        CacheIndex {
+            entries: BTreeMap::new(),
+            by_fingerprint: BTreeMap::new(),
+            total_size: 0,
+            index_path: cache_dir.join("index.bin"),
+            dirty: false,
+        }
+    }
+    
+    /// Load index from disk
+    pub fn load(cache_dir: &Path) -> Result<Self, CacheError> {
+        let index_path = cache_dir.join("index.bin");
+        
+        if !index_path.exists() {
+            return Ok(Self::new(cache_dir));
+        }
+        
+        let file = File::open(&index_path)
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        let mut reader = BufReader::new(file);
+        
+        // Read header
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        if &magic != b"QNTCACHE" {
+            return Err(CacheError::CorruptedIndex);
+        }
+        
+        // Read version
+        let mut version = [0u8; 4];
+        reader.read_exact(&mut version)
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        let version = u32::from_le_bytes(version);
+        
+        if version != 1 {
+            return Err(CacheError::UnsupportedVersion(version));
+        }
+        
+        // Read entry count
+        let mut count_bytes = [0u8; 8];
+        reader.read_exact(&mut count_bytes)
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        let count = u64::from_le_bytes(count_bytes) as usize;
+        
+        // Read entries
+        let mut index = Self::new(cache_dir);
+        
+        for _ in 0..count {
+            let entry = Self::read_entry(&mut reader)?;
+            index.add_entry(entry);
+        }
+        
+        Ok(index)
+    }
+    
+    fn read_entry(reader: &mut BufReader<File>) -> Result<CacheEntry, CacheError> {
+        let mut buf = [0u8; 8];
+        
+        // Key
+        reader.read_exact(&mut buf).map_err(|e| CacheError::IoError(e.to_string()))?;
+        let key = DepNodeId(u64::from_le_bytes(buf));
+        
+        // Fingerprint
+        reader.read_exact(&mut buf).map_err(|e| CacheError::IoError(e.to_string()))?;
+        let fp_hi = u64::from_le_bytes(buf);
+        reader.read_exact(&mut buf).map_err(|e| CacheError::IoError(e.to_string()))?;
+        let fp_lo = u64::from_le_bytes(buf);
+        let fingerprint = Fingerprint(fp_hi, fp_lo);
+        
+        // Dependencies count
+        let mut count_buf = [0u8; 4];
+        reader.read_exact(&mut count_buf).map_err(|e| CacheError::IoError(e.to_string()))?;
+        let dep_count = u32::from_le_bytes(count_buf) as usize;
+        
+        // Dependencies
+        let mut dependencies = Vec::with_capacity(dep_count);
+        for _ in 0..dep_count {
+            reader.read_exact(&mut buf).map_err(|e| CacheError::IoError(e.to_string()))?;
+            dependencies.push(DepNodeId(u64::from_le_bytes(buf)));
+        }
+        
+        // Timestamps
+        reader.read_exact(&mut buf).map_err(|e| CacheError::IoError(e.to_string()))?;
+        let created_secs = u64::from_le_bytes(buf);
+        let created = UNIX_EPOCH + Duration::from_secs(created_secs);
+        
+        reader.read_exact(&mut buf).map_err(|e| CacheError::IoError(e.to_string()))?;
+        let accessed_secs = u64::from_le_bytes(buf);
+        let accessed = UNIX_EPOCH + Duration::from_secs(accessed_secs);
+        
+        // Size
+        reader.read_exact(&mut buf).map_err(|e| CacheError::IoError(e.to_string()))?;
+        let size = u64::from_le_bytes(buf);
+        
+        // Kind
+        let mut kind_buf = [0u8; 1];
+        reader.read_exact(&mut kind_buf).map_err(|e| CacheError::IoError(e.to_string()))?;
+        let kind = match kind_buf[0] {
+            0 => CacheEntryKind::Hir,
+            1 => CacheEntryKind::Mir,
+            2 => CacheEntryKind::MirOptimized,
+            3 => CacheEntryKind::Object,
+            4 => CacheEntryKind::Metadata,
+            5 => CacheEntryKind::TypeInfo,
+            6 => CacheEntryKind::QueryResult,
+            _ => return Err(CacheError::CorruptedIndex),
+        };
+        
+        Ok(CacheEntry {
+            key,
+            fingerprint,
+            dependencies,
+            created,
+            accessed,
+            size,
+            kind,
+        })
+    }
+    
+    /// Save index to disk
+    pub fn save(&self) -> Result<(), CacheError> {
+        if let Some(parent) = self.index_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| CacheError::IoError(e.to_string()))?;
+        }
+        
+        let file = File::create(&self.index_path)
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        let mut writer = BufWriter::new(file);
+        
+        // Header
+        writer.write_all(b"QNTCACHE")
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        // Version
+        writer.write_all(&1u32.to_le_bytes())
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        // Entry count
+        writer.write_all(&(self.entries.len() as u64).to_le_bytes())
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        // Entries
+        for entry in self.entries.values() {
+            Self::write_entry(&mut writer, entry)?;
+        }
+        
+        writer.flush().map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    fn write_entry(writer: &mut BufWriter<File>, entry: &CacheEntry) -> Result<(), CacheError> {
+        // Key
+        writer.write_all(&entry.key.0.to_le_bytes())
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        // Fingerprint
+        writer.write_all(&entry.fingerprint.0.to_le_bytes())
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        writer.write_all(&entry.fingerprint.1.to_le_bytes())
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        // Dependencies
+        writer.write_all(&(entry.dependencies.len() as u32).to_le_bytes())
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        for dep in &entry.dependencies {
+            writer.write_all(&dep.0.to_le_bytes())
+                .map_err(|e| CacheError::IoError(e.to_string()))?;
+        }
+        
+        // Timestamps
+        let created_secs = entry.created
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        writer.write_all(&created_secs.to_le_bytes())
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        let accessed_secs = entry.accessed
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        writer.write_all(&accessed_secs.to_le_bytes())
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        // Size
+        writer.write_all(&entry.size.to_le_bytes())
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        // Kind
+        let kind_byte = match entry.kind {
+            CacheEntryKind::Hir => 0u8,
+            CacheEntryKind::Mir => 1,
+            CacheEntryKind::MirOptimized => 2,
+            CacheEntryKind::Object => 3,
+            CacheEntryKind::Metadata => 4,
+            CacheEntryKind::TypeInfo => 5,
+            CacheEntryKind::QueryResult => 6,
+        };
+        writer.write_all(&[kind_byte])
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    /// Add entry to index
+    pub fn add_entry(&mut self, entry: CacheEntry) {
+        self.total_size += entry.size;
+        
+        self.by_fingerprint
+            .entry(entry.fingerprint)
+            .or_default()
+            .push(entry.key);
+        
+        self.entries.insert(entry.key, entry);
+        self.dirty = true;
+    }
+    
+    /// Get entry by key
+    pub fn get(&self, key: DepNodeId) -> Option<&CacheEntry> {
+        self.entries.get(&key)
+    }
+    
+    /// Get entry by fingerprint
+    pub fn get_by_fingerprint(&self, fp: Fingerprint) -> Vec<&CacheEntry> {
+        self.by_fingerprint.get(&fp)
+            .map(|ids| ids.iter().filter_map(|id| self.entries.get(id)).collect())
+            .unwrap_or_default()
+    }
+    
+    /// Remove entry
+    pub fn remove(&mut self, key: DepNodeId) -> Option<CacheEntry> {
+        if let Some(entry) = self.entries.remove(&key) {
+            self.total_size -= entry.size;
+            
+            if let Some(ids) = self.by_fingerprint.get_mut(&entry.fingerprint) {
+                ids.retain(|id| *id != key);
+            }
+            
+            self.dirty = true;
+            Some(entry)
+        } else {
+            None
+        }
+    }
+    
+    /// Update access time
+    pub fn touch(&mut self, key: DepNodeId) {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.accessed = SystemTime::now();
+            self.dirty = true;
+        }
+    }
+    
+    /// Total cache size
+    pub fn total_size(&self) -> u64 {
+        self.total_size
+    }
+    
+    /// Entry count
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    
+    /// Is index dirty?
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CACHE STORE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Main cache storage
+pub struct CacheStore {
+    /// Configuration
+    config: CacheConfig,
+    
+    /// Cache index
+    index: CacheIndex,
+}
+
+impl CacheStore {
+    /// Open cache store
+    pub fn open(config: CacheConfig) -> Result<Self, CacheError> {
+        fs::create_dir_all(&config.cache_dir)
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        let index = CacheIndex::load(&config.cache_dir)?;
+        
+        Ok(CacheStore { config, index })
+    }
+    
+    /// Get artifact path
+    fn artifact_path(&self, key: DepNodeId, kind: CacheEntryKind) -> PathBuf {
+        let subdir = kind.subdirectory();
+        let ext = kind.extension();
+        
+        // Use two-level directory structure to avoid too many files per directory
+        let id = key.0;
+        let dir1 = format!("{:02x}", (id >> 56) & 0xFF);
+        let dir2 = format!("{:02x}", (id >> 48) & 0xFF);
+        
+        self.config.cache_dir
+            .join(subdir)
+            .join(dir1)
+            .join(dir2)
+            .join(format!("{:016x}.{}", id, ext))
+    }
+    
+    /// Store artifact
+    pub fn store(
+        &mut self,
+        key: DepNodeId,
+        kind: CacheEntryKind,
+        data: &[u8],
+        dependencies: Vec<DepNodeId>,
+    ) -> Result<(), CacheError> {
+        let path = self.artifact_path(key, kind);
+        
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| CacheError::IoError(e.to_string()))?;
+        }
+        
+        // Compute fingerprint
+        let fingerprint = Fingerprint::from_bytes(data);
+        
+        // Write data (with optional compression)
+        let written_data = if self.config.compress {
+            self.compress(data)?
+        } else {
+            data.to_vec()
+        };
+        
+        let file = File::create(&path)
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        let mut writer = BufWriter::new(file);
+        
+        // Write header with checksum
+        let checksum = self.compute_checksum(&written_data);
+        writer.write_all(&checksum.to_le_bytes())
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        writer.write_all(&written_data)
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        writer.flush().map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        // Update index
+        let entry = CacheEntry {
+            key,
+            fingerprint,
+            dependencies,
+            created: SystemTime::now(),
+            accessed: SystemTime::now(),
+            size: (written_data.len() + 8) as u64,
+            kind,
+        };
+        
+        self.index.add_entry(entry);
+        
+        // Check if we need to evict
+        self.maybe_evict()?;
+        
+        Ok(())
+    }
+    
+    /// Load artifact
+    pub fn load(&mut self, key: DepNodeId, kind: CacheEntryKind) -> Result<Vec<u8>, CacheError> {
+        let path = self.artifact_path(key, kind);
+        
+        if !path.exists() {
+            return Err(CacheError::NotFound(key));
+        }
+        
+        let file = File::open(&path)
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        let mut reader = BufReader::new(file);
+        
+        // Read checksum
+        let mut checksum_bytes = [0u8; 8];
+        reader.read_exact(&mut checksum_bytes)
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        let stored_checksum = u64::from_le_bytes(checksum_bytes);
+        
+        // Read data
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data)
+            .map_err(|e| CacheError::IoError(e.to_string()))?;
+        
+        // Verify checksum
+        if self.config.verify_checksums {
+            let computed = self.compute_checksum(&data);
+            if computed != stored_checksum {
+                return Err(CacheError::ChecksumMismatch);
+            }
+        }
+        
+        // Decompress if needed
+        let decompressed = if self.config.compress {
+            self.decompress(&data)?
+        } else {
+            data
+        };
+        
+        // Update access time
+        self.index.touch(key);
+        
+        Ok(decompressed)
+    }
+    
+    /// Check if entry exists
+    pub fn contains(&self, key: DepNodeId) -> bool {
+        self.index.get(key).is_some()
+    }
+    
+    /// Get entry metadata
+    pub fn get_entry(&self, key: DepNodeId) -> Option<&CacheEntry> {
+        self.index.get(key)
+    }
+    
+    /// Remove entry
+    pub fn remove(&mut self, key: DepNodeId, kind: CacheEntryKind) -> Result<(), CacheError> {
+        let path = self.artifact_path(key, kind);
+        
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|e| CacheError::IoError(e.to_string()))?;
+        }
+        
+        self.index.remove(key);
+        Ok(())
+    }
+    
+    /// Evict entries if over limits
+    fn maybe_evict(&mut self) -> Result<(), CacheError> {
+        // Check size limit
+        while self.index.total_size() > self.config.max_size {
+            if let Some(key) = self.find_lru_entry() {
+                if let Some(entry) = self.index.remove(key) {
+                    let path = self.artifact_path(key, entry.kind);
+                    let _ = fs::remove_file(path);
+                }
+            } else {
+                break;
+            }
+        }
+        
+        // Check entry limit
+        while self.index.len() > self.config.max_entries {
+            if let Some(key) = self.find_lru_entry() {
+                if let Some(entry) = self.index.remove(key) {
+                    let path = self.artifact_path(key, entry.kind);
+                    let _ = fs::remove_file(path);
+                }
+            } else {
+                break;
+            }
+        }
+        
+        // Remove expired entries
+        let now = SystemTime::now();
+        let expired: Vec<_> = self.index.entries.iter()
+            .filter(|(_, entry)| {
+                entry.accessed.elapsed().map(|d| d > self.config.ttl).unwrap_or(false)
+            })
+            .map(|(&key, entry)| (key, entry.kind))
+            .collect();
+        
+        for (key, kind) in expired {
+            let path = self.artifact_path(key, kind);
+            let _ = fs::remove_file(path);
+            self.index.remove(key);
+        }
+        
+        Ok(())
+    }
+    
+    /// Find least recently used entry
+    fn find_lru_entry(&self) -> Option<DepNodeId> {
+        self.index.entries.iter()
+            .min_by_key(|(_, entry)| entry.accessed)
+            .map(|(&key, _)| key)
+    }
+    
+    /// Compress data
+    fn compress(&self, data: &[u8]) -> Result<Vec<u8>, CacheError> {
+        // Simple LZ77-style compression placeholder
+        // Real implementation would use zstd or similar
+        Ok(data.to_vec())
+    }
+    
+    /// Decompress data
+    fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, CacheError> {
+        Ok(data.to_vec())
+    }
+    
+    /// Compute checksum
+    fn compute_checksum(&self, data: &[u8]) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let mut hasher = DefaultHasher::new();
+        data.hash(&mut hasher);
+        hasher.finish()
+    }
+    
+    /// Flush index to disk
+    pub fn flush(&self) -> Result<(), CacheError> {
+        if self.index.is_dirty() {
+            self.index.save()?;
+        }
+        Ok(())
+    }
+    
+    /// Clear entire cache
+    pub fn clear(&mut self) -> Result<(), CacheError> {
+        // Remove all files
+        for subdir in ["hir", "mir", "obj", "meta", "types", "queries"] {
+            let dir = self.config.cache_dir.join(subdir);
+            if dir.exists() {
+                fs::remove_dir_all(&dir)
+                    .map_err(|e| CacheError::IoError(e.to_string()))?;
+            }
+        }
+        
+        // Reset index
+        self.index = CacheIndex::new(&self.config.cache_dir);
+        
+        Ok(())
+    }
+    
+    /// Get cache statistics
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            total_entries: self.index.len(),
+            total_size: self.index.total_size(),
+            max_size: self.config.max_size,
+            hit_rate: 0.0, // Would track this separately
+        }
+    }
+}
+
+/// Cache statistics
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    pub total_entries: usize,
+    pub total_size: u64,
+    pub max_size: u64,
+    pub hit_rate: f64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum CacheError {
+    IoError(String),
+    NotFound(DepNodeId),
+    CorruptedIndex,
+    ChecksumMismatch,
+    UnsupportedVersion(u32),
+    CompressionError(String),
+}
+
+impl std::fmt::Display for CacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IoError(e) => write!(f, "I/O error: {}", e),
+            Self::NotFound(id) => write!(f, "cache entry not found: {:?}", id),
+            Self::CorruptedIndex => write!(f, "corrupted cache index"),
+            Self::ChecksumMismatch => write!(f, "checksum mismatch"),
+            Self::UnsupportedVersion(v) => write!(f, "unsupported cache version: {}", v),
+            Self::CompressionError(e) => write!(f, "compression error: {}", e),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env::temp_dir;
+    
+    fn temp_cache_dir() -> PathBuf {
+        temp_dir().join(format!("quanta_cache_test_{}", std::process::id()))
+    }
+    
+    #[test]
+    fn test_cache_store_basic() {
+        let cache_dir = temp_cache_dir();
+        let config = CacheConfig {
+            cache_dir: cache_dir.clone(),
+            ..Default::default()
+        };
+        
+        let mut store = CacheStore::open(config).unwrap();
+        
+        let key = DepNodeId::new(12345);
+        let data = b"test artifact data";
+        
+        store.store(key, CacheEntryKind::Hir, data, vec![]).unwrap();
+        
+        assert!(store.contains(key));
+        
+        let loaded = store.load(key, CacheEntryKind::Hir).unwrap();
+        assert_eq!(&loaded, data);
+        
+        // Cleanup
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+    
+    #[test]
+    fn test_cache_index_persistence() {
+        let cache_dir = temp_cache_dir();
+        
+        {
+            let mut index = CacheIndex::new(&cache_dir);
+            
+            index.add_entry(CacheEntry {
+                key: DepNodeId::new(1),
+                fingerprint: Fingerprint::new(123, 456),
+                dependencies: vec![DepNodeId::new(2)],
+                created: SystemTime::now(),
+                accessed: SystemTime::now(),
+                size: 100,
+                kind: CacheEntryKind::Hir,
+            });
+            
+            index.save().unwrap();
+        }
+        
+        {
+            let index = CacheIndex::load(&cache_dir).unwrap();
+            assert_eq!(index.len(), 1);
+            
+            let entry = index.get(DepNodeId::new(1)).unwrap();
+            assert_eq!(entry.fingerprint, Fingerprint::new(123, 456));
+        }
+        
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+}

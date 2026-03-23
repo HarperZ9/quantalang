@@ -1,0 +1,500 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ TEST RUNNER — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The QuantaLang Test Runner (quantatest) provides integrated test execution
+// for QuantaLang projects.
+//
+// Features:
+// - Automatic test discovery (#[test] attribute)
+// - Parallel test execution
+// - Output capture and reporting
+// - Multiple output formats (pretty, JSON, JUnit)
+// - Test filtering and skip patterns
+// - Timeout support
+// - Doc test execution
+// - Benchmark support
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang Test Runner
+//!
+//! Integrated test framework for QuantaLang.
+//!
+//! ## Quick Start
+//!
+//! ```bash
+//! # Run all tests
+//! quantatest
+//!
+//! # Run specific test
+//! quantatest test_foo
+//!
+//! # Run ignored tests
+//! quantatest --ignored
+//!
+//! # Show verbose output
+//! quantatest -v
+//!
+//! # Generate JUnit report
+//! quantatest --report results.xml --report-format junit
+//! ```
+//!
+//! ## Writing Tests
+//!
+//! ```quanta
+//! #[test]
+//! fn test_simple() {
+//!     assert!(true);
+//! }
+//!
+//! #[test]
+//! #[ignore = "not ready"]
+//! fn test_ignored() {
+//!     todo!()
+//! }
+//!
+//! #[test]
+//! #[should_panic(expected = "oops")]
+//! fn test_panic() {
+//!     panic!("oops");
+//! }
+//!
+//! #[test]
+//! #[timeout(5s)]
+//! fn test_with_timeout() {
+//!     // Must complete within 5 seconds
+//! }
+//! ```
+//!
+//! ## Modules
+//!
+//! - [`config`] - Test configuration and types
+//! - [`discovery`] - Test discovery from source files
+//! - [`executor`] - Test execution engine
+//! - [`reporter`] - Output formatters
+//! - [`cli`] - Command-line interface
+
+module quantalang::test
+
+// Submodules
+pub mod config;
+pub mod discovery;
+pub mod executor;
+pub mod reporter;
+pub mod cli;
+
+// Re-exports
+pub use config::{
+    TestConfig, TestDescriptor, TestResult, TestOutcome, TestSummary,
+    TestSuite, TestKind, TestAttribute, ShouldPanic,
+    CaptureMode, OutputFormat, ColorChoice, ReportFormat, TestOrder,
+    AssertionFailure, AssertionKind,
+};
+
+pub use discovery::{
+    TestDiscovery, DiscoveryOptions, DiscoveryError,
+};
+
+pub use executor::{
+    TestExecutor, TestHarness, ProcessRunner, ProcessResult,
+};
+
+pub use reporter::{
+    Reporter, PrettyReporter, TerseReporter, JsonReporter, JunitReporter, TapReporter,
+    create_reporter, create_file_reporter,
+};
+
+pub use cli::{
+    CliArgs, parse_args, run,
+};
+
+// Version
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIGH-LEVEL API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Run tests with default configuration
+///
+/// # Examples
+///
+/// ```quanta
+/// use quantalang::test;
+///
+/// let summary = test::run_tests()?;
+/// if summary.is_success() {
+///     println!("All tests passed!");
+/// }
+/// ```
+pub fn run_tests() -> Result<TestSummary, String> {
+    run_tests_with_config(TestConfig::default())
+}
+
+/// Run tests with custom configuration
+pub fn run_tests_with_config(config: TestConfig) -> Result<TestSummary, String> {
+    let root = std::env::current_dir()
+        .map_err(|e| format!("failed to get current directory: {}", e))?;
+    
+    run_tests_in_dir(&root, config)
+}
+
+/// Run tests in a specific directory
+pub fn run_tests_in_dir(dir: &std::path::Path, config: TestConfig) -> Result<TestSummary, String> {
+    // Discover tests
+    let mut discovery = TestDiscovery::new(dir);
+    let suites = discovery.discover()
+        .map_err(|e| format!("discovery failed: {}", e))?;
+    
+    // Collect tests
+    let tests: Vec<_> = suites.iter()
+        .flat_map(|s| s.tests.clone())
+        .collect();
+    
+    // Execute
+    let mut executor = TestExecutor::new(config);
+    let summary = executor.run(tests);
+    
+    Ok(summary.clone())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEST BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Builder for running tests programmatically
+///
+/// # Examples
+///
+/// ```quanta
+/// use quantalang::test::TestBuilder;
+///
+/// TestBuilder::new()
+///     .filter("test_foo")
+///     .threads(4)
+///     .timeout(Duration::from_secs(30))
+///     .run()?;
+/// ```
+pub struct TestBuilder {
+    config: TestConfig,
+    directory: Option<std::path::PathBuf>,
+    reporter: Option<Box<dyn Reporter>>,
+}
+
+impl TestBuilder {
+    /// Create new test builder
+    pub fn new() -> Self {
+        TestBuilder {
+            config: TestConfig::default(),
+            directory: None,
+            reporter: None,
+        }
+    }
+    
+    /// Set test filter
+    pub fn filter(mut self, pattern: &str) -> Self {
+        self.config.filter = Some(pattern.to_string());
+        self
+    }
+    
+    /// Set exact match
+    pub fn exact(mut self, exact: bool) -> Self {
+        self.config.exact = exact;
+        self
+    }
+    
+    /// Set number of threads
+    pub fn threads(mut self, n: usize) -> Self {
+        self.config.test_threads = n;
+        self
+    }
+    
+    /// Set test timeout
+    pub fn timeout(mut self, timeout: core::time::Duration) -> Self {
+        self.config.default_timeout = timeout;
+        self
+    }
+    
+    /// Include ignored tests
+    pub fn include_ignored(mut self, include: bool) -> Self {
+        self.config.include_ignored = include;
+        self
+    }
+    
+    /// Run only ignored tests
+    pub fn run_ignored(mut self, run: bool) -> Self {
+        self.config.run_ignored = run;
+        self
+    }
+    
+    /// Continue after failures
+    pub fn no_fail_fast(mut self, no_fail_fast: bool) -> Self {
+        self.config.no_fail_fast = no_fail_fast;
+        self
+    }
+    
+    /// Skip tests matching pattern
+    pub fn skip(mut self, pattern: &str) -> Self {
+        self.config.skip.push(pattern.to_string());
+        self
+    }
+    
+    /// Set output format
+    pub fn format(mut self, format: OutputFormat) -> Self {
+        self.config.format = format;
+        self
+    }
+    
+    /// Set verbose mode
+    pub fn verbose(mut self, verbose: bool) -> Self {
+        self.config.verbose = verbose;
+        self
+    }
+    
+    /// Set quiet mode
+    pub fn quiet(mut self, quiet: bool) -> Self {
+        self.config.quiet = quiet;
+        self
+    }
+    
+    /// Set test directory
+    pub fn directory(mut self, dir: &std::path::Path) -> Self {
+        self.directory = Some(dir.to_path_buf());
+        self
+    }
+    
+    /// Set custom reporter
+    pub fn reporter<R: Reporter + 'static>(mut self, reporter: R) -> Self {
+        self.reporter = Some(Box::new(reporter));
+        self
+    }
+    
+    /// Set report file
+    pub fn report(mut self, path: &str, format: ReportFormat) -> Self {
+        self.config.report_path = Some(path.to_string());
+        self.config.report_format = format;
+        self
+    }
+    
+    /// Get the configuration
+    pub fn config(&self) -> &TestConfig {
+        &self.config
+    }
+    
+    /// Run tests
+    pub fn run(self) -> Result<TestSummary, String> {
+        let dir = self.directory
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "failed to determine test directory".to_string())?;
+        
+        // Discover tests
+        let mut discovery = TestDiscovery::new(&dir);
+        let suites = discovery.discover()
+            .map_err(|e| format!("discovery failed: {}", e))?;
+        
+        let tests: Vec<_> = suites.iter()
+            .flat_map(|s| s.tests.clone())
+            .collect();
+        
+        // Create reporter
+        let mut reporter: Box<dyn Reporter> = self.reporter
+            .unwrap_or_else(|| create_reporter(&self.config));
+        
+        // Execute tests
+        let mut executor = TestExecutor::new(self.config.clone());
+        
+        reporter.start(tests.len());
+        let summary = executor.run(tests);
+        
+        for result in executor.results() {
+            reporter.test_end(result);
+        }
+        
+        reporter.finish(summary);
+        
+        Ok(summary.clone())
+    }
+    
+    /// List tests without running
+    pub fn list(self) -> Result<Vec<TestDescriptor>, String> {
+        let dir = self.directory
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "failed to determine test directory".to_string())?;
+        
+        let mut discovery = TestDiscovery::new(&dir);
+        let suites = discovery.discover()
+            .map_err(|e| format!("discovery failed: {}", e))?;
+        
+        let tests: Vec<_> = suites.iter()
+            .flat_map(|s| s.tests.clone())
+            .filter(|t| self.config.should_run(t))
+            .collect();
+        
+        Ok(tests)
+    }
+}
+
+impl Default for TestBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ASSERTION MACROS (would be built-in)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Assert that a condition is true
+///
+/// # Examples
+///
+/// ```quanta
+/// assert!(1 + 1 == 2);
+/// assert!(x > 0, "x must be positive");
+/// ```
+#[macro_export]
+macro_rules! assert {
+    ($cond:expr) => {
+        if !$cond {
+            panic!("assertion failed: {}", stringify!($cond));
+        }
+    };
+    ($cond:expr, $($arg:tt)+) => {
+        if !$cond {
+            panic!("assertion failed: {}: {}", stringify!($cond), format!($($arg)+));
+        }
+    };
+}
+
+/// Assert that two values are equal
+///
+/// # Examples
+///
+/// ```quanta
+/// assert_eq!(1 + 1, 2);
+/// assert_eq!(result, expected, "mismatch");
+/// ```
+#[macro_export]
+macro_rules! assert_eq {
+    ($left:expr, $right:expr) => {
+        match (&$left, &$right) {
+            (left_val, right_val) => {
+                if !(*left_val == *right_val) {
+                    panic!(
+                        "assertion `left == right` failed\n  left: {:?}\n right: {:?}",
+                        left_val, right_val
+                    );
+                }
+            }
+        }
+    };
+    ($left:expr, $right:expr, $($arg:tt)+) => {
+        match (&$left, &$right) {
+            (left_val, right_val) => {
+                if !(*left_val == *right_val) {
+                    panic!(
+                        "assertion `left == right` failed: {}\n  left: {:?}\n right: {:?}",
+                        format!($($arg)+), left_val, right_val
+                    );
+                }
+            }
+        }
+    };
+}
+
+/// Assert that two values are not equal
+#[macro_export]
+macro_rules! assert_ne {
+    ($left:expr, $right:expr) => {
+        match (&$left, &$right) {
+            (left_val, right_val) => {
+                if *left_val == *right_val {
+                    panic!(
+                        "assertion `left != right` failed\n  left: {:?}\n right: {:?}",
+                        left_val, right_val
+                    );
+                }
+            }
+        }
+    };
+    ($left:expr, $right:expr, $($arg:tt)+) => {
+        match (&$left, &$right) {
+            (left_val, right_val) => {
+                if *left_val == *right_val {
+                    panic!(
+                        "assertion `left != right` failed: {}\n  left: {:?}\n right: {:?}",
+                        format!($($arg)+), left_val, right_val
+                    );
+                }
+            }
+        }
+    };
+}
+
+/// Debug assertion (only in debug builds)
+#[macro_export]
+macro_rules! debug_assert {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        assert!($($arg)*);
+    };
+}
+
+/// Debug assertion for equality
+#[macro_export]
+macro_rules! debug_assert_eq {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        assert_eq!($($arg)*);
+    };
+}
+
+/// Debug assertion for inequality
+#[macro_export]
+macro_rules! debug_assert_ne {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        assert_ne!($($arg)*);
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Main entry point for quantatest binary
+pub fn main() -> Result<i32, String> {
+    cli::main()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_builder() {
+        let builder = TestBuilder::new()
+            .filter("test_foo")
+            .threads(4)
+            .verbose(true);
+        
+        assert_eq!(builder.config().filter, Some("test_foo".to_string()));
+        assert_eq!(builder.config().test_threads, 4);
+        assert!(builder.config().verbose);
+    }
+    
+    #[test]
+    fn test_config_defaults() {
+        let config = TestConfig::default();
+        assert_eq!(config.test_threads, 0);
+        assert!(!config.no_fail_fast);
+    }
+}

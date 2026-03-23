@@ -1,0 +1,652 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ ALLOC — Heap Allocation Library
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The `alloc` crate provides heap allocation types for QuantaLang.
+// Unlike `core`, it requires a heap allocator but NOT an operating system.
+//
+// # Crate Structure
+//
+// ```
+// alloc
+// ├── alloc      — Allocator traits, Layout, GlobalAlloc
+// ├── boxed      — Box<T> heap-allocated smart pointer
+// ├── vec        — Vec<T> growable array
+// ├── string     — String UTF-8 encoded growable string
+// ├── rc         — Rc<T>, Arc<T> reference counting
+// └── collections — BTreeMap, BTreeSet, LinkedList, VecDeque (future)
+// ```
+//
+// # Usage
+//
+// To use this crate, you must provide a global allocator:
+//
+// ```
+// #[global_allocator]
+// static ALLOCATOR: MyAllocator = MyAllocator;
+// ```
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#![no_std]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODULE DECLARATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub mod alloc;
+pub mod boxed;
+pub mod vec;
+pub mod string;
+pub mod rc;
+
+// Future modules:
+// pub mod collections;
+// pub mod borrow;
+// pub mod fmt;
+// pub mod slice;
+// pub mod str;
+// pub mod sync;
+// pub mod task;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RE-EXPORTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Allocation primitives
+pub use alloc::{
+    Layout,
+    LayoutError,
+    Allocator,
+    GlobalAlloc,
+    Global,
+    AllocError,
+    alloc,
+    dealloc,
+    realloc,
+    alloc_zeroed,
+    handle_alloc_error,
+};
+
+// Box
+pub use boxed::Box;
+
+// Vec
+pub use vec::Vec;
+#[doc(inline)]
+pub use vec::vec;
+
+// String
+pub use string::String;
+pub use string::FromUtf8Error;
+
+// Reference counting
+pub use rc::{Rc, Weak};
+pub use rc::{Arc, AWeak};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The alloc prelude.
+/// 
+/// Import with `use alloc::prelude::*;` to get commonly used types.
+pub mod prelude {
+    pub mod v1 {
+        // Smart pointers
+        pub use crate::boxed::Box;
+        pub use crate::rc::{Rc, Arc};
+        
+        // Collections
+        pub use crate::vec::Vec;
+        pub use crate::string::String;
+        
+        // Macros
+        pub use crate::vec;
+        
+        // Traits
+        pub use crate::alloc::Allocator;
+        pub use core::borrow::ToOwned;
+    }
+    
+    pub use v1::*;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RAW VEC (internal, shared between modules)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Internal buffer management used by Vec and String.
+/// 
+/// This is not part of the public API.
+pub(crate) mod raw_vec {
+    pub use crate::vec::RawVec;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BORROW TRAIT EXTENSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Extension trait for creating owned data from borrowed data.
+pub trait ToOwned {
+    type Owned;
+    
+    fn to_owned(&self) -> Self::Owned;
+    
+    fn clone_into(&self, target: &mut Self::Owned) {
+        *target = self.to_owned();
+    }
+}
+
+impl ToOwned for str {
+    type Owned = String;
+    
+    #[inline]
+    fn to_owned(&self) -> String {
+        String::from(self)
+    }
+    
+    fn clone_into(&self, target: &mut String) {
+        target.clear();
+        target.push_str(self);
+    }
+}
+
+impl<T: Clone> ToOwned for [T] {
+    type Owned = Vec<T>;
+    
+    fn to_owned(&self) -> Vec<T> {
+        let mut v = Vec::with_capacity(self.len());
+        v.extend_from_slice(self);
+        v
+    }
+    
+    fn clone_into(&self, target: &mut Vec<T>) {
+        target.clear();
+        target.extend_from_slice(self);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COW (Clone-on-Write)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use core::borrow::Borrow;
+use core::cmp::Ordering;
+use core::hash::{Hash, Hasher};
+use core::ops::Deref;
+
+/// A clone-on-write smart pointer.
+/// 
+/// `Cow` can hold either borrowed or owned data. It implements `Deref`,
+/// so you can call non-mutating methods on it directly. When mutation
+/// is needed, `to_mut()` clones the data if it was borrowed.
+/// 
+/// # Examples
+/// 
+/// ```
+/// use alloc::borrow::Cow;
+/// 
+/// fn abs_all(input: &mut Cow<[i32]>) {
+///     for i in 0..input.len() {
+///         let v = input[i];
+///         if v < 0 {
+///             // Clone on first mutation
+///             input.to_mut()[i] = -v;
+///         }
+///     }
+/// }
+/// ```
+pub enum Cow<'a, B: ?Sized + ToOwned + 'a> {
+    /// Borrowed data
+    Borrowed(&'a B),
+    
+    /// Owned data
+    Owned(<B as ToOwned>::Owned),
+}
+
+impl<B: ?Sized + ToOwned> Cow<'_, B> {
+    /// Returns true if the data is borrowed.
+    #[inline]
+    pub const fn is_borrowed(&self) -> bool {
+        matches!(self, Cow::Borrowed(_))
+    }
+    
+    /// Returns true if the data is owned.
+    #[inline]
+    pub const fn is_owned(&self) -> bool {
+        matches!(self, Cow::Owned(_))
+    }
+    
+    /// Acquires a mutable reference to the owned form.
+    /// 
+    /// Clones the data if it's currently borrowed.
+    pub fn to_mut(&mut self) -> &mut <B as ToOwned>::Owned {
+        match *self {
+            Cow::Borrowed(borrowed) => {
+                *self = Cow::Owned(borrowed.to_owned());
+                match *self {
+                    Cow::Owned(ref mut owned) => owned,
+                    Cow::Borrowed(..) => unreachable!(),
+                }
+            }
+            Cow::Owned(ref mut owned) => owned,
+        }
+    }
+    
+    /// Extracts the owned data.
+    /// 
+    /// Clones the data if it's currently borrowed.
+    pub fn into_owned(self) -> <B as ToOwned>::Owned {
+        match self {
+            Cow::Borrowed(borrowed) => borrowed.to_owned(),
+            Cow::Owned(owned) => owned,
+        }
+    }
+}
+
+impl<B: ?Sized + ToOwned> Deref for Cow<'_, B>
+where
+    B::Owned: Borrow<B>,
+{
+    type Target = B;
+    
+    fn deref(&self) -> &B {
+        match *self {
+            Cow::Borrowed(borrowed) => borrowed,
+            Cow::Owned(ref owned) => owned.borrow(),
+        }
+    }
+}
+
+impl<B: ?Sized + ToOwned> Clone for Cow<'_, B>
+where
+    B::Owned: Clone,
+{
+    fn clone(&self) -> Self {
+        match *self {
+            Cow::Borrowed(b) => Cow::Borrowed(b),
+            Cow::Owned(ref o) => Cow::Owned(o.clone()),
+        }
+    }
+}
+
+impl<B: ?Sized + ToOwned + PartialEq> PartialEq for Cow<'_, B>
+where
+    B::Owned: Borrow<B>,
+{
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<B: ?Sized + ToOwned + Eq> Eq for Cow<'_, B> where B::Owned: Borrow<B> {}
+
+impl<B: ?Sized + ToOwned + PartialOrd> PartialOrd for Cow<'_, B>
+where
+    B::Owned: Borrow<B>,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        (**self).partial_cmp(&**other)
+    }
+}
+
+impl<B: ?Sized + ToOwned + Ord> Ord for Cow<'_, B>
+where
+    B::Owned: Borrow<B>,
+{
+    fn cmp(&self, other: &Self) -> Ordering {
+        (**self).cmp(&**other)
+    }
+}
+
+impl<B: ?Sized + ToOwned + Hash> Hash for Cow<'_, B>
+where
+    B::Owned: Borrow<B>,
+{
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (**self).hash(state);
+    }
+}
+
+impl<'a> From<&'a str> for Cow<'a, str> {
+    fn from(s: &'a str) -> Self {
+        Cow::Borrowed(s)
+    }
+}
+
+impl From<String> for Cow<'_, str> {
+    fn from(s: String) -> Self {
+        Cow::Owned(s)
+    }
+}
+
+impl<'a, T: Clone> From<&'a [T]> for Cow<'a, [T]> {
+    fn from(s: &'a [T]) -> Self {
+        Cow::Borrowed(s)
+    }
+}
+
+impl<T: Clone> From<Vec<T>> for Cow<'_, [T]> {
+    fn from(v: Vec<T>) -> Self {
+        Cow::Owned(v)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FORMAT MACRO SUPPORT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Formatting support for String.
+/// 
+/// Used by format!, write!, etc.
+pub mod fmt {
+    use crate::string::String;
+    use core::fmt::{self, Write};
+    
+    /// Creates a `String` using interpolation of runtime expressions.
+    /// 
+    /// # Examples
+    /// ```
+    /// let s = format!("Hello, {}!", "world");
+    /// assert_eq!(s, "Hello, world!");
+    /// ```
+    #[macro_export]
+    macro_rules! format {
+        ($($arg:tt)*) => {{
+            let mut s = $crate::string::String::new();
+            core::fmt::write(&mut s, core::format_args!($($arg)*)).unwrap();
+            s
+        }};
+    }
+    
+    /// Writes formatted data into a buffer.
+    #[macro_export]
+    macro_rules! write {
+        ($dst:expr, $($arg:tt)*) => {
+            core::fmt::write(&mut $dst, core::format_args!($($arg)*))
+        };
+    }
+    
+    /// Writes formatted data with newline.
+    #[macro_export]
+    macro_rules! writeln {
+        ($dst:expr $(,)?) => {
+            core::fmt::write(&mut $dst, core::format_args!("\n"))
+        };
+        ($dst:expr, $($arg:tt)*) => {{
+            let _ = core::fmt::write(&mut $dst, core::format_args!($($arg)*));
+            core::fmt::write(&mut $dst, core::format_args!("\n"))
+        }};
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLICE EXTENSION TRAITS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Extension methods for slices that require allocation.
+pub trait SliceExt<T> {
+    /// Creates a `Vec<T>` from a slice.
+    fn to_vec(&self) -> Vec<T>
+    where
+        T: Clone;
+    
+    /// Creates a `Box<[T]>` from a slice.
+    fn into_boxed_slice(self) -> Box<[T]>
+    where
+        T: Clone;
+    
+    /// Returns a vector with the contents in reverse order.
+    fn to_vec_reversed(&self) -> Vec<T>
+    where
+        T: Clone;
+    
+    /// Repeats the slice `n` times into a new vector.
+    fn repeat(&self, n: usize) -> Vec<T>
+    where
+        T: Copy;
+    
+    /// Concatenates all inner slices into a new vector.
+    fn concat(&self) -> Vec<T>
+    where
+        T: Clone,
+        Self: AsRef<[T]>;
+    
+    /// Joins slices with a separator.
+    fn join<S>(&self, sep: &S) -> Vec<T>
+    where
+        T: Clone,
+        S: AsRef<[T]> + ?Sized;
+}
+
+impl<T> SliceExt<T> for [T] {
+    fn to_vec(&self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        let mut v = Vec::with_capacity(self.len());
+        v.extend_from_slice(self);
+        v
+    }
+    
+    fn into_boxed_slice(self) -> Box<[T]>
+    where
+        T: Clone,
+    {
+        self.to_vec().into_boxed_slice()
+    }
+    
+    fn to_vec_reversed(&self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        let mut v = self.to_vec();
+        v.reverse();
+        v
+    }
+    
+    fn repeat(&self, n: usize) -> Vec<T>
+    where
+        T: Copy,
+    {
+        let mut v = Vec::with_capacity(self.len() * n);
+        for _ in 0..n {
+            v.extend_from_within(..);
+        }
+        v
+    }
+    
+    fn concat(&self) -> Vec<T>
+    where
+        T: Clone,
+        Self: AsRef<[T]>,
+    {
+        self.as_ref().to_vec()
+    }
+    
+    fn join<S>(&self, sep: &S) -> Vec<T>
+    where
+        T: Clone,
+        S: AsRef<[T]> + ?Sized,
+    {
+        let sep = sep.as_ref();
+        let total_len = self.len() + sep.len() * self.len().saturating_sub(1);
+        let mut v = Vec::with_capacity(total_len);
+        
+        let mut first = true;
+        for item in self {
+            if !first {
+                v.extend_from_slice(sep);
+            }
+            v.push(item.clone());
+            first = false;
+        }
+        v
+    }
+}
+
+/// Extension methods for `str` that require allocation.
+pub trait StrExt {
+    /// Creates a `String` from a string slice.
+    fn to_string(&self) -> String;
+    
+    /// Returns a string with leading and trailing whitespace removed.
+    fn trim_to_string(&self) -> String;
+    
+    /// Converts to uppercase.
+    fn to_uppercase(&self) -> String;
+    
+    /// Converts to lowercase.
+    fn to_lowercase(&self) -> String;
+    
+    /// Repeats the string `n` times.
+    fn repeat(&self, n: usize) -> String;
+    
+    /// Replaces all occurrences of a pattern.
+    fn replace(&self, from: &str, to: &str) -> String;
+    
+    /// Replaces the first `n` occurrences.
+    fn replacen(&self, from: &str, to: &str, n: usize) -> String;
+}
+
+impl StrExt for str {
+    #[inline]
+    fn to_string(&self) -> String {
+        String::from(self)
+    }
+    
+    fn trim_to_string(&self) -> String {
+        String::from(self.trim())
+    }
+    
+    fn to_uppercase(&self) -> String {
+        let mut s = String::with_capacity(self.len());
+        for c in self.chars() {
+            for upper in c.to_uppercase() {
+                s.push(upper);
+            }
+        }
+        s
+    }
+    
+    fn to_lowercase(&self) -> String {
+        let mut s = String::with_capacity(self.len());
+        for c in self.chars() {
+            for lower in c.to_lowercase() {
+                s.push(lower);
+            }
+        }
+        s
+    }
+    
+    fn repeat(&self, n: usize) -> String {
+        String::repeat(self, n)
+    }
+    
+    fn replace(&self, from: &str, to: &str) -> String {
+        let mut result = String::new();
+        let mut last_end = 0;
+        
+        for (start, part) in self.match_indices(from) {
+            result.push_str(&self[last_end..start]);
+            result.push_str(to);
+            last_end = start + part.len();
+        }
+        result.push_str(&self[last_end..]);
+        result
+    }
+    
+    fn replacen(&self, from: &str, to: &str, n: usize) -> String {
+        let mut result = String::new();
+        let mut last_end = 0;
+        let mut count = 0;
+        
+        for (start, part) in self.match_indices(from) {
+            if count >= n {
+                break;
+            }
+            result.push_str(&self[last_end..start]);
+            result.push_str(to);
+            last_end = start + part.len();
+            count += 1;
+        }
+        result.push_str(&self[last_end..]);
+        result
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_to_owned_str() {
+        let s: &str = "hello";
+        let owned: String = s.to_owned();
+        assert_eq!(owned, "hello");
+    }
+    
+    #[test]
+    fn test_to_owned_slice() {
+        let s: &[i32] = &[1, 2, 3];
+        let owned: Vec<i32> = s.to_owned();
+        assert_eq!(owned, vec![1, 2, 3]);
+    }
+    
+    #[test]
+    fn test_cow_borrowed() {
+        let s = "hello";
+        let cow: Cow<str> = Cow::Borrowed(s);
+        assert!(cow.is_borrowed());
+        assert_eq!(&*cow, "hello");
+    }
+    
+    #[test]
+    fn test_cow_owned() {
+        let cow: Cow<str> = Cow::Owned(String::from("hello"));
+        assert!(cow.is_owned());
+        assert_eq!(&*cow, "hello");
+    }
+    
+    #[test]
+    fn test_cow_to_mut() {
+        let mut cow: Cow<str> = Cow::Borrowed("hello");
+        cow.to_mut().push_str(" world");
+        assert!(cow.is_owned());
+        assert_eq!(&*cow, "hello world");
+    }
+    
+    #[test]
+    fn test_str_to_uppercase() {
+        assert_eq!("hello".to_uppercase(), "HELLO");
+        assert_eq!("WORLD".to_lowercase(), "world");
+    }
+    
+    #[test]
+    fn test_str_replace() {
+        let s = "hello world world";
+        assert_eq!(s.replace("world", "rust"), "hello rust rust");
+        assert_eq!(s.replacen("world", "rust", 1), "hello rust world");
+    }
+    
+    #[test]
+    fn test_str_repeat() {
+        assert_eq!("ab".repeat(3), "ababab");
+        assert_eq!("".repeat(100), "");
+    }
+    
+    #[test]
+    fn test_slice_to_vec() {
+        let arr = [1, 2, 3];
+        let v = arr.to_vec();
+        assert_eq!(v, vec![1, 2, 3]);
+    }
+}

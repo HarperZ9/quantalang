@@ -1,0 +1,1310 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ SIMD — Auto-Vectorizer
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Automatic loop vectorization:
+// - Dependency analysis
+// - Loop transformation
+// - Vectorization legality checking
+// - Cost model for vectorization decisions
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::simd::vectorizer
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+use super::intrinsics::{SimdLevel, SimdElemType, SimdOp, SimdFeatures};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP REPRESENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop to be vectorized
+#[derive(Debug, Clone)]
+pub struct Loop {
+    /// Loop identifier
+    pub id: LoopId,
+    
+    /// Induction variable
+    pub induction: InductionVar,
+    
+    /// Loop bounds
+    pub bounds: LoopBounds,
+    
+    /// Loop body statements
+    pub body: Vec<Statement>,
+    
+    /// Memory accesses in loop
+    pub accesses: Vec<MemoryAccess>,
+    
+    /// Nested loops
+    pub nested: Vec<Loop>,
+    
+    /// Loop metadata
+    pub meta: LoopMeta,
+}
+
+/// Loop identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LoopId(pub u32);
+
+/// Induction variable
+#[derive(Debug, Clone)]
+pub struct InductionVar {
+    pub name: String,
+    pub start: Expr,
+    pub step: Expr,
+    pub ty: ScalarType,
+}
+
+/// Loop bounds
+#[derive(Debug, Clone)]
+pub struct LoopBounds {
+    pub lower: Expr,
+    pub upper: Expr,
+    pub step: Expr,
+    pub kind: BoundKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundKind {
+    /// i < upper
+    LessThan,
+    /// i <= upper
+    LessEqual,
+    /// i > lower
+    GreaterThan,
+    /// i >= lower
+    GreaterEqual,
+}
+
+/// Loop metadata
+#[derive(Debug, Clone, Default)]
+pub struct LoopMeta {
+    /// Known trip count (if constant)
+    pub trip_count: Option<u64>,
+    
+    /// Vectorization hint
+    pub vectorize_hint: VectorizeHint,
+    
+    /// Parallel hint
+    pub parallel_hint: bool,
+    
+    /// Unroll factor hint
+    pub unroll_hint: Option<u32>,
+    
+    /// Alignment assertions
+    pub alignments: BTreeMap<String, u32>,
+}
+
+/// Vectorization hint from source
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorizeHint {
+    #[default]
+    Auto,
+    Enable,
+    Disable,
+    Width(u32),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATEMENTS AND EXPRESSIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop body statement
+#[derive(Debug, Clone)]
+pub enum Statement {
+    /// Assignment: lhs = rhs
+    Assign {
+        lhs: LValue,
+        rhs: Expr,
+    },
+    
+    /// Store to memory
+    Store {
+        ptr: Expr,
+        value: Expr,
+    },
+    
+    /// Conditional
+    If {
+        condition: Expr,
+        then_branch: Vec<Statement>,
+        else_branch: Vec<Statement>,
+    },
+    
+    /// Reduction operation
+    Reduction {
+        var: String,
+        op: ReductionOp,
+        value: Expr,
+    },
+    
+    /// Function call (may have side effects)
+    Call {
+        func: String,
+        args: Vec<Expr>,
+        result: Option<String>,
+    },
+}
+
+/// Left-hand value
+#[derive(Debug, Clone)]
+pub enum LValue {
+    Var(String),
+    ArrayIndex(String, Box<Expr>),
+    Field(Box<LValue>, String),
+}
+
+/// Expression
+#[derive(Debug, Clone)]
+pub enum Expr {
+    /// Variable reference
+    Var(String),
+    
+    /// Literal constant
+    Const(Constant),
+    
+    /// Array element load
+    Load(Box<Expr>, Box<Expr>),
+    
+    /// Binary operation
+    BinOp(Box<Expr>, BinOp, Box<Expr>),
+    
+    /// Unary operation
+    UnaryOp(UnaryOp, Box<Expr>),
+    
+    /// Type cast
+    Cast(Box<Expr>, ScalarType),
+    
+    /// Select (ternary)
+    Select(Box<Expr>, Box<Expr>, Box<Expr>),
+    
+    /// Math function
+    MathFunc(MathFunc, Vec<Expr>),
+    
+    /// Induction variable
+    Induction(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum Constant {
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    Bool(bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor,
+    Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+    Min, Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg, Not, BitNot, Abs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MathFunc {
+    Sqrt, Sin, Cos, Tan, Exp, Log, Log2, Pow,
+    Floor, Ceil, Round, Trunc,
+    Fma,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReductionOp {
+    Sum, Product, Min, Max, And, Or, Xor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarType {
+    Bool,
+    I8, I16, I32, I64,
+    U8, U16, U32, U64,
+    F32, F64,
+}
+
+impl ScalarType {
+    pub fn size_bits(&self) -> u32 {
+        match self {
+            ScalarType::Bool | ScalarType::I8 | ScalarType::U8 => 8,
+            ScalarType::I16 | ScalarType::U16 => 16,
+            ScalarType::I32 | ScalarType::U32 | ScalarType::F32 => 32,
+            ScalarType::I64 | ScalarType::U64 | ScalarType::F64 => 64,
+        }
+    }
+    
+    pub fn to_simd_elem(&self) -> SimdElemType {
+        match self {
+            ScalarType::Bool => SimdElemType::I8,
+            ScalarType::I8 => SimdElemType::I8,
+            ScalarType::I16 => SimdElemType::I16,
+            ScalarType::I32 => SimdElemType::I32,
+            ScalarType::I64 => SimdElemType::I64,
+            ScalarType::U8 => SimdElemType::U8,
+            ScalarType::U16 => SimdElemType::U16,
+            ScalarType::U32 => SimdElemType::U32,
+            ScalarType::U64 => SimdElemType::U64,
+            ScalarType::F32 => SimdElemType::F32,
+            ScalarType::F64 => SimdElemType::F64,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY ACCESS ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Memory access descriptor
+#[derive(Debug, Clone)]
+pub struct MemoryAccess {
+    /// Access kind
+    pub kind: AccessKind,
+    
+    /// Base array/pointer
+    pub base: String,
+    
+    /// Access pattern
+    pub pattern: AccessPattern,
+    
+    /// Statement index in loop body
+    pub stmt_idx: usize,
+    
+    /// Element type
+    pub elem_type: ScalarType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessKind {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+/// Memory access pattern
+#[derive(Debug, Clone)]
+pub enum AccessPattern {
+    /// Consecutive access: base[i], base[i+1], ...
+    Consecutive { stride: i64 },
+    
+    /// Strided access: base[i*stride]
+    Strided { stride: i64 },
+    
+    /// Gather/scatter: base[indices[i]]
+    Indexed { indices: String },
+    
+    /// Unknown pattern
+    Unknown,
+}
+
+impl AccessPattern {
+    pub fn is_consecutive(&self) -> bool {
+        matches!(self, AccessPattern::Consecutive { stride: 1 })
+    }
+    
+    pub fn is_unit_stride(&self) -> bool {
+        match self {
+            AccessPattern::Consecutive { stride } => stride.abs() == 1,
+            AccessPattern::Strided { stride } => stride.abs() == 1,
+            _ => false,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEPENDENCY ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Data dependency
+#[derive(Debug, Clone)]
+pub struct Dependency {
+    /// Source statement
+    pub source: usize,
+    
+    /// Sink statement
+    pub sink: usize,
+    
+    /// Dependency type
+    pub kind: DepKind,
+    
+    /// Distance (loop iterations)
+    pub distance: DepDistance,
+    
+    /// Memory location (if memory dependency)
+    pub memory: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepKind {
+    /// Read after Write (true dependency)
+    Flow,
+    /// Write after Read (anti-dependency)
+    Anti,
+    /// Write after Write (output dependency)
+    Output,
+    /// Read after Read (input, not a real dependency)
+    Input,
+}
+
+/// Dependency distance
+#[derive(Debug, Clone)]
+pub enum DepDistance {
+    /// Constant distance
+    Constant(i64),
+    /// Variable distance (unknown)
+    Variable,
+    /// No dependency between iterations
+    None,
+}
+
+/// Dependency analyzer
+pub struct DependencyAnalyzer {
+    dependencies: Vec<Dependency>,
+}
+
+impl DependencyAnalyzer {
+    pub fn new() -> Self {
+        DependencyAnalyzer {
+            dependencies: Vec::new(),
+        }
+    }
+    
+    /// Analyze loop for dependencies
+    pub fn analyze(&mut self, loop_: &Loop) -> &[Dependency] {
+        self.dependencies.clear();
+        
+        // Build def-use chains
+        let defs = self.collect_defs(loop_);
+        let uses = self.collect_uses(loop_);
+        
+        // Check for flow dependencies (RAW)
+        for (def_idx, def_var) in &defs {
+            for (use_idx, use_var) in &uses {
+                if def_var == use_var {
+                    let distance = self.compute_distance(loop_, *def_idx, *use_idx);
+                    self.dependencies.push(Dependency {
+                        source: *def_idx,
+                        sink: *use_idx,
+                        kind: DepKind::Flow,
+                        distance,
+                        memory: None,
+                    });
+                }
+            }
+        }
+        
+        // Check for anti dependencies (WAR)
+        for (use_idx, use_var) in &uses {
+            for (def_idx, def_var) in &defs {
+                if use_var == def_var && *use_idx < *def_idx {
+                    let distance = self.compute_distance(loop_, *use_idx, *def_idx);
+                    self.dependencies.push(Dependency {
+                        source: *use_idx,
+                        sink: *def_idx,
+                        kind: DepKind::Anti,
+                        distance,
+                        memory: None,
+                    });
+                }
+            }
+        }
+        
+        // Check for output dependencies (WAW)
+        for (i, (def_idx1, def_var1)) in defs.iter().enumerate() {
+            for (def_idx2, def_var2) in defs.iter().skip(i + 1) {
+                if def_var1 == def_var2 {
+                    let distance = self.compute_distance(loop_, *def_idx1, *def_idx2);
+                    self.dependencies.push(Dependency {
+                        source: *def_idx1,
+                        sink: *def_idx2,
+                        kind: DepKind::Output,
+                        distance,
+                        memory: None,
+                    });
+                }
+            }
+        }
+        
+        // Memory dependency analysis
+        self.analyze_memory_deps(loop_);
+        
+        &self.dependencies
+    }
+    
+    fn collect_defs(&self, loop_: &Loop) -> Vec<(usize, String)> {
+        let mut defs = Vec::new();
+        
+        for (idx, stmt) in loop_.body.iter().enumerate() {
+            match stmt {
+                Statement::Assign { lhs, .. } => {
+                    if let LValue::Var(name) = lhs {
+                        defs.push((idx, name.clone()));
+                    }
+                }
+                Statement::Reduction { var, .. } => {
+                    defs.push((idx, var.clone()));
+                }
+                _ => {}
+            }
+        }
+        
+        defs
+    }
+    
+    fn collect_uses(&self, loop_: &Loop) -> Vec<(usize, String)> {
+        let mut uses = Vec::new();
+        
+        for (idx, stmt) in loop_.body.iter().enumerate() {
+            match stmt {
+                Statement::Assign { rhs, .. } => {
+                    self.collect_expr_uses(rhs, idx, &mut uses);
+                }
+                Statement::Store { ptr, value } => {
+                    self.collect_expr_uses(ptr, idx, &mut uses);
+                    self.collect_expr_uses(value, idx, &mut uses);
+                }
+                Statement::Reduction { value, .. } => {
+                    self.collect_expr_uses(value, idx, &mut uses);
+                }
+                _ => {}
+            }
+        }
+        
+        uses
+    }
+    
+    fn collect_expr_uses(&self, expr: &Expr, idx: usize, uses: &mut Vec<(usize, String)>) {
+        match expr {
+            Expr::Var(name) => {
+                uses.push((idx, name.clone()));
+            }
+            Expr::BinOp(lhs, _, rhs) => {
+                self.collect_expr_uses(lhs, idx, uses);
+                self.collect_expr_uses(rhs, idx, uses);
+            }
+            Expr::UnaryOp(_, e) => {
+                self.collect_expr_uses(e, idx, uses);
+            }
+            Expr::Load(base, index) => {
+                self.collect_expr_uses(base, idx, uses);
+                self.collect_expr_uses(index, idx, uses);
+            }
+            Expr::Select(c, t, f) => {
+                self.collect_expr_uses(c, idx, uses);
+                self.collect_expr_uses(t, idx, uses);
+                self.collect_expr_uses(f, idx, uses);
+            }
+            Expr::MathFunc(_, args) => {
+                for arg in args {
+                    self.collect_expr_uses(arg, idx, uses);
+                }
+            }
+            Expr::Cast(e, _) => {
+                self.collect_expr_uses(e, idx, uses);
+            }
+            _ => {}
+        }
+    }
+    
+    fn compute_distance(&self, _loop_: &Loop, _source: usize, _sink: usize) -> DepDistance {
+        // Simplified: assume same-iteration unless we can prove otherwise
+        DepDistance::Constant(0)
+    }
+    
+    fn analyze_memory_deps(&mut self, loop_: &Loop) {
+        let accesses = &loop_.accesses;
+        
+        for (i, access1) in accesses.iter().enumerate() {
+            for access2 in accesses.iter().skip(i + 1) {
+                if access1.base == access2.base {
+                    // Potential aliasing
+                    let kind = match (access1.kind, access2.kind) {
+                        (AccessKind::Write, AccessKind::Read) => Some(DepKind::Flow),
+                        (AccessKind::Read, AccessKind::Write) => Some(DepKind::Anti),
+                        (AccessKind::Write, AccessKind::Write) => Some(DepKind::Output),
+                        _ => None,
+                    };
+                    
+                    if let Some(kind) = kind {
+                        let distance = self.analyze_access_distance(&access1.pattern, &access2.pattern);
+                        
+                        self.dependencies.push(Dependency {
+                            source: access1.stmt_idx,
+                            sink: access2.stmt_idx,
+                            kind,
+                            distance,
+                            memory: Some(access1.base.clone()),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    
+    fn analyze_access_distance(&self, p1: &AccessPattern, p2: &AccessPattern) -> DepDistance {
+        match (p1, p2) {
+            (AccessPattern::Consecutive { stride: s1 }, AccessPattern::Consecutive { stride: s2 })
+                if s1 == s2 => DepDistance::Constant(0),
+            (AccessPattern::Unknown, _) | (_, AccessPattern::Unknown) => DepDistance::Variable,
+            _ => DepDistance::Variable,
+        }
+    }
+    
+    /// Check if loop can be vectorized
+    pub fn can_vectorize(&self) -> bool {
+        for dep in &self.dependencies {
+            match &dep.distance {
+                DepDistance::Constant(d) if *d != 0 => {
+                    // Cross-iteration dependency
+                    if dep.kind == DepKind::Flow || dep.kind == DepKind::Output {
+                        return false;
+                    }
+                }
+                DepDistance::Variable => {
+                    // Unknown distance - assume worst case
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+}
+
+impl Default for DependencyAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COST MODEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Vectorization cost model
+pub struct CostModel {
+    /// Target SIMD level
+    target_level: SimdLevel,
+    
+    /// Target vector width
+    vector_width: u32,
+    
+    /// Instruction costs
+    instruction_costs: BTreeMap<String, u32>,
+}
+
+impl CostModel {
+    pub fn new(level: SimdLevel) -> Self {
+        let mut costs = BTreeMap::new();
+        
+        // Basic costs (cycles)
+        costs.insert("add".to_string(), 1);
+        costs.insert("sub".to_string(), 1);
+        costs.insert("mul".to_string(), 4);
+        costs.insert("div".to_string(), 20);
+        costs.insert("fma".to_string(), 4);
+        costs.insert("load_aligned".to_string(), 3);
+        costs.insert("load_unaligned".to_string(), 5);
+        costs.insert("store_aligned".to_string(), 3);
+        costs.insert("store_unaligned".to_string(), 5);
+        costs.insert("gather".to_string(), 15);
+        costs.insert("scatter".to_string(), 20);
+        costs.insert("shuffle".to_string(), 2);
+        costs.insert("blend".to_string(), 1);
+        costs.insert("broadcast".to_string(), 1);
+        
+        CostModel {
+            target_level: level,
+            vector_width: level.vector_width(),
+            instruction_costs: costs,
+        }
+    }
+    
+    /// Estimate scalar cost of loop
+    pub fn scalar_cost(&self, loop_: &Loop) -> u64 {
+        let trip_count = loop_.meta.trip_count.unwrap_or(100);
+        let body_cost: u64 = loop_.body.iter()
+            .map(|s| self.stmt_cost(s))
+            .sum();
+        
+        trip_count * body_cost
+    }
+    
+    /// Estimate vectorized cost of loop
+    pub fn vector_cost(&self, loop_: &Loop, vf: u32) -> u64 {
+        let trip_count = loop_.meta.trip_count.unwrap_or(100);
+        let vector_iters = trip_count / vf as u64;
+        let scalar_remainder = trip_count % vf as u64;
+        
+        let body_cost: u64 = loop_.body.iter()
+            .map(|s| self.stmt_cost(s))
+            .sum();
+        
+        // Vector iterations + setup + scalar remainder
+        let setup_cost = 10;
+        let vector_body_cost = body_cost; // Simplified: same ops, but on vectors
+        
+        setup_cost + vector_iters * vector_body_cost + scalar_remainder * body_cost
+    }
+    
+    fn stmt_cost(&self, stmt: &Statement) -> u64 {
+        match stmt {
+            Statement::Assign { rhs, .. } => self.expr_cost(rhs),
+            Statement::Store { value, .. } => {
+                self.instruction_costs.get("store_aligned").copied().unwrap_or(3) as u64
+                    + self.expr_cost(value)
+            }
+            Statement::Reduction { value, .. } => {
+                self.expr_cost(value) + 2 // reduction operation
+            }
+            Statement::Call { .. } => 20, // Function call overhead
+            Statement::If { condition, then_branch, else_branch } => {
+                self.expr_cost(condition)
+                    + then_branch.iter().map(|s| self.stmt_cost(s)).sum::<u64>()
+                    + else_branch.iter().map(|s| self.stmt_cost(s)).sum::<u64>()
+            }
+        }
+    }
+    
+    fn expr_cost(&self, expr: &Expr) -> u64 {
+        match expr {
+            Expr::Var(_) | Expr::Const(_) | Expr::Induction(_) => 0,
+            Expr::Load(_, _) => {
+                self.instruction_costs.get("load_aligned").copied().unwrap_or(3) as u64
+            }
+            Expr::BinOp(l, op, r) => {
+                let op_cost = match op {
+                    BinOp::Add | BinOp::Sub => 1,
+                    BinOp::Mul => 4,
+                    BinOp::Div | BinOp::Rem => 20,
+                    _ => 1,
+                };
+                self.expr_cost(l) + self.expr_cost(r) + op_cost
+            }
+            Expr::UnaryOp(_, e) => self.expr_cost(e) + 1,
+            Expr::MathFunc(func, args) => {
+                let func_cost = match func {
+                    MathFunc::Sqrt => 15,
+                    MathFunc::Sin | MathFunc::Cos | MathFunc::Tan => 50,
+                    MathFunc::Exp | MathFunc::Log => 30,
+                    MathFunc::Fma => 4,
+                    _ => 10,
+                };
+                args.iter().map(|a| self.expr_cost(a)).sum::<u64>() + func_cost
+            }
+            Expr::Cast(e, _) => self.expr_cost(e) + 1,
+            Expr::Select(c, t, f) => {
+                self.expr_cost(c) + self.expr_cost(t) + self.expr_cost(f) + 1
+            }
+        }
+    }
+    
+    /// Determine best vectorization factor
+    pub fn best_vf(&self, loop_: &Loop, elem_type: ScalarType) -> u32 {
+        let max_vf = self.vector_width / elem_type.size_bits();
+        
+        let mut best_vf = 1;
+        let mut best_cost = self.scalar_cost(loop_);
+        
+        for vf in [2, 4, 8, 16, 32].iter().copied() {
+            if vf > max_vf {
+                break;
+            }
+            
+            let cost = self.vector_cost(loop_, vf);
+            if cost < best_cost {
+                best_cost = cost;
+                best_vf = vf;
+            }
+        }
+        
+        best_vf
+    }
+    
+    /// Should we vectorize?
+    pub fn should_vectorize(&self, loop_: &Loop, vf: u32) -> bool {
+        let scalar = self.scalar_cost(loop_);
+        let vector = self.vector_cost(loop_, vf);
+        
+        // Vectorize if at least 20% speedup
+        vector < scalar * 80 / 100
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VECTORIZER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop vectorizer
+pub struct Vectorizer {
+    /// SIMD features
+    features: SimdFeatures,
+    
+    /// Target SIMD level
+    target_level: SimdLevel,
+    
+    /// Dependency analyzer
+    dep_analyzer: DependencyAnalyzer,
+    
+    /// Cost model
+    cost_model: CostModel,
+}
+
+/// Vectorization result
+#[derive(Debug)]
+pub struct VectorizationResult {
+    /// Was vectorization successful?
+    pub success: bool,
+    
+    /// Vectorization factor used
+    pub vf: u32,
+    
+    /// Transformed loop (if successful)
+    pub vectorized_loop: Option<VectorizedLoop>,
+    
+    /// Reason for failure (if failed)
+    pub failure_reason: Option<VectorizationFailure>,
+    
+    /// Estimated speedup
+    pub estimated_speedup: f64,
+}
+
+/// Vectorized loop representation
+#[derive(Debug, Clone)]
+pub struct VectorizedLoop {
+    /// Original loop ID
+    pub original_id: LoopId,
+    
+    /// Vectorization factor
+    pub vf: u32,
+    
+    /// Vectorized body operations
+    pub vector_ops: Vec<VectorOp>,
+    
+    /// Scalar remainder handling
+    pub remainder: RemainderStrategy,
+    
+    /// Prologue for alignment
+    pub prologue: Option<Vec<Statement>>,
+    
+    /// Epilogue for cleanup
+    pub epilogue: Option<Vec<Statement>>,
+}
+
+/// Vector operation
+#[derive(Debug, Clone)]
+pub struct VectorOp {
+    /// Operation kind
+    pub kind: SimdOp,
+    
+    /// Result variable
+    pub result: String,
+    
+    /// Operands
+    pub operands: Vec<VectorOperand>,
+    
+    /// Element type
+    pub elem_type: SimdElemType,
+    
+    /// Vector width
+    pub width: u32,
+}
+
+/// Vector operand
+#[derive(Debug, Clone)]
+pub enum VectorOperand {
+    Vector(String),
+    Scalar(String),
+    Constant(Constant),
+    Load { base: String, offset: Expr, aligned: bool },
+}
+
+/// Remainder handling strategy
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemainderStrategy {
+    /// Scalar loop for remainder
+    ScalarLoop,
+    /// Masked vector operations
+    MaskedVector,
+    /// No remainder (trip count divisible by VF)
+    None,
+}
+
+/// Vectorization failure reason
+#[derive(Debug, Clone)]
+pub enum VectorizationFailure {
+    /// Loop-carried dependency prevents vectorization
+    LoopCarriedDependency(String),
+    /// Unsupported operation in loop body
+    UnsupportedOperation(String),
+    /// Not profitable (cost too high)
+    NotProfitable { scalar_cost: u64, vector_cost: u64 },
+    /// Unknown trip count with non-trivial remainder
+    UnknownTripCount,
+    /// Unaligned memory access without support
+    UnalignedAccess,
+    /// Function call with side effects
+    FunctionCallSideEffects(String),
+    /// Disabled by hint
+    DisabledByHint,
+    /// Too few iterations
+    TooFewIterations(u64),
+}
+
+impl Vectorizer {
+    pub fn new(features: SimdFeatures) -> Self {
+        let level = features.best_level();
+        Vectorizer {
+            features,
+            target_level: level,
+            dep_analyzer: DependencyAnalyzer::new(),
+            cost_model: CostModel::new(level),
+        }
+    }
+    
+    /// Attempt to vectorize loop
+    pub fn vectorize(&mut self, loop_: &Loop) -> VectorizationResult {
+        // Check hints
+        if loop_.meta.vectorize_hint == VectorizeHint::Disable {
+            return VectorizationResult {
+                success: false,
+                vf: 1,
+                vectorized_loop: None,
+                failure_reason: Some(VectorizationFailure::DisabledByHint),
+                estimated_speedup: 1.0,
+            };
+        }
+        
+        // Check trip count
+        if let Some(tc) = loop_.meta.trip_count {
+            if tc < 4 {
+                return VectorizationResult {
+                    success: false,
+                    vf: 1,
+                    vectorized_loop: None,
+                    failure_reason: Some(VectorizationFailure::TooFewIterations(tc)),
+                    estimated_speedup: 1.0,
+                };
+            }
+        }
+        
+        // Analyze dependencies
+        self.dep_analyzer.analyze(loop_);
+        
+        if !self.dep_analyzer.can_vectorize() {
+            return VectorizationResult {
+                success: false,
+                vf: 1,
+                vectorized_loop: None,
+                failure_reason: Some(VectorizationFailure::LoopCarriedDependency(
+                    "cross-iteration dependency detected".to_string()
+                )),
+                estimated_speedup: 1.0,
+            };
+        }
+        
+        // Check for unsupported operations
+        if let Some(reason) = self.check_unsupported(loop_) {
+            return VectorizationResult {
+                success: false,
+                vf: 1,
+                vectorized_loop: None,
+                failure_reason: Some(reason),
+                estimated_speedup: 1.0,
+            };
+        }
+        
+        // Determine element type and VF
+        let elem_type = self.dominant_elem_type(loop_);
+        let vf = match loop_.meta.vectorize_hint {
+            VectorizeHint::Width(w) => w,
+            _ => self.cost_model.best_vf(loop_, elem_type),
+        };
+        
+        // Check profitability
+        if !self.cost_model.should_vectorize(loop_, vf) {
+            let scalar = self.cost_model.scalar_cost(loop_);
+            let vector = self.cost_model.vector_cost(loop_, vf);
+            return VectorizationResult {
+                success: false,
+                vf: 1,
+                vectorized_loop: None,
+                failure_reason: Some(VectorizationFailure::NotProfitable {
+                    scalar_cost: scalar,
+                    vector_cost: vector,
+                }),
+                estimated_speedup: scalar as f64 / vector as f64,
+            };
+        }
+        
+        // Generate vectorized loop
+        let vectorized = self.generate_vectorized_loop(loop_, vf, elem_type);
+        
+        let scalar_cost = self.cost_model.scalar_cost(loop_);
+        let vector_cost = self.cost_model.vector_cost(loop_, vf);
+        let speedup = scalar_cost as f64 / vector_cost as f64;
+        
+        VectorizationResult {
+            success: true,
+            vf,
+            vectorized_loop: Some(vectorized),
+            failure_reason: None,
+            estimated_speedup: speedup,
+        }
+    }
+    
+    fn check_unsupported(&self, loop_: &Loop) -> Option<VectorizationFailure> {
+        for stmt in &loop_.body {
+            if let Statement::Call { func, .. } = stmt {
+                // Check if function is vectorizable
+                if !self.is_vectorizable_call(func) {
+                    return Some(VectorizationFailure::FunctionCallSideEffects(func.clone()));
+                }
+            }
+        }
+        
+        // Check memory accesses
+        for access in &loop_.accesses {
+            if matches!(access.pattern, AccessPattern::Unknown) {
+                return Some(VectorizationFailure::UnsupportedOperation(
+                    "unknown memory access pattern".to_string()
+                ));
+            }
+        }
+        
+        None
+    }
+    
+    fn is_vectorizable_call(&self, func: &str) -> bool {
+        // Math functions are vectorizable
+        matches!(func, 
+            "sin" | "cos" | "tan" | "sqrt" | "exp" | "log" |
+            "floor" | "ceil" | "round" | "abs" | "min" | "max" |
+            "fma" | "pow"
+        )
+    }
+    
+    fn dominant_elem_type(&self, loop_: &Loop) -> ScalarType {
+        // Find most common element type in accesses
+        let mut type_counts: BTreeMap<ScalarType, usize> = BTreeMap::new();
+        
+        for access in &loop_.accesses {
+            *type_counts.entry(access.elem_type).or_insert(0) += 1;
+        }
+        
+        type_counts.into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(ty, _)| ty)
+            .unwrap_or(ScalarType::F32)
+    }
+    
+    fn generate_vectorized_loop(
+        &self,
+        loop_: &Loop,
+        vf: u32,
+        elem_type: ScalarType,
+    ) -> VectorizedLoop {
+        let remainder = if let Some(tc) = loop_.meta.trip_count {
+            if tc % vf as u64 == 0 {
+                RemainderStrategy::None
+            } else {
+                RemainderStrategy::ScalarLoop
+            }
+        } else {
+            RemainderStrategy::ScalarLoop
+        };
+        
+        let mut vector_ops = Vec::new();
+        
+        // Convert each statement to vector operations
+        for (idx, stmt) in loop_.body.iter().enumerate() {
+            let ops = self.vectorize_statement(stmt, vf, elem_type, idx);
+            vector_ops.extend(ops);
+        }
+        
+        VectorizedLoop {
+            original_id: loop_.id,
+            vf,
+            vector_ops,
+            remainder,
+            prologue: None,
+            epilogue: None,
+        }
+    }
+    
+    fn vectorize_statement(
+        &self,
+        stmt: &Statement,
+        vf: u32,
+        elem_type: ScalarType,
+        idx: usize,
+    ) -> Vec<VectorOp> {
+        let width = self.target_level.vector_width();
+        let simd_elem = elem_type.to_simd_elem();
+        
+        match stmt {
+            Statement::Assign { lhs: LValue::ArrayIndex(arr, _), rhs } => {
+                // Array store - need load, compute, store
+                let mut ops = Vec::new();
+                
+                // Vectorize RHS computation
+                let (rhs_ops, rhs_result) = self.vectorize_expr(rhs, vf, simd_elem, width, idx);
+                ops.extend(rhs_ops);
+                
+                // Store result
+                ops.push(VectorOp {
+                    kind: SimdOp::StoreAligned,
+                    result: format!("{}_store_{}", arr, idx),
+                    operands: vec![
+                        VectorOperand::Load {
+                            base: arr.clone(),
+                            offset: Expr::Induction("i".to_string()),
+                            aligned: true,
+                        },
+                        VectorOperand::Vector(rhs_result),
+                    ],
+                    elem_type: simd_elem,
+                    width,
+                });
+                
+                ops
+            }
+            Statement::Reduction { var, op, value } => {
+                let simd_op = match op {
+                    ReductionOp::Sum => SimdOp::Add,
+                    ReductionOp::Product => SimdOp::Mul,
+                    ReductionOp::Min => SimdOp::Min,
+                    ReductionOp::Max => SimdOp::Max,
+                    _ => SimdOp::Add,
+                };
+                
+                let (val_ops, val_result) = self.vectorize_expr(value, vf, simd_elem, width, idx);
+                let mut ops = val_ops;
+                
+                // Partial reduction within vector
+                ops.push(VectorOp {
+                    kind: simd_op,
+                    result: format!("{}_partial_{}", var, idx),
+                    operands: vec![
+                        VectorOperand::Vector(format!("{}_accum", var)),
+                        VectorOperand::Vector(val_result),
+                    ],
+                    elem_type: simd_elem,
+                    width,
+                });
+                
+                ops
+            }
+            _ => Vec::new(),
+        }
+    }
+    
+    fn vectorize_expr(
+        &self,
+        expr: &Expr,
+        vf: u32,
+        elem_type: SimdElemType,
+        width: u32,
+        idx: usize,
+    ) -> (Vec<VectorOp>, String) {
+        match expr {
+            Expr::Load(base, _index) => {
+                if let Expr::Var(arr) = base.as_ref() {
+                    let result = format!("load_{}_{}", arr, idx);
+                    let op = VectorOp {
+                        kind: SimdOp::LoadAligned,
+                        result: result.clone(),
+                        operands: vec![VectorOperand::Load {
+                            base: arr.clone(),
+                            offset: Expr::Induction("i".to_string()),
+                            aligned: true,
+                        }],
+                        elem_type,
+                        width,
+                    };
+                    (vec![op], result)
+                } else {
+                    (vec![], format!("unknown_{}", idx))
+                }
+            }
+            Expr::BinOp(lhs, op, rhs) => {
+                let (lhs_ops, lhs_result) = self.vectorize_expr(lhs, vf, elem_type, width, idx);
+                let (rhs_ops, rhs_result) = self.vectorize_expr(rhs, vf, elem_type, width, idx + 1000);
+                
+                let simd_op = match op {
+                    BinOp::Add => SimdOp::Add,
+                    BinOp::Sub => SimdOp::Sub,
+                    BinOp::Mul => SimdOp::Mul,
+                    BinOp::Div => SimdOp::Div,
+                    BinOp::Min => SimdOp::Min,
+                    BinOp::Max => SimdOp::Max,
+                    _ => SimdOp::Add,
+                };
+                
+                let result = format!("binop_{}", idx);
+                let mut ops = lhs_ops;
+                ops.extend(rhs_ops);
+                ops.push(VectorOp {
+                    kind: simd_op,
+                    result: result.clone(),
+                    operands: vec![
+                        VectorOperand::Vector(lhs_result),
+                        VectorOperand::Vector(rhs_result),
+                    ],
+                    elem_type,
+                    width,
+                });
+                
+                (ops, result)
+            }
+            Expr::Const(c) => {
+                let result = format!("const_{}", idx);
+                let op = VectorOp {
+                    kind: SimdOp::Broadcast,
+                    result: result.clone(),
+                    operands: vec![VectorOperand::Constant(c.clone())],
+                    elem_type,
+                    width,
+                };
+                (vec![op], result)
+            }
+            _ => (vec![], format!("expr_{}", idx)),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn create_simple_loop() -> Loop {
+        Loop {
+            id: LoopId(0),
+            induction: InductionVar {
+                name: "i".to_string(),
+                start: Expr::Const(Constant::Int(0)),
+                step: Expr::Const(Constant::Int(1)),
+                ty: ScalarType::I64,
+            },
+            bounds: LoopBounds {
+                lower: Expr::Const(Constant::Int(0)),
+                upper: Expr::Var("n".to_string()),
+                step: Expr::Const(Constant::Int(1)),
+                kind: BoundKind::LessThan,
+            },
+            body: vec![
+                Statement::Assign {
+                    lhs: LValue::ArrayIndex("c".to_string(), Box::new(Expr::Var("i".to_string()))),
+                    rhs: Expr::BinOp(
+                        Box::new(Expr::Load(
+                            Box::new(Expr::Var("a".to_string())),
+                            Box::new(Expr::Var("i".to_string())),
+                        )),
+                        BinOp::Add,
+                        Box::new(Expr::Load(
+                            Box::new(Expr::Var("b".to_string())),
+                            Box::new(Expr::Var("i".to_string())),
+                        )),
+                    ),
+                },
+            ],
+            accesses: vec![
+                MemoryAccess {
+                    kind: AccessKind::Read,
+                    base: "a".to_string(),
+                    pattern: AccessPattern::Consecutive { stride: 1 },
+                    stmt_idx: 0,
+                    elem_type: ScalarType::F32,
+                },
+                MemoryAccess {
+                    kind: AccessKind::Read,
+                    base: "b".to_string(),
+                    pattern: AccessPattern::Consecutive { stride: 1 },
+                    stmt_idx: 0,
+                    elem_type: ScalarType::F32,
+                },
+                MemoryAccess {
+                    kind: AccessKind::Write,
+                    base: "c".to_string(),
+                    pattern: AccessPattern::Consecutive { stride: 1 },
+                    stmt_idx: 0,
+                    elem_type: ScalarType::F32,
+                },
+            ],
+            nested: vec![],
+            meta: LoopMeta {
+                trip_count: Some(1000),
+                ..Default::default()
+            },
+        }
+    }
+    
+    #[test]
+    fn test_dependency_analysis() {
+        let loop_ = create_simple_loop();
+        let mut analyzer = DependencyAnalyzer::new();
+        
+        analyzer.analyze(&loop_);
+        assert!(analyzer.can_vectorize());
+    }
+    
+    #[test]
+    fn test_cost_model() {
+        let loop_ = create_simple_loop();
+        let model = CostModel::new(SimdLevel::Avx2);
+        
+        let scalar_cost = model.scalar_cost(&loop_);
+        let vector_cost = model.vector_cost(&loop_, 8);
+        
+        assert!(scalar_cost > vector_cost);
+    }
+    
+    #[test]
+    fn test_vectorizer() {
+        let loop_ = create_simple_loop();
+        let features = SimdFeatures {
+            avx2: true,
+            avx: true,
+            sse4_2: true,
+            sse4_1: true,
+            ssse3: true,
+            sse3: true,
+            sse2: true,
+            ..Default::default()
+        };
+        
+        let mut vectorizer = Vectorizer::new(features);
+        let result = vectorizer.vectorize(&loop_);
+        
+        assert!(result.success);
+        assert!(result.vf > 1);
+        assert!(result.estimated_speedup > 1.0);
+    }
+    
+    #[test]
+    fn test_access_pattern() {
+        let consecutive = AccessPattern::Consecutive { stride: 1 };
+        assert!(consecutive.is_consecutive());
+        assert!(consecutive.is_unit_stride());
+        
+        let strided = AccessPattern::Strided { stride: 4 };
+        assert!(!strided.is_unit_stride());
+    }
+}

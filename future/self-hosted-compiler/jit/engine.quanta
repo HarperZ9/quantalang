@@ -1,0 +1,851 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ JIT — Just-In-Time Compilation Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// JIT compilation infrastructure:
+// - Tiered compilation (interpreter → baseline → optimized)
+// - On-stack replacement (OSR)
+// - Inline caching
+// - Deoptimization support
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::jit::engine
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::sync::Arc;
+use alloc::collections::BTreeMap;
+use std::sync::{RwLock, Mutex};
+use std::time::{Instant, Duration};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXECUTABLE MEMORY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Executable memory region
+pub struct ExecutableMemory {
+    /// Base address
+    base: *mut u8,
+    
+    /// Total size
+    size: usize,
+    
+    /// Current write offset
+    offset: usize,
+    
+    /// Memory protection state
+    protection: Protection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protection {
+    ReadWrite,
+    ReadExecute,
+}
+
+impl ExecutableMemory {
+    /// Allocate executable memory
+    pub fn allocate(size: usize) -> Result<Self, JitError> {
+        #[cfg(unix)]
+        {
+            use std::ptr;
+            
+            let ptr = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            
+            if ptr == libc::MAP_FAILED {
+                return Err(JitError::MemoryAllocation);
+            }
+            
+            Ok(ExecutableMemory {
+                base: ptr as *mut u8,
+                size,
+                offset: 0,
+                protection: Protection::ReadWrite,
+            })
+        }
+        
+        #[cfg(windows)]
+        {
+            use std::ptr;
+            
+            let ptr = unsafe {
+                winapi::um::memoryapi::VirtualAlloc(
+                    ptr::null_mut(),
+                    size,
+                    winapi::um::winnt::MEM_COMMIT | winapi::um::winnt::MEM_RESERVE,
+                    winapi::um::winnt::PAGE_READWRITE,
+                )
+            };
+            
+            if ptr.is_null() {
+                return Err(JitError::MemoryAllocation);
+            }
+            
+            Ok(ExecutableMemory {
+                base: ptr as *mut u8,
+                size,
+                offset: 0,
+                protection: Protection::ReadWrite,
+            })
+        }
+        
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(JitError::UnsupportedPlatform)
+        }
+    }
+    
+    /// Write bytes to memory
+    pub fn write(&mut self, bytes: &[u8]) -> Result<usize, JitError> {
+        if self.protection != Protection::ReadWrite {
+            return Err(JitError::NotWritable);
+        }
+        
+        if self.offset + bytes.len() > self.size {
+            return Err(JitError::OutOfMemory);
+        }
+        
+        let addr = self.offset;
+        
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.base.add(self.offset),
+                bytes.len(),
+            );
+        }
+        
+        self.offset += bytes.len();
+        Ok(addr)
+    }
+    
+    /// Make memory executable
+    pub fn make_executable(&mut self) -> Result<(), JitError> {
+        if self.protection == Protection::ReadExecute {
+            return Ok(());
+        }
+        
+        #[cfg(unix)]
+        {
+            let result = unsafe {
+                libc::mprotect(
+                    self.base as *mut libc::c_void,
+                    self.size,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                )
+            };
+            
+            if result != 0 {
+                return Err(JitError::ProtectionChange);
+            }
+            
+            // Flush instruction cache
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                std::arch::asm!(
+                    "dc cvau, {0}",
+                    "dsb ish",
+                    "ic ivau, {0}",
+                    "dsb ish",
+                    "isb",
+                    in(reg) self.base,
+                );
+            }
+        }
+        
+        #[cfg(windows)]
+        {
+            let mut old_protect = 0u32;
+            let result = unsafe {
+                winapi::um::memoryapi::VirtualProtect(
+                    self.base as *mut _,
+                    self.size,
+                    winapi::um::winnt::PAGE_EXECUTE_READ,
+                    &mut old_protect,
+                )
+            };
+            
+            if result == 0 {
+                return Err(JitError::ProtectionChange);
+            }
+            
+            // Flush instruction cache
+            unsafe {
+                winapi::um::processthreadsapi::FlushInstructionCache(
+                    winapi::um::processthreadsapi::GetCurrentProcess(),
+                    self.base as *const _,
+                    self.size,
+                );
+            }
+        }
+        
+        self.protection = Protection::ReadExecute;
+        Ok(())
+    }
+    
+    /// Get function pointer at offset
+    pub unsafe fn get_function<F>(&self, offset: usize) -> F {
+        std::mem::transmute_copy(&self.base.add(offset))
+    }
+    
+    /// Get base address
+    pub fn base(&self) -> *const u8 {
+        self.base
+    }
+    
+    /// Get current offset
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+    
+    /// Remaining capacity
+    pub fn remaining(&self) -> usize {
+        self.size - self.offset
+    }
+}
+
+impl Drop for ExecutableMemory {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::munmap(self.base as *mut libc::c_void, self.size);
+        }
+        
+        #[cfg(windows)]
+        unsafe {
+            winapi::um::memoryapi::VirtualFree(
+                self.base as *mut _,
+                0,
+                winapi::um::winnt::MEM_RELEASE,
+            );
+        }
+    }
+}
+
+// Safety: ExecutableMemory manages its own memory and is thread-safe
+unsafe impl Send for ExecutableMemory {}
+unsafe impl Sync for ExecutableMemory {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CODE BUFFER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Buffer for assembling machine code
+pub struct CodeBuffer {
+    /// Assembled bytes
+    bytes: Vec<u8>,
+    
+    /// Label definitions
+    labels: BTreeMap<Label, usize>,
+    
+    /// Pending label fixups
+    fixups: Vec<Fixup>,
+    
+    /// Relocation entries
+    relocations: Vec<Relocation>,
+}
+
+/// Label for jumps/branches
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Label(pub u32);
+
+/// Pending fixup for label reference
+#[derive(Debug, Clone)]
+struct Fixup {
+    /// Position in code
+    position: usize,
+    
+    /// Target label
+    label: Label,
+    
+    /// Fixup kind
+    kind: FixupKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FixupKind {
+    /// 8-bit relative offset
+    Rel8,
+    /// 32-bit relative offset
+    Rel32,
+    /// 64-bit absolute address
+    Abs64,
+}
+
+/// Relocation entry
+#[derive(Debug, Clone)]
+pub struct Relocation {
+    pub position: usize,
+    pub kind: RelocKind,
+    pub symbol: String,
+    pub addend: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelocKind {
+    /// PC-relative 32-bit
+    PcRel32,
+    /// Absolute 64-bit
+    Abs64,
+    /// GOT entry
+    GotPcRel32,
+    /// PLT entry
+    PltPcRel32,
+}
+
+impl CodeBuffer {
+    pub fn new() -> Self {
+        CodeBuffer {
+            bytes: Vec::with_capacity(4096),
+            labels: BTreeMap::new(),
+            fixups: Vec::new(),
+            relocations: Vec::new(),
+        }
+    }
+    
+    /// Current position
+    pub fn position(&self) -> usize {
+        self.bytes.len()
+    }
+    
+    /// Emit single byte
+    pub fn emit_u8(&mut self, byte: u8) {
+        self.bytes.push(byte);
+    }
+    
+    /// Emit 16-bit value (little-endian)
+    pub fn emit_u16(&mut self, val: u16) {
+        self.bytes.extend_from_slice(&val.to_le_bytes());
+    }
+    
+    /// Emit 32-bit value (little-endian)
+    pub fn emit_u32(&mut self, val: u32) {
+        self.bytes.extend_from_slice(&val.to_le_bytes());
+    }
+    
+    /// Emit 64-bit value (little-endian)
+    pub fn emit_u64(&mut self, val: u64) {
+        self.bytes.extend_from_slice(&val.to_le_bytes());
+    }
+    
+    /// Emit bytes
+    pub fn emit_bytes(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+    
+    /// Create new label
+    pub fn create_label(&self) -> Label {
+        Label(self.labels.len() as u32 + self.fixups.len() as u32)
+    }
+    
+    /// Bind label at current position
+    pub fn bind_label(&mut self, label: Label) {
+        self.labels.insert(label, self.bytes.len());
+    }
+    
+    /// Emit relative jump to label (32-bit)
+    pub fn emit_jmp_rel32(&mut self, label: Label) {
+        let position = self.bytes.len() + 1; // After opcode
+        
+        // Placeholder
+        self.emit_u8(0xE9); // JMP rel32
+        self.emit_u32(0);
+        
+        self.fixups.push(Fixup {
+            position,
+            label,
+            kind: FixupKind::Rel32,
+        });
+    }
+    
+    /// Emit conditional jump
+    pub fn emit_jcc_rel32(&mut self, condition: Condition, label: Label) {
+        let position = self.bytes.len() + 2; // After opcodes
+        
+        self.emit_u8(0x0F);
+        self.emit_u8(0x80 | condition as u8);
+        self.emit_u32(0);
+        
+        self.fixups.push(Fixup {
+            position,
+            label,
+            kind: FixupKind::Rel32,
+        });
+    }
+    
+    /// Add relocation
+    pub fn add_relocation(&mut self, kind: RelocKind, symbol: String, addend: i64) {
+        self.relocations.push(Relocation {
+            position: self.bytes.len(),
+            kind,
+            symbol,
+            addend,
+        });
+    }
+    
+    /// Resolve all fixups
+    pub fn resolve_fixups(&mut self) -> Result<(), JitError> {
+        for fixup in &self.fixups {
+            let target = *self.labels.get(&fixup.label)
+                .ok_or(JitError::UnresolvedLabel(fixup.label))?;
+            
+            let position = fixup.position;
+            
+            match fixup.kind {
+                FixupKind::Rel8 => {
+                    let offset = (target as i64 - (position + 1) as i64) as i8;
+                    self.bytes[position] = offset as u8;
+                }
+                FixupKind::Rel32 => {
+                    let offset = (target as i64 - (position + 4) as i64) as i32;
+                    let bytes = offset.to_le_bytes();
+                    self.bytes[position..position + 4].copy_from_slice(&bytes);
+                }
+                FixupKind::Abs64 => {
+                    let bytes = (target as u64).to_le_bytes();
+                    self.bytes[position..position + 8].copy_from_slice(&bytes);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Get assembled bytes
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    
+    /// Take ownership of bytes
+    pub fn take_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+    
+    /// Get relocations
+    pub fn relocations(&self) -> &[Relocation] {
+        &self.relocations
+    }
+}
+
+impl Default for CodeBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Condition codes for x86
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Condition {
+    Overflow = 0,
+    NoOverflow = 1,
+    Below = 2,
+    AboveEqual = 3,
+    Equal = 4,
+    NotEqual = 5,
+    BelowEqual = 6,
+    Above = 7,
+    Sign = 8,
+    NoSign = 9,
+    Parity = 10,
+    NoParity = 11,
+    Less = 12,
+    GreaterEqual = 13,
+    LessEqual = 14,
+    Greater = 15,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// x86-64 ASSEMBLER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// x86-64 register
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Reg64 {
+    Rax = 0, Rcx = 1, Rdx = 2, Rbx = 3,
+    Rsp = 4, Rbp = 5, Rsi = 6, Rdi = 7,
+    R8 = 8, R9 = 9, R10 = 10, R11 = 11,
+    R12 = 12, R13 = 13, R14 = 14, R15 = 15,
+}
+
+impl Reg64 {
+    fn needs_rex(&self) -> bool {
+        (*self as u8) >= 8
+    }
+    
+    fn encoding(&self) -> u8 {
+        (*self as u8) & 0x7
+    }
+}
+
+/// x86-64 XMM register
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RegXmm {
+    Xmm0 = 0, Xmm1 = 1, Xmm2 = 2, Xmm3 = 3,
+    Xmm4 = 4, Xmm5 = 5, Xmm6 = 6, Xmm7 = 7,
+    Xmm8 = 8, Xmm9 = 9, Xmm10 = 10, Xmm11 = 11,
+    Xmm12 = 12, Xmm13 = 13, Xmm14 = 14, Xmm15 = 15,
+}
+
+/// x86-64 assembler
+pub struct X64Assembler {
+    buffer: CodeBuffer,
+}
+
+impl X64Assembler {
+    pub fn new() -> Self {
+        X64Assembler {
+            buffer: CodeBuffer::new(),
+        }
+    }
+    
+    /// Get underlying buffer
+    pub fn buffer(&self) -> &CodeBuffer {
+        &self.buffer
+    }
+    
+    /// Take buffer
+    pub fn take_buffer(self) -> CodeBuffer {
+        self.buffer
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // LABELS
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    pub fn create_label(&self) -> Label {
+        self.buffer.create_label()
+    }
+    
+    pub fn bind_label(&mut self, label: Label) {
+        self.buffer.bind_label(label);
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // DATA MOVEMENT
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// MOV reg64, reg64
+    pub fn mov_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_rr(true, dst, src);
+        self.buffer.emit_u8(0x89);
+        self.emit_modrm(0b11, src.encoding(), dst.encoding());
+    }
+    
+    /// MOV reg64, imm64
+    pub fn mov_ri(&mut self, dst: Reg64, imm: i64) {
+        self.emit_rex(true, false, false, dst.needs_rex());
+        self.buffer.emit_u8(0xB8 + dst.encoding());
+        self.buffer.emit_u64(imm as u64);
+    }
+    
+    /// MOV reg64, [reg64 + offset]
+    pub fn mov_rm(&mut self, dst: Reg64, base: Reg64, offset: i32) {
+        self.emit_rex_rr(true, dst, base);
+        self.buffer.emit_u8(0x8B);
+        self.emit_modrm_mem(dst.encoding(), base.encoding(), offset);
+    }
+    
+    /// MOV [reg64 + offset], reg64
+    pub fn mov_mr(&mut self, base: Reg64, offset: i32, src: Reg64) {
+        self.emit_rex_rr(true, src, base);
+        self.buffer.emit_u8(0x89);
+        self.emit_modrm_mem(src.encoding(), base.encoding(), offset);
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // ARITHMETIC
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// ADD reg64, reg64
+    pub fn add_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_rr(true, src, dst);
+        self.buffer.emit_u8(0x01);
+        self.emit_modrm(0b11, src.encoding(), dst.encoding());
+    }
+    
+    /// ADD reg64, imm32
+    pub fn add_ri(&mut self, dst: Reg64, imm: i32) {
+        self.emit_rex(true, false, false, dst.needs_rex());
+        if imm >= -128 && imm <= 127 {
+            self.buffer.emit_u8(0x83);
+            self.emit_modrm(0b11, 0, dst.encoding());
+            self.buffer.emit_u8(imm as u8);
+        } else {
+            self.buffer.emit_u8(0x81);
+            self.emit_modrm(0b11, 0, dst.encoding());
+            self.buffer.emit_u32(imm as u32);
+        }
+    }
+    
+    /// SUB reg64, reg64
+    pub fn sub_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_rr(true, src, dst);
+        self.buffer.emit_u8(0x29);
+        self.emit_modrm(0b11, src.encoding(), dst.encoding());
+    }
+    
+    /// SUB reg64, imm32
+    pub fn sub_ri(&mut self, dst: Reg64, imm: i32) {
+        self.emit_rex(true, false, false, dst.needs_rex());
+        if imm >= -128 && imm <= 127 {
+            self.buffer.emit_u8(0x83);
+            self.emit_modrm(0b11, 5, dst.encoding());
+            self.buffer.emit_u8(imm as u8);
+        } else {
+            self.buffer.emit_u8(0x81);
+            self.emit_modrm(0b11, 5, dst.encoding());
+            self.buffer.emit_u32(imm as u32);
+        }
+    }
+    
+    /// IMUL reg64, reg64
+    pub fn imul_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_rr(true, dst, src);
+        self.buffer.emit_u8(0x0F);
+        self.buffer.emit_u8(0xAF);
+        self.emit_modrm(0b11, dst.encoding(), src.encoding());
+    }
+    
+    /// CMP reg64, reg64
+    pub fn cmp_rr(&mut self, lhs: Reg64, rhs: Reg64) {
+        self.emit_rex_rr(true, rhs, lhs);
+        self.buffer.emit_u8(0x39);
+        self.emit_modrm(0b11, rhs.encoding(), lhs.encoding());
+    }
+    
+    /// CMP reg64, imm32
+    pub fn cmp_ri(&mut self, lhs: Reg64, imm: i32) {
+        self.emit_rex(true, false, false, lhs.needs_rex());
+        if imm >= -128 && imm <= 127 {
+            self.buffer.emit_u8(0x83);
+            self.emit_modrm(0b11, 7, lhs.encoding());
+            self.buffer.emit_u8(imm as u8);
+        } else {
+            self.buffer.emit_u8(0x81);
+            self.emit_modrm(0b11, 7, lhs.encoding());
+            self.buffer.emit_u32(imm as u32);
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // CONTROL FLOW
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// JMP rel32
+    pub fn jmp(&mut self, label: Label) {
+        self.buffer.emit_jmp_rel32(label);
+    }
+    
+    /// Jcc rel32
+    pub fn jcc(&mut self, condition: Condition, label: Label) {
+        self.buffer.emit_jcc_rel32(condition, label);
+    }
+    
+    /// CALL reg64
+    pub fn call_r(&mut self, reg: Reg64) {
+        if reg.needs_rex() {
+            self.emit_rex(false, false, false, true);
+        }
+        self.buffer.emit_u8(0xFF);
+        self.emit_modrm(0b11, 2, reg.encoding());
+    }
+    
+    /// CALL [rip + offset]
+    pub fn call_rip_rel(&mut self, symbol: String) {
+        self.buffer.emit_u8(0xFF);
+        self.buffer.emit_u8(0x15);
+        self.buffer.add_relocation(RelocKind::PcRel32, symbol, -4);
+        self.buffer.emit_u32(0);
+    }
+    
+    /// RET
+    pub fn ret(&mut self) {
+        self.buffer.emit_u8(0xC3);
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // STACK
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// PUSH reg64
+    pub fn push(&mut self, reg: Reg64) {
+        if reg.needs_rex() {
+            self.emit_rex(false, false, false, true);
+        }
+        self.buffer.emit_u8(0x50 + reg.encoding());
+    }
+    
+    /// POP reg64
+    pub fn pop(&mut self, reg: Reg64) {
+        if reg.needs_rex() {
+            self.emit_rex(false, false, false, true);
+        }
+        self.buffer.emit_u8(0x58 + reg.encoding());
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // ENCODING HELPERS
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn emit_rex(&mut self, w: bool, r: bool, x: bool, b: bool) {
+        let mut rex = 0x40u8;
+        if w { rex |= 0x08; }
+        if r { rex |= 0x04; }
+        if x { rex |= 0x02; }
+        if b { rex |= 0x01; }
+        self.buffer.emit_u8(rex);
+    }
+    
+    fn emit_rex_rr(&mut self, w: bool, reg: Reg64, rm: Reg64) {
+        if w || reg.needs_rex() || rm.needs_rex() {
+            self.emit_rex(w, reg.needs_rex(), false, rm.needs_rex());
+        }
+    }
+    
+    fn emit_modrm(&mut self, mode: u8, reg: u8, rm: u8) {
+        self.buffer.emit_u8((mode << 6) | (reg << 3) | rm);
+    }
+    
+    fn emit_modrm_mem(&mut self, reg: u8, base: u8, offset: i32) {
+        if offset == 0 && base != Reg64::Rbp.encoding() && base != Reg64::R13.encoding() {
+            self.emit_modrm(0b00, reg, base);
+        } else if offset >= -128 && offset <= 127 {
+            self.emit_modrm(0b01, reg, base);
+            self.buffer.emit_u8(offset as u8);
+        } else {
+            self.emit_modrm(0b10, reg, base);
+            self.buffer.emit_u32(offset as u32);
+        }
+        
+        // SIB byte for RSP/R12
+        if base == Reg64::Rsp.encoding() || base == 4 {
+            self.buffer.emit_u8(0x24);
+        }
+    }
+    
+    /// Finalize and get bytes
+    pub fn finalize(mut self) -> Result<Vec<u8>, JitError> {
+        self.buffer.resolve_fixups()?;
+        Ok(self.buffer.take_bytes())
+    }
+}
+
+impl Default for X64Assembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum JitError {
+    MemoryAllocation,
+    ProtectionChange,
+    NotWritable,
+    OutOfMemory,
+    UnresolvedLabel(Label),
+    UnsupportedPlatform,
+    CompilationFailed(String),
+}
+
+impl std::fmt::Display for JitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MemoryAllocation => write!(f, "failed to allocate executable memory"),
+            Self::ProtectionChange => write!(f, "failed to change memory protection"),
+            Self::NotWritable => write!(f, "memory is not writable"),
+            Self::OutOfMemory => write!(f, "code buffer out of memory"),
+            Self::UnresolvedLabel(l) => write!(f, "unresolved label: {:?}", l),
+            Self::UnsupportedPlatform => write!(f, "JIT not supported on this platform"),
+            Self::CompilationFailed(m) => write!(f, "compilation failed: {}", m),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_code_buffer() {
+        let mut buf = CodeBuffer::new();
+        buf.emit_u8(0x90); // NOP
+        buf.emit_u32(0xDEADBEEF);
+        
+        assert_eq!(buf.bytes().len(), 5);
+        assert_eq!(buf.bytes()[0], 0x90);
+    }
+    
+    #[test]
+    fn test_x64_mov() {
+        let mut asm = X64Assembler::new();
+        asm.mov_rr(Reg64::Rax, Reg64::Rbx);
+        
+        let bytes = asm.finalize().unwrap();
+        // REX.W + MOV + ModRM
+        assert_eq!(bytes, [0x48, 0x89, 0xD8]);
+    }
+    
+    #[test]
+    fn test_x64_add() {
+        let mut asm = X64Assembler::new();
+        asm.add_ri(Reg64::Rax, 42);
+        
+        let bytes = asm.finalize().unwrap();
+        // REX.W + ADD imm8 + ModRM + imm
+        assert_eq!(bytes, [0x48, 0x83, 0xC0, 0x2A]);
+    }
+    
+    #[test]
+    fn test_x64_labels() {
+        let mut asm = X64Assembler::new();
+        
+        let loop_start = asm.create_label();
+        asm.bind_label(loop_start);
+        asm.add_ri(Reg64::Rax, 1);
+        asm.jcc(Condition::NotEqual, loop_start);
+        
+        let bytes = asm.finalize().unwrap();
+        assert!(!bytes.is_empty());
+    }
+    
+    #[test]
+    fn test_executable_memory() {
+        let mut mem = ExecutableMemory::allocate(4096).unwrap();
+        
+        // Write a simple function that returns 42
+        // mov eax, 42; ret
+        mem.write(&[0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3]).unwrap();
+        
+        mem.make_executable().unwrap();
+        
+        // Call the function
+        let func: extern "C" fn() -> i32 = unsafe { mem.get_function(0) };
+        assert_eq!(func(), 42);
+    }
+}

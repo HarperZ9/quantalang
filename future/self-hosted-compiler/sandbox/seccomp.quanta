@@ -1,0 +1,824 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ SANDBOX — Seccomp-BPF Syscall Filtering
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Linux seccomp-BPF implementation for syscall filtering:
+// - BPF program generation
+// - Per-syscall argument filtering
+// - Architecture-specific syscall numbers
+// - Filter installation and management
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::sandbox::seccomp
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::collections::BTreeMap;
+
+use super::policy::{SyscallPolicy, SyscallAction, SyscallRule, ArgFilter, FilterOp};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BPF INSTRUCTION SET
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// BPF instruction
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BpfInsn {
+    /// Instruction code
+    pub code: u16,
+    /// Jump true offset
+    pub jt: u8,
+    /// Jump false offset
+    pub jf: u8,
+    /// Constant/offset
+    pub k: u32,
+}
+
+impl BpfInsn {
+    /// Load word from absolute offset
+    pub const fn ld_abs(off: u32) -> Self {
+        BpfInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: off,
+        }
+    }
+    
+    /// Load half-word from absolute offset
+    pub const fn ldh_abs(off: u32) -> Self {
+        BpfInsn {
+            code: BPF_LD | BPF_H | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: off,
+        }
+    }
+    
+    /// Load byte from absolute offset
+    pub const fn ldb_abs(off: u32) -> Self {
+        BpfInsn {
+            code: BPF_LD | BPF_B | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: off,
+        }
+    }
+    
+    /// Load immediate into accumulator
+    pub const fn ld_imm(val: u32) -> Self {
+        BpfInsn {
+            code: BPF_LD | BPF_IMM,
+            jt: 0,
+            jf: 0,
+            k: val,
+        }
+    }
+    
+    /// Jump if accumulator equals constant
+    pub const fn jeq_k(k: u32, jt: u8, jf: u8) -> Self {
+        BpfInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt,
+            jf,
+            k,
+        }
+    }
+    
+    /// Jump if accumulator >= constant
+    pub const fn jge_k(k: u32, jt: u8, jf: u8) -> Self {
+        BpfInsn {
+            code: BPF_JMP | BPF_JGE | BPF_K,
+            jt,
+            jf,
+            k,
+        }
+    }
+    
+    /// Jump if accumulator > constant
+    pub const fn jgt_k(k: u32, jt: u8, jf: u8) -> Self {
+        BpfInsn {
+            code: BPF_JMP | BPF_JGT | BPF_K,
+            jt,
+            jf,
+            k,
+        }
+    }
+    
+    /// Jump if (accumulator & constant) == constant
+    pub const fn jset_k(k: u32, jt: u8, jf: u8) -> Self {
+        BpfInsn {
+            code: BPF_JMP | BPF_JSET | BPF_K,
+            jt,
+            jf,
+            k,
+        }
+    }
+    
+    /// Unconditional jump
+    pub const fn ja(k: u32) -> Self {
+        BpfInsn {
+            code: BPF_JMP | BPF_JA,
+            jt: 0,
+            jf: 0,
+            k,
+        }
+    }
+    
+    /// Return with constant
+    pub const fn ret_k(k: u32) -> Self {
+        BpfInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k,
+        }
+    }
+    
+    /// ALU AND with constant
+    pub const fn and_k(k: u32) -> Self {
+        BpfInsn {
+            code: BPF_ALU | BPF_AND | BPF_K,
+            jt: 0,
+            jf: 0,
+            k,
+        }
+    }
+}
+
+// BPF instruction class
+const BPF_LD: u16 = 0x00;
+const BPF_LDX: u16 = 0x01;
+const BPF_ST: u16 = 0x02;
+const BPF_STX: u16 = 0x03;
+const BPF_ALU: u16 = 0x04;
+const BPF_JMP: u16 = 0x05;
+const BPF_RET: u16 = 0x06;
+const BPF_MISC: u16 = 0x07;
+
+// BPF ld/ldx size
+const BPF_W: u16 = 0x00;
+const BPF_H: u16 = 0x08;
+const BPF_B: u16 = 0x10;
+
+// BPF ld/ldx mode
+const BPF_IMM: u16 = 0x00;
+const BPF_ABS: u16 = 0x20;
+const BPF_IND: u16 = 0x40;
+const BPF_MEM: u16 = 0x60;
+
+// BPF alu/jmp fields
+const BPF_ADD: u16 = 0x00;
+const BPF_SUB: u16 = 0x10;
+const BPF_MUL: u16 = 0x20;
+const BPF_DIV: u16 = 0x30;
+const BPF_OR: u16 = 0x40;
+const BPF_AND: u16 = 0x50;
+const BPF_LSH: u16 = 0x60;
+const BPF_RSH: u16 = 0x70;
+const BPF_NEG: u16 = 0x80;
+
+// BPF jmp type
+const BPF_JA: u16 = 0x00;
+const BPF_JEQ: u16 = 0x10;
+const BPF_JGT: u16 = 0x20;
+const BPF_JGE: u16 = 0x30;
+const BPF_JSET: u16 = 0x40;
+
+// BPF src
+const BPF_K: u16 = 0x00;
+const BPF_X: u16 = 0x08;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECCOMP RETURN VALUES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Seccomp return action
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeccompAction {
+    /// Kill the thread
+    KillThread = 0x00000000,
+    /// Kill the process
+    KillProcess = 0x80000000,
+    /// Send SIGSYS
+    Trap = 0x00030000,
+    /// Return errno
+    Errno(u16) = 0x00050000,
+    /// Notify userspace
+    UserNotif = 0x7fc00000,
+    /// Log the syscall
+    Log = 0x7ffc0000,
+    /// Allow the syscall
+    Allow = 0x7fff0000,
+}
+
+impl SeccompAction {
+    pub fn to_ret_val(self) -> u32 {
+        match self {
+            SeccompAction::KillThread => 0x00000000,
+            SeccompAction::KillProcess => 0x80000000,
+            SeccompAction::Trap => 0x00030000,
+            SeccompAction::Errno(e) => 0x00050000 | (e as u32),
+            SeccompAction::UserNotif => 0x7fc00000,
+            SeccompAction::Log => 0x7ffc0000,
+            SeccompAction::Allow => 0x7fff0000,
+        }
+    }
+}
+
+impl From<SyscallAction> for SeccompAction {
+    fn from(action: SyscallAction) -> Self {
+        match action {
+            SyscallAction::Allow => SeccompAction::Allow,
+            SyscallAction::Kill => SeccompAction::KillProcess,
+            SyscallAction::Trap => SeccompAction::Trap,
+            SyscallAction::Errno(e) => SeccompAction::Errno(e as u16),
+            SyscallAction::Log => SeccompAction::Log,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECCOMP DATA STRUCTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Seccomp data structure offsets (for BPF loads)
+#[repr(C)]
+pub struct SeccompData {
+    /// Syscall number
+    pub nr: i32,
+    /// Architecture
+    pub arch: u32,
+    /// Instruction pointer
+    pub instruction_pointer: u64,
+    /// Syscall arguments
+    pub args: [u64; 6],
+}
+
+// Field offsets in seccomp_data
+const OFF_NR: u32 = 0;
+const OFF_ARCH: u32 = 4;
+const OFF_IP_LO: u32 = 8;
+const OFF_IP_HI: u32 = 12;
+const OFF_ARGS: u32 = 16;
+
+fn arg_offset(n: usize) -> u32 {
+    OFF_ARGS + (n as u32) * 8
+}
+
+fn arg_offset_lo(n: usize) -> u32 {
+    arg_offset(n)
+}
+
+fn arg_offset_hi(n: usize) -> u32 {
+    arg_offset(n) + 4
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ARCHITECTURE CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Supported architectures
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    X86_64,
+    X86,
+    Arm,
+    Arm64,
+    Riscv64,
+}
+
+impl Arch {
+    /// Get audit arch value
+    pub fn audit_arch(self) -> u32 {
+        match self {
+            Arch::X86_64 => AUDIT_ARCH_X86_64,
+            Arch::X86 => AUDIT_ARCH_I386,
+            Arch::Arm => AUDIT_ARCH_ARM,
+            Arch::Arm64 => AUDIT_ARCH_AARCH64,
+            Arch::Riscv64 => AUDIT_ARCH_RISCV64,
+        }
+    }
+    
+    /// Detect current architecture
+    pub fn current() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        { Arch::X86_64 }
+        #[cfg(target_arch = "x86")]
+        { Arch::X86 }
+        #[cfg(target_arch = "arm")]
+        { Arch::Arm }
+        #[cfg(target_arch = "aarch64")]
+        { Arch::Arm64 }
+        #[cfg(target_arch = "riscv64")]
+        { Arch::Riscv64 }
+    }
+}
+
+// Audit architecture constants
+const AUDIT_ARCH_X86_64: u32 = 0xc000003e;
+const AUDIT_ARCH_I386: u32 = 0x40000003;
+const AUDIT_ARCH_ARM: u32 = 0x40000028;
+const AUDIT_ARCH_AARCH64: u32 = 0xc00000b7;
+const AUDIT_ARCH_RISCV64: u32 = 0xc00000f3;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BPF PROGRAM BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Builder for BPF filter programs
+pub struct BpfProgramBuilder {
+    instructions: Vec<BpfInsn>,
+    arch: Arch,
+    default_action: SeccompAction,
+}
+
+impl BpfProgramBuilder {
+    /// Create a new builder
+    pub fn new(arch: Arch) -> Self {
+        BpfProgramBuilder {
+            instructions: Vec::new(),
+            arch,
+            default_action: SeccompAction::KillProcess,
+        }
+    }
+    
+    /// Set default action
+    pub fn default_action(mut self, action: SeccompAction) -> Self {
+        self.default_action = action;
+        self
+    }
+    
+    /// Add an instruction
+    pub fn insn(mut self, insn: BpfInsn) -> Self {
+        self.instructions.push(insn);
+        self
+    }
+    
+    /// Add architecture check
+    pub fn check_arch(mut self) -> Self {
+        // Load arch
+        self.instructions.push(BpfInsn::ld_abs(OFF_ARCH));
+        // Check against expected arch
+        // Jump over kill if matches, otherwise kill
+        self.instructions.push(BpfInsn::jeq_k(
+            self.arch.audit_arch(),
+            1, // skip kill
+            0, // proceed to kill
+        ));
+        self.instructions.push(BpfInsn::ret_k(SeccompAction::KillProcess.to_ret_val()));
+        self
+    }
+    
+    /// Add syscall allow rule
+    pub fn allow_syscall(mut self, nr: u32) -> Self {
+        // Load syscall number
+        self.instructions.push(BpfInsn::ld_abs(OFF_NR));
+        // Check syscall number
+        self.instructions.push(BpfInsn::jeq_k(nr, 0, 1));
+        self.instructions.push(BpfInsn::ret_k(SeccompAction::Allow.to_ret_val()));
+        self
+    }
+    
+    /// Add syscall deny rule
+    pub fn deny_syscall(mut self, nr: u32, action: SeccompAction) -> Self {
+        // Load syscall number
+        self.instructions.push(BpfInsn::ld_abs(OFF_NR));
+        // Check syscall number
+        self.instructions.push(BpfInsn::jeq_k(nr, 0, 1));
+        self.instructions.push(BpfInsn::ret_k(action.to_ret_val()));
+        self
+    }
+    
+    /// Add syscall rule with argument checking
+    pub fn syscall_with_args(mut self, nr: u32, filters: &[ArgFilter], action: SeccompAction) -> Self {
+        // Load syscall number
+        self.instructions.push(BpfInsn::ld_abs(OFF_NR));
+        
+        // Calculate jump offsets
+        let filter_insns = filters.len() * 3; // Each filter needs ~3 instructions
+        
+        // Check syscall number - if not match, skip all filter checks
+        self.instructions.push(BpfInsn::jeq_k(
+            nr,
+            0, // continue to filters
+            (filter_insns + 1) as u8, // skip to next rule
+        ));
+        
+        // Add argument filters
+        for filter in filters {
+            self = self.add_arg_filter(filter, action);
+        }
+        
+        // If all filters pass, apply action
+        self.instructions.push(BpfInsn::ret_k(action.to_ret_val()));
+        
+        self
+    }
+    
+    fn add_arg_filter(mut self, filter: &ArgFilter, _action: SeccompAction) -> Self {
+        let arg_lo = arg_offset_lo(filter.arg_index);
+        let arg_hi = arg_offset_hi(filter.arg_index);
+        
+        // For 32-bit comparisons, load low word
+        self.instructions.push(BpfInsn::ld_abs(arg_lo));
+        
+        match filter.op {
+            FilterOp::Equal => {
+                self.instructions.push(BpfInsn::jeq_k(
+                    filter.value as u32,
+                    0, // match - continue
+                    1, // no match - skip action
+                ));
+            }
+            FilterOp::NotEqual => {
+                self.instructions.push(BpfInsn::jeq_k(
+                    filter.value as u32,
+                    1, // match - skip action
+                    0, // no match - continue
+                ));
+            }
+            FilterOp::LessThan => {
+                self.instructions.push(BpfInsn::jge_k(
+                    filter.value as u32,
+                    1, // >= skip action
+                    0, // < continue
+                ));
+            }
+            FilterOp::LessEqual => {
+                self.instructions.push(BpfInsn::jgt_k(
+                    filter.value as u32,
+                    1, // > skip action
+                    0, // <= continue
+                ));
+            }
+            FilterOp::GreaterThan => {
+                self.instructions.push(BpfInsn::jgt_k(
+                    filter.value as u32,
+                    0, // > continue
+                    1, // <= skip action
+                ));
+            }
+            FilterOp::GreaterEqual => {
+                self.instructions.push(BpfInsn::jge_k(
+                    filter.value as u32,
+                    0, // >= continue
+                    1, // < skip action
+                ));
+            }
+            FilterOp::MaskedEqual(mask) => {
+                self.instructions.push(BpfInsn::and_k(mask as u32));
+                self.instructions.push(BpfInsn::jeq_k(
+                    filter.value as u32,
+                    0, // match - continue
+                    1, // no match - skip action
+                ));
+            }
+        }
+        
+        self
+    }
+    
+    /// Finalize with default action
+    pub fn finish(mut self) -> BpfProgram {
+        // Add default return
+        self.instructions.push(BpfInsn::ret_k(self.default_action.to_ret_val()));
+        
+        BpfProgram {
+            instructions: self.instructions,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BPF PROGRAM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compiled BPF program
+pub struct BpfProgram {
+    instructions: Vec<BpfInsn>,
+}
+
+impl BpfProgram {
+    /// Get instruction count
+    pub fn len(&self) -> usize {
+        self.instructions.len()
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.instructions.is_empty()
+    }
+    
+    /// Get instructions
+    pub fn instructions(&self) -> &[BpfInsn] {
+        &self.instructions
+    }
+    
+    /// Convert to sock_fprog for seccomp
+    #[cfg(target_os = "linux")]
+    pub fn to_sock_fprog(&self) -> SockFprog {
+        SockFprog {
+            len: self.instructions.len() as u16,
+            filter: self.instructions.as_ptr(),
+        }
+    }
+}
+
+/// sock_fprog structure for seccomp
+#[cfg(target_os = "linux")]
+#[repr(C)]
+pub struct SockFprog {
+    pub len: u16,
+    pub filter: *const BpfInsn,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECCOMP FILTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Seccomp filter builder from policy
+pub struct SeccompFilter {
+    program: BpfProgram,
+}
+
+impl SeccompFilter {
+    /// Create filter from policy
+    pub fn from_policy(policy: &SyscallPolicy) -> Self {
+        let arch = Arch::current();
+        let mut builder = BpfProgramBuilder::new(arch)
+            .default_action(policy.default_action.into())
+            .check_arch();
+        
+        // Add per-syscall rules
+        for (nr, rule) in &policy.rules {
+            if rule.arg_filters.is_empty() {
+                // Simple allow/deny
+                match rule.action {
+                    SyscallAction::Allow => {
+                        builder = builder.allow_syscall(*nr);
+                    }
+                    action => {
+                        builder = builder.deny_syscall(*nr, action.into());
+                    }
+                }
+            } else {
+                // With argument filters
+                builder = builder.syscall_with_args(
+                    *nr,
+                    &rule.arg_filters,
+                    rule.action.into(),
+                );
+            }
+        }
+        
+        SeccompFilter {
+            program: builder.finish(),
+        }
+    }
+    
+    /// Install the filter
+    #[cfg(target_os = "linux")]
+    pub fn install(&self) -> Result<(), SeccompError> {
+        use std::os::unix::prelude::*;
+        
+        // Set NO_NEW_PRIVS
+        unsafe {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(SeccompError::SetNoNewPrivs(
+                    std::io::Error::last_os_error().to_string()
+                ));
+            }
+        }
+        
+        // Install filter
+        let fprog = self.program.to_sock_fprog();
+        
+        unsafe {
+            if libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &fprog as *const _,
+                0,
+                0,
+            ) != 0 {
+                return Err(SeccompError::InstallFilter(
+                    std::io::Error::last_os_error().to_string()
+                ));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Get the BPF program
+    pub fn program(&self) -> &BpfProgram {
+        &self.program
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREDEFINED FILTERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create a minimal seccomp filter
+pub fn minimal_filter() -> SeccompFilter {
+    SeccompFilter::from_policy(&SyscallPolicy::minimal())
+}
+
+/// Create a standard seccomp filter
+pub fn standard_filter() -> SeccompFilter {
+    SeccompFilter::from_policy(&SyscallPolicy::standard())
+}
+
+/// Create a permissive seccomp filter
+pub fn permissive_filter() -> SeccompFilter {
+    SeccompFilter::from_policy(&SyscallPolicy::permissive())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SYSCALL NUMBERS (x86_64)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(target_arch = "x86_64")]
+pub mod syscall_nr {
+    pub const READ: u32 = 0;
+    pub const WRITE: u32 = 1;
+    pub const OPEN: u32 = 2;
+    pub const CLOSE: u32 = 3;
+    pub const STAT: u32 = 4;
+    pub const FSTAT: u32 = 5;
+    pub const LSTAT: u32 = 6;
+    pub const POLL: u32 = 7;
+    pub const LSEEK: u32 = 8;
+    pub const MMAP: u32 = 9;
+    pub const MPROTECT: u32 = 10;
+    pub const MUNMAP: u32 = 11;
+    pub const BRK: u32 = 12;
+    pub const RT_SIGACTION: u32 = 13;
+    pub const RT_SIGPROCMASK: u32 = 14;
+    pub const RT_SIGRETURN: u32 = 15;
+    pub const IOCTL: u32 = 16;
+    pub const PREAD64: u32 = 17;
+    pub const PWRITE64: u32 = 18;
+    pub const READV: u32 = 19;
+    pub const WRITEV: u32 = 20;
+    pub const ACCESS: u32 = 21;
+    pub const PIPE: u32 = 22;
+    pub const SELECT: u32 = 23;
+    pub const SCHED_YIELD: u32 = 24;
+    pub const MREMAP: u32 = 25;
+    pub const MSYNC: u32 = 26;
+    pub const MINCORE: u32 = 27;
+    pub const MADVISE: u32 = 28;
+    pub const DUP: u32 = 32;
+    pub const DUP2: u32 = 33;
+    pub const NANOSLEEP: u32 = 35;
+    pub const GETPID: u32 = 39;
+    pub const SOCKET: u32 = 41;
+    pub const CONNECT: u32 = 42;
+    pub const ACCEPT: u32 = 43;
+    pub const SENDTO: u32 = 44;
+    pub const RECVFROM: u32 = 45;
+    pub const SENDMSG: u32 = 46;
+    pub const RECVMSG: u32 = 47;
+    pub const SHUTDOWN: u32 = 48;
+    pub const BIND: u32 = 49;
+    pub const LISTEN: u32 = 50;
+    pub const GETSOCKNAME: u32 = 51;
+    pub const GETPEERNAME: u32 = 52;
+    pub const SOCKETPAIR: u32 = 53;
+    pub const SETSOCKOPT: u32 = 54;
+    pub const GETSOCKOPT: u32 = 55;
+    pub const CLONE: u32 = 56;
+    pub const FORK: u32 = 57;
+    pub const VFORK: u32 = 58;
+    pub const EXECVE: u32 = 59;
+    pub const EXIT: u32 = 60;
+    pub const WAIT4: u32 = 61;
+    pub const KILL: u32 = 62;
+    pub const FCNTL: u32 = 72;
+    pub const FLOCK: u32 = 73;
+    pub const FSYNC: u32 = 74;
+    pub const FDATASYNC: u32 = 75;
+    pub const GETCWD: u32 = 79;
+    pub const CHDIR: u32 = 80;
+    pub const RENAME: u32 = 82;
+    pub const MKDIR: u32 = 83;
+    pub const RMDIR: u32 = 84;
+    pub const CREAT: u32 = 85;
+    pub const LINK: u32 = 86;
+    pub const UNLINK: u32 = 87;
+    pub const SYMLINK: u32 = 88;
+    pub const READLINK: u32 = 89;
+    pub const CHMOD: u32 = 90;
+    pub const FCHMOD: u32 = 91;
+    pub const CHOWN: u32 = 92;
+    pub const FCHOWN: u32 = 93;
+    pub const UMASK: u32 = 95;
+    pub const GETTIMEOFDAY: u32 = 96;
+    pub const GETUID: u32 = 102;
+    pub const GETGID: u32 = 104;
+    pub const GETEUID: u32 = 107;
+    pub const GETEGID: u32 = 108;
+    pub const GETPPID: u32 = 110;
+    pub const GETPGRP: u32 = 111;
+    pub const PTRACE: u32 = 101;
+    pub const SYSINFO: u32 = 99;
+    pub const UNAME: u32 = 63;
+    pub const ARCH_PRCTL: u32 = 158;
+    pub const EXIT_GROUP: u32 = 231;
+    pub const EPOLL_CREATE: u32 = 213;
+    pub const EPOLL_CTL: u32 = 233;
+    pub const EPOLL_WAIT: u32 = 232;
+    pub const EPOLL_PWAIT: u32 = 281;
+    pub const EVENTFD: u32 = 284;
+    pub const EVENTFD2: u32 = 290;
+    pub const TIMERFD_CREATE: u32 = 283;
+    pub const TIMERFD_SETTIME: u32 = 286;
+    pub const TIMERFD_GETTIME: u32 = 287;
+    pub const SIGNALFD: u32 = 282;
+    pub const SIGNALFD4: u32 = 289;
+    pub const OPENAT: u32 = 257;
+    pub const MKDIRAT: u32 = 258;
+    pub const FSTATAT: u32 = 262;
+    pub const UNLINKAT: u32 = 263;
+    pub const RENAMEAT: u32 = 264;
+    pub const FACCESSAT: u32 = 269;
+    pub const GETRANDOM: u32 = 318;
+    pub const MEMFD_CREATE: u32 = 319;
+    pub const COPY_FILE_RANGE: u32 = 326;
+    pub const STATX: u32 = 332;
+    pub const CLONE3: u32 = 435;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Seccomp error
+#[derive(Debug, Clone)]
+pub enum SeccompError {
+    SetNoNewPrivs(String),
+    InstallFilter(String),
+    InvalidFilter(String),
+    NotSupported,
+}
+
+impl std::fmt::Display for SeccompError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SetNoNewPrivs(e) => write!(f, "failed to set NO_NEW_PRIVS: {}", e),
+            Self::InstallFilter(e) => write!(f, "failed to install filter: {}", e),
+            Self::InvalidFilter(e) => write!(f, "invalid filter: {}", e),
+            Self::NotSupported => write!(f, "seccomp not supported on this platform"),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_bpf_insn_sizes() {
+        assert_eq!(std::mem::size_of::<BpfInsn>(), 8);
+    }
+    
+    #[test]
+    fn test_minimal_filter() {
+        let filter = minimal_filter();
+        assert!(!filter.program().is_empty());
+    }
+    
+    #[test]
+    fn test_builder() {
+        let arch = Arch::X86_64;
+        let program = BpfProgramBuilder::new(arch)
+            .default_action(SeccompAction::KillProcess)
+            .check_arch()
+            .allow_syscall(0) // read
+            .allow_syscall(1) // write
+            .finish();
+        
+        // Should have: arch check (3) + 2 syscalls (6) + default (1) = 10
+        assert!(program.len() >= 7);
+    }
+    
+    #[test]
+    fn test_seccomp_action() {
+        assert_eq!(SeccompAction::Allow.to_ret_val(), 0x7fff0000);
+        assert_eq!(SeccompAction::KillProcess.to_ret_val(), 0x80000000);
+        assert_eq!(SeccompAction::Errno(1).to_ret_val(), 0x00050001);
+    }
+}

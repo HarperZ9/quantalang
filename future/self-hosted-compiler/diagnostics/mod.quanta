@@ -1,0 +1,592 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DIAGNOSTICS — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Comprehensive compiler diagnostics system:
+// - Rust-style error messages with source snippets
+// - Error codes with documentation links
+// - Suggestions with auto-fix support
+// - Multiple output formats (terminal, JSON, SARIF)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang Diagnostics
+//!
+//! Rich compiler error reporting with source highlighting.
+//!
+//! ## Quick Start
+//!
+//! ```quanta
+//! use quantalang::diagnostics::prelude::*;
+//!
+//! // Create source map
+//! let source_map = SourceMap::new();
+//! let file = source_map.add_file("main.quanta", source_code);
+//!
+//! // Create diagnostic handler
+//! let handler = DiagnosticHandler::new(
+//!     TerminalRenderer::new(source_map.clone())
+//! );
+//!
+//! // Emit an error
+//! handler.struct_error("type mismatch")
+//!     .code(types::TYPE_MISMATCH)
+//!     .span_label(error_span, file.id, "expected `i32`, found `String`")
+//!     .note("cannot convert `String` to `i32`")
+//!     .help("consider using `.parse::<i32>()`")
+//!     .emit(&handler);
+//!
+//! // Check for errors
+//! handler.abort_if_errors();
+//! ```
+
+module quantalang::diagnostics
+
+// Submodules
+pub mod span;
+pub mod diagnostic;
+pub mod renderer;
+
+// Re-exports from span
+pub use span::{
+    // Position types
+    BytePos, Span, SpannedFile,
+    
+    // Location types
+    LineNumber, ColumnNumber, Location, LocationRange,
+    
+    // File management
+    FileId, SourceFile, SourceMap,
+    
+    // Multi-span
+    LabeledSpan, SpanStyle, MultiSpan,
+    
+    // Utilities
+    Spanned,
+};
+
+// Re-exports from diagnostic
+pub use diagnostic::{
+    // Severity
+    Severity,
+    
+    // Error codes
+    ErrorCode, ErrorCategory,
+    
+    // Predefined codes
+    syntax, types, resolution, borrow, constant, lint,
+    
+    // Diagnostic types
+    Diagnostic, SubDiagnostic,
+    
+    // Suggestions
+    Suggestion, SuggestionReplacement, Applicability, SuggestionStyle,
+    
+    // Builder
+    DiagnosticBuilder,
+    
+    // Handler
+    DiagnosticHandler, DiagnosticEmitter,
+    CollectingEmitter, StderrEmitter,
+};
+
+// Re-exports from renderer
+pub use renderer::{
+    // Terminal rendering
+    TerminalRenderer, ColorConfig, colors,
+    
+    // JSON rendering
+    JsonRenderer,
+    
+    // Short format
+    ShortRenderer,
+    
+    // SARIF format
+    SarifRenderer,
+};
+
+use alloc::sync::Arc;
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::format;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DIAGNOSTIC CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unified diagnostic context for compilation
+pub struct DiagnosticContext {
+    /// Source map
+    source_map: Arc<SourceMap>,
+    
+    /// Diagnostic handler
+    handler: DiagnosticHandler,
+    
+    /// Output format
+    format: OutputFormat,
+}
+
+impl DiagnosticContext {
+    /// Create a new diagnostic context
+    pub fn new(source_map: Arc<SourceMap>) -> Self {
+        let renderer = TerminalRenderer::new(source_map.clone());
+        DiagnosticContext {
+            source_map: source_map.clone(),
+            handler: DiagnosticHandler::new(renderer),
+            format: OutputFormat::Terminal,
+        }
+    }
+    
+    /// Create with specific format
+    pub fn with_format(source_map: Arc<SourceMap>, format: OutputFormat) -> Self {
+        let handler = match format {
+            OutputFormat::Terminal => {
+                DiagnosticHandler::new(TerminalRenderer::new(source_map.clone()))
+            }
+            OutputFormat::Json => {
+                DiagnosticHandler::new(JsonRenderer::new(source_map.clone()))
+            }
+            OutputFormat::Short => {
+                DiagnosticHandler::new(ShortRenderer::new(source_map.clone()))
+            }
+        };
+        
+        DiagnosticContext {
+            source_map,
+            handler,
+            format,
+        }
+    }
+    
+    /// Get source map
+    pub fn source_map(&self) -> &Arc<SourceMap> {
+        &self.source_map
+    }
+    
+    /// Get handler
+    pub fn handler(&self) -> &DiagnosticHandler {
+        &self.handler
+    }
+    
+    /// Emit a diagnostic
+    pub fn emit(&self, diagnostic: &Diagnostic) {
+        self.handler.emit(diagnostic);
+    }
+    
+    /// Create error
+    pub fn error(&self, message: impl Into<String>) -> DiagnosticBuilder {
+        DiagnosticBuilder::error(message)
+    }
+    
+    /// Create warning
+    pub fn warning(&self, message: impl Into<String>) -> DiagnosticBuilder {
+        DiagnosticBuilder::warning(message)
+    }
+    
+    /// Create bug report
+    pub fn bug(&self, message: impl Into<String>) -> DiagnosticBuilder {
+        DiagnosticBuilder::bug(message)
+    }
+    
+    /// Check error count
+    pub fn error_count(&self) -> usize {
+        self.handler.error_count()
+    }
+    
+    /// Check warning count
+    pub fn warning_count(&self) -> usize {
+        self.handler.warning_count()
+    }
+    
+    /// Check if errors occurred
+    pub fn has_errors(&self) -> bool {
+        self.handler.has_errors()
+    }
+    
+    /// Abort if errors
+    pub fn abort_if_errors(&self) {
+        self.handler.abort_if_errors();
+    }
+    
+    /// Get all diagnostics
+    pub fn diagnostics(&self) -> Vec<Diagnostic> {
+        self.handler.diagnostics()
+    }
+    
+    /// Print summary
+    pub fn print_summary(&self) {
+        let errors = self.error_count();
+        let warnings = self.warning_count();
+        
+        if errors > 0 || warnings > 0 {
+            eprintln!(
+                "{}",
+                format_summary(errors, warnings)
+            );
+        }
+    }
+}
+
+/// Output format
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Terminal,
+    Json,
+    Short,
+}
+
+impl OutputFormat {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "terminal" | "human" | "rich" => Some(OutputFormat::Terminal),
+            "json" => Some(OutputFormat::Json),
+            "short" | "gcc" => Some(OutputFormat::Short),
+            _ => None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONVENIENCE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Format error/warning summary
+pub fn format_summary(errors: usize, warnings: usize) -> String {
+    let error_str = if errors == 1 { "error" } else { "errors" };
+    let warning_str = if warnings == 1 { "warning" } else { "warnings" };
+    
+    match (errors > 0, warnings > 0) {
+        (true, true) => format!(
+            "\x1b[1;31m{} {}\x1b[0m and \x1b[1;33m{} {}\x1b[0m generated",
+            errors, error_str, warnings, warning_str
+        ),
+        (true, false) => format!(
+            "\x1b[1;31m{} {}\x1b[0m generated",
+            errors, error_str
+        ),
+        (false, true) => format!(
+            "\x1b[1;33m{} {}\x1b[0m generated",
+            warnings, warning_str
+        ),
+        (false, false) => String::new(),
+    }
+}
+
+/// Create a simple error diagnostic
+pub fn simple_error(
+    source_map: &Arc<SourceMap>,
+    message: impl Into<String>,
+    span: Span,
+    file_id: FileId,
+) -> Diagnostic {
+    Diagnostic::error(message)
+        .with_span(span, file_id)
+}
+
+/// Create type mismatch error
+pub fn type_mismatch(
+    source_map: &Arc<SourceMap>,
+    span: Span,
+    file_id: FileId,
+    expected: &str,
+    found: &str,
+) -> Diagnostic {
+    DiagnosticBuilder::error(format!("expected `{}`, found `{}`", expected, found))
+        .code(types::TYPE_MISMATCH)
+        .span_label(span, file_id, format!("expected `{}`", expected))
+        .note(format!("cannot coerce `{}` to `{}`", found, expected))
+        .build()
+}
+
+/// Create undefined variable error
+pub fn undefined_variable(
+    source_map: &Arc<SourceMap>,
+    span: Span,
+    file_id: FileId,
+    name: &str,
+    suggestions: &[&str],
+) -> Diagnostic {
+    let mut builder = DiagnosticBuilder::error(format!("cannot find value `{}` in this scope", name))
+        .code(resolution::UNDEFINED_VARIABLE)
+        .span_label(span, file_id, "not found in this scope");
+    
+    if !suggestions.is_empty() {
+        let suggestion = if suggestions.len() == 1 {
+            format!("a value with a similar name exists: `{}`", suggestions[0])
+        } else {
+            format!("values with similar names exist: {}", 
+                suggestions.iter()
+                    .map(|s| format!("`{}`", s))
+                    .collect::<Vec<_>>()
+                    .join(", "))
+        };
+        builder = builder.help(suggestion);
+    }
+    
+    builder.build()
+}
+
+/// Create unused variable warning
+pub fn unused_variable(
+    source_map: &Arc<SourceMap>,
+    span: Span,
+    file_id: FileId,
+    name: &str,
+) -> Diagnostic {
+    DiagnosticBuilder::warning(format!("unused variable: `{}`", name))
+        .code(lint::UNUSED_VARIABLE)
+        .span_label(span, file_id, "")
+        .help(format!("if this is intentional, prefix it with an underscore: `_{}`", name))
+        .suggest_replace(
+            "prefix with underscore to suppress warning",
+            span,
+            file_id,
+            format!("_{}", name),
+        )
+        .build()
+}
+
+/// Create borrow error
+pub fn use_after_move(
+    source_map: &Arc<SourceMap>,
+    use_span: Span,
+    move_span: Span,
+    file_id: FileId,
+    name: &str,
+) -> Diagnostic {
+    DiagnosticBuilder::error(format!("use of moved value: `{}`", name))
+        .code(borrow::USE_AFTER_MOVE)
+        .span_label(use_span, file_id, "value used here after move")
+        .secondary_label(move_span, file_id, format!("value moved here"))
+        .note(format!("`{}` moved due to this implicit call to `.into_iter()`", name))
+        .help("consider cloning the value if you need to use it again")
+        .build()
+}
+
+/// Create syntax error for unexpected token
+pub fn unexpected_token(
+    source_map: &Arc<SourceMap>,
+    span: Span,
+    file_id: FileId,
+    found: &str,
+    expected: &[&str],
+) -> Diagnostic {
+    let expected_str = if expected.len() == 1 {
+        format!("`{}`", expected[0])
+    } else if expected.len() <= 3 {
+        let last = expected.len() - 1;
+        format!(
+            "{} or `{}`",
+            expected[..last].iter()
+                .map(|e| format!("`{}`", e))
+                .collect::<Vec<_>>()
+                .join(", "),
+            expected[last]
+        )
+    } else {
+        format!("one of {} tokens", expected.len())
+    };
+    
+    DiagnosticBuilder::error(format!("expected {}, found `{}`", expected_str, found))
+        .code(syntax::UNEXPECTED_TOKEN)
+        .span_label(span, file_id, format!("unexpected `{}`", found))
+        .build()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR RECOVERY HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Levenshtein distance for suggestions
+pub fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    
+    let a_len = a_chars.len();
+    let b_len = b_chars.len();
+    
+    if a_len == 0 { return b_len; }
+    if b_len == 0 { return a_len; }
+    
+    let mut matrix = vec![vec![0usize; b_len + 1]; a_len + 1];
+    
+    for i in 0..=a_len {
+        matrix[i][0] = i;
+    }
+    for j in 0..=b_len {
+        matrix[0][j] = j;
+    }
+    
+    for i in 1..=a_len {
+        for j in 1..=b_len {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            matrix[i][j] = (matrix[i - 1][j] + 1)
+                .min(matrix[i][j - 1] + 1)
+                .min(matrix[i - 1][j - 1] + cost);
+        }
+    }
+    
+    matrix[a_len][b_len]
+}
+
+/// Find similar names for suggestions
+pub fn find_similar_names<'a>(
+    name: &str,
+    candidates: &[&'a str],
+    max_distance: usize,
+) -> Vec<&'a str> {
+    let mut matches: Vec<(&str, usize)> = candidates.iter()
+        .filter_map(|&candidate| {
+            let distance = levenshtein_distance(name, candidate);
+            if distance <= max_distance {
+                Some((candidate, distance))
+            } else {
+                None
+            }
+        })
+        .collect();
+    
+    matches.sort_by_key(|(_, d)| *d);
+    matches.into_iter()
+        .take(3)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Common diagnostic types
+pub mod prelude {
+    pub use super::{
+        // Context
+        DiagnosticContext, OutputFormat,
+        
+        // Source management
+        SourceMap, SourceFile, FileId,
+        Span, BytePos, Location,
+        
+        // Diagnostics
+        Diagnostic, DiagnosticBuilder, DiagnosticHandler,
+        Severity, ErrorCode,
+        
+        // Error codes
+        syntax, types, resolution, borrow, constant, lint,
+        
+        // Renderers
+        TerminalRenderer, JsonRenderer, ShortRenderer,
+        
+        // Helpers
+        simple_error, type_mismatch, undefined_variable,
+        unused_variable, use_after_move, unexpected_token,
+        find_similar_names,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    
+    fn test_source_map() -> Arc<SourceMap> {
+        let map = SourceMap::new();
+        map.add_file(
+            PathBuf::from("test.quanta"),
+            "fn main() {\n    let x = 42;\n    println(x);\n}\n".to_string(),
+        );
+        map
+    }
+    
+    #[test]
+    fn test_version() {
+        assert_eq!(VERSION, "1.0.0");
+    }
+    
+    #[test]
+    fn test_diagnostic_context() {
+        let map = test_source_map();
+        let ctx = DiagnosticContext::new(map);
+        
+        assert_eq!(ctx.error_count(), 0);
+        assert!(!ctx.has_errors());
+    }
+    
+    #[test]
+    fn test_levenshtein() {
+        assert_eq!(levenshtein_distance("hello", "hello"), 0);
+        assert_eq!(levenshtein_distance("hello", "helo"), 1);
+        assert_eq!(levenshtein_distance("hello", "world"), 4);
+    }
+    
+    #[test]
+    fn test_find_similar() {
+        let candidates = vec!["println", "print", "panic", "parse"];
+        let similar = find_similar_names("printn", &candidates, 2);
+        
+        assert!(similar.contains(&"println"));
+        assert!(similar.contains(&"print"));
+    }
+    
+    #[test]
+    fn test_type_mismatch_error() {
+        let map = test_source_map();
+        let diag = type_mismatch(
+            &map,
+            Span::new(BytePos(20), BytePos(22)),
+            FileId(0),
+            "String",
+            "i32",
+        );
+        
+        assert!(diag.is_error());
+        assert_eq!(diag.code, Some(types::TYPE_MISMATCH));
+    }
+    
+    #[test]
+    fn test_undefined_variable_error() {
+        let map = test_source_map();
+        let diag = undefined_variable(
+            &map,
+            Span::new(BytePos(40), BytePos(41)),
+            FileId(0),
+            "y",
+            &["x"],
+        );
+        
+        assert!(diag.is_error());
+        assert_eq!(diag.code, Some(resolution::UNDEFINED_VARIABLE));
+    }
+    
+    #[test]
+    fn test_output_format() {
+        assert_eq!(OutputFormat::from_str("terminal"), Some(OutputFormat::Terminal));
+        assert_eq!(OutputFormat::from_str("JSON"), Some(OutputFormat::Json));
+        assert_eq!(OutputFormat::from_str("gcc"), Some(OutputFormat::Short));
+        assert_eq!(OutputFormat::from_str("invalid"), None);
+    }
+    
+    #[test]
+    fn test_format_summary() {
+        let summary = format_summary(2, 3);
+        assert!(summary.contains("2 errors"));
+        assert!(summary.contains("3 warnings"));
+        
+        let summary = format_summary(1, 0);
+        assert!(summary.contains("1 error"));
+        assert!(!summary.contains("warning"));
+    }
+}

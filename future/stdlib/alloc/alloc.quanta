@@ -1,0 +1,588 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ ALLOC — Memory Allocation Traits
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// This module defines the core allocation traits and the global allocator.
+// Unlike `core`, `alloc` requires a heap but does not require an OS.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#![no_std]
+
+module alloc::alloc
+
+use core::ptr::{self, NonNull};
+use core::mem;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LAYOUT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Memory layout requirements for an allocation.
+/// 
+/// Specifies size and alignment constraints. Used by allocators to satisfy
+/// allocation requests with proper memory layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Layout {
+    size: usize,
+    align: usize,
+}
+
+impl Layout {
+    /// Creates a layout from a size and alignment.
+    /// 
+    /// # Panics
+    /// Panics if:
+    /// - `align` is not a power of two
+    /// - `size` rounded up to `align` overflows `isize::MAX`
+    #[inline]
+    pub const fn from_size_align(size: usize, align: usize) -> Result<Self, LayoutError> {
+        if !align.is_power_of_two() {
+            return Err(LayoutError);
+        }
+        
+        // Size must not overflow when rounded up to alignment
+        let aligned_size = match size.checked_add(align - 1) {
+            Some(s) => s & !(align - 1),
+            None => return Err(LayoutError),
+        };
+        
+        if aligned_size > isize::MAX as usize {
+            return Err(LayoutError);
+        }
+        
+        Ok(Layout { size, align })
+    }
+    
+    /// Creates a layout without checking validity.
+    /// 
+    /// # Safety
+    /// - `align` must be a power of two
+    /// - `size`, when rounded up to `align`, must not overflow `isize::MAX`
+    #[inline]
+    pub const unsafe fn from_size_align_unchecked(size: usize, align: usize) -> Self {
+        Layout { size, align }
+    }
+    
+    /// Creates a layout for type `T`.
+    #[inline]
+    pub const fn new<T>() -> Self {
+        Layout {
+            size: mem::size_of::<T>(),
+            align: mem::align_of::<T>(),
+        }
+    }
+    
+    /// Creates a layout for a value.
+    #[inline]
+    pub fn for_value<T: ?Sized>(t: &T) -> Self {
+        Layout {
+            size: mem::size_of_val(t),
+            align: mem::align_of_val(t),
+        }
+    }
+    
+    /// Returns the size of the layout.
+    #[inline]
+    pub const fn size(&self) -> usize {
+        self.size
+    }
+    
+    /// Returns the alignment of the layout.
+    #[inline]
+    pub const fn align(&self) -> usize {
+        self.align
+    }
+    
+    /// Creates a layout for an array of `n` elements of type `T`.
+    #[inline]
+    pub fn array<T>(n: usize) -> Result<Self, LayoutError> {
+        let element = Layout::new::<T>();
+        element.repeat(n).map(|(layout, _)| layout)
+    }
+    
+    /// Returns the layout for `n` repetitions of this layout.
+    /// 
+    /// Returns (layout, stride) where stride is the distance between elements.
+    pub fn repeat(&self, n: usize) -> Result<(Self, usize), LayoutError> {
+        // Stride is size rounded up to alignment
+        let stride = self.size.checked_add(self.align - 1)
+            .ok_or(LayoutError)?
+            & !(self.align - 1);
+        
+        let total_size = stride.checked_mul(n).ok_or(LayoutError)?;
+        
+        if total_size > isize::MAX as usize {
+            return Err(LayoutError);
+        }
+        
+        Ok((Layout { size: total_size, align: self.align }, stride))
+    }
+    
+    /// Extends this layout with another layout.
+    /// 
+    /// Returns (combined_layout, offset_of_second).
+    pub fn extend(&self, next: Layout) -> Result<(Self, usize), LayoutError> {
+        let new_align = self.align.max(next.align);
+        
+        // Offset of next is size rounded up to next's alignment
+        let offset = self.size.checked_add(next.align - 1)
+            .ok_or(LayoutError)?
+            & !(next.align - 1);
+        
+        let new_size = offset.checked_add(next.size).ok_or(LayoutError)?;
+        
+        Layout::from_size_align(new_size, new_align)
+            .map(|layout| (layout, offset))
+    }
+    
+    /// Returns layout with size padded to alignment.
+    #[inline]
+    pub fn pad_to_align(&self) -> Self {
+        let size = (self.size + self.align - 1) & !(self.align - 1);
+        Layout { size, align: self.align }
+    }
+    
+    /// Returns the amount of padding needed after `self` for alignment.
+    #[inline]
+    pub const fn padding_needed_for(&self, align: usize) -> usize {
+        let len = self.size;
+        let align_m1 = align.wrapping_sub(1);
+        len.wrapping_add(align_m1) & !align_m1
+    }
+    
+    /// Creates a "dangling" pointer that is aligned for this layout.
+    #[inline]
+    pub const fn dangling(&self) -> NonNull<u8> {
+        unsafe { NonNull::new_unchecked(self.align as *mut u8) }
+    }
+}
+
+/// Error indicating invalid layout parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutError;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALLOCATOR TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Error returned on allocation failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllocError;
+
+/// A memory allocator.
+/// 
+/// # Safety
+/// - Memory returned by `allocate` must be valid for reads and writes
+/// - Memory must remain valid until deallocated
+/// - Memory must be properly aligned per the requested layout
+/// - Calling `deallocate` with a different layout than was used for
+///   `allocate` is undefined behavior
+pub unsafe trait Allocator {
+    /// Attempts to allocate memory.
+    /// 
+    /// On success, returns a non-null pointer to allocated memory.
+    /// The memory is uninitialized.
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError>;
+    
+    /// Deallocates previously allocated memory.
+    /// 
+    /// # Safety
+    /// - `ptr` must be currently allocated via this allocator
+    /// - `layout` must match the layout used to allocate
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout);
+    
+    /// Allocates zero-initialized memory.
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let ptr = self.allocate(layout)?;
+        unsafe {
+            ptr.as_ptr().cast::<u8>().write_bytes(0, layout.size());
+        }
+        Ok(ptr)
+    }
+    
+    /// Attempts to grow an allocation in place.
+    /// 
+    /// # Safety
+    /// - `ptr` must be currently allocated via this allocator
+    /// - `old_layout` must match the layout used to allocate
+    /// - `new_layout.size() >= old_layout.size()`
+    unsafe fn grow(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        debug_assert!(new_layout.size() >= old_layout.size());
+        
+        let new_ptr = self.allocate(new_layout)?;
+        ptr::copy_nonoverlapping(
+            ptr.as_ptr(),
+            new_ptr.as_ptr().cast(),
+            old_layout.size(),
+        );
+        self.deallocate(ptr, old_layout);
+        Ok(new_ptr)
+    }
+    
+    /// Attempts to grow an allocation, zeroing the new bytes.
+    unsafe fn grow_zeroed(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        debug_assert!(new_layout.size() >= old_layout.size());
+        
+        let new_ptr = self.allocate_zeroed(new_layout)?;
+        ptr::copy_nonoverlapping(
+            ptr.as_ptr(),
+            new_ptr.as_ptr().cast(),
+            old_layout.size(),
+        );
+        self.deallocate(ptr, old_layout);
+        Ok(new_ptr)
+    }
+    
+    /// Attempts to shrink an allocation in place.
+    /// 
+    /// # Safety
+    /// - `ptr` must be currently allocated via this allocator
+    /// - `old_layout` must match the layout used to allocate
+    /// - `new_layout.size() <= old_layout.size()`
+    unsafe fn shrink(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        debug_assert!(new_layout.size() <= old_layout.size());
+        
+        let new_ptr = self.allocate(new_layout)?;
+        ptr::copy_nonoverlapping(
+            ptr.as_ptr(),
+            new_ptr.as_ptr().cast(),
+            new_layout.size(),
+        );
+        self.deallocate(ptr, old_layout);
+        Ok(new_ptr)
+    }
+    
+    /// Returns a reference to this allocator that implements `Clone`.
+    fn by_ref(&self) -> &Self {
+        self
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL ALLOCATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The global memory allocator.
+/// 
+/// This trait is used to configure the allocator used by types like `Box`, `Vec`,
+/// and `String` by default.
+/// 
+/// # Example
+/// ```
+/// use alloc::alloc::{GlobalAlloc, Layout};
+/// 
+/// struct MyAllocator;
+/// 
+/// unsafe impl GlobalAlloc for MyAllocator {
+///     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+///         // ... allocation implementation
+///     }
+///     
+///     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+///         // ... deallocation implementation
+///     }
+/// }
+/// 
+/// #[global_allocator]
+/// static ALLOCATOR: MyAllocator = MyAllocator;
+/// ```
+pub unsafe trait GlobalAlloc {
+    /// Allocate memory as described by the given layout.
+    /// 
+    /// Returns null pointer on allocation failure.
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8;
+    
+    /// Deallocate the block of memory at the given pointer.
+    /// 
+    /// # Safety
+    /// - `ptr` must denote a block currently allocated via this allocator
+    /// - `layout` must be the same layout used to allocate
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout);
+    
+    /// Behaves like `alloc`, but also zeros out the memory.
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = self.alloc(layout);
+        if !ptr.is_null() {
+            ptr::write_bytes(ptr, 0, layout.size());
+        }
+        ptr
+    }
+    
+    /// Shrink or grow a block of memory to the given `new_size`.
+    /// 
+    /// # Safety
+    /// - `ptr` must be currently allocated via this allocator
+    /// - `layout` must be the same layout used to allocate
+    /// - `new_size` must be greater than zero
+    /// - `new_size`, when rounded up to alignment, must not overflow
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
+        let new_ptr = self.alloc(new_layout);
+        if !new_ptr.is_null() {
+            let copy_size = layout.size().min(new_size);
+            ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+            self.dealloc(ptr, layout);
+        }
+        new_ptr
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL ALLOCATOR HANDLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Handle to the global allocator.
+/// 
+/// This type implements `Allocator` by forwarding to the global allocator
+/// set via `#[global_allocator]`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Global;
+
+unsafe impl Allocator for Global {
+    #[inline]
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        if layout.size() == 0 {
+            // Return dangling pointer for ZST
+            return Ok(NonNull::slice_from_raw_parts(layout.dangling(), 0));
+        }
+        
+        unsafe {
+            let ptr = alloc(layout);
+            NonNull::new(ptr)
+                .map(|p| NonNull::slice_from_raw_parts(p, layout.size()))
+                .ok_or(AllocError)
+        }
+    }
+    
+    #[inline]
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        if layout.size() != 0 {
+            dealloc(ptr.as_ptr(), layout);
+        }
+    }
+    
+    #[inline]
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        if layout.size() == 0 {
+            return Ok(NonNull::slice_from_raw_parts(layout.dangling(), 0));
+        }
+        
+        unsafe {
+            let ptr = alloc_zeroed(layout);
+            NonNull::new(ptr)
+                .map(|p| NonNull::slice_from_raw_parts(p, layout.size()))
+                .ok_or(AllocError)
+        }
+    }
+    
+    #[inline]
+    unsafe fn grow(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        debug_assert!(new_layout.size() >= old_layout.size());
+        
+        if old_layout.size() == 0 {
+            return self.allocate(new_layout);
+        }
+        
+        let new_ptr = realloc(ptr.as_ptr(), old_layout, new_layout.size());
+        NonNull::new(new_ptr)
+            .map(|p| NonNull::slice_from_raw_parts(p, new_layout.size()))
+            .ok_or(AllocError)
+    }
+    
+    #[inline]
+    unsafe fn shrink(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        debug_assert!(new_layout.size() <= old_layout.size());
+        
+        if new_layout.size() == 0 {
+            self.deallocate(ptr, old_layout);
+            return Ok(NonNull::slice_from_raw_parts(new_layout.dangling(), 0));
+        }
+        
+        let new_ptr = realloc(ptr.as_ptr(), old_layout, new_layout.size());
+        NonNull::new(new_ptr)
+            .map(|p| NonNull::slice_from_raw_parts(p, new_layout.size()))
+            .ok_or(AllocError)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL ALLOCATOR FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// These are implemented by the runtime and linked to the #[global_allocator].
+
+extern "Rust" {
+    #[rustc_allocator]
+    #[rustc_allocator_nounwind]
+    fn __rust_alloc(size: usize, align: usize) -> *mut u8;
+    
+    #[rustc_allocator_nounwind]
+    fn __rust_dealloc(ptr: *mut u8, size: usize, align: usize);
+    
+    #[rustc_allocator_nounwind]
+    fn __rust_realloc(ptr: *mut u8, old_size: usize, align: usize, new_size: usize) -> *mut u8;
+    
+    #[rustc_allocator_nounwind]
+    fn __rust_alloc_zeroed(size: usize, align: usize) -> *mut u8;
+}
+
+/// Allocates memory with the global allocator.
+#[inline]
+pub unsafe fn alloc(layout: Layout) -> *mut u8 {
+    __rust_alloc(layout.size(), layout.align())
+}
+
+/// Deallocates memory with the global allocator.
+#[inline]
+pub unsafe fn dealloc(ptr: *mut u8, layout: Layout) {
+    __rust_dealloc(ptr, layout.size(), layout.align())
+}
+
+/// Reallocates memory with the global allocator.
+#[inline]
+pub unsafe fn realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    __rust_realloc(ptr, layout.size(), layout.align(), new_size)
+}
+
+/// Allocates zero-initialized memory with the global allocator.
+#[inline]
+pub unsafe fn alloc_zeroed(layout: Layout) -> *mut u8 {
+    __rust_alloc_zeroed(layout.size(), layout.align())
+}
+
+/// Signals allocation failure.
+/// 
+/// Called when allocation fails and the allocator cannot recover.
+#[cold]
+pub fn handle_alloc_error(layout: Layout) -> ! {
+    extern "Rust" {
+        #[rustc_allocator_nounwind]
+        fn __rust_alloc_error_handler(size: usize, align: usize) -> !;
+    }
+    
+    unsafe { __rust_alloc_error_handler(layout.size(), layout.align()) }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RAW ALLOCATION FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Exchange allocation: allocate and initialize in one step.
+/// 
+/// This is the underlying mechanism for `Box::new`.
+pub fn exchange_malloc(size: usize, align: usize) -> *mut u8 {
+    if size == 0 {
+        return align as *mut u8;  // Dangling pointer for ZST
+    }
+    
+    let layout = unsafe { Layout::from_size_align_unchecked(size, align) };
+    let ptr = unsafe { alloc(layout) };
+    
+    if ptr.is_null() {
+        handle_alloc_error(layout);
+    }
+    
+    ptr
+}
+
+/// Exchange deallocation.
+#[inline]
+pub unsafe fn exchange_free(ptr: *mut u8, size: usize, align: usize) {
+    if size != 0 {
+        let layout = Layout::from_size_align_unchecked(size, align);
+        dealloc(ptr, layout);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_layout_new() {
+        let layout = Layout::new::<u32>();
+        assert_eq!(layout.size(), 4);
+        assert_eq!(layout.align(), 4);
+        
+        let layout = Layout::new::<u8>();
+        assert_eq!(layout.size(), 1);
+        assert_eq!(layout.align(), 1);
+        
+        let layout = Layout::new::<[u64; 10]>();
+        assert_eq!(layout.size(), 80);
+        assert_eq!(layout.align(), 8);
+    }
+    
+    #[test]
+    fn test_layout_from_size_align() {
+        let layout = Layout::from_size_align(16, 8).unwrap();
+        assert_eq!(layout.size(), 16);
+        assert_eq!(layout.align(), 8);
+        
+        // Invalid alignment (not power of two)
+        assert!(Layout::from_size_align(16, 3).is_err());
+        
+        // Zero alignment
+        assert!(Layout::from_size_align(16, 0).is_err());
+    }
+    
+    #[test]
+    fn test_layout_array() {
+        let layout = Layout::array::<u32>(10).unwrap();
+        assert_eq!(layout.size(), 40);
+        assert_eq!(layout.align(), 4);
+    }
+    
+    #[test]
+    fn test_layout_extend() {
+        let l1 = Layout::new::<u32>();
+        let l2 = Layout::new::<u64>();
+        let (combined, offset) = l1.extend(l2).unwrap();
+        
+        // u32 (4 bytes) + padding (4 bytes) + u64 (8 bytes) = 16 bytes
+        assert_eq!(offset, 8);  // u64 alignment
+        assert_eq!(combined.size(), 16);
+        assert_eq!(combined.align(), 8);
+    }
+    
+    #[test]
+    fn test_layout_pad_to_align() {
+        let layout = Layout::from_size_align(5, 4).unwrap();
+        let padded = layout.pad_to_align();
+        assert_eq!(padded.size(), 8);
+        assert_eq!(padded.align(), 4);
+    }
+}

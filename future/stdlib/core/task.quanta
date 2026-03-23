@@ -1,0 +1,1004 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ CORE LIBRARY — Task and Async Primitives
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// This module provides the fundamental building blocks for asynchronous programming:
+// - Future trait: the core abstraction for async computations
+// - Poll: the result of polling a future
+// - Waker/RawWaker: task wake-up mechanism
+// - Context: polling context passed to futures
+//
+// These primitives are #![no_std] compatible and form the foundation for
+// higher-level async runtimes in the std crate.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use crate::marker::{PhantomData, Unpin, Send, Sync};
+use crate::option::{Option, Result};
+use crate::ptr::NonNull;
+use crate::ops::{Deref, DerefMut};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POLL ENUM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Indicates whether a value is available or if the current task has been
+/// scheduled to receive a wakeup instead.
+///
+/// This is the return type of the `Future::poll` method.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[must_use = "this `Poll` may be a `Pending` variant, which should be handled"]
+pub enum Poll<T> {
+    /// Represents that a value is immediately ready.
+    Ready(T),
+    /// Represents that a value is not ready yet.
+    ///
+    /// When a function returns `Pending`, the function *must* also
+    /// ensure that the current task is scheduled to be awoken when
+    /// progress can be made.
+    Pending,
+}
+
+impl<T> Poll<T> {
+    /// Returns `true` if this is `Poll::Ready`.
+    #[inline]
+    pub const fn is_ready(&self) -> bool {
+        matches!(self, Poll::Ready(_))
+    }
+
+    /// Returns `true` if this is `Poll::Pending`.
+    #[inline]
+    pub const fn is_pending(&self) -> bool {
+        matches!(self, Poll::Pending)
+    }
+
+    /// Maps a `Poll<T>` to `Poll<U>` by applying a function to a contained value.
+    #[inline]
+    pub fn map<U, F>(self, f: F) -> Poll<U>
+    where
+        F: FnOnce(T) -> U,
+    {
+        match self {
+            Poll::Ready(t) => Poll::Ready(f(t)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Unwraps a ready value or panics.
+    #[inline]
+    pub fn unwrap(self) -> T {
+        match self {
+            Poll::Ready(t) => t,
+            Poll::Pending => panic!("called `Poll::unwrap()` on a `Pending` value"),
+        }
+    }
+
+    /// Unwraps a ready value or returns a default.
+    #[inline]
+    pub fn unwrap_or(self, default: T) -> T {
+        match self {
+            Poll::Ready(t) => t,
+            Poll::Pending => default,
+        }
+    }
+
+    /// Unwraps a ready value or computes it from a closure.
+    #[inline]
+    pub fn unwrap_or_else<F: FnOnce() -> T>(self, f: F) -> T {
+        match self {
+            Poll::Ready(t) => t,
+            Poll::Pending => f(),
+        }
+    }
+}
+
+impl<T, E> Poll<Result<T, E>> {
+    /// Maps a `Poll<Result<T, E>>` to `Poll<Result<U, E>>`.
+    #[inline]
+    pub fn map_ok<U, F>(self, f: F) -> Poll<Result<U, E>>
+    where
+        F: FnOnce(T) -> U,
+    {
+        match self {
+            Poll::Ready(Ok(t)) => Poll::Ready(Ok(f(t))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Maps a `Poll<Result<T, E>>` to `Poll<Result<T, F>>`.
+    #[inline]
+    pub fn map_err<U, F>(self, f: F) -> Poll<Result<T, U>>
+    where
+        F: FnOnce(E) -> U,
+    {
+        match self {
+            Poll::Ready(Ok(t)) => Poll::Ready(Ok(t)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(f(e))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T> From<T> for Poll<T> {
+    /// Converts a value `T` into `Poll::Ready(T)`.
+    fn from(t: T) -> Poll<T> {
+        Poll::Ready(t)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RAW WAKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A `RawWaker` allows the implementor of a task executor to create a `Waker`
+/// which provides customized wakeup behavior.
+///
+/// It consists of a data pointer and a virtual function pointer table (vtable)
+/// that customizes the behavior of the `RawWaker`.
+#[derive(Clone, Copy, Debug)]
+pub struct RawWaker {
+    /// A data pointer, which can be used to store arbitrary data as required
+    /// by the executor. This could be e.g. a type-erased pointer to an `Arc`
+    /// that is associated with the task.
+    data: *const (),
+    /// Virtual function pointer table that customizes the behavior of this waker.
+    vtable: &'static RawWakerVTable,
+}
+
+impl RawWaker {
+    /// Creates a new `RawWaker` from the provided `data` pointer and `vtable`.
+    ///
+    /// The `data` pointer can be used to store arbitrary data as required by
+    /// the executor. This could be a type-erased pointer to an `Arc` or some
+    /// other reference-counted type.
+    ///
+    /// # Safety
+    ///
+    /// The behavior of the returned `RawWaker` is undefined if the caller
+    /// does not adhere to the contract documented in `RawWakerVTable`.
+    #[inline]
+    pub const fn new(data: *const (), vtable: &'static RawWakerVTable) -> RawWaker {
+        RawWaker { data, vtable }
+    }
+
+    /// Get the `data` pointer used to create this `RawWaker`.
+    #[inline]
+    pub fn data(&self) -> *const () {
+        self.data
+    }
+
+    /// Get the `vtable` pointer used to create this `RawWaker`.
+    #[inline]
+    pub fn vtable(&self) -> &'static RawWakerVTable {
+        self.vtable
+    }
+}
+
+/// A virtual function pointer table (vtable) that specifies the behavior
+/// of a `RawWaker`.
+///
+/// The pointer passed to all functions inside the vtable is the `data` pointer
+/// from the enclosing `RawWaker` object.
+///
+/// # Thread Safety
+///
+/// All functions in this vtable must be thread-safe.
+#[derive(Clone, Copy, Debug)]
+pub struct RawWakerVTable {
+    /// This function will be called when the `RawWaker` gets cloned,
+    /// e.g. when the `Waker` in which the `RawWaker` is stored gets cloned.
+    ///
+    /// The implementation of this function must retain all resources that are
+    /// required for this additional instance of a `RawWaker` and associated
+    /// task. Calling `wake` on the resulting `RawWaker` should result in
+    /// a wakeup of the same task that would have been awoken by the original
+    /// `RawWaker`.
+    clone: unsafe fn(*const ()) -> RawWaker,
+
+    /// This function will be called when `wake` is called on the `Waker`.
+    /// It must wake up the task associated with this `RawWaker`.
+    ///
+    /// The implementation of this function must make sure to release any
+    /// resources that are associated with this instance of a `RawWaker` and
+    /// associated task.
+    wake: unsafe fn(*const ()),
+
+    /// This function will be called when `wake_by_ref` is called on the `Waker`.
+    /// It must wake up the task associated with this `RawWaker`.
+    ///
+    /// This function is similar to `wake`, but must not consume the provided data
+    /// pointer.
+    wake_by_ref: unsafe fn(*const ()),
+
+    /// This function gets called when a `Waker` gets dropped.
+    ///
+    /// The implementation of this function must make sure to release any
+    /// resources that are associated with this instance of a `RawWaker` and
+    /// associated task.
+    drop: unsafe fn(*const ()),
+}
+
+impl RawWakerVTable {
+    /// Creates a new `RawWakerVTable` from the provided `clone`, `wake`,
+    /// `wake_by_ref`, and `drop` functions.
+    ///
+    /// # Safety
+    ///
+    /// All function pointers must satisfy the contracts documented in their
+    /// respective fields.
+    #[inline]
+    pub const fn new(
+        clone: unsafe fn(*const ()) -> RawWaker,
+        wake: unsafe fn(*const ()),
+        wake_by_ref: unsafe fn(*const ()),
+        drop: unsafe fn(*const ()),
+    ) -> Self {
+        Self { clone, wake, wake_by_ref, drop }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WAKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A `Waker` is a handle for waking up a task by notifying its executor that it
+/// is ready to be run.
+///
+/// This handle encapsulates a `RawWaker` instance, which defines the
+/// executor-specific wakeup behavior.
+///
+/// Wakers are typically created by executors and passed to futures via
+/// the `Context` parameter to `Future::poll`.
+#[repr(transparent)]
+pub struct Waker {
+    waker: RawWaker,
+}
+
+impl Waker {
+    /// Wake up the task associated with this `Waker`.
+    ///
+    /// As long as the executor keeps running and the task is not finished,
+    /// it is guaranteed that each invocation of `wake` (or `wake_by_ref`)
+    /// will be followed by at least one `poll` of the task to which this
+    /// `Waker` belongs. This makes it possible to temporarily yield to
+    /// other tasks while waiting for an event.
+    ///
+    /// Note that the above implies that multiple wake-ups may be coalesced
+    /// into a single `poll` invocation by the runtime.
+    ///
+    /// This method consumes the `Waker` to avoid calling `drop` and `wake`.
+    #[inline]
+    pub fn wake(self) {
+        // The actual wakeup call is made through the vtable.
+        // We prevent drop from being called by using ManuallyDrop.
+        let waker = crate::mem::ManuallyDrop::new(self);
+
+        // SAFETY: This is safe because the vtable functions are guaranteed
+        // to be valid by the contract of RawWaker::new.
+        unsafe { (waker.waker.vtable.wake)(waker.waker.data) }
+    }
+
+    /// Wake up the task associated with this `Waker` without consuming the `Waker`.
+    ///
+    /// This is similar to `wake`, but may be slightly less efficient in the
+    /// case where an owned waker is available. This method should be preferred
+    /// when working with borrowed wakers, since it doesn't require cloning.
+    #[inline]
+    pub fn wake_by_ref(&self) {
+        // SAFETY: This is safe because the vtable functions are guaranteed
+        // to be valid by the contract of RawWaker::new.
+        unsafe { (self.waker.vtable.wake_by_ref)(self.waker.data) }
+    }
+
+    /// Returns `true` if this `Waker` and another `Waker` would wake the same task.
+    ///
+    /// This function works on a best-effort basis, and may return false even
+    /// when the Wakers would awaken the same task. However, if this function
+    /// returns `true`, it is guaranteed that the Wakers will awaken the same task.
+    #[inline]
+    pub fn will_wake(&self, other: &Waker) -> bool {
+        // Compare both data pointers and vtable pointers
+        self.waker.data == other.waker.data
+            && core::ptr::eq(self.waker.vtable, other.waker.vtable)
+    }
+
+    /// Creates a new `Waker` from a `RawWaker`.
+    ///
+    /// # Safety
+    ///
+    /// The behavior of the returned `Waker` is undefined if the contract defined
+    /// in `RawWakerVTable` is not upheld by the implementation of `RawWaker`.
+    #[inline]
+    pub const unsafe fn from_raw(waker: RawWaker) -> Waker {
+        Waker { waker }
+    }
+
+    /// Get a reference to the underlying `RawWaker`.
+    #[inline]
+    pub fn as_raw(&self) -> &RawWaker {
+        &self.waker
+    }
+
+    /// Creates a new `Waker` that does nothing when `wake` is called.
+    ///
+    /// This is mostly useful for writing tests that don't need to be woken.
+    #[inline]
+    pub fn noop() -> Waker {
+        const NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(core::ptr::null(), &NOOP_VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &NOOP_VTABLE)) }
+    }
+}
+
+impl Clone for Waker {
+    #[inline]
+    fn clone(&self) -> Self {
+        // SAFETY: This is safe because the vtable functions are guaranteed
+        // to be valid by the contract of RawWaker::new.
+        let raw_waker = unsafe { (self.waker.vtable.clone)(self.waker.data) };
+        Waker { waker: raw_waker }
+    }
+}
+
+impl Drop for Waker {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: This is safe because the vtable functions are guaranteed
+        // to be valid by the contract of RawWaker::new.
+        unsafe { (self.waker.vtable.drop)(self.waker.data) }
+    }
+}
+
+// Waker is Send + Sync because the vtable ensures thread-safe behavior
+unsafe impl Send for Waker {}
+unsafe impl Sync for Waker {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The context of an asynchronous task.
+///
+/// Currently, `Context` only serves to provide access to a `&Waker`
+/// which can be used to wake the current task.
+pub struct Context<'a> {
+    waker: &'a Waker,
+    /// Marker to make `Context` invariant over the lifetime 'a
+    _marker: PhantomData<fn(&'a ()) -> &'a ()>,
+}
+
+impl<'a> Context<'a> {
+    /// Create a new `Context` from a `&Waker`.
+    #[inline]
+    pub const fn from_waker(waker: &'a Waker) -> Self {
+        Context {
+            waker,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns a reference to the `Waker` for the current task.
+    #[inline]
+    pub const fn waker(&self) -> &'a Waker {
+        self.waker
+    }
+}
+
+impl core::fmt::Debug for Context<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Context")
+            .field("waker", &"...")
+            .finish()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUTURE TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A future represents an asynchronous computation obtained by use of `async`.
+///
+/// A future is a value that might not have finished computing yet. This kind of
+/// "asynchronous value" makes it possible for a thread to continue doing useful
+/// work while it waits for the value to become available.
+///
+/// # The `poll` method
+///
+/// The core method of future, `poll`, *attempts* to resolve the future into a
+/// final value. This method does not block if the value is not ready. Instead,
+/// the current task is scheduled to be woken up when it's possible to make
+/// further progress by `poll`ing again. The `context` passed to the `poll`
+/// method can provide a `Waker`, which is a handle for waking up the current
+/// task.
+///
+/// When using a future, you generally won't call `poll` directly, but instead
+/// `.await` the value.
+///
+/// # Examples
+///
+/// ```quanta
+/// async fn example() -> i32 {
+///     let result = some_async_operation().await;
+///     result + 1
+/// }
+/// ```
+pub trait Future {
+    /// The type of value produced on completion.
+    type Output;
+
+    /// Attempt to resolve the future to a final value, registering
+    /// the current task for wakeup if the value is not yet available.
+    ///
+    /// # Return value
+    ///
+    /// This function returns:
+    ///
+    /// - [`Poll::Pending`] if the future is not ready yet
+    /// - [`Poll::Ready(val)`] with the result `val` of this future if it finished
+    ///   successfully.
+    ///
+    /// Once a future has finished, clients should not `poll` it again.
+    ///
+    /// # Panics
+    ///
+    /// Once a future has completed (returned `Ready` from `poll`), calling
+    /// `poll` on it again may panic, block forever, or cause other problems.
+    /// The `Future` trait places no requirements on how `poll` behaves after
+    /// the first `Ready` is returned.
+    ///
+    /// # Safety
+    ///
+    /// The `poll` function is not marked `unsafe` because it should be
+    /// implemented by safe code. However, futures that incorrectly use
+    /// the waker (e.g., wake before registering) may cause undefined behavior
+    /// in the executor.
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>;
+}
+
+// Future is implemented for references to futures
+impl<F: ?Sized + Future + Unpin> Future for &mut F {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        F::poll(Pin::new(&mut **self), cx)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PIN TYPE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A pinned pointer.
+///
+/// This is a wrapper around a reference that prevents moving the value it points to.
+/// This is important for async code because futures may hold self-references.
+///
+/// See the [pin module documentation][crate::pin] for more information.
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct Pin<P> {
+    pointer: P,
+}
+
+impl<P: Deref> Pin<P> {
+    /// Construct a new `Pin<P>` around a pointer to some data of a type that
+    /// implements [`Unpin`].
+    ///
+    /// Unlike `Pin::new_unchecked`, this method is safe because the pointer
+    /// `P` dereferences to an `Unpin` type, which cancels the pinning guarantees.
+    #[inline]
+    pub fn new(pointer: P) -> Pin<P>
+    where
+        P::Target: Unpin,
+    {
+        // SAFETY: the value pointed to is `Unpin`, and so has no requirements
+        // around pinning.
+        unsafe { Pin::new_unchecked(pointer) }
+    }
+
+    /// Construct a new `Pin<P>` around a reference to some data of a type
+    /// that may or may not implement `Unpin`.
+    ///
+    /// # Safety
+    ///
+    /// This constructor is unsafe because we cannot guarantee that the data
+    /// pointed to by `pointer` is pinned, meaning that the data will not be
+    /// moved or its storage invalidated until it gets dropped. If the constructed
+    /// `Pin<P>` does not guarantee that the data `P` points to is pinned, that
+    /// is a violation of the API contract and may lead to undefined behavior in
+    /// later (safe) operations.
+    #[inline]
+    pub const unsafe fn new_unchecked(pointer: P) -> Pin<P> {
+        Pin { pointer }
+    }
+
+    /// Gets a pinned shared reference from this pinned pointer.
+    #[inline]
+    pub fn as_ref(&self) -> Pin<&P::Target> {
+        // SAFETY: `self` is pinned, so `*self.pointer` is also pinned.
+        unsafe { Pin::new_unchecked(&*self.pointer) }
+    }
+}
+
+impl<P: DerefMut> Pin<P> {
+    /// Gets a pinned mutable reference from this pinned pointer.
+    #[inline]
+    pub fn as_mut(&mut self) -> Pin<&mut P::Target> {
+        // SAFETY: `self` is pinned, so `*self.pointer` is also pinned.
+        unsafe { Pin::new_unchecked(&mut *self.pointer) }
+    }
+
+    /// Assigns a new value to the memory behind the pinned reference.
+    ///
+    /// This function is equivalent to `*self.get_mut() = value`.
+    #[inline]
+    pub fn set(&mut self, value: P::Target)
+    where
+        P::Target: Sized,
+    {
+        *(unsafe { self.get_unchecked_mut() }) = value;
+    }
+}
+
+impl<'a, T: ?Sized> Pin<&'a T> {
+    /// Gets a shared reference to the contained value.
+    ///
+    /// This is safe because getting a shared reference never moves the value.
+    #[inline]
+    pub const fn get_ref(self) -> &'a T {
+        self.pointer
+    }
+}
+
+impl<'a, T: ?Sized> Pin<&'a mut T> {
+    /// Gets a mutable reference to the contained value.
+    ///
+    /// This is only valid if `T: Unpin`. Otherwise, the content may not be
+    /// modified: for example, the content may be aliased.
+    #[inline]
+    pub fn get_mut(self) -> &'a mut T
+    where
+        T: Unpin,
+    {
+        self.pointer
+    }
+
+    /// Gets a mutable reference to the data inside of this `Pin`.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe. You must guarantee that you will never move
+    /// the data out of the mutable reference you receive when you call this
+    /// function.
+    #[inline]
+    pub unsafe fn get_unchecked_mut(self) -> &'a mut T {
+        self.pointer
+    }
+}
+
+impl<P: Deref> Deref for Pin<P> {
+    type Target = P::Target;
+
+    fn deref(&self) -> &P::Target {
+        &*self.pointer
+    }
+}
+
+impl<P: DerefMut<Target: Unpin>> DerefMut for Pin<P> {
+    fn deref_mut(&mut self) -> &mut P::Target {
+        &mut *self.pointer
+    }
+}
+
+// Pin is Send/Sync if the underlying pointer is
+unsafe impl<P: Send> Send for Pin<P> {}
+unsafe impl<P: Sync> Sync for Pin<P> {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUTURE EXTENSION TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Extension trait for futures.
+pub trait FutureExt: Future {
+    /// Maps the output of this future to a different type.
+    fn map<U, F>(self, f: F) -> Map<Self, F>
+    where
+        Self: Sized,
+        F: FnOnce(Self::Output) -> U,
+    {
+        Map { future: self, f: Some(f) }
+    }
+
+    /// Chains a computation on the output of this future.
+    fn then<U, F>(self, f: F) -> Then<Self, F>
+    where
+        Self: Sized,
+        F: FnOnce(Self::Output) -> U,
+        U: Future,
+    {
+        Then { future: self, f: Some(f) }
+    }
+
+    /// Fuses a future such that `poll` will never again be called once it has
+    /// completed.
+    fn fuse(self) -> Fuse<Self>
+    where
+        Self: Sized,
+    {
+        Fuse { future: Some(self) }
+    }
+
+    /// Boxes this future, making it heap-allocated and type-erased.
+    #[cfg(feature = "alloc")]
+    fn boxed<'a>(self) -> Pin<alloc::boxed::Box<dyn Future<Output = Self::Output> + Send + 'a>>
+    where
+        Self: Sized + Send + 'a,
+    {
+        alloc::boxed::Box::pin(self)
+    }
+
+    /// Boxes this future without requiring `Send`.
+    #[cfg(feature = "alloc")]
+    fn boxed_local<'a>(self) -> Pin<alloc::boxed::Box<dyn Future<Output = Self::Output> + 'a>>
+    where
+        Self: Sized + 'a,
+    {
+        alloc::boxed::Box::pin(self)
+    }
+}
+
+// Implement FutureExt for all types that implement Future
+impl<T: Future> FutureExt for T {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUTURE COMBINATORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Future for the `map` method.
+#[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Map<Fut, F> {
+    future: Fut,
+    f: Option<F>,
+}
+
+impl<Fut, F> Map<Fut, F> {
+    /// Creates a new Map.
+    pub fn new(future: Fut, f: F) -> Self {
+        Map { future, f: Some(f) }
+    }
+}
+
+impl<Fut: Unpin, F> Unpin for Map<Fut, F> {}
+
+impl<Fut, F, U> Future for Map<Fut, F>
+where
+    Fut: Future,
+    F: FnOnce(Fut::Output) -> U,
+{
+    type Output = U;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: We never move the future out of `self`.
+        let this = unsafe { self.get_unchecked_mut() };
+        let future = unsafe { Pin::new_unchecked(&mut this.future) };
+
+        match future.poll(cx) {
+            Poll::Ready(output) => {
+                let f = this.f.take().expect("Map polled after completion");
+                Poll::Ready(f(output))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Future for the `then` method.
+#[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Then<Fut, F> {
+    future: Fut,
+    f: Option<F>,
+}
+
+impl<Fut: Unpin, F> Unpin for Then<Fut, F> {}
+
+/// Future for the `fuse` method.
+#[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Fuse<Fut> {
+    future: Option<Fut>,
+}
+
+impl<Fut> Fuse<Fut> {
+    /// Returns `true` if the underlying future has completed.
+    pub fn is_terminated(&self) -> bool {
+        self.future.is_none()
+    }
+}
+
+impl<Fut: Unpin> Unpin for Fuse<Fut> {}
+
+impl<Fut: Future> Future for Fuse<Fut> {
+    type Output = Fut::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: We never move the future out of `self`.
+        let this = unsafe { self.get_unchecked_mut() };
+
+        match &mut this.future {
+            Some(fut) => {
+                let fut = unsafe { Pin::new_unchecked(fut) };
+                match fut.poll(cx) {
+                    Poll::Ready(output) => {
+                        this.future = None;
+                        Poll::Ready(output)
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            None => Poll::Pending,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// READY AND PENDING FUTURES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A future that is immediately ready with a value.
+#[derive(Debug, Clone)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Ready<T> {
+    value: Option<T>,
+}
+
+impl<T> Ready<T> {
+    /// Create a new ready future.
+    pub const fn new(value: T) -> Self {
+        Ready { value: Some(value) }
+    }
+}
+
+impl<T> Unpin for Ready<T> {}
+
+impl<T> Future for Ready<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        Poll::Ready(this.value.take().expect("Ready polled after completion"))
+    }
+}
+
+/// Creates a future that is immediately ready with a value.
+///
+/// This is a convenience function equivalent to `Ready::new(value)`.
+///
+/// # Examples
+///
+/// ```quanta
+/// use core::task::ready;
+///
+/// async fn example() -> i32 {
+///     ready(42).await
+/// }
+/// ```
+#[inline]
+pub fn ready<T>(value: T) -> Ready<T> {
+    Ready::new(value)
+}
+
+/// A future that yields once before completing.
+///
+/// This is useful for allowing other tasks to run in cooperative multitasking.
+#[derive(Debug, Clone)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Yield {
+    yielded: bool,
+}
+
+impl Yield {
+    /// Create a new yield future.
+    pub const fn new() -> Self {
+        Yield { yielded: false }
+    }
+}
+
+impl Default for Yield {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Unpin for Yield {}
+
+impl Future for Yield {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.yielded {
+            Poll::Ready(())
+        } else {
+            this.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+/// Creates a future that yields once to the runtime.
+///
+/// This is useful for cooperative multitasking.
+#[inline]
+pub fn yield_now() -> Yield {
+    Yield::new()
+}
+
+/// A future that is always pending (never completes).
+#[derive(Debug, Clone)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Pending<T> {
+    _marker: PhantomData<T>,
+}
+
+impl<T> Pending<T> {
+    /// Create a new pending future.
+    pub const fn new() -> Self {
+        Pending { _marker: PhantomData }
+    }
+}
+
+impl<T> Default for Pending<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Unpin for Pending<T> {}
+
+impl<T> Future for Pending<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Pending
+    }
+}
+
+/// Creates a future which never resolves.
+///
+/// The returned future will forever return `Poll::Pending`.
+///
+/// # Examples
+///
+/// ```quanta
+/// use core::task::pending;
+///
+/// async fn example() {
+///     // This will never complete
+///     pending::<()>().await;
+/// }
+/// ```
+#[inline]
+pub fn pending<T>() -> Pending<T> {
+    Pending::new()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POLL MACROS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Extracts the successful value of a `Poll<T>` or returns `Poll::Pending`.
+///
+/// This macro is similar to the `?` operator for `Result`, but for `Poll`.
+#[macro_export]
+macro_rules! ready {
+    ($e:expr) => {
+        match $e {
+            $crate::task::Poll::Ready(t) => t,
+            $crate::task::Poll::Pending => return $crate::task::Poll::Pending,
+        }
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TASK ID
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A unique identifier for a running task.
+///
+/// Task IDs are opaque and should only be compared for equality.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct TaskId(u64);
+
+impl TaskId {
+    /// Creates a new task ID from a raw u64 value.
+    pub const fn from_raw(id: u64) -> Self {
+        TaskId(id)
+    }
+
+    /// Returns the raw u64 value of this task ID.
+    pub const fn as_raw(&self) -> u64 {
+        self.0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_poll_ready() {
+        let poll: Poll<i32> = Poll::Ready(42);
+        assert!(poll.is_ready());
+        assert!(!poll.is_pending());
+        assert_eq!(poll.unwrap(), 42);
+    }
+
+    #[test]
+    fn test_poll_pending() {
+        let poll: Poll<i32> = Poll::Pending;
+        assert!(!poll.is_ready());
+        assert!(poll.is_pending());
+    }
+
+    #[test]
+    fn test_poll_map() {
+        let poll: Poll<i32> = Poll::Ready(42);
+        let mapped = poll.map(|x| x * 2);
+        assert_eq!(mapped.unwrap(), 84);
+    }
+
+    #[test]
+    fn test_noop_waker() {
+        let waker = Waker::noop();
+        waker.wake_by_ref();
+        // Should not panic
+    }
+
+    #[test]
+    fn test_ready_future() {
+        let mut future = ready(42);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        match Pin::new(&mut future).poll(&mut cx) {
+            Poll::Ready(value) => assert_eq!(value, 42),
+            Poll::Pending => panic!("Ready future returned Pending"),
+        }
+    }
+
+    #[test]
+    fn test_pending_future() {
+        let mut future = pending::<i32>();
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(Pin::new(&mut future).poll(&mut cx).is_pending());
+    }
+
+    #[test]
+    fn test_task_id() {
+        let id1 = TaskId::from_raw(1);
+        let id2 = TaskId::from_raw(2);
+        let id3 = TaskId::from_raw(1);
+
+        assert_ne!(id1, id2);
+        assert_eq!(id1, id3);
+        assert_eq!(id1.as_raw(), 1);
+    }
+}

@@ -1,0 +1,1059 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Code Coverage Instrumentation
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Source code coverage instrumentation:
+//   - Line coverage
+//   - Branch coverage
+//   - Region coverage
+//   - MC/DC coverage (Modified Condition/Decision Coverage)
+//   - Coverage report generation
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::coverage
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
+use std::fs::File;
+use std::path::Path;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COVERAGE DATA FORMAT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Coverage data magic number
+const COVERAGE_MAGIC: u64 = 0x514E5441_434F5652; // "QNTACOVR"
+
+/// Coverage data version
+const COVERAGE_VERSION: u32 = 1;
+
+/// Coverage granularity
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageGranularity {
+    /// Line-level coverage
+    Line,
+    /// Branch-level coverage
+    Branch,
+    /// Region-level coverage
+    Region,
+    /// MC/DC coverage
+    Mcdc,
+}
+
+/// Coverage configuration
+#[derive(Debug, Clone)]
+pub struct CoverageConfig {
+    pub granularity: CoverageGranularity,
+    /// Instrument all functions including implicit ones
+    pub instrument_all: bool,
+    /// Generate branch coverage
+    pub branch_coverage: bool,
+    /// Generate function coverage
+    pub function_coverage: bool,
+    /// Output format
+    pub output_format: CoverageFormat,
+    /// Output directory
+    pub output_dir: String,
+    /// Profile filename pattern
+    pub profile_pattern: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageFormat {
+    /// LLVM profraw format
+    LlvmProfraw,
+    /// gcov-compatible format
+    Gcov,
+    /// JSON format
+    Json,
+    /// HTML report
+    Html,
+    /// LCOV format
+    Lcov,
+}
+
+impl Default for CoverageConfig {
+    fn default() -> Self {
+        CoverageConfig {
+            granularity: CoverageGranularity::Region,
+            instrument_all: false,
+            branch_coverage: true,
+            function_coverage: true,
+            output_format: CoverageFormat::LlvmProfraw,
+            output_dir: "coverage".to_string(),
+            profile_pattern: "default_%p_%m.profraw".to_string(),
+        }
+    }
+}
+
+/// Source location
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SourceLocation {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+impl SourceLocation {
+    pub fn new(file: impl Into<String>, line: u32, column: u32) -> Self {
+        SourceLocation {
+            file: file.into(),
+            line,
+            column,
+        }
+    }
+}
+
+/// Coverage region
+#[derive(Debug, Clone)]
+pub struct CoverageRegion {
+    /// Start location
+    pub start: SourceLocation,
+    /// End location
+    pub end: SourceLocation,
+    /// Region kind
+    pub kind: RegionKind,
+    /// Counter ID
+    pub counter_id: u32,
+    /// File ID
+    pub file_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionKind {
+    /// Code region
+    Code,
+    /// Gap region (whitespace, etc.)
+    Gap,
+    /// Expansion region (macro/inline)
+    Expansion,
+    /// Skipped region (preprocessor)
+    Skipped,
+    /// Branch region
+    Branch,
+}
+
+/// Function coverage mapping
+#[derive(Debug, Clone)]
+pub struct FunctionCoverageMapping {
+    /// Function name
+    pub name: String,
+    /// Mangled name
+    pub mangled_name: String,
+    /// Function hash (for validation)
+    pub hash: u64,
+    /// Coverage regions
+    pub regions: Vec<CoverageRegion>,
+    /// Branch info
+    pub branches: Vec<BranchInfo>,
+    /// Number of counters
+    pub num_counters: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct BranchInfo {
+    /// Source location
+    pub location: SourceLocation,
+    /// True branch counter
+    pub true_counter: u32,
+    /// False branch counter
+    pub false_counter: u32,
+    /// Condition ID for MC/DC
+    pub condition_id: Option<u32>,
+}
+
+/// Coverage mapping data for a module
+#[derive(Debug, Clone)]
+pub struct CoverageMappingData {
+    /// Module name
+    pub module_name: String,
+    /// Source files
+    pub files: Vec<String>,
+    /// Function mappings
+    pub functions: Vec<FunctionCoverageMapping>,
+    /// Working directory
+    pub working_dir: String,
+}
+
+impl CoverageMappingData {
+    pub fn new(module_name: impl Into<String>) -> Self {
+        CoverageMappingData {
+            module_name: module_name.into(),
+            files: Vec::new(),
+            functions: Vec::new(),
+            working_dir: String::new(),
+        }
+    }
+    
+    pub fn add_file(&mut self, path: impl Into<String>) -> u32 {
+        let path = path.into();
+        if let Some(idx) = self.files.iter().position(|f| f == &path) {
+            return idx as u32;
+        }
+        let idx = self.files.len() as u32;
+        self.files.push(path);
+        idx
+    }
+    
+    pub fn add_function(&mut self, mapping: FunctionCoverageMapping) {
+        self.functions.push(mapping);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COVERAGE INSTRUMENTATION PASS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Coverage instrumentation pass
+pub struct CoverageInstrumentationPass {
+    config: CoverageConfig,
+    mapping: CoverageMappingData,
+    next_counter_id: u32,
+}
+
+impl CoverageInstrumentationPass {
+    pub fn new(config: CoverageConfig, module_name: impl Into<String>) -> Self {
+        CoverageInstrumentationPass {
+            config,
+            mapping: CoverageMappingData::new(module_name),
+            next_counter_id: 0,
+        }
+    }
+    
+    /// Instrument a function for coverage
+    pub fn instrument_function(&mut self, func: &mut MirFunction, source_map: &SourceMap) {
+        let mut regions = Vec::new();
+        let mut branches = Vec::new();
+        let func_start_counter = self.next_counter_id;
+        
+        // Add function entry counter
+        let entry_counter = self.allocate_counter();
+        self.insert_counter_increment(&mut func.blocks[0], 0, entry_counter);
+        
+        // Get function source location
+        if let Some(loc) = source_map.get_function_location(&func.name) {
+            let file_id = self.mapping.add_file(&loc.file);
+            regions.push(CoverageRegion {
+                start: loc.clone(),
+                end: source_map.get_function_end(&func.name).unwrap_or(loc.clone()),
+                kind: RegionKind::Code,
+                counter_id: entry_counter,
+                file_id,
+            });
+        }
+        
+        // Instrument each block
+        for block in &mut func.blocks {
+            // Skip entry block (already instrumented)
+            if block.id == 0 {
+                continue;
+            }
+            
+            // Add block counter if it has source location
+            if let Some(loc) = source_map.get_block_location(block.id) {
+                let counter = self.allocate_counter();
+                self.insert_counter_increment(block, 0, counter);
+                
+                let file_id = self.mapping.add_file(&loc.file);
+                regions.push(CoverageRegion {
+                    start: loc.clone(),
+                    end: source_map.get_block_end(block.id).unwrap_or(loc.clone()),
+                    kind: RegionKind::Code,
+                    counter_id: counter,
+                    file_id,
+                });
+            }
+            
+            // Instrument branches
+            if self.config.branch_coverage {
+                if let Some(branch) = self.instrument_terminator(&mut block.terminator, source_map) {
+                    branches.push(branch);
+                }
+            }
+        }
+        
+        // Create function mapping
+        let func_hash = self.compute_function_hash(func);
+        let mapping = FunctionCoverageMapping {
+            name: func.name.clone(),
+            mangled_name: func.mangled_name.clone().unwrap_or_else(|| func.name.clone()),
+            hash: func_hash,
+            regions,
+            branches,
+            num_counters: self.next_counter_id - func_start_counter,
+        };
+        
+        self.mapping.add_function(mapping);
+    }
+    
+    fn allocate_counter(&mut self) -> u32 {
+        let id = self.next_counter_id;
+        self.next_counter_id += 1;
+        id
+    }
+    
+    fn insert_counter_increment(&self, block: &mut MirBlock, position: usize, counter_id: u32) {
+        let stmt = MirStatement::IncrementCounter {
+            counter_id,
+            counter_type: CounterType::Region,
+        };
+        block.statements.insert(position, stmt);
+    }
+    
+    fn instrument_terminator(&mut self, terminator: &mut MirTerminator, source_map: &SourceMap) -> Option<BranchInfo> {
+        match terminator {
+            MirTerminator::If { cond, then_bb, else_bb, location } => {
+                let true_counter = self.allocate_counter();
+                let false_counter = self.allocate_counter();
+                
+                // Wrap terminator with branch counters
+                *terminator = MirTerminator::IfCounted {
+                    cond: cond.clone(),
+                    then_bb: *then_bb,
+                    else_bb: *else_bb,
+                    location: location.clone(),
+                    true_counter,
+                    false_counter,
+                };
+                
+                Some(BranchInfo {
+                    location: location.clone().unwrap_or_else(|| SourceLocation::new("unknown", 0, 0)),
+                    true_counter,
+                    false_counter,
+                    condition_id: None,
+                })
+            }
+            MirTerminator::Switch { discr, targets, location } => {
+                // Each case gets a counter
+                let mut case_counters = Vec::new();
+                for _ in targets {
+                    case_counters.push(self.allocate_counter());
+                }
+                
+                *terminator = MirTerminator::SwitchCounted {
+                    discr: discr.clone(),
+                    targets: targets.clone(),
+                    location: location.clone(),
+                    counters: case_counters,
+                };
+                
+                None // Switch branches handled differently
+            }
+            _ => None,
+        }
+    }
+    
+    fn compute_function_hash(&self, func: &MirFunction) -> u64 {
+        // Simple hash based on function structure
+        let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+        
+        hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+        hash ^= func.blocks.len() as u64;
+        
+        for block in &func.blocks {
+            hash = hash.wrapping_mul(0x100000001b3);
+            hash ^= block.statements.len() as u64;
+        }
+        
+        hash
+    }
+    
+    /// Get the coverage mapping data
+    pub fn get_mapping(&self) -> &CoverageMappingData {
+        &self.mapping
+    }
+    
+    /// Get total number of counters
+    pub fn counter_count(&self) -> u32 {
+        self.next_counter_id
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COVERAGE DATA COLLECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Raw coverage data from execution
+#[derive(Debug, Clone)]
+pub struct CoverageData {
+    /// Module hash for validation
+    pub module_hash: u64,
+    /// Counter values
+    pub counters: Vec<u64>,
+    /// Function data
+    pub functions: Vec<FunctionData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionData {
+    /// Function name hash
+    pub name_hash: u64,
+    /// Function structure hash
+    pub struct_hash: u64,
+    /// Counter start index
+    pub counter_start: u32,
+    /// Number of counters
+    pub num_counters: u32,
+}
+
+impl CoverageData {
+    pub fn new(num_counters: usize) -> Self {
+        CoverageData {
+            module_hash: 0,
+            counters: vec![0; num_counters],
+            functions: Vec::new(),
+        }
+    }
+    
+    /// Merge another profile into this one
+    pub fn merge(&mut self, other: &CoverageData) {
+        if self.counters.len() != other.counters.len() {
+            return; // Incompatible
+        }
+        
+        for (i, count) in other.counters.iter().enumerate() {
+            self.counters[i] = self.counters[i].saturating_add(*count);
+        }
+    }
+    
+    /// Write to binary format
+    pub fn write<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        // Magic
+        writer.write_all(&COVERAGE_MAGIC.to_le_bytes())?;
+        
+        // Version
+        writer.write_all(&COVERAGE_VERSION.to_le_bytes())?;
+        
+        // Module hash
+        writer.write_all(&self.module_hash.to_le_bytes())?;
+        
+        // Counters
+        writer.write_all(&(self.counters.len() as u64).to_le_bytes())?;
+        for counter in &self.counters {
+            writer.write_all(&counter.to_le_bytes())?;
+        }
+        
+        // Functions
+        writer.write_all(&(self.functions.len() as u32).to_le_bytes())?;
+        for func in &self.functions {
+            writer.write_all(&func.name_hash.to_le_bytes())?;
+            writer.write_all(&func.struct_hash.to_le_bytes())?;
+            writer.write_all(&func.counter_start.to_le_bytes())?;
+            writer.write_all(&func.num_counters.to_le_bytes())?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Read from binary format
+    pub fn read<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let mut buf8 = [0u8; 8];
+        let mut buf4 = [0u8; 4];
+        
+        // Magic
+        reader.read_exact(&mut buf8)?;
+        let magic = u64::from_le_bytes(buf8);
+        if magic != COVERAGE_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid coverage magic number"
+            ));
+        }
+        
+        // Version
+        reader.read_exact(&mut buf4)?;
+        let _version = u32::from_le_bytes(buf4);
+        
+        // Module hash
+        reader.read_exact(&mut buf8)?;
+        let module_hash = u64::from_le_bytes(buf8);
+        
+        // Counters
+        reader.read_exact(&mut buf8)?;
+        let counter_count = u64::from_le_bytes(buf8) as usize;
+        
+        let mut counters = Vec::with_capacity(counter_count);
+        for _ in 0..counter_count {
+            reader.read_exact(&mut buf8)?;
+            counters.push(u64::from_le_bytes(buf8));
+        }
+        
+        // Functions
+        reader.read_exact(&mut buf4)?;
+        let func_count = u32::from_le_bytes(buf4) as usize;
+        
+        let mut functions = Vec::with_capacity(func_count);
+        for _ in 0..func_count {
+            reader.read_exact(&mut buf8)?;
+            let name_hash = u64::from_le_bytes(buf8);
+            
+            reader.read_exact(&mut buf8)?;
+            let struct_hash = u64::from_le_bytes(buf8);
+            
+            reader.read_exact(&mut buf4)?;
+            let counter_start = u32::from_le_bytes(buf4);
+            
+            reader.read_exact(&mut buf4)?;
+            let num_counters = u32::from_le_bytes(buf4);
+            
+            functions.push(FunctionData {
+                name_hash,
+                struct_hash,
+                counter_start,
+                num_counters,
+            });
+        }
+        
+        Ok(CoverageData {
+            module_hash,
+            counters,
+            functions,
+        })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COVERAGE REPORT GENERATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Coverage statistics
+#[derive(Debug, Clone, Default)]
+pub struct CoverageStats {
+    pub lines_total: u32,
+    pub lines_covered: u32,
+    pub functions_total: u32,
+    pub functions_covered: u32,
+    pub branches_total: u32,
+    pub branches_covered: u32,
+    pub regions_total: u32,
+    pub regions_covered: u32,
+}
+
+impl CoverageStats {
+    pub fn line_coverage_percent(&self) -> f64 {
+        if self.lines_total == 0 { 0.0 }
+        else { (self.lines_covered as f64 / self.lines_total as f64) * 100.0 }
+    }
+    
+    pub fn function_coverage_percent(&self) -> f64 {
+        if self.functions_total == 0 { 0.0 }
+        else { (self.functions_covered as f64 / self.functions_total as f64) * 100.0 }
+    }
+    
+    pub fn branch_coverage_percent(&self) -> f64 {
+        if self.branches_total == 0 { 0.0 }
+        else { (self.branches_covered as f64 / self.branches_total as f64) * 100.0 }
+    }
+    
+    pub fn region_coverage_percent(&self) -> f64 {
+        if self.regions_total == 0 { 0.0 }
+        else { (self.regions_covered as f64 / self.regions_total as f64) * 100.0 }
+    }
+}
+
+/// Coverage report generator
+pub struct CoverageReportGenerator {
+    mapping: CoverageMappingData,
+    data: CoverageData,
+}
+
+impl CoverageReportGenerator {
+    pub fn new(mapping: CoverageMappingData, data: CoverageData) -> Self {
+        CoverageReportGenerator { mapping, data }
+    }
+    
+    /// Generate summary statistics
+    pub fn generate_stats(&self) -> CoverageStats {
+        let mut stats = CoverageStats::default();
+        
+        for func in &self.mapping.functions {
+            stats.functions_total += 1;
+            
+            // Check if function was executed
+            let func_counter = self.data.counters.get(func.regions.first()
+                .map(|r| r.counter_id as usize)
+                .unwrap_or(0))
+                .copied()
+                .unwrap_or(0);
+            
+            if func_counter > 0 {
+                stats.functions_covered += 1;
+            }
+            
+            // Count regions
+            for region in &func.regions {
+                if region.kind == RegionKind::Code {
+                    stats.regions_total += 1;
+                    
+                    let count = self.data.counters.get(region.counter_id as usize)
+                        .copied()
+                        .unwrap_or(0);
+                    
+                    if count > 0 {
+                        stats.regions_covered += 1;
+                    }
+                }
+            }
+            
+            // Count branches
+            for branch in &func.branches {
+                stats.branches_total += 2; // True and false
+                
+                let true_count = self.data.counters.get(branch.true_counter as usize)
+                    .copied()
+                    .unwrap_or(0);
+                let false_count = self.data.counters.get(branch.false_counter as usize)
+                    .copied()
+                    .unwrap_or(0);
+                
+                if true_count > 0 { stats.branches_covered += 1; }
+                if false_count > 0 { stats.branches_covered += 1; }
+            }
+        }
+        
+        // Calculate line coverage from regions
+        stats.lines_total = self.calculate_total_lines();
+        stats.lines_covered = self.calculate_covered_lines();
+        
+        stats
+    }
+    
+    fn calculate_total_lines(&self) -> u32 {
+        let mut lines: BTreeSet<(u32, u32)> = BTreeSet::new();
+        
+        for func in &self.mapping.functions {
+            for region in &func.regions {
+                for line in region.start.line..=region.end.line {
+                    lines.insert((region.file_id, line));
+                }
+            }
+        }
+        
+        lines.len() as u32
+    }
+    
+    fn calculate_covered_lines(&self) -> u32 {
+        let mut covered_lines: BTreeSet<(u32, u32)> = BTreeSet::new();
+        
+        for func in &self.mapping.functions {
+            for region in &func.regions {
+                let count = self.data.counters.get(region.counter_id as usize)
+                    .copied()
+                    .unwrap_or(0);
+                
+                if count > 0 {
+                    for line in region.start.line..=region.end.line {
+                        covered_lines.insert((region.file_id, line));
+                    }
+                }
+            }
+        }
+        
+        covered_lines.len() as u32
+    }
+    
+    /// Generate LCOV format report
+    pub fn generate_lcov(&self) -> String {
+        let mut output = String::new();
+        
+        for file_idx in 0..self.mapping.files.len() {
+            let file = &self.mapping.files[file_idx];
+            
+            output.push_str(&format!("SF:{}\n", file));
+            
+            // Function data
+            for func in &self.mapping.functions {
+                let in_file = func.regions.iter().any(|r| r.file_id == file_idx as u32);
+                if !in_file { continue; }
+                
+                let start_line = func.regions.first()
+                    .map(|r| r.start.line)
+                    .unwrap_or(0);
+                
+                output.push_str(&format!("FN:{},{}\n", start_line, func.name));
+            }
+            
+            // Function execution counts
+            for func in &self.mapping.functions {
+                let in_file = func.regions.iter().any(|r| r.file_id == file_idx as u32);
+                if !in_file { continue; }
+                
+                let count = func.regions.first()
+                    .and_then(|r| self.data.counters.get(r.counter_id as usize))
+                    .copied()
+                    .unwrap_or(0);
+                
+                output.push_str(&format!("FNDA:{},{}\n", count, func.name));
+            }
+            
+            // Line data
+            let mut line_counts: BTreeMap<u32, u64> = BTreeMap::new();
+            
+            for func in &self.mapping.functions {
+                for region in &func.regions {
+                    if region.file_id != file_idx as u32 { continue; }
+                    
+                    let count = self.data.counters.get(region.counter_id as usize)
+                        .copied()
+                        .unwrap_or(0);
+                    
+                    for line in region.start.line..=region.end.line {
+                        *line_counts.entry(line).or_insert(0) += count;
+                    }
+                }
+            }
+            
+            for (line, count) in &line_counts {
+                output.push_str(&format!("DA:{},{}\n", line, count));
+            }
+            
+            // Branch data
+            let mut branch_idx = 0;
+            for func in &self.mapping.functions {
+                for branch in &func.branches {
+                    let true_count = self.data.counters.get(branch.true_counter as usize)
+                        .copied()
+                        .unwrap_or(0);
+                    let false_count = self.data.counters.get(branch.false_counter as usize)
+                        .copied()
+                        .unwrap_or(0);
+                    
+                    output.push_str(&format!("BRDA:{},{},{},{}\n", 
+                        branch.location.line, branch_idx, 0, 
+                        if true_count > 0 { true_count.to_string() } else { "-".to_string() }));
+                    output.push_str(&format!("BRDA:{},{},{},{}\n", 
+                        branch.location.line, branch_idx, 1,
+                        if false_count > 0 { false_count.to_string() } else { "-".to_string() }));
+                    
+                    branch_idx += 1;
+                }
+            }
+            
+            output.push_str("end_of_record\n");
+        }
+        
+        output
+    }
+    
+    /// Generate JSON report
+    pub fn generate_json(&self) -> String {
+        let stats = self.generate_stats();
+        
+        let mut output = String::new();
+        output.push_str("{\n");
+        output.push_str("  \"type\": \"quanta.coverage.1\",\n");
+        output.push_str(&format!("  \"version\": \"{}\",\n", COVERAGE_VERSION));
+        
+        // Summary
+        output.push_str("  \"summary\": {\n");
+        output.push_str(&format!("    \"lines\": {{ \"total\": {}, \"covered\": {}, \"percent\": {:.2} }},\n",
+            stats.lines_total, stats.lines_covered, stats.line_coverage_percent()));
+        output.push_str(&format!("    \"functions\": {{ \"total\": {}, \"covered\": {}, \"percent\": {:.2} }},\n",
+            stats.functions_total, stats.functions_covered, stats.function_coverage_percent()));
+        output.push_str(&format!("    \"branches\": {{ \"total\": {}, \"covered\": {}, \"percent\": {:.2} }},\n",
+            stats.branches_total, stats.branches_covered, stats.branch_coverage_percent()));
+        output.push_str(&format!("    \"regions\": {{ \"total\": {}, \"covered\": {}, \"percent\": {:.2} }}\n",
+            stats.regions_total, stats.regions_covered, stats.region_coverage_percent()));
+        output.push_str("  },\n");
+        
+        // Files
+        output.push_str("  \"files\": [\n");
+        for (i, file) in self.mapping.files.iter().enumerate() {
+            if i > 0 { output.push_str(",\n"); }
+            output.push_str(&format!("    {{ \"path\": \"{}\" }}", file));
+        }
+        output.push_str("\n  ],\n");
+        
+        // Functions
+        output.push_str("  \"functions\": [\n");
+        for (i, func) in self.mapping.functions.iter().enumerate() {
+            if i > 0 { output.push_str(",\n"); }
+            
+            let count = func.regions.first()
+                .and_then(|r| self.data.counters.get(r.counter_id as usize))
+                .copied()
+                .unwrap_or(0);
+            
+            output.push_str(&format!("    {{ \"name\": \"{}\", \"count\": {} }}", func.name, count));
+        }
+        output.push_str("\n  ]\n");
+        
+        output.push_str("}\n");
+        output
+    }
+    
+    /// Generate HTML report
+    pub fn generate_html(&self) -> String {
+        let stats = self.generate_stats();
+        
+        let mut html = String::new();
+        html.push_str("<!DOCTYPE html>\n<html>\n<head>\n");
+        html.push_str("<title>Coverage Report</title>\n");
+        html.push_str("<style>\n");
+        html.push_str("body { font-family: system-ui, sans-serif; margin: 20px; }\n");
+        html.push_str(".summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; }\n");
+        html.push_str(".stat { background: #f5f5f5; padding: 15px; border-radius: 8px; }\n");
+        html.push_str(".stat h3 { margin: 0 0 10px 0; color: #666; }\n");
+        html.push_str(".stat .value { font-size: 2em; font-weight: bold; }\n");
+        html.push_str(".covered { background: #d4edda; }\n");
+        html.push_str(".uncovered { background: #f8d7da; }\n");
+        html.push_str(".partial { background: #fff3cd; }\n");
+        html.push_str("table { width: 100%; border-collapse: collapse; margin-top: 20px; }\n");
+        html.push_str("th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }\n");
+        html.push_str(".bar { height: 20px; background: #e0e0e0; border-radius: 4px; overflow: hidden; }\n");
+        html.push_str(".bar-fill { height: 100%; background: #4caf50; }\n");
+        html.push_str("</style>\n</head>\n<body>\n");
+        
+        html.push_str("<h1>Coverage Report</h1>\n");
+        
+        // Summary boxes
+        html.push_str("<div class=\"summary\">\n");
+        
+        html.push_str("<div class=\"stat\">\n");
+        html.push_str("<h3>Line Coverage</h3>\n");
+        html.push_str(&format!("<div class=\"value\">{:.1}%</div>\n", stats.line_coverage_percent()));
+        html.push_str(&format!("<div>{} / {} lines</div>\n", stats.lines_covered, stats.lines_total));
+        html.push_str("</div>\n");
+        
+        html.push_str("<div class=\"stat\">\n");
+        html.push_str("<h3>Function Coverage</h3>\n");
+        html.push_str(&format!("<div class=\"value\">{:.1}%</div>\n", stats.function_coverage_percent()));
+        html.push_str(&format!("<div>{} / {} functions</div>\n", stats.functions_covered, stats.functions_total));
+        html.push_str("</div>\n");
+        
+        html.push_str("<div class=\"stat\">\n");
+        html.push_str("<h3>Branch Coverage</h3>\n");
+        html.push_str(&format!("<div class=\"value\">{:.1}%</div>\n", stats.branch_coverage_percent()));
+        html.push_str(&format!("<div>{} / {} branches</div>\n", stats.branches_covered, stats.branches_total));
+        html.push_str("</div>\n");
+        
+        html.push_str("<div class=\"stat\">\n");
+        html.push_str("<h3>Region Coverage</h3>\n");
+        html.push_str(&format!("<div class=\"value\">{:.1}%</div>\n", stats.region_coverage_percent()));
+        html.push_str(&format!("<div>{} / {} regions</div>\n", stats.regions_covered, stats.regions_total));
+        html.push_str("</div>\n");
+        
+        html.push_str("</div>\n");
+        
+        // Functions table
+        html.push_str("<h2>Functions</h2>\n");
+        html.push_str("<table>\n");
+        html.push_str("<tr><th>Function</th><th>Execution Count</th><th>Regions</th></tr>\n");
+        
+        for func in &self.mapping.functions {
+            let count = func.regions.first()
+                .and_then(|r| self.data.counters.get(r.counter_id as usize))
+                .copied()
+                .unwrap_or(0);
+            
+            let covered_regions = func.regions.iter()
+                .filter(|r| self.data.counters.get(r.counter_id as usize).copied().unwrap_or(0) > 0)
+                .count();
+            
+            let class = if count == 0 { "uncovered" } 
+                       else if covered_regions == func.regions.len() { "covered" }
+                       else { "partial" };
+            
+            html.push_str(&format!(
+                "<tr class=\"{}\"><td>{}</td><td>{}</td><td>{}/{}</td></tr>\n",
+                class, func.name, count, covered_regions, func.regions.len()
+            ));
+        }
+        
+        html.push_str("</table>\n");
+        html.push_str("</body>\n</html>\n");
+        
+        html
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub mangled_name: Option<String>,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    /// Increment a coverage counter
+    IncrementCounter {
+        counter_id: u32,
+        counter_type: CounterType,
+    },
+    Other,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CounterType {
+    Region,
+    Branch,
+    Gap,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Return,
+    Goto(u32),
+    If {
+        cond: String,
+        then_bb: u32,
+        else_bb: u32,
+        location: Option<SourceLocation>,
+    },
+    IfCounted {
+        cond: String,
+        then_bb: u32,
+        else_bb: u32,
+        location: Option<SourceLocation>,
+        true_counter: u32,
+        false_counter: u32,
+    },
+    Switch {
+        discr: String,
+        targets: Vec<u32>,
+        location: Option<SourceLocation>,
+    },
+    SwitchCounted {
+        discr: String,
+        targets: Vec<u32>,
+        location: Option<SourceLocation>,
+        counters: Vec<u32>,
+    },
+}
+
+/// Source map for coverage
+pub struct SourceMap {
+    function_locations: BTreeMap<String, SourceLocation>,
+    function_ends: BTreeMap<String, SourceLocation>,
+    block_locations: BTreeMap<u32, SourceLocation>,
+    block_ends: BTreeMap<u32, SourceLocation>,
+}
+
+impl SourceMap {
+    pub fn new() -> Self {
+        SourceMap {
+            function_locations: BTreeMap::new(),
+            function_ends: BTreeMap::new(),
+            block_locations: BTreeMap::new(),
+            block_ends: BTreeMap::new(),
+        }
+    }
+    
+    pub fn add_function(&mut self, name: &str, start: SourceLocation, end: SourceLocation) {
+        self.function_locations.insert(name.to_string(), start);
+        self.function_ends.insert(name.to_string(), end);
+    }
+    
+    pub fn add_block(&mut self, block_id: u32, start: SourceLocation, end: SourceLocation) {
+        self.block_locations.insert(block_id, start);
+        self.block_ends.insert(block_id, end);
+    }
+    
+    pub fn get_function_location(&self, name: &str) -> Option<&SourceLocation> {
+        self.function_locations.get(name)
+    }
+    
+    pub fn get_function_end(&self, name: &str) -> Option<SourceLocation> {
+        self.function_ends.get(name).cloned()
+    }
+    
+    pub fn get_block_location(&self, block_id: u32) -> Option<&SourceLocation> {
+        self.block_locations.get(&block_id)
+    }
+    
+    pub fn get_block_end(&self, block_id: u32) -> Option<SourceLocation> {
+        self.block_ends.get(&block_id).cloned()
+    }
+}
+
+impl Default for SourceMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_coverage_config_default() {
+        let config = CoverageConfig::default();
+        
+        assert_eq!(config.granularity, CoverageGranularity::Region);
+        assert!(config.branch_coverage);
+    }
+    
+    #[test]
+    fn test_coverage_data_roundtrip() {
+        let mut data = CoverageData::new(10);
+        data.counters[0] = 100;
+        data.counters[5] = 50;
+        data.module_hash = 12345;
+        
+        let mut buffer = Vec::new();
+        data.write(&mut buffer).unwrap();
+        
+        let mut cursor = std::io::Cursor::new(buffer);
+        let loaded = CoverageData::read(&mut cursor).unwrap();
+        
+        assert_eq!(loaded.module_hash, 12345);
+        assert_eq!(loaded.counters[0], 100);
+        assert_eq!(loaded.counters[5], 50);
+    }
+    
+    #[test]
+    fn test_coverage_merge() {
+        let mut data1 = CoverageData::new(5);
+        data1.counters = vec![10, 20, 30, 40, 50];
+        
+        let mut data2 = CoverageData::new(5);
+        data2.counters = vec![5, 15, 25, 35, 45];
+        
+        data1.merge(&data2);
+        
+        assert_eq!(data1.counters, vec![15, 35, 55, 75, 95]);
+    }
+    
+    #[test]
+    fn test_coverage_stats() {
+        let stats = CoverageStats {
+            lines_total: 100,
+            lines_covered: 75,
+            functions_total: 10,
+            functions_covered: 8,
+            branches_total: 20,
+            branches_covered: 15,
+            regions_total: 50,
+            regions_covered: 40,
+        };
+        
+        assert!((stats.line_coverage_percent() - 75.0).abs() < 0.01);
+        assert!((stats.function_coverage_percent() - 80.0).abs() < 0.01);
+        assert!((stats.branch_coverage_percent() - 75.0).abs() < 0.01);
+        assert!((stats.region_coverage_percent() - 80.0).abs() < 0.01);
+    }
+}

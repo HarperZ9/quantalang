@@ -1,0 +1,607 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ PACKAGE MANAGER — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The QuantaLang Package Manager (quanta) handles dependency management,
+// building, testing, and publishing of QuantaLang packages.
+//
+// Features:
+// - Manifest parsing (quanta.toml)
+// - Semantic versioning with version requirements
+// - Lock file generation for reproducible builds
+// - PubGrub-inspired dependency resolution
+// - Registry integration with sparse index protocol
+// - Workspace support
+// - Feature unification
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang Package Manager
+//!
+//! This crate provides package management functionality for QuantaLang projects.
+//!
+//! ## Quick Start
+//!
+//! ```bash
+//! # Create a new package
+//! quanta new my-project
+//! cd my-project
+//!
+//! # Add a dependency
+//! quanta add serde --features derive
+//!
+//! # Build the project
+//! quanta build --release
+//!
+//! # Run tests
+//! quanta test
+//! ```
+//!
+//! ## Manifest Format (quanta.toml)
+//!
+//! ```toml
+//! [package]
+//! name = "my-project"
+//! version = "0.1.0"
+//! edition = "2025"
+//! authors = ["Your Name <you@example.com>"]
+//! description = "A sample QuantaLang project"
+//! license = "MIT"
+//!
+//! [dependencies]
+//! serde = { version = "1.0", features = ["derive"] }
+//! tokio = { version = "1.0", features = ["full"] }
+//!
+//! [dev-dependencies]
+//! pretty_assertions = "1.0"
+//!
+//! [features]
+//! default = ["std"]
+//! std = []
+//! ```
+//!
+//! ## Modules
+//!
+//! - [`manifest`] - Manifest file parsing and serialization
+//! - [`version`] - Semantic versioning implementation
+//! - [`lockfile`] - Lock file management
+//! - [`resolver`] - Dependency resolution algorithm
+//! - [`registry`] - Package registry client
+//! - [`cli`] - Command-line interface
+
+module quantalang::pkg
+
+// Submodules
+pub mod manifest;
+pub mod version;
+pub mod lockfile;
+pub mod resolver;
+pub mod registry;
+pub mod cli;
+
+// Re-exports for convenience
+pub use manifest::{
+    Manifest, Package, Dependency, 
+    Workspace, Profile, OptLevel, Lto, PanicStrategy,
+    BinaryTarget, LibraryTarget, TestTarget, CrateType,
+    parse_manifest,
+};
+
+pub use version::{
+    Version, VersionReq, Comparator, Op,
+    Prerelease, BuildMetadata,
+};
+
+pub use lockfile::{
+    Lockfile, LockedPackage, LockedDependency,
+    LockfileDiff, LockMetadata,
+    compute_checksum,
+};
+
+pub use resolver::{
+    Resolver, Resolution, ResolvedPackage, PackageSource,
+    Constraint, Incompatibility, ResolveError,
+    Registry, PackageMetadata, MockRegistry,
+};
+
+pub use registry::{
+    RegistryClient, RegistryConfig, RegistryError,
+    SearchResult, PackageInfo, VersionInfo, Owner,
+    PublishMetadata, SparseIndexEntry,
+    DEFAULT_REGISTRY,
+};
+
+pub use cli::{
+    Command, GlobalOptions, ColorChoice,
+    NewOptions, BuildOptions, RunOptions, TestOptions,
+    AddOptions, RemoveOptions, TreeOptions,
+    parse_args, execute,
+};
+
+// Version information
+pub const VERSION: &str = "1.0.0";
+pub const VERSION_MAJOR: u32 = 1;
+pub const VERSION_MINOR: u32 = 0;
+pub const VERSION_PATCH: u32 = 0;
+
+// File constants
+pub const MANIFEST_FILE: &str = "quanta.toml";
+pub const LOCK_FILE: &str = "quanta.lock";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIGH-LEVEL API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Load manifest from current directory
+///
+/// # Errors
+///
+/// Returns error if manifest file doesn't exist or is invalid.
+///
+/// # Examples
+///
+/// ```quanta
+/// use quantalang::pkg;
+///
+/// let manifest = pkg::load_manifest()?;
+/// println!("Package: {} v{}", manifest.package.name, manifest.package.version);
+/// ```
+pub fn load_manifest() -> Result<Manifest, String> {
+    load_manifest_from(MANIFEST_FILE)
+}
+
+/// Load manifest from specific path
+pub fn load_manifest_from(path: &str) -> Result<Manifest, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {}", path, e))?;
+    
+    parse_manifest(&content)
+        .map_err(|e| format!("failed to parse {}: {}", path, e))
+}
+
+/// Load lock file from current directory
+///
+/// Returns `None` if lock file doesn't exist.
+pub fn load_lockfile() -> Option<Lockfile> {
+    load_lockfile_from(LOCK_FILE)
+}
+
+/// Load lock file from specific path
+pub fn load_lockfile_from(path: &str) -> Option<Lockfile> {
+    let content = std::fs::read_to_string(path).ok()?;
+    Lockfile::parse(&content).ok()
+}
+
+/// Save lock file to current directory
+pub fn save_lockfile(lockfile: &Lockfile) -> Result<(), String> {
+    save_lockfile_to(lockfile, LOCK_FILE)
+}
+
+/// Save lock file to specific path
+pub fn save_lockfile_to(lockfile: &Lockfile, path: &str) -> Result<(), String> {
+    std::fs::write(path, lockfile.to_toml())
+        .map_err(|e| format!("failed to write {}: {}", path, e))
+}
+
+/// Resolve dependencies for a manifest
+///
+/// # Examples
+///
+/// ```quanta
+/// use quantalang::pkg;
+///
+/// let manifest = pkg::load_manifest()?;
+/// let resolution = pkg::resolve(&manifest)?;
+///
+/// for pkg in &resolution.packages {
+///     println!("{} v{}", pkg.name, pkg.version);
+/// }
+/// ```
+pub fn resolve(manifest: &Manifest) -> Result<Resolution, ResolveError> {
+    let client = RegistryClient::new();
+    resolve_with_registry(manifest, &client)
+}
+
+/// Resolve dependencies with custom registry
+pub fn resolve_with_registry<R: Registry>(manifest: &Manifest, registry: &R) -> Result<Resolution, ResolveError> {
+    let lockfile = load_lockfile();
+    
+    let mut resolver = Resolver::new(registry, manifest);
+    
+    if let Some(ref lock) = lockfile {
+        resolver = resolver.with_lockfile(lock);
+    }
+    
+    resolver.resolve()
+}
+
+/// Update dependencies and regenerate lock file
+pub fn update(manifest: &Manifest) -> Result<Resolution, String> {
+    let client = RegistryClient::new();
+    let resolution = resolve_with_registry(manifest, &client)
+        .map_err(|e| e.to_string())?;
+    
+    let lockfile = resolution.to_lockfile();
+    save_lockfile(&lockfile)?;
+    
+    Ok(resolution)
+}
+
+/// Fetch all dependencies to local cache
+pub fn fetch(manifest: &Manifest) -> Result<(), String> {
+    let resolution = resolve(manifest).map_err(|e| e.to_string())?;
+    let client = RegistryClient::new();
+    
+    for pkg in &resolution.packages {
+        if let PackageSource::Registry(_) = pkg.source {
+            client.download(&pkg.name, &pkg.version)
+                .map_err(|e| format!("failed to download {} v{}: {}", pkg.name, pkg.version, e))?;
+        }
+    }
+    
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUILDER PATTERN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Builder for package operations
+///
+/// # Examples
+///
+/// ```quanta
+/// use quantalang::pkg::PackageBuilder;
+///
+/// PackageBuilder::new("my-crate")
+///     .version("0.1.0")
+///     .author("Your Name <you@example.com>")
+///     .dependency("serde", "1.0")
+///     .feature("default", vec!["std"])
+///     .create()?;
+/// ```
+pub struct PackageBuilder {
+    manifest: Manifest,
+}
+
+impl PackageBuilder {
+    /// Create a new package builder
+    pub fn new(name: &str) -> Self {
+        PackageBuilder {
+            manifest: Manifest::new(name, "0.1.0"),
+        }
+    }
+    
+    /// Set package version
+    pub fn version(mut self, version: &str) -> Self {
+        self.manifest.package.version = version.to_string();
+        self
+    }
+    
+    /// Set edition
+    pub fn edition(mut self, edition: &str) -> Self {
+        self.manifest.package.edition = Some(edition.to_string());
+        self
+    }
+    
+    /// Add author
+    pub fn author(mut self, author: &str) -> Self {
+        self.manifest.package.authors.push(author.to_string());
+        self
+    }
+    
+    /// Set description
+    pub fn description(mut self, desc: &str) -> Self {
+        self.manifest.package.description = Some(desc.to_string());
+        self
+    }
+    
+    /// Set license
+    pub fn license(mut self, license: &str) -> Self {
+        self.manifest.package.license = Some(license.to_string());
+        self
+    }
+    
+    /// Set repository URL
+    pub fn repository(mut self, url: &str) -> Self {
+        self.manifest.package.repository = Some(url.to_string());
+        self
+    }
+    
+    /// Add dependency
+    pub fn dependency(mut self, name: &str, version: &str) -> Self {
+        self.manifest.add_dependency(name, Dependency::version(version));
+        self
+    }
+    
+    /// Add dependency with features
+    pub fn dependency_with_features(mut self, name: &str, version: &str, features: Vec<String>) -> Self {
+        let dep = Dependency::version(version).with_features(features);
+        self.manifest.add_dependency(name, dep);
+        self
+    }
+    
+    /// Add git dependency
+    pub fn git_dependency(mut self, name: &str, url: &str) -> Self {
+        self.manifest.add_dependency(name, Dependency::git(url));
+        self
+    }
+    
+    /// Add path dependency
+    pub fn path_dependency(mut self, name: &str, path: &str) -> Self {
+        self.manifest.add_dependency(name, Dependency::path(path));
+        self
+    }
+    
+    /// Add dev dependency
+    pub fn dev_dependency(mut self, name: &str, version: &str) -> Self {
+        self.manifest.add_dev_dependency(name, Dependency::version(version));
+        self
+    }
+    
+    /// Add feature
+    pub fn feature(mut self, name: &str, deps: Vec<String>) -> Self {
+        self.manifest.add_feature(name, deps);
+        self
+    }
+    
+    /// Get the built manifest
+    pub fn build(self) -> Manifest {
+        self.manifest
+    }
+    
+    /// Create package directory with manifest
+    pub fn create(self) -> Result<(), String> {
+        self.create_at(&self.manifest.package.name)
+    }
+    
+    /// Create package at specific path
+    pub fn create_at(self, path: &str) -> Result<(), String> {
+        // Create directory structure
+        std::fs::create_dir_all(path)
+            .map_err(|e| format!("failed to create directory: {}", e))?;
+        
+        std::fs::create_dir_all(format!("{}/src", path))
+            .map_err(|e| format!("failed to create src directory: {}", e))?;
+        
+        // Write manifest
+        let manifest_path = format!("{}/{}", path, MANIFEST_FILE);
+        std::fs::write(&manifest_path, self.manifest.to_toml())
+            .map_err(|e| format!("failed to write manifest: {}", e))?;
+        
+        // Write main.quanta
+        let main_path = format!("{}/src/main.quanta", path);
+        std::fs::write(&main_path, DEFAULT_MAIN)
+            .map_err(|e| format!("failed to write main.quanta: {}", e))?;
+        
+        // Write .gitignore
+        let gitignore_path = format!("{}/.gitignore", path);
+        std::fs::write(&gitignore_path, DEFAULT_GITIGNORE)
+            .map_err(|e| format!("failed to write .gitignore: {}", e))?;
+        
+        Ok(())
+    }
+}
+
+const DEFAULT_MAIN: &str = r#"//! Main entry point
+
+fn main() {
+    println!("Hello, World!");
+}
+"#;
+
+const DEFAULT_GITIGNORE: &str = r#"/target
+quanta.lock
+*.swp
+*.swo
+.DS_Store
+"#;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WORKSPACE OPERATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Find workspace root from current directory
+pub fn find_workspace_root() -> Option<String> {
+    let mut current = std::env::current_dir().ok()?;
+    
+    loop {
+        let manifest_path = current.join(MANIFEST_FILE);
+        
+        if manifest_path.exists() {
+            let content = std::fs::read_to_string(&manifest_path).ok()?;
+            if let Ok(manifest) = parse_manifest(&content) {
+                if manifest.is_workspace() {
+                    return Some(current.to_string_lossy().to_string());
+                }
+            }
+        }
+        
+        if !current.pop() {
+            break;
+        }
+    }
+    
+    None
+}
+
+/// Get all members of a workspace
+pub fn workspace_members(root: &str) -> Result<Vec<String>, String> {
+    let manifest_path = format!("{}/{}", root, MANIFEST_FILE);
+    let manifest = load_manifest_from(&manifest_path)?;
+    
+    let workspace = manifest.workspace
+        .ok_or_else(|| "not a workspace".to_string())?;
+    
+    let mut members = Vec::new();
+    
+    for pattern in &workspace.members {
+        // Handle glob patterns
+        if pattern.contains('*') {
+            let expanded = expand_glob(root, pattern)?;
+            members.extend(expanded);
+        } else {
+            members.push(format!("{}/{}", root, pattern));
+        }
+    }
+    
+    // Filter excludes
+    members.retain(|m| {
+        !workspace.exclude.iter().any(|ex| m.ends_with(ex))
+    });
+    
+    Ok(members)
+}
+
+fn expand_glob(root: &str, pattern: &str) -> Result<Vec<String>, String> {
+    let mut results = Vec::new();
+    
+    // Simple glob expansion (production would use glob crate)
+    let parts: Vec<&str> = pattern.split('/').collect();
+    let base_dir = if parts[0] == "*" {
+        root.to_string()
+    } else {
+        format!("{}/{}", root, parts[0])
+    };
+    
+    if let Ok(entries) = std::fs::read_dir(&base_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let manifest = path.join(MANIFEST_FILE);
+                if manifest.exists() {
+                    results.push(path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    
+    Ok(results)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Validate package name
+///
+/// Package names must:
+/// - Start with a letter or underscore
+/// - Contain only alphanumeric characters, hyphens, and underscores
+/// - Be non-empty and not exceed 64 characters
+/// - Not be a reserved name
+pub fn validate_package_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("package name cannot be empty".to_string());
+    }
+    
+    if name.len() > 64 {
+        return Err("package name cannot exceed 64 characters".to_string());
+    }
+    
+    let first = name.chars().next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return Err("package name must start with a letter or underscore".to_string());
+    }
+    
+    for c in name.chars() {
+        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
+            return Err(format!("invalid character in package name: '{}'", c));
+        }
+    }
+    
+    // Reserved names
+    const RESERVED: &[&str] = &[
+        "std", "core", "alloc", "test", "proc_macro",
+        "self", "super", "crate", "Self",
+    ];
+    
+    if RESERVED.contains(&name) {
+        return Err(format!("'{}' is a reserved name", name));
+    }
+    
+    Ok(())
+}
+
+/// Get target directory
+pub fn target_dir() -> String {
+    std::env::var("QUANTA_TARGET_DIR")
+        .unwrap_or_else(|_| "target".to_string())
+}
+
+/// Get profile-specific output directory
+pub fn output_dir(profile: &str) -> String {
+    format!("{}/{}", target_dir(), profile)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Main entry point for the package manager
+pub fn main() -> Result<i32, String> {
+    let args: Vec<String> = std::env::args().collect();
+    let (global, command) = parse_args(&args[1..])?;
+    execute(&global, &command)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_validate_package_name() {
+        assert!(validate_package_name("my-crate").is_ok());
+        assert!(validate_package_name("my_crate").is_ok());
+        assert!(validate_package_name("MyCrate").is_ok());
+        assert!(validate_package_name("crate123").is_ok());
+        
+        assert!(validate_package_name("").is_err());
+        assert!(validate_package_name("123crate").is_err());
+        assert!(validate_package_name("-crate").is_err());
+        assert!(validate_package_name("my.crate").is_err());
+        assert!(validate_package_name("std").is_err());
+    }
+    
+    #[test]
+    fn test_package_builder() {
+        let manifest = PackageBuilder::new("test-crate")
+            .version("1.0.0")
+            .author("Test Author")
+            .dependency("serde", "1.0")
+            .feature("default", vec!["std".to_string()])
+            .build();
+        
+        assert_eq!(manifest.package.name, "test-crate");
+        assert_eq!(manifest.package.version, "1.0.0");
+        assert!(manifest.dependencies.contains_key("serde"));
+        assert!(manifest.features.contains_key("default"));
+    }
+    
+    #[test]
+    fn test_version_parse() {
+        let v = Version::parse("1.2.3").unwrap();
+        assert_eq!(v.major, 1);
+        assert_eq!(v.minor, 2);
+        assert_eq!(v.patch, 3);
+        
+        let v = Version::parse("1.0.0-alpha.1+build.123").unwrap();
+        assert!(v.is_prerelease());
+    }
+    
+    #[test]
+    fn test_version_req() {
+        let req = VersionReq::parse("^1.2.3").unwrap();
+        
+        assert!(req.matches(&Version::parse("1.2.3").unwrap()));
+        assert!(req.matches(&Version::parse("1.9.9").unwrap()));
+        assert!(!req.matches(&Version::parse("2.0.0").unwrap()));
+    }
+}

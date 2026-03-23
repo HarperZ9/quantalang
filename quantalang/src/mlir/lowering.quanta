@@ -1,0 +1,803 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ MLIR — MIR to MLIR Lowering
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Lowering from QuantaLang MIR to MLIR:
+//   MIR (Mid-level IR) → QuantaLang Dialect → Standard Dialects → LLVM Dialect
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::mlir::lowering
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use std::sync::Arc;
+
+use super::dialect::{MlirContext, MlirType, MlirAttribute, MlirTypeKind, MlirAttrKind, TypeId};
+use super::ir::{
+    Module, Operation, Block, Region, Value, TypedValue, Location, BlockId,
+    IrBuilder, CmpIPredicate,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES (imported from compiler)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// MIR Function
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub params: Vec<MirParam>,
+    pub return_type: MirType,
+    pub body: Vec<MirBlock>,
+    pub is_public: bool,
+    pub is_async: bool,
+    pub attributes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirParam {
+    pub name: String,
+    pub ty: MirType,
+}
+
+/// MIR Basic Block
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+/// MIR Statement
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { place: MirPlace, rvalue: MirRvalue },
+    StorageLive(MirLocal),
+    StorageDead(MirLocal),
+    Drop(MirPlace),
+    Call {
+        dest: Option<MirPlace>,
+        func: MirOperand,
+        args: Vec<MirOperand>,
+    },
+    SetDiscriminant { place: MirPlace, variant: u32 },
+}
+
+/// MIR Terminator
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Return,
+    Goto { target: u32 },
+    SwitchInt {
+        operand: MirOperand,
+        targets: Vec<(u128, u32)>,
+        otherwise: u32,
+    },
+    Call {
+        func: MirOperand,
+        args: Vec<MirOperand>,
+        dest: Option<MirPlace>,
+        target: Option<u32>,
+        unwind: Option<u32>,
+    },
+    Assert {
+        cond: MirOperand,
+        expected: bool,
+        target: u32,
+        msg: String,
+    },
+    Unreachable,
+    Drop {
+        place: MirPlace,
+        target: u32,
+        unwind: Option<u32>,
+    },
+}
+
+/// MIR Place (lvalue)
+#[derive(Debug, Clone)]
+pub struct MirPlace {
+    pub local: MirLocal,
+    pub projections: Vec<MirProjection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MirLocal(pub u32);
+
+#[derive(Debug, Clone)]
+pub enum MirProjection {
+    Deref,
+    Field(u32),
+    Index(MirLocal),
+    Downcast(u32),
+}
+
+/// MIR Rvalue
+#[derive(Debug, Clone)]
+pub enum MirRvalue {
+    Use(MirOperand),
+    Ref { mutable: bool, place: MirPlace },
+    AddressOf { mutable: bool, place: MirPlace },
+    BinaryOp(MirBinOp, MirOperand, MirOperand),
+    UnaryOp(MirUnaryOp, MirOperand),
+    Cast(MirCastKind, MirOperand, MirType),
+    Aggregate(MirAggregate, Vec<MirOperand>),
+    Discriminant(MirPlace),
+    Len(MirPlace),
+}
+
+/// MIR Operand
+#[derive(Debug, Clone)]
+pub enum MirOperand {
+    Copy(MirPlace),
+    Move(MirPlace),
+    Constant(MirConstant),
+}
+
+/// MIR Constant
+#[derive(Debug, Clone)]
+pub enum MirConstant {
+    Bool(bool),
+    Int(i128, MirType),
+    Float(f64, MirType),
+    Str(String),
+    Unit,
+    ZeroSized(MirType),
+}
+
+/// MIR Type
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirType {
+    Unit,
+    Bool,
+    Char,
+    Int(u32, bool), // width, signed
+    Float(u32),
+    Ptr(Box<MirType>, bool), // inner, mutable
+    Ref(Box<MirType>, bool), // inner, mutable
+    Array(Box<MirType>, usize),
+    Slice(Box<MirType>),
+    Tuple(Vec<MirType>),
+    Struct { name: String, fields: Vec<(String, MirType)> },
+    Enum { name: String, variants: Vec<MirVariant> },
+    Function { params: Vec<MirType>, ret: Box<MirType> },
+    Never,
+    Infer,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MirVariant {
+    pub name: String,
+    pub fields: Vec<MirType>,
+    pub discriminant: u32,
+}
+
+/// MIR Binary Operations
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MirBinOp {
+    Add, Sub, Mul, Div, Rem,
+    BitAnd, BitOr, BitXor,
+    Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+}
+
+/// MIR Unary Operations
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MirUnaryOp {
+    Not, Neg,
+}
+
+/// MIR Cast Kind
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MirCastKind {
+    IntToInt,
+    IntToFloat,
+    FloatToInt,
+    FloatToFloat,
+    PtrToPtr,
+    PtrToInt,
+    IntToPtr,
+}
+
+/// MIR Aggregate
+#[derive(Debug, Clone)]
+pub enum MirAggregate {
+    Array,
+    Tuple,
+    Struct(String),
+    Enum(String, u32), // type name, variant index
+    Closure(String),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TO MLIR LOWERING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Lowers MIR to MLIR
+pub struct MirToMlir<'ctx> {
+    context: &'ctx mut MlirContext,
+    builder: IrBuilder<'ctx>,
+    
+    /// Local variable to MLIR value mapping
+    locals: BTreeMap<MirLocal, Value>,
+    
+    /// Block ID mapping
+    blocks: BTreeMap<u32, BlockId>,
+    
+    /// Current function return type
+    return_type: Option<MlirType>,
+}
+
+impl<'ctx> MirToMlir<'ctx> {
+    pub fn new(context: &'ctx mut MlirContext) -> Self {
+        // This is a workaround - in real code we'd use proper lifetime management
+        let builder = unsafe {
+            std::mem::transmute::<IrBuilder<'_>, IrBuilder<'ctx>>(
+                IrBuilder::new(std::mem::transmute::<&mut MlirContext, &'ctx mut MlirContext>(
+                    context as *mut MlirContext as *const MlirContext as *mut MlirContext
+                ))
+            )
+        };
+        
+        MirToMlir {
+            context,
+            builder,
+            locals: BTreeMap::new(),
+            blocks: BTreeMap::new(),
+            return_type: None,
+        }
+    }
+    
+    /// Lower a complete MIR module to MLIR
+    pub fn lower_module(&mut self, functions: &[MirFunction]) -> Module {
+        let mut module = Module::new().with_name("quanta_module");
+        
+        for func in functions {
+            let op = self.lower_function(func);
+            module.push_operation(op);
+        }
+        
+        module
+    }
+    
+    /// Lower a single function
+    pub fn lower_function(&mut self, func: &MirFunction) -> Operation {
+        // Clear state
+        self.locals.clear();
+        self.blocks.clear();
+        
+        // Convert parameter and return types
+        let param_types: Vec<MlirType> = func.params.iter()
+            .map(|p| self.lower_type(&p.ty))
+            .collect();
+        
+        let result_types = if func.return_type == MirType::Unit {
+            vec![]
+        } else {
+            vec![self.lower_type(&func.return_type)]
+        };
+        
+        self.return_type = result_types.first().cloned();
+        
+        // Create function operation
+        let mut func_op = self.builder.func(&func.name, param_types.clone(), result_types);
+        
+        // Create blocks
+        for block in &func.body {
+            let block_id = self.builder.create_block();
+            self.blocks.insert(block.id, block_id);
+        }
+        
+        // Create entry block with arguments
+        let entry_block_id = *self.blocks.get(&0).unwrap_or(&BlockId(0));
+        let mut entry_block = Block::new(entry_block_id);
+        
+        // Map parameters to block arguments
+        for (i, param) in func.params.iter().enumerate() {
+            let ty = self.lower_type(&param.ty);
+            let value = Value::new(self.context.next_value_id());
+            
+            entry_block.add_argument(TypedValue { value, ty });
+            self.locals.insert(MirLocal(i as u32), value);
+        }
+        
+        // Lower each block
+        let mut region = Region::new();
+        
+        for mir_block in &func.body {
+            let block_id = *self.blocks.get(&mir_block.id).unwrap();
+            let mut block = if mir_block.id == 0 {
+                entry_block.clone()
+            } else {
+                Block::new(block_id)
+            };
+            
+            // Lower statements
+            for stmt in &mir_block.statements {
+                if let Some(op) = self.lower_statement(stmt) {
+                    block.push_operation(op);
+                }
+            }
+            
+            // Lower terminator
+            let term_ops = self.lower_terminator(&mir_block.terminator);
+            for op in term_ops {
+                block.push_operation(op);
+            }
+            
+            region.push_block(block);
+        }
+        
+        func_op.regions.push(region);
+        func_op
+    }
+    
+    /// Lower MIR type to MLIR type
+    fn lower_type(&mut self, ty: &MirType) -> MlirType {
+        let kind = match ty {
+            MirType::Unit => MlirTypeKind::Tuple(vec![]),
+            MirType::Bool => MlirTypeKind::Integer { width: 1, signed: false },
+            MirType::Char => MlirTypeKind::Integer { width: 32, signed: false },
+            MirType::Int(width, signed) => MlirTypeKind::Integer { width: *width, signed: *signed },
+            MirType::Float(width) => MlirTypeKind::Float { width: *width },
+            MirType::Ptr(inner, _) => MlirTypeKind::LlvmPtr,
+            MirType::Ref(inner, _) => MlirTypeKind::LlvmPtr,
+            MirType::Array(elem, size) => {
+                let elem_ty = self.lower_type(elem);
+                MlirTypeKind::LlvmArray {
+                    element: Box::new(elem_ty),
+                    size: *size as u64,
+                }
+            }
+            MirType::Slice(elem) => {
+                let elem_ty = self.lower_type(elem);
+                MlirTypeKind::QuantaSlice(Box::new(elem_ty))
+            }
+            MirType::Tuple(elems) => {
+                let elem_types: Vec<MlirType> = elems.iter()
+                    .map(|t| self.lower_type(t))
+                    .collect();
+                MlirTypeKind::Tuple(elem_types)
+            }
+            MirType::Struct { name, fields } => {
+                let field_types: Vec<MlirType> = fields.iter()
+                    .map(|(_, t)| self.lower_type(t))
+                    .collect();
+                MlirTypeKind::LlvmStruct { fields: field_types, packed: false }
+            }
+            MirType::Enum { .. } => {
+                // Enums are represented as tagged unions
+                MlirTypeKind::LlvmPtr
+            }
+            MirType::Function { params, ret } => {
+                let param_types: Vec<MlirType> = params.iter()
+                    .map(|t| self.lower_type(t))
+                    .collect();
+                let ret_type = self.lower_type(ret);
+                MlirTypeKind::Function {
+                    inputs: param_types,
+                    results: vec![ret_type],
+                }
+            }
+            MirType::Never => MlirTypeKind::LlvmVoid,
+            MirType::Infer => MlirTypeKind::LlvmPtr, // Should not happen
+        };
+        
+        MlirType { id: TypeId(0), kind }
+    }
+    
+    /// Lower a statement
+    fn lower_statement(&mut self, stmt: &MirStatement) -> Option<Operation> {
+        match stmt {
+            MirStatement::Assign { place, rvalue } => {
+                let (op, value) = self.lower_rvalue(rvalue)?;
+                
+                // Store to place
+                if place.projections.is_empty() {
+                    self.locals.insert(place.local, value);
+                    Some(op)
+                } else {
+                    // Complex place - need store
+                    Some(op)
+                }
+            }
+            
+            MirStatement::StorageLive(local) => {
+                // Could emit alloca here
+                None
+            }
+            
+            MirStatement::StorageDead(local) => {
+                // Could emit dealloc here
+                None
+            }
+            
+            MirStatement::Drop(place) => {
+                // Emit drop call
+                let value = self.get_place_value(place)?;
+                Some(self.builder.box_dealloc(value))
+            }
+            
+            MirStatement::Call { dest, func, args } => {
+                let arg_values: Vec<Value> = args.iter()
+                    .filter_map(|a| self.lower_operand(a))
+                    .collect();
+                
+                let func_name = match func {
+                    MirOperand::Constant(MirConstant::ZeroSized(MirType::Function { .. })) => {
+                        "unknown_func"
+                    }
+                    _ => "dynamic_call",
+                };
+                
+                let result_types = if dest.is_some() {
+                    vec![MlirType { id: TypeId(0), kind: MlirTypeKind::LlvmPtr }]
+                } else {
+                    vec![]
+                };
+                
+                let (op, results) = self.builder.call(func_name, arg_values, result_types);
+                
+                if let (Some(dest), Some(result)) = (dest, results.first()) {
+                    self.locals.insert(dest.local, *result);
+                }
+                
+                Some(op)
+            }
+            
+            MirStatement::SetDiscriminant { place, variant } => {
+                // Set enum discriminant
+                None
+            }
+        }
+    }
+    
+    /// Lower an rvalue
+    fn lower_rvalue(&mut self, rvalue: &MirRvalue) -> Option<(Operation, Value)> {
+        match rvalue {
+            MirRvalue::Use(operand) => {
+                let value = self.lower_operand(operand)?;
+                // Create a copy operation
+                let ty = MlirType { id: TypeId(0), kind: MlirTypeKind::LlvmPtr };
+                Some(self.builder.constant_int(0, ty)) // Placeholder
+            }
+            
+            MirRvalue::BinaryOp(op, lhs, rhs) => {
+                let lhs_val = self.lower_operand(lhs)?;
+                let rhs_val = self.lower_operand(rhs)?;
+                let ty = MlirType { id: TypeId(0), kind: MlirTypeKind::Integer { width: 64, signed: true } };
+                
+                match op {
+                    MirBinOp::Add => Some(self.builder.addi(lhs_val, rhs_val, ty)),
+                    MirBinOp::Sub => Some(self.builder.subi(lhs_val, rhs_val, ty)),
+                    MirBinOp::Mul => Some(self.builder.muli(lhs_val, rhs_val, ty)),
+                    MirBinOp::Div => Some(self.builder.divsi(lhs_val, rhs_val, ty)),
+                    MirBinOp::Eq => Some(self.builder.cmpi(CmpIPredicate::Eq, lhs_val, rhs_val)),
+                    MirBinOp::Ne => Some(self.builder.cmpi(CmpIPredicate::Ne, lhs_val, rhs_val)),
+                    MirBinOp::Lt => Some(self.builder.cmpi(CmpIPredicate::Slt, lhs_val, rhs_val)),
+                    MirBinOp::Le => Some(self.builder.cmpi(CmpIPredicate::Sle, lhs_val, rhs_val)),
+                    MirBinOp::Gt => Some(self.builder.cmpi(CmpIPredicate::Sgt, lhs_val, rhs_val)),
+                    MirBinOp::Ge => Some(self.builder.cmpi(CmpIPredicate::Sge, lhs_val, rhs_val)),
+                    _ => {
+                        // Other ops - implement as needed
+                        Some(self.builder.constant_int(0, ty))
+                    }
+                }
+            }
+            
+            MirRvalue::UnaryOp(op, operand) => {
+                let val = self.lower_operand(operand)?;
+                let ty = MlirType { id: TypeId(0), kind: MlirTypeKind::Integer { width: 64, signed: true } };
+                
+                match op {
+                    MirUnaryOp::Neg => {
+                        let (zero_op, zero) = self.builder.constant_int(0, ty.clone());
+                        Some(self.builder.subi(zero, val, ty))
+                    }
+                    MirUnaryOp::Not => {
+                        // XOR with -1
+                        let (ones_op, ones) = self.builder.constant_int(-1, ty.clone());
+                        Some(self.builder.addi(val, ones, ty)) // Placeholder
+                    }
+                }
+            }
+            
+            MirRvalue::Aggregate(agg, operands) => {
+                let values: Vec<Value> = operands.iter()
+                    .filter_map(|o| self.lower_operand(o))
+                    .collect();
+                
+                match agg {
+                    MirAggregate::Tuple => {
+                        // Create tuple
+                        let ty = MlirType { id: TypeId(0), kind: MlirTypeKind::Tuple(vec![]) };
+                        Some(self.builder.constant_int(0, ty))
+                    }
+                    MirAggregate::Struct(name) => {
+                        let ty = MlirType { id: TypeId(0), kind: MlirTypeKind::LlvmPtr };
+                        let field_names: Vec<String> = (0..values.len())
+                            .map(|i| format!("field_{}", i))
+                            .collect();
+                        Some(self.builder.struct_construct(values, field_names, ty))
+                    }
+                    _ => {
+                        let ty = MlirType { id: TypeId(0), kind: MlirTypeKind::LlvmPtr };
+                        Some(self.builder.constant_int(0, ty))
+                    }
+                }
+            }
+            
+            MirRvalue::Ref { mutable, place } => {
+                // Get address of place
+                let ty = MlirType { id: TypeId(0), kind: MlirTypeKind::LlvmPtr };
+                Some(self.builder.constant_int(0, ty))
+            }
+            
+            MirRvalue::Cast(kind, operand, ty) => {
+                let val = self.lower_operand(operand)?;
+                let target_ty = self.lower_type(ty);
+                
+                // For now, just pass through
+                Some(self.builder.constant_int(0, target_ty))
+            }
+            
+            MirRvalue::Len(place) => {
+                let ty = MlirType { id: TypeId(0), kind: MlirTypeKind::Index };
+                Some(self.builder.constant_int(0, ty))
+            }
+            
+            MirRvalue::Discriminant(place) => {
+                let ty = MlirType { id: TypeId(0), kind: MlirTypeKind::Integer { width: 32, signed: false } };
+                Some(self.builder.constant_int(0, ty))
+            }
+            
+            MirRvalue::AddressOf { mutable, place } => {
+                let ty = MlirType { id: TypeId(0), kind: MlirTypeKind::LlvmPtr };
+                Some(self.builder.constant_int(0, ty))
+            }
+        }
+    }
+    
+    /// Lower an operand
+    fn lower_operand(&mut self, operand: &MirOperand) -> Option<Value> {
+        match operand {
+            MirOperand::Copy(place) | MirOperand::Move(place) => {
+                self.get_place_value(place)
+            }
+            
+            MirOperand::Constant(constant) => {
+                let (_, value) = self.lower_constant(constant)?;
+                Some(value)
+            }
+        }
+    }
+    
+    /// Lower a constant
+    fn lower_constant(&mut self, constant: &MirConstant) -> Option<(Operation, Value)> {
+        match constant {
+            MirConstant::Bool(b) => {
+                let ty = MlirType {
+                    id: TypeId(0),
+                    kind: MlirTypeKind::Integer { width: 1, signed: false },
+                };
+                Some(self.builder.constant_int(if *b { 1 } else { 0 }, ty))
+            }
+            
+            MirConstant::Int(value, mir_ty) => {
+                let ty = self.lower_type(mir_ty);
+                Some(self.builder.constant_int(*value as i64, ty))
+            }
+            
+            MirConstant::Float(value, mir_ty) => {
+                let ty = self.lower_type(mir_ty);
+                Some(self.builder.constant_float(*value, ty))
+            }
+            
+            MirConstant::Unit => {
+                let ty = MlirType {
+                    id: TypeId(0),
+                    kind: MlirTypeKind::Tuple(vec![]),
+                };
+                Some(self.builder.constant_int(0, ty))
+            }
+            
+            MirConstant::Str(s) => {
+                // String constants need special handling
+                let ty = MlirType {
+                    id: TypeId(0),
+                    kind: MlirTypeKind::QuantaStr,
+                };
+                Some(self.builder.constant_int(0, ty))
+            }
+            
+            MirConstant::ZeroSized(_) => {
+                let ty = MlirType {
+                    id: TypeId(0),
+                    kind: MlirTypeKind::Tuple(vec![]),
+                };
+                Some(self.builder.constant_int(0, ty))
+            }
+        }
+    }
+    
+    /// Get value for a place
+    fn get_place_value(&self, place: &MirPlace) -> Option<Value> {
+        if place.projections.is_empty() {
+            self.locals.get(&place.local).copied()
+        } else {
+            // Complex place access - would need load operations
+            self.locals.get(&place.local).copied()
+        }
+    }
+    
+    /// Lower a terminator
+    fn lower_terminator(&mut self, term: &MirTerminator) -> Vec<Operation> {
+        match term {
+            MirTerminator::Return => {
+                // Get return value from local 0 if not unit
+                let operands = if let Some(ret_ty) = &self.return_type {
+                    self.locals.get(&MirLocal(0)).map(|v| vec![*v]).unwrap_or_default()
+                } else {
+                    vec![]
+                };
+                
+                vec![self.builder.return_op(operands)]
+            }
+            
+            MirTerminator::Goto { target } => {
+                // Branch to target block
+                let target_block = self.blocks.get(target).copied().unwrap_or(BlockId(0));
+                let mut op = Operation::new("cf.br", Location::Unknown);
+                op.successors.push(target_block);
+                vec![op]
+            }
+            
+            MirTerminator::SwitchInt { operand, targets, otherwise } => {
+                let cond = self.lower_operand(operand).unwrap_or(Value::new(super::dialect::ValueId(0)));
+                
+                // Create switch operation
+                let mut op = Operation::new("cf.switch", Location::Unknown);
+                op.operands.push(cond);
+                
+                for (_, target) in targets {
+                    if let Some(block) = self.blocks.get(target) {
+                        op.successors.push(*block);
+                    }
+                }
+                
+                if let Some(block) = self.blocks.get(otherwise) {
+                    op.successors.push(*block);
+                }
+                
+                vec![op]
+            }
+            
+            MirTerminator::Call { func, args, dest, target, unwind } => {
+                let arg_values: Vec<Value> = args.iter()
+                    .filter_map(|a| self.lower_operand(a))
+                    .collect();
+                
+                let result_types = if dest.is_some() {
+                    vec![MlirType { id: TypeId(0), kind: MlirTypeKind::LlvmPtr }]
+                } else {
+                    vec![]
+                };
+                
+                let (call_op, results) = self.builder.call("callee", arg_values, result_types);
+                
+                if let (Some(dest), Some(result)) = (dest, results.first()) {
+                    self.locals.insert(dest.local, *result);
+                }
+                
+                let mut ops = vec![call_op];
+                
+                // Add branch to target
+                if let Some(target) = target {
+                    if let Some(block) = self.blocks.get(target) {
+                        let mut br = Operation::new("cf.br", Location::Unknown);
+                        br.successors.push(*block);
+                        ops.push(br);
+                    }
+                }
+                
+                ops
+            }
+            
+            MirTerminator::Assert { cond, expected, target, msg } => {
+                let cond_val = self.lower_operand(cond).unwrap_or(Value::new(super::dialect::ValueId(0)));
+                
+                // Create assert operation
+                let assert_op = Operation::new("cf.assert", Location::Unknown)
+                    .with_operands(vec![cond_val]);
+                
+                let mut ops = vec![assert_op];
+                
+                if let Some(block) = self.blocks.get(target) {
+                    let mut br = Operation::new("cf.br", Location::Unknown);
+                    br.successors.push(*block);
+                    ops.push(br);
+                }
+                
+                ops
+            }
+            
+            MirTerminator::Unreachable => {
+                vec![Operation::new("llvm.unreachable", Location::Unknown)]
+            }
+            
+            MirTerminator::Drop { place, target, unwind } => {
+                let value = self.get_place_value(place);
+                
+                let mut ops = Vec::new();
+                
+                if let Some(val) = value {
+                    ops.push(self.builder.box_dealloc(val));
+                }
+                
+                if let Some(block) = self.blocks.get(target) {
+                    let mut br = Operation::new("cf.br", Location::Unknown);
+                    br.successors.push(*block);
+                    ops.push(br);
+                }
+                
+                ops
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_type_lowering() {
+        let mut ctx = MlirContext::new();
+        let mut lowering = MirToMlir::new(&mut ctx);
+        
+        let i32_ty = MirType::Int(32, true);
+        let mlir_ty = lowering.lower_type(&i32_ty);
+        
+        match mlir_ty.kind {
+            MlirTypeKind::Integer { width: 32, signed: true } => {}
+            _ => panic!("Expected i32"),
+        }
+    }
+    
+    #[test]
+    fn test_simple_function() {
+        let mut ctx = MlirContext::new();
+        let mut lowering = MirToMlir::new(&mut ctx);
+        
+        let func = MirFunction {
+            name: "test".to_string(),
+            params: vec![],
+            return_type: MirType::Unit,
+            body: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![],
+                    terminator: MirTerminator::Return,
+                }
+            ],
+            is_public: true,
+            is_async: false,
+            attributes: vec![],
+        };
+        
+        let op = lowering.lower_function(&func);
+        
+        assert_eq!(op.name, "func.func");
+        assert_eq!(op.regions.len(), 1);
+    }
+}

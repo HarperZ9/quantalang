@@ -1,0 +1,1326 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ MIR — Mid-level Intermediate Representation
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending (P089-P095)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// MIR is a control-flow-graph representation optimized for:
+// 1. Borrow checking (NLL - Non-Lexical Lifetimes)
+// 2. Drop elaboration (destructor insertion)
+// 3. Move checking (linear/affine type enforcement)
+// 4. Monomorphization (generic instantiation)
+// 5. Optimization passes (constant propagation, dead code elimination)
+//
+// MIR structure:
+// - Body = collection of BasicBlocks
+// - BasicBlock = sequence of Statements + Terminator
+// - Statement = assignment to Place
+// - Terminator = control flow (goto, switch, return, call, etc.)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::mir
+
+use std::collections::{HashMap, HashSet, BTreeMap, BTreeSet}
+use crate::ast::{Span, Mutability, BinaryOp, UnaryOp}
+use crate::types::{Ty, TypeVar, AdtId, TraitId, Lifetime, EffectSet, IntTy, FloatTy}
+use crate::hir::{DefId, LocalId, BodyId, HirAbi}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR BODY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A MIR body is a control-flow graph representation of a function
+#[derive(Debug)]
+pub struct MirBody {
+    /// Unique identifier for this body
+    pub def_id: DefId,
+    
+    /// Basic blocks (index 0 = entry block)
+    pub basic_blocks: Vec<BasicBlock>,
+    
+    /// Local variable declarations
+    pub locals: Vec<LocalDecl>,
+    
+    /// Number of argument locals (first N locals are parameters)
+    pub arg_count: usize,
+    
+    /// Return type
+    pub return_ty: Ty,
+    
+    /// Source span
+    pub span: Span,
+    
+    /// Generator info (if this is a generator/async fn)
+    pub generator: Option<GeneratorInfo>,
+}
+
+#[derive(Debug)]
+pub struct LocalDecl {
+    pub ty: Ty,
+    pub mutability: Mutability,
+    pub name: Option<String>,
+    pub source: LocalSource,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalSource {
+    /// Return place (local 0)
+    ReturnPointer,
+    /// Function argument
+    Arg,
+    /// User variable from `let`
+    User,
+    /// Compiler temporary
+    Temp,
+}
+
+#[derive(Debug)]
+pub struct GeneratorInfo {
+    pub yield_ty: Ty,
+    pub resume_ty: Ty,
+    pub state_adt: AdtId,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BASIC BLOCKS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BasicBlockId(pub u32);
+
+impl BasicBlockId {
+    pub const START: BasicBlockId = BasicBlockId(0);
+}
+
+#[derive(Debug)]
+pub struct BasicBlock {
+    pub id: BasicBlockId,
+    pub statements: Vec<Statement>,
+    pub terminator: Terminator,
+    pub is_cleanup: bool,  // Part of unwinding path
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATEMENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct Statement {
+    pub kind: StatementKind,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum StatementKind {
+    /// place = rvalue
+    Assign(Place, Rvalue),
+    
+    /// Drop glue marker (actual drop in terminator)
+    SetDiscriminant { place: Place, variant_index: u32 },
+    
+    /// Deinitialize a place (for unions, uninitialized memory)
+    Deinit(Place),
+    
+    /// Storage markers for liveness analysis
+    StorageLive(Local),
+    StorageDead(Local),
+    
+    /// Retag for Stacked Borrows (optional memory model)
+    Retag(RetagKind, Place),
+    
+    /// Assertion for optimization hints
+    Intrinsic(IntrinsicOp),
+    
+    /// Coverage instrumentation
+    Coverage(CoverageKind),
+    
+    /// No operation (placeholder)
+    Nop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetagKind {
+    /// Reborrow (new tag for reference)
+    FnEntry,
+    TwoPhase,
+    Raw,
+    Default,
+}
+
+#[derive(Debug)]
+pub enum IntrinsicOp {
+    Assume(Operand),
+    CopyNonOverlapping { src: Operand, dst: Operand, count: Operand },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageKind {
+    Counter(u32),
+    Expression(u32),
+    Unreachable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLACES (L-values)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A local variable index
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Local(pub u32);
+
+impl Local {
+    /// The return place is always local 0
+    pub const RETURN_PLACE: Local = Local(0);
+}
+
+/// A Place is a path to a memory location
+#[derive(Debug, Clone)]
+pub struct Place {
+    pub local: Local,
+    pub projection: Vec<PlaceElem>,
+}
+
+impl Place {
+    pub fn local(local: Local) -> Self {
+        Place { local, projection: Vec::new() }
+    }
+    
+    pub fn return_place() -> Self {
+        Place::local(Local::RETURN_PLACE)
+    }
+    
+    pub fn project(&self, elem: PlaceElem) -> Self {
+        let mut projection = self.projection.clone();
+        projection.push(elem);
+        Place { local: self.local, projection }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaceElem {
+    /// Dereference: *place
+    Deref,
+    
+    /// Field access: place.field
+    Field(FieldIdx, Ty),
+    
+    /// Index into array/slice: place[index]
+    Index(Local),
+    
+    /// Constant index (known at compile time)
+    ConstantIndex {
+        offset: u64,
+        min_length: u64,
+        from_end: bool,
+    },
+    
+    /// Subslice: place[from..to]
+    Subslice {
+        from: u64,
+        to: u64,
+        from_end: bool,
+    },
+    
+    /// Downcast to enum variant: place as Variant
+    Downcast(Option<String>, VariantIdx),
+    
+    /// Opaque cast (for type-changing projections)
+    OpaqueCast(Ty),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FieldIdx(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VariantIdx(pub u32);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OPERANDS (R-values that are immediate)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub enum Operand {
+    /// Copy value from place (for Copy types)
+    Copy(Place),
+    
+    /// Move value from place (consumes the place)
+    Move(Place),
+    
+    /// Constant value
+    Constant(Constant),
+}
+
+#[derive(Debug, Clone)]
+pub struct Constant {
+    pub ty: Ty,
+    pub value: ConstValue,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConstValue {
+    /// A scalar value (integer, float, bool, char, pointer)
+    Scalar(Scalar),
+    
+    /// A zero-sized type value
+    ZeroSized,
+    
+    /// A slice (pointer + length)
+    Slice { data: Vec<u8>, meta: u64 },
+    
+    /// An aggregate (struct, tuple, array with all fields constant)
+    Aggregate(Vec<ConstValue>),
+    
+    /// Unevaluated constant (needs const-eval)
+    Unevaluated { def: DefId, args: Vec<Ty> },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Scalar {
+    Int(u128, IntTy),
+    Float(f64, FloatTy),
+    Bool(bool),
+    Char(char),
+    Ptr(u64),  // Address
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RVALUES (Expressions that produce values)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum Rvalue {
+    /// Use an operand (move/copy/constant)
+    Use(Operand),
+    
+    /// Repeat: [operand; count]
+    Repeat(Operand, u64),
+    
+    /// Reference: &place or &mut place
+    Ref(Region, BorrowKind, Place),
+    
+    /// Address of: &raw const place or &raw mut place
+    AddressOf(Mutability, Place),
+    
+    /// Length of array/slice
+    Len(Place),
+    
+    /// Binary operation
+    BinaryOp(BinOp, Operand, Operand),
+    
+    /// Checked binary operation (returns (result, overflow))
+    CheckedBinaryOp(BinOp, Operand, Operand),
+    
+    /// Unary operation
+    UnaryOp(UnOp, Operand),
+    
+    /// Discriminant of enum
+    Discriminant(Place),
+    
+    /// Create aggregate (struct, tuple, array, closure)
+    Aggregate(AggregateKind, Vec<Operand>),
+    
+    /// Shallow initialization check (for partially initialized structs)
+    ShallowInitBox(Operand, Ty),
+    
+    /// Null operation (for padding, etc.)
+    NullOp(NullOp, Ty),
+    
+    /// Cast
+    Cast(CastKind, Operand, Ty),
+    
+    /// Copy for deref (special case for *ptr)
+    CopyForDeref(Place),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region(pub u32);
+
+impl Region {
+    pub const STATIC: Region = Region(0);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorrowKind {
+    /// Shared reference (&T)
+    Shared,
+    
+    /// Mutable reference (&mut T)
+    Mut { allow_two_phase: bool },
+    
+    /// Shallow borrow (for match guards)
+    Shallow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    BitAnd, BitOr, BitXor,
+    Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+    Offset,  // Pointer arithmetic
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnOp {
+    Not,
+    Neg,
+}
+
+#[derive(Debug)]
+pub enum AggregateKind {
+    Tuple,
+    Array(Ty),
+    Adt(AdtId, VariantIdx, Vec<Ty>, Option<u32>),  // ADT, variant, type args, user type annotation
+    Closure(DefId, Vec<Ty>),
+    Generator(DefId, Vec<Ty>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullOp {
+    SizeOf,
+    AlignOf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastKind {
+    IntToInt,
+    FloatToFloat,
+    FloatToInt,
+    IntToFloat,
+    PtrToPtr,
+    FnPtrToPtr,
+    Pointer(PointerCast),
+    Transmute,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerCast {
+    ReifyFnPointer,
+    UnsafeFnPointer,
+    ClosureFnPointer,
+    MutToConstPointer,
+    ArrayToPointer,
+    Unsize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TERMINATORS (Control flow)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct Terminator {
+    pub kind: TerminatorKind,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum TerminatorKind {
+    /// Unconditional jump
+    Goto { target: BasicBlockId },
+    
+    /// Conditional branch
+    SwitchInt {
+        discr: Operand,
+        targets: SwitchTargets,
+    },
+    
+    /// Return from function
+    Return,
+    
+    /// Unreachable (UB if reached)
+    Unreachable,
+    
+    /// Drop a value
+    Drop {
+        place: Place,
+        target: BasicBlockId,
+        unwind: UnwindAction,
+    },
+    
+    /// Function call
+    Call {
+        func: Operand,
+        args: Vec<Operand>,
+        destination: Place,
+        target: Option<BasicBlockId>,
+        unwind: UnwindAction,
+        fn_span: Span,
+    },
+    
+    /// Assert (panic if false)
+    Assert {
+        cond: Operand,
+        expected: bool,
+        msg: AssertMessage,
+        target: BasicBlockId,
+        unwind: UnwindAction,
+    },
+    
+    /// Yield (for generators)
+    Yield {
+        value: Operand,
+        resume: BasicBlockId,
+        resume_arg: Place,
+        drop: Option<BasicBlockId>,
+    },
+    
+    /// Generator drop
+    GeneratorDrop,
+    
+    /// Inline assembly
+    InlineAsm {
+        template: Vec<AsmTemplatePiece>,
+        operands: Vec<AsmOperand>,
+        options: AsmOptions,
+        destination: Option<BasicBlockId>,
+        unwind: UnwindAction,
+    },
+    
+    /// False edges (for borrow checking of match guards)
+    FalseEdge {
+        real_target: BasicBlockId,
+        imaginary_target: BasicBlockId,
+    },
+    
+    /// False unwind (for borrow checking of loops)
+    FalseUnwind {
+        real_target: BasicBlockId,
+        unwind: UnwindAction,
+    },
+}
+
+#[derive(Debug)]
+pub struct SwitchTargets {
+    /// Value -> target block mapping
+    pub values: Vec<(u128, BasicBlockId)>,
+    /// Default target (when no value matches)
+    pub otherwise: BasicBlockId,
+}
+
+impl SwitchTargets {
+    pub fn new(values: Vec<(u128, BasicBlockId)>, otherwise: BasicBlockId) -> Self {
+        SwitchTargets { values, otherwise }
+    }
+    
+    pub fn if_then(value: u128, then_: BasicBlockId, else_: BasicBlockId) -> Self {
+        SwitchTargets {
+            values: vec![(value, then_)],
+            otherwise: else_,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum UnwindAction {
+    /// Continue unwinding
+    Continue,
+    /// Cleanup block to run
+    Cleanup(BasicBlockId),
+    /// Terminate process (abort)
+    Terminate,
+    /// Unreachable (function cannot unwind)
+    Unreachable,
+}
+
+#[derive(Debug)]
+pub enum AssertMessage {
+    BoundsCheck { len: Operand, index: Operand },
+    Overflow(BinOp, Operand, Operand),
+    OverflowNeg(Operand),
+    DivisionByZero(Operand),
+    RemainderByZero(Operand),
+    ResumedAfterReturn,
+    ResumedAfterPanic,
+    MisalignedPointerDereference { required: Operand, found: Operand },
+}
+
+#[derive(Debug)]
+pub enum AsmTemplatePiece {
+    String(String),
+    Placeholder { operand_idx: usize, modifier: Option<char> },
+}
+
+#[derive(Debug)]
+pub struct AsmOperand {
+    pub kind: AsmOperandKind,
+}
+
+#[derive(Debug)]
+pub enum AsmOperandKind {
+    In { reg: AsmRegSpec, value: Operand },
+    Out { reg: AsmRegSpec, place: Option<Place>, late: bool },
+    InOut { reg: AsmRegSpec, in_value: Operand, out_place: Option<Place> },
+    Const { value: Constant },
+    SymFn { def: DefId },
+    SymStatic { def: DefId },
+}
+
+#[derive(Debug, Clone)]
+pub enum AsmRegSpec {
+    Named(String),
+    Explicit(String),
+}
+
+#[derive(Debug, Default)]
+pub struct AsmOptions {
+    pub pure_: bool,
+    pub nomem: bool,
+    pub readonly: bool,
+    pub preserves_flags: bool,
+    pub noreturn: bool,
+    pub nostack: bool,
+    pub att_syntax: bool,
+    pub raw: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BORROW CHECKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Borrow checking context
+pub struct BorrowChecker {
+    /// Current function being checked
+    body: MirBody,
+    
+    /// Errors collected during checking
+    errors: Vec<BorrowError>,
+    
+    /// Liveness information
+    liveness: LivenessInfo,
+    
+    /// Active borrows at each program point
+    borrows: BorrowSet,
+    
+    /// Move paths
+    move_data: MoveData,
+}
+
+#[derive(Debug)]
+pub enum BorrowError {
+    /// Use of moved value
+    UseAfterMove {
+        place: String,
+        moved_at: Span,
+        used_at: Span,
+    },
+    
+    /// Conflicting borrow
+    ConflictingBorrow {
+        place: String,
+        first_borrow: BorrowKind,
+        first_borrow_span: Span,
+        second_borrow: BorrowKind,
+        second_borrow_span: Span,
+    },
+    
+    /// Borrow of moved value
+    BorrowOfMoved {
+        place: String,
+        moved_at: Span,
+        borrowed_at: Span,
+    },
+    
+    /// Assignment to borrowed value
+    AssignToBorrowed {
+        place: String,
+        borrow_span: Span,
+        assign_span: Span,
+    },
+    
+    /// Return of local reference
+    ReturnLocalRef {
+        place: String,
+        span: Span,
+    },
+    
+    /// Mutable borrow of immutable data
+    MutBorrowOfImmutable {
+        place: String,
+        span: Span,
+    },
+    
+    /// Linear type not consumed
+    LinearNotConsumed {
+        place: String,
+        ty: Ty,
+        span: Span,
+    },
+    
+    /// Linear type used multiple times
+    LinearMultipleUse {
+        place: String,
+        first_use: Span,
+        second_use: Span,
+    },
+}
+
+#[derive(Debug, Default)]
+pub struct LivenessInfo {
+    /// For each basic block, which locals are live at entry
+    live_in: HashMap<BasicBlockId, BitSet>,
+    /// For each basic block, which locals are live at exit
+    live_out: HashMap<BasicBlockId, BitSet>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BitSet {
+    bits: Vec<u64>,
+}
+
+impl BitSet {
+    pub fn new(size: usize) -> Self {
+        BitSet { bits: vec![0; (size + 63) / 64] }
+    }
+    
+    pub fn insert(&mut self, idx: usize) {
+        let word = idx / 64;
+        let bit = idx % 64;
+        if word < self.bits.len() {
+            self.bits[word] |= 1 << bit;
+        }
+    }
+    
+    pub fn remove(&mut self, idx: usize) {
+        let word = idx / 64;
+        let bit = idx % 64;
+        if word < self.bits.len() {
+            self.bits[word] &= !(1 << bit);
+        }
+    }
+    
+    pub fn contains(&self, idx: usize) -> bool {
+        let word = idx / 64;
+        let bit = idx % 64;
+        word < self.bits.len() && (self.bits[word] & (1 << bit)) != 0
+    }
+    
+    pub fn union(&mut self, other: &BitSet) {
+        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *a |= *b;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct BorrowSet {
+    borrows: Vec<BorrowData>,
+    /// Map from place to active borrows
+    place_borrows: HashMap<PlaceRef, Vec<BorrowIdx>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BorrowIdx(pub u32);
+
+#[derive(Debug)]
+pub struct BorrowData {
+    pub kind: BorrowKind,
+    pub region: Region,
+    pub place: Place,
+    pub span: Span,
+}
+
+/// Hashable reference to a Place
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PlaceRef {
+    pub local: Local,
+    pub projection_hash: u64,
+}
+
+impl From<&Place> for PlaceRef {
+    fn from(place: &Place) -> Self {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+        let mut hasher = DefaultHasher::new();
+        place.projection.hash(&mut hasher);
+        PlaceRef {
+            local: place.local,
+            projection_hash: hasher.finish(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct MoveData {
+    /// All move paths in the function
+    move_paths: Vec<MovePath>,
+    /// Map from place to move path
+    place_to_path: HashMap<PlaceRef, MovePathIdx>,
+    /// Move operations
+    moves: Vec<MoveOut>,
+    /// Initialization operations
+    inits: Vec<Init>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MovePathIdx(pub u32);
+
+#[derive(Debug)]
+pub struct MovePath {
+    pub place: Place,
+    pub parent: Option<MovePathIdx>,
+    pub children: Vec<MovePathIdx>,
+}
+
+#[derive(Debug)]
+pub struct MoveOut {
+    pub path: MovePathIdx,
+    pub location: Location,
+}
+
+#[derive(Debug)]
+pub struct Init {
+    pub path: MovePathIdx,
+    pub kind: InitKind,
+    pub location: Location,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitKind {
+    Deep,
+    Shallow,
+    NonPanicPathOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Location {
+    pub block: BasicBlockId,
+    pub statement_index: u32,
+}
+
+impl BorrowChecker {
+    pub fn new(body: MirBody) -> Self {
+        BorrowChecker {
+            body,
+            errors: Vec::new(),
+            liveness: LivenessInfo::default(),
+            borrows: BorrowSet::default(),
+            move_data: MoveData::default(),
+        }
+    }
+    
+    /// Run borrow checking on the body
+    pub fn check(&mut self) {
+        self.compute_liveness();
+        self.compute_move_data();
+        self.check_borrows();
+        self.check_moves();
+        self.check_linear_types();
+    }
+    
+    /// Compute liveness information (backward dataflow)
+    fn compute_liveness(&mut self) {
+        let num_locals = self.body.locals.len();
+        
+        // Initialize
+        for bb in &self.body.basic_blocks {
+            self.liveness.live_in.insert(bb.id, BitSet::new(num_locals));
+            self.liveness.live_out.insert(bb.id, BitSet::new(num_locals));
+        }
+        
+        // Fixed-point iteration (reverse postorder)
+        let mut changed = true;
+        while changed {
+            changed = false;
+            
+            for bb in self.body.basic_blocks.iter().rev() {
+                let mut live = self.liveness.live_out.get(&bb.id).cloned()
+                    .unwrap_or_else(|| BitSet::new(num_locals));
+                
+                // Process terminator
+                self.process_terminator_liveness(&bb.terminator, &mut live);
+                
+                // Process statements in reverse
+                for stmt in bb.statements.iter().rev() {
+                    self.process_statement_liveness(stmt, &mut live);
+                }
+                
+                // Update live_in
+                let old_live_in = self.liveness.live_in.get(&bb.id).cloned()
+                    .unwrap_or_else(|| BitSet::new(num_locals));
+                if live.bits != old_live_in.bits {
+                    changed = true;
+                    self.liveness.live_in.insert(bb.id, live.clone());
+                }
+                
+                // Propagate to predecessors
+                for pred in self.predecessors(bb.id) {
+                    let pred_live_out = self.liveness.live_out.entry(pred)
+                        .or_insert_with(|| BitSet::new(num_locals));
+                    pred_live_out.union(&live);
+                }
+            }
+        }
+    }
+    
+    fn process_terminator_liveness(&self, term: &Terminator, live: &mut BitSet) {
+        match &term.kind {
+            TerminatorKind::Return => {
+                live.insert(Local::RETURN_PLACE.0 as usize);
+            }
+            TerminatorKind::Call { func, args, destination, .. } => {
+                // Destination is defined (kill)
+                live.remove(destination.local.0 as usize);
+                // Func and args are used (gen)
+                self.mark_operand_live(func, live);
+                for arg in args {
+                    self.mark_operand_live(arg, live);
+                }
+            }
+            TerminatorKind::SwitchInt { discr, .. } => {
+                self.mark_operand_live(discr, live);
+            }
+            TerminatorKind::Drop { place, .. } => {
+                live.insert(place.local.0 as usize);
+            }
+            TerminatorKind::Assert { cond, .. } => {
+                self.mark_operand_live(cond, live);
+            }
+            _ => {}
+        }
+    }
+    
+    fn process_statement_liveness(&self, stmt: &Statement, live: &mut BitSet) {
+        match &stmt.kind {
+            StatementKind::Assign(place, rvalue) => {
+                // Place is defined (kill)
+                live.remove(place.local.0 as usize);
+                // Rvalue operands are used (gen)
+                self.mark_rvalue_live(rvalue, live);
+            }
+            StatementKind::StorageLive(local) => {
+                live.remove(local.0 as usize);
+            }
+            StatementKind::StorageDead(local) => {
+                // Variable goes out of scope, remove from live set
+                live.remove(local.0 as usize);
+            }
+            _ => {}
+        }
+    }
+    
+    fn mark_operand_live(&self, operand: &Operand, live: &mut BitSet) {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                live.insert(place.local.0 as usize);
+            }
+            Operand::Constant(_) => {}
+        }
+    }
+    
+    fn mark_rvalue_live(&self, rvalue: &Rvalue, live: &mut BitSet) {
+        match rvalue {
+            Rvalue::Use(op) => self.mark_operand_live(op, live),
+            Rvalue::Repeat(op, _) => self.mark_operand_live(op, live),
+            Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
+                live.insert(place.local.0 as usize);
+            }
+            Rvalue::Len(place) | Rvalue::Discriminant(place) => {
+                live.insert(place.local.0 as usize);
+            }
+            Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+                self.mark_operand_live(a, live);
+                self.mark_operand_live(b, live);
+            }
+            Rvalue::UnaryOp(_, op) => self.mark_operand_live(op, live),
+            Rvalue::Aggregate(_, ops) => {
+                for op in ops {
+                    self.mark_operand_live(op, live);
+                }
+            }
+            Rvalue::Cast(_, op, _) | Rvalue::ShallowInitBox(op, _) => {
+                self.mark_operand_live(op, live);
+            }
+            Rvalue::CopyForDeref(place) => {
+                live.insert(place.local.0 as usize);
+            }
+            Rvalue::NullOp(_, _) => {}
+        }
+    }
+    
+    fn predecessors(&self, _block: BasicBlockId) -> Vec<BasicBlockId> {
+        // TODO: Build predecessor graph
+        Vec::new()
+    }
+    
+    fn compute_move_data(&mut self) {
+        // Build move paths for all places
+        for (idx, local) in self.body.locals.iter().enumerate() {
+            let place = Place::local(Local(idx as u32));
+            let path_idx = MovePathIdx(self.move_data.move_paths.len() as u32);
+            self.move_data.move_paths.push(MovePath {
+                place: place.clone(),
+                parent: None,
+                children: Vec::new(),
+            });
+            self.move_data.place_to_path.insert(PlaceRef::from(&place), path_idx);
+        }
+        
+        // Find all moves and initializations
+        for (bb_idx, bb) in self.body.basic_blocks.iter().enumerate() {
+            for (stmt_idx, stmt) in bb.statements.iter().enumerate() {
+                let location = Location {
+                    block: BasicBlockId(bb_idx as u32),
+                    statement_index: stmt_idx as u32,
+                };
+                
+                match &stmt.kind {
+                    StatementKind::Assign(place, rvalue) => {
+                        // Assignment is an initialization
+                        if let Some(&path) = self.move_data.place_to_path.get(&PlaceRef::from(place)) {
+                            self.move_data.inits.push(Init {
+                                path,
+                                kind: InitKind::Deep,
+                                location,
+                            });
+                        }
+                        
+                        // Check for moves in rvalue
+                        self.check_rvalue_moves(rvalue, location);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    
+    fn check_rvalue_moves(&mut self, rvalue: &Rvalue, location: Location) {
+        match rvalue {
+            Rvalue::Use(Operand::Move(place)) => {
+                if let Some(&path) = self.move_data.place_to_path.get(&PlaceRef::from(place)) {
+                    self.move_data.moves.push(MoveOut { path, location });
+                }
+            }
+            Rvalue::Aggregate(_, operands) => {
+                for op in operands {
+                    if let Operand::Move(place) = op {
+                        if let Some(&path) = self.move_data.place_to_path.get(&PlaceRef::from(place)) {
+                            self.move_data.moves.push(MoveOut { path, location });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    fn check_borrows(&mut self) {
+        // Check each borrow for conflicts
+        for (bb_idx, bb) in self.body.basic_blocks.iter().enumerate() {
+            for (stmt_idx, stmt) in bb.statements.iter().enumerate() {
+                if let StatementKind::Assign(_, Rvalue::Ref(region, kind, place)) = &stmt.kind {
+                    // Check for conflicting borrows
+                    let place_ref = PlaceRef::from(place);
+                    if let Some(existing) = self.borrows.place_borrows.get(&place_ref) {
+                        for &borrow_idx in existing {
+                            let existing_borrow = &self.borrows.borrows[borrow_idx.0 as usize];
+                            if self.borrows_conflict(existing_borrow.kind, *kind) {
+                                self.errors.push(BorrowError::ConflictingBorrow {
+                                    place: format!("{:?}", place),
+                                    first_borrow: existing_borrow.kind,
+                                    first_borrow_span: existing_borrow.span,
+                                    second_borrow: *kind,
+                                    second_borrow_span: stmt.span,
+                                });
+                            }
+                        }
+                    }
+                    
+                    // Record the borrow
+                    let borrow_idx = BorrowIdx(self.borrows.borrows.len() as u32);
+                    self.borrows.borrows.push(BorrowData {
+                        kind: *kind,
+                        region: *region,
+                        place: place.clone(),
+                        span: stmt.span,
+                    });
+                    self.borrows.place_borrows
+                        .entry(place_ref)
+                        .or_default()
+                        .push(borrow_idx);
+                }
+            }
+        }
+    }
+    
+    fn borrows_conflict(&self, b1: BorrowKind, b2: BorrowKind) -> bool {
+        match (b1, b2) {
+            (BorrowKind::Shared, BorrowKind::Shared) => false,
+            (BorrowKind::Shared, BorrowKind::Shallow) => false,
+            (BorrowKind::Shallow, BorrowKind::Shared) => false,
+            (BorrowKind::Shallow, BorrowKind::Shallow) => false,
+            _ => true,  // Any mutable borrow conflicts
+        }
+    }
+    
+    fn check_moves(&mut self) {
+        // Check for use-after-move
+        let mut moved: HashSet<MovePathIdx> = HashSet::new();
+        
+        for move_out in &self.move_data.moves {
+            if moved.contains(&move_out.path) {
+                let path = &self.move_data.move_paths[move_out.path.0 as usize];
+                self.errors.push(BorrowError::UseAfterMove {
+                    place: format!("{:?}", path.place),
+                    moved_at: Span::new(0, 0, 0),  // TODO: track original move
+                    used_at: Span::new(0, 0, 0),
+                });
+            }
+            moved.insert(move_out.path);
+        }
+    }
+    
+    fn check_linear_types(&mut self) {
+        // Check that all linear types are consumed exactly once
+        for (idx, local) in self.body.locals.iter().enumerate() {
+            if self.is_linear(&local.ty) {
+                let local_idx = Local(idx as u32);
+                let place = Place::local(local_idx);
+                let place_ref = PlaceRef::from(&place);
+                
+                // Count moves of this place
+                let move_count = self.move_data.moves.iter()
+                    .filter(|m| {
+                        let path = &self.move_data.move_paths[m.path.0 as usize];
+                        PlaceRef::from(&path.place) == place_ref
+                    })
+                    .count();
+                
+                if move_count == 0 {
+                    self.errors.push(BorrowError::LinearNotConsumed {
+                        place: local.name.clone().unwrap_or_else(|| format!("_{}", idx)),
+                        ty: local.ty.clone(),
+                        span: local.span,
+                    });
+                } else if move_count > 1 {
+                    self.errors.push(BorrowError::LinearMultipleUse {
+                        place: local.name.clone().unwrap_or_else(|| format!("_{}", idx)),
+                        first_use: Span::new(0, 0, 0),
+                        second_use: Span::new(0, 0, 0),
+                    });
+                }
+            }
+        }
+    }
+    
+    fn is_linear(&self, ty: &Ty) -> bool {
+        matches!(ty, Ty::Linear(_))
+    }
+    
+    pub fn errors(&self) -> &[BorrowError] {
+        &self.errors
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MONOMORPHIZATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Monomorphization: instantiate generic functions with concrete types
+pub struct Monomorphizer {
+    /// Already monomorphized instances
+    instances: HashMap<MonoKey, DefId>,
+    
+    /// Work queue of pending monomorphizations
+    queue: Vec<MonoKey>,
+    
+    /// Generated MIR bodies
+    bodies: HashMap<DefId, MirBody>,
+    
+    /// Next available DefId
+    next_def_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MonoKey {
+    pub def_id: DefId,
+    pub type_args: Vec<Ty>,
+}
+
+impl Monomorphizer {
+    pub fn new() -> Self {
+        Monomorphizer {
+            instances: HashMap::new(),
+            queue: Vec::new(),
+            bodies: HashMap::new(),
+            next_def_id: 1_000_000,  // High IDs for monomorphized functions
+        }
+    }
+    
+    /// Request a monomorphized instance
+    pub fn instance(&mut self, def_id: DefId, type_args: Vec<Ty>) -> DefId {
+        let key = MonoKey { def_id, type_args };
+        
+        if let Some(&instance) = self.instances.get(&key) {
+            return instance;
+        }
+        
+        // Create new instance
+        let instance_id = DefId::local(self.next_def_id);
+        self.next_def_id += 1;
+        
+        self.instances.insert(key.clone(), instance_id);
+        self.queue.push(key);
+        
+        instance_id
+    }
+    
+    /// Process pending monomorphizations
+    pub fn process(&mut self, get_body: impl Fn(DefId) -> Option<MirBody>) {
+        while let Some(key) = self.queue.pop() {
+            let instance_id = self.instances[&key];
+            
+            if let Some(body) = get_body(key.def_id) {
+                let mono_body = self.monomorphize_body(body, &key.type_args, instance_id);
+                self.bodies.insert(instance_id, mono_body);
+            }
+        }
+    }
+    
+    fn monomorphize_body(&self, mut body: MirBody, type_args: &[Ty], new_def_id: DefId) -> MirBody {
+        // Substitute type parameters with concrete types
+        let subst = TypeSubst::new(type_args);
+        
+        body.def_id = new_def_id;
+        body.return_ty = subst.apply(&body.return_ty);
+        
+        for local in &mut body.locals {
+            local.ty = subst.apply(&local.ty);
+        }
+        
+        for bb in &mut body.basic_blocks {
+            for stmt in &mut bb.statements {
+                self.mono_statement(stmt, &subst);
+            }
+            self.mono_terminator(&mut bb.terminator, &subst);
+        }
+        
+        body
+    }
+    
+    fn mono_statement(&self, stmt: &mut Statement, subst: &TypeSubst) {
+        match &mut stmt.kind {
+            StatementKind::Assign(_, rvalue) => {
+                self.mono_rvalue(rvalue, subst);
+            }
+            _ => {}
+        }
+    }
+    
+    fn mono_rvalue(&self, rvalue: &mut Rvalue, subst: &TypeSubst) {
+        match rvalue {
+            Rvalue::Cast(_, _, ty) => {
+                *ty = subst.apply(ty);
+            }
+            Rvalue::Aggregate(AggregateKind::Adt(_, _, ref mut args, _), _) => {
+                for arg in args.iter_mut() {
+                    *arg = subst.apply(arg);
+                }
+            }
+            Rvalue::NullOp(_, ty) => {
+                *ty = subst.apply(ty);
+            }
+            Rvalue::ShallowInitBox(_, ty) => {
+                *ty = subst.apply(ty);
+            }
+            _ => {}
+        }
+    }
+    
+    fn mono_terminator(&self, term: &mut Terminator, subst: &TypeSubst) {
+        // Monomorphize function calls
+        if let TerminatorKind::Call { func, .. } = &mut term.kind {
+            if let Operand::Constant(c) = func {
+                c.ty = subst.apply(&c.ty);
+            }
+        }
+    }
+    
+    pub fn bodies(&self) -> &HashMap<DefId, MirBody> {
+        &self.bodies
+    }
+}
+
+struct TypeSubst<'a> {
+    args: &'a [Ty],
+}
+
+impl<'a> TypeSubst<'a> {
+    fn new(args: &'a [Ty]) -> Self {
+        TypeSubst { args }
+    }
+    
+    fn apply(&self, ty: &Ty) -> Ty {
+        match ty {
+            Ty::Var(TypeVar(idx)) => {
+                if (*idx as usize) < self.args.len() {
+                    self.args[*idx as usize].clone()
+                } else {
+                    ty.clone()
+                }
+            }
+            Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.apply(t)).collect()),
+            Ty::Array(elem, n) => Ty::Array(Box::new(self.apply(elem)), *n),
+            Ty::Slice(elem) => Ty::Slice(Box::new(self.apply(elem))),
+            Ty::Ref(lt, m, inner) => Ty::Ref(lt.clone(), *m, Box::new(self.apply(inner))),
+            Ty::Ptr(m, inner) => Ty::Ptr(*m, Box::new(self.apply(inner))),
+            Ty::Adt(id, args) => Ty::Adt(*id, args.iter().map(|t| self.apply(t)).collect()),
+            Ty::Linear(inner) => Ty::Linear(Box::new(self.apply(inner))),
+            Ty::Affine(inner) => Ty::Affine(Box::new(self.apply(inner))),
+            Ty::Volatile(access, inner) => Ty::Volatile(*access, Box::new(self.apply(inner))),
+            _ => ty.clone(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_bitset() {
+        let mut bs = BitSet::new(100);
+        assert!(!bs.contains(42));
+        bs.insert(42);
+        assert!(bs.contains(42));
+        bs.remove(42);
+        assert!(!bs.contains(42));
+    }
+    
+    #[test]
+    fn test_place() {
+        let place = Place::local(Local(0));
+        assert_eq!(place.local.0, 0);
+        assert!(place.projection.is_empty());
+        
+        let field = place.project(PlaceElem::Field(FieldIdx(1), Ty::Unit));
+        assert_eq!(field.projection.len(), 1);
+    }
+    
+    #[test]
+    fn test_switch_targets() {
+        let targets = SwitchTargets::if_then(1, BasicBlockId(1), BasicBlockId(2));
+        assert_eq!(targets.values.len(), 1);
+        assert_eq!(targets.otherwise, BasicBlockId(2));
+    }
+    
+    #[test]
+    fn test_mono_key() {
+        let key1 = MonoKey {
+            def_id: DefId::local(1),
+            type_args: vec![Ty::Int(IntTy::U32)],
+        };
+        let key2 = MonoKey {
+            def_id: DefId::local(1),
+            type_args: vec![Ty::Int(IntTy::U64)],
+        };
+        assert_ne!(key1, key2);
+    }
+}

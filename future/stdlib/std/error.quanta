@@ -1,0 +1,493 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ STANDARD LIBRARY — Error Module
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Error handling:
+// - Error trait
+// - Error chain utilities
+// - Panic utilities
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module std::error
+
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt::{self, Debug, Display};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The Error trait for all error types
+pub trait Error: Debug + Display {
+    /// The lower-level source of this error, if any
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        None
+    }
+    
+    /// Get a description of the error (deprecated)
+    #[deprecated(note = "use Display instead")]
+    fn description(&self) -> &str {
+        "description() is deprecated; use Display"
+    }
+    
+    /// Get the cause of the error (deprecated)
+    #[deprecated(note = "use source() instead")]
+    fn cause(&self) -> Option<&dyn Error> {
+        self.source()
+    }
+    
+    /// Provides type-based access to context
+    fn provide<'a>(&'a self, request: &mut Request<'a>) {
+        // Default implementation does nothing
+        let _ = request;
+    }
+}
+
+impl<'a, E: Error + 'a> From<E> for Box<dyn Error + 'a> {
+    fn from(err: E) -> Box<dyn Error + 'a> {
+        Box::new(err)
+    }
+}
+
+impl<'a, E: Error + Send + Sync + 'a> From<E> for Box<dyn Error + Send + Sync + 'a> {
+    fn from(err: E) -> Box<dyn Error + Send + Sync + 'a> {
+        Box::new(err)
+    }
+}
+
+impl Error for ! {}
+
+impl Error for alloc::string::FromUtf8Error {}
+
+impl Error for core::str::Utf8Error {}
+
+impl Error for core::num::ParseIntError {}
+
+impl Error for core::num::ParseFloatError {}
+
+impl Error for core::num::TryFromIntError {}
+
+impl Error for core::array::TryFromSliceError {}
+
+impl Error for core::char::ParseCharError {}
+
+impl Error for core::char::CharTryFromError {}
+
+impl Error for alloc::string::FromUtf16Error {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR CHAIN ITERATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// An iterator over the error chain
+pub struct Chain<'a> {
+    current: Option<&'a (dyn Error + 'static)>,
+}
+
+impl<'a> Chain<'a> {
+    /// Create a new chain iterator
+    pub fn new(error: &'a (dyn Error + 'static)) -> Self {
+        Chain { current: Some(error) }
+    }
+}
+
+impl<'a> Iterator for Chain<'a> {
+    type Item = &'a (dyn Error + 'static);
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.current?;
+        self.current = current.source();
+        Some(current)
+    }
+}
+
+/// Extension trait for Error to get the chain
+pub trait ErrorExt: Error {
+    /// Get the error chain
+    fn chain(&self) -> Chain<'_>
+    where
+        Self: Sized,
+    {
+        Chain::new(self)
+    }
+}
+
+impl<E: Error> ErrorExt for E {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REPORT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A formatted error report
+pub struct Report<E> {
+    error: E,
+    show_backtrace: bool,
+    pretty: bool,
+}
+
+impl<E: Error> Report<E> {
+    /// Create a new report
+    pub fn new(error: E) -> Self {
+        Report {
+            error,
+            show_backtrace: false,
+            pretty: false,
+        }
+    }
+    
+    /// Enable pretty printing
+    pub fn pretty(mut self, pretty: bool) -> Self {
+        self.pretty = pretty;
+        self
+    }
+    
+    /// Show backtrace
+    pub fn show_backtrace(mut self, show: bool) -> Self {
+        self.show_backtrace = show;
+        self
+    }
+}
+
+impl<E: Error> fmt::Display for Report<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.pretty {
+            self.format_pretty(f)
+        } else {
+            self.format_compact(f)
+        }
+    }
+}
+
+impl<E: Error> Report<E> {
+    fn format_compact(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.error)?;
+        
+        let mut current = self.error.source();
+        while let Some(source) = current {
+            write!(f, ": {}", source)?;
+            current = source.source();
+        }
+        
+        Ok(())
+    }
+    
+    fn format_pretty(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Error: {}", self.error)?;
+        
+        let mut level = 0;
+        let mut current = self.error.source();
+        
+        while let Some(source) = current {
+            level += 1;
+            writeln!(f)?;
+            writeln!(f, "Caused by:")?;
+            writeln!(f, "    {}: {}", level, source)?;
+            current = source.source();
+        }
+        
+        Ok(())
+    }
+}
+
+impl<E: Error> fmt::Debug for Report<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REQUEST (PROVIDER API)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A request for context from an Error
+pub struct Request<'a> {
+    _marker: core::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> Request<'a> {
+    /// Provide a value
+    pub fn provide_value<T: 'static>(&mut self, value: T) -> &mut Self {
+        // Implementation would store the value
+        let _ = value;
+        self
+    }
+    
+    /// Provide a reference
+    pub fn provide_ref<T: 'static + ?Sized>(&mut self, value: &'a T) -> &mut Self {
+        // Implementation would store the reference
+        let _ = value;
+        self
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIMPLE ERROR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A simple string error
+#[derive(Debug, Clone)]
+pub struct StringError {
+    message: String,
+    source: Option<Box<dyn Error + Send + Sync>>,
+}
+
+impl StringError {
+    /// Create a new string error
+    pub fn new<S: Into<String>>(message: S) -> Self {
+        StringError {
+            message: message.into(),
+            source: None,
+        }
+    }
+    
+    /// Add a source error
+    pub fn with_source<E: Error + Send + Sync + 'static>(mut self, source: E) -> Self {
+        self.source = Some(Box::new(source));
+        self
+    }
+}
+
+impl fmt::Display for StringError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl Error for StringError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source.as_ref().map(|e| e.as_ref() as &(dyn Error + 'static))
+    }
+}
+
+impl From<&str> for StringError {
+    fn from(s: &str) -> Self {
+        StringError::new(s)
+    }
+}
+
+impl From<String> for StringError {
+    fn from(s: String) -> Self {
+        StringError::new(s)
+    }
+}
+
+/// A boxed error type alias
+pub type BoxError = Box<dyn Error + Send + Sync>;
+
+/// A result with a boxed error
+pub type BoxResult<T> = core::result::Result<T, BoxError>;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PANIC HANDLING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Information about a panic
+pub struct PanicInfo<'a> {
+    payload: &'a (dyn core::any::Any + Send),
+    location: Option<&'a Location<'a>>,
+}
+
+impl<'a> PanicInfo<'a> {
+    /// Get the panic payload
+    pub fn payload(&self) -> &(dyn core::any::Any + Send) {
+        self.payload
+    }
+    
+    /// Get the panic location
+    pub fn location(&self) -> Option<&Location<'a>> {
+        self.location
+    }
+    
+    /// Get the panic message
+    pub fn message(&self) -> Option<&str> {
+        self.payload.downcast_ref::<&str>().copied()
+            .or_else(|| self.payload.downcast_ref::<String>().map(|s| s.as_str()))
+    }
+}
+
+impl fmt::Display for PanicInfo<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(msg) = self.message() {
+            write!(f, "panicked at '{}'", msg)?;
+        } else {
+            write!(f, "panicked")?;
+        }
+        
+        if let Some(loc) = self.location {
+            write!(f, ", {}", loc)?;
+        }
+        
+        Ok(())
+    }
+}
+
+/// A panic location
+pub struct Location<'a> {
+    file: &'a str,
+    line: u32,
+    col: u32,
+}
+
+impl<'a> Location<'a> {
+    /// Create a new location
+    #[track_caller]
+    pub fn caller() -> &'static Self {
+        // Would use #[track_caller] mechanism
+        static LOC: Location<'static> = Location {
+            file: "<unknown>",
+            line: 0,
+            col: 0,
+        };
+        &LOC
+    }
+    
+    /// Get the file
+    pub fn file(&self) -> &str {
+        self.file
+    }
+    
+    /// Get the line
+    pub fn line(&self) -> u32 {
+        self.line
+    }
+    
+    /// Get the column
+    pub fn column(&self) -> u32 {
+        self.col
+    }
+}
+
+impl fmt::Display for Location<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}:{}", self.file, self.line, self.col)
+    }
+}
+
+impl fmt::Debug for Location<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// Set a custom panic hook
+pub fn set_hook(hook: Box<dyn Fn(&PanicInfo<'_>) + Sync + Send + 'static>) {
+    crate::sys::set_panic_hook(hook);
+}
+
+/// Take the current panic hook
+pub fn take_hook() -> Box<dyn Fn(&PanicInfo<'_>) + Sync + Send + 'static> {
+    crate::sys::take_panic_hook()
+}
+
+/// Catch a panic and return it as a Result
+pub fn catch_unwind<F, R>(f: F) -> core::result::Result<R, Box<dyn core::any::Any + Send>>
+where
+    F: FnOnce() -> R + core::panic::UnwindSafe,
+{
+    core::panic::catch_unwind(f)
+}
+
+/// Resume unwinding after catching a panic
+pub fn resume_unwind(payload: Box<dyn core::any::Any + Send>) -> ! {
+    core::panic::resume_unwind(payload)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ASSERT UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Assert that two values are equal, returning an error if not
+pub fn assert_eq_result<T: PartialEq + Debug>(left: T, right: T) -> core::result::Result<(), AssertError> {
+    if left == right {
+        Ok(())
+    } else {
+        Err(AssertError::new(format!(
+            "assertion failed: `(left == right)`\n  left: `{:?}`,\n right: `{:?}`",
+            left, right
+        )))
+    }
+}
+
+/// Assert that two values are not equal, returning an error if equal
+pub fn assert_ne_result<T: PartialEq + Debug>(left: T, right: T) -> core::result::Result<(), AssertError> {
+    if left != right {
+        Ok(())
+    } else {
+        Err(AssertError::new(format!(
+            "assertion failed: `(left != right)`\n  left: `{:?}`,\n right: `{:?}`",
+            left, right
+        )))
+    }
+}
+
+/// An assertion error
+#[derive(Debug)]
+pub struct AssertError {
+    message: String,
+}
+
+impl AssertError {
+    /// Create a new assertion error
+    pub fn new<S: Into<String>>(message: S) -> Self {
+        AssertError { message: message.into() }
+    }
+}
+
+impl fmt::Display for AssertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl Error for AssertError {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_string_error() {
+        let err = StringError::new("test error");
+        assert_eq!(format!("{}", err), "test error");
+    }
+    
+    #[test]
+    fn test_error_chain() {
+        let inner = StringError::new("inner error");
+        let outer = StringError::new("outer error").with_source(inner);
+        
+        let chain: Vec<_> = outer.chain().collect();
+        assert_eq!(chain.len(), 2);
+    }
+    
+    #[test]
+    fn test_report() {
+        let err = StringError::new("test error");
+        let report = Report::new(err);
+        
+        let s = format!("{}", report);
+        assert!(s.contains("test error"));
+    }
+    
+    #[test]
+    fn test_assert_eq_result() {
+        assert!(assert_eq_result(1, 1).is_ok());
+        assert!(assert_eq_result(1, 2).is_err());
+    }
+    
+    #[test]
+    fn test_assert_ne_result() {
+        assert!(assert_ne_result(1, 2).is_ok());
+        assert!(assert_ne_result(1, 1).is_err());
+    }
+}

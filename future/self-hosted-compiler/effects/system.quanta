@@ -1,0 +1,827 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ EFFECTS — Algebraic Effects System
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Algebraic effects and handlers for controlled side effects:
+// - Effect declarations with operations
+// - Effect handlers with continuations
+// - Effect polymorphism
+// - Effect inference
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::effects::system
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::sync::Arc;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::RwLock;
+use std::any::Any;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EFFECT DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Effect identifier
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EffectId(pub String);
+
+impl EffectId {
+    pub fn new(name: impl Into<String>) -> Self {
+        EffectId(name.into())
+    }
+}
+
+impl std::fmt::Display for EffectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Effect declaration
+#[derive(Debug, Clone)]
+pub struct Effect {
+    /// Effect identifier
+    pub id: EffectId,
+    
+    /// Effect operations
+    pub operations: Vec<Operation>,
+    
+    /// Type parameters
+    pub type_params: Vec<TypeParam>,
+    
+    /// Documentation
+    pub doc: Option<String>,
+}
+
+/// Effect operation
+#[derive(Debug, Clone)]
+pub struct Operation {
+    /// Operation name
+    pub name: String,
+    
+    /// Parameter types
+    pub params: Vec<Type>,
+    
+    /// Return type
+    pub return_type: Type,
+    
+    /// Is resumable (can continue after handling)
+    pub resumable: bool,
+    
+    /// Documentation
+    pub doc: Option<String>,
+}
+
+/// Type parameter for polymorphic effects
+#[derive(Debug, Clone)]
+pub struct TypeParam {
+    pub name: String,
+    pub bounds: Vec<TypeBound>,
+}
+
+/// Type bound
+#[derive(Debug, Clone)]
+pub enum TypeBound {
+    /// Trait bound
+    Trait(String),
+    /// Effect bound
+    Effect(EffectId),
+    /// Lifetime bound
+    Lifetime(String),
+}
+
+/// Type representation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Type {
+    /// Unit type
+    Unit,
+    /// Boolean
+    Bool,
+    /// Integer types
+    Int(IntSize),
+    /// Float types
+    Float(FloatSize),
+    /// String
+    String,
+    /// Type variable
+    Var(String),
+    /// Named type
+    Named(String, Vec<Type>),
+    /// Function type
+    Function {
+        params: Vec<Type>,
+        result: Box<Type>,
+        effects: EffectSet,
+    },
+    /// Reference
+    Ref(Box<Type>, Mutability),
+    /// Tuple
+    Tuple(Vec<Type>),
+    /// Array
+    Array(Box<Type>, Option<usize>),
+    /// Never type
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntSize {
+    I8, I16, I32, I64, I128, ISize,
+    U8, U16, U32, U64, U128, USize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatSize {
+    F32, F64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutability {
+    Shared,
+    Mutable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EFFECT SETS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Set of effects
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EffectSet {
+    effects: BTreeSet<EffectId>,
+}
+
+impl EffectSet {
+    pub fn new() -> Self {
+        EffectSet {
+            effects: BTreeSet::new(),
+        }
+    }
+    
+    pub fn pure() -> Self {
+        EffectSet::new()
+    }
+    
+    pub fn total() -> Self {
+        let mut set = EffectSet::new();
+        // Total = all possible effects
+        set.effects.insert(EffectId::new("IO"));
+        set.effects.insert(EffectId::new("State"));
+        set.effects.insert(EffectId::new("Exception"));
+        set.effects.insert(EffectId::new("Async"));
+        set.effects.insert(EffectId::new("NonDet"));
+        set
+    }
+    
+    pub fn singleton(effect: EffectId) -> Self {
+        let mut set = EffectSet::new();
+        set.effects.insert(effect);
+        set
+    }
+    
+    pub fn add(&mut self, effect: EffectId) {
+        self.effects.insert(effect);
+    }
+    
+    pub fn remove(&mut self, effect: &EffectId) {
+        self.effects.remove(effect);
+    }
+    
+    pub fn contains(&self, effect: &EffectId) -> bool {
+        self.effects.contains(effect)
+    }
+    
+    pub fn is_pure(&self) -> bool {
+        self.effects.is_empty()
+    }
+    
+    pub fn is_subset(&self, other: &EffectSet) -> bool {
+        self.effects.is_subset(&other.effects)
+    }
+    
+    pub fn union(&self, other: &EffectSet) -> EffectSet {
+        EffectSet {
+            effects: self.effects.union(&other.effects).cloned().collect(),
+        }
+    }
+    
+    pub fn difference(&self, other: &EffectSet) -> EffectSet {
+        EffectSet {
+            effects: self.effects.difference(&other.effects).cloned().collect(),
+        }
+    }
+    
+    pub fn intersection(&self, other: &EffectSet) -> EffectSet {
+        EffectSet {
+            effects: self.effects.intersection(&other.effects).cloned().collect(),
+        }
+    }
+    
+    pub fn iter(&self) -> impl Iterator<Item = &EffectId> {
+        self.effects.iter()
+    }
+}
+
+impl std::fmt::Display for EffectSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_pure() {
+            write!(f, "Pure")
+        } else {
+            let names: Vec<_> = self.effects.iter().map(|e| e.0.as_str()).collect();
+            write!(f, "{{{}}}", names.join(", "))
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EFFECT HANDLERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Effect handler
+#[derive(Debug, Clone)]
+pub struct Handler {
+    /// Effect being handled
+    pub effect: EffectId,
+    
+    /// Operation implementations
+    pub operations: BTreeMap<String, OpHandler>,
+    
+    /// Return clause
+    pub return_clause: Option<ReturnClause>,
+    
+    /// Finally clause
+    pub finally_clause: Option<FinallyClause>,
+}
+
+/// Operation handler implementation
+#[derive(Debug, Clone)]
+pub struct OpHandler {
+    /// Operation name
+    pub name: String,
+    
+    /// Parameter bindings
+    pub params: Vec<String>,
+    
+    /// Continuation binding (if resumable)
+    pub continuation: Option<String>,
+    
+    /// Handler body (AST representation)
+    pub body: HandlerBody,
+}
+
+/// Handler body representation
+#[derive(Debug, Clone)]
+pub enum HandlerBody {
+    /// Resume with value
+    Resume(Box<Expr>),
+    
+    /// Return without resuming
+    Return(Box<Expr>),
+    
+    /// Tail-resume (optimized)
+    TailResume(Box<Expr>),
+    
+    /// Custom expression
+    Custom(Box<Expr>),
+}
+
+/// Return clause for handler
+#[derive(Debug, Clone)]
+pub struct ReturnClause {
+    pub param: String,
+    pub body: Box<Expr>,
+}
+
+/// Finally clause for handler
+#[derive(Debug, Clone)]
+pub struct FinallyClause {
+    pub body: Box<Expr>,
+}
+
+/// Expression representation (simplified)
+#[derive(Debug, Clone)]
+pub enum Expr {
+    /// Variable
+    Var(String),
+    /// Literal
+    Lit(Literal),
+    /// Function application
+    App(Box<Expr>, Vec<Expr>),
+    /// Lambda
+    Lambda(Vec<String>, Box<Expr>),
+    /// Let binding
+    Let(String, Box<Expr>, Box<Expr>),
+    /// Perform effect operation
+    Perform(EffectId, String, Vec<Expr>),
+    /// Handle expression
+    Handle(Box<Expr>, Vec<Handler>),
+    /// If expression
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// Match expression
+    Match(Box<Expr>, Vec<MatchArm>),
+    /// Block
+    Block(Vec<Expr>),
+    /// Resume continuation
+    Resume(Box<Expr>),
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub guard: Option<Box<Expr>>,
+    pub body: Box<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    Wildcard,
+    Var(String),
+    Lit(Literal),
+    Constructor(String, Vec<Pattern>),
+    Tuple(Vec<Pattern>),
+}
+
+#[derive(Debug, Clone)]
+pub enum Literal {
+    Unit,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONTINUATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Delimited continuation
+pub struct Continuation {
+    /// Continuation ID
+    id: u64,
+    
+    /// Captured stack frames
+    frames: Vec<Frame>,
+    
+    /// Is one-shot (can only be invoked once)
+    one_shot: bool,
+    
+    /// Has been invoked
+    invoked: bool,
+}
+
+/// Stack frame
+#[derive(Debug, Clone)]
+pub struct Frame {
+    /// Function being executed
+    function: String,
+    
+    /// Local variables
+    locals: BTreeMap<String, Value>,
+    
+    /// Program counter
+    pc: usize,
+    
+    /// Pending handlers
+    handlers: Vec<HandlerFrame>,
+}
+
+/// Handler frame on stack
+#[derive(Debug, Clone)]
+pub struct HandlerFrame {
+    /// Effect being handled
+    effect: EffectId,
+    
+    /// Handler definition
+    handler: Handler,
+    
+    /// Captured environment
+    env: BTreeMap<String, Value>,
+}
+
+/// Runtime value
+#[derive(Debug, Clone)]
+pub enum Value {
+    Unit,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    Tuple(Vec<Value>),
+    Array(Vec<Value>),
+    Closure(ClosureValue),
+    Continuation(Arc<Continuation>),
+    Object(ObjectValue),
+}
+
+#[derive(Debug, Clone)]
+pub struct ClosureValue {
+    pub params: Vec<String>,
+    pub body: Box<Expr>,
+    pub env: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectValue {
+    pub type_id: String,
+    pub fields: BTreeMap<String, Value>,
+}
+
+impl Continuation {
+    pub fn new(frames: Vec<Frame>, one_shot: bool) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        
+        Continuation {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            frames,
+            one_shot,
+            invoked: false,
+        }
+    }
+    
+    /// Invoke continuation with value
+    pub fn resume(&mut self, value: Value) -> Result<Value, EffectError> {
+        if self.one_shot && self.invoked {
+            return Err(EffectError::ContinuationAlreadyInvoked);
+        }
+        
+        self.invoked = true;
+        
+        // Would restore frames and continue execution
+        Ok(value)
+    }
+    
+    pub fn is_invoked(&self) -> bool {
+        self.invoked
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EFFECT RUNTIME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Effect runtime
+pub struct EffectRuntime {
+    /// Effect registry
+    effects: RwLock<BTreeMap<EffectId, Effect>>,
+    
+    /// Handler stack
+    handler_stack: RwLock<Vec<HandlerFrame>>,
+    
+    /// Active continuations
+    continuations: RwLock<BTreeMap<u64, Arc<Continuation>>>,
+}
+
+impl EffectRuntime {
+    pub fn new() -> Self {
+        let mut runtime = EffectRuntime {
+            effects: RwLock::new(BTreeMap::new()),
+            handler_stack: RwLock::new(Vec::new()),
+            continuations: RwLock::new(BTreeMap::new()),
+        };
+        
+        // Register built-in effects
+        runtime.register_builtins();
+        
+        runtime
+    }
+    
+    fn register_builtins(&mut self) {
+        // IO Effect
+        self.register_effect(Effect {
+            id: EffectId::new("IO"),
+            operations: vec![
+                Operation {
+                    name: "print".to_string(),
+                    params: vec![Type::String],
+                    return_type: Type::Unit,
+                    resumable: true,
+                    doc: Some("Print to stdout".to_string()),
+                },
+                Operation {
+                    name: "read_line".to_string(),
+                    params: vec![],
+                    return_type: Type::String,
+                    resumable: true,
+                    doc: Some("Read line from stdin".to_string()),
+                },
+                Operation {
+                    name: "read_file".to_string(),
+                    params: vec![Type::String],
+                    return_type: Type::String,
+                    resumable: true,
+                    doc: Some("Read file contents".to_string()),
+                },
+                Operation {
+                    name: "write_file".to_string(),
+                    params: vec![Type::String, Type::String],
+                    return_type: Type::Unit,
+                    resumable: true,
+                    doc: Some("Write to file".to_string()),
+                },
+            ],
+            type_params: vec![],
+            doc: Some("Input/Output effect".to_string()),
+        });
+        
+        // State Effect
+        self.register_effect(Effect {
+            id: EffectId::new("State"),
+            operations: vec![
+                Operation {
+                    name: "get".to_string(),
+                    params: vec![],
+                    return_type: Type::Var("S".to_string()),
+                    resumable: true,
+                    doc: Some("Get current state".to_string()),
+                },
+                Operation {
+                    name: "put".to_string(),
+                    params: vec![Type::Var("S".to_string())],
+                    return_type: Type::Unit,
+                    resumable: true,
+                    doc: Some("Set state".to_string()),
+                },
+                Operation {
+                    name: "modify".to_string(),
+                    params: vec![Type::Function {
+                        params: vec![Type::Var("S".to_string())],
+                        result: Box::new(Type::Var("S".to_string())),
+                        effects: EffectSet::pure(),
+                    }],
+                    return_type: Type::Unit,
+                    resumable: true,
+                    doc: Some("Modify state with function".to_string()),
+                },
+            ],
+            type_params: vec![TypeParam {
+                name: "S".to_string(),
+                bounds: vec![],
+            }],
+            doc: Some("Mutable state effect".to_string()),
+        });
+        
+        // Exception Effect
+        self.register_effect(Effect {
+            id: EffectId::new("Exception"),
+            operations: vec![
+                Operation {
+                    name: "raise".to_string(),
+                    params: vec![Type::Var("E".to_string())],
+                    return_type: Type::Never,
+                    resumable: false,
+                    doc: Some("Raise exception".to_string()),
+                },
+            ],
+            type_params: vec![TypeParam {
+                name: "E".to_string(),
+                bounds: vec![],
+            }],
+            doc: Some("Exception effect".to_string()),
+        });
+        
+        // Async Effect
+        self.register_effect(Effect {
+            id: EffectId::new("Async"),
+            operations: vec![
+                Operation {
+                    name: "await".to_string(),
+                    params: vec![Type::Named("Future".to_string(), vec![Type::Var("T".to_string())])],
+                    return_type: Type::Var("T".to_string()),
+                    resumable: true,
+                    doc: Some("Await future".to_string()),
+                },
+                Operation {
+                    name: "spawn".to_string(),
+                    params: vec![Type::Function {
+                        params: vec![],
+                        result: Box::new(Type::Var("T".to_string())),
+                        effects: EffectSet::singleton(EffectId::new("Async")),
+                    }],
+                    return_type: Type::Named("Task".to_string(), vec![Type::Var("T".to_string())]),
+                    resumable: true,
+                    doc: Some("Spawn async task".to_string()),
+                },
+            ],
+            type_params: vec![TypeParam {
+                name: "T".to_string(),
+                bounds: vec![],
+            }],
+            doc: Some("Asynchronous effect".to_string()),
+        });
+        
+        // NonDet Effect (nondeterminism)
+        self.register_effect(Effect {
+            id: EffectId::new("NonDet"),
+            operations: vec![
+                Operation {
+                    name: "choose".to_string(),
+                    params: vec![Type::Array(Box::new(Type::Var("T".to_string())), None)],
+                    return_type: Type::Var("T".to_string()),
+                    resumable: true,
+                    doc: Some("Choose from alternatives".to_string()),
+                },
+                Operation {
+                    name: "fail".to_string(),
+                    params: vec![],
+                    return_type: Type::Never,
+                    resumable: false,
+                    doc: Some("Fail current branch".to_string()),
+                },
+            ],
+            type_params: vec![TypeParam {
+                name: "T".to_string(),
+                bounds: vec![],
+            }],
+            doc: Some("Nondeterminism effect".to_string()),
+        });
+    }
+    
+    /// Register effect
+    pub fn register_effect(&self, effect: Effect) {
+        let mut effects = self.effects.write().unwrap();
+        effects.insert(effect.id.clone(), effect);
+    }
+    
+    /// Get effect by ID
+    pub fn get_effect(&self, id: &EffectId) -> Option<Effect> {
+        self.effects.read().unwrap().get(id).cloned()
+    }
+    
+    /// Push handler onto stack
+    pub fn push_handler(&self, frame: HandlerFrame) {
+        self.handler_stack.write().unwrap().push(frame);
+    }
+    
+    /// Pop handler from stack
+    pub fn pop_handler(&self) -> Option<HandlerFrame> {
+        self.handler_stack.write().unwrap().pop()
+    }
+    
+    /// Find handler for effect
+    pub fn find_handler(&self, effect: &EffectId) -> Option<HandlerFrame> {
+        let stack = self.handler_stack.read().unwrap();
+        stack.iter().rev()
+            .find(|h| h.effect == *effect)
+            .cloned()
+    }
+    
+    /// Perform effect operation
+    pub fn perform(
+        &self,
+        effect: &EffectId,
+        operation: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, EffectError> {
+        // Find handler
+        let handler_frame = self.find_handler(effect)
+            .ok_or_else(|| EffectError::UnhandledEffect(effect.clone()))?;
+        
+        // Find operation handler
+        let op_handler = handler_frame.handler.operations.get(operation)
+            .ok_or_else(|| EffectError::UnknownOperation(operation.to_string()))?;
+        
+        // If operation is resumable, create continuation
+        let effect_def = self.get_effect(effect)
+            .ok_or_else(|| EffectError::UnknownEffect(effect.clone()))?;
+        
+        let op_def = effect_def.operations.iter()
+            .find(|o| o.name == operation)
+            .ok_or_else(|| EffectError::UnknownOperation(operation.to_string()))?;
+        
+        if op_def.resumable {
+            // Create continuation for resumption
+            let cont = Continuation::new(vec![], true);
+            let cont_arc = Arc::new(cont);
+            
+            self.continuations.write().unwrap().insert(
+                Arc::as_ptr(&cont_arc) as u64,
+                cont_arc.clone(),
+            );
+            
+            // Execute handler body (simplified)
+            Ok(Value::Unit)
+        } else {
+            // Non-resumable: just execute handler
+            Ok(Value::Unit)
+        }
+    }
+    
+    /// List all registered effects
+    pub fn list_effects(&self) -> Vec<EffectId> {
+        self.effects.read().unwrap().keys().cloned().collect()
+    }
+}
+
+impl Default for EffectRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum EffectError {
+    UnknownEffect(EffectId),
+    UnknownOperation(String),
+    UnhandledEffect(EffectId),
+    TypeMismatch { expected: Type, found: Type },
+    ContinuationAlreadyInvoked,
+    HandlerStackUnderflow,
+}
+
+impl std::fmt::Display for EffectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownEffect(id) => write!(f, "unknown effect: {}", id),
+            Self::UnknownOperation(op) => write!(f, "unknown operation: {}", op),
+            Self::UnhandledEffect(id) => write!(f, "unhandled effect: {}", id),
+            Self::TypeMismatch { expected, found } => {
+                write!(f, "type mismatch: expected {:?}, found {:?}", expected, found)
+            }
+            Self::ContinuationAlreadyInvoked => write!(f, "continuation already invoked"),
+            Self::HandlerStackUnderflow => write!(f, "handler stack underflow"),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_effect_id() {
+        let id = EffectId::new("IO");
+        assert_eq!(id.to_string(), "IO");
+    }
+    
+    #[test]
+    fn test_effect_set() {
+        let mut set = EffectSet::new();
+        assert!(set.is_pure());
+        
+        set.add(EffectId::new("IO"));
+        assert!(!set.is_pure());
+        assert!(set.contains(&EffectId::new("IO")));
+    }
+    
+    #[test]
+    fn test_effect_set_operations() {
+        let mut a = EffectSet::new();
+        a.add(EffectId::new("IO"));
+        a.add(EffectId::new("State"));
+        
+        let mut b = EffectSet::new();
+        b.add(EffectId::new("State"));
+        b.add(EffectId::new("Exception"));
+        
+        let union = a.union(&b);
+        assert!(union.contains(&EffectId::new("IO")));
+        assert!(union.contains(&EffectId::new("State")));
+        assert!(union.contains(&EffectId::new("Exception")));
+        
+        let intersection = a.intersection(&b);
+        assert!(intersection.contains(&EffectId::new("State")));
+        assert!(!intersection.contains(&EffectId::new("IO")));
+    }
+    
+    #[test]
+    fn test_effect_runtime() {
+        let runtime = EffectRuntime::new();
+        
+        let effects = runtime.list_effects();
+        assert!(effects.contains(&EffectId::new("IO")));
+        assert!(effects.contains(&EffectId::new("State")));
+        assert!(effects.contains(&EffectId::new("Exception")));
+        assert!(effects.contains(&EffectId::new("Async")));
+    }
+    
+    #[test]
+    fn test_effect_operations() {
+        let runtime = EffectRuntime::new();
+        
+        let io = runtime.get_effect(&EffectId::new("IO")).unwrap();
+        assert_eq!(io.operations.len(), 4);
+        
+        let print_op = io.operations.iter().find(|o| o.name == "print").unwrap();
+        assert!(print_op.resumable);
+    }
+    
+    #[test]
+    fn test_continuation() {
+        let cont = Continuation::new(vec![], true);
+        assert!(!cont.is_invoked());
+    }
+}

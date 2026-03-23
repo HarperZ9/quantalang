@@ -1,0 +1,849 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Scalar Evolution Analysis
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Scalar evolution analysis for loop optimization:
+//   - SCEV (SCalar EVolution) representation
+//   - Recurrence detection
+//   - Trip count computation
+//   - Loop exit analysis
+//   - Induction variable analysis
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::scev
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCEV EXPRESSIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SCEV expression type
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SCEV {
+    /// Constant value
+    Constant(i64),
+    /// Unknown value (couldn't analyze)
+    Unknown(String),
+    /// Variable not varying in loop
+    Invariant(String),
+    /// Add recurrence: {start, +, step}<loop>
+    AddRec(AddRecExpr),
+    /// Addition
+    Add(Vec<Arc<SCEV>>),
+    /// Multiplication
+    Mul(Vec<Arc<SCEV>>),
+    /// Signed division
+    SDiv(Arc<SCEV>, Arc<SCEV>),
+    /// Unsigned division
+    UDiv(Arc<SCEV>, Arc<SCEV>),
+    /// Truncate
+    Truncate(Arc<SCEV>, u32),
+    /// Zero extend
+    ZeroExtend(Arc<SCEV>, u32),
+    /// Sign extend
+    SignExtend(Arc<SCEV>, u32),
+    /// Max expression
+    SMax(Vec<Arc<SCEV>>),
+    /// Min expression
+    SMin(Vec<Arc<SCEV>>),
+    /// Unsigned max
+    UMax(Vec<Arc<SCEV>>),
+    /// Unsigned min
+    UMin(Vec<Arc<SCEV>>),
+    /// Select expression
+    Select(Arc<SCEV>, Arc<SCEV>, Arc<SCEV>),
+    /// Pointer to member
+    PtrToInt(Arc<SCEV>),
+    /// Couldnt compute
+    CouldNotCompute,
+}
+
+/// Add recurrence expression: {start, +, step}<loop>
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AddRecExpr {
+    /// Starting value
+    pub start: Arc<SCEV>,
+    /// Step per iteration
+    pub step: Arc<SCEV>,
+    /// Loop ID
+    pub loop_id: u32,
+    /// Whether step is known to not wrap
+    pub no_wrap: WrapFlags,
+}
+
+/// Wrap flags for recurrences
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WrapFlags {
+    /// No unsigned wrap
+    pub nuw: bool,
+    /// No signed wrap
+    pub nsw: bool,
+}
+
+impl WrapFlags {
+    pub fn none() -> Self {
+        WrapFlags { nuw: false, nsw: false }
+    }
+    
+    pub fn all() -> Self {
+        WrapFlags { nuw: true, nsw: true }
+    }
+}
+
+impl SCEV {
+    /// Create constant SCEV
+    pub fn constant(value: i64) -> Arc<SCEV> {
+        Arc::new(SCEV::Constant(value))
+    }
+    
+    /// Create unknown SCEV
+    pub fn unknown(name: impl Into<String>) -> Arc<SCEV> {
+        Arc::new(SCEV::Unknown(name.into()))
+    }
+    
+    /// Create add recurrence
+    pub fn add_rec(start: Arc<SCEV>, step: Arc<SCEV>, loop_id: u32) -> Arc<SCEV> {
+        Arc::new(SCEV::AddRec(AddRecExpr {
+            start,
+            step,
+            loop_id,
+            no_wrap: WrapFlags::none(),
+        }))
+    }
+    
+    /// Create addition
+    pub fn add(operands: Vec<Arc<SCEV>>) -> Arc<SCEV> {
+        // Simplify: collect constants
+        let mut constant = 0i64;
+        let mut others = Vec::new();
+        
+        for op in operands {
+            match op.as_ref() {
+                SCEV::Constant(c) => constant = constant.wrapping_add(*c),
+                SCEV::Add(ops) => others.extend(ops.iter().cloned()),
+                _ => others.push(op),
+            }
+        }
+        
+        if constant != 0 {
+            others.push(SCEV::constant(constant));
+        }
+        
+        match others.len() {
+            0 => SCEV::constant(0),
+            1 => others.pop().unwrap(),
+            _ => Arc::new(SCEV::Add(others)),
+        }
+    }
+    
+    /// Create multiplication
+    pub fn mul(operands: Vec<Arc<SCEV>>) -> Arc<SCEV> {
+        // Simplify: collect constants
+        let mut constant = 1i64;
+        let mut others = Vec::new();
+        
+        for op in operands {
+            match op.as_ref() {
+                SCEV::Constant(0) => return SCEV::constant(0),
+                SCEV::Constant(c) => constant = constant.wrapping_mul(*c),
+                SCEV::Mul(ops) => others.extend(ops.iter().cloned()),
+                _ => others.push(op),
+            }
+        }
+        
+        if constant != 1 {
+            others.insert(0, SCEV::constant(constant));
+        }
+        
+        match others.len() {
+            0 => SCEV::constant(1),
+            1 => others.pop().unwrap(),
+            _ => Arc::new(SCEV::Mul(others)),
+        }
+    }
+    
+    /// Check if this is a constant
+    pub fn is_constant(&self) -> bool {
+        matches!(self, SCEV::Constant(_))
+    }
+    
+    /// Get constant value if this is a constant
+    pub fn get_constant(&self) -> Option<i64> {
+        if let SCEV::Constant(c) = self {
+            Some(*c)
+        } else {
+            None
+        }
+    }
+    
+    /// Check if this is an add recurrence
+    pub fn is_add_rec(&self) -> bool {
+        matches!(self, SCEV::AddRec(_))
+    }
+    
+    /// Get add recurrence if this is one
+    pub fn get_add_rec(&self) -> Option<&AddRecExpr> {
+        if let SCEV::AddRec(rec) = self {
+            Some(rec)
+        } else {
+            None
+        }
+    }
+    
+    /// Check if this SCEV is loop invariant
+    pub fn is_loop_invariant(&self, loop_id: u32) -> bool {
+        match self {
+            SCEV::Constant(_) | SCEV::Unknown(_) | SCEV::CouldNotCompute => true,
+            SCEV::Invariant(_) => true,
+            SCEV::AddRec(rec) => rec.loop_id != loop_id,
+            SCEV::Add(ops) | SCEV::Mul(ops) | SCEV::SMax(ops) | 
+            SCEV::SMin(ops) | SCEV::UMax(ops) | SCEV::UMin(ops) => {
+                ops.iter().all(|op| op.is_loop_invariant(loop_id))
+            }
+            SCEV::SDiv(a, b) | SCEV::UDiv(a, b) => {
+                a.is_loop_invariant(loop_id) && b.is_loop_invariant(loop_id)
+            }
+            SCEV::Truncate(op, _) | SCEV::ZeroExtend(op, _) | 
+            SCEV::SignExtend(op, _) | SCEV::PtrToInt(op) => {
+                op.is_loop_invariant(loop_id)
+            }
+            SCEV::Select(cond, t, f) => {
+                cond.is_loop_invariant(loop_id) &&
+                t.is_loop_invariant(loop_id) &&
+                f.is_loop_invariant(loop_id)
+            }
+        }
+    }
+    
+    /// Evaluate SCEV at a given iteration
+    pub fn evaluate_at_iteration(&self, iteration: i64) -> Option<i64> {
+        match self {
+            SCEV::Constant(c) => Some(*c),
+            SCEV::AddRec(rec) => {
+                let start = rec.start.evaluate_at_iteration(0)?;
+                let step = rec.step.evaluate_at_iteration(0)?;
+                Some(start.wrapping_add(step.wrapping_mul(iteration)))
+            }
+            SCEV::Add(ops) => {
+                let mut sum = 0i64;
+                for op in ops {
+                    sum = sum.wrapping_add(op.evaluate_at_iteration(iteration)?);
+                }
+                Some(sum)
+            }
+            SCEV::Mul(ops) => {
+                let mut product = 1i64;
+                for op in ops {
+                    product = product.wrapping_mul(op.evaluate_at_iteration(iteration)?);
+                }
+                Some(product)
+            }
+            _ => None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCALAR EVOLUTION ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Scalar evolution analysis
+pub struct ScalarEvolution {
+    /// SCEV cache
+    cache: BTreeMap<String, Arc<SCEV>>,
+    /// Loop info
+    loops: BTreeMap<u32, LoopInfo>,
+    /// Trip counts
+    trip_counts: BTreeMap<u32, Arc<SCEV>>,
+    /// Backedge taken counts
+    backedge_counts: BTreeMap<u32, Arc<SCEV>>,
+}
+
+/// Loop information for SCEV
+#[derive(Debug, Clone)]
+pub struct LoopInfo {
+    /// Loop header block
+    pub header: u32,
+    /// Loop blocks
+    pub blocks: BTreeSet<u32>,
+    /// Back edges
+    pub back_edges: Vec<u32>,
+    /// Exit blocks
+    pub exit_blocks: Vec<u32>,
+    /// Exit conditions
+    pub exit_conditions: Vec<ExitCondition>,
+    /// Parent loop
+    pub parent: Option<u32>,
+}
+
+/// Loop exit condition
+#[derive(Debug, Clone)]
+pub struct ExitCondition {
+    /// Exiting block
+    pub block: u32,
+    /// LHS of comparison
+    pub lhs: Arc<SCEV>,
+    /// RHS of comparison
+    pub rhs: Arc<SCEV>,
+    /// Comparison predicate
+    pub predicate: Predicate,
+}
+
+/// Comparison predicate
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Predicate {
+    EQ,  // ==
+    NE,  // !=
+    SLT, // <  (signed)
+    SLE, // <= (signed)
+    SGT, // >  (signed)
+    SGE, // >= (signed)
+    ULT, // <  (unsigned)
+    ULE, // <= (unsigned)
+    UGT, // >  (unsigned)
+    UGE, // >= (unsigned)
+}
+
+impl Predicate {
+    /// Negate predicate
+    pub fn negate(&self) -> Self {
+        match self {
+            Predicate::EQ => Predicate::NE,
+            Predicate::NE => Predicate::EQ,
+            Predicate::SLT => Predicate::SGE,
+            Predicate::SLE => Predicate::SGT,
+            Predicate::SGT => Predicate::SLE,
+            Predicate::SGE => Predicate::SLT,
+            Predicate::ULT => Predicate::UGE,
+            Predicate::ULE => Predicate::UGT,
+            Predicate::UGT => Predicate::ULE,
+            Predicate::UGE => Predicate::ULT,
+        }
+    }
+    
+    /// Swap operands (swap LHS and RHS)
+    pub fn swap(&self) -> Self {
+        match self {
+            Predicate::EQ => Predicate::EQ,
+            Predicate::NE => Predicate::NE,
+            Predicate::SLT => Predicate::SGT,
+            Predicate::SLE => Predicate::SGE,
+            Predicate::SGT => Predicate::SLT,
+            Predicate::SGE => Predicate::SLE,
+            Predicate::ULT => Predicate::UGT,
+            Predicate::ULE => Predicate::UGE,
+            Predicate::UGT => Predicate::ULT,
+            Predicate::UGE => Predicate::ULE,
+        }
+    }
+}
+
+impl ScalarEvolution {
+    pub fn new() -> Self {
+        ScalarEvolution {
+            cache: BTreeMap::new(),
+            loops: BTreeMap::new(),
+            trip_counts: BTreeMap::new(),
+            backedge_counts: BTreeMap::new(),
+        }
+    }
+    
+    /// Analyze a function
+    pub fn analyze(&mut self, func: &MirFunction) {
+        // Detect loops
+        self.detect_loops(func);
+        
+        // Compute SCEV for all variables
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                self.analyze_statement(stmt, block.id, func);
+            }
+        }
+        
+        // Compute trip counts
+        for &loop_id in self.loops.keys().cloned().collect::<Vec<_>>().iter() {
+            self.compute_trip_count(loop_id, func);
+        }
+    }
+    
+    fn detect_loops(&mut self, func: &MirFunction) {
+        // Simple loop detection using back edges
+        let dominators = self.compute_dominators(func);
+        
+        for block in &func.blocks {
+            for succ in self.get_successors(block) {
+                // Back edge: succ dominates block
+                if self.dominates(&dominators, succ, block.id) {
+                    // Found loop with header = succ
+                    let loop_blocks = self.find_loop_blocks(func, block.id, succ);
+                    
+                    let loop_info = LoopInfo {
+                        header: succ,
+                        blocks: loop_blocks.clone(),
+                        back_edges: vec![block.id],
+                        exit_blocks: self.find_exit_blocks(func, &loop_blocks),
+                        exit_conditions: Vec::new(),
+                        parent: None,
+                    };
+                    
+                    self.loops.insert(succ, loop_info);
+                }
+            }
+        }
+    }
+    
+    fn compute_dominators(&self, func: &MirFunction) -> BTreeMap<u32, BTreeSet<u32>> {
+        let mut doms: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        let all_blocks: BTreeSet<u32> = func.blocks.iter().map(|b| b.id).collect();
+        
+        for block in &func.blocks {
+            doms.insert(block.id, all_blocks.clone());
+        }
+        
+        if let Some(entry) = func.blocks.first() {
+            doms.insert(entry.id, [entry.id].into_iter().collect());
+        }
+        
+        let mut changed = true;
+        while changed {
+            changed = false;
+            
+            for block in &func.blocks {
+                let preds = self.get_predecessors(func, block.id);
+                
+                if preds.is_empty() {
+                    continue;
+                }
+                
+                let mut new_doms: Option<BTreeSet<u32>> = None;
+                
+                for pred in preds {
+                    if let Some(pred_doms) = doms.get(&pred) {
+                        match &mut new_doms {
+                            None => new_doms = Some(pred_doms.clone()),
+                            Some(d) => {
+                                *d = d.intersection(pred_doms).copied().collect();
+                            }
+                        }
+                    }
+                }
+                
+                if let Some(mut new) = new_doms {
+                    new.insert(block.id);
+                    
+                    if doms.get(&block.id) != Some(&new) {
+                        doms.insert(block.id, new);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        
+        doms
+    }
+    
+    fn dominates(&self, doms: &BTreeMap<u32, BTreeSet<u32>>, a: u32, b: u32) -> bool {
+        doms.get(&b).map(|d| d.contains(&a)).unwrap_or(false)
+    }
+    
+    fn find_loop_blocks(&self, func: &MirFunction, latch: u32, header: u32) -> BTreeSet<u32> {
+        let mut blocks = BTreeSet::new();
+        blocks.insert(header);
+        
+        if latch == header {
+            return blocks;
+        }
+        
+        let mut worklist = vec![latch];
+        blocks.insert(latch);
+        
+        while let Some(block) = worklist.pop() {
+            for pred in self.get_predecessors(func, block) {
+                if !blocks.contains(&pred) {
+                    blocks.insert(pred);
+                    worklist.push(pred);
+                }
+            }
+        }
+        
+        blocks
+    }
+    
+    fn find_exit_blocks(&self, func: &MirFunction, loop_blocks: &BTreeSet<u32>) -> Vec<u32> {
+        let mut exits = Vec::new();
+        
+        for block in &func.blocks {
+            if loop_blocks.contains(&block.id) {
+                for succ in self.get_successors(block) {
+                    if !loop_blocks.contains(&succ) && !exits.contains(&succ) {
+                        exits.push(succ);
+                    }
+                }
+            }
+        }
+        
+        exits
+    }
+    
+    fn get_predecessors(&self, func: &MirFunction, block_id: u32) -> Vec<u32> {
+        let mut preds = Vec::new();
+        
+        for block in &func.blocks {
+            if self.get_successors(block).contains(&block_id) {
+                preds.push(block.id);
+            }
+        }
+        
+        preds
+    }
+    
+    fn get_successors(&self, block: &MirBlock) -> Vec<u32> {
+        match &block.terminator {
+            MirTerminator::Goto(target) => vec![*target],
+            MirTerminator::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+            MirTerminator::Switch { targets, default, .. } => {
+                let mut succs: Vec<_> = targets.iter().map(|(_, t)| *t).collect();
+                succs.push(*default);
+                succs
+            }
+            _ => vec![],
+        }
+    }
+    
+    fn analyze_statement(&mut self, stmt: &MirStatement, block_id: u32, func: &MirFunction) {
+        match stmt {
+            MirStatement::Assign { dest, value } => {
+                let scev = self.analyze_operand(value, block_id, func);
+                self.cache.insert(dest.clone(), scev);
+            }
+            MirStatement::BinaryOp { dest, op, lhs, rhs } => {
+                let lhs_scev = self.analyze_operand(lhs, block_id, func);
+                let rhs_scev = self.analyze_operand(rhs, block_id, func);
+                
+                let scev = match op {
+                    BinOp::Add => SCEV::add(vec![lhs_scev, rhs_scev]),
+                    BinOp::Sub => {
+                        let neg_rhs = SCEV::mul(vec![SCEV::constant(-1), rhs_scev]);
+                        SCEV::add(vec![lhs_scev, neg_rhs])
+                    }
+                    BinOp::Mul => SCEV::mul(vec![lhs_scev, rhs_scev]),
+                    BinOp::Div => Arc::new(SCEV::SDiv(lhs_scev, rhs_scev)),
+                    _ => SCEV::unknown(dest),
+                };
+                
+                self.cache.insert(dest.clone(), scev);
+            }
+            MirStatement::Phi { dest, incoming } => {
+                // Check if this is a loop phi
+                if let Some(loop_id) = self.get_loop_for_header(block_id) {
+                    let scev = self.analyze_phi(dest, incoming, loop_id, func);
+                    self.cache.insert(dest.clone(), scev);
+                } else {
+                    self.cache.insert(dest.clone(), SCEV::unknown(dest));
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    fn analyze_operand(&self, operand: &MirOperand, block_id: u32, func: &MirFunction) -> Arc<SCEV> {
+        match operand {
+            MirOperand::Constant(c) => SCEV::constant(*c),
+            MirOperand::Variable(name) => {
+                self.cache.get(name).cloned().unwrap_or_else(|| SCEV::unknown(name))
+            }
+        }
+    }
+    
+    fn analyze_phi(&mut self, dest: &str, incoming: &[(u32, MirOperand)], loop_id: u32, func: &MirFunction) -> Arc<SCEV> {
+        let loop_info = match self.loops.get(&loop_id) {
+            Some(l) => l.clone(),
+            None => return SCEV::unknown(dest),
+        };
+        
+        // Separate preheader value from backedge value
+        let mut preheader_val: Option<Arc<SCEV>> = None;
+        let mut backedge_val: Option<Arc<SCEV>> = None;
+        
+        for (pred, val) in incoming {
+            if loop_info.back_edges.contains(pred) {
+                backedge_val = Some(self.analyze_operand(val, *pred, func));
+            } else {
+                preheader_val = Some(self.analyze_operand(val, *pred, func));
+            }
+        }
+        
+        let start = preheader_val.unwrap_or_else(|| SCEV::constant(0));
+        
+        // Try to extract step from backedge value
+        if let Some(backedge) = backedge_val {
+            if let Some(step) = self.extract_step(&start, &backedge, dest) {
+                return SCEV::add_rec(start, step, loop_id);
+            }
+        }
+        
+        SCEV::unknown(dest)
+    }
+    
+    fn extract_step(&self, start: &Arc<SCEV>, backedge: &Arc<SCEV>, phi_name: &str) -> Option<Arc<SCEV>> {
+        // Look for pattern: phi + step
+        if let SCEV::Add(ops) = backedge.as_ref() {
+            for (i, op) in ops.iter().enumerate() {
+                if let SCEV::Unknown(name) = op.as_ref() {
+                    if name == phi_name {
+                        // Found the phi reference, step is the rest
+                        let mut step_ops: Vec<_> = ops.iter()
+                            .enumerate()
+                            .filter(|(j, _)| *j != i)
+                            .map(|(_, o)| o.clone())
+                            .collect();
+                        
+                        return Some(if step_ops.len() == 1 {
+                            step_ops.pop().unwrap()
+                        } else {
+                            SCEV::add(step_ops)
+                        });
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn get_loop_for_header(&self, block_id: u32) -> Option<u32> {
+        for (&loop_id, info) in &self.loops {
+            if info.header == block_id {
+                return Some(loop_id);
+            }
+        }
+        None
+    }
+    
+    fn compute_trip_count(&mut self, loop_id: u32, func: &MirFunction) {
+        let loop_info = match self.loops.get(&loop_id) {
+            Some(l) => l.clone(),
+            None => return,
+        };
+        
+        // Find exit condition
+        for block in &func.blocks {
+            if !loop_info.blocks.contains(&block.id) {
+                continue;
+            }
+            
+            if let MirTerminator::Branch { cond, then_bb, else_bb } = &block.terminator {
+                let exits_loop = !loop_info.blocks.contains(then_bb) || 
+                                !loop_info.blocks.contains(else_bb);
+                
+                if exits_loop {
+                    if let Some(trip_count) = self.compute_exit_count(cond, then_bb, else_bb, &loop_info, func) {
+                        self.trip_counts.insert(loop_id, trip_count);
+                        return;
+                    }
+                }
+            }
+        }
+        
+        self.trip_counts.insert(loop_id, Arc::new(SCEV::CouldNotCompute));
+    }
+    
+    fn compute_exit_count(
+        &self,
+        cond: &MirOperand,
+        then_bb: &u32,
+        else_bb: &u32,
+        loop_info: &LoopInfo,
+        func: &MirFunction,
+    ) -> Option<Arc<SCEV>> {
+        // Try to find comparison in the condition
+        // This is simplified - real implementation would trace the condition
+        
+        // For now, just return unknown
+        None
+    }
+    
+    /// Get SCEV for a variable
+    pub fn get_scev(&self, var: &str) -> Option<Arc<SCEV>> {
+        self.cache.get(var).cloned()
+    }
+    
+    /// Get trip count for a loop
+    pub fn get_trip_count(&self, loop_id: u32) -> Option<Arc<SCEV>> {
+        self.trip_counts.get(&loop_id).cloned()
+    }
+    
+    /// Get constant trip count if known
+    pub fn get_constant_trip_count(&self, loop_id: u32) -> Option<u64> {
+        self.get_trip_count(loop_id)
+            .and_then(|tc| tc.get_constant())
+            .map(|c| c as u64)
+    }
+    
+    /// Check if a SCEV is affine (linear in loop iteration)
+    pub fn is_affine(&self, scev: &SCEV) -> bool {
+        match scev {
+            SCEV::Constant(_) | SCEV::Invariant(_) => true,
+            SCEV::AddRec(rec) => rec.step.is_constant(),
+            SCEV::Add(ops) => ops.iter().all(|op| self.is_affine(op)),
+            SCEV::Mul(ops) => {
+                let affine_count = ops.iter().filter(|op| self.is_affine(op)).count();
+                let constant_count = ops.iter().filter(|op| op.is_constant()).count();
+                affine_count == ops.len() && (affine_count - constant_count) <= 1
+            }
+            _ => false,
+        }
+    }
+    
+    /// Get the step of an affine SCEV
+    pub fn get_step(&self, scev: &SCEV, loop_id: u32) -> Option<Arc<SCEV>> {
+        match scev {
+            SCEV::Constant(_) | SCEV::Invariant(_) => Some(SCEV::constant(0)),
+            SCEV::AddRec(rec) if rec.loop_id == loop_id => Some(rec.step.clone()),
+            SCEV::Add(ops) => {
+                let steps: Vec<_> = ops.iter()
+                    .filter_map(|op| self.get_step(op, loop_id))
+                    .collect();
+                
+                if steps.len() == ops.len() {
+                    Some(SCEV::add(steps))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Default for ScalarEvolution {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Nop,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+impl MirOperand {
+    pub fn is_var(&self, name: &str) -> bool {
+        matches!(self, MirOperand::Variable(n) if n == name)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Shl, Shr,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Switch { value: MirOperand, targets: Vec<(i64, u32)>, default: u32 },
+    Return { value: Option<MirOperand> },
+    Unreachable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_scev_constant() {
+        let scev = SCEV::constant(42);
+        assert!(scev.is_constant());
+        assert_eq!(scev.get_constant(), Some(42));
+    }
+    
+    #[test]
+    fn test_scev_add() {
+        let a = SCEV::constant(10);
+        let b = SCEV::constant(20);
+        let sum = SCEV::add(vec![a, b]);
+        
+        assert!(sum.is_constant());
+        assert_eq!(sum.get_constant(), Some(30));
+    }
+    
+    #[test]
+    fn test_scev_add_rec() {
+        let start = SCEV::constant(0);
+        let step = SCEV::constant(1);
+        let rec = SCEV::add_rec(start, step, 0);
+        
+        assert!(rec.is_add_rec());
+        
+        // Evaluate at different iterations
+        assert_eq!(rec.evaluate_at_iteration(0), Some(0));
+        assert_eq!(rec.evaluate_at_iteration(5), Some(5));
+        assert_eq!(rec.evaluate_at_iteration(100), Some(100));
+    }
+    
+    #[test]
+    fn test_scev_loop_invariant() {
+        let constant = SCEV::constant(42);
+        assert!(constant.is_loop_invariant(0));
+        
+        let rec = SCEV::add_rec(SCEV::constant(0), SCEV::constant(1), 0);
+        assert!(!rec.is_loop_invariant(0));
+        assert!(rec.is_loop_invariant(1)); // Different loop
+    }
+    
+    #[test]
+    fn test_predicate_negate() {
+        assert_eq!(Predicate::SLT.negate(), Predicate::SGE);
+        assert_eq!(Predicate::EQ.negate(), Predicate::NE);
+    }
+    
+    #[test]
+    fn test_predicate_swap() {
+        assert_eq!(Predicate::SLT.swap(), Predicate::SGT);
+        assert_eq!(Predicate::EQ.swap(), Predicate::EQ);
+    }
+}

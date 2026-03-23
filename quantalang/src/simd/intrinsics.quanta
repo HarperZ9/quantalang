@@ -1,0 +1,890 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ SIMD — Intrinsics and Vectorization
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// SIMD (Single Instruction Multiple Data) support:
+// - x86 SSE/SSE2/SSE3/SSSE3/SSE4.1/SSE4.2/AVX/AVX2/AVX-512
+// - ARM NEON/SVE/SVE2
+// - WASM SIMD128
+// - Platform-agnostic vector types
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::simd::intrinsics
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::format;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIMD FEATURE DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// CPU SIMD features
+#[derive(Debug, Clone, Default)]
+pub struct SimdFeatures {
+    // x86/x86_64
+    pub sse: bool,
+    pub sse2: bool,
+    pub sse3: bool,
+    pub ssse3: bool,
+    pub sse4_1: bool,
+    pub sse4_2: bool,
+    pub avx: bool,
+    pub avx2: bool,
+    pub avx512f: bool,
+    pub avx512bw: bool,
+    pub avx512cd: bool,
+    pub avx512dq: bool,
+    pub avx512vl: bool,
+    pub fma: bool,
+    pub bmi1: bool,
+    pub bmi2: bool,
+    pub popcnt: bool,
+    pub lzcnt: bool,
+    
+    // ARM
+    pub neon: bool,
+    pub sve: bool,
+    pub sve2: bool,
+    
+    // WASM
+    pub simd128: bool,
+}
+
+impl SimdFeatures {
+    /// Detect CPU features at runtime
+    #[cfg(target_arch = "x86_64")]
+    pub fn detect() -> Self {
+        let mut features = SimdFeatures::default();
+        
+        // CPUID leaf 1
+        unsafe {
+            let cpuid = core::arch::x86_64::__cpuid(1);
+            
+            features.sse = (cpuid.edx & (1 << 25)) != 0;
+            features.sse2 = (cpuid.edx & (1 << 26)) != 0;
+            features.sse3 = (cpuid.ecx & (1 << 0)) != 0;
+            features.ssse3 = (cpuid.ecx & (1 << 9)) != 0;
+            features.sse4_1 = (cpuid.ecx & (1 << 19)) != 0;
+            features.sse4_2 = (cpuid.ecx & (1 << 20)) != 0;
+            features.avx = (cpuid.ecx & (1 << 28)) != 0;
+            features.fma = (cpuid.ecx & (1 << 12)) != 0;
+            features.popcnt = (cpuid.ecx & (1 << 23)) != 0;
+        }
+        
+        // CPUID leaf 7
+        unsafe {
+            let cpuid = core::arch::x86_64::__cpuid_count(7, 0);
+            
+            features.avx2 = (cpuid.ebx & (1 << 5)) != 0;
+            features.bmi1 = (cpuid.ebx & (1 << 3)) != 0;
+            features.bmi2 = (cpuid.ebx & (1 << 8)) != 0;
+            features.avx512f = (cpuid.ebx & (1 << 16)) != 0;
+            features.avx512bw = (cpuid.ebx & (1 << 30)) != 0;
+            features.avx512cd = (cpuid.ebx & (1 << 28)) != 0;
+            features.avx512dq = (cpuid.ebx & (1 << 17)) != 0;
+            features.avx512vl = (cpuid.ebx & (1 << 31)) != 0;
+        }
+        
+        features
+    }
+    
+    #[cfg(target_arch = "aarch64")]
+    pub fn detect() -> Self {
+        let mut features = SimdFeatures::default();
+        features.neon = true; // NEON is mandatory on AArch64
+        
+        // SVE detection via HWCAP
+        #[cfg(target_os = "linux")]
+        {
+            // Check /proc/cpuinfo or use getauxval
+            features.sve = std::fs::read_to_string("/proc/cpuinfo")
+                .map(|s| s.contains("sve"))
+                .unwrap_or(false);
+        }
+        
+        features
+    }
+    
+    #[cfg(target_arch = "wasm32")]
+    pub fn detect() -> Self {
+        SimdFeatures {
+            simd128: true, // Assume SIMD support in modern browsers
+            ..Default::default()
+        }
+    }
+    
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "wasm32")))]
+    pub fn detect() -> Self {
+        SimdFeatures::default()
+    }
+    
+    /// Best available vector width (bits)
+    pub fn best_vector_width(&self) -> u32 {
+        if self.avx512f { 512 }
+        else if self.avx || self.avx2 { 256 }
+        else if self.sse2 || self.neon || self.simd128 { 128 }
+        else { 64 }
+    }
+    
+    /// Best SIMD level
+    pub fn best_level(&self) -> SimdLevel {
+        if self.avx512f { SimdLevel::Avx512 }
+        else if self.avx2 { SimdLevel::Avx2 }
+        else if self.avx { SimdLevel::Avx }
+        else if self.sse4_2 { SimdLevel::Sse42 }
+        else if self.sse4_1 { SimdLevel::Sse41 }
+        else if self.ssse3 { SimdLevel::Ssse3 }
+        else if self.sse3 { SimdLevel::Sse3 }
+        else if self.sse2 { SimdLevel::Sse2 }
+        else if self.neon { SimdLevel::Neon }
+        else if self.sve { SimdLevel::Sve }
+        else if self.simd128 { SimdLevel::Simd128 }
+        else { SimdLevel::Scalar }
+    }
+}
+
+/// SIMD instruction set level
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SimdLevel {
+    Scalar,
+    Sse2,
+    Sse3,
+    Ssse3,
+    Sse41,
+    Sse42,
+    Avx,
+    Avx2,
+    Avx512,
+    Neon,
+    Sve,
+    Sve2,
+    Simd128,
+}
+
+impl SimdLevel {
+    pub fn vector_width(&self) -> u32 {
+        match self {
+            SimdLevel::Scalar => 64,
+            SimdLevel::Sse2 | SimdLevel::Sse3 | SimdLevel::Ssse3 |
+            SimdLevel::Sse41 | SimdLevel::Sse42 | SimdLevel::Neon |
+            SimdLevel::Simd128 => 128,
+            SimdLevel::Avx | SimdLevel::Avx2 => 256,
+            SimdLevel::Avx512 | SimdLevel::Sve | SimdLevel::Sve2 => 512,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VECTOR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 128-bit vector types
+pub mod v128 {
+    /// 4 x f32
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct f32x4(pub [f32; 4]);
+    
+    /// 2 x f64
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct f64x2(pub [f64; 2]);
+    
+    /// 4 x i32
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct i32x4(pub [i32; 4]);
+    
+    /// 4 x u32
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct u32x4(pub [u32; 4]);
+    
+    /// 8 x i16
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct i16x8(pub [i16; 8]);
+    
+    /// 8 x u16
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct u16x8(pub [u16; 8]);
+    
+    /// 16 x i8
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct i8x16(pub [i8; 16]);
+    
+    /// 16 x u8
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct u8x16(pub [u8; 16]);
+    
+    /// 2 x i64
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct i64x2(pub [i64; 2]);
+    
+    /// 2 x u64
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct u64x2(pub [u64; 2]);
+    
+    impl f32x4 {
+        pub const fn new(a: f32, b: f32, c: f32, d: f32) -> Self {
+            f32x4([a, b, c, d])
+        }
+        
+        pub const fn splat(v: f32) -> Self {
+            f32x4([v, v, v, v])
+        }
+        
+        pub const fn zero() -> Self {
+            f32x4([0.0, 0.0, 0.0, 0.0])
+        }
+    }
+    
+    impl i32x4 {
+        pub const fn new(a: i32, b: i32, c: i32, d: i32) -> Self {
+            i32x4([a, b, c, d])
+        }
+        
+        pub const fn splat(v: i32) -> Self {
+            i32x4([v, v, v, v])
+        }
+        
+        pub const fn zero() -> Self {
+            i32x4([0, 0, 0, 0])
+        }
+    }
+}
+
+/// 256-bit vector types
+pub mod v256 {
+    /// 8 x f32
+    #[repr(C, align(32))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct f32x8(pub [f32; 8]);
+    
+    /// 4 x f64
+    #[repr(C, align(32))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct f64x4(pub [f64; 4]);
+    
+    /// 8 x i32
+    #[repr(C, align(32))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct i32x8(pub [i32; 8]);
+    
+    /// 8 x u32
+    #[repr(C, align(32))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct u32x8(pub [u32; 8]);
+    
+    /// 4 x i64
+    #[repr(C, align(32))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct i64x4(pub [i64; 4]);
+    
+    /// 4 x u64
+    #[repr(C, align(32))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct u64x4(pub [u64; 4]);
+    
+    impl f32x8 {
+        pub const fn splat(v: f32) -> Self {
+            f32x8([v, v, v, v, v, v, v, v])
+        }
+        
+        pub const fn zero() -> Self {
+            f32x8([0.0; 8])
+        }
+    }
+}
+
+/// 512-bit vector types
+pub mod v512 {
+    /// 16 x f32
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct f32x16(pub [f32; 16]);
+    
+    /// 8 x f64
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct f64x8(pub [f64; 8]);
+    
+    /// 16 x i32
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct i32x16(pub [i32; 16]);
+    
+    /// 16 x u32
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct u32x16(pub [u32; 16]);
+    
+    /// 8 x i64
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct i64x8(pub [i64; 8]);
+    
+    /// 8 x u64
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy, Debug)]
+    pub struct u64x8(pub [u64; 8]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIMD OPERATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SIMD operation category
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimdOp {
+    // Arithmetic
+    Add, Sub, Mul, Div,
+    FmaAdd,  // a * b + c
+    FmaSub,  // a * b - c
+    FnmaAdd, // -a * b + c
+    Min, Max,
+    Abs, Neg,
+    Sqrt, Rsqrt, Rcp,
+    
+    // Comparison
+    CmpEq, CmpNe,
+    CmpLt, CmpLe, CmpGt, CmpGe,
+    
+    // Bitwise
+    And, Or, Xor, AndNot,
+    Shl, Shr, Sar,
+    
+    // Shuffle/Permute
+    Shuffle, Permute,
+    Blend, Select,
+    
+    // Horizontal
+    HAdd, HSub,
+    Reduce,
+    
+    // Conversion
+    CvtF32ToI32, CvtI32ToF32,
+    CvtF64ToF32, CvtF32ToF64,
+    
+    // Load/Store
+    Load, LoadAligned, LoadUnaligned,
+    Store, StoreAligned, StoreUnaligned,
+    Gather, Scatter,
+    
+    // Broadcast
+    Broadcast, Splat,
+    
+    // Extract/Insert
+    Extract, Insert,
+    
+    // Pack/Unpack
+    PackLo, PackHi,
+    UnpackLo, UnpackHi,
+}
+
+/// SIMD intrinsic descriptor
+#[derive(Debug, Clone)]
+pub struct SimdIntrinsic {
+    /// Operation
+    pub op: SimdOp,
+    
+    /// Vector element type
+    pub elem_type: SimdElemType,
+    
+    /// Vector width (bits)
+    pub width: u32,
+    
+    /// Required SIMD level
+    pub min_level: SimdLevel,
+    
+    /// x86 intrinsic name
+    pub x86_name: Option<&'static str>,
+    
+    /// ARM intrinsic name
+    pub arm_name: Option<&'static str>,
+    
+    /// WASM intrinsic
+    pub wasm_name: Option<&'static str>,
+}
+
+/// SIMD element type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimdElemType {
+    I8, I16, I32, I64,
+    U8, U16, U32, U64,
+    F32, F64,
+}
+
+impl SimdElemType {
+    pub fn size_bits(&self) -> u32 {
+        match self {
+            SimdElemType::I8 | SimdElemType::U8 => 8,
+            SimdElemType::I16 | SimdElemType::U16 => 16,
+            SimdElemType::I32 | SimdElemType::U32 | SimdElemType::F32 => 32,
+            SimdElemType::I64 | SimdElemType::U64 | SimdElemType::F64 => 64,
+        }
+    }
+    
+    pub fn is_float(&self) -> bool {
+        matches!(self, SimdElemType::F32 | SimdElemType::F64)
+    }
+    
+    pub fn is_signed(&self) -> bool {
+        matches!(self, 
+            SimdElemType::I8 | SimdElemType::I16 | 
+            SimdElemType::I32 | SimdElemType::I64 |
+            SimdElemType::F32 | SimdElemType::F64
+        )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTRINSIC DATABASE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SIMD intrinsic registry
+pub struct SimdIntrinsicRegistry {
+    intrinsics: Vec<SimdIntrinsic>,
+}
+
+impl SimdIntrinsicRegistry {
+    pub fn new() -> Self {
+        let mut reg = SimdIntrinsicRegistry {
+            intrinsics: Vec::new(),
+        };
+        reg.register_sse2();
+        reg.register_avx();
+        reg.register_avx2();
+        reg.register_avx512();
+        reg.register_neon();
+        reg.register_wasm_simd();
+        reg
+    }
+    
+    fn register_sse2(&mut self) {
+        // f32x4 operations
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Add,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Sse2,
+            x86_name: Some("_mm_add_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Sub,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Sse2,
+            x86_name: Some("_mm_sub_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Mul,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Sse2,
+            x86_name: Some("_mm_mul_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Div,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Sse2,
+            x86_name: Some("_mm_div_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Min,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Sse2,
+            x86_name: Some("_mm_min_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Max,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Sse2,
+            x86_name: Some("_mm_max_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Sqrt,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Sse2,
+            x86_name: Some("_mm_sqrt_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        // Integer operations
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Add,
+            elem_type: SimdElemType::I32,
+            width: 128,
+            min_level: SimdLevel::Sse2,
+            x86_name: Some("_mm_add_epi32"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Sub,
+            elem_type: SimdElemType::I32,
+            width: 128,
+            min_level: SimdLevel::Sse2,
+            x86_name: Some("_mm_sub_epi32"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        // Load/store
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::LoadAligned,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Sse2,
+            x86_name: Some("_mm_load_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::LoadUnaligned,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Sse2,
+            x86_name: Some("_mm_loadu_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::StoreAligned,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Sse2,
+            x86_name: Some("_mm_store_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+    }
+    
+    fn register_avx(&mut self) {
+        // 256-bit f32 operations
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Add,
+            elem_type: SimdElemType::F32,
+            width: 256,
+            min_level: SimdLevel::Avx,
+            x86_name: Some("_mm256_add_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Mul,
+            elem_type: SimdElemType::F32,
+            width: 256,
+            min_level: SimdLevel::Avx,
+            x86_name: Some("_mm256_mul_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        // FMA
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::FmaAdd,
+            elem_type: SimdElemType::F32,
+            width: 256,
+            min_level: SimdLevel::Avx2, // Actually FMA, bundled with AVX2
+            x86_name: Some("_mm256_fmadd_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+    }
+    
+    fn register_avx2(&mut self) {
+        // 256-bit integer operations
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Add,
+            elem_type: SimdElemType::I32,
+            width: 256,
+            min_level: SimdLevel::Avx2,
+            x86_name: Some("_mm256_add_epi32"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Gather,
+            elem_type: SimdElemType::F32,
+            width: 256,
+            min_level: SimdLevel::Avx2,
+            x86_name: Some("_mm256_i32gather_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+    }
+    
+    fn register_avx512(&mut self) {
+        // 512-bit operations
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Add,
+            elem_type: SimdElemType::F32,
+            width: 512,
+            min_level: SimdLevel::Avx512,
+            x86_name: Some("_mm512_add_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::FmaAdd,
+            elem_type: SimdElemType::F32,
+            width: 512,
+            min_level: SimdLevel::Avx512,
+            x86_name: Some("_mm512_fmadd_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+        
+        // Masked operations
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Blend,
+            elem_type: SimdElemType::F32,
+            width: 512,
+            min_level: SimdLevel::Avx512,
+            x86_name: Some("_mm512_mask_blend_ps"),
+            arm_name: None,
+            wasm_name: None,
+        });
+    }
+    
+    fn register_neon(&mut self) {
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Add,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Neon,
+            x86_name: None,
+            arm_name: Some("vaddq_f32"),
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Mul,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Neon,
+            x86_name: None,
+            arm_name: Some("vmulq_f32"),
+            wasm_name: None,
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::FmaAdd,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Neon,
+            x86_name: None,
+            arm_name: Some("vfmaq_f32"),
+            wasm_name: None,
+        });
+    }
+    
+    fn register_wasm_simd(&mut self) {
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Add,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Simd128,
+            x86_name: None,
+            arm_name: None,
+            wasm_name: Some("f32x4.add"),
+        });
+        
+        self.intrinsics.push(SimdIntrinsic {
+            op: SimdOp::Mul,
+            elem_type: SimdElemType::F32,
+            width: 128,
+            min_level: SimdLevel::Simd128,
+            x86_name: None,
+            arm_name: None,
+            wasm_name: Some("f32x4.mul"),
+        });
+    }
+    
+    /// Find intrinsic for operation
+    pub fn find(
+        &self,
+        op: SimdOp,
+        elem_type: SimdElemType,
+        width: u32,
+        level: SimdLevel,
+    ) -> Option<&SimdIntrinsic> {
+        self.intrinsics.iter().find(|i| {
+            i.op == op && 
+            i.elem_type == elem_type && 
+            i.width == width && 
+            i.min_level <= level
+        })
+    }
+    
+    /// Get all intrinsics for a SIMD level
+    pub fn for_level(&self, level: SimdLevel) -> Vec<&SimdIntrinsic> {
+        self.intrinsics.iter()
+            .filter(|i| i.min_level <= level)
+            .collect()
+    }
+}
+
+impl Default for SimdIntrinsicRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIMD CODE GENERATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SIMD code generator
+pub struct SimdCodeGen {
+    target_level: SimdLevel,
+    target_arch: TargetArch,
+    registry: SimdIntrinsicRegistry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetArch {
+    X86_64,
+    Aarch64,
+    Wasm32,
+    Unknown,
+}
+
+impl SimdCodeGen {
+    pub fn new(target_arch: TargetArch, target_level: SimdLevel) -> Self {
+        SimdCodeGen {
+            target_level,
+            target_arch,
+            registry: SimdIntrinsicRegistry::new(),
+        }
+    }
+    
+    /// Generate intrinsic call code
+    pub fn gen_intrinsic(
+        &self,
+        op: SimdOp,
+        elem_type: SimdElemType,
+        width: u32,
+    ) -> Option<String> {
+        let intrinsic = self.registry.find(op, elem_type, width, self.target_level)?;
+        
+        match self.target_arch {
+            TargetArch::X86_64 => intrinsic.x86_name.map(|s| s.to_string()),
+            TargetArch::Aarch64 => intrinsic.arm_name.map(|s| s.to_string()),
+            TargetArch::Wasm32 => intrinsic.wasm_name.map(|s| s.to_string()),
+            TargetArch::Unknown => None,
+        }
+    }
+    
+    /// Best vector width for element type
+    pub fn best_width(&self, elem_type: SimdElemType) -> u32 {
+        let base_width = self.target_level.vector_width();
+        let elem_bits = elem_type.size_bits();
+        
+        // At least 2 elements per vector
+        base_width.max(elem_bits * 2)
+    }
+    
+    /// Elements per vector
+    pub fn elements_per_vector(&self, elem_type: SimdElemType) -> u32 {
+        self.best_width(elem_type) / elem_type.size_bits()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_simd_features_detect() {
+        let features = SimdFeatures::detect();
+        // At minimum, should detect something
+        let level = features.best_level();
+        println!("Detected SIMD level: {:?}", level);
+    }
+    
+    #[test]
+    fn test_vector_types() {
+        let v = v128::f32x4::new(1.0, 2.0, 3.0, 4.0);
+        assert_eq!(v.0[0], 1.0);
+        assert_eq!(v.0[3], 4.0);
+        
+        let splat = v128::f32x4::splat(5.0);
+        assert_eq!(splat.0[0], 5.0);
+        assert_eq!(splat.0[3], 5.0);
+    }
+    
+    #[test]
+    fn test_intrinsic_registry() {
+        let reg = SimdIntrinsicRegistry::new();
+        
+        let add_f32_128 = reg.find(SimdOp::Add, SimdElemType::F32, 128, SimdLevel::Sse2);
+        assert!(add_f32_128.is_some());
+        assert_eq!(add_f32_128.unwrap().x86_name, Some("_mm_add_ps"));
+        
+        let add_f32_256 = reg.find(SimdOp::Add, SimdElemType::F32, 256, SimdLevel::Avx);
+        assert!(add_f32_256.is_some());
+    }
+    
+    #[test]
+    fn test_elem_type() {
+        assert_eq!(SimdElemType::F32.size_bits(), 32);
+        assert_eq!(SimdElemType::I64.size_bits(), 64);
+        assert!(SimdElemType::F64.is_float());
+        assert!(!SimdElemType::U32.is_signed());
+    }
+    
+    #[test]
+    fn test_simd_codegen() {
+        let codegen = SimdCodeGen::new(TargetArch::X86_64, SimdLevel::Avx2);
+        
+        let intrinsic = codegen.gen_intrinsic(SimdOp::Add, SimdElemType::F32, 256);
+        assert_eq!(intrinsic, Some("_mm256_add_ps".to_string()));
+        
+        assert_eq!(codegen.elements_per_vector(SimdElemType::F32), 8);
+    }
+}

@@ -1,0 +1,1025 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ FORMAL VERIFICATION — Core Module
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Formal verification infrastructure:
+// - SMT solver integration (Z3, CVC5)
+// - Property specification language
+// - Invariant checking
+// - Proof generation and verification
+// - Symbolic execution
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # Formal Verification
+//!
+//! Formal verification for QuantaLang programs.
+//!
+//! ## Features
+//!
+//! - **SMT Integration**: Z3 and CVC5 solver backends
+//! - **Property Checking**: Pre/postconditions, invariants
+//! - **Symbolic Execution**: Path-sensitive analysis
+//! - **Proof Generation**: Machine-checkable proofs
+//!
+//! ## Verification Annotations
+//!
+//! ```quanta
+//! #[requires(x > 0)]
+//! #[ensures(result > x)]
+//! fn increment(x: i32) -> i32 {
+//!     x + 1
+//! }
+//!
+//! #[invariant(self.len <= self.capacity)]
+//! struct Vec<T> {
+//!     data: *mut T,
+//!     len: usize,
+//!     capacity: usize,
+//! }
+//! ```
+
+module quantalang::verification
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::collections::BTreeMap;
+use core::fmt;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMT SORTS (TYPES)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SMT sort (type)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Sort {
+    /// Boolean
+    Bool,
+    
+    /// Integers (unbounded)
+    Int,
+    
+    /// Real numbers
+    Real,
+    
+    /// Bitvectors
+    BitVec(u32),
+    
+    /// Arrays
+    Array { index: Box<Sort>, element: Box<Sort> },
+    
+    /// Uninterpreted sort
+    Uninterpreted(String),
+    
+    /// Datatype
+    Datatype(String),
+    
+    /// Function sort
+    Function { params: Vec<Sort>, result: Box<Sort> },
+}
+
+impl Sort {
+    pub fn bool() -> Self { Sort::Bool }
+    pub fn int() -> Self { Sort::Int }
+    pub fn real() -> Self { Sort::Real }
+    pub fn bv(width: u32) -> Self { Sort::BitVec(width) }
+    
+    pub fn array(index: Sort, element: Sort) -> Self {
+        Sort::Array {
+            index: Box::new(index),
+            element: Box::new(element),
+        }
+    }
+    
+    pub fn function(params: Vec<Sort>, result: Sort) -> Self {
+        Sort::Function {
+            params,
+            result: Box::new(result),
+        }
+    }
+}
+
+impl fmt::Display for Sort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Sort::Bool => write!(f, "Bool"),
+            Sort::Int => write!(f, "Int"),
+            Sort::Real => write!(f, "Real"),
+            Sort::BitVec(n) => write!(f, "(_ BitVec {})", n),
+            Sort::Array { index, element } => {
+                write!(f, "(Array {} {})", index, element)
+            }
+            Sort::Uninterpreted(name) => write!(f, "{}", name),
+            Sort::Datatype(name) => write!(f, "{}", name),
+            Sort::Function { params, result } => {
+                write!(f, "(")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 { write!(f, " ")?; }
+                    write!(f, "{}", p)?;
+                }
+                write!(f, ") {}", result)
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMT EXPRESSIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SMT expression
+#[derive(Debug, Clone)]
+pub enum Expr {
+    // Constants
+    BoolConst(bool),
+    IntConst(i64),
+    RealConst(f64),
+    BitVecConst { value: u64, width: u32 },
+    
+    // Variables
+    Var(String, Sort),
+    
+    // Boolean operations
+    Not(Box<Expr>),
+    And(Vec<Expr>),
+    Or(Vec<Expr>),
+    Implies(Box<Expr>, Box<Expr>),
+    Iff(Box<Expr>, Box<Expr>),
+    Ite(Box<Expr>, Box<Expr>, Box<Expr>), // if-then-else
+    
+    // Arithmetic
+    Neg(Box<Expr>),
+    Add(Vec<Expr>),
+    Sub(Box<Expr>, Box<Expr>),
+    Mul(Vec<Expr>),
+    Div(Box<Expr>, Box<Expr>),
+    Mod(Box<Expr>, Box<Expr>),
+    
+    // Comparison
+    Eq(Box<Expr>, Box<Expr>),
+    Ne(Box<Expr>, Box<Expr>),
+    Lt(Box<Expr>, Box<Expr>),
+    Le(Box<Expr>, Box<Expr>),
+    Gt(Box<Expr>, Box<Expr>),
+    Ge(Box<Expr>, Box<Expr>),
+    
+    // Bitvector operations
+    BvNot(Box<Expr>),
+    BvAnd(Box<Expr>, Box<Expr>),
+    BvOr(Box<Expr>, Box<Expr>),
+    BvXor(Box<Expr>, Box<Expr>),
+    BvAdd(Box<Expr>, Box<Expr>),
+    BvSub(Box<Expr>, Box<Expr>),
+    BvMul(Box<Expr>, Box<Expr>),
+    BvUDiv(Box<Expr>, Box<Expr>),
+    BvSDiv(Box<Expr>, Box<Expr>),
+    BvShl(Box<Expr>, Box<Expr>),
+    BvLShr(Box<Expr>, Box<Expr>),
+    BvAShr(Box<Expr>, Box<Expr>),
+    BvULt(Box<Expr>, Box<Expr>),
+    BvSLt(Box<Expr>, Box<Expr>),
+    BvExtract { high: u32, low: u32, expr: Box<Expr> },
+    BvConcat(Box<Expr>, Box<Expr>),
+    BvZeroExt(u32, Box<Expr>),
+    BvSignExt(u32, Box<Expr>),
+    
+    // Array operations
+    Select(Box<Expr>, Box<Expr>),
+    Store(Box<Expr>, Box<Expr>, Box<Expr>),
+    
+    // Quantifiers
+    Forall(Vec<(String, Sort)>, Box<Expr>),
+    Exists(Vec<(String, Sort)>, Box<Expr>),
+    
+    // Function application
+    Apply(String, Vec<Expr>),
+    
+    // Let binding
+    Let(Vec<(String, Expr)>, Box<Expr>),
+}
+
+impl Expr {
+    // Constructors
+    pub fn bool_const(b: bool) -> Self { Expr::BoolConst(b) }
+    pub fn int_const(n: i64) -> Self { Expr::IntConst(n) }
+    pub fn real_const(r: f64) -> Self { Expr::RealConst(r) }
+    pub fn bv_const(value: u64, width: u32) -> Self { 
+        Expr::BitVecConst { value, width } 
+    }
+    pub fn var(name: impl Into<String>, sort: Sort) -> Self {
+        Expr::Var(name.into(), sort)
+    }
+    
+    // Boolean operations
+    pub fn not(self) -> Self { Expr::Not(Box::new(self)) }
+    pub fn and(exprs: Vec<Expr>) -> Self { Expr::And(exprs) }
+    pub fn or(exprs: Vec<Expr>) -> Self { Expr::Or(exprs) }
+    pub fn implies(self, other: Expr) -> Self {
+        Expr::Implies(Box::new(self), Box::new(other))
+    }
+    pub fn iff(self, other: Expr) -> Self {
+        Expr::Iff(Box::new(self), Box::new(other))
+    }
+    pub fn ite(cond: Expr, then_: Expr, else_: Expr) -> Self {
+        Expr::Ite(Box::new(cond), Box::new(then_), Box::new(else_))
+    }
+    
+    // Arithmetic
+    pub fn neg(self) -> Self { Expr::Neg(Box::new(self)) }
+    pub fn add(exprs: Vec<Expr>) -> Self { Expr::Add(exprs) }
+    pub fn sub(self, other: Expr) -> Self {
+        Expr::Sub(Box::new(self), Box::new(other))
+    }
+    pub fn mul(exprs: Vec<Expr>) -> Self { Expr::Mul(exprs) }
+    pub fn div(self, other: Expr) -> Self {
+        Expr::Div(Box::new(self), Box::new(other))
+    }
+    
+    // Comparison
+    pub fn eq(self, other: Expr) -> Self {
+        Expr::Eq(Box::new(self), Box::new(other))
+    }
+    pub fn ne(self, other: Expr) -> Self {
+        Expr::Ne(Box::new(self), Box::new(other))
+    }
+    pub fn lt(self, other: Expr) -> Self {
+        Expr::Lt(Box::new(self), Box::new(other))
+    }
+    pub fn le(self, other: Expr) -> Self {
+        Expr::Le(Box::new(self), Box::new(other))
+    }
+    pub fn gt(self, other: Expr) -> Self {
+        Expr::Gt(Box::new(self), Box::new(other))
+    }
+    pub fn ge(self, other: Expr) -> Self {
+        Expr::Ge(Box::new(self), Box::new(other))
+    }
+    
+    // Quantifiers
+    pub fn forall(vars: Vec<(String, Sort)>, body: Expr) -> Self {
+        Expr::Forall(vars, Box::new(body))
+    }
+    pub fn exists(vars: Vec<(String, Sort)>, body: Expr) -> Self {
+        Expr::Exists(vars, Box::new(body))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMT SOLVER INTERFACE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SMT solver result
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SolverResult {
+    Sat,
+    Unsat,
+    Unknown,
+    Timeout,
+    Error(String),
+}
+
+/// Model (satisfying assignment)
+#[derive(Debug, Clone)]
+pub struct Model {
+    assignments: BTreeMap<String, Value>,
+}
+
+impl Model {
+    pub fn new() -> Self {
+        Model { assignments: BTreeMap::new() }
+    }
+    
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.assignments.get(name)
+    }
+    
+    pub fn set(&mut self, name: impl Into<String>, value: Value) {
+        self.assignments.insert(name.into(), value);
+    }
+    
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.assignments.iter()
+    }
+}
+
+impl Default for Model {
+    fn default() -> Self { Self::new() }
+}
+
+/// Value in model
+#[derive(Debug, Clone)]
+pub enum Value {
+    Bool(bool),
+    Int(i64),
+    Real(f64),
+    BitVec { value: u64, width: u32 },
+    Array(Box<Value>), // Default value
+}
+
+/// SMT solver trait
+pub trait Solver {
+    /// Push a new assertion scope
+    fn push(&mut self);
+    
+    /// Pop assertion scope
+    fn pop(&mut self);
+    
+    /// Declare a constant
+    fn declare_const(&mut self, name: &str, sort: &Sort);
+    
+    /// Declare a function
+    fn declare_fun(&mut self, name: &str, params: &[Sort], result: &Sort);
+    
+    /// Assert a formula
+    fn assert(&mut self, expr: &Expr);
+    
+    /// Check satisfiability
+    fn check(&mut self) -> SolverResult;
+    
+    /// Get model (if SAT)
+    fn get_model(&self) -> Option<Model>;
+    
+    /// Get unsat core (if UNSAT and enabled)
+    fn get_unsat_core(&self) -> Option<Vec<String>>;
+    
+    /// Set option
+    fn set_option(&mut self, name: &str, value: &str);
+    
+    /// Reset solver state
+    fn reset(&mut self);
+    
+    /// Get solver statistics
+    fn statistics(&self) -> SolverStats;
+}
+
+/// Solver statistics
+#[derive(Debug, Clone, Default)]
+pub struct SolverStats {
+    pub queries: u64,
+    pub sat_results: u64,
+    pub unsat_results: u64,
+    pub unknown_results: u64,
+    pub total_time_ms: u64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Z3 SOLVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Z3 solver implementation
+pub struct Z3Solver {
+    /// SMT-LIB2 script builder
+    script: Vec<String>,
+    
+    /// Assertion stack depth
+    stack_depth: usize,
+    
+    /// Declared symbols
+    symbols: BTreeMap<String, Sort>,
+    
+    /// Options
+    options: BTreeMap<String, String>,
+    
+    /// Statistics
+    stats: SolverStats,
+    
+    /// Last model
+    last_model: Option<Model>,
+    
+    /// Timeout (milliseconds)
+    timeout: Option<u64>,
+}
+
+impl Z3Solver {
+    pub fn new() -> Self {
+        Z3Solver {
+            script: Vec::new(),
+            stack_depth: 0,
+            symbols: BTreeMap::new(),
+            options: BTreeMap::new(),
+            stats: SolverStats::default(),
+            last_model: None,
+            timeout: None,
+        }
+    }
+    
+    pub fn with_timeout(mut self, ms: u64) -> Self {
+        self.timeout = Some(ms);
+        self
+    }
+    
+    /// Convert expression to SMT-LIB2 string
+    fn expr_to_smt(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::BoolConst(true) => "true".to_string(),
+            Expr::BoolConst(false) => "false".to_string(),
+            Expr::IntConst(n) => {
+                if *n >= 0 { n.to_string() } 
+                else { format!("(- {})", -n) }
+            }
+            Expr::RealConst(r) => format!("{:.15}", r),
+            Expr::BitVecConst { value, width } => {
+                format!("(_ bv{} {})", value, width)
+            }
+            Expr::Var(name, _) => name.clone(),
+            
+            Expr::Not(e) => format!("(not {})", self.expr_to_smt(e)),
+            Expr::And(es) => {
+                if es.is_empty() { "true".to_string() }
+                else {
+                    let args: Vec<_> = es.iter().map(|e| self.expr_to_smt(e)).collect();
+                    format!("(and {})", args.join(" "))
+                }
+            }
+            Expr::Or(es) => {
+                if es.is_empty() { "false".to_string() }
+                else {
+                    let args: Vec<_> = es.iter().map(|e| self.expr_to_smt(e)).collect();
+                    format!("(or {})", args.join(" "))
+                }
+            }
+            Expr::Implies(a, b) => {
+                format!("(=> {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::Iff(a, b) => {
+                format!("(= {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::Ite(c, t, e) => {
+                format!("(ite {} {} {})", 
+                    self.expr_to_smt(c), 
+                    self.expr_to_smt(t), 
+                    self.expr_to_smt(e))
+            }
+            
+            Expr::Neg(e) => format!("(- {})", self.expr_to_smt(e)),
+            Expr::Add(es) => {
+                let args: Vec<_> = es.iter().map(|e| self.expr_to_smt(e)).collect();
+                format!("(+ {})", args.join(" "))
+            }
+            Expr::Sub(a, b) => {
+                format!("(- {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::Mul(es) => {
+                let args: Vec<_> = es.iter().map(|e| self.expr_to_smt(e)).collect();
+                format!("(* {})", args.join(" "))
+            }
+            Expr::Div(a, b) => {
+                format!("(div {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::Mod(a, b) => {
+                format!("(mod {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            
+            Expr::Eq(a, b) => {
+                format!("(= {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::Ne(a, b) => {
+                format!("(not (= {} {}))", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::Lt(a, b) => {
+                format!("(< {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::Le(a, b) => {
+                format!("(<= {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::Gt(a, b) => {
+                format!("(> {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::Ge(a, b) => {
+                format!("(>= {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            
+            Expr::BvAdd(a, b) => {
+                format!("(bvadd {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::BvSub(a, b) => {
+                format!("(bvsub {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::BvAnd(a, b) => {
+                format!("(bvand {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::BvOr(a, b) => {
+                format!("(bvor {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::BvShl(a, b) => {
+                format!("(bvshl {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::BvULt(a, b) => {
+                format!("(bvult {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            Expr::BvSLt(a, b) => {
+                format!("(bvslt {} {})", self.expr_to_smt(a), self.expr_to_smt(b))
+            }
+            
+            Expr::Select(arr, idx) => {
+                format!("(select {} {})", self.expr_to_smt(arr), self.expr_to_smt(idx))
+            }
+            Expr::Store(arr, idx, val) => {
+                format!("(store {} {} {})", 
+                    self.expr_to_smt(arr),
+                    self.expr_to_smt(idx),
+                    self.expr_to_smt(val))
+            }
+            
+            Expr::Forall(vars, body) => {
+                let bindings: Vec<_> = vars.iter()
+                    .map(|(n, s)| format!("({} {})", n, s))
+                    .collect();
+                format!("(forall ({}) {})", bindings.join(" "), self.expr_to_smt(body))
+            }
+            Expr::Exists(vars, body) => {
+                let bindings: Vec<_> = vars.iter()
+                    .map(|(n, s)| format!("({} {})", n, s))
+                    .collect();
+                format!("(exists ({}) {})", bindings.join(" "), self.expr_to_smt(body))
+            }
+            
+            Expr::Apply(name, args) => {
+                if args.is_empty() {
+                    name.clone()
+                } else {
+                    let arg_strs: Vec<_> = args.iter()
+                        .map(|a| self.expr_to_smt(a))
+                        .collect();
+                    format!("({} {})", name, arg_strs.join(" "))
+                }
+            }
+            
+            _ => "???".to_string(), // Unhandled cases
+        }
+    }
+    
+    /// Generate full SMT-LIB2 script
+    pub fn to_smtlib2(&self) -> String {
+        let mut lines = Vec::new();
+        
+        // Options
+        for (k, v) in &self.options {
+            lines.push(format!("(set-option :{} {})", k, v));
+        }
+        
+        // Logic
+        lines.push("(set-logic ALL)".to_string());
+        
+        // Script commands
+        lines.extend(self.script.clone());
+        
+        lines.join("\n")
+    }
+}
+
+impl Default for Z3Solver {
+    fn default() -> Self { Self::new() }
+}
+
+impl Solver for Z3Solver {
+    fn push(&mut self) {
+        self.script.push("(push)".to_string());
+        self.stack_depth += 1;
+    }
+    
+    fn pop(&mut self) {
+        if self.stack_depth > 0 {
+            self.script.push("(pop)".to_string());
+            self.stack_depth -= 1;
+        }
+    }
+    
+    fn declare_const(&mut self, name: &str, sort: &Sort) {
+        self.script.push(format!("(declare-const {} {})", name, sort));
+        self.symbols.insert(name.to_string(), sort.clone());
+    }
+    
+    fn declare_fun(&mut self, name: &str, params: &[Sort], result: &Sort) {
+        let params_str: Vec<_> = params.iter().map(|s| s.to_string()).collect();
+        self.script.push(format!(
+            "(declare-fun {} ({}) {})",
+            name,
+            params_str.join(" "),
+            result
+        ));
+    }
+    
+    fn assert(&mut self, expr: &Expr) {
+        let smt = self.expr_to_smt(expr);
+        self.script.push(format!("(assert {})", smt));
+    }
+    
+    fn check(&mut self) -> SolverResult {
+        self.stats.queries += 1;
+        self.script.push("(check-sat)".to_string());
+        
+        // In a real implementation, this would invoke the Z3 binary
+        // For now, return Unknown
+        self.stats.unknown_results += 1;
+        SolverResult::Unknown
+    }
+    
+    fn get_model(&self) -> Option<Model> {
+        self.last_model.clone()
+    }
+    
+    fn get_unsat_core(&self) -> Option<Vec<String>> {
+        None
+    }
+    
+    fn set_option(&mut self, name: &str, value: &str) {
+        self.options.insert(name.to_string(), value.to_string());
+    }
+    
+    fn reset(&mut self) {
+        self.script.clear();
+        self.stack_depth = 0;
+        self.symbols.clear();
+        self.last_model = None;
+    }
+    
+    fn statistics(&self) -> SolverStats {
+        self.stats.clone()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERIFICATION CONDITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Verification condition
+#[derive(Debug, Clone)]
+pub struct VerificationCondition {
+    /// Name/identifier
+    pub name: String,
+    
+    /// Location in source
+    pub location: Option<SourceLocation>,
+    
+    /// Formula to verify (should be valid/UNSAT when negated)
+    pub formula: Expr,
+    
+    /// Kind of property
+    pub kind: VcKind,
+    
+    /// Verification result
+    pub result: Option<VcResult>,
+}
+
+/// Source location for VC
+#[derive(Debug, Clone)]
+pub struct SourceLocation {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// Kind of verification condition
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcKind {
+    Precondition,
+    Postcondition,
+    Invariant,
+    Assertion,
+    LoopInvariant,
+    ArrayBounds,
+    DivisionByZero,
+    Overflow,
+    NullPointer,
+    MemorySafety,
+    Termination,
+}
+
+/// Verification result
+#[derive(Debug, Clone)]
+pub enum VcResult {
+    Verified,
+    Failed { counterexample: Option<Model> },
+    Unknown { reason: String },
+    Timeout,
+    Error(String),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERIFIER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Program verifier
+pub struct Verifier {
+    solver: Box<dyn Solver>,
+    conditions: Vec<VerificationCondition>,
+    config: VerifierConfig,
+}
+
+/// Verifier configuration
+#[derive(Debug, Clone)]
+pub struct VerifierConfig {
+    /// Timeout per VC (milliseconds)
+    pub timeout_ms: u64,
+    
+    /// Generate counterexamples
+    pub counterexamples: bool,
+    
+    /// Verify array bounds
+    pub check_bounds: bool,
+    
+    /// Verify arithmetic overflow
+    pub check_overflow: bool,
+    
+    /// Verify division by zero
+    pub check_div_zero: bool,
+    
+    /// Verify null pointers
+    pub check_null: bool,
+    
+    /// Verbose output
+    pub verbose: bool,
+}
+
+impl Default for VerifierConfig {
+    fn default() -> Self {
+        VerifierConfig {
+            timeout_ms: 10000,
+            counterexamples: true,
+            check_bounds: true,
+            check_overflow: true,
+            check_div_zero: true,
+            check_null: true,
+            verbose: false,
+        }
+    }
+}
+
+impl Verifier {
+    /// Create new verifier
+    pub fn new(solver: Box<dyn Solver>) -> Self {
+        Verifier {
+            solver,
+            conditions: Vec::new(),
+            config: VerifierConfig::default(),
+        }
+    }
+    
+    /// Create with Z3 solver
+    pub fn with_z3() -> Self {
+        Self::new(Box::new(Z3Solver::new()))
+    }
+    
+    /// Set configuration
+    pub fn with_config(mut self, config: VerifierConfig) -> Self {
+        self.config = config;
+        self
+    }
+    
+    /// Add verification condition
+    pub fn add_condition(&mut self, vc: VerificationCondition) {
+        self.conditions.push(vc);
+    }
+    
+    /// Verify all conditions
+    pub fn verify_all(&mut self) -> VerificationReport {
+        let mut report = VerificationReport::new();
+        
+        for vc in &mut self.conditions {
+            let result = self.verify_single(vc);
+            
+            match &result {
+                VcResult::Verified => report.verified += 1,
+                VcResult::Failed { .. } => report.failed += 1,
+                VcResult::Unknown { .. } => report.unknown += 1,
+                VcResult::Timeout => report.timeout += 1,
+                VcResult::Error(_) => report.errors += 1,
+            }
+            
+            report.results.push((vc.name.clone(), result.clone()));
+            vc.result = Some(result);
+        }
+        
+        report
+    }
+    
+    /// Verify single condition
+    fn verify_single(&mut self, vc: &VerificationCondition) -> VcResult {
+        self.solver.push();
+        
+        // Assert negation of formula (looking for counterexample)
+        let negated = vc.formula.clone().not();
+        self.solver.assert(&negated);
+        
+        let result = match self.solver.check() {
+            SolverResult::Unsat => VcResult::Verified,
+            SolverResult::Sat => {
+                let counterexample = if self.config.counterexamples {
+                    self.solver.get_model()
+                } else {
+                    None
+                };
+                VcResult::Failed { counterexample }
+            }
+            SolverResult::Unknown => VcResult::Unknown {
+                reason: "solver returned unknown".to_string(),
+            },
+            SolverResult::Timeout => VcResult::Timeout,
+            SolverResult::Error(e) => VcResult::Error(e),
+        };
+        
+        self.solver.pop();
+        result
+    }
+    
+    /// Get all conditions
+    pub fn conditions(&self) -> &[VerificationCondition] {
+        &self.conditions
+    }
+}
+
+/// Verification report
+#[derive(Debug, Clone)]
+pub struct VerificationReport {
+    pub verified: usize,
+    pub failed: usize,
+    pub unknown: usize,
+    pub timeout: usize,
+    pub errors: usize,
+    pub results: Vec<(String, VcResult)>,
+}
+
+impl VerificationReport {
+    pub fn new() -> Self {
+        VerificationReport {
+            verified: 0,
+            failed: 0,
+            unknown: 0,
+            timeout: 0,
+            errors: 0,
+            results: Vec::new(),
+        }
+    }
+    
+    pub fn total(&self) -> usize {
+        self.verified + self.failed + self.unknown + self.timeout + self.errors
+    }
+    
+    pub fn success_rate(&self) -> f64 {
+        if self.total() == 0 { 0.0 }
+        else { self.verified as f64 / self.total() as f64 }
+    }
+    
+    pub fn is_success(&self) -> bool {
+        self.failed == 0 && self.errors == 0
+    }
+}
+
+impl Default for VerificationReport {
+    fn default() -> Self { Self::new() }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROPERTY ANNOTATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Property annotation
+#[derive(Debug, Clone)]
+pub enum Property {
+    /// Precondition
+    Requires(Expr),
+    
+    /// Postcondition
+    Ensures(Expr),
+    
+    /// Loop invariant
+    Invariant(Expr),
+    
+    /// Assertion
+    Assert(Expr),
+    
+    /// Assumption
+    Assume(Expr),
+    
+    /// Variant (for termination)
+    Decreases(Expr),
+}
+
+/// Function contract
+#[derive(Debug, Clone)]
+pub struct Contract {
+    pub name: String,
+    pub requires: Vec<Expr>,
+    pub ensures: Vec<Expr>,
+    pub modifies: Vec<String>,
+}
+
+impl Contract {
+    pub fn new(name: impl Into<String>) -> Self {
+        Contract {
+            name: name.into(),
+            requires: Vec::new(),
+            ensures: Vec::new(),
+            modifies: Vec::new(),
+        }
+    }
+    
+    pub fn requires(mut self, expr: Expr) -> Self {
+        self.requires.push(expr);
+        self
+    }
+    
+    pub fn ensures(mut self, expr: Expr) -> Self {
+        self.ensures.push(expr);
+        self
+    }
+    
+    pub fn modifies(mut self, var: impl Into<String>) -> Self {
+        self.modifies.push(var.into());
+        self
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub mod prelude {
+    pub use super::{
+        // Sorts and expressions
+        Sort, Expr, Value, Model,
+        
+        // Solver
+        Solver, SolverResult, SolverStats, Z3Solver,
+        
+        // Verification
+        VerificationCondition, VcKind, VcResult, SourceLocation,
+        Verifier, VerifierConfig, VerificationReport,
+        
+        // Properties
+        Property, Contract,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_sort_display() {
+        assert_eq!(Sort::Bool.to_string(), "Bool");
+        assert_eq!(Sort::bv(32).to_string(), "(_ BitVec 32)");
+        assert_eq!(
+            Sort::array(Sort::Int, Sort::Bool).to_string(),
+            "(Array Int Bool)"
+        );
+    }
+    
+    #[test]
+    fn test_expr_construction() {
+        let x = Expr::var("x", Sort::Int);
+        let y = Expr::var("y", Sort::Int);
+        let sum = Expr::add(vec![x.clone(), y.clone()]);
+        let cond = Expr::gt(sum, Expr::int_const(0));
+        
+        // Just verify construction doesn't panic
+        assert!(matches!(cond, Expr::Gt(_, _)));
+    }
+    
+    #[test]
+    fn test_solver_smtlib() {
+        let mut solver = Z3Solver::new();
+        solver.declare_const("x", &Sort::Int);
+        solver.declare_const("y", &Sort::Int);
+        
+        let x = Expr::var("x", Sort::Int);
+        let constraint = Expr::gt(x, Expr::int_const(0));
+        solver.assert(&constraint);
+        
+        let smt = solver.to_smtlib2();
+        assert!(smt.contains("declare-const x Int"));
+        assert!(smt.contains("(assert (> x 0))"));
+    }
+    
+    #[test]
+    fn test_verifier() {
+        let verifier = Verifier::with_z3();
+        assert!(verifier.conditions().is_empty());
+    }
+    
+    #[test]
+    fn test_verification_report() {
+        let mut report = VerificationReport::new();
+        report.verified = 5;
+        report.failed = 1;
+        
+        assert_eq!(report.total(), 6);
+        assert!(!report.is_success());
+    }
+}

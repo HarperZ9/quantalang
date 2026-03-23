@@ -1,0 +1,1059 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ ASYNC — Channels
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Async message-passing channels:
+// - MPSC (multi-producer, single-consumer)
+// - Oneshot (single value)
+// - Broadcast (multi-producer, multi-consumer)
+// - Watch (single value, multiple watchers)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::async::channel
+
+use alloc::vec::Vec;
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, Condvar};
+
+use super::waker::Waker;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MPSC CHANNEL (Multi-Producer, Single-Consumer)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create an unbounded MPSC channel
+pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
+    let shared = Arc::new(MpscShared {
+        queue: Mutex::new(VecDeque::new()),
+        closed: AtomicBool::new(false),
+        sender_count: AtomicUsize::new(1),
+        recv_waker: Mutex::new(None),
+        send_wakers: Mutex::new(Vec::new()),
+    });
+    
+    (
+        Sender { shared: shared.clone() },
+        Receiver { shared },
+    )
+}
+
+/// Create a bounded MPSC channel
+pub fn bounded<T>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
+    let shared = Arc::new(BoundedMpscShared {
+        queue: Mutex::new(VecDeque::with_capacity(capacity)),
+        capacity,
+        closed: AtomicBool::new(false),
+        sender_count: AtomicUsize::new(1),
+        recv_waker: Mutex::new(None),
+        send_wakers: Mutex::new(Vec::new()),
+    });
+    
+    (
+        BoundedSender { shared: shared.clone() },
+        BoundedReceiver { shared },
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unbounded MPSC
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct MpscShared<T> {
+    queue: Mutex<VecDeque<T>>,
+    closed: AtomicBool,
+    sender_count: AtomicUsize,
+    recv_waker: Mutex<Option<Waker>>,
+    send_wakers: Mutex<Vec<Waker>>,
+}
+
+/// Sender half of an unbounded MPSC channel
+pub struct Sender<T> {
+    shared: Arc<MpscShared<T>>,
+}
+
+impl<T> Sender<T> {
+    /// Send a value
+    pub fn send(&self, value: T) -> Result<(), SendError<T>> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Err(SendError(value));
+        }
+        
+        {
+            let mut queue = self.shared.queue.lock().unwrap();
+            queue.push_back(value);
+        }
+        
+        // Wake receiver
+        if let Some(waker) = self.shared.recv_waker.lock().unwrap().take() {
+            waker.wake();
+        }
+        
+        Ok(())
+    }
+    
+    /// Try to send without blocking
+    pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Err(TrySendError::Closed(value));
+        }
+        
+        self.send(value).map_err(|e| TrySendError::Closed(e.0))
+    }
+    
+    /// Check if channel is closed
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::SeqCst)
+    }
+    
+    /// Close the sending side
+    pub fn close(&self) {
+        self.shared.closed.store(true, Ordering::SeqCst);
+        if let Some(waker) = self.shared.recv_waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+}
+
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        self.shared.sender_count.fetch_add(1, Ordering::SeqCst);
+        Sender { shared: self.shared.clone() }
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        if self.shared.sender_count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.shared.closed.store(true, Ordering::SeqCst);
+            if let Some(waker) = self.shared.recv_waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+    }
+}
+
+/// Receiver half of an unbounded MPSC channel
+pub struct Receiver<T> {
+    shared: Arc<MpscShared<T>>,
+}
+
+impl<T> Receiver<T> {
+    /// Receive a value (blocking)
+    pub fn recv(&self) -> Option<T> {
+        loop {
+            {
+                let mut queue = self.shared.queue.lock().unwrap();
+                if let Some(value) = queue.pop_front() {
+                    // Wake a sender if any are waiting
+                    let wakers = std::mem::take(&mut *self.shared.send_wakers.lock().unwrap());
+                    for waker in wakers {
+                        waker.wake();
+                    }
+                    return Some(value);
+                }
+            }
+            
+            if self.shared.closed.load(Ordering::SeqCst) {
+                return None;
+            }
+            
+            // Would wait here in real implementation
+            std::thread::yield_now();
+        }
+    }
+    
+    /// Try to receive without blocking
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let mut queue = self.shared.queue.lock().unwrap();
+        
+        if let Some(value) = queue.pop_front() {
+            return Ok(value);
+        }
+        
+        if self.shared.closed.load(Ordering::SeqCst) {
+            Err(TryRecvError::Closed)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+    
+    /// Poll for a value (async)
+    pub fn poll_recv(&self, waker: &Waker) -> Poll<Option<T>> {
+        let mut queue = self.shared.queue.lock().unwrap();
+        
+        if let Some(value) = queue.pop_front() {
+            return Poll::Ready(Some(value));
+        }
+        
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Poll::Ready(None);
+        }
+        
+        *self.shared.recv_waker.lock().unwrap() = Some(waker.clone());
+        Poll::Pending
+    }
+    
+    /// Close the receiving side
+    pub fn close(&self) {
+        self.shared.closed.store(true, Ordering::SeqCst);
+        let wakers = std::mem::take(&mut *self.shared.send_wakers.lock().unwrap());
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+}
+
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bounded MPSC
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct BoundedMpscShared<T> {
+    queue: Mutex<VecDeque<T>>,
+    capacity: usize,
+    closed: AtomicBool,
+    sender_count: AtomicUsize,
+    recv_waker: Mutex<Option<Waker>>,
+    send_wakers: Mutex<Vec<Waker>>,
+}
+
+/// Sender half of a bounded MPSC channel
+pub struct BoundedSender<T> {
+    shared: Arc<BoundedMpscShared<T>>,
+}
+
+impl<T> BoundedSender<T> {
+    /// Send a value (may block if full)
+    pub fn send(&self, value: T) -> Result<(), SendError<T>> {
+        loop {
+            match self.try_send(value) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(v)) => {
+                    // Would wait here
+                    std::thread::yield_now();
+                    value = v;
+                }
+                Err(TrySendError::Closed(v)) => return Err(SendError(v)),
+            }
+        }
+    }
+    
+    /// Try to send without blocking
+    pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Err(TrySendError::Closed(value));
+        }
+        
+        let mut queue = self.shared.queue.lock().unwrap();
+        
+        if queue.len() >= self.shared.capacity {
+            return Err(TrySendError::Full(value));
+        }
+        
+        queue.push_back(value);
+        drop(queue);
+        
+        if let Some(waker) = self.shared.recv_waker.lock().unwrap().take() {
+            waker.wake();
+        }
+        
+        Ok(())
+    }
+    
+    /// Poll for send readiness (async)
+    pub fn poll_send(&self, value: T, waker: &Waker) -> Poll<Result<(), SendError<T>>> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Poll::Ready(Err(SendError(value)));
+        }
+        
+        let mut queue = self.shared.queue.lock().unwrap();
+        
+        if queue.len() < self.shared.capacity {
+            queue.push_back(value);
+            drop(queue);
+            
+            if let Some(w) = self.shared.recv_waker.lock().unwrap().take() {
+                w.wake();
+            }
+            
+            Poll::Ready(Ok(()))
+        } else {
+            self.shared.send_wakers.lock().unwrap().push(waker.clone());
+            Poll::Pending
+        }
+    }
+    
+    /// Get remaining capacity
+    pub fn capacity(&self) -> usize {
+        let queue = self.shared.queue.lock().unwrap();
+        self.shared.capacity - queue.len()
+    }
+    
+    /// Check if channel is closed
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::SeqCst)
+    }
+}
+
+impl<T> Clone for BoundedSender<T> {
+    fn clone(&self) -> Self {
+        self.shared.sender_count.fetch_add(1, Ordering::SeqCst);
+        BoundedSender { shared: self.shared.clone() }
+    }
+}
+
+impl<T> Drop for BoundedSender<T> {
+    fn drop(&mut self) {
+        if self.shared.sender_count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.shared.closed.store(true, Ordering::SeqCst);
+            if let Some(waker) = self.shared.recv_waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+    }
+}
+
+/// Receiver half of a bounded MPSC channel
+pub struct BoundedReceiver<T> {
+    shared: Arc<BoundedMpscShared<T>>,
+}
+
+impl<T> BoundedReceiver<T> {
+    /// Receive a value
+    pub fn recv(&self) -> Option<T> {
+        loop {
+            match self.try_recv() {
+                Ok(value) => return Some(value),
+                Err(TryRecvError::Empty) => std::thread::yield_now(),
+                Err(TryRecvError::Closed) => return None,
+            }
+        }
+    }
+    
+    /// Try to receive without blocking
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let mut queue = self.shared.queue.lock().unwrap();
+        
+        if let Some(value) = queue.pop_front() {
+            drop(queue);
+            
+            // Wake waiting senders
+            let wakers = std::mem::take(&mut *self.shared.send_wakers.lock().unwrap());
+            for waker in wakers {
+                waker.wake();
+            }
+            
+            return Ok(value);
+        }
+        
+        if self.shared.closed.load(Ordering::SeqCst) {
+            Err(TryRecvError::Closed)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+    
+    /// Poll for a value (async)
+    pub fn poll_recv(&self, waker: &Waker) -> Poll<Option<T>> {
+        let mut queue = self.shared.queue.lock().unwrap();
+        
+        if let Some(value) = queue.pop_front() {
+            drop(queue);
+            
+            let wakers = std::mem::take(&mut *self.shared.send_wakers.lock().unwrap());
+            for w in wakers {
+                w.wake();
+            }
+            
+            return Poll::Ready(Some(value));
+        }
+        
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Poll::Ready(None);
+        }
+        
+        *self.shared.recv_waker.lock().unwrap() = Some(waker.clone());
+        Poll::Pending
+    }
+}
+
+impl<T> Drop for BoundedReceiver<T> {
+    fn drop(&mut self) {
+        self.shared.closed.store(true, Ordering::SeqCst);
+        let wakers = std::mem::take(&mut *self.shared.send_wakers.lock().unwrap());
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ONESHOT CHANNEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create a oneshot channel
+pub fn oneshot<T>() -> (OneshotSender<T>, OneshotReceiver<T>) {
+    let shared = Arc::new(OneshotShared {
+        value: Mutex::new(None),
+        completed: AtomicBool::new(false),
+        closed: AtomicBool::new(false),
+        recv_waker: Mutex::new(None),
+    });
+    
+    (
+        OneshotSender { shared: shared.clone(), sent: false },
+        OneshotReceiver { shared },
+    )
+}
+
+struct OneshotShared<T> {
+    value: Mutex<Option<T>>,
+    completed: AtomicBool,
+    closed: AtomicBool,
+    recv_waker: Mutex<Option<Waker>>,
+}
+
+/// Sender half of a oneshot channel
+pub struct OneshotSender<T> {
+    shared: Arc<OneshotShared<T>>,
+    sent: bool,
+}
+
+impl<T> OneshotSender<T> {
+    /// Send the value
+    pub fn send(mut self, value: T) -> Result<(), T> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Err(value);
+        }
+        
+        *self.shared.value.lock().unwrap() = Some(value);
+        self.shared.completed.store(true, Ordering::SeqCst);
+        self.sent = true;
+        
+        if let Some(waker) = self.shared.recv_waker.lock().unwrap().take() {
+            waker.wake();
+        }
+        
+        Ok(())
+    }
+    
+    /// Check if receiver is still waiting
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::SeqCst)
+    }
+}
+
+impl<T> Drop for OneshotSender<T> {
+    fn drop(&mut self) {
+        if !self.sent {
+            self.shared.closed.store(true, Ordering::SeqCst);
+            if let Some(waker) = self.shared.recv_waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+    }
+}
+
+/// Receiver half of a oneshot channel
+pub struct OneshotReceiver<T> {
+    shared: Arc<OneshotShared<T>>,
+}
+
+impl<T> OneshotReceiver<T> {
+    /// Receive the value (blocking)
+    pub fn recv(self) -> Result<T, OneshotRecvError> {
+        loop {
+            if self.shared.completed.load(Ordering::SeqCst) {
+                let value = self.shared.value.lock().unwrap().take();
+                return value.ok_or(OneshotRecvError::Closed);
+            }
+            
+            if self.shared.closed.load(Ordering::SeqCst) {
+                return Err(OneshotRecvError::Closed);
+            }
+            
+            std::thread::yield_now();
+        }
+    }
+    
+    /// Try to receive without blocking
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        if self.shared.completed.load(Ordering::SeqCst) {
+            let value = self.shared.value.lock().unwrap().take();
+            return value.ok_or(TryRecvError::Closed);
+        }
+        
+        if self.shared.closed.load(Ordering::SeqCst) {
+            Err(TryRecvError::Closed)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+    
+    /// Poll for the value (async)
+    pub fn poll_recv(&self, waker: &Waker) -> Poll<Result<T, OneshotRecvError>> {
+        if self.shared.completed.load(Ordering::SeqCst) {
+            let value = self.shared.value.lock().unwrap().take();
+            return Poll::Ready(value.ok_or(OneshotRecvError::Closed));
+        }
+        
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Poll::Ready(Err(OneshotRecvError::Closed));
+        }
+        
+        *self.shared.recv_waker.lock().unwrap() = Some(waker.clone());
+        Poll::Pending
+    }
+    
+    /// Close the receiver (signals sender)
+    pub fn close(&self) {
+        self.shared.closed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl<T> Drop for OneshotReceiver<T> {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BROADCAST CHANNEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create a broadcast channel
+pub fn broadcast<T: Clone>(capacity: usize) -> (BroadcastSender<T>, BroadcastReceiver<T>) {
+    let shared = Arc::new(BroadcastShared {
+        buffer: Mutex::new(Vec::with_capacity(capacity)),
+        capacity,
+        head: AtomicUsize::new(0),
+        tail: AtomicUsize::new(0),
+        closed: AtomicBool::new(false),
+        sender_count: AtomicUsize::new(1),
+        receiver_count: AtomicUsize::new(1),
+        wakers: Mutex::new(Vec::new()),
+    });
+    
+    (
+        BroadcastSender { shared: shared.clone() },
+        BroadcastReceiver { shared, position: 0 },
+    )
+}
+
+struct BroadcastShared<T> {
+    buffer: Mutex<Vec<Option<T>>>,
+    capacity: usize,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    closed: AtomicBool,
+    sender_count: AtomicUsize,
+    receiver_count: AtomicUsize,
+    wakers: Mutex<Vec<Waker>>,
+}
+
+/// Sender half of a broadcast channel
+pub struct BroadcastSender<T> {
+    shared: Arc<BroadcastShared<T>>,
+}
+
+impl<T: Clone> BroadcastSender<T> {
+    /// Broadcast a value to all receivers
+    pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Err(SendError(value));
+        }
+        
+        let receiver_count = self.shared.receiver_count.load(Ordering::SeqCst);
+        if receiver_count == 0 {
+            return Err(SendError(value));
+        }
+        
+        {
+            let mut buffer = self.shared.buffer.lock().unwrap();
+            let tail = self.shared.tail.fetch_add(1, Ordering::SeqCst);
+            let index = tail % self.shared.capacity;
+            
+            // Initialize buffer if needed
+            while buffer.len() <= index {
+                buffer.push(None);
+            }
+            
+            buffer[index] = Some(value);
+        }
+        
+        // Wake all receivers
+        let wakers = std::mem::take(&mut *self.shared.wakers.lock().unwrap());
+        for waker in &wakers {
+            waker.wake();
+        }
+        
+        Ok(wakers.len())
+    }
+    
+    /// Get number of active receivers
+    pub fn receiver_count(&self) -> usize {
+        self.shared.receiver_count.load(Ordering::SeqCst)
+    }
+    
+    /// Subscribe a new receiver
+    pub fn subscribe(&self) -> BroadcastReceiver<T> {
+        self.shared.receiver_count.fetch_add(1, Ordering::SeqCst);
+        let position = self.shared.tail.load(Ordering::SeqCst);
+        BroadcastReceiver {
+            shared: self.shared.clone(),
+            position,
+        }
+    }
+}
+
+impl<T> Clone for BroadcastSender<T> {
+    fn clone(&self) -> Self {
+        self.shared.sender_count.fetch_add(1, Ordering::SeqCst);
+        BroadcastSender { shared: self.shared.clone() }
+    }
+}
+
+impl<T> Drop for BroadcastSender<T> {
+    fn drop(&mut self) {
+        if self.shared.sender_count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.shared.closed.store(true, Ordering::SeqCst);
+            let wakers = std::mem::take(&mut *self.shared.wakers.lock().unwrap());
+            for waker in wakers {
+                waker.wake();
+            }
+        }
+    }
+}
+
+/// Receiver half of a broadcast channel
+pub struct BroadcastReceiver<T> {
+    shared: Arc<BroadcastShared<T>>,
+    position: usize,
+}
+
+impl<T: Clone> BroadcastReceiver<T> {
+    /// Receive the next broadcast value
+    pub fn recv(&mut self) -> Result<T, BroadcastRecvError> {
+        loop {
+            match self.try_recv() {
+                Ok(value) => return Ok(value),
+                Err(TryBroadcastRecvError::Empty) => std::thread::yield_now(),
+                Err(TryBroadcastRecvError::Lagged(n)) => return Err(BroadcastRecvError::Lagged(n)),
+                Err(TryBroadcastRecvError::Closed) => return Err(BroadcastRecvError::Closed),
+            }
+        }
+    }
+    
+    /// Try to receive without blocking
+    pub fn try_recv(&mut self) -> Result<T, TryBroadcastRecvError> {
+        let tail = self.shared.tail.load(Ordering::SeqCst);
+        
+        if self.position >= tail {
+            if self.shared.closed.load(Ordering::SeqCst) {
+                return Err(TryBroadcastRecvError::Closed);
+            }
+            return Err(TryBroadcastRecvError::Empty);
+        }
+        
+        let head = self.shared.head.load(Ordering::SeqCst);
+        
+        // Check for lag
+        if self.position < head {
+            let lagged = head - self.position;
+            self.position = head;
+            return Err(TryBroadcastRecvError::Lagged(lagged));
+        }
+        
+        let index = self.position % self.shared.capacity;
+        let buffer = self.shared.buffer.lock().unwrap();
+        
+        if let Some(ref value) = buffer[index] {
+            self.position += 1;
+            Ok(value.clone())
+        } else {
+            Err(TryBroadcastRecvError::Empty)
+        }
+    }
+    
+    /// Poll for a value (async)
+    pub fn poll_recv(&mut self, waker: &Waker) -> Poll<Result<T, BroadcastRecvError>> {
+        match self.try_recv() {
+            Ok(value) => Poll::Ready(Ok(value)),
+            Err(TryBroadcastRecvError::Lagged(n)) => Poll::Ready(Err(BroadcastRecvError::Lagged(n))),
+            Err(TryBroadcastRecvError::Closed) => Poll::Ready(Err(BroadcastRecvError::Closed)),
+            Err(TryBroadcastRecvError::Empty) => {
+                self.shared.wakers.lock().unwrap().push(waker.clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl<T> Clone for BroadcastReceiver<T> {
+    fn clone(&self) -> Self {
+        self.shared.receiver_count.fetch_add(1, Ordering::SeqCst);
+        BroadcastReceiver {
+            shared: self.shared.clone(),
+            position: self.position,
+        }
+    }
+}
+
+impl<T> Drop for BroadcastReceiver<T> {
+    fn drop(&mut self) {
+        self.shared.receiver_count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WATCH CHANNEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create a watch channel
+pub fn watch<T>(initial: T) -> (WatchSender<T>, WatchReceiver<T>) {
+    let shared = Arc::new(WatchShared {
+        value: Mutex::new(initial),
+        version: AtomicUsize::new(0),
+        closed: AtomicBool::new(false),
+        wakers: Mutex::new(Vec::new()),
+    });
+    
+    (
+        WatchSender { shared: shared.clone() },
+        WatchReceiver { shared, version: 0 },
+    )
+}
+
+struct WatchShared<T> {
+    value: Mutex<T>,
+    version: AtomicUsize,
+    closed: AtomicBool,
+    wakers: Mutex<Vec<Waker>>,
+}
+
+/// Sender half of a watch channel
+pub struct WatchSender<T> {
+    shared: Arc<WatchShared<T>>,
+}
+
+impl<T> WatchSender<T> {
+    /// Send a new value (replaces previous)
+    pub fn send(&self, value: T) -> Result<(), SendError<T>> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Err(SendError(value));
+        }
+        
+        *self.shared.value.lock().unwrap() = value;
+        self.shared.version.fetch_add(1, Ordering::SeqCst);
+        
+        let wakers = std::mem::take(&mut *self.shared.wakers.lock().unwrap());
+        for waker in wakers {
+            waker.wake();
+        }
+        
+        Ok(())
+    }
+    
+    /// Modify the value in place
+    pub fn send_modify<F: FnOnce(&mut T)>(&self, f: F) {
+        f(&mut *self.shared.value.lock().unwrap());
+        self.shared.version.fetch_add(1, Ordering::SeqCst);
+        
+        let wakers = std::mem::take(&mut *self.shared.wakers.lock().unwrap());
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+    
+    /// Get a reference to current value
+    pub fn borrow(&self) -> WatchRef<'_, T> {
+        WatchRef {
+            guard: self.shared.value.lock().unwrap(),
+        }
+    }
+    
+    /// Subscribe a new receiver
+    pub fn subscribe(&self) -> WatchReceiver<T> {
+        WatchReceiver {
+            shared: self.shared.clone(),
+            version: self.shared.version.load(Ordering::SeqCst),
+        }
+    }
+    
+    /// Check if there are any receivers
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::SeqCst)
+    }
+}
+
+impl<T> Drop for WatchSender<T> {
+    fn drop(&mut self) {
+        self.shared.closed.store(true, Ordering::SeqCst);
+        let wakers = std::mem::take(&mut *self.shared.wakers.lock().unwrap());
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+}
+
+/// Reference to watch value
+pub struct WatchRef<'a, T> {
+    guard: std::sync::MutexGuard<'a, T>,
+}
+
+impl<'a, T> std::ops::Deref for WatchRef<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &*self.guard
+    }
+}
+
+/// Receiver half of a watch channel
+pub struct WatchReceiver<T> {
+    shared: Arc<WatchShared<T>>,
+    version: usize,
+}
+
+impl<T: Clone> WatchReceiver<T> {
+    /// Get current value
+    pub fn borrow(&self) -> WatchRef<'_, T> {
+        WatchRef {
+            guard: self.shared.value.lock().unwrap(),
+        }
+    }
+    
+    /// Wait for value to change
+    pub fn changed(&mut self) -> Result<(), WatchRecvError> {
+        loop {
+            let current = self.shared.version.load(Ordering::SeqCst);
+            if current != self.version {
+                self.version = current;
+                return Ok(());
+            }
+            
+            if self.shared.closed.load(Ordering::SeqCst) {
+                return Err(WatchRecvError::Closed);
+            }
+            
+            std::thread::yield_now();
+        }
+    }
+    
+    /// Poll for change (async)
+    pub fn poll_changed(&mut self, waker: &Waker) -> Poll<Result<(), WatchRecvError>> {
+        let current = self.shared.version.load(Ordering::SeqCst);
+        
+        if current != self.version {
+            self.version = current;
+            return Poll::Ready(Ok(()));
+        }
+        
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Poll::Ready(Err(WatchRecvError::Closed));
+        }
+        
+        self.shared.wakers.lock().unwrap().push(waker.clone());
+        Poll::Pending
+    }
+    
+    /// Check if value has changed since last seen
+    pub fn has_changed(&self) -> bool {
+        self.shared.version.load(Ordering::SeqCst) != self.version
+    }
+    
+    /// Mark current value as seen
+    pub fn mark_unchanged(&mut self) {
+        self.version = self.shared.version.load(Ordering::SeqCst);
+    }
+}
+
+impl<T> Clone for WatchReceiver<T> {
+    fn clone(&self) -> Self {
+        WatchReceiver {
+            shared: self.shared.clone(),
+            version: self.version,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POLL TYPE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Poll result
+pub enum Poll<T> {
+    Ready(T),
+    Pending,
+}
+
+impl<T> Poll<T> {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Poll::Ready(_))
+    }
+    
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Poll::Pending)
+    }
+    
+    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Poll<U> {
+        match self {
+            Poll::Ready(t) => Poll::Ready(f(t)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Error when sending fails
+#[derive(Debug, Clone)]
+pub struct SendError<T>(pub T);
+
+impl<T> std::fmt::Display for SendError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "channel closed")
+    }
+}
+
+/// Error when try_send fails
+#[derive(Debug, Clone)]
+pub enum TrySendError<T> {
+    Full(T),
+    Closed(T),
+}
+
+impl<T> std::fmt::Display for TrySendError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full(_) => write!(f, "channel full"),
+            Self::Closed(_) => write!(f, "channel closed"),
+        }
+    }
+}
+
+/// Error when try_recv fails
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryRecvError {
+    Empty,
+    Closed,
+}
+
+impl std::fmt::Display for TryRecvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "channel empty"),
+            Self::Closed => write!(f, "channel closed"),
+        }
+    }
+}
+
+/// Error for oneshot receive
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OneshotRecvError {
+    Closed,
+}
+
+/// Error for broadcast receive
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcastRecvError {
+    Lagged(usize),
+    Closed,
+}
+
+/// Error for broadcast try_recv
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryBroadcastRecvError {
+    Empty,
+    Lagged(usize),
+    Closed,
+}
+
+/// Error for watch receive
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchRecvError {
+    Closed,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_unbounded_send_recv() {
+        let (tx, rx) = unbounded();
+        tx.send(42).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), 42);
+    }
+    
+    #[test]
+    fn test_bounded_capacity() {
+        let (tx, _rx) = bounded::<i32>(2);
+        assert!(tx.try_send(1).is_ok());
+        assert!(tx.try_send(2).is_ok());
+        assert!(matches!(tx.try_send(3), Err(TrySendError::Full(_))));
+    }
+    
+    #[test]
+    fn test_oneshot() {
+        let (tx, rx) = oneshot();
+        tx.send(42).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), 42);
+    }
+    
+    #[test]
+    fn test_broadcast() {
+        let (tx, mut rx1) = broadcast(10);
+        let mut rx2 = tx.subscribe();
+        
+        tx.send(42).unwrap();
+        
+        assert_eq!(rx1.try_recv().unwrap(), 42);
+        assert_eq!(rx2.try_recv().unwrap(), 42);
+    }
+    
+    #[test]
+    fn test_watch() {
+        let (tx, rx) = watch(0);
+        
+        assert_eq!(*rx.borrow(), 0);
+        
+        tx.send(42).unwrap();
+        assert_eq!(*rx.borrow(), 42);
+    }
+    
+    #[test]
+    fn test_sender_clone() {
+        let (tx1, rx) = unbounded();
+        let tx2 = tx1.clone();
+        
+        tx1.send(1).unwrap();
+        tx2.send(2).unwrap();
+        
+        assert_eq!(rx.try_recv().unwrap(), 1);
+        assert_eq!(rx.try_recv().unwrap(), 2);
+    }
+    
+    #[test]
+    fn test_closed_channel() {
+        let (tx, rx) = unbounded::<i32>();
+        drop(rx);
+        assert!(tx.send(42).is_err());
+    }
+}

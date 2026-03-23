@@ -1,0 +1,884 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ FORMATTER — Pretty Printer
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Wadler-Lindig style pretty printer for producing formatted output.
+// Uses a document algebra with combinators for optimal line breaking.
+//
+// Based on "A Prettier Printer" by Philip Wadler and "Strictly Pretty"
+// by Christian Lindig.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::fmt::printer
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use alloc::rc::Rc;
+use core::cell::RefCell;
+use crate::fmt::config::Config;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOCUMENT TYPE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A document represents pretty-printable content
+#[derive(Clone)]
+pub enum Doc {
+    /// Empty document
+    Nil,
+    
+    /// Line break (or space in flat mode)
+    Line,
+    
+    /// Hard line break (always breaks)
+    HardLine,
+    
+    /// Soft line break (breaks if group doesn't fit)
+    SoftLine,
+    
+    /// Literal text
+    Text(String),
+    
+    /// Concatenation of documents
+    Concat(Rc<Doc>, Rc<Doc>),
+    
+    /// Nested (indented) document
+    Nest(i32, Rc<Doc>),
+    
+    /// Group that can be flattened
+    Group(Rc<Doc>),
+    
+    /// If-flat choice (flat_doc, break_doc)
+    IfFlat(Rc<Doc>, Rc<Doc>),
+    
+    /// Fill: break only when necessary
+    Fill(Vec<Rc<Doc>>),
+    
+    /// Alignment to current column
+    Align(Rc<Doc>),
+    
+    /// Hanging indent
+    Hang(i32, Rc<Doc>),
+    
+    /// Break parent group
+    BreakParent,
+    
+    /// Trailing content (for comments)
+    Trailing(Rc<Doc>),
+    
+    /// Leading content
+    Leading(Rc<Doc>),
+    
+    /// Cursor position marker
+    Cursor,
+    
+    /// Line suffix (printed at end of line)
+    LineSuffix(Rc<Doc>),
+    
+    /// Line suffix boundary
+    LineSuffixBoundary,
+    
+    /// Labeled document (for diagnostics)
+    Label(String, Rc<Doc>),
+    
+    /// Trim trailing whitespace
+    Trim,
+}
+
+impl Doc {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONSTRUCTORS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Create nil document
+    pub fn nil() -> Self {
+        Doc::Nil
+    }
+    
+    /// Create text document
+    pub fn text<S: Into<String>>(s: S) -> Self {
+        let s = s.into();
+        if s.is_empty() {
+            Doc::Nil
+        } else {
+            Doc::Text(s)
+        }
+    }
+    
+    /// Create single space
+    pub fn space() -> Self {
+        Doc::Text(" ".to_string())
+    }
+    
+    /// Create multiple spaces
+    pub fn spaces(n: usize) -> Self {
+        Doc::Text(" ".repeat(n))
+    }
+    
+    /// Create line break (or space if flat)
+    pub fn line() -> Self {
+        Doc::Line
+    }
+    
+    /// Create hard line break
+    pub fn hardline() -> Self {
+        Doc::HardLine
+    }
+    
+    /// Create soft line break (empty if flat)
+    pub fn softline() -> Self {
+        Doc::SoftLine
+    }
+    
+    /// Create literal line break in flat mode
+    pub fn literalline() -> Self {
+        Doc::IfFlat(Rc::new(Doc::Text("\n".to_string())), Rc::new(Doc::HardLine))
+    }
+    
+    /// Concatenate two documents
+    pub fn concat(self, other: Doc) -> Self {
+        match (&self, &other) {
+            (Doc::Nil, _) => other,
+            (_, Doc::Nil) => self,
+            _ => Doc::Concat(Rc::new(self), Rc::new(other)),
+        }
+    }
+    
+    /// Nest document by indent
+    pub fn nest(self, indent: i32) -> Self {
+        if indent == 0 {
+            self
+        } else {
+            Doc::Nest(indent, Rc::new(self))
+        }
+    }
+    
+    /// Create a group
+    pub fn group(self) -> Self {
+        Doc::Group(Rc::new(self))
+    }
+    
+    /// Conditional group that expands if contents don't fit
+    pub fn conditional_group(self, condition: bool) -> Self {
+        if condition {
+            self.group()
+        } else {
+            self
+        }
+    }
+    
+    /// Align to current column
+    pub fn align(self) -> Self {
+        Doc::Align(Rc::new(self))
+    }
+    
+    /// Hanging indent
+    pub fn hang(self, indent: i32) -> Self {
+        Doc::Hang(indent, Rc::new(self))
+    }
+    
+    /// Indent document
+    pub fn indent(self, indent: i32) -> Self {
+        Doc::Concat(
+            Rc::new(Doc::Text(" ".repeat(indent as usize))),
+            Rc::new(self),
+        )
+    }
+    
+    /// If-flat choice
+    pub fn if_flat(flat: Doc, break_doc: Doc) -> Self {
+        Doc::IfFlat(Rc::new(flat), Rc::new(break_doc))
+    }
+    
+    /// Fill mode (flow layout)
+    pub fn fill(docs: Vec<Doc>) -> Self {
+        Doc::Fill(docs.into_iter().map(Rc::new).collect())
+    }
+    
+    /// Join documents with separator
+    pub fn join(docs: Vec<Doc>, sep: Doc) -> Self {
+        if docs.is_empty() {
+            return Doc::Nil;
+        }
+        
+        let mut result = docs[0].clone();
+        for doc in docs.into_iter().skip(1) {
+            result = result.concat(sep.clone()).concat(doc);
+        }
+        result
+    }
+    
+    /// Join with line breaks
+    pub fn join_lines(docs: Vec<Doc>) -> Self {
+        Self::join(docs, Doc::Line)
+    }
+    
+    /// Join with hard line breaks
+    pub fn join_hardlines(docs: Vec<Doc>) -> Self {
+        Self::join(docs, Doc::HardLine)
+    }
+    
+    /// Join with commas and line breaks
+    pub fn join_comma(docs: Vec<Doc>) -> Self {
+        Self::join(docs, Doc::text(",").concat(Doc::Line))
+    }
+    
+    /// Surround with delimiters
+    pub fn surround(self, open: &str, close: &str) -> Self {
+        Doc::text(open).concat(self).concat(Doc::text(close))
+    }
+    
+    /// Wrap in parentheses
+    pub fn parens(self) -> Self {
+        self.surround("(", ")")
+    }
+    
+    /// Wrap in brackets
+    pub fn brackets(self) -> Self {
+        self.surround("[", "]")
+    }
+    
+    /// Wrap in braces
+    pub fn braces(self) -> Self {
+        self.surround("{", "}")
+    }
+    
+    /// Wrap in angles
+    pub fn angles(self) -> Self {
+        self.surround("<", ">")
+    }
+    
+    /// Break parent group
+    pub fn break_parent() -> Self {
+        Doc::BreakParent
+    }
+    
+    /// Trailing comment
+    pub fn trailing(self) -> Self {
+        Doc::Trailing(Rc::new(self))
+    }
+    
+    /// Leading content
+    pub fn leading(self) -> Self {
+        Doc::Leading(Rc::new(self))
+    }
+    
+    /// Line suffix
+    pub fn line_suffix(self) -> Self {
+        Doc::LineSuffix(Rc::new(self))
+    }
+    
+    /// Label for diagnostics
+    pub fn label<S: Into<String>>(self, name: S) -> Self {
+        Doc::Label(name.into(), Rc::new(self))
+    }
+    
+    /// Trim trailing whitespace
+    pub fn trim() -> Self {
+        Doc::Trim
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HELPERS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Check if document is empty
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Doc::Nil)
+    }
+    
+    /// Get flat width (approximate)
+    pub fn flat_width(&self) -> Option<usize> {
+        match self {
+            Doc::Nil => Some(0),
+            Doc::Text(s) => Some(s.len()),
+            Doc::Line | Doc::SoftLine => Some(1),
+            Doc::HardLine => None, // Cannot be flattened
+            Doc::Concat(a, b) => {
+                let wa = a.flat_width()?;
+                let wb = b.flat_width()?;
+                Some(wa + wb)
+            }
+            Doc::Nest(_, d) => d.flat_width(),
+            Doc::Group(d) => d.flat_width(),
+            Doc::IfFlat(flat, _) => flat.flat_width(),
+            Doc::Align(d) => d.flat_width(),
+            Doc::Hang(_, d) => d.flat_width(),
+            Doc::BreakParent => None,
+            Doc::Fill(docs) => {
+                let mut total = 0;
+                for d in docs {
+                    total += d.flat_width()?;
+                }
+                Some(total)
+            }
+            _ => None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRETTY PRINTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Pretty printer state
+pub struct Printer {
+    config: Config,
+    output: String,
+    column: usize,
+    indent: i32,
+    fits_on_line: bool,
+    line_suffixes: Vec<Doc>,
+}
+
+impl Printer {
+    /// Create new printer with configuration
+    pub fn new(config: Config) -> Self {
+        Printer {
+            config,
+            output: String::new(),
+            column: 0,
+            indent: 0,
+            fits_on_line: true,
+            line_suffixes: Vec::new(),
+        }
+    }
+    
+    /// Format a document to string
+    pub fn print(&mut self, doc: &Doc) -> String {
+        self.output.clear();
+        self.column = 0;
+        self.indent = 0;
+        self.line_suffixes.clear();
+        
+        self.print_doc(doc, Mode::Break);
+        self.flush_line_suffixes();
+        
+        // Final newline
+        if self.config.insert_final_newline && !self.output.ends_with('\n') {
+            self.output.push('\n');
+        }
+        
+        // Remove trailing whitespace if configured
+        if self.config.remove_trailing_whitespace {
+            self.remove_trailing_whitespace();
+        }
+        
+        self.output.clone()
+    }
+    
+    fn print_doc(&mut self, doc: &Doc, mode: Mode) {
+        match doc {
+            Doc::Nil => {}
+            
+            Doc::Text(s) => {
+                self.output.push_str(s);
+                self.column += s.len();
+            }
+            
+            Doc::Line => {
+                if mode == Mode::Flat {
+                    self.output.push(' ');
+                    self.column += 1;
+                } else {
+                    self.print_newline();
+                }
+            }
+            
+            Doc::HardLine => {
+                self.print_newline();
+            }
+            
+            Doc::SoftLine => {
+                if mode == Mode::Flat {
+                    // No output in flat mode
+                } else {
+                    self.print_newline();
+                }
+            }
+            
+            Doc::Concat(a, b) => {
+                self.print_doc(a, mode);
+                self.print_doc(b, mode);
+            }
+            
+            Doc::Nest(i, d) => {
+                let old_indent = self.indent;
+                self.indent += i;
+                self.print_doc(d, mode);
+                self.indent = old_indent;
+            }
+            
+            Doc::Group(d) => {
+                // Try to fit on one line
+                let fits = self.fits(d, self.config.max_width.saturating_sub(self.column));
+                let new_mode = if fits { Mode::Flat } else { Mode::Break };
+                self.print_doc(d, new_mode);
+            }
+            
+            Doc::IfFlat(flat, break_doc) => {
+                if mode == Mode::Flat {
+                    self.print_doc(flat, mode);
+                } else {
+                    self.print_doc(break_doc, mode);
+                }
+            }
+            
+            Doc::Fill(docs) => {
+                self.print_fill(docs, mode);
+            }
+            
+            Doc::Align(d) => {
+                let old_indent = self.indent;
+                self.indent = self.column as i32;
+                self.print_doc(d, mode);
+                self.indent = old_indent;
+            }
+            
+            Doc::Hang(i, d) => {
+                let old_indent = self.indent;
+                self.indent = (self.column as i32) + i;
+                self.print_doc(d, mode);
+                self.indent = old_indent;
+            }
+            
+            Doc::BreakParent => {
+                // Force parent to break (handled in group)
+            }
+            
+            Doc::Trailing(d) => {
+                self.print_doc(d, mode);
+            }
+            
+            Doc::Leading(d) => {
+                self.print_doc(d, mode);
+            }
+            
+            Doc::Cursor => {
+                // Cursor marker (for IDE integration)
+            }
+            
+            Doc::LineSuffix(d) => {
+                self.line_suffixes.push((**d).clone());
+            }
+            
+            Doc::LineSuffixBoundary => {
+                self.flush_line_suffixes();
+            }
+            
+            Doc::Label(_, d) => {
+                self.print_doc(d, mode);
+            }
+            
+            Doc::Trim => {
+                // Trim trailing whitespace from current line
+                while self.output.ends_with(' ') || self.output.ends_with('\t') {
+                    self.output.pop();
+                    self.column = self.column.saturating_sub(1);
+                }
+            }
+        }
+    }
+    
+    fn print_newline(&mut self) {
+        self.flush_line_suffixes();
+        
+        // Remove trailing whitespace before newline
+        while self.output.ends_with(' ') || self.output.ends_with('\t') {
+            self.output.pop();
+        }
+        
+        self.output.push('\n');
+        
+        // Add indentation
+        let indent_str = self.config.indent_string();
+        let indent_count = (self.indent / self.config.tab_spaces as i32) as usize;
+        let extra_spaces = (self.indent % self.config.tab_spaces as i32) as usize;
+        
+        for _ in 0..indent_count {
+            self.output.push_str(&indent_str);
+        }
+        for _ in 0..extra_spaces {
+            self.output.push(' ');
+        }
+        
+        self.column = (indent_count * self.config.tab_spaces) + extra_spaces;
+    }
+    
+    fn flush_line_suffixes(&mut self) {
+        let suffixes = std::mem::take(&mut self.line_suffixes);
+        for suffix in suffixes {
+            self.print_doc(&suffix, Mode::Break);
+        }
+    }
+    
+    fn print_fill(&mut self, docs: &[Rc<Doc>], mode: Mode) {
+        if docs.is_empty() {
+            return;
+        }
+        
+        for (i, doc) in docs.iter().enumerate() {
+            if i > 0 {
+                // Check if next item fits
+                let remaining = self.config.max_width.saturating_sub(self.column);
+                let fits = self.fits(doc, remaining);
+                
+                if fits {
+                    self.output.push(' ');
+                    self.column += 1;
+                } else {
+                    self.print_newline();
+                }
+            }
+            
+            self.print_doc(doc, mode);
+        }
+    }
+    
+    /// Check if document fits in remaining width
+    fn fits(&self, doc: &Doc, width: usize) -> bool {
+        let mut remaining = width as i32;
+        let mut stack = vec![(doc, Mode::Flat)];
+        
+        while let Some((d, mode)) = stack.pop() {
+            if remaining < 0 {
+                return false;
+            }
+            
+            match d {
+                Doc::Nil => {}
+                
+                Doc::Text(s) => {
+                    remaining -= s.len() as i32;
+                }
+                
+                Doc::Line => {
+                    if mode == Mode::Flat {
+                        remaining -= 1;
+                    } else {
+                        return true; // Line break always fits
+                    }
+                }
+                
+                Doc::HardLine => {
+                    return true; // Hard line break ends checking
+                }
+                
+                Doc::SoftLine => {
+                    if mode != Mode::Flat {
+                        return true;
+                    }
+                }
+                
+                Doc::Concat(a, b) => {
+                    stack.push((b, mode));
+                    stack.push((a, mode));
+                }
+                
+                Doc::Nest(_, d) => {
+                    stack.push((d, mode));
+                }
+                
+                Doc::Group(d) => {
+                    stack.push((d, Mode::Flat));
+                }
+                
+                Doc::IfFlat(flat, break_doc) => {
+                    if mode == Mode::Flat {
+                        stack.push((flat, mode));
+                    } else {
+                        stack.push((break_doc, mode));
+                    }
+                }
+                
+                Doc::Align(d) | Doc::Hang(_, d) | Doc::Label(_, d) => {
+                    stack.push((d, mode));
+                }
+                
+                Doc::BreakParent => {
+                    return false; // Forces break
+                }
+                
+                Doc::Fill(docs) => {
+                    for doc in docs.iter().rev() {
+                        stack.push((doc, mode));
+                    }
+                }
+                
+                Doc::Trailing(d) | Doc::Leading(d) => {
+                    stack.push((d, mode));
+                }
+                
+                _ => {}
+            }
+        }
+        
+        remaining >= 0
+    }
+    
+    fn remove_trailing_whitespace(&mut self) {
+        let lines: Vec<&str> = self.output.lines().collect();
+        self.output = lines
+            .iter()
+            .map(|line| line.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n");
+        
+        if !lines.is_empty() && self.config.insert_final_newline {
+            self.output.push('\n');
+        }
+    }
+}
+
+/// Printing mode
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Flatten everything to single line
+    Flat,
+    /// Allow line breaks
+    Break,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOCUMENT BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Builder for constructing documents
+pub struct DocBuilder {
+    docs: Vec<Doc>,
+}
+
+impl DocBuilder {
+    pub fn new() -> Self {
+        DocBuilder { docs: Vec::new() }
+    }
+    
+    /// Add text
+    pub fn text<S: Into<String>>(mut self, s: S) -> Self {
+        self.docs.push(Doc::text(s));
+        self
+    }
+    
+    /// Add space
+    pub fn space(mut self) -> Self {
+        self.docs.push(Doc::space());
+        self
+    }
+    
+    /// Add line
+    pub fn line(mut self) -> Self {
+        self.docs.push(Doc::line());
+        self
+    }
+    
+    /// Add hard line
+    pub fn hardline(mut self) -> Self {
+        self.docs.push(Doc::hardline());
+        self
+    }
+    
+    /// Add soft line
+    pub fn softline(mut self) -> Self {
+        self.docs.push(Doc::softline());
+        self
+    }
+    
+    /// Add document
+    pub fn doc(mut self, d: Doc) -> Self {
+        self.docs.push(d);
+        self
+    }
+    
+    /// Add optional document
+    pub fn maybe_doc(self, d: Option<Doc>) -> Self {
+        match d {
+            Some(doc) => self.doc(doc),
+            None => self,
+        }
+    }
+    
+    /// Add document conditionally
+    pub fn when(self, condition: bool, d: Doc) -> Self {
+        if condition {
+            self.doc(d)
+        } else {
+            self
+        }
+    }
+    
+    /// Build final document
+    pub fn build(self) -> Doc {
+        if self.docs.is_empty() {
+            Doc::Nil
+        } else {
+            let mut result = self.docs[0].clone();
+            for doc in self.docs.into_iter().skip(1) {
+                result = result.concat(doc);
+            }
+            result
+        }
+    }
+    
+    /// Build and group
+    pub fn group(self) -> Doc {
+        self.build().group()
+    }
+    
+    /// Build and nest
+    pub fn nest(self, indent: i32) -> Doc {
+        self.build().nest(indent)
+    }
+}
+
+impl Default for DocBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONVENIENCE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Format document with default config
+pub fn format(doc: &Doc) -> String {
+    let mut printer = Printer::new(Config::default());
+    printer.print(doc)
+}
+
+/// Format document with config
+pub fn format_with_config(doc: &Doc, config: Config) -> String {
+    let mut printer = Printer::new(config);
+    printer.print(doc)
+}
+
+/// Create a list with brackets and separators
+pub fn list(
+    open: &str,
+    close: &str,
+    sep: Doc,
+    items: Vec<Doc>,
+    trailing: bool,
+) -> Doc {
+    if items.is_empty() {
+        return Doc::text(open).concat(Doc::text(close));
+    }
+    
+    let inner = Doc::join(items, sep.clone().concat(Doc::line()));
+    let trailing_sep = if trailing { sep } else { Doc::Nil };
+    
+    Doc::text(open)
+        .concat(
+            Doc::line()
+                .concat(inner)
+                .concat(trailing_sep)
+                .nest(4)
+        )
+        .concat(Doc::line())
+        .concat(Doc::text(close))
+        .group()
+}
+
+/// Create a block with braces
+pub fn block(content: Doc) -> Doc {
+    Doc::text("{")
+        .concat(Doc::hardline().concat(content).nest(4))
+        .concat(Doc::hardline())
+        .concat(Doc::text("}"))
+}
+
+/// Create inline block
+pub fn inline_block(content: Doc) -> Doc {
+    Doc::text("{")
+        .concat(Doc::space())
+        .concat(content)
+        .concat(Doc::space())
+        .concat(Doc::text("}"))
+        .group()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_simple_text() {
+        let doc = Doc::text("hello world");
+        assert_eq!(format(&doc), "hello world\n");
+    }
+    
+    #[test]
+    fn test_concat() {
+        let doc = Doc::text("hello").concat(Doc::space()).concat(Doc::text("world"));
+        assert_eq!(format(&doc), "hello world\n");
+    }
+    
+    #[test]
+    fn test_group_fits() {
+        let doc = Doc::text("a")
+            .concat(Doc::line())
+            .concat(Doc::text("b"))
+            .group();
+        assert_eq!(format(&doc), "a b\n");
+    }
+    
+    #[test]
+    fn test_group_breaks() {
+        let mut config = Config::default();
+        config.max_width = 5;
+        
+        let doc = Doc::text("hello")
+            .concat(Doc::line())
+            .concat(Doc::text("world"))
+            .group();
+        
+        let result = format_with_config(&doc, config);
+        assert!(result.contains('\n'));
+    }
+    
+    #[test]
+    fn test_nest() {
+        let doc = Doc::text("{")
+            .concat(Doc::hardline().concat(Doc::text("body")).nest(4))
+            .concat(Doc::hardline())
+            .concat(Doc::text("}"));
+        
+        let result = format(&doc);
+        assert!(result.contains("    body"));
+    }
+    
+    #[test]
+    fn test_builder() {
+        let doc = DocBuilder::new()
+            .text("fn")
+            .space()
+            .text("main")
+            .text("()")
+            .build();
+        
+        assert_eq!(format(&doc), "fn main()\n");
+    }
+    
+    #[test]
+    fn test_list() {
+        let items = vec![
+            Doc::text("a"),
+            Doc::text("b"),
+            Doc::text("c"),
+        ];
+        
+        let doc = list("[", "]", Doc::text(","), items, true);
+        let result = format(&doc);
+        assert!(result.contains("["));
+        assert!(result.contains("]"));
+    }
+}

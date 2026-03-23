@@ -1,0 +1,1138 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Optimization Pipeline Manager
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Optimization pipeline infrastructure:
+//   - Pass manager
+//   - Pass scheduling
+//   - Pass dependencies
+//   - Pass statistics
+//   - Optimization levels
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::pipeline
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OPTIMIZATION LEVELS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Optimization level
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OptLevel {
+    /// No optimization
+    O0,
+    /// Basic optimization
+    O1,
+    /// Standard optimization
+    O2,
+    /// Aggressive optimization
+    O3,
+    /// Size optimization
+    Os,
+    /// Aggressive size optimization
+    Oz,
+}
+
+impl OptLevel {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "0" | "O0" => Some(OptLevel::O0),
+            "1" | "O1" => Some(OptLevel::O1),
+            "2" | "O2" => Some(OptLevel::O2),
+            "3" | "O3" => Some(OptLevel::O3),
+            "s" | "Os" => Some(OptLevel::Os),
+            "z" | "Oz" => Some(OptLevel::Oz),
+            _ => None,
+        }
+    }
+    
+    pub fn inline_threshold(&self) -> i32 {
+        match self {
+            OptLevel::O0 => 0,
+            OptLevel::O1 => 150,
+            OptLevel::O2 => 250,
+            OptLevel::O3 => 500,
+            OptLevel::Os => 75,
+            OptLevel::Oz => 25,
+        }
+    }
+    
+    pub fn unroll_threshold(&self) -> u32 {
+        match self {
+            OptLevel::O0 | OptLevel::Os | OptLevel::Oz => 0,
+            OptLevel::O1 => 50,
+            OptLevel::O2 => 200,
+            OptLevel::O3 => 400,
+        }
+    }
+    
+    pub fn vectorize(&self) -> bool {
+        matches!(self, OptLevel::O2 | OptLevel::O3)
+    }
+    
+    pub fn lto_mode(&self) -> LtoMode {
+        match self {
+            OptLevel::O3 => LtoMode::Full,
+            OptLevel::O2 | OptLevel::Os => LtoMode::Thin,
+            _ => LtoMode::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LtoMode {
+    None,
+    Thin,
+    Full,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PASS INTERFACE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Pass result
+#[derive(Debug, Clone)]
+pub struct PassResult {
+    /// Whether the pass modified the IR
+    pub modified: bool,
+    /// Number of transformations applied
+    pub transformations: u32,
+    /// Execution time
+    pub duration: Duration,
+    /// Pass-specific statistics
+    pub stats: BTreeMap<String, u64>,
+}
+
+impl PassResult {
+    pub fn unchanged() -> Self {
+        PassResult {
+            modified: false,
+            transformations: 0,
+            duration: Duration::ZERO,
+            stats: BTreeMap::new(),
+        }
+    }
+    
+    pub fn changed(transformations: u32) -> Self {
+        PassResult {
+            modified: true,
+            transformations,
+            duration: Duration::ZERO,
+            stats: BTreeMap::new(),
+        }
+    }
+    
+    pub fn with_stat(mut self, name: impl Into<String>, value: u64) -> Self {
+        self.stats.insert(name.into(), value);
+        self
+    }
+}
+
+/// Pass trait for function passes
+pub trait FunctionPass: Send + Sync {
+    /// Pass name
+    fn name(&self) -> &str;
+    
+    /// Run the pass on a function
+    fn run(&mut self, func: &mut MirFunction, ctx: &PassContext) -> PassResult;
+    
+    /// Pass dependencies
+    fn dependencies(&self) -> Vec<&str> {
+        Vec::new()
+    }
+    
+    /// Passes invalidated by this pass
+    fn invalidates(&self) -> Vec<&str> {
+        Vec::new()
+    }
+    
+    /// Whether this pass preserves CFG
+    fn preserves_cfg(&self) -> bool {
+        true
+    }
+}
+
+/// Pass trait for module passes
+pub trait ModulePass: Send + Sync {
+    /// Pass name
+    fn name(&self) -> &str;
+    
+    /// Run the pass on a module
+    fn run(&mut self, module: &mut MirModule, ctx: &PassContext) -> PassResult;
+    
+    /// Pass dependencies
+    fn dependencies(&self) -> Vec<&str> {
+        Vec::new()
+    }
+    
+    /// Passes invalidated by this pass
+    fn invalidates(&self) -> Vec<&str> {
+        Vec::new()
+    }
+}
+
+/// Pass context provides shared state for passes
+#[derive(Debug)]
+pub struct PassContext {
+    /// Optimization level
+    pub opt_level: OptLevel,
+    /// Target information
+    pub target: TargetInfo,
+    /// Analysis results cache
+    analyses: BTreeMap<String, Arc<dyn std::any::Any + Send + Sync>>,
+    /// Debug output enabled
+    pub debug: bool,
+    /// Statistics collection enabled
+    pub collect_stats: bool,
+}
+
+impl PassContext {
+    pub fn new(opt_level: OptLevel, target: TargetInfo) -> Self {
+        PassContext {
+            opt_level,
+            target,
+            analyses: BTreeMap::new(),
+            debug: false,
+            collect_stats: true,
+        }
+    }
+    
+    /// Cache an analysis result
+    pub fn cache_analysis<T: std::any::Any + Send + Sync>(&mut self, name: &str, analysis: T) {
+        self.analyses.insert(name.to_string(), Arc::new(analysis));
+    }
+    
+    /// Get a cached analysis result
+    pub fn get_analysis<T: std::any::Any + Send + Sync + Clone>(&self, name: &str) -> Option<T> {
+        self.analyses.get(name)
+            .and_then(|a| a.downcast_ref::<T>().cloned())
+    }
+    
+    /// Invalidate an analysis
+    pub fn invalidate(&mut self, name: &str) {
+        self.analyses.remove(name);
+    }
+    
+    /// Invalidate all analyses
+    pub fn invalidate_all(&mut self) {
+        self.analyses.clear();
+    }
+}
+
+/// Target information for optimization decisions
+#[derive(Debug, Clone)]
+pub struct TargetInfo {
+    /// Target triple
+    pub triple: String,
+    /// Pointer size in bytes
+    pub pointer_size: u32,
+    /// Vector width in bits
+    pub vector_width: u32,
+    /// Cache line size
+    pub cache_line_size: u32,
+    /// Has hardware division
+    pub has_hw_div: bool,
+    /// Has hardware FMA
+    pub has_fma: bool,
+}
+
+impl Default for TargetInfo {
+    fn default() -> Self {
+        TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".to_string(),
+            pointer_size: 8,
+            vector_width: 256,
+            cache_line_size: 64,
+            has_hw_div: true,
+            has_fma: true,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PASS MANAGER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Function pass manager
+pub struct FunctionPassManager {
+    /// Registered passes
+    passes: Vec<Box<dyn FunctionPass>>,
+    /// Pass context
+    ctx: PassContext,
+    /// Statistics
+    stats: PipelineStats,
+}
+
+impl FunctionPassManager {
+    pub fn new(ctx: PassContext) -> Self {
+        FunctionPassManager {
+            passes: Vec::new(),
+            ctx,
+            stats: PipelineStats::new(),
+        }
+    }
+    
+    /// Add a pass to the pipeline
+    pub fn add_pass<P: FunctionPass + 'static>(&mut self, pass: P) {
+        self.passes.push(Box::new(pass));
+    }
+    
+    /// Run all passes on a function
+    pub fn run(&mut self, func: &mut MirFunction) -> PipelineResult {
+        let start = Instant::now();
+        let mut total_transformations = 0;
+        let mut modified = false;
+        
+        for pass in &mut self.passes {
+            let pass_start = Instant::now();
+            
+            let result = pass.run(func, &self.ctx);
+            
+            let duration = pass_start.elapsed();
+            
+            if result.modified {
+                modified = true;
+                total_transformations += result.transformations;
+                
+                // Invalidate analyses affected by this pass
+                for inv in pass.invalidates() {
+                    self.ctx.invalidate(inv);
+                }
+                
+                if !pass.preserves_cfg() {
+                    self.ctx.invalidate("cfg");
+                    self.ctx.invalidate("dom_tree");
+                    self.ctx.invalidate("loop_info");
+                }
+            }
+            
+            self.stats.record_pass(pass.name(), &result, duration);
+        }
+        
+        PipelineResult {
+            modified,
+            total_transformations,
+            total_duration: start.elapsed(),
+            pass_results: self.stats.pass_stats.clone(),
+        }
+    }
+    
+    /// Run passes until fixed point
+    pub fn run_until_fixed_point(&mut self, func: &mut MirFunction, max_iterations: u32) -> PipelineResult {
+        let start = Instant::now();
+        let mut total_transformations = 0;
+        let mut iterations = 0;
+        
+        loop {
+            let mut modified = false;
+            
+            for pass in &mut self.passes {
+                let result = pass.run(func, &self.ctx);
+                
+                if result.modified {
+                    modified = true;
+                    total_transformations += result.transformations;
+                    
+                    for inv in pass.invalidates() {
+                        self.ctx.invalidate(inv);
+                    }
+                }
+            }
+            
+            iterations += 1;
+            
+            if !modified || iterations >= max_iterations {
+                break;
+            }
+        }
+        
+        PipelineResult {
+            modified: total_transformations > 0,
+            total_transformations,
+            total_duration: start.elapsed(),
+            pass_results: self.stats.pass_stats.clone(),
+        }
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &PipelineStats {
+        &self.stats
+    }
+}
+
+/// Module pass manager
+pub struct ModulePassManager {
+    /// Registered passes
+    passes: Vec<Box<dyn ModulePass>>,
+    /// Function pass manager to run on each function
+    function_pm: Option<FunctionPassManager>,
+    /// Pass context
+    ctx: PassContext,
+    /// Statistics
+    stats: PipelineStats,
+}
+
+impl ModulePassManager {
+    pub fn new(ctx: PassContext) -> Self {
+        ModulePassManager {
+            passes: Vec::new(),
+            function_pm: None,
+            ctx,
+            stats: PipelineStats::new(),
+        }
+    }
+    
+    /// Add a module pass
+    pub fn add_pass<P: ModulePass + 'static>(&mut self, pass: P) {
+        self.passes.push(Box::new(pass));
+    }
+    
+    /// Set function pass manager
+    pub fn set_function_pm(&mut self, pm: FunctionPassManager) {
+        self.function_pm = Some(pm);
+    }
+    
+    /// Run all passes on a module
+    pub fn run(&mut self, module: &mut MirModule) -> PipelineResult {
+        let start = Instant::now();
+        let mut total_transformations = 0;
+        let mut modified = false;
+        
+        // Run module passes
+        for pass in &mut self.passes {
+            let pass_start = Instant::now();
+            
+            let result = pass.run(module, &self.ctx);
+            
+            let duration = pass_start.elapsed();
+            
+            if result.modified {
+                modified = true;
+                total_transformations += result.transformations;
+                
+                for inv in pass.invalidates() {
+                    self.ctx.invalidate(inv);
+                }
+            }
+            
+            self.stats.record_pass(pass.name(), &result, duration);
+        }
+        
+        // Run function passes on each function
+        if let Some(ref mut fpm) = self.function_pm {
+            for func in &mut module.functions {
+                let result = fpm.run(func);
+                
+                if result.modified {
+                    modified = true;
+                    total_transformations += result.total_transformations;
+                }
+            }
+        }
+        
+        PipelineResult {
+            modified,
+            total_transformations,
+            total_duration: start.elapsed(),
+            pass_results: self.stats.pass_stats.clone(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PIPELINE STATISTICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Pipeline execution result
+#[derive(Debug, Clone)]
+pub struct PipelineResult {
+    /// Whether any pass modified the IR
+    pub modified: bool,
+    /// Total number of transformations
+    pub total_transformations: u32,
+    /// Total execution time
+    pub total_duration: Duration,
+    /// Per-pass results
+    pub pass_results: BTreeMap<String, PassStats>,
+}
+
+/// Per-pass statistics
+#[derive(Debug, Clone, Default)]
+pub struct PassStats {
+    /// Number of times the pass ran
+    pub runs: u32,
+    /// Total transformations
+    pub transformations: u32,
+    /// Total execution time
+    pub duration: Duration,
+    /// Custom statistics
+    pub custom: BTreeMap<String, u64>,
+}
+
+/// Pipeline statistics collector
+#[derive(Debug, Clone)]
+pub struct PipelineStats {
+    /// Per-pass statistics
+    pub pass_stats: BTreeMap<String, PassStats>,
+    /// Total passes run
+    pub total_passes: u32,
+    /// Total time
+    pub total_time: Duration,
+}
+
+impl PipelineStats {
+    pub fn new() -> Self {
+        PipelineStats {
+            pass_stats: BTreeMap::new(),
+            total_passes: 0,
+            total_time: Duration::ZERO,
+        }
+    }
+    
+    /// Record a pass execution
+    pub fn record_pass(&mut self, name: &str, result: &PassResult, duration: Duration) {
+        let stats = self.pass_stats.entry(name.to_string()).or_default();
+        
+        stats.runs += 1;
+        stats.transformations += result.transformations;
+        stats.duration += duration;
+        
+        for (k, v) in &result.stats {
+            *stats.custom.entry(k.clone()).or_default() += v;
+        }
+        
+        self.total_passes += 1;
+        self.total_time += duration;
+    }
+    
+    /// Print statistics report
+    pub fn report(&self) -> String {
+        let mut report = String::new();
+        
+        report.push_str("=== Optimization Pipeline Statistics ===\n\n");
+        
+        report.push_str(&format!("Total passes run: {}\n", self.total_passes));
+        report.push_str(&format!("Total time: {:?}\n\n", self.total_time));
+        
+        report.push_str("Per-pass breakdown:\n");
+        report.push_str("-".repeat(60).as_str());
+        report.push('\n');
+        
+        for (name, stats) in &self.pass_stats {
+            report.push_str(&format!(
+                "{}: {} runs, {} transforms, {:?}\n",
+                name, stats.runs, stats.transformations, stats.duration
+            ));
+            
+            for (key, value) in &stats.custom {
+                report.push_str(&format!("  {}: {}\n", key, value));
+            }
+        }
+        
+        report
+    }
+}
+
+impl Default for PipelineStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STANDARD PIPELINES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Build a standard optimization pipeline
+pub fn build_standard_pipeline(opt_level: OptLevel, target: TargetInfo) -> ModulePassManager {
+    let ctx = PassContext::new(opt_level, target);
+    let mut mpm = ModulePassManager::new(ctx.clone());
+    let mut fpm = FunctionPassManager::new(ctx);
+    
+    match opt_level {
+        OptLevel::O0 => {
+            // Minimal passes for debug builds
+            fpm.add_pass(SimplifyCfgPass::new());
+        }
+        OptLevel::O1 => {
+            // Basic optimizations
+            fpm.add_pass(SimplifyCfgPass::new());
+            fpm.add_pass(ConstantFoldingPass::new());
+            fpm.add_pass(DeadCodeEliminationPass::new());
+            fpm.add_pass(CopyPropagationPass::new());
+        }
+        OptLevel::O2 => {
+            // Standard optimizations
+            fpm.add_pass(SimplifyCfgPass::new());
+            fpm.add_pass(ConstantFoldingPass::new());
+            fpm.add_pass(ScalarReplacementPass::new());
+            fpm.add_pass(GvnPass::new());
+            fpm.add_pass(LicmPass::new());
+            fpm.add_pass(DeadCodeEliminationPass::new());
+            fpm.add_pass(LoopUnrollPass::new(200));
+            fpm.add_pass(SimplifyCfgPass::new());
+            
+            mpm.add_pass(InliningPass::new(250));
+            mpm.add_pass(GlobalDcePass::new());
+        }
+        OptLevel::O3 => {
+            // Aggressive optimizations
+            fpm.add_pass(SimplifyCfgPass::new());
+            fpm.add_pass(ConstantFoldingPass::new());
+            fpm.add_pass(ScalarReplacementPass::new());
+            fpm.add_pass(GvnPass::new());
+            fpm.add_pass(LicmPass::new());
+            fpm.add_pass(LoopVectorizePass::new());
+            fpm.add_pass(SlpVectorizePass::new());
+            fpm.add_pass(DeadCodeEliminationPass::new());
+            fpm.add_pass(LoopUnrollPass::new(400));
+            fpm.add_pass(SimplifyCfgPass::new());
+            
+            mpm.add_pass(InliningPass::new(500));
+            mpm.add_pass(GlobalDcePass::new());
+            mpm.add_pass(ArgumentPromotionPass::new());
+            mpm.add_pass(IpConstPropPass::new());
+        }
+        OptLevel::Os | OptLevel::Oz => {
+            // Size optimizations
+            fpm.add_pass(SimplifyCfgPass::new());
+            fpm.add_pass(ConstantFoldingPass::new());
+            fpm.add_pass(DeadCodeEliminationPass::new());
+            fpm.add_pass(MergeFunctionsPass::new());
+            
+            mpm.add_pass(InliningPass::new(if opt_level == OptLevel::Oz { 25 } else { 75 }));
+            mpm.add_pass(GlobalDcePass::new());
+        }
+    }
+    
+    mpm.set_function_pm(fpm);
+    mpm
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STANDARD PASSES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Simplify CFG pass
+pub struct SimplifyCfgPass;
+
+impl SimplifyCfgPass {
+    pub fn new() -> Self {
+        SimplifyCfgPass
+    }
+}
+
+impl FunctionPass for SimplifyCfgPass {
+    fn name(&self) -> &str {
+        "simplify-cfg"
+    }
+    
+    fn run(&mut self, func: &mut MirFunction, _ctx: &PassContext) -> PassResult {
+        // Would simplify control flow graph
+        PassResult::unchanged()
+    }
+    
+    fn preserves_cfg(&self) -> bool {
+        false
+    }
+}
+
+impl Default for SimplifyCfgPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Constant folding pass
+pub struct ConstantFoldingPass;
+
+impl ConstantFoldingPass {
+    pub fn new() -> Self {
+        ConstantFoldingPass
+    }
+}
+
+impl FunctionPass for ConstantFoldingPass {
+    fn name(&self) -> &str {
+        "constant-folding"
+    }
+    
+    fn run(&mut self, _func: &mut MirFunction, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+}
+
+impl Default for ConstantFoldingPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Dead code elimination pass
+pub struct DeadCodeEliminationPass;
+
+impl DeadCodeEliminationPass {
+    pub fn new() -> Self {
+        DeadCodeEliminationPass
+    }
+}
+
+impl FunctionPass for DeadCodeEliminationPass {
+    fn name(&self) -> &str {
+        "dce"
+    }
+    
+    fn run(&mut self, _func: &mut MirFunction, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+}
+
+impl Default for DeadCodeEliminationPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Copy propagation pass
+pub struct CopyPropagationPass;
+
+impl CopyPropagationPass {
+    pub fn new() -> Self {
+        CopyPropagationPass
+    }
+}
+
+impl FunctionPass for CopyPropagationPass {
+    fn name(&self) -> &str {
+        "copy-propagation"
+    }
+    
+    fn run(&mut self, _func: &mut MirFunction, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+}
+
+impl Default for CopyPropagationPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Scalar replacement pass (SROA)
+pub struct ScalarReplacementPass;
+
+impl ScalarReplacementPass {
+    pub fn new() -> Self {
+        ScalarReplacementPass
+    }
+}
+
+impl FunctionPass for ScalarReplacementPass {
+    fn name(&self) -> &str {
+        "sroa"
+    }
+    
+    fn run(&mut self, _func: &mut MirFunction, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+}
+
+impl Default for ScalarReplacementPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// GVN pass
+pub struct GvnPass;
+
+impl GvnPass {
+    pub fn new() -> Self {
+        GvnPass
+    }
+}
+
+impl FunctionPass for GvnPass {
+    fn name(&self) -> &str {
+        "gvn"
+    }
+    
+    fn run(&mut self, _func: &mut MirFunction, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+    
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["dom_tree"]
+    }
+}
+
+impl Default for GvnPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// LICM pass
+pub struct LicmPass;
+
+impl LicmPass {
+    pub fn new() -> Self {
+        LicmPass
+    }
+}
+
+impl FunctionPass for LicmPass {
+    fn name(&self) -> &str {
+        "licm"
+    }
+    
+    fn run(&mut self, _func: &mut MirFunction, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+    
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["loop_info", "alias_analysis"]
+    }
+}
+
+impl Default for LicmPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Loop unroll pass
+pub struct LoopUnrollPass {
+    threshold: u32,
+}
+
+impl LoopUnrollPass {
+    pub fn new(threshold: u32) -> Self {
+        LoopUnrollPass { threshold }
+    }
+}
+
+impl FunctionPass for LoopUnrollPass {
+    fn name(&self) -> &str {
+        "loop-unroll"
+    }
+    
+    fn run(&mut self, _func: &mut MirFunction, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+    
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["loop_info", "scalar_evolution"]
+    }
+    
+    fn preserves_cfg(&self) -> bool {
+        false
+    }
+}
+
+/// Loop vectorize pass
+pub struct LoopVectorizePass;
+
+impl LoopVectorizePass {
+    pub fn new() -> Self {
+        LoopVectorizePass
+    }
+}
+
+impl FunctionPass for LoopVectorizePass {
+    fn name(&self) -> &str {
+        "loop-vectorize"
+    }
+    
+    fn run(&mut self, _func: &mut MirFunction, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+    
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["loop_info", "alias_analysis", "scalar_evolution"]
+    }
+    
+    fn preserves_cfg(&self) -> bool {
+        false
+    }
+}
+
+impl Default for LoopVectorizePass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// SLP vectorize pass
+pub struct SlpVectorizePass;
+
+impl SlpVectorizePass {
+    pub fn new() -> Self {
+        SlpVectorizePass
+    }
+}
+
+impl FunctionPass for SlpVectorizePass {
+    fn name(&self) -> &str {
+        "slp-vectorize"
+    }
+    
+    fn run(&mut self, _func: &mut MirFunction, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+    
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["alias_analysis"]
+    }
+}
+
+impl Default for SlpVectorizePass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Merge functions pass
+pub struct MergeFunctionsPass;
+
+impl MergeFunctionsPass {
+    pub fn new() -> Self {
+        MergeFunctionsPass
+    }
+}
+
+impl FunctionPass for MergeFunctionsPass {
+    fn name(&self) -> &str {
+        "merge-functions"
+    }
+    
+    fn run(&mut self, _func: &mut MirFunction, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+}
+
+impl Default for MergeFunctionsPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Module passes
+
+/// Inlining pass
+pub struct InliningPass {
+    threshold: i32,
+}
+
+impl InliningPass {
+    pub fn new(threshold: i32) -> Self {
+        InliningPass { threshold }
+    }
+}
+
+impl ModulePass for InliningPass {
+    fn name(&self) -> &str {
+        "inline"
+    }
+    
+    fn run(&mut self, _module: &mut MirModule, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+    
+    fn invalidates(&self) -> Vec<&str> {
+        vec!["call_graph"]
+    }
+}
+
+/// Global DCE pass
+pub struct GlobalDcePass;
+
+impl GlobalDcePass {
+    pub fn new() -> Self {
+        GlobalDcePass
+    }
+}
+
+impl ModulePass for GlobalDcePass {
+    fn name(&self) -> &str {
+        "global-dce"
+    }
+    
+    fn run(&mut self, _module: &mut MirModule, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+}
+
+impl Default for GlobalDcePass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Argument promotion pass
+pub struct ArgumentPromotionPass;
+
+impl ArgumentPromotionPass {
+    pub fn new() -> Self {
+        ArgumentPromotionPass
+    }
+}
+
+impl ModulePass for ArgumentPromotionPass {
+    fn name(&self) -> &str {
+        "argument-promotion"
+    }
+    
+    fn run(&mut self, _module: &mut MirModule, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+    
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["call_graph", "alias_analysis"]
+    }
+}
+
+impl Default for ArgumentPromotionPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Interprocedural constant propagation pass
+pub struct IpConstPropPass;
+
+impl IpConstPropPass {
+    pub fn new() -> Self {
+        IpConstPropPass
+    }
+}
+
+impl ModulePass for IpConstPropPass {
+    fn name(&self) -> &str {
+        "ip-const-prop"
+    }
+    
+    fn run(&mut self, _module: &mut MirModule, _ctx: &PassContext) -> PassResult {
+        PassResult::unchanged()
+    }
+    
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["call_graph"]
+    }
+}
+
+impl Default for IpConstPropPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirModule {
+    pub functions: Vec<MirFunction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Nop,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Switch { value: MirOperand, targets: Vec<(i64, u32)>, default: u32 },
+    Return { value: Option<MirOperand> },
+    Unreachable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_opt_level() {
+        assert_eq!(OptLevel::from_str("O2"), Some(OptLevel::O2));
+        assert_eq!(OptLevel::from_str("3"), Some(OptLevel::O3));
+        
+        assert!(OptLevel::O3.inline_threshold() > OptLevel::O2.inline_threshold());
+        assert!(OptLevel::O2.vectorize());
+        assert!(!OptLevel::O1.vectorize());
+    }
+    
+    #[test]
+    fn test_pass_result() {
+        let result = PassResult::changed(5)
+            .with_stat("loads_eliminated", 3)
+            .with_stat("stores_eliminated", 2);
+        
+        assert!(result.modified);
+        assert_eq!(result.transformations, 5);
+        assert_eq!(result.stats.get("loads_eliminated"), Some(&3));
+    }
+    
+    #[test]
+    fn test_pipeline_stats() {
+        let mut stats = PipelineStats::new();
+        
+        let result = PassResult::changed(10);
+        stats.record_pass("test-pass", &result, Duration::from_millis(100));
+        
+        assert_eq!(stats.total_passes, 1);
+        assert!(stats.pass_stats.contains_key("test-pass"));
+    }
+    
+    #[test]
+    fn test_build_pipeline() {
+        let target = TargetInfo::default();
+        let _mpm = build_standard_pipeline(OptLevel::O2, target);
+    }
+}

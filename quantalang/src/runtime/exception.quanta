@@ -1,0 +1,827 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Exception Runtime
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Exception handling runtime:
+//   - Zero-cost exception tables
+//   - Unwinding support
+//   - Cleanup actions
+//   - Personality routines
+//   - Platform-specific unwinders
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::runtime::exception
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use core::sync::atomic::{AtomicPtr, AtomicBool, Ordering};
+use core::ptr::NonNull;
+use core::mem;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXCEPTION TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Exception type ID
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExceptionTypeId(pub u64);
+
+impl ExceptionTypeId {
+    /// Generate from type name
+    pub fn from_name(name: &str) -> Self {
+        // FNV-1a hash
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in name.bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        ExceptionTypeId(hash)
+    }
+    
+    /// Matches another type (including inheritance)
+    pub fn matches(&self, other: ExceptionTypeId, type_info: &TypeHierarchy) -> bool {
+        if *self == other {
+            return true;
+        }
+        type_info.is_subtype_of(other, *self)
+    }
+}
+
+/// Type hierarchy for exception matching
+pub struct TypeHierarchy {
+    /// Parent type for each type
+    parents: Vec<(ExceptionTypeId, ExceptionTypeId)>,
+}
+
+impl TypeHierarchy {
+    pub fn new() -> Self {
+        TypeHierarchy { parents: Vec::new() }
+    }
+    
+    pub fn add_parent(&mut self, child: ExceptionTypeId, parent: ExceptionTypeId) {
+        self.parents.push((child, parent));
+    }
+    
+    pub fn is_subtype_of(&self, child: ExceptionTypeId, ancestor: ExceptionTypeId) -> bool {
+        let mut current = child;
+        
+        for _ in 0..100 { // Depth limit
+            if current == ancestor {
+                return true;
+            }
+            
+            if let Some((_, parent)) = self.parents.iter().find(|(c, _)| *c == current) {
+                current = *parent;
+            } else {
+                break;
+            }
+        }
+        
+        false
+    }
+}
+
+impl Default for TypeHierarchy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXCEPTION OBJECT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Exception object header
+#[repr(C)]
+pub struct ExceptionHeader {
+    /// Exception type
+    pub type_id: ExceptionTypeId,
+    /// Exception class (language identifier)
+    pub exception_class: u64,
+    /// Cleanup function
+    pub cleanup: Option<unsafe fn(*mut ExceptionHeader)>,
+    /// Personality routine
+    pub personality: Option<PersonalityFn>,
+    /// Language-specific data
+    pub lsda: *const u8,
+    /// Caught flag
+    pub caught: bool,
+    /// Re-throw count
+    pub rethrow_count: u32,
+    /// Stack trace
+    pub stack_trace: *const StackTrace,
+}
+
+/// Personality function type
+pub type PersonalityFn = unsafe fn(
+    version: i32,
+    actions: UnwindAction,
+    exception_class: u64,
+    exception: *mut ExceptionHeader,
+    context: *mut UnwindContext,
+) -> UnwindReasonCode;
+
+/// Stack trace
+pub struct StackTrace {
+    /// Frames
+    pub frames: Vec<StackFrame>,
+    /// Captured
+    pub captured: bool,
+}
+
+/// Stack frame in trace
+#[derive(Debug, Clone)]
+pub struct StackFrame {
+    /// Instruction pointer
+    pub ip: usize,
+    /// Frame pointer
+    pub fp: usize,
+    /// Function name (if available)
+    pub function: Option<String>,
+    /// File name
+    pub file: Option<String>,
+    /// Line number
+    pub line: Option<u32>,
+}
+
+impl ExceptionHeader {
+    /// Create new exception header
+    pub fn new(type_id: ExceptionTypeId) -> Self {
+        ExceptionHeader {
+            type_id,
+            exception_class: QUANTA_EXCEPTION_CLASS,
+            cleanup: None,
+            personality: None,
+            lsda: core::ptr::null(),
+            caught: false,
+            rethrow_count: 0,
+            stack_trace: core::ptr::null(),
+        }
+    }
+    
+    /// Get exception data pointer
+    pub fn data(&self) -> *mut u8 {
+        unsafe {
+            (self as *const ExceptionHeader as *mut u8)
+                .add(mem::size_of::<ExceptionHeader>())
+        }
+    }
+}
+
+/// QuantaLang exception class identifier
+pub const QUANTA_EXCEPTION_CLASS: u64 = 0x514E5441_00000001; // "QNTA" + version
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UNWINDING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unwind action flags
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+pub struct UnwindAction(pub u32);
+
+impl UnwindAction {
+    pub const SEARCH_PHASE: UnwindAction = UnwindAction(1);
+    pub const CLEANUP_PHASE: UnwindAction = UnwindAction(2);
+    pub const HANDLER_FRAME: UnwindAction = UnwindAction(4);
+    pub const FORCE_UNWIND: UnwindAction = UnwindAction(8);
+    
+    pub fn is_search(&self) -> bool { (self.0 & 1) != 0 }
+    pub fn is_cleanup(&self) -> bool { (self.0 & 2) != 0 }
+    pub fn is_handler(&self) -> bool { (self.0 & 4) != 0 }
+    pub fn is_forced(&self) -> bool { (self.0 & 8) != 0 }
+}
+
+/// Unwind reason code
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum UnwindReasonCode {
+    NoReason = 0,
+    ForeignExceptionCaught = 1,
+    FatalPhase2Error = 2,
+    FatalPhase1Error = 3,
+    NormalStop = 4,
+    EndOfStack = 5,
+    HandlerFound = 6,
+    InstallContext = 7,
+    ContinueUnwind = 8,
+}
+
+/// Unwind context (platform-specific)
+#[repr(C)]
+pub struct UnwindContext {
+    /// General registers
+    pub regs: [u64; 32],
+    /// Instruction pointer
+    pub ip: u64,
+    /// Stack pointer
+    pub sp: u64,
+    /// Frame pointer
+    pub fp: u64,
+    /// Return address
+    pub ra: u64,
+    /// Current CFA
+    pub cfa: u64,
+}
+
+impl UnwindContext {
+    pub fn new() -> Self {
+        UnwindContext {
+            regs: [0; 32],
+            ip: 0,
+            sp: 0,
+            fp: 0,
+            ra: 0,
+            cfa: 0,
+        }
+    }
+    
+    /// Get register value
+    pub fn get_reg(&self, reg: u32) -> u64 {
+        self.regs.get(reg as usize).copied().unwrap_or(0)
+    }
+    
+    /// Set register value
+    pub fn set_reg(&mut self, reg: u32, value: u64) {
+        if let Some(r) = self.regs.get_mut(reg as usize) {
+            *r = value;
+        }
+    }
+    
+    /// Get IP
+    pub fn get_ip(&self) -> u64 {
+        self.ip
+    }
+    
+    /// Set IP
+    pub fn set_ip(&mut self, ip: u64) {
+        self.ip = ip;
+    }
+}
+
+impl Default for UnwindContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXCEPTION TABLES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Exception table entry (LSDA format)
+#[repr(C, packed)]
+pub struct ExceptionTableEntry {
+    /// Start of region
+    pub start: i32,
+    /// Length of region
+    pub length: i32,
+    /// Landing pad offset
+    pub landing_pad: i32,
+    /// Action table index (0 = cleanup only)
+    pub action: u32,
+}
+
+/// Action table entry
+#[repr(C, packed)]
+pub struct ActionEntry {
+    /// Type filter (positive = catch, negative = spec)
+    pub type_filter: i32,
+    /// Next action offset (0 = end)
+    pub next: i32,
+}
+
+/// Call site table
+#[repr(C)]
+pub struct CallSiteTable {
+    /// Encoding
+    pub encoding: u8,
+    /// Table length
+    pub length: u32,
+    /// Entries
+    pub entries: Vec<CallSiteEntry>,
+}
+
+/// Call site entry
+#[repr(C)]
+pub struct CallSiteEntry {
+    /// Region start
+    pub start: usize,
+    /// Region length
+    pub length: usize,
+    /// Landing pad
+    pub landing_pad: usize,
+    /// Action offset
+    pub action: usize,
+}
+
+/// Language-specific data area
+pub struct LSDA {
+    /// Landing pad base
+    pub lp_base: usize,
+    /// Type table encoding
+    pub tt_encoding: u8,
+    /// Type table pointer
+    pub type_table: *const *const TypeInfo,
+    /// Call site table
+    pub call_sites: CallSiteTable,
+    /// Action table
+    pub actions: Vec<ActionEntry>,
+}
+
+/// Type info for exception matching
+#[repr(C)]
+pub struct TypeInfo {
+    /// Type ID
+    pub type_id: ExceptionTypeId,
+    /// Type name
+    pub name: *const u8,
+    /// Parent type (for inheritance)
+    pub parent: *const TypeInfo,
+}
+
+impl LSDA {
+    /// Parse LSDA from raw data
+    pub unsafe fn parse(data: *const u8, base: usize) -> Option<Self> {
+        if data.is_null() {
+            return None;
+        }
+        
+        let mut ptr = data;
+        
+        // Read landing pad base encoding
+        let lp_base_encoding = *ptr;
+        ptr = ptr.add(1);
+        
+        let lp_base = if lp_base_encoding != 0xFF {
+            Self::read_encoded(ptr, lp_base_encoding, base)
+        } else {
+            base
+        };
+        
+        // Read type table encoding
+        let tt_encoding = *ptr;
+        ptr = ptr.add(1);
+        
+        let type_table = if tt_encoding != 0xFF {
+            let offset = Self::read_uleb128(&mut ptr);
+            ptr.add(offset as usize) as *const *const TypeInfo
+        } else {
+            core::ptr::null()
+        };
+        
+        // Read call site table
+        let cs_encoding = *ptr;
+        ptr = ptr.add(1);
+        
+        let cs_length = Self::read_uleb128(&mut ptr) as usize;
+        let cs_end = ptr.add(cs_length);
+        
+        let mut call_sites = CallSiteTable {
+            encoding: cs_encoding,
+            length: cs_length as u32,
+            entries: Vec::new(),
+        };
+        
+        while ptr < cs_end {
+            let start = Self::read_encoded(ptr, cs_encoding, lp_base);
+            ptr = ptr.add(Self::encoding_size(cs_encoding));
+            
+            let length = Self::read_encoded(ptr, cs_encoding, lp_base);
+            ptr = ptr.add(Self::encoding_size(cs_encoding));
+            
+            let landing_pad = Self::read_encoded(ptr, cs_encoding, lp_base);
+            ptr = ptr.add(Self::encoding_size(cs_encoding));
+            
+            let action = Self::read_uleb128(&mut ptr) as usize;
+            
+            call_sites.entries.push(CallSiteEntry {
+                start,
+                length,
+                landing_pad,
+                action,
+            });
+        }
+        
+        // Parse action table
+        let actions = Vec::new(); // Simplified
+        
+        Some(LSDA {
+            lp_base,
+            tt_encoding,
+            type_table,
+            call_sites,
+            actions,
+        })
+    }
+    
+    fn read_uleb128(ptr: &mut *const u8) -> u64 {
+        let mut result: u64 = 0;
+        let mut shift = 0;
+        
+        loop {
+            let byte = unsafe { **ptr };
+            *ptr = unsafe { ptr.add(1) };
+            
+            result |= ((byte & 0x7F) as u64) << shift;
+            
+            if (byte & 0x80) == 0 {
+                break;
+            }
+            
+            shift += 7;
+        }
+        
+        result
+    }
+    
+    fn read_sleb128(ptr: &mut *const u8) -> i64 {
+        let mut result: i64 = 0;
+        let mut shift = 0;
+        let mut byte: u8;
+        
+        loop {
+            byte = unsafe { **ptr };
+            *ptr = unsafe { ptr.add(1) };
+            
+            result |= ((byte & 0x7F) as i64) << shift;
+            shift += 7;
+            
+            if (byte & 0x80) == 0 {
+                break;
+            }
+        }
+        
+        // Sign extend
+        if shift < 64 && (byte & 0x40) != 0 {
+            result |= -(1i64 << shift);
+        }
+        
+        result
+    }
+    
+    fn read_encoded(ptr: *const u8, encoding: u8, base: usize) -> usize {
+        // Simplified - full impl handles all DWARF encodings
+        unsafe { *(ptr as *const u32) as usize }
+    }
+    
+    fn encoding_size(encoding: u8) -> usize {
+        match encoding & 0x0F {
+            0x00 => mem::size_of::<*const u8>(), // absptr
+            0x01 => 2,  // uleb128 (simplified)
+            0x02 => 2,  // udata2
+            0x03 => 4,  // udata4
+            0x04 => 8,  // udata8
+            0x09 => 2,  // sleb128
+            0x0A => 2,  // sdata2
+            0x0B => 4,  // sdata4
+            0x0C => 8,  // sdata8
+            _ => mem::size_of::<*const u8>(),
+        }
+    }
+    
+    /// Find landing pad for IP
+    pub fn find_landing_pad(&self, ip: usize) -> Option<&CallSiteEntry> {
+        self.call_sites.entries.iter().find(|cs| {
+            ip >= cs.start && ip < cs.start + cs.length
+        })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PERSONALITY ROUTINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// QuantaLang personality routine
+pub unsafe fn quanta_personality(
+    version: i32,
+    actions: UnwindAction,
+    exception_class: u64,
+    exception: *mut ExceptionHeader,
+    context: *mut UnwindContext,
+) -> UnwindReasonCode {
+    if version != 1 {
+        return UnwindReasonCode::FatalPhase1Error;
+    }
+    
+    let ip = (*context).get_ip() as usize;
+    let lsda = (*exception).lsda;
+    
+    // Parse LSDA
+    let lsda = match LSDA::parse(lsda, ip) {
+        Some(lsda) => lsda,
+        None => return UnwindReasonCode::ContinueUnwind,
+    };
+    
+    // Find call site
+    let call_site = match lsda.find_landing_pad(ip) {
+        Some(cs) => cs,
+        None => return UnwindReasonCode::ContinueUnwind,
+    };
+    
+    if call_site.landing_pad == 0 {
+        return UnwindReasonCode::ContinueUnwind;
+    }
+    
+    if actions.is_search() {
+        // Phase 1: Search for handler
+        if call_site.action == 0 {
+            // Cleanup only
+            return UnwindReasonCode::ContinueUnwind;
+        }
+        
+        // Check if type matches
+        if check_type_match(&lsda, call_site.action, (*exception).type_id) {
+            return UnwindReasonCode::HandlerFound;
+        }
+        
+        UnwindReasonCode::ContinueUnwind
+    } else if actions.is_cleanup() {
+        // Phase 2: Cleanup and install handler
+        (*context).set_ip(call_site.landing_pad as u64);
+        
+        // Set exception pointer in register
+        (*context).set_reg(0, exception as u64);
+        
+        UnwindReasonCode::InstallContext
+    } else {
+        UnwindReasonCode::FatalPhase2Error
+    }
+}
+
+fn check_type_match(lsda: &LSDA, action: usize, type_id: ExceptionTypeId) -> bool {
+    // Walk action chain
+    // Simplified - real impl walks action table
+    true
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXCEPTION API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Throw exception
+pub unsafe fn throw(exception: *mut ExceptionHeader) -> ! {
+    // Capture stack trace if configured
+    (*exception).stack_trace = capture_stack_trace();
+    
+    // Begin unwinding
+    _unwind_raise_exception(exception);
+    
+    // Should never return
+    core::intrinsics::abort();
+}
+
+/// Rethrow current exception
+pub unsafe fn rethrow() -> ! {
+    let current = get_current_exception();
+    
+    if current.is_null() {
+        // No current exception - abort
+        core::intrinsics::abort();
+    }
+    
+    (*current).rethrow_count += 1;
+    (*current).caught = false;
+    
+    _unwind_resume(current);
+    
+    core::intrinsics::abort();
+}
+
+/// Get current exception being processed
+pub fn get_current_exception() -> *mut ExceptionHeader {
+    // Thread-local current exception
+    CURRENT_EXCEPTION.load(Ordering::Relaxed)
+}
+
+/// Set current exception
+pub fn set_current_exception(exc: *mut ExceptionHeader) {
+    CURRENT_EXCEPTION.store(exc, Ordering::Relaxed);
+}
+
+/// Thread-local current exception
+static CURRENT_EXCEPTION: AtomicPtr<ExceptionHeader> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Capture stack trace
+fn capture_stack_trace() -> *const StackTrace {
+    // Platform-specific stack walking
+    core::ptr::null()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLATFORM UNWINDING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Raise exception (platform-specific)
+unsafe fn _unwind_raise_exception(exception: *mut ExceptionHeader) -> UnwindReasonCode {
+    // Phase 1: Search for handler
+    let mut context = UnwindContext::new();
+    
+    loop {
+        let reason = unwind_phase1(exception, &mut context);
+        
+        match reason {
+            UnwindReasonCode::HandlerFound => break,
+            UnwindReasonCode::EndOfStack => {
+                // No handler found - terminate
+                return UnwindReasonCode::EndOfStack;
+            }
+            UnwindReasonCode::ContinueUnwind => {
+                // Continue searching
+                if !unwind_step(&mut context) {
+                    return UnwindReasonCode::EndOfStack;
+                }
+            }
+            _ => return reason,
+        }
+    }
+    
+    // Phase 2: Cleanup and install handler
+    context = UnwindContext::new(); // Reset
+    
+    loop {
+        let reason = unwind_phase2(exception, &mut context);
+        
+        match reason {
+            UnwindReasonCode::InstallContext => {
+                // Jump to landing pad
+                install_context(&context);
+            }
+            UnwindReasonCode::ContinueUnwind => {
+                if !unwind_step(&mut context) {
+                    return UnwindReasonCode::FatalPhase2Error;
+                }
+            }
+            _ => return reason,
+        }
+    }
+}
+
+/// Resume unwinding
+unsafe fn _unwind_resume(exception: *mut ExceptionHeader) -> ! {
+    let mut context = UnwindContext::new();
+    
+    loop {
+        let reason = unwind_phase2(exception, &mut context);
+        
+        match reason {
+            UnwindReasonCode::InstallContext => {
+                install_context(&context);
+            }
+            UnwindReasonCode::ContinueUnwind => {
+                if !unwind_step(&mut context) {
+                    core::intrinsics::abort();
+                }
+            }
+            _ => core::intrinsics::abort(),
+        }
+    }
+}
+
+fn unwind_phase1(exception: *mut ExceptionHeader, context: &mut UnwindContext) -> UnwindReasonCode {
+    unsafe {
+        let personality = (*exception).personality;
+        
+        if let Some(p) = personality {
+            p(
+                1,
+                UnwindAction::SEARCH_PHASE,
+                (*exception).exception_class,
+                exception,
+                context,
+            )
+        } else {
+            UnwindReasonCode::ContinueUnwind
+        }
+    }
+}
+
+fn unwind_phase2(exception: *mut ExceptionHeader, context: &mut UnwindContext) -> UnwindReasonCode {
+    unsafe {
+        let personality = (*exception).personality;
+        
+        if let Some(p) = personality {
+            p(
+                1,
+                UnwindAction(UnwindAction::CLEANUP_PHASE.0 | UnwindAction::HANDLER_FRAME.0),
+                (*exception).exception_class,
+                exception,
+                context,
+            )
+        } else {
+            UnwindReasonCode::ContinueUnwind
+        }
+    }
+}
+
+fn unwind_step(context: &mut UnwindContext) -> bool {
+    // Platform-specific frame unwinding
+    // Uses DWARF CFI or platform ABI
+    false
+}
+
+fn install_context(context: &UnwindContext) -> ! {
+    // Platform-specific context switch
+    unsafe { core::intrinsics::abort() }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRY/CATCH SUPPORT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Try context
+#[repr(C)]
+pub struct TryContext {
+    /// Jump buffer
+    pub jmp_buf: [u64; 16],
+    /// Previous context
+    pub prev: *mut TryContext,
+    /// Caught exception
+    pub exception: *mut ExceptionHeader,
+}
+
+/// Thread-local try context stack
+static TRY_CONTEXT: AtomicPtr<TryContext> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Begin try block
+pub unsafe fn begin_try(ctx: *mut TryContext) {
+    (*ctx).prev = TRY_CONTEXT.load(Ordering::Relaxed);
+    (*ctx).exception = core::ptr::null_mut();
+    TRY_CONTEXT.store(ctx, Ordering::Release);
+}
+
+/// End try block
+pub unsafe fn end_try() {
+    let ctx = TRY_CONTEXT.load(Ordering::Acquire);
+    if !ctx.is_null() {
+        TRY_CONTEXT.store((*ctx).prev, Ordering::Release);
+    }
+}
+
+/// Begin catch block
+pub unsafe fn begin_catch(exception: *mut ExceptionHeader) -> *mut u8 {
+    set_current_exception(exception);
+    (*exception).caught = true;
+    (*exception).data()
+}
+
+/// End catch block
+pub unsafe fn end_catch() {
+    let exception = get_current_exception();
+    
+    if !exception.is_null() && (*exception).caught {
+        // Clean up exception
+        if let Some(cleanup) = (*exception).cleanup {
+            cleanup(exception);
+        }
+        set_current_exception(core::ptr::null_mut());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_exception_type_id() {
+        let id1 = ExceptionTypeId::from_name("std::exception");
+        let id2 = ExceptionTypeId::from_name("std::exception");
+        let id3 = ExceptionTypeId::from_name("other::exception");
+        
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+    }
+    
+    #[test]
+    fn test_type_hierarchy() {
+        let mut hierarchy = TypeHierarchy::new();
+        
+        let base = ExceptionTypeId::from_name("Base");
+        let derived = ExceptionTypeId::from_name("Derived");
+        
+        hierarchy.add_parent(derived, base);
+        
+        assert!(hierarchy.is_subtype_of(derived, base));
+        assert!(!hierarchy.is_subtype_of(base, derived));
+    }
+    
+    #[test]
+    fn test_unwind_action() {
+        let search = UnwindAction::SEARCH_PHASE;
+        assert!(search.is_search());
+        assert!(!search.is_cleanup());
+        
+        let cleanup = UnwindAction::CLEANUP_PHASE;
+        assert!(!cleanup.is_search());
+        assert!(cleanup.is_cleanup());
+    }
+}

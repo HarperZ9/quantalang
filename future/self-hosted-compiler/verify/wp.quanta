@@ -1,0 +1,648 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ VERIFICATION — Weakest Precondition Calculus
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Weakest precondition (WP) and strongest postcondition (SP) computation:
+//   - Dijkstra's guarded command language
+//   - WP for program statements
+//   - VC generation from WP
+//   - Loop invariant handling
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::verify::wp
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+
+use super::core::{
+    Formula, Term, Sort, Contract, LoopInvariant,
+    VerificationCondition, VcKind, SourceLocation, VerificationContext,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROGRAM STATEMENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Statement in a simple imperative language
+#[derive(Debug, Clone)]
+pub enum Statement {
+    /// Skip (no-op)
+    Skip,
+    
+    /// Assignment: x := e
+    Assign(String, Term),
+    
+    /// Sequential composition: S1; S2
+    Seq(Box<Statement>, Box<Statement>),
+    
+    /// Conditional: if C then S1 else S2
+    If(Formula, Box<Statement>, Box<Statement>),
+    
+    /// While loop with invariant: while C do S
+    While {
+        condition: Formula,
+        invariant: Formula,
+        variant: Option<Term>,
+        body: Box<Statement>,
+    },
+    
+    /// Assert statement
+    Assert(Formula),
+    
+    /// Assume statement
+    Assume(Formula),
+    
+    /// Havoc (non-deterministic assignment)
+    Havoc(String),
+    
+    /// Function call
+    Call {
+        result: Option<String>,
+        function: String,
+        args: Vec<Term>,
+    },
+    
+    /// Block with local declarations
+    Block {
+        locals: Vec<(String, Sort)>,
+        body: Box<Statement>,
+    },
+    
+    /// Array update: a[i] := v
+    ArrayUpdate(String, Term, Term),
+    
+    /// Non-deterministic choice: S1 [] S2
+    Choice(Box<Statement>, Box<Statement>),
+}
+
+impl Statement {
+    pub fn skip() -> Statement {
+        Statement::Skip
+    }
+    
+    pub fn assign(var: impl Into<String>, value: Term) -> Statement {
+        Statement::Assign(var.into(), value)
+    }
+    
+    pub fn seq(first: Statement, second: Statement) -> Statement {
+        Statement::Seq(Box::new(first), Box::new(second))
+    }
+    
+    pub fn if_then_else(cond: Formula, then_branch: Statement, else_branch: Statement) -> Statement {
+        Statement::If(cond, Box::new(then_branch), Box::new(else_branch))
+    }
+    
+    pub fn while_loop(cond: Formula, invariant: Formula, body: Statement) -> Statement {
+        Statement::While {
+            condition: cond,
+            invariant,
+            variant: None,
+            body: Box::new(body),
+        }
+    }
+    
+    pub fn assert(cond: Formula) -> Statement {
+        Statement::Assert(cond)
+    }
+    
+    pub fn assume(cond: Formula) -> Statement {
+        Statement::Assume(cond)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WEAKEST PRECONDITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compute weakest precondition: wp(S, Q)
+/// 
+/// The weakest precondition wp(S, Q) is the weakest formula P such that
+/// if P holds before executing S, then Q holds after S terminates.
+pub fn wp(stmt: &Statement, post: &Formula, ctx: &VerificationContext) -> Formula {
+    match stmt {
+        Statement::Skip => post.clone(),
+        
+        Statement::Assign(var, expr) => {
+            // wp(x := e, Q) = Q[x/e]
+            post.substitute(var, expr)
+        }
+        
+        Statement::Seq(s1, s2) => {
+            // wp(S1; S2, Q) = wp(S1, wp(S2, Q))
+            let mid = wp(s2, post, ctx);
+            wp(s1, &mid, ctx)
+        }
+        
+        Statement::If(cond, then_branch, else_branch) => {
+            // wp(if C then S1 else S2, Q) = (C => wp(S1, Q)) ∧ (¬C => wp(S2, Q))
+            let wp_then = wp(then_branch, post, ctx);
+            let wp_else = wp(else_branch, post, ctx);
+            
+            let then_part = cond.clone().implies(wp_then);
+            let else_part = cond.clone().not().implies(wp_else);
+            
+            then_part.and(else_part)
+        }
+        
+        Statement::While { condition, invariant, variant, body } => {
+            // For while loops, the invariant must be provided
+            // wp(while C do S, Q) = I ∧ (∀x. (I ∧ C => wp(S, I)) ∧ (I ∧ ¬C => Q))
+            // Simplified: just return the invariant, VCs are generated separately
+            invariant.clone()
+        }
+        
+        Statement::Assert(cond) => {
+            // wp(assert P, Q) = P ∧ Q
+            cond.clone().and(post.clone())
+        }
+        
+        Statement::Assume(cond) => {
+            // wp(assume P, Q) = P => Q
+            cond.clone().implies(post.clone())
+        }
+        
+        Statement::Havoc(var) => {
+            // wp(havoc x, Q) = ∀x. Q
+            Formula::forall(var.clone(), Sort::Int, post.clone())
+        }
+        
+        Statement::Call { result, function, args } => {
+            // Use the function's contract
+            if let Some(contract) = ctx.contracts.get(function) {
+                // Substitute arguments into precondition
+                let mut pre = contract.combined_precondition();
+                for (i, arg) in args.iter().enumerate() {
+                    let param_name = format!("arg{}", i);
+                    pre = pre.substitute(&param_name, arg);
+                }
+                
+                // Substitute result into postcondition and Q
+                let mut q = post.clone();
+                if let Some(res_var) = result {
+                    let result_post = contract.combined_postcondition()
+                        .substitute("result", &Term::Var(res_var.clone()));
+                    q = result_post.and(q);
+                }
+                
+                pre.and(q)
+            } else {
+                // Unknown function: assume anything
+                post.clone()
+            }
+        }
+        
+        Statement::Block { locals, body } => {
+            // For local variables, we need to handle scoping
+            let mut result = wp(body, post, ctx);
+            
+            // Existentially quantify locals in the precondition
+            for (name, sort) in locals.iter().rev() {
+                result = Formula::exists(name.clone(), sort.clone(), result);
+            }
+            
+            result
+        }
+        
+        Statement::ArrayUpdate(arr, idx, val) => {
+            // wp(a[i] := v, Q) = Q[a/store(a, i, v)]
+            let new_array = Term::Store(
+                Box::new(Term::Var(arr.clone())),
+                Box::new(idx.clone()),
+                Box::new(val.clone()),
+            );
+            post.substitute(arr, &new_array)
+        }
+        
+        Statement::Choice(s1, s2) => {
+            // wp(S1 [] S2, Q) = wp(S1, Q) ∧ wp(S2, Q)
+            let wp1 = wp(s1, post, ctx);
+            let wp2 = wp(s2, post, ctx);
+            wp1.and(wp2)
+        }
+    }
+}
+
+/// Compute weakest liberal precondition: wlp(S, Q)
+/// 
+/// Like wp, but ignores non-termination.
+pub fn wlp(stmt: &Statement, post: &Formula, ctx: &VerificationContext) -> Formula {
+    match stmt {
+        Statement::Skip => post.clone(),
+        Statement::Assign(var, expr) => post.substitute(var, expr),
+        Statement::Seq(s1, s2) => {
+            let mid = wlp(s2, post, ctx);
+            wlp(s1, &mid, ctx)
+        }
+        Statement::If(cond, then_branch, else_branch) => {
+            let wp_then = wlp(then_branch, post, ctx);
+            let wp_else = wlp(else_branch, post, ctx);
+            cond.clone().implies(wp_then).and(cond.clone().not().implies(wp_else))
+        }
+        Statement::While { invariant, .. } => {
+            // wlp uses the invariant directly
+            invariant.clone()
+        }
+        Statement::Assert(cond) => cond.clone().and(post.clone()),
+        Statement::Assume(cond) => cond.clone().implies(post.clone()),
+        _ => wp(stmt, post, ctx),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRONGEST POSTCONDITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compute strongest postcondition: sp(S, P)
+/// 
+/// The strongest postcondition sp(S, P) is the strongest formula Q such that
+/// if P holds before executing S and S terminates, then Q holds after.
+pub fn sp(stmt: &Statement, pre: &Formula, ctx: &VerificationContext) -> Formula {
+    match stmt {
+        Statement::Skip => pre.clone(),
+        
+        Statement::Assign(var, expr) => {
+            // sp(x := e, P) = ∃x'. P[x/x'] ∧ x = e[x/x']
+            let old_var = format!("{}_old", var);
+            let pre_renamed = pre.substitute(var, &Term::Var(old_var.clone()));
+            let expr_renamed = expr.substitute(var, &Term::Var(old_var.clone()));
+            let equality = Formula::Eq(
+                Box::new(Term::Var(var.clone())),
+                Box::new(expr_renamed),
+            );
+            Formula::exists(old_var, Sort::Int, pre_renamed.and(equality))
+        }
+        
+        Statement::Seq(s1, s2) => {
+            // sp(S1; S2, P) = sp(S2, sp(S1, P))
+            let mid = sp(s1, pre, ctx);
+            sp(s2, &mid, ctx)
+        }
+        
+        Statement::If(cond, then_branch, else_branch) => {
+            // sp(if C then S1 else S2, P) = sp(S1, P ∧ C) ∨ sp(S2, P ∧ ¬C)
+            let sp_then = sp(then_branch, &pre.clone().and(cond.clone()), ctx);
+            let sp_else = sp(else_branch, &pre.clone().and(cond.clone().not()), ctx);
+            sp_then.or(sp_else)
+        }
+        
+        Statement::Assert(cond) => {
+            // sp(assert P, Q) = Q ∧ P
+            pre.clone().and(cond.clone())
+        }
+        
+        Statement::Assume(cond) => {
+            // sp(assume P, Q) = Q ∧ P
+            pre.clone().and(cond.clone())
+        }
+        
+        _ => pre.clone(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERIFICATION CONDITION GENERATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Generate verification conditions for a function
+pub struct VcGenerator {
+    ctx: VerificationContext,
+    location: SourceLocation,
+}
+
+impl VcGenerator {
+    pub fn new(ctx: VerificationContext) -> Self {
+        VcGenerator {
+            ctx,
+            location: SourceLocation::default(),
+        }
+    }
+    
+    pub fn with_location(mut self, location: SourceLocation) -> Self {
+        self.location = location;
+        self
+    }
+    
+    /// Generate VCs for a statement with given pre/postcondition
+    pub fn generate(
+        &mut self,
+        stmt: &Statement,
+        precondition: &Formula,
+        postcondition: &Formula,
+    ) -> Vec<VerificationCondition> {
+        let mut vcs = Vec::new();
+        self.generate_vcs(stmt, precondition, postcondition, &mut vcs);
+        vcs
+    }
+    
+    fn generate_vcs(
+        &mut self,
+        stmt: &Statement,
+        pre: &Formula,
+        post: &Formula,
+        vcs: &mut Vec<VerificationCondition>,
+    ) {
+        match stmt {
+            Statement::Skip | Statement::Assign(_, _) | Statement::Havoc(_) => {
+                // Simple statements: verify wp(S, Q) is implied by P
+                let wp_post = wp(stmt, post, &self.ctx);
+                let vc_goal = pre.clone().implies(wp_post);
+                
+                let id = self.ctx.generate_vc(
+                    format!("Statement validity"),
+                    VcKind::Postcondition,
+                    vc_goal,
+                    self.location.clone(),
+                );
+                
+                if let Some(vc) = self.ctx.get_vc(id) {
+                    vcs.push(vc.clone());
+                }
+            }
+            
+            Statement::Seq(s1, s2) => {
+                let mid = wp(s2, post, &self.ctx);
+                self.generate_vcs(s1, pre, &mid, vcs);
+                let post_s1 = sp(s1, pre, &self.ctx);
+                self.generate_vcs(s2, &post_s1, post, vcs);
+            }
+            
+            Statement::If(cond, then_branch, else_branch) => {
+                // Generate VCs for both branches
+                let then_pre = pre.clone().and(cond.clone());
+                let else_pre = pre.clone().and(cond.clone().not());
+                
+                self.generate_vcs(then_branch, &then_pre, post, vcs);
+                self.generate_vcs(else_branch, &else_pre, post, vcs);
+            }
+            
+            Statement::While { condition, invariant, variant, body } => {
+                // VC1: Precondition implies invariant (establishment)
+                let establish = pre.clone().implies(invariant.clone());
+                let id1 = self.ctx.generate_vc(
+                    "Loop invariant establishment",
+                    VcKind::LoopInvariantInit,
+                    establish,
+                    self.location.clone(),
+                );
+                if let Some(vc) = self.ctx.get_vc(id1) {
+                    vcs.push(vc.clone());
+                }
+                
+                // VC2: Invariant ∧ condition is preserved by body
+                let loop_pre = invariant.clone().and(condition.clone());
+                let preserve = loop_pre.implies(wp(body, invariant, &self.ctx));
+                let id2 = self.ctx.generate_vc(
+                    "Loop invariant preservation",
+                    VcKind::LoopInvariant,
+                    preserve,
+                    self.location.clone(),
+                );
+                if let Some(vc) = self.ctx.get_vc(id2) {
+                    vcs.push(vc.clone());
+                }
+                
+                // VC3: Invariant ∧ ¬condition implies postcondition
+                let exit = invariant.clone().and(condition.clone().not()).implies(post.clone());
+                let id3 = self.ctx.generate_vc(
+                    "Loop postcondition",
+                    VcKind::Postcondition,
+                    exit,
+                    self.location.clone(),
+                );
+                if let Some(vc) = self.ctx.get_vc(id3) {
+                    vcs.push(vc.clone());
+                }
+                
+                // VC4: Termination (if variant provided)
+                if let Some(variant_term) = variant {
+                    // Variant decreases and stays non-negative
+                    let v = variant_term.clone();
+                    let v_old = Term::Old(Box::new(v.clone()));
+                    
+                    let decreases = Formula::Lt(
+                        Box::new(wp(body, &v, &self.ctx)),
+                        Box::new(v_old.clone()),
+                    );
+                    let bounded = Formula::Ge(Box::new(v.clone()), Box::new(Term::IntConst(0)));
+                    
+                    let termination = invariant.clone().and(condition.clone())
+                        .implies(decreases.and(bounded));
+                    
+                    let id4 = self.ctx.generate_vc(
+                        "Loop termination",
+                        VcKind::Termination,
+                        termination,
+                        self.location.clone(),
+                    );
+                    if let Some(vc) = self.ctx.get_vc(id4) {
+                        vcs.push(vc.clone());
+                    }
+                }
+                
+                // Generate VCs for the loop body
+                self.generate_vcs(body, &loop_pre, invariant, vcs);
+            }
+            
+            Statement::Assert(cond) => {
+                // VC: Precondition implies asserted condition
+                let goal = pre.clone().implies(cond.clone());
+                let id = self.ctx.generate_vc(
+                    "Assert check",
+                    VcKind::Assert,
+                    goal,
+                    self.location.clone(),
+                );
+                if let Some(vc) = self.ctx.get_vc(id) {
+                    vcs.push(vc.clone());
+                }
+            }
+            
+            Statement::Call { function, args, .. } => {
+                // VC: Precondition implies function's precondition
+                if let Some(contract) = self.ctx.contracts.get(function) {
+                    let mut fn_pre = contract.combined_precondition();
+                    for (i, arg) in args.iter().enumerate() {
+                        let param = format!("arg{}", i);
+                        fn_pre = fn_pre.substitute(&param, arg);
+                    }
+                    
+                    let goal = pre.clone().implies(fn_pre);
+                    let id = self.ctx.generate_vc(
+                        format!("Precondition for call to {}", function),
+                        VcKind::Precondition,
+                        goal,
+                        self.location.clone(),
+                    );
+                    if let Some(vc) = self.ctx.get_vc(id) {
+                        vcs.push(vc.clone());
+                    }
+                }
+            }
+            
+            Statement::ArrayUpdate(arr, idx, _) => {
+                // VC: Array bounds check (if we have bounds info)
+                let bounds_check = Formula::And(
+                    Box::new(Formula::Ge(Box::new(idx.clone()), Box::new(Term::IntConst(0)))),
+                    Box::new(Formula::Lt(
+                        Box::new(idx.clone()),
+                        Box::new(Term::App(format!("{}_len", arr), vec![])),
+                    )),
+                );
+                
+                let goal = pre.clone().implies(bounds_check);
+                let id = self.ctx.generate_vc(
+                    format!("Array bounds check for {}", arr),
+                    VcKind::ArrayBounds,
+                    goal,
+                    self.location.clone(),
+                );
+                if let Some(vc) = self.ctx.get_vc(id) {
+                    vcs.push(vc.clone());
+                }
+            }
+            
+            Statement::Block { body, .. } => {
+                self.generate_vcs(body, pre, post, vcs);
+            }
+            
+            Statement::Choice(s1, s2) => {
+                self.generate_vcs(s1, pre, post, vcs);
+                self.generate_vcs(s2, pre, post, vcs);
+            }
+            
+            Statement::Assume(_) => {
+                // Assume doesn't generate VCs
+            }
+        }
+    }
+    
+    /// Generate VCs for a function with contract
+    pub fn generate_for_function(
+        &mut self,
+        function: &str,
+        body: &Statement,
+    ) -> Vec<VerificationCondition> {
+        let contract = self.ctx.contracts.get(function).cloned()
+            .unwrap_or_else(|| Contract::new(function));
+        
+        let pre = contract.combined_precondition();
+        let post = contract.combined_postcondition();
+        
+        self.generate(body, &pre, &post)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_wp_skip() {
+        let ctx = VerificationContext::new();
+        let post = Formula::Var("Q".to_string());
+        let result = wp(&Statement::Skip, &post, &ctx);
+        
+        assert_eq!(result, post);
+    }
+    
+    #[test]
+    fn test_wp_assign() {
+        let ctx = VerificationContext::new();
+        
+        // wp(x := 5, x > 0) = 5 > 0
+        let post = Formula::Gt(
+            Box::new(Term::Var("x".to_string())),
+            Box::new(Term::IntConst(0)),
+        );
+        let stmt = Statement::Assign("x".to_string(), Term::IntConst(5));
+        
+        let result = wp(&stmt, &post, &ctx);
+        
+        // Result should be: 5 > 0
+        match result {
+            Formula::Gt(l, r) => {
+                assert_eq!(*l, Term::IntConst(5));
+                assert_eq!(*r, Term::IntConst(0));
+            }
+            _ => panic!("Expected Gt formula"),
+        }
+    }
+    
+    #[test]
+    fn test_wp_seq() {
+        let ctx = VerificationContext::new();
+        
+        // wp(x := 1; y := x + 1, y > 1)
+        let post = Formula::Gt(
+            Box::new(Term::Var("y".to_string())),
+            Box::new(Term::IntConst(1)),
+        );
+        
+        let s1 = Statement::Assign("x".to_string(), Term::IntConst(1));
+        let s2 = Statement::Assign(
+            "y".to_string(),
+            Term::Add(Box::new(Term::Var("x".to_string())), Box::new(Term::IntConst(1))),
+        );
+        let stmt = Statement::Seq(Box::new(s1), Box::new(s2));
+        
+        let result = wp(&stmt, &post, &ctx);
+        
+        // Should simplify to: 1 + 1 > 1, i.e., 2 > 1
+        assert!(matches!(result, Formula::Gt(_, _)));
+    }
+    
+    #[test]
+    fn test_wp_if() {
+        let ctx = VerificationContext::new();
+        
+        let cond = Formula::Gt(
+            Box::new(Term::Var("x".to_string())),
+            Box::new(Term::IntConst(0)),
+        );
+        let then_branch = Statement::Assign("y".to_string(), Term::IntConst(1));
+        let else_branch = Statement::Assign("y".to_string(), Term::IntConst(0));
+        
+        let post = Formula::Ge(
+            Box::new(Term::Var("y".to_string())),
+            Box::new(Term::IntConst(0)),
+        );
+        
+        let stmt = Statement::If(cond, Box::new(then_branch), Box::new(else_branch));
+        let result = wp(&stmt, &post, &ctx);
+        
+        // Should be an And of two implications
+        assert!(matches!(result, Formula::And(_, _)));
+    }
+    
+    #[test]
+    fn test_vc_generation() {
+        let ctx = VerificationContext::new();
+        let mut gen = VcGenerator::new(ctx);
+        
+        let stmt = Statement::Assert(Formula::Gt(
+            Box::new(Term::Var("x".to_string())),
+            Box::new(Term::IntConst(0)),
+        ));
+        
+        let pre = Formula::Ge(
+            Box::new(Term::Var("x".to_string())),
+            Box::new(Term::IntConst(1)),
+        );
+        let post = Formula::True;
+        
+        let vcs = gen.generate(&stmt, &pre, &post);
+        
+        assert!(!vcs.is_empty());
+        assert_eq!(vcs[0].kind, VcKind::Assert);
+    }
+}

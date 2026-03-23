@@ -1,0 +1,1006 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Inlining Infrastructure
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Inlining infrastructure:
+//   - Inline cost analysis
+//   - Inline decision making
+//   - Call site transformation
+//   - Recursive inlining
+//   - Inline history tracking
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::inline
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use crate::opt::ipo::{CallGraph, CallGraphNode, FunctionAttributes};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INLINE CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Inlining configuration
+#[derive(Debug, Clone)]
+pub struct InlineConfig {
+    /// Base cost threshold for inlining
+    pub threshold: i32,
+    /// Threshold for hot call sites
+    pub hot_threshold: i32,
+    /// Threshold for cold call sites
+    pub cold_threshold: i32,
+    /// Threshold for always-inline functions
+    pub always_inline_threshold: i32,
+    /// Maximum size of function after inlining
+    pub growth_limit: u32,
+    /// Maximum call depth for recursive inlining
+    pub max_depth: u32,
+    /// Enable partial inlining
+    pub partial_inline: bool,
+    /// Inline across translation units
+    pub cross_module: bool,
+}
+
+impl Default for InlineConfig {
+    fn default() -> Self {
+        InlineConfig {
+            threshold: 250,
+            hot_threshold: 500,
+            cold_threshold: 50,
+            always_inline_threshold: 10000,
+            growth_limit: 50000,
+            max_depth: 10,
+            partial_inline: true,
+            cross_module: true,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INLINE COST MODEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Inline cost analysis
+#[derive(Debug, Clone, Default)]
+pub struct InlineCost {
+    /// Base cost of the callee
+    pub callee_cost: i32,
+    /// Cost savings from known arguments
+    pub argument_bonus: i32,
+    /// Cost savings from constant propagation
+    pub const_prop_bonus: i32,
+    /// Cost of call instruction itself
+    pub call_overhead: i32,
+    /// Bonus for single caller
+    pub single_caller_bonus: i32,
+    /// Bonus for hot call site
+    pub hotness_bonus: i32,
+    /// Penalty for code size growth
+    pub size_penalty: i32,
+    /// Penalty for recursion
+    pub recursion_penalty: i32,
+}
+
+impl InlineCost {
+    pub fn new() -> Self {
+        InlineCost::default()
+    }
+    
+    /// Calculate net inline benefit (positive = beneficial)
+    pub fn benefit(&self) -> i32 {
+        self.call_overhead +
+        self.argument_bonus +
+        self.const_prop_bonus +
+        self.single_caller_bonus +
+        self.hotness_bonus -
+        self.callee_cost -
+        self.size_penalty -
+        self.recursion_penalty
+    }
+    
+    /// Check if inlining is beneficial
+    pub fn should_inline(&self, threshold: i32) -> bool {
+        self.callee_cost - self.argument_bonus - self.const_prop_bonus <= threshold
+    }
+}
+
+/// Inline cost analyzer
+pub struct InlineCostAnalyzer {
+    /// Instruction costs
+    instruction_costs: BTreeMap<InstructionKind, i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum InstructionKind {
+    Arithmetic,
+    Memory,
+    Branch,
+    Call,
+    Alloca,
+    Phi,
+    Select,
+    Cast,
+    Compare,
+    Other,
+}
+
+impl InlineCostAnalyzer {
+    pub fn new() -> Self {
+        let mut costs = BTreeMap::new();
+        
+        // Default instruction costs
+        costs.insert(InstructionKind::Arithmetic, 5);
+        costs.insert(InstructionKind::Memory, 10);
+        costs.insert(InstructionKind::Branch, 3);
+        costs.insert(InstructionKind::Call, 20);
+        costs.insert(InstructionKind::Alloca, 8);
+        costs.insert(InstructionKind::Phi, 0); // Phis are free
+        costs.insert(InstructionKind::Select, 5);
+        costs.insert(InstructionKind::Cast, 1);
+        costs.insert(InstructionKind::Compare, 3);
+        costs.insert(InstructionKind::Other, 5);
+        
+        InlineCostAnalyzer {
+            instruction_costs: costs,
+        }
+    }
+    
+    /// Analyze inline cost for a call site
+    pub fn analyze(
+        &self,
+        call_site: &CallSite,
+        callee: &MirFunction,
+        call_graph: &CallGraph,
+    ) -> InlineCost {
+        let mut cost = InlineCost::new();
+        
+        // Calculate base callee cost
+        cost.callee_cost = self.calculate_function_cost(callee);
+        
+        // Call overhead (saved if we inline)
+        cost.call_overhead = 20;
+        
+        // Analyze arguments for constant propagation opportunities
+        cost.argument_bonus = self.analyze_arguments(call_site, callee);
+        cost.const_prop_bonus = self.estimate_const_prop_benefit(call_site, callee);
+        
+        // Single caller bonus
+        if let Some(node) = call_graph.get_node(&callee.name) {
+            if node.callers.len() == 1 {
+                cost.single_caller_bonus = 30;
+            }
+        }
+        
+        // Hotness bonus (from profiling)
+        if let Some(count) = call_site.profile_count {
+            if count > 1000 {
+                cost.hotness_bonus = 50;
+            } else if count > 100 {
+                cost.hotness_bonus = 20;
+            }
+        }
+        
+        // Size penalty for very large functions
+        if cost.callee_cost > 500 {
+            cost.size_penalty = (cost.callee_cost - 500) / 10;
+        }
+        
+        // Recursion penalty
+        if self.is_recursive_call(call_site, callee, call_graph) {
+            cost.recursion_penalty = 100;
+        }
+        
+        cost
+    }
+    
+    fn calculate_function_cost(&self, func: &MirFunction) -> i32 {
+        let mut cost = 0;
+        
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                cost += self.instruction_cost(stmt);
+            }
+            
+            // Terminator cost
+            cost += match &block.terminator {
+                MirTerminator::Branch { .. } => 3,
+                MirTerminator::Switch { targets, .. } => 5 + targets.len() as i32,
+                _ => 1,
+            };
+        }
+        
+        cost
+    }
+    
+    fn instruction_cost(&self, stmt: &MirStatement) -> i32 {
+        let kind = match stmt {
+            MirStatement::BinaryOp { op, .. } => {
+                match op {
+                    BinOp::Div | BinOp::Rem => InstructionKind::Arithmetic, // Higher cost
+                    _ => InstructionKind::Arithmetic,
+                }
+            }
+            MirStatement::Load { .. } | MirStatement::Store { .. } => InstructionKind::Memory,
+            MirStatement::Call { .. } => InstructionKind::Call,
+            MirStatement::Alloca { .. } => InstructionKind::Alloca,
+            MirStatement::Phi { .. } => InstructionKind::Phi,
+            MirStatement::Assign { .. } => InstructionKind::Other,
+            _ => InstructionKind::Other,
+        };
+        
+        *self.instruction_costs.get(&kind).unwrap_or(&5)
+    }
+    
+    fn analyze_arguments(&self, call_site: &CallSite, callee: &MirFunction) -> i32 {
+        let mut bonus = 0;
+        
+        for (i, arg) in call_site.args.iter().enumerate() {
+            if let MirOperand::Constant(_) = arg {
+                // Constant argument can enable optimizations
+                bonus += self.estimate_constant_arg_benefit(callee, i);
+            }
+        }
+        
+        bonus
+    }
+    
+    fn estimate_constant_arg_benefit(&self, callee: &MirFunction, arg_idx: usize) -> i32 {
+        // Estimate how much we can simplify with a constant argument
+        let param_name = callee.params.get(arg_idx);
+        
+        let param_name = match param_name {
+            Some(n) => n,
+            None => return 0,
+        };
+        
+        let mut uses = 0;
+        
+        for block in &callee.blocks {
+            for stmt in &block.statements {
+                if self.uses_param(stmt, param_name) {
+                    uses += 1;
+                }
+            }
+            
+            // Extra bonus if used in branch condition
+            if let MirTerminator::Branch { cond, .. } = &block.terminator {
+                if cond.is_var(param_name) {
+                    uses += 5; // Branch elimination is valuable
+                }
+            }
+        }
+        
+        uses * 3
+    }
+    
+    fn uses_param(&self, stmt: &MirStatement, param: &str) -> bool {
+        match stmt {
+            MirStatement::Assign { value, .. } => value.is_var(param),
+            MirStatement::BinaryOp { lhs, rhs, .. } => lhs.is_var(param) || rhs.is_var(param),
+            MirStatement::Load { ptr, .. } => ptr.is_var(param),
+            MirStatement::Store { ptr, value, .. } => ptr.is_var(param) || value.is_var(param),
+            MirStatement::Call { args, .. } => args.iter().any(|a| a.is_var(param)),
+            _ => false,
+        }
+    }
+    
+    fn estimate_const_prop_benefit(&self, call_site: &CallSite, callee: &MirFunction) -> i32 {
+        // Estimate cascade of constant propagation
+        let mut benefit = 0;
+        
+        let const_args: u32 = call_site.args.iter()
+            .filter(|a| matches!(a, MirOperand::Constant(_)))
+            .count() as u32;
+        
+        // More constant args = more propagation opportunities
+        benefit += (const_args * const_args * 2) as i32;
+        
+        benefit
+    }
+    
+    fn is_recursive_call(&self, call_site: &CallSite, callee: &MirFunction, call_graph: &CallGraph) -> bool {
+        // Check if inlining would create recursion
+        call_site.caller == callee.name ||
+        call_graph.get_node(&call_site.caller)
+            .map(|n| call_graph.is_recursive(n.id))
+            .unwrap_or(false)
+    }
+}
+
+impl Default for InlineCostAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INLINE DECISION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Inline decision for a call site
+#[derive(Debug, Clone)]
+pub enum InlineDecision {
+    /// Inline the call
+    Inline {
+        reason: InlineReason,
+        cost: InlineCost,
+    },
+    /// Don't inline
+    NoInline {
+        reason: NoInlineReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum InlineReason {
+    /// Always-inline attribute
+    AlwaysInline,
+    /// Cost analysis says yes
+    CostBeneficial,
+    /// Small function
+    SmallFunction,
+    /// Single caller
+    SingleCaller,
+    /// Hot call site
+    HotCallSite,
+    /// Constant arguments
+    ConstantArgs,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum NoInlineReason {
+    /// Never-inline attribute
+    NeverInline,
+    /// Too expensive
+    TooExpensive,
+    /// Would exceed growth limit
+    GrowthLimit,
+    /// Recursive
+    Recursive,
+    /// External function
+    External,
+    /// Has indirect calls
+    IndirectCalls,
+    /// Exception handling
+    ExceptionHandling,
+    /// Too deep
+    TooDeep,
+    /// Address taken
+    AddressTaken,
+}
+
+/// Inline advisor makes inlining decisions
+pub struct InlineAdvisor {
+    config: InlineConfig,
+    cost_analyzer: InlineCostAnalyzer,
+    /// Current inline depth
+    depth: u32,
+    /// Functions currently being inlined (for recursion detection)
+    inline_stack: Vec<String>,
+    /// Inline history for avoiding re-inlining
+    history: BTreeSet<(String, String)>,
+}
+
+impl InlineAdvisor {
+    pub fn new(config: InlineConfig) -> Self {
+        InlineAdvisor {
+            config,
+            cost_analyzer: InlineCostAnalyzer::new(),
+            depth: 0,
+            inline_stack: Vec::new(),
+            history: BTreeSet::new(),
+        }
+    }
+    
+    /// Get inline decision for a call site
+    pub fn get_decision(
+        &mut self,
+        call_site: &CallSite,
+        callee: &MirFunction,
+        caller: &MirFunction,
+        call_graph: &CallGraph,
+    ) -> InlineDecision {
+        // Check for always-inline
+        if callee.attributes.always_inline {
+            let cost = self.cost_analyzer.analyze(call_site, callee, call_graph);
+            return InlineDecision::Inline {
+                reason: InlineReason::AlwaysInline,
+                cost,
+            };
+        }
+        
+        // Check for never-inline
+        if callee.attributes.no_inline {
+            return InlineDecision::NoInline {
+                reason: NoInlineReason::NeverInline,
+            };
+        }
+        
+        // Check depth limit
+        if self.depth >= self.config.max_depth {
+            return InlineDecision::NoInline {
+                reason: NoInlineReason::TooDeep,
+            };
+        }
+        
+        // Check for recursion
+        if self.inline_stack.contains(&callee.name) {
+            return InlineDecision::NoInline {
+                reason: NoInlineReason::Recursive,
+            };
+        }
+        
+        // Check if already inlined here
+        if self.history.contains(&(caller.name.clone(), callee.name.clone())) {
+            return InlineDecision::NoInline {
+                reason: NoInlineReason::Recursive,
+            };
+        }
+        
+        // Check for external functions
+        if callee.is_external {
+            return InlineDecision::NoInline {
+                reason: NoInlineReason::External,
+            };
+        }
+        
+        // Check growth limit
+        let caller_size = self.estimate_size(caller);
+        let callee_size = self.estimate_size(callee);
+        
+        if caller_size + callee_size > self.config.growth_limit {
+            return InlineDecision::NoInline {
+                reason: NoInlineReason::GrowthLimit,
+            };
+        }
+        
+        // Perform cost analysis
+        let cost = self.cost_analyzer.analyze(call_site, callee, call_graph);
+        
+        // Determine threshold based on hotness
+        let threshold = match call_site.profile_count {
+            Some(count) if count > 1000 => self.config.hot_threshold,
+            Some(count) if count < 10 => self.config.cold_threshold,
+            _ => self.config.threshold,
+        };
+        
+        if cost.should_inline(threshold) {
+            let reason = if callee_size < 20 {
+                InlineReason::SmallFunction
+            } else if cost.single_caller_bonus > 0 {
+                InlineReason::SingleCaller
+            } else if cost.hotness_bonus > 0 {
+                InlineReason::HotCallSite
+            } else if cost.argument_bonus > 50 {
+                InlineReason::ConstantArgs
+            } else {
+                InlineReason::CostBeneficial
+            };
+            
+            InlineDecision::Inline { reason, cost }
+        } else {
+            InlineDecision::NoInline {
+                reason: NoInlineReason::TooExpensive,
+            }
+        }
+    }
+    
+    fn estimate_size(&self, func: &MirFunction) -> u32 {
+        let mut size = 0;
+        
+        for block in &func.blocks {
+            size += block.statements.len() as u32;
+        }
+        
+        size
+    }
+    
+    /// Push function onto inline stack
+    pub fn push(&mut self, func_name: String) {
+        self.inline_stack.push(func_name);
+        self.depth += 1;
+    }
+    
+    /// Pop function from inline stack
+    pub fn pop(&mut self) {
+        self.inline_stack.pop();
+        self.depth -= 1;
+    }
+    
+    /// Record inline in history
+    pub fn record(&mut self, caller: &str, callee: &str) {
+        self.history.insert((caller.to_string(), callee.to_string()));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INLINER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Call site information
+#[derive(Debug, Clone)]
+pub struct CallSite {
+    /// Caller function name
+    pub caller: String,
+    /// Callee function name
+    pub callee: String,
+    /// Block containing the call
+    pub block: u32,
+    /// Index of call instruction
+    pub index: usize,
+    /// Call arguments
+    pub args: Vec<MirOperand>,
+    /// Return value destination
+    pub dest: Option<String>,
+    /// Profile count
+    pub profile_count: Option<u64>,
+}
+
+/// Function inliner
+pub struct Inliner {
+    advisor: InlineAdvisor,
+    /// Statistics
+    stats: InlineStats,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InlineStats {
+    pub sites_analyzed: u32,
+    pub sites_inlined: u32,
+    pub always_inline: u32,
+    pub cost_beneficial: u32,
+    pub too_expensive: u32,
+    pub growth_limited: u32,
+    pub recursive: u32,
+}
+
+impl Inliner {
+    pub fn new(config: InlineConfig) -> Self {
+        Inliner {
+            advisor: InlineAdvisor::new(config),
+            stats: InlineStats::default(),
+        }
+    }
+    
+    /// Run inlining on a module
+    pub fn run(&mut self, module: &mut MirModule, call_graph: &CallGraph) -> u32 {
+        let mut inlined = 0;
+        
+        // Collect all call sites
+        let call_sites = self.collect_call_sites(module);
+        
+        for call_site in call_sites {
+            self.stats.sites_analyzed += 1;
+            
+            // Find caller and callee
+            let caller = match module.functions.iter().find(|f| f.name == call_site.caller) {
+                Some(f) => f.clone(),
+                None => continue,
+            };
+            
+            let callee = match module.functions.iter().find(|f| f.name == call_site.callee) {
+                Some(f) => f.clone(),
+                None => continue,
+            };
+            
+            // Get inline decision
+            let decision = self.advisor.get_decision(&call_site, &callee, &caller, call_graph);
+            
+            match decision {
+                InlineDecision::Inline { reason, cost } => {
+                    self.inline_call_site(module, &call_site, &callee);
+                    self.advisor.record(&call_site.caller, &call_site.callee);
+                    
+                    self.stats.sites_inlined += 1;
+                    match reason {
+                        InlineReason::AlwaysInline => self.stats.always_inline += 1,
+                        InlineReason::CostBeneficial => self.stats.cost_beneficial += 1,
+                        _ => {}
+                    }
+                    
+                    inlined += 1;
+                }
+                InlineDecision::NoInline { reason } => {
+                    match reason {
+                        NoInlineReason::TooExpensive => self.stats.too_expensive += 1,
+                        NoInlineReason::GrowthLimit => self.stats.growth_limited += 1,
+                        NoInlineReason::Recursive => self.stats.recursive += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        
+        inlined
+    }
+    
+    fn collect_call_sites(&self, module: &MirModule) -> Vec<CallSite> {
+        let mut sites = Vec::new();
+        
+        for func in &module.functions {
+            for block in &func.blocks {
+                for (idx, stmt) in block.statements.iter().enumerate() {
+                    if let MirStatement::Call { callee, args, dest } = stmt {
+                        sites.push(CallSite {
+                            caller: func.name.clone(),
+                            callee: callee.clone(),
+                            block: block.id,
+                            index: idx,
+                            args: args.clone(),
+                            dest: dest.clone(),
+                            profile_count: None,
+                        });
+                    }
+                }
+            }
+        }
+        
+        sites
+    }
+    
+    fn inline_call_site(&self, module: &mut MirModule, call_site: &CallSite, callee: &MirFunction) {
+        let caller = match module.functions.iter_mut().find(|f| f.name == call_site.caller) {
+            Some(f) => f,
+            None => return,
+        };
+        
+        let block = match caller.blocks.iter_mut().find(|b| b.id == call_site.block) {
+            Some(b) => b,
+            None => return,
+        };
+        
+        // Clone and rename callee blocks
+        let mut cloned_blocks = self.clone_and_rename_blocks(callee, call_site);
+        
+        // Map callee parameters to call arguments
+        self.substitute_parameters(&mut cloned_blocks, callee, call_site);
+        
+        // Split the caller block at the call site
+        let (before, after) = self.split_block(block, call_site.index);
+        
+        // Connect: before -> callee entry
+        // callee returns -> after
+        
+        // Replace return with assignment to dest and jump to after
+        self.replace_returns(&mut cloned_blocks, call_site.dest.as_deref(), after.id);
+        
+        // Insert cloned blocks into caller
+        let insert_idx = caller.blocks.iter()
+            .position(|b| b.id == call_site.block)
+            .unwrap();
+        
+        // Replace original block with before block
+        caller.blocks[insert_idx] = before;
+        
+        // Insert cloned blocks and after block
+        let after_idx = insert_idx + 1;
+        for (i, cloned) in cloned_blocks.into_iter().enumerate() {
+            caller.blocks.insert(after_idx + i, cloned);
+        }
+        caller.blocks.insert(after_idx + callee.blocks.len(), after);
+    }
+    
+    fn clone_and_rename_blocks(&self, callee: &MirFunction, call_site: &CallSite) -> Vec<MirBlock> {
+        let suffix = format!("_inline_{}", call_site.index);
+        let mut cloned = Vec::new();
+        
+        for block in &callee.blocks {
+            let mut new_block = block.clone();
+            new_block.id = block.id + 1000; // Offset to avoid conflicts
+            
+            // Rename all variables
+            for stmt in &mut new_block.statements {
+                self.rename_variables(stmt, &suffix);
+            }
+            
+            cloned.push(new_block);
+        }
+        
+        cloned
+    }
+    
+    fn rename_variables(&self, stmt: &mut MirStatement, suffix: &str) {
+        match stmt {
+            MirStatement::Assign { dest, value } => {
+                *dest = format!("{}{}", dest, suffix);
+                self.rename_operand(value, suffix);
+            }
+            MirStatement::BinaryOp { dest, lhs, rhs, .. } => {
+                *dest = format!("{}{}", dest, suffix);
+                self.rename_operand(lhs, suffix);
+                self.rename_operand(rhs, suffix);
+            }
+            MirStatement::Load { dest, ptr, .. } => {
+                *dest = format!("{}{}", dest, suffix);
+                self.rename_operand(ptr, suffix);
+            }
+            MirStatement::Store { ptr, value, .. } => {
+                self.rename_operand(ptr, suffix);
+                self.rename_operand(value, suffix);
+            }
+            MirStatement::Call { args, dest, .. } => {
+                for arg in args {
+                    self.rename_operand(arg, suffix);
+                }
+                if let Some(d) = dest {
+                    *d = format!("{}{}", d, suffix);
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    fn rename_operand(&self, operand: &mut MirOperand, suffix: &str) {
+        if let MirOperand::Variable(name) = operand {
+            *name = format!("{}{}", name, suffix);
+        }
+    }
+    
+    fn substitute_parameters(&self, blocks: &mut [MirBlock], callee: &MirFunction, call_site: &CallSite) {
+        for (i, param) in callee.params.iter().enumerate() {
+            if let Some(arg) = call_site.args.get(i) {
+                let param_name = format!("{}_inline_{}", param, call_site.index);
+                
+                for block in blocks.iter_mut() {
+                    for stmt in &mut block.statements {
+                        self.substitute_operand(stmt, &param_name, arg.clone());
+                    }
+                }
+            }
+        }
+    }
+    
+    fn substitute_operand(&self, stmt: &mut MirStatement, old: &str, new: MirOperand) {
+        match stmt {
+            MirStatement::Assign { value, .. } => {
+                if value.is_var(old) {
+                    *value = new.clone();
+                }
+            }
+            MirStatement::BinaryOp { lhs, rhs, .. } => {
+                if lhs.is_var(old) {
+                    *lhs = new.clone();
+                }
+                if rhs.is_var(old) {
+                    *rhs = new.clone();
+                }
+            }
+            MirStatement::Load { ptr, .. } => {
+                if ptr.is_var(old) {
+                    *ptr = new.clone();
+                }
+            }
+            MirStatement::Store { ptr, value, .. } => {
+                if ptr.is_var(old) {
+                    *ptr = new.clone();
+                }
+                if value.is_var(old) {
+                    *value = new.clone();
+                }
+            }
+            MirStatement::Call { args, .. } => {
+                for arg in args {
+                    if arg.is_var(old) {
+                        *arg = new.clone();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    fn split_block(&self, block: &MirBlock, at: usize) -> (MirBlock, MirBlock) {
+        let before_stmts = block.statements[..at].to_vec();
+        let after_stmts = block.statements[at + 1..].to_vec(); // Skip the call
+        
+        let before = MirBlock {
+            id: block.id,
+            statements: before_stmts,
+            terminator: MirTerminator::Goto(block.id + 2000), // To callee entry
+        };
+        
+        let after = MirBlock {
+            id: block.id + 3000,
+            statements: after_stmts,
+            terminator: block.terminator.clone(),
+        };
+        
+        (before, after)
+    }
+    
+    fn replace_returns(&self, blocks: &mut [MirBlock], dest: Option<&str>, after_block: u32) {
+        for block in blocks {
+            if let MirTerminator::Return { value } = &block.terminator {
+                if let (Some(d), Some(v)) = (dest, value) {
+                    // Assign return value to dest
+                    block.statements.push(MirStatement::Assign {
+                        dest: d.to_string(),
+                        value: v.clone(),
+                    });
+                }
+                
+                block.terminator = MirTerminator::Goto(after_block);
+            }
+        }
+    }
+    
+    /// Get inline statistics
+    pub fn stats(&self) -> &InlineStats {
+        &self.stats
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirModule {
+    pub functions: Vec<MirFunction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub params: Vec<String>,
+    pub blocks: Vec<MirBlock>,
+    pub attributes: FunctionAttributes,
+    pub is_external: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Alloca { dest: String, size: usize },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+impl MirOperand {
+    pub fn is_var(&self, name: &str) -> bool {
+        matches!(self, MirOperand::Variable(n) if n == name)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Shl, Shr,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Switch { value: MirOperand, targets: Vec<(i64, u32)>, default: u32 },
+    Return { value: Option<MirOperand> },
+    Unreachable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_inline_cost() {
+        let cost = InlineCost {
+            callee_cost: 100,
+            call_overhead: 20,
+            argument_bonus: 30,
+            const_prop_bonus: 10,
+            single_caller_bonus: 0,
+            hotness_bonus: 0,
+            size_penalty: 0,
+            recursion_penalty: 0,
+        };
+        
+        // Should inline if callee_cost - bonuses <= threshold
+        assert!(cost.should_inline(100));
+        assert!(!cost.should_inline(50));
+    }
+    
+    #[test]
+    fn test_cost_analyzer() {
+        let analyzer = InlineCostAnalyzer::new();
+        
+        let func = MirFunction {
+            name: "test".to_string(),
+            params: vec!["x".to_string()],
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::BinaryOp {
+                            dest: "r".to_string(),
+                            op: BinOp::Add,
+                            lhs: MirOperand::Variable("x".to_string()),
+                            rhs: MirOperand::Constant(1),
+                        },
+                    ],
+                    terminator: MirTerminator::Return {
+                        value: Some(MirOperand::Variable("r".to_string())),
+                    },
+                },
+            ],
+            attributes: FunctionAttributes::default(),
+            is_external: false,
+        };
+        
+        let cost = analyzer.calculate_function_cost(&func);
+        assert!(cost > 0);
+    }
+    
+    #[test]
+    fn test_inline_decision() {
+        let config = InlineConfig::default();
+        let mut advisor = InlineAdvisor::new(config);
+        
+        let call_site = CallSite {
+            caller: "caller".to_string(),
+            callee: "callee".to_string(),
+            block: 0,
+            index: 0,
+            args: vec![MirOperand::Constant(42)],
+            dest: Some("result".to_string()),
+            profile_count: None,
+        };
+        
+        let callee = MirFunction {
+            name: "callee".to_string(),
+            params: vec!["x".to_string()],
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![],
+                    terminator: MirTerminator::Return {
+                        value: Some(MirOperand::Variable("x".to_string())),
+                    },
+                },
+            ],
+            attributes: FunctionAttributes::default(),
+            is_external: false,
+        };
+        
+        let caller = MirFunction {
+            name: "caller".to_string(),
+            params: vec![],
+            blocks: vec![],
+            attributes: FunctionAttributes::default(),
+            is_external: false,
+        };
+        
+        let call_graph = CallGraph::new();
+        
+        let decision = advisor.get_decision(&call_site, &callee, &caller, &call_graph);
+        
+        // Small function should be inlined
+        matches!(decision, InlineDecision::Inline { .. });
+    }
+}

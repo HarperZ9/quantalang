@@ -1,0 +1,876 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ JIT — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+//! # Just-In-Time Compilation
+//!
+//! Tiered JIT compilation for optimal performance:
+//!
+//! - **Tier 0**: Interpreter (immediate execution)
+//! - **Tier 1**: Baseline JIT (fast compilation)
+//! - **Tier 2**: Optimizing JIT (aggressive optimization)
+//!
+//! ## Features
+//!
+//! - On-Stack Replacement (OSR) for hot loops
+//! - Inline caching for polymorphic dispatch
+//! - Deoptimization for speculative optimization
+//! - Profile-Guided Optimization (PGO)
+//!
+//! ## Architecture
+//!
+//! ```text
+//! Source → Bytecode → [Interpreter]
+//!                          │
+//!                    (hot function)
+//!                          ▼
+//!               [Baseline JIT Compiler]
+//!                          │
+//!                    (very hot)
+//!                          ▼
+//!              [Optimizing JIT Compiler]
+//! ```
+
+module quantalang::jit
+
+pub mod engine;
+
+pub use engine::{
+    // Memory
+    ExecutableMemory, Protection,
+    
+    // Code generation
+    CodeBuffer, Label, Relocation, RelocKind,
+    
+    // x86-64
+    X64Assembler, Reg64, RegXmm, Condition,
+    
+    // Errors
+    JitError,
+};
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::collections::BTreeMap;
+use std::sync::{RwLock, Mutex, atomic::{AtomicU64, AtomicUsize, Ordering}};
+use std::time::{Instant, Duration};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPILATION TIERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compilation tier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tier {
+    /// Interpreter
+    Interpreter,
+    /// Baseline JIT (fast compilation, moderate performance)
+    Baseline,
+    /// Optimizing JIT (slow compilation, high performance)
+    Optimized,
+}
+
+impl Tier {
+    pub fn next(&self) -> Option<Tier> {
+        match self {
+            Tier::Interpreter => Some(Tier::Baseline),
+            Tier::Baseline => Some(Tier::Optimized),
+            Tier::Optimized => None,
+        }
+    }
+}
+
+/// Tier thresholds
+#[derive(Debug, Clone)]
+pub struct TierThresholds {
+    /// Invocations before baseline compilation
+    pub baseline_threshold: u64,
+    
+    /// Invocations before optimized compilation
+    pub optimized_threshold: u64,
+    
+    /// Loop iterations before OSR
+    pub osr_threshold: u64,
+}
+
+impl Default for TierThresholds {
+    fn default() -> Self {
+        TierThresholds {
+            baseline_threshold: 100,
+            optimized_threshold: 10_000,
+            osr_threshold: 1_000,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUNCTION PROFILE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Runtime profile data for a function
+pub struct FunctionProfile {
+    /// Invocation count
+    pub invocations: AtomicU64,
+    
+    /// Current compilation tier
+    pub tier: RwLock<Tier>,
+    
+    /// Branch profile (taken/not-taken counts)
+    pub branches: RwLock<BTreeMap<u32, BranchProfile>>,
+    
+    /// Type profile for polymorphic sites
+    pub type_profiles: RwLock<BTreeMap<u32, TypeProfile>>,
+    
+    /// Loop iteration counts
+    pub loops: RwLock<BTreeMap<u32, LoopProfile>>,
+    
+    /// Deoptimization count
+    pub deopts: AtomicU64,
+}
+
+/// Branch profile
+#[derive(Debug, Clone, Default)]
+pub struct BranchProfile {
+    pub taken: u64,
+    pub not_taken: u64,
+}
+
+impl BranchProfile {
+    pub fn probability(&self) -> f64 {
+        let total = self.taken + self.not_taken;
+        if total > 0 {
+            self.taken as f64 / total as f64
+        } else {
+            0.5
+        }
+    }
+    
+    pub fn is_biased(&self) -> bool {
+        let prob = self.probability();
+        prob < 0.1 || prob > 0.9
+    }
+}
+
+/// Type profile for polymorphic call sites
+#[derive(Debug, Clone)]
+pub struct TypeProfile {
+    /// Observed types (type_id -> count)
+    pub types: BTreeMap<u64, u64>,
+    
+    /// Total observations
+    pub total: u64,
+}
+
+impl TypeProfile {
+    pub fn new() -> Self {
+        TypeProfile {
+            types: BTreeMap::new(),
+            total: 0,
+        }
+    }
+    
+    pub fn record(&mut self, type_id: u64) {
+        *self.types.entry(type_id).or_insert(0) += 1;
+        self.total += 1;
+    }
+    
+    pub fn is_monomorphic(&self) -> bool {
+        self.types.len() == 1
+    }
+    
+    pub fn is_polymorphic(&self) -> bool {
+        self.types.len() > 1 && self.types.len() <= 4
+    }
+    
+    pub fn is_megamorphic(&self) -> bool {
+        self.types.len() > 4
+    }
+    
+    pub fn dominant_type(&self) -> Option<(u64, f64)> {
+        self.types.iter()
+            .max_by_key(|(_, &count)| count)
+            .map(|(&type_id, &count)| {
+                (type_id, count as f64 / self.total as f64)
+            })
+    }
+}
+
+impl Default for TypeProfile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Loop profile
+#[derive(Debug, Clone, Default)]
+pub struct LoopProfile {
+    /// Total iterations
+    pub iterations: u64,
+    
+    /// Times loop was entered
+    pub entries: u64,
+    
+    /// OSR trigger count
+    pub osr_triggers: u64,
+}
+
+impl LoopProfile {
+    pub fn avg_iterations(&self) -> f64 {
+        if self.entries > 0 {
+            self.iterations as f64 / self.entries as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+impl FunctionProfile {
+    pub fn new() -> Self {
+        FunctionProfile {
+            invocations: AtomicU64::new(0),
+            tier: RwLock::new(Tier::Interpreter),
+            branches: RwLock::new(BTreeMap::new()),
+            type_profiles: RwLock::new(BTreeMap::new()),
+            loops: RwLock::new(BTreeMap::new()),
+            deopts: AtomicU64::new(0),
+        }
+    }
+    
+    pub fn increment_invocations(&self) -> u64 {
+        self.invocations.fetch_add(1, Ordering::Relaxed)
+    }
+    
+    pub fn record_branch(&self, pc: u32, taken: bool) {
+        let mut branches = self.branches.write().unwrap();
+        let profile = branches.entry(pc).or_default();
+        if taken {
+            profile.taken += 1;
+        } else {
+            profile.not_taken += 1;
+        }
+    }
+    
+    pub fn record_type(&self, site: u32, type_id: u64) {
+        let mut profiles = self.type_profiles.write().unwrap();
+        let profile = profiles.entry(site).or_default();
+        profile.record(type_id);
+    }
+    
+    pub fn record_loop_iteration(&self, loop_id: u32) {
+        let mut loops = self.loops.write().unwrap();
+        let profile = loops.entry(loop_id).or_default();
+        profile.iterations += 1;
+    }
+    
+    pub fn should_tier_up(&self, thresholds: &TierThresholds) -> bool {
+        let invocations = self.invocations.load(Ordering::Relaxed);
+        let tier = *self.tier.read().unwrap();
+        
+        match tier {
+            Tier::Interpreter => invocations >= thresholds.baseline_threshold,
+            Tier::Baseline => invocations >= thresholds.optimized_threshold,
+            Tier::Optimized => false,
+        }
+    }
+}
+
+impl Default for FunctionProfile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPILED CODE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compiled function entry
+pub struct CompiledCode {
+    /// Function ID
+    pub function_id: u64,
+    
+    /// Compilation tier
+    pub tier: Tier,
+    
+    /// Entry point offset in memory
+    pub entry_offset: usize,
+    
+    /// Code size
+    pub code_size: usize,
+    
+    /// Stack frame size
+    pub frame_size: u32,
+    
+    /// Inline cache entries
+    pub inline_caches: Vec<InlineCache>,
+    
+    /// Deoptimization points
+    pub deopt_points: Vec<DeoptPoint>,
+    
+    /// Stack maps for GC
+    pub stack_maps: Vec<StackMap>,
+    
+    /// Compilation time
+    pub compile_time: Duration,
+}
+
+/// Inline cache for polymorphic dispatch
+#[derive(Debug, Clone)]
+pub struct InlineCache {
+    /// Site identifier
+    pub site_id: u32,
+    
+    /// Patch offset in code
+    pub patch_offset: usize,
+    
+    /// Cache entries
+    pub entries: Vec<ICEntry>,
+    
+    /// Maximum entries before megamorphic
+    pub max_entries: usize,
+}
+
+/// Inline cache entry
+#[derive(Debug, Clone)]
+pub struct ICEntry {
+    pub type_id: u64,
+    pub target: usize,
+}
+
+impl InlineCache {
+    pub fn new(site_id: u32, patch_offset: usize) -> Self {
+        InlineCache {
+            site_id,
+            patch_offset,
+            entries: Vec::new(),
+            max_entries: 4,
+        }
+    }
+    
+    pub fn lookup(&self, type_id: u64) -> Option<usize> {
+        self.entries.iter()
+            .find(|e| e.type_id == type_id)
+            .map(|e| e.target)
+    }
+    
+    pub fn add(&mut self, type_id: u64, target: usize) -> bool {
+        if self.entries.len() >= self.max_entries {
+            return false;
+        }
+        
+        self.entries.push(ICEntry { type_id, target });
+        true
+    }
+    
+    pub fn is_monomorphic(&self) -> bool {
+        self.entries.len() == 1
+    }
+    
+    pub fn is_megamorphic(&self) -> bool {
+        self.entries.len() >= self.max_entries
+    }
+}
+
+/// Deoptimization point
+#[derive(Debug, Clone)]
+pub struct DeoptPoint {
+    /// Code offset
+    pub code_offset: usize,
+    
+    /// Original bytecode PC
+    pub bytecode_pc: u32,
+    
+    /// Reason for potential deopt
+    pub reason: DeoptReason,
+    
+    /// Values to recover
+    pub state: DeoptState,
+}
+
+/// Deoptimization reason
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeoptReason {
+    /// Type guard failed
+    TypeGuardFailed,
+    /// Bounds check failed
+    BoundsCheckFailed,
+    /// Null check failed
+    NullCheckFailed,
+    /// Division by zero
+    DivisionByZero,
+    /// Overflow
+    Overflow,
+    /// Uncommon trap
+    UncommonTrap,
+    /// OSR entry
+    OsrEntry,
+}
+
+/// State to recover during deoptimization
+#[derive(Debug, Clone)]
+pub struct DeoptState {
+    /// Register values
+    pub registers: Vec<ValueLocation>,
+    
+    /// Stack slots
+    pub stack: Vec<ValueLocation>,
+    
+    /// Pending expression values
+    pub operands: Vec<ValueLocation>,
+}
+
+/// Location of a value
+#[derive(Debug, Clone)]
+pub enum ValueLocation {
+    /// In a register
+    Register(u8),
+    /// On stack at offset
+    Stack(i32),
+    /// Constant value
+    Constant(i64),
+    /// In memory at address
+    Memory(u64),
+}
+
+/// Stack map for garbage collection
+#[derive(Debug, Clone)]
+pub struct StackMap {
+    /// Code offset
+    pub code_offset: usize,
+    
+    /// GC roots (register or stack locations)
+    pub roots: Vec<GcRoot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GcRoot {
+    pub location: ValueLocation,
+    pub is_derived: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JIT COMPILER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// JIT compiler
+pub struct JitCompiler {
+    /// Executable memory pool
+    memory_pool: Arc<RwLock<MemoryPool>>,
+    
+    /// Compiled code registry
+    code_registry: RwLock<BTreeMap<u64, Arc<CompiledCode>>>,
+    
+    /// Function profiles
+    profiles: RwLock<BTreeMap<u64, Arc<FunctionProfile>>>,
+    
+    /// Configuration
+    config: JitConfig,
+    
+    /// Statistics
+    stats: JitStats,
+}
+
+/// Memory pool for JIT code
+pub struct MemoryPool {
+    regions: Vec<ExecutableMemory>,
+    current_region: usize,
+    region_size: usize,
+}
+
+impl MemoryPool {
+    pub fn new(region_size: usize) -> Self {
+        MemoryPool {
+            regions: Vec::new(),
+            current_region: 0,
+            region_size,
+        }
+    }
+    
+    pub fn allocate(&mut self, size: usize) -> Result<(usize, usize), JitError> {
+        // Try current region
+        if let Some(region) = self.regions.get_mut(self.current_region) {
+            if region.remaining() >= size {
+                let offset = region.offset();
+                // Would write code here
+                return Ok((self.current_region, offset));
+            }
+        }
+        
+        // Need new region
+        let mut new_region = ExecutableMemory::allocate(self.region_size)?;
+        let region_idx = self.regions.len();
+        let offset = 0;
+        
+        self.regions.push(new_region);
+        self.current_region = region_idx;
+        
+        Ok((region_idx, offset))
+    }
+}
+
+/// JIT configuration
+#[derive(Debug, Clone)]
+pub struct JitConfig {
+    /// Tier thresholds
+    pub thresholds: TierThresholds,
+    
+    /// Enable OSR
+    pub enable_osr: bool,
+    
+    /// Enable inline caching
+    pub enable_ic: bool,
+    
+    /// Maximum inline cache entries
+    pub max_ic_entries: usize,
+    
+    /// Enable speculative optimization
+    pub enable_speculation: bool,
+    
+    /// Memory region size
+    pub region_size: usize,
+    
+    /// Maximum code size per function
+    pub max_code_size: usize,
+}
+
+impl Default for JitConfig {
+    fn default() -> Self {
+        JitConfig {
+            thresholds: TierThresholds::default(),
+            enable_osr: true,
+            enable_ic: true,
+            max_ic_entries: 4,
+            enable_speculation: true,
+            region_size: 4 * 1024 * 1024, // 4 MB
+            max_code_size: 256 * 1024,    // 256 KB
+        }
+    }
+}
+
+/// JIT statistics
+#[derive(Debug, Default)]
+pub struct JitStats {
+    /// Baseline compilations
+    pub baseline_compiles: AtomicU64,
+    
+    /// Optimized compilations
+    pub optimized_compiles: AtomicU64,
+    
+    /// OSR compilations
+    pub osr_compiles: AtomicU64,
+    
+    /// Deoptimizations
+    pub deoptimizations: AtomicU64,
+    
+    /// Total compile time
+    pub total_compile_time_ns: AtomicU64,
+    
+    /// Total code size
+    pub total_code_size: AtomicUsize,
+    
+    /// Inline cache hits
+    pub ic_hits: AtomicU64,
+    
+    /// Inline cache misses
+    pub ic_misses: AtomicU64,
+}
+
+impl JitCompiler {
+    /// Create new JIT compiler
+    pub fn new(config: JitConfig) -> Self {
+        JitCompiler {
+            memory_pool: Arc::new(RwLock::new(MemoryPool::new(config.region_size))),
+            code_registry: RwLock::new(BTreeMap::new()),
+            profiles: RwLock::new(BTreeMap::new()),
+            config,
+            stats: JitStats::default(),
+        }
+    }
+    
+    /// Get or create profile for function
+    pub fn get_profile(&self, function_id: u64) -> Arc<FunctionProfile> {
+        let mut profiles = self.profiles.write().unwrap();
+        profiles.entry(function_id)
+            .or_insert_with(|| Arc::new(FunctionProfile::new()))
+            .clone()
+    }
+    
+    /// Check if function should be compiled
+    pub fn should_compile(&self, function_id: u64) -> Option<Tier> {
+        let profile = self.get_profile(function_id);
+        
+        if profile.should_tier_up(&self.config.thresholds) {
+            let current_tier = *profile.tier.read().unwrap();
+            current_tier.next()
+        } else {
+            None
+        }
+    }
+    
+    /// Compile function to specified tier
+    pub fn compile(&self, function_id: u64, tier: Tier) -> Result<Arc<CompiledCode>, JitError> {
+        let start = Instant::now();
+        
+        // Generate code based on tier
+        let code = match tier {
+            Tier::Interpreter => {
+                return Err(JitError::CompilationFailed(
+                    "cannot JIT compile interpreter tier".to_string()
+                ));
+            }
+            Tier::Baseline => {
+                self.compile_baseline(function_id)?
+            }
+            Tier::Optimized => {
+                self.compile_optimized(function_id)?
+            }
+        };
+        
+        let compile_time = start.elapsed();
+        
+        // Update stats
+        match tier {
+            Tier::Baseline => {
+                self.stats.baseline_compiles.fetch_add(1, Ordering::Relaxed);
+            }
+            Tier::Optimized => {
+                self.stats.optimized_compiles.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        
+        self.stats.total_compile_time_ns.fetch_add(
+            compile_time.as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        
+        self.stats.total_code_size.fetch_add(code.code_size, Ordering::Relaxed);
+        
+        // Update profile tier
+        let profile = self.get_profile(function_id);
+        *profile.tier.write().unwrap() = tier;
+        
+        // Register code
+        let code = Arc::new(code);
+        self.code_registry.write().unwrap().insert(function_id, code.clone());
+        
+        Ok(code)
+    }
+    
+    fn compile_baseline(&self, function_id: u64) -> Result<CompiledCode, JitError> {
+        let mut asm = X64Assembler::new();
+        
+        // Generate baseline code
+        // Prologue
+        asm.push(Reg64::Rbp);
+        asm.mov_rr(Reg64::Rbp, Reg64::Rsp);
+        
+        // Would generate code from bytecode here
+        
+        // Epilogue
+        asm.pop(Reg64::Rbp);
+        asm.ret();
+        
+        let bytes = asm.finalize()?;
+        let code_size = bytes.len();
+        
+        // Allocate executable memory
+        let mut pool = self.memory_pool.write().unwrap();
+        let (region_idx, offset) = pool.allocate(code_size)?;
+        
+        // Write code to memory
+        if let Some(region) = pool.regions.get_mut(region_idx) {
+            region.write(&bytes)?;
+            region.make_executable()?;
+        }
+        
+        Ok(CompiledCode {
+            function_id,
+            tier: Tier::Baseline,
+            entry_offset: offset,
+            code_size,
+            frame_size: 0,
+            inline_caches: Vec::new(),
+            deopt_points: Vec::new(),
+            stack_maps: Vec::new(),
+            compile_time: Duration::ZERO,
+        })
+    }
+    
+    fn compile_optimized(&self, function_id: u64) -> Result<CompiledCode, JitError> {
+        let profile = self.get_profile(function_id);
+        let mut asm = X64Assembler::new();
+        
+        // Generate optimized code using profile data
+        // Prologue
+        asm.push(Reg64::Rbp);
+        asm.mov_rr(Reg64::Rbp, Reg64::Rsp);
+        
+        // Would generate optimized code with:
+        // - Speculative inlining
+        // - Type-specialized paths
+        // - Hoisted checks
+        // - Loop unrolling
+        
+        // Epilogue
+        asm.pop(Reg64::Rbp);
+        asm.ret();
+        
+        let bytes = asm.finalize()?;
+        let code_size = bytes.len();
+        
+        let mut pool = self.memory_pool.write().unwrap();
+        let (region_idx, offset) = pool.allocate(code_size)?;
+        
+        if let Some(region) = pool.regions.get_mut(region_idx) {
+            region.write(&bytes)?;
+            region.make_executable()?;
+        }
+        
+        Ok(CompiledCode {
+            function_id,
+            tier: Tier::Optimized,
+            entry_offset: offset,
+            code_size,
+            frame_size: 0,
+            inline_caches: Vec::new(),
+            deopt_points: Vec::new(),
+            stack_maps: Vec::new(),
+            compile_time: Duration::ZERO,
+        })
+    }
+    
+    /// Deoptimize function
+    pub fn deoptimize(&self, function_id: u64, reason: DeoptReason) {
+        self.stats.deoptimizations.fetch_add(1, Ordering::Relaxed);
+        
+        let profile = self.get_profile(function_id);
+        profile.deopts.fetch_add(1, Ordering::Relaxed);
+        
+        // Revert to interpreter
+        *profile.tier.write().unwrap() = Tier::Interpreter;
+        
+        // Remove compiled code
+        self.code_registry.write().unwrap().remove(&function_id);
+    }
+    
+    /// Get compiled code
+    pub fn get_code(&self, function_id: u64) -> Option<Arc<CompiledCode>> {
+        self.code_registry.read().unwrap().get(&function_id).cloned()
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &JitStats {
+        &self.stats
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub mod prelude {
+    pub use super::{
+        // Tiers
+        Tier, TierThresholds,
+        
+        // Profiles
+        FunctionProfile, BranchProfile, TypeProfile, LoopProfile,
+        
+        // Compiled code
+        CompiledCode, InlineCache, DeoptPoint, DeoptReason,
+        DeoptState, ValueLocation, StackMap,
+        
+        // Compiler
+        JitCompiler, JitConfig, JitStats,
+        
+        // Low-level
+        ExecutableMemory, CodeBuffer, X64Assembler,
+        Reg64, Condition, Label,
+        
+        // Errors
+        JitError,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_tier_progression() {
+        assert_eq!(Tier::Interpreter.next(), Some(Tier::Baseline));
+        assert_eq!(Tier::Baseline.next(), Some(Tier::Optimized));
+        assert_eq!(Tier::Optimized.next(), None);
+    }
+    
+    #[test]
+    fn test_function_profile() {
+        let profile = FunctionProfile::new();
+        
+        for _ in 0..100 {
+            profile.increment_invocations();
+        }
+        
+        let thresholds = TierThresholds::default();
+        assert!(profile.should_tier_up(&thresholds));
+    }
+    
+    #[test]
+    fn test_branch_profile() {
+        let mut profile = BranchProfile::default();
+        
+        for _ in 0..90 {
+            profile.taken += 1;
+        }
+        for _ in 0..10 {
+            profile.not_taken += 1;
+        }
+        
+        assert!((profile.probability() - 0.9).abs() < 0.001);
+        assert!(profile.is_biased());
+    }
+    
+    #[test]
+    fn test_type_profile() {
+        let mut profile = TypeProfile::new();
+        
+        profile.record(1);
+        profile.record(1);
+        profile.record(1);
+        
+        assert!(profile.is_monomorphic());
+        
+        profile.record(2);
+        assert!(profile.is_polymorphic());
+    }
+    
+    #[test]
+    fn test_inline_cache() {
+        let mut ic = InlineCache::new(0, 0);
+        
+        ic.add(1, 0x1000);
+        ic.add(2, 0x2000);
+        
+        assert_eq!(ic.lookup(1), Some(0x1000));
+        assert_eq!(ic.lookup(2), Some(0x2000));
+        assert_eq!(ic.lookup(3), None);
+    }
+    
+    #[test]
+    fn test_jit_compiler() {
+        let compiler = JitCompiler::new(JitConfig::default());
+        
+        let profile = compiler.get_profile(1);
+        assert_eq!(*profile.tier.read().unwrap(), Tier::Interpreter);
+    }
+}

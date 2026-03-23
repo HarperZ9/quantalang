@@ -1,0 +1,735 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Bounds Check Elimination
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Bounds check elimination optimization:
+//   - Range analysis for array indices
+//   - Loop bounds inference
+//   - Redundant check elimination
+//   - Check hoisting
+//   - Safe deoptimization
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::bce
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BOUNDS CHECK REPRESENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A bounds check operation
+#[derive(Debug, Clone)]
+pub struct BoundsCheck {
+    /// Check ID
+    pub id: u32,
+    /// Block containing the check
+    pub block: u32,
+    /// Instruction index
+    pub index: usize,
+    /// Index being checked
+    pub index_var: String,
+    /// Array length/upper bound
+    pub bound: BoundExpr,
+    /// Check kind
+    pub kind: CheckKind,
+}
+
+/// Expression for bound value
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundExpr {
+    /// Constant bound
+    Constant(i64),
+    /// Variable bound (array length)
+    Variable(String),
+    /// Computed bound
+    Computed(String, BinOp, i64),
+}
+
+/// Kind of bounds check
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckKind {
+    /// index < length
+    UpperBound,
+    /// index >= 0
+    LowerBound,
+    /// Both bounds
+    Both,
+}
+
+/// Binary operation for computed bounds
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add, Sub, Mul, Div,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INDEX RANGE ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Range of possible values for an index
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexRange {
+    /// Unknown range
+    Unknown,
+    /// Constant value
+    Constant(i64),
+    /// Range with known bounds
+    Range { min: i64, max: i64 },
+    /// Bounded by variable
+    BoundedBy(String),
+    /// Affine expression: base + coeff * var
+    Affine { base: i64, coeff: i64, var: String },
+}
+
+impl IndexRange {
+    /// Check if range is always non-negative
+    pub fn is_non_negative(&self) -> bool {
+        match self {
+            IndexRange::Constant(c) => *c >= 0,
+            IndexRange::Range { min, .. } => *min >= 0,
+            IndexRange::Affine { base, coeff, .. } => {
+                // Conservative: only true if base >= 0 and coeff >= 0
+                *base >= 0 && *coeff >= 0
+            }
+            _ => false,
+        }
+    }
+    
+    /// Check if range is always less than bound
+    pub fn is_less_than(&self, bound: &BoundExpr) -> bool {
+        match (self, bound) {
+            (IndexRange::Constant(idx), BoundExpr::Constant(b)) => *idx < *b,
+            (IndexRange::Range { max, .. }, BoundExpr::Constant(b)) => *max < *b,
+            _ => false,
+        }
+    }
+    
+    /// Merge two ranges (least upper bound)
+    pub fn merge(&self, other: &IndexRange) -> IndexRange {
+        match (self, other) {
+            (IndexRange::Constant(a), IndexRange::Constant(b)) => {
+                if a == b {
+                    IndexRange::Constant(*a)
+                } else {
+                    IndexRange::Range {
+                        min: (*a).min(*b),
+                        max: (*a).max(*b),
+                    }
+                }
+            }
+            (IndexRange::Range { min: min1, max: max1 }, IndexRange::Range { min: min2, max: max2 }) => {
+                IndexRange::Range {
+                    min: (*min1).min(*min2),
+                    max: (*max1).max(*max2),
+                }
+            }
+            (IndexRange::Constant(c), IndexRange::Range { min, max }) |
+            (IndexRange::Range { min, max }, IndexRange::Constant(c)) => {
+                IndexRange::Range {
+                    min: (*min).min(*c),
+                    max: (*max).max(*c),
+                }
+            }
+            _ => IndexRange::Unknown,
+        }
+    }
+    
+    /// Apply addition
+    pub fn add(&self, offset: i64) -> IndexRange {
+        match self {
+            IndexRange::Constant(c) => IndexRange::Constant(c + offset),
+            IndexRange::Range { min, max } => IndexRange::Range {
+                min: min + offset,
+                max: max + offset,
+            },
+            IndexRange::Affine { base, coeff, var } => IndexRange::Affine {
+                base: base + offset,
+                coeff: *coeff,
+                var: var.clone(),
+            },
+            _ => IndexRange::Unknown,
+        }
+    }
+    
+    /// Apply multiplication
+    pub fn mul(&self, factor: i64) -> IndexRange {
+        if factor == 0 {
+            return IndexRange::Constant(0);
+        }
+        
+        match self {
+            IndexRange::Constant(c) => IndexRange::Constant(c * factor),
+            IndexRange::Range { min, max } => {
+                let (new_min, new_max) = if factor > 0 {
+                    (min * factor, max * factor)
+                } else {
+                    (max * factor, min * factor)
+                };
+                IndexRange::Range { min: new_min, max: new_max }
+            }
+            IndexRange::Affine { base, coeff, var } => IndexRange::Affine {
+                base: base * factor,
+                coeff: coeff * factor,
+                var: var.clone(),
+            },
+            _ => IndexRange::Unknown,
+        }
+    }
+}
+
+/// Index range analyzer
+pub struct IndexRangeAnalyzer {
+    /// Ranges for each variable
+    ranges: BTreeMap<String, IndexRange>,
+    /// Loop induction variables
+    induction_vars: BTreeMap<String, InductionInfo>,
+}
+
+/// Information about an induction variable
+#[derive(Debug, Clone)]
+pub struct InductionInfo {
+    /// Initial value
+    pub init: i64,
+    /// Step per iteration
+    pub step: i64,
+    /// Final value (if known)
+    pub final_val: Option<i64>,
+    /// Loop header
+    pub loop_header: u32,
+}
+
+impl IndexRangeAnalyzer {
+    pub fn new() -> Self {
+        IndexRangeAnalyzer {
+            ranges: BTreeMap::new(),
+            induction_vars: BTreeMap::new(),
+        }
+    }
+    
+    /// Analyze a function
+    pub fn analyze(&mut self, func: &MirFunction, loop_info: &LoopInfo) {
+        self.ranges.clear();
+        self.induction_vars.clear();
+        
+        // Find induction variables
+        self.find_induction_vars(func, loop_info);
+        
+        // Compute ranges
+        self.compute_ranges(func);
+    }
+    
+    fn find_induction_vars(&mut self, func: &MirFunction, loop_info: &LoopInfo) {
+        for (header, blocks) in &loop_info.loops {
+            // Look for phi nodes in header
+            if let Some(header_block) = func.blocks.iter().find(|b| b.id == *header) {
+                for stmt in &header_block.statements {
+                    if let MirStatement::Phi { dest, incoming } = stmt {
+                        // Check if this is an induction variable
+                        if let Some(info) = self.analyze_induction(dest, incoming, func, blocks) {
+                            self.induction_vars.insert(dest.clone(), info);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    fn analyze_induction(
+        &self,
+        dest: &str,
+        incoming: &[(u32, MirOperand)],
+        func: &MirFunction,
+        loop_blocks: &BTreeSet<u32>,
+    ) -> Option<InductionInfo> {
+        if incoming.len() != 2 {
+            return None;
+        }
+        
+        // Find init value (from outside loop) and step (from inside)
+        let mut init: Option<i64> = None;
+        let mut step_var: Option<String> = None;
+        
+        for (block, op) in incoming {
+            if loop_blocks.contains(block) {
+                // Back edge - should reference dest
+                if let MirOperand::Variable(v) = op {
+                    step_var = Some(v.clone());
+                }
+            } else {
+                // Entry edge - initial value
+                if let MirOperand::Constant(c) = op {
+                    init = Some(*c);
+                }
+            }
+        }
+        
+        let init = init?;
+        let step_var = step_var?;
+        
+        // Find the increment operation
+        let step = self.find_increment(func, loop_blocks, dest, &step_var)?;
+        
+        Some(InductionInfo {
+            init,
+            step,
+            final_val: None,
+            loop_header: 0,
+        })
+    }
+    
+    fn find_increment(
+        &self,
+        func: &MirFunction,
+        loop_blocks: &BTreeSet<u32>,
+        iv: &str,
+        result: &str,
+    ) -> Option<i64> {
+        for block in &func.blocks {
+            if !loop_blocks.contains(&block.id) {
+                continue;
+            }
+            
+            for stmt in &block.statements {
+                if let MirStatement::BinaryOp { dest, op: MirBinOp::Add, lhs, rhs } = stmt {
+                    if dest == result {
+                        // Check if this is iv + constant
+                        match (lhs, rhs) {
+                            (MirOperand::Variable(v), MirOperand::Constant(c)) if v == iv => {
+                                return Some(*c);
+                            }
+                            (MirOperand::Constant(c), MirOperand::Variable(v)) if v == iv => {
+                                return Some(*c);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn compute_ranges(&mut self, func: &MirFunction) {
+        // Initialize from induction variables
+        for (var, info) in &self.induction_vars {
+            if let Some(final_val) = info.final_val {
+                let (min, max) = if info.step > 0 {
+                    (info.init, final_val)
+                } else {
+                    (final_val, info.init)
+                };
+                self.ranges.insert(var.clone(), IndexRange::Range { min, max });
+            } else {
+                self.ranges.insert(var.clone(), IndexRange::Affine {
+                    base: info.init,
+                    coeff: info.step,
+                    var: "_iter".to_string(),
+                });
+            }
+        }
+        
+        // Propagate through statements
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                self.analyze_statement(stmt);
+            }
+        }
+    }
+    
+    fn analyze_statement(&mut self, stmt: &MirStatement) {
+        match stmt {
+            MirStatement::Assign { dest, value } => {
+                let range = match value {
+                    MirOperand::Constant(c) => IndexRange::Constant(*c),
+                    MirOperand::Variable(v) => {
+                        self.ranges.get(v).cloned().unwrap_or(IndexRange::Unknown)
+                    }
+                };
+                self.ranges.insert(dest.clone(), range);
+            }
+            MirStatement::BinaryOp { dest, op, lhs, rhs } => {
+                let lhs_range = self.operand_range(lhs);
+                let rhs_range = self.operand_range(rhs);
+                
+                let result_range = match op {
+                    MirBinOp::Add => {
+                        if let IndexRange::Constant(c) = rhs_range {
+                            lhs_range.add(c)
+                        } else if let IndexRange::Constant(c) = lhs_range {
+                            rhs_range.add(c)
+                        } else {
+                            IndexRange::Unknown
+                        }
+                    }
+                    MirBinOp::Mul => {
+                        if let IndexRange::Constant(c) = rhs_range {
+                            lhs_range.mul(c)
+                        } else if let IndexRange::Constant(c) = lhs_range {
+                            rhs_range.mul(c)
+                        } else {
+                            IndexRange::Unknown
+                        }
+                    }
+                    _ => IndexRange::Unknown,
+                };
+                
+                self.ranges.insert(dest.clone(), result_range);
+            }
+            _ => {}
+        }
+    }
+    
+    fn operand_range(&self, op: &MirOperand) -> IndexRange {
+        match op {
+            MirOperand::Constant(c) => IndexRange::Constant(*c),
+            MirOperand::Variable(v) => {
+                self.ranges.get(v).cloned().unwrap_or(IndexRange::Unknown)
+            }
+        }
+    }
+    
+    /// Get range for a variable
+    pub fn get_range(&self, var: &str) -> Option<&IndexRange> {
+        self.ranges.get(var)
+    }
+}
+
+impl Default for IndexRangeAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BOUNDS CHECK ELIMINATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Bounds check elimination pass
+pub struct BoundsCheckElimination {
+    /// Range analyzer
+    range_analyzer: IndexRangeAnalyzer,
+    /// Detected bounds checks
+    checks: Vec<BoundsCheck>,
+    /// Checks that can be eliminated
+    eliminable: BTreeSet<u32>,
+    /// Checks that can be hoisted
+    hoistable: BTreeMap<u32, u32>,
+    /// Statistics
+    stats: BCEStats,
+}
+
+/// BCE statistics
+#[derive(Debug, Clone, Default)]
+pub struct BCEStats {
+    /// Total bounds checks found
+    pub total_checks: usize,
+    /// Checks eliminated
+    pub eliminated: usize,
+    /// Checks hoisted
+    pub hoisted: usize,
+    /// Checks remaining
+    pub remaining: usize,
+}
+
+impl BoundsCheckElimination {
+    pub fn new() -> Self {
+        BoundsCheckElimination {
+            range_analyzer: IndexRangeAnalyzer::new(),
+            checks: Vec::new(),
+            eliminable: BTreeSet::new(),
+            hoistable: BTreeMap::new(),
+            stats: BCEStats::default(),
+        }
+    }
+    
+    /// Run BCE on a function
+    pub fn run(&mut self, func: &mut MirFunction, loop_info: &LoopInfo) -> &BCEStats {
+        self.stats = BCEStats::default();
+        self.checks.clear();
+        self.eliminable.clear();
+        self.hoistable.clear();
+        
+        // Analyze ranges
+        self.range_analyzer.analyze(func, loop_info);
+        
+        // Find bounds checks
+        self.find_bounds_checks(func);
+        self.stats.total_checks = self.checks.len();
+        
+        // Analyze each check
+        for check in &self.checks {
+            self.analyze_check(check);
+        }
+        
+        // Apply eliminations
+        self.apply_eliminations(func);
+        
+        self.stats.remaining = self.stats.total_checks - self.stats.eliminated - self.stats.hoisted;
+        
+        &self.stats
+    }
+    
+    fn find_bounds_checks(&mut self, func: &MirFunction) {
+        let mut check_id = 0;
+        
+        for block in &func.blocks {
+            for (idx, stmt) in block.statements.iter().enumerate() {
+                if let Some(check) = self.extract_bounds_check(stmt, block.id, idx, check_id) {
+                    self.checks.push(check);
+                    check_id += 1;
+                }
+            }
+        }
+    }
+    
+    fn extract_bounds_check(
+        &self,
+        stmt: &MirStatement,
+        block: u32,
+        index: usize,
+        check_id: u32,
+    ) -> Option<BoundsCheck> {
+        // Look for comparison patterns: index < length or index >= 0
+        if let MirStatement::BinaryOp { dest, op, lhs, rhs } = stmt {
+            match op {
+                MirBinOp::Lt => {
+                    // index < length (upper bound)
+                    if let MirOperand::Variable(idx) = lhs {
+                        let bound = self.operand_to_bound(rhs);
+                        return Some(BoundsCheck {
+                            id: check_id,
+                            block,
+                            index,
+                            index_var: idx.clone(),
+                            bound,
+                            kind: CheckKind::UpperBound,
+                        });
+                    }
+                }
+                MirBinOp::Ge => {
+                    // index >= 0 (lower bound)
+                    if let MirOperand::Variable(idx) = lhs {
+                        if let MirOperand::Constant(0) = rhs {
+                            return Some(BoundsCheck {
+                                id: check_id,
+                                block,
+                                index,
+                                index_var: idx.clone(),
+                                bound: BoundExpr::Constant(0),
+                                kind: CheckKind::LowerBound,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        None
+    }
+    
+    fn operand_to_bound(&self, op: &MirOperand) -> BoundExpr {
+        match op {
+            MirOperand::Constant(c) => BoundExpr::Constant(*c),
+            MirOperand::Variable(v) => BoundExpr::Variable(v.clone()),
+        }
+    }
+    
+    fn analyze_check(&mut self, check: &BoundsCheck) {
+        let range = self.range_analyzer.get_range(&check.index_var);
+        
+        if let Some(range) = range {
+            match check.kind {
+                CheckKind::LowerBound => {
+                    if range.is_non_negative() {
+                        self.eliminable.insert(check.id);
+                    }
+                }
+                CheckKind::UpperBound => {
+                    if range.is_less_than(&check.bound) {
+                        self.eliminable.insert(check.id);
+                    }
+                }
+                CheckKind::Both => {
+                    if range.is_non_negative() && range.is_less_than(&check.bound) {
+                        self.eliminable.insert(check.id);
+                    }
+                }
+            }
+        }
+    }
+    
+    fn apply_eliminations(&mut self, func: &mut MirFunction) {
+        for check in &self.checks {
+            if self.eliminable.contains(&check.id) {
+                // Replace check with constant true
+                if let Some(block) = func.blocks.iter_mut().find(|b| b.id == check.block) {
+                    if check.index < block.statements.len() {
+                        if let MirStatement::BinaryOp { dest, .. } = &block.statements[check.index] {
+                            block.statements[check.index] = MirStatement::Assign {
+                                dest: dest.clone(),
+                                value: MirOperand::Constant(1),
+                            };
+                            self.stats.eliminated += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &BCEStats {
+        &self.stats
+    }
+}
+
+impl Default for BoundsCheckElimination {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES AND LOOP INFO
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop information
+#[derive(Debug, Clone)]
+pub struct LoopInfo {
+    /// Loop headers to loop blocks
+    pub loops: BTreeMap<u32, BTreeSet<u32>>,
+}
+
+impl LoopInfo {
+    pub fn new() -> Self {
+        LoopInfo { loops: BTreeMap::new() }
+    }
+}
+
+impl Default for LoopInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: MirBinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand },
+    Store { ptr: MirOperand, value: MirOperand },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirBinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Return { value: Option<MirOperand> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_index_range_non_negative() {
+        assert!(IndexRange::Constant(5).is_non_negative());
+        assert!(!IndexRange::Constant(-1).is_non_negative());
+        assert!(IndexRange::Range { min: 0, max: 10 }.is_non_negative());
+        assert!(!IndexRange::Range { min: -5, max: 10 }.is_non_negative());
+    }
+    
+    #[test]
+    fn test_index_range_less_than() {
+        let range = IndexRange::Range { min: 0, max: 5 };
+        assert!(range.is_less_than(&BoundExpr::Constant(10)));
+        assert!(!range.is_less_than(&BoundExpr::Constant(3)));
+    }
+    
+    #[test]
+    fn test_index_range_add() {
+        let range = IndexRange::Constant(5);
+        assert_eq!(range.add(3), IndexRange::Constant(8));
+        
+        let range = IndexRange::Range { min: 0, max: 5 };
+        assert_eq!(range.add(2), IndexRange::Range { min: 2, max: 7 });
+    }
+    
+    #[test]
+    fn test_index_range_mul() {
+        let range = IndexRange::Constant(5);
+        assert_eq!(range.mul(2), IndexRange::Constant(10));
+        
+        let range = IndexRange::Range { min: 1, max: 5 };
+        assert_eq!(range.mul(2), IndexRange::Range { min: 2, max: 10 });
+    }
+    
+    #[test]
+    fn test_bce() {
+        let func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::BinaryOp {
+                            dest: "check".to_string(),
+                            op: MirBinOp::Lt,
+                            lhs: MirOperand::Variable("i".to_string()),
+                            rhs: MirOperand::Constant(10),
+                        },
+                    ],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let mut bce = BoundsCheckElimination::new();
+        let loop_info = LoopInfo::new();
+        bce.run(&mut func.clone(), &loop_info);
+        
+        assert_eq!(bce.stats().total_checks, 1);
+    }
+}

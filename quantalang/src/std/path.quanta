@@ -1,0 +1,1476 @@
+/// QuantaLang Standard Library - Path and Filesystem
+/// Path manipulation, directory traversal, metadata
+module std::path;
+
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
+use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd};
+use std::hash::{Hash, Hasher};
+use std::iter::Iterator;
+use std::option::Option;
+use std::result::Result;
+use std::string::String;
+use std::vec::Vec;
+use std::io::{Error, ErrorKind, Result as IoResult};
+use std::time::SystemTime;
+
+// ============================================================================
+// Path constants
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+const MAIN_SEPARATOR: char = '\\';
+#[cfg(not(target_os = "windows"))]
+const MAIN_SEPARATOR: char = '/';
+
+#[cfg(target_os = "windows")]
+const MAIN_SEPARATOR_STR: &str = "\\";
+#[cfg(not(target_os = "windows"))]
+const MAIN_SEPARATOR_STR: &str = "/";
+
+/// Check if character is a path separator
+pub fn is_separator(c: char) -> bool {
+    c == '/' || c == '\\'
+}
+
+// ============================================================================
+// Path - Borrowed path slice
+// ============================================================================
+
+/// Borrowed reference to a path
+#[repr(transparent)]
+pub struct Path {
+    inner: str,
+}
+
+impl Path {
+    /// Create Path from string slice
+    pub fn new<S: AsRef<str> + ?Sized>(s: &S) -> &Path {
+        unsafe { &*(s.as_ref() as *const str as *const Path) }
+    }
+    
+    /// Get the underlying string
+    pub fn as_str(&self) -> &str {
+        &self.inner
+    }
+    
+    /// Convert to owned PathBuf
+    pub fn to_path_buf(&self) -> PathBuf {
+        PathBuf { inner: self.inner.to_string() }
+    }
+    
+    /// Check if path is absolute
+    pub fn is_absolute(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            // Windows: C:\ or \\server or /
+            let bytes = self.inner.as_bytes();
+            if bytes.len() >= 3 && bytes[1] == b':' && is_separator(bytes[2] as char) {
+                return true;
+            }
+            if bytes.len() >= 2 && bytes[0] == b'\\' && bytes[1] == b'\\' {
+                return true;
+            }
+            bytes.len() >= 1 && is_separator(bytes[0] as char)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.inner.starts_with('/')
+        }
+    }
+    
+    /// Check if path is relative
+    pub fn is_relative(&self) -> bool {
+        !self.is_absolute()
+    }
+    
+    /// Check if path has a root
+    pub fn has_root(&self) -> bool {
+        self.is_absolute()
+    }
+    
+    /// Get the parent directory
+    pub fn parent(&self) -> Option<&Path> {
+        let path = self.inner.trim_end_matches(is_separator);
+        if path.is_empty() {
+            return None;
+        }
+        
+        match path.rfind(is_separator) {
+            Some(idx) if idx > 0 => Some(Path::new(&self.inner[..idx])),
+            Some(0) => Some(Path::new(&self.inner[..1])),
+            None => None,
+        }
+    }
+    
+    /// Get ancestors iterator (path, parent, grandparent, etc.)
+    pub fn ancestors(&self) -> Ancestors<'_> {
+        Ancestors { path: Some(self) }
+    }
+    
+    /// Get the final component (file or directory name)
+    pub fn file_name(&self) -> Option<&str> {
+        let path = self.inner.trim_end_matches(is_separator);
+        if path.is_empty() {
+            return None;
+        }
+        
+        match path.rfind(is_separator) {
+            Some(idx) => Some(&path[idx + 1..]),
+            None => Some(path),
+        }
+    }
+    
+    /// Get file stem (name without extension)
+    pub fn file_stem(&self) -> Option<&str> {
+        let name = self.file_name()?;
+        match name.rfind('.') {
+            Some(idx) if idx > 0 => Some(&name[..idx]),
+            _ => Some(name),
+        }
+    }
+    
+    /// Get file extension (without dot)
+    pub fn extension(&self) -> Option<&str> {
+        let name = self.file_name()?;
+        match name.rfind('.') {
+            Some(idx) if idx > 0 && idx < name.len() - 1 => Some(&name[idx + 1..]),
+            _ => None,
+        }
+    }
+    
+    /// Join path with another component
+    pub fn join<P: AsRef<Path>>(&self, path: P) -> PathBuf {
+        let path = path.as_ref();
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        
+        let mut result = self.to_path_buf();
+        result.push(path);
+        result
+    }
+    
+    /// Create path with different extension
+    pub fn with_extension<S: AsRef<str>>(&self, extension: S) -> PathBuf {
+        let mut result = self.to_path_buf();
+        result.set_extension(extension);
+        result
+    }
+    
+    /// Create path with different file name
+    pub fn with_file_name<S: AsRef<str>>(&self, file_name: S) -> PathBuf {
+        let mut result = match self.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => PathBuf::new(),
+        };
+        result.push(file_name.as_ref());
+        result
+    }
+    
+    /// Iterate over path components
+    pub fn components(&self) -> Components<'_> {
+        Components {
+            path: &self.inner,
+            front_offset: 0,
+            back_offset: self.inner.len(),
+        }
+    }
+    
+    /// Iterate over path ancestors
+    pub fn iter(&self) -> Iter<'_> {
+        Iter {
+            inner: self.components(),
+        }
+    }
+    
+    /// Check if path starts with another path
+    pub fn starts_with<P: AsRef<Path>>(&self, base: P) -> bool {
+        let base = base.as_ref();
+        let mut self_components = self.components();
+        let mut base_components = base.components();
+        
+        loop {
+            match (self_components.next(), base_components.next()) {
+                (Some(a), Some(b)) if a == b => continue,
+                (_, None) => return true,
+                _ => return false,
+            }
+        }
+    }
+    
+    /// Check if path ends with another path
+    pub fn ends_with<P: AsRef<Path>>(&self, child: P) -> bool {
+        let child = child.as_ref();
+        let mut self_components = self.components().rev();
+        let mut child_components = child.components().rev();
+        
+        loop {
+            match (self_components.next(), child_components.next()) {
+                (Some(a), Some(b)) if a == b => continue,
+                (_, None) => return true,
+                _ => return false,
+            }
+        }
+    }
+    
+    /// Strip prefix from path
+    pub fn strip_prefix<P: AsRef<Path>>(&self, base: P) -> Result<&Path, StripPrefixError> {
+        let base = base.as_ref();
+        
+        if !self.starts_with(base) {
+            return Err(StripPrefixError(()));
+        }
+        
+        let base_len = base.inner.len();
+        let remainder = &self.inner[base_len..];
+        let trimmed = remainder.trim_start_matches(is_separator);
+        
+        Ok(Path::new(trimmed))
+    }
+    
+    /// Display path (may differ from as_str on Windows)
+    pub fn display(&self) -> Display<'_> {
+        Display { path: self }
+    }
+    
+    /// Check if path exists
+    pub fn exists(&self) -> bool {
+        metadata(self).is_ok()
+    }
+    
+    /// Check if path is a file
+    pub fn is_file(&self) -> bool {
+        metadata(self).map(|m| m.is_file()).unwrap_or(false)
+    }
+    
+    /// Check if path is a directory
+    pub fn is_dir(&self) -> bool {
+        metadata(self).map(|m| m.is_dir()).unwrap_or(false)
+    }
+    
+    /// Check if path is a symlink
+    pub fn is_symlink(&self) -> bool {
+        symlink_metadata(self).map(|m| m.is_symlink()).unwrap_or(false)
+    }
+    
+    /// Get metadata without following symlinks
+    pub fn symlink_metadata(&self) -> IoResult<Metadata> {
+        symlink_metadata(self)
+    }
+    
+    /// Get metadata (follows symlinks)
+    pub fn metadata(&self) -> IoResult<Metadata> {
+        metadata(self)
+    }
+    
+    /// Read directory contents
+    pub fn read_dir(&self) -> IoResult<ReadDir> {
+        read_dir(self)
+    }
+    
+    /// Get canonical (absolute, normalized) path
+    pub fn canonicalize(&self) -> IoResult<PathBuf> {
+        canonicalize(self)
+    }
+    
+    /// Read symlink target
+    pub fn read_link(&self) -> IoResult<PathBuf> {
+        read_link(self)
+    }
+}
+
+impl AsRef<Path> for Path {
+    fn as_ref(&self) -> &Path {
+        self
+    }
+}
+
+impl AsRef<str> for Path {
+    fn as_ref(&self) -> &str {
+        &self.inner
+    }
+}
+
+impl Debug for Path {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "\"{}\"", self.inner)
+    }
+}
+
+impl PartialEq for Path {
+    fn eq(&self, other: &Path) -> bool {
+        self.components().eq(other.components())
+    }
+}
+
+impl Eq for Path {}
+
+impl Hash for Path {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for component in self.components() {
+            component.hash(state);
+        }
+    }
+}
+
+impl ToOwned for Path {
+    type Owned = PathBuf;
+    
+    fn to_owned(&self) -> PathBuf {
+        self.to_path_buf()
+    }
+}
+
+// ============================================================================
+// PathBuf - Owned path
+// ============================================================================
+
+/// Owned, mutable path
+#[derive(Clone, Default)]
+pub struct PathBuf {
+    inner: String,
+}
+
+impl PathBuf {
+    /// Create empty PathBuf
+    pub fn new() -> Self {
+        Self { inner: String::new() }
+    }
+    
+    /// Create with capacity
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self { inner: String::with_capacity(capacity) }
+    }
+    
+    /// Create from string
+    pub fn from<S: Into<String>>(s: S) -> Self {
+        Self { inner: s.into() }
+    }
+    
+    /// Get as Path slice
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.inner)
+    }
+    
+    /// Push component onto path
+    pub fn push<P: AsRef<Path>>(&mut self, path: P) {
+        let path = path.as_ref();
+        
+        if path.is_absolute() {
+            self.inner = path.inner.to_string();
+            return;
+        }
+        
+        if !self.inner.is_empty() && !self.inner.ends_with(is_separator) {
+            self.inner.push(MAIN_SEPARATOR);
+        }
+        
+        self.inner.push_str(&path.inner);
+    }
+    
+    /// Pop last component
+    pub fn pop(&mut self) -> bool {
+        match self.as_path().parent() {
+            Some(parent) => {
+                self.inner.truncate(parent.inner.len());
+                true
+            }
+            None => false,
+        }
+    }
+    
+    /// Set file name
+    pub fn set_file_name<S: AsRef<str>>(&mut self, file_name: S) {
+        if self.as_path().file_name().is_some() {
+            self.pop();
+        }
+        self.push(file_name.as_ref());
+    }
+    
+    /// Set extension
+    pub fn set_extension<S: AsRef<str>>(&mut self, extension: S) -> bool {
+        let ext = extension.as_ref();
+        
+        // Find current extension position
+        if let Some(stem) = self.as_path().file_stem() {
+            let parent_len = self.as_path()
+                .parent()
+                .map(|p| p.inner.len() + 1)
+                .unwrap_or(0);
+            
+            self.inner.truncate(parent_len + stem.len());
+            
+            if !ext.is_empty() {
+                self.inner.push('.');
+                self.inner.push_str(ext);
+            }
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Clear the path
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+    
+    /// Reserve capacity
+    pub fn reserve(&mut self, additional: usize) {
+        self.inner.reserve(additional);
+    }
+    
+    /// Shrink to fit
+    pub fn shrink_to_fit(&mut self) {
+        self.inner.shrink_to_fit();
+    }
+    
+    /// Get capacity
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+    
+    /// Convert to string
+    pub fn into_string(self) -> String {
+        self.inner
+    }
+}
+
+impl Deref for PathBuf {
+    type Target = Path;
+    
+    fn deref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+impl AsRef<Path> for PathBuf {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+impl AsRef<str> for PathBuf {
+    fn as_ref(&self) -> &str {
+        &self.inner
+    }
+}
+
+impl From<String> for PathBuf {
+    fn from(s: String) -> Self {
+        Self { inner: s }
+    }
+}
+
+impl From<&str> for PathBuf {
+    fn from(s: &str) -> Self {
+        Self { inner: s.to_string() }
+    }
+}
+
+impl From<&Path> for PathBuf {
+    fn from(path: &Path) -> Self {
+        path.to_path_buf()
+    }
+}
+
+impl Debug for PathBuf {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        Debug::fmt(self.as_path(), f)
+    }
+}
+
+impl std::fmt::Display for PathBuf {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}", self.inner)
+    }
+}
+
+impl PartialEq for PathBuf {
+    fn eq(&self, other: &PathBuf) -> bool {
+        self.as_path() == other.as_path()
+    }
+}
+
+impl Eq for PathBuf {}
+
+impl Hash for PathBuf {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_path().hash(state);
+    }
+}
+
+impl Borrow<Path> for PathBuf {
+    fn borrow(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+// ============================================================================
+// Component - Path component
+// ============================================================================
+
+/// Individual path component
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Component<'a> {
+    /// Root directory (/ on Unix, \ or C:\ on Windows)
+    RootDir,
+    /// Current directory (.)
+    CurDir,
+    /// Parent directory (..)
+    ParentDir,
+    /// Normal component (file or directory name)
+    Normal(&'a str),
+    /// Windows drive prefix (C:)
+    #[cfg(target_os = "windows")]
+    Prefix(PrefixComponent<'a>),
+}
+
+impl<'a> Component<'a> {
+    pub fn as_str(&self) -> &'a str {
+        match self {
+            Component::RootDir => MAIN_SEPARATOR_STR,
+            Component::CurDir => ".",
+            Component::ParentDir => "..",
+            Component::Normal(s) => s,
+            #[cfg(target_os = "windows")]
+            Component::Prefix(p) => p.as_str(),
+        }
+    }
+}
+
+impl AsRef<Path> for Component<'_> {
+    fn as_ref(&self) -> &Path {
+        Path::new(self.as_str())
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct PrefixComponent<'a> {
+    raw: &'a str,
+}
+
+#[cfg(target_os = "windows")]
+impl<'a> PrefixComponent<'a> {
+    pub fn as_str(&self) -> &'a str {
+        self.raw
+    }
+}
+
+// ============================================================================
+// Iterators
+// ============================================================================
+
+/// Iterator over path components
+pub struct Components<'a> {
+    path: &'a str,
+    front_offset: usize,
+    back_offset: usize,
+}
+
+impl<'a> Iterator for Components<'a> {
+    type Item = Component<'a>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.front_offset < self.back_offset {
+            let remaining = &self.path[self.front_offset..self.back_offset];
+            
+            // Skip leading separators
+            if remaining.starts_with(is_separator) {
+                // Root directory
+                if self.front_offset == 0 {
+                    self.front_offset += 1;
+                    return Some(Component::RootDir);
+                }
+                self.front_offset += 1;
+                continue;
+            }
+            
+            // Find end of component
+            let end = remaining.find(is_separator).unwrap_or(remaining.len());
+            let component = &remaining[..end];
+            self.front_offset += end;
+            
+            match component {
+                "." => return Some(Component::CurDir),
+                ".." => return Some(Component::ParentDir),
+                "" => continue,
+                _ => return Some(Component::Normal(component)),
+            }
+        }
+        None
+    }
+}
+
+impl<'a> DoubleEndedIterator for Components<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        while self.front_offset < self.back_offset {
+            let remaining = &self.path[self.front_offset..self.back_offset];
+            
+            // Skip trailing separators
+            let trimmed = remaining.trim_end_matches(is_separator);
+            if trimmed.len() < remaining.len() {
+                self.back_offset = self.front_offset + trimmed.len();
+                continue;
+            }
+            
+            // Find start of component
+            let start = remaining.rfind(is_separator)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            
+            let component = &remaining[start..];
+            self.back_offset = self.front_offset + start.saturating_sub(1).max(start);
+            
+            match component {
+                "." => return Some(Component::CurDir),
+                ".." => return Some(Component::ParentDir),
+                "" => continue,
+                _ => return Some(Component::Normal(component)),
+            }
+        }
+        None
+    }
+}
+
+/// Iterator over path components as Path references
+pub struct Iter<'a> {
+    inner: Components<'a>,
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = &'a Path;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|c| c.as_ref())
+    }
+}
+
+impl<'a> DoubleEndedIterator for Iter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(|c| c.as_ref())
+    }
+}
+
+/// Iterator over ancestors
+pub struct Ancestors<'a> {
+    path: Option<&'a Path>,
+}
+
+impl<'a> Iterator for Ancestors<'a> {
+    type Item = &'a Path;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        let path = self.path?;
+        self.path = path.parent();
+        Some(path)
+    }
+}
+
+/// Path display helper
+pub struct Display<'a> {
+    path: &'a Path,
+}
+
+impl std::fmt::Display for Display<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}", self.path.inner)
+    }
+}
+
+/// Error from strip_prefix
+#[derive(Debug)]
+pub struct StripPrefixError(());
+
+impl std::fmt::Display for StripPrefixError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "prefix not found")
+    }
+}
+
+// ============================================================================
+// Filesystem Operations
+// ============================================================================
+
+/// File type
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FileType {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+impl FileType {
+    pub fn is_file(&self) -> bool {
+        matches!(self, FileType::File)
+    }
+    
+    pub fn is_dir(&self) -> bool {
+        matches!(self, FileType::Directory)
+    }
+    
+    pub fn is_symlink(&self) -> bool {
+        matches!(self, FileType::Symlink)
+    }
+}
+
+/// File permissions
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Permissions {
+    mode: u32,
+}
+
+impl Permissions {
+    pub fn readonly(&self) -> bool {
+        (self.mode & 0o222) == 0
+    }
+    
+    pub fn set_readonly(&mut self, readonly: bool) {
+        if readonly {
+            self.mode &= !0o222;
+        } else {
+            self.mode |= 0o644 & 0o222;
+        }
+    }
+    
+    #[cfg(unix)]
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+    
+    #[cfg(unix)]
+    pub fn set_mode(&mut self, mode: u32) {
+        self.mode = mode;
+    }
+    
+    #[cfg(unix)]
+    pub fn from_mode(mode: u32) -> Self {
+        Self { mode }
+    }
+}
+
+/// File metadata
+#[derive(Clone, Debug)]
+pub struct Metadata {
+    file_type: FileType,
+    size: u64,
+    permissions: Permissions,
+    modified: Option<SystemTime>,
+    accessed: Option<SystemTime>,
+    created: Option<SystemTime>,
+}
+
+impl Metadata {
+    pub fn file_type(&self) -> FileType {
+        self.file_type
+    }
+    
+    pub fn is_file(&self) -> bool {
+        self.file_type.is_file()
+    }
+    
+    pub fn is_dir(&self) -> bool {
+        self.file_type.is_dir()
+    }
+    
+    pub fn is_symlink(&self) -> bool {
+        self.file_type.is_symlink()
+    }
+    
+    pub fn len(&self) -> u64 {
+        self.size
+    }
+    
+    pub fn permissions(&self) -> Permissions {
+        self.permissions
+    }
+    
+    pub fn modified(&self) -> IoResult<SystemTime> {
+        self.modified.ok_or_else(|| Error::new(
+            ErrorKind::Unsupported,
+            "modified time not available",
+        ))
+    }
+    
+    pub fn accessed(&self) -> IoResult<SystemTime> {
+        self.accessed.ok_or_else(|| Error::new(
+            ErrorKind::Unsupported,
+            "accessed time not available",
+        ))
+    }
+    
+    pub fn created(&self) -> IoResult<SystemTime> {
+        self.created.ok_or_else(|| Error::new(
+            ErrorKind::Unsupported,
+            "created time not available",
+        ))
+    }
+}
+
+/// Directory entry
+pub struct DirEntry {
+    path: PathBuf,
+    file_type: FileType,
+    metadata: Option<Metadata>,
+}
+
+impl DirEntry {
+    pub fn path(&self) -> PathBuf {
+        self.path.clone()
+    }
+    
+    pub fn file_name(&self) -> &str {
+        self.path.file_name().unwrap_or("")
+    }
+    
+    pub fn file_type(&self) -> IoResult<FileType> {
+        Ok(self.file_type)
+    }
+    
+    pub fn metadata(&self) -> IoResult<Metadata> {
+        self.metadata.clone().ok_or_else(|| {
+            metadata(&self.path).unwrap_or_else(|e| panic!("failed to get metadata: {}", e))
+        }).or_else(|_| metadata(&self.path))
+    }
+}
+
+/// Directory iterator
+pub struct ReadDir {
+    handle: usize,
+    path: PathBuf,
+}
+
+impl Iterator for ReadDir {
+    type Item = IoResult<DirEntry>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        unsafe {
+            let result = __readdir_next(self.handle);
+            if result.is_null() {
+                return None;
+            }
+            
+            let name = std::ffi::CStr::from_ptr(result as *const i8)
+                .to_string_lossy()
+                .into_owned();
+            
+            // Skip . and ..
+            if name == "." || name == ".." {
+                return self.next();
+            }
+            
+            let entry_path = self.path.join(&name);
+            let file_type = match __stat_type(entry_path.as_str().as_ptr(), entry_path.as_str().len()) {
+                0 => FileType::File,
+                1 => FileType::Directory,
+                2 => FileType::Symlink,
+                _ => FileType::Other,
+            };
+            
+            Some(Ok(DirEntry {
+                path: entry_path,
+                file_type,
+                metadata: None,
+            }))
+        }
+    }
+}
+
+impl Drop for ReadDir {
+    fn drop(&mut self) {
+        unsafe { __closedir(self.handle); }
+    }
+}
+
+// ============================================================================
+// Filesystem functions
+// ============================================================================
+
+/// Get file metadata (follows symlinks)
+pub fn metadata<P: AsRef<Path>>(path: P) -> IoResult<Metadata> {
+    let path = path.as_ref();
+    unsafe {
+        let mut stat = std::mem::zeroed::<StatBuf>();
+        let result = __stat(
+            path.as_str().as_ptr(),
+            path.as_str().len(),
+            &mut stat as *mut _,
+        );
+        
+        if result < 0 {
+            return Err(Error::last_os_error());
+        }
+        
+        Ok(Metadata {
+            file_type: match stat.mode & 0o170000 {
+                0o100000 => FileType::File,
+                0o040000 => FileType::Directory,
+                0o120000 => FileType::Symlink,
+                _ => FileType::Other,
+            },
+            size: stat.size,
+            permissions: Permissions { mode: stat.mode & 0o7777 },
+            modified: Some(SystemTime::from_timestamp(stat.mtime)),
+            accessed: Some(SystemTime::from_timestamp(stat.atime)),
+            created: if stat.ctime > 0 {
+                Some(SystemTime::from_timestamp(stat.ctime))
+            } else {
+                None
+            },
+        })
+    }
+}
+
+/// Get symlink metadata (doesn't follow symlinks)
+pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> IoResult<Metadata> {
+    let path = path.as_ref();
+    unsafe {
+        let mut stat = std::mem::zeroed::<StatBuf>();
+        let result = __lstat(
+            path.as_str().as_ptr(),
+            path.as_str().len(),
+            &mut stat as *mut _,
+        );
+        
+        if result < 0 {
+            return Err(Error::last_os_error());
+        }
+        
+        Ok(Metadata {
+            file_type: match stat.mode & 0o170000 {
+                0o100000 => FileType::File,
+                0o040000 => FileType::Directory,
+                0o120000 => FileType::Symlink,
+                _ => FileType::Other,
+            },
+            size: stat.size,
+            permissions: Permissions { mode: stat.mode & 0o7777 },
+            modified: Some(SystemTime::from_timestamp(stat.mtime)),
+            accessed: Some(SystemTime::from_timestamp(stat.atime)),
+            created: None,
+        })
+    }
+}
+
+/// Read directory contents
+pub fn read_dir<P: AsRef<Path>>(path: P) -> IoResult<ReadDir> {
+    let path = path.as_ref();
+    unsafe {
+        let handle = __opendir(path.as_str().as_ptr(), path.as_str().len());
+        if handle == 0 {
+            return Err(Error::last_os_error());
+        }
+        
+        Ok(ReadDir {
+            handle,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+/// Create a directory
+pub fn create_dir<P: AsRef<Path>>(path: P) -> IoResult<()> {
+    let path = path.as_ref();
+    unsafe {
+        let result = __mkdir(path.as_str().as_ptr(), path.as_str().len(), 0o755);
+        if result < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Create directory and all parent directories
+pub fn create_dir_all<P: AsRef<Path>>(path: P) -> IoResult<()> {
+    let path = path.as_ref();
+    
+    if path.exists() {
+        return if path.is_dir() {
+            Ok(())
+        } else {
+            Err(Error::new(ErrorKind::AlreadyExists, "path exists but is not a directory"))
+        };
+    }
+    
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
+    
+    create_dir(path)
+}
+
+/// Remove an empty directory
+pub fn remove_dir<P: AsRef<Path>>(path: P) -> IoResult<()> {
+    let path = path.as_ref();
+    unsafe {
+        let result = __rmdir(path.as_str().as_ptr(), path.as_str().len());
+        if result < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Remove directory and all contents
+pub fn remove_dir_all<P: AsRef<Path>>(path: P) -> IoResult<()> {
+    let path = path.as_ref();
+    
+    for entry in read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        
+        if entry.file_type()?.is_dir() {
+            remove_dir_all(&entry_path)?;
+        } else {
+            remove_file(&entry_path)?;
+        }
+    }
+    
+    remove_dir(path)
+}
+
+/// Remove a file
+pub fn remove_file<P: AsRef<Path>>(path: P) -> IoResult<()> {
+    let path = path.as_ref();
+    unsafe {
+        let result = __unlink(path.as_str().as_ptr(), path.as_str().len());
+        if result < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Rename a file or directory
+pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> IoResult<()> {
+    let from = from.as_ref();
+    let to = to.as_ref();
+    unsafe {
+        let result = __rename(
+            from.as_str().as_ptr(), from.as_str().len(),
+            to.as_str().as_ptr(), to.as_str().len(),
+        );
+        if result < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Copy a file
+pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> IoResult<u64> {
+    let from = from.as_ref();
+    let to = to.as_ref();
+    
+    // Read source
+    let contents = std::fs::read(from)?;
+    let len = contents.len() as u64;
+    
+    // Write destination
+    std::fs::write(to, &contents)?;
+    
+    // Copy permissions
+    let meta = metadata(from)?;
+    set_permissions(to, meta.permissions())?;
+    
+    Ok(len)
+}
+
+/// Create a hard link
+pub fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> IoResult<()> {
+    let original = original.as_ref();
+    let link = link.as_ref();
+    unsafe {
+        let result = __link(
+            original.as_str().as_ptr(), original.as_str().len(),
+            link.as_str().as_ptr(), link.as_str().len(),
+        );
+        if result < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Create a symbolic link
+#[cfg(unix)]
+pub fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> IoResult<()> {
+    let original = original.as_ref();
+    let link = link.as_ref();
+    unsafe {
+        let result = __symlink(
+            original.as_str().as_ptr(), original.as_str().len(),
+            link.as_str().as_ptr(), link.as_str().len(),
+        );
+        if result < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Read symlink target
+pub fn read_link<P: AsRef<Path>>(path: P) -> IoResult<PathBuf> {
+    let path = path.as_ref();
+    unsafe {
+        let mut buf = [0u8; 4096];
+        let len = __readlink(
+            path.as_str().as_ptr(), path.as_str().len(),
+            buf.as_mut_ptr(), buf.len(),
+        );
+        
+        if len < 0 {
+            Err(Error::last_os_error())
+        } else {
+            let s = std::str::from_utf8(&buf[..len as usize])
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8 in symlink"))?;
+            Ok(PathBuf::from(s))
+        }
+    }
+}
+
+/// Get canonical absolute path
+pub fn canonicalize<P: AsRef<Path>>(path: P) -> IoResult<PathBuf> {
+    let path = path.as_ref();
+    unsafe {
+        let mut buf = [0u8; 4096];
+        let len = __realpath(
+            path.as_str().as_ptr(), path.as_str().len(),
+            buf.as_mut_ptr(), buf.len(),
+        );
+        
+        if len < 0 {
+            Err(Error::last_os_error())
+        } else {
+            let s = std::str::from_utf8(&buf[..len as usize])
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8 in path"))?;
+            Ok(PathBuf::from(s))
+        }
+    }
+}
+
+/// Set file permissions
+pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> IoResult<()> {
+    let path = path.as_ref();
+    unsafe {
+        let result = __chmod(path.as_str().as_ptr(), path.as_str().len(), perm.mode);
+        if result < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Get current working directory
+pub fn current_dir() -> IoResult<PathBuf> {
+    unsafe {
+        let mut buf = [0u8; 4096];
+        let len = __getcwd(buf.as_mut_ptr(), buf.len());
+        
+        if len < 0 {
+            Err(Error::last_os_error())
+        } else {
+            let s = std::str::from_utf8(&buf[..len as usize])
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8 in cwd"))?;
+            Ok(PathBuf::from(s))
+        }
+    }
+}
+
+/// Set current working directory
+pub fn set_current_dir<P: AsRef<Path>>(path: P) -> IoResult<()> {
+    let path = path.as_ref();
+    unsafe {
+        let result = __chdir(path.as_str().as_ptr(), path.as_str().len());
+        if result < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Get temporary directory
+pub fn temp_dir() -> PathBuf {
+    // Try environment variables
+    if let Some(dir) = std::env::var_os("TMPDIR") {
+        return PathBuf::from(dir.to_string_lossy().into_owned());
+    }
+    if let Some(dir) = std::env::var_os("TMP") {
+        return PathBuf::from(dir.to_string_lossy().into_owned());
+    }
+    if let Some(dir) = std::env::var_os("TEMP") {
+        return PathBuf::from(dir.to_string_lossy().into_owned());
+    }
+    
+    // Platform defaults
+    #[cfg(target_os = "windows")]
+    { PathBuf::from("C:\\Windows\\Temp") }
+    #[cfg(not(target_os = "windows"))]
+    { PathBuf::from("/tmp") }
+}
+
+// ============================================================================
+// Directory walker
+// ============================================================================
+
+/// Options for walking directory tree
+pub struct WalkDirOptions {
+    /// Follow symlinks
+    pub follow_links: bool,
+    /// Maximum depth (None = unlimited)
+    pub max_depth: Option<usize>,
+    /// Minimum depth before yielding entries
+    pub min_depth: usize,
+    /// Sort entries by name
+    pub sort_by_name: bool,
+    /// Process directories before their contents
+    pub contents_first: bool,
+}
+
+impl Default for WalkDirOptions {
+    fn default() -> Self {
+        Self {
+            follow_links: false,
+            max_depth: None,
+            min_depth: 0,
+            sort_by_name: false,
+            contents_first: false,
+        }
+    }
+}
+
+/// Entry from directory walk
+pub struct WalkDirEntry {
+    pub path: PathBuf,
+    pub depth: usize,
+    pub file_type: FileType,
+}
+
+/// Recursive directory walker
+pub struct WalkDir {
+    stack: Vec<(PathBuf, usize)>,
+    options: WalkDirOptions,
+}
+
+impl WalkDir {
+    pub fn new<P: AsRef<Path>>(root: P) -> Self {
+        Self {
+            stack: vec![(root.as_ref().to_path_buf(), 0)],
+            options: WalkDirOptions::default(),
+        }
+    }
+    
+    pub fn with_options<P: AsRef<Path>>(root: P, options: WalkDirOptions) -> Self {
+        Self {
+            stack: vec![(root.as_ref().to_path_buf(), 0)],
+            options,
+        }
+    }
+    
+    pub fn follow_links(mut self, follow: bool) -> Self {
+        self.options.follow_links = follow;
+        self
+    }
+    
+    pub fn max_depth(mut self, depth: usize) -> Self {
+        self.options.max_depth = Some(depth);
+        self
+    }
+    
+    pub fn min_depth(mut self, depth: usize) -> Self {
+        self.options.min_depth = depth;
+        self
+    }
+}
+
+impl Iterator for WalkDir {
+    type Item = IoResult<WalkDirEntry>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((path, depth)) = self.stack.pop() {
+            // Check max depth
+            if let Some(max) = self.options.max_depth {
+                if depth > max {
+                    continue;
+                }
+            }
+            
+            // Get file type
+            let meta_result = if self.options.follow_links {
+                metadata(&path)
+            } else {
+                symlink_metadata(&path)
+            };
+            
+            let file_type = match meta_result {
+                Ok(meta) => meta.file_type(),
+                Err(e) => return Some(Err(e)),
+            };
+            
+            // If directory, add children to stack
+            if file_type.is_dir() {
+                if let Ok(entries) = read_dir(&path) {
+                    let mut children: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+                    
+                    if self.options.sort_by_name {
+                        children.sort_by(|a, b| a.file_name().cmp(b.file_name()));
+                    }
+                    
+                    // Add in reverse order so first item is processed first
+                    for entry in children.into_iter().rev() {
+                        self.stack.push((entry.path(), depth + 1));
+                    }
+                }
+            }
+            
+            // Check min depth
+            if depth >= self.options.min_depth {
+                return Some(Ok(WalkDirEntry {
+                    path,
+                    depth,
+                    file_type,
+                }));
+            }
+        }
+        
+        None
+    }
+}
+
+// ============================================================================
+// External declarations
+// ============================================================================
+
+#[repr(C)]
+struct StatBuf {
+    mode: u32,
+    size: u64,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
+}
+
+extern "C" {
+    fn __stat(path: *const u8, path_len: usize, buf: *mut StatBuf) -> i32;
+    fn __lstat(path: *const u8, path_len: usize, buf: *mut StatBuf) -> i32;
+    fn __stat_type(path: *const u8, path_len: usize) -> i32;
+    fn __opendir(path: *const u8, path_len: usize) -> usize;
+    fn __readdir_next(handle: usize) -> *const u8;
+    fn __closedir(handle: usize);
+    fn __mkdir(path: *const u8, path_len: usize, mode: u32) -> i32;
+    fn __rmdir(path: *const u8, path_len: usize) -> i32;
+    fn __unlink(path: *const u8, path_len: usize) -> i32;
+    fn __rename(from: *const u8, from_len: usize, to: *const u8, to_len: usize) -> i32;
+    fn __link(original: *const u8, original_len: usize, link: *const u8, link_len: usize) -> i32;
+    fn __symlink(original: *const u8, original_len: usize, link: *const u8, link_len: usize) -> i32;
+    fn __readlink(path: *const u8, path_len: usize, buf: *mut u8, buf_len: usize) -> i32;
+    fn __realpath(path: *const u8, path_len: usize, buf: *mut u8, buf_len: usize) -> i32;
+    fn __chmod(path: *const u8, path_len: usize, mode: u32) -> i32;
+    fn __getcwd(buf: *mut u8, buf_len: usize) -> i32;
+    fn __chdir(path: *const u8, path_len: usize) -> i32;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_path_components() {
+        let p = Path::new("/usr/local/bin/test");
+        let components: Vec<_> = p.components().collect();
+        assert_eq!(components.len(), 5);
+        assert_eq!(components[0], Component::RootDir);
+        assert_eq!(components[1], Component::Normal("usr"));
+        assert_eq!(components[4], Component::Normal("test"));
+    }
+    
+    #[test]
+    fn test_path_parent() {
+        let p = Path::new("/usr/local/bin");
+        assert_eq!(p.parent().unwrap().as_str(), "/usr/local");
+        assert_eq!(p.parent().unwrap().parent().unwrap().as_str(), "/usr");
+    }
+    
+    #[test]
+    fn test_path_file_name() {
+        assert_eq!(Path::new("/usr/bin/env").file_name(), Some("env"));
+        assert_eq!(Path::new("/").file_name(), None);
+        assert_eq!(Path::new("foo.txt").file_name(), Some("foo.txt"));
+    }
+    
+    #[test]
+    fn test_path_extension() {
+        assert_eq!(Path::new("foo.txt").extension(), Some("txt"));
+        assert_eq!(Path::new("foo.tar.gz").extension(), Some("gz"));
+        assert_eq!(Path::new("foo").extension(), None);
+        assert_eq!(Path::new(".hidden").extension(), None);
+    }
+    
+    #[test]
+    fn test_path_stem() {
+        assert_eq!(Path::new("foo.txt").file_stem(), Some("foo"));
+        assert_eq!(Path::new("foo.tar.gz").file_stem(), Some("foo.tar"));
+        assert_eq!(Path::new("foo").file_stem(), Some("foo"));
+    }
+    
+    #[test]
+    fn test_pathbuf_push() {
+        let mut p = PathBuf::from("/usr");
+        p.push("local");
+        p.push("bin");
+        assert_eq!(p.as_str(), "/usr/local/bin");
+    }
+    
+    #[test]
+    fn test_pathbuf_set_extension() {
+        let mut p = PathBuf::from("foo.txt");
+        p.set_extension("md");
+        assert_eq!(p.as_str(), "foo.md");
+        
+        p.set_extension("");
+        assert_eq!(p.as_str(), "foo");
+    }
+    
+    #[test]
+    fn test_path_join() {
+        let p = Path::new("/usr").join("local").join("bin");
+        assert_eq!(p.as_str(), "/usr/local/bin");
+        
+        // Absolute path replaces
+        let p = Path::new("/usr").join("/etc");
+        assert_eq!(p.as_str(), "/etc");
+    }
+    
+    #[test]
+    fn test_strip_prefix() {
+        let p = Path::new("/usr/local/bin/env");
+        let stripped = p.strip_prefix("/usr/local").unwrap();
+        assert_eq!(stripped.as_str(), "bin/env");
+    }
+    
+    #[test]
+    fn test_starts_ends_with() {
+        let p = Path::new("/usr/local/bin");
+        assert!(p.starts_with("/usr"));
+        assert!(p.starts_with("/usr/local"));
+        assert!(!p.starts_with("/etc"));
+        
+        assert!(p.ends_with("bin"));
+        assert!(p.ends_with("local/bin"));
+        assert!(!p.ends_with("usr"));
+    }
+}

@@ -1,0 +1,419 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ STANDARD LIBRARY — Thread Module
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Threading support:
+// - Thread spawning and joining
+// - Thread local storage
+// - Thread parking and unparking
+// - Scoped threads
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module std::thread
+
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::cell::UnsafeCell;
+use core::time::Duration;
+use crate::io;
+use crate::time::Instant;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THREAD HANDLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Handle to a thread
+pub struct Thread {
+    inner: crate::sys::Thread,
+}
+
+impl Thread {
+    /// Get the thread's name
+    pub fn name(&self) -> Option<&str> {
+        self.inner.name()
+    }
+    
+    /// Get the thread's unique identifier
+    pub fn id(&self) -> ThreadId {
+        ThreadId(self.inner.id())
+    }
+    
+    /// Atomically make the handle's token available
+    pub fn unpark(&self) {
+        self.inner.unpark()
+    }
+}
+
+impl Clone for Thread {
+    fn clone(&self) -> Self {
+        Thread {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// A unique thread identifier
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ThreadId(u64);
+
+impl ThreadId {
+    /// Get the underlying ID as u64
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOIN HANDLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Handle for joining a thread
+pub struct JoinHandle<T> {
+    inner: crate::sys::JoinHandle<T>,
+    thread: Thread,
+}
+
+impl<T> JoinHandle<T> {
+    /// Get a reference to the thread
+    pub fn thread(&self) -> &Thread {
+        &self.thread
+    }
+    
+    /// Wait for the thread to finish
+    pub fn join(self) -> Result<T> {
+        self.inner.join()
+    }
+    
+    /// Check if thread has finished
+    pub fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+    }
+}
+
+/// Thread result type
+pub type Result<T> = core::result::Result<T, Box<dyn core::any::Any + Send + 'static>>;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPAWN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Spawn a new thread
+pub fn spawn<F, T>(f: F) -> JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    Builder::new().spawn(f).expect("failed to spawn thread")
+}
+
+/// Thread builder
+pub struct Builder {
+    name: Option<String>,
+    stack_size: Option<usize>,
+}
+
+impl Builder {
+    /// Create a new thread builder
+    pub fn new() -> Self {
+        Builder {
+            name: None,
+            stack_size: None,
+        }
+    }
+    
+    /// Set the thread name
+    pub fn name(mut self, name: String) -> Self {
+        self.name = Some(name);
+        self
+    }
+    
+    /// Set the stack size
+    pub fn stack_size(mut self, size: usize) -> Self {
+        self.stack_size = Some(size);
+        self
+    }
+    
+    /// Spawn the thread
+    pub fn spawn<F, T>(self, f: F) -> io::Result<JoinHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (inner, thread_inner) = crate::sys::spawn(
+            self.name.as_deref(),
+            self.stack_size,
+            f,
+        )?;
+        
+        Ok(JoinHandle {
+            inner,
+            thread: Thread { inner: thread_inner },
+        })
+    }
+    
+    /// Spawn a scoped thread
+    pub fn spawn_scoped<'scope, 'env, F, T>(
+        self,
+        scope: &'scope Scope<'scope, 'env>,
+        f: F,
+    ) -> io::Result<ScopedJoinHandle<'scope, T>>
+    where
+        F: FnOnce() -> T + Send + 'scope,
+        T: Send + 'scope,
+    {
+        // Implementation would be more complex
+        todo!("scoped threads")
+    }
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CURRENT THREAD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Get handle to current thread
+pub fn current() -> Thread {
+    Thread {
+        inner: crate::sys::current_thread(),
+    }
+}
+
+/// Sleep for a duration
+pub fn sleep(dur: Duration) {
+    crate::sys::sleep(dur)
+}
+
+/// Sleep until a deadline
+pub fn sleep_until(deadline: Instant) {
+    let now = Instant::now();
+    if let Some(dur) = deadline.checked_duration_since(now) {
+        sleep(dur);
+    }
+}
+
+/// Yield the current time slice
+pub fn yield_now() {
+    crate::sys::yield_now()
+}
+
+/// Park the current thread
+pub fn park() {
+    crate::sys::park()
+}
+
+/// Park with timeout
+pub fn park_timeout(dur: Duration) {
+    crate::sys::park_timeout(dur)
+}
+
+/// Park until deadline
+pub fn park_timeout_ms(ms: u32) {
+    park_timeout(Duration::from_millis(ms as u64))
+}
+
+/// Check if thread is panicking
+pub fn panicking() -> bool {
+    crate::sys::panicking()
+}
+
+/// Get available parallelism (number of CPUs)
+pub fn available_parallelism() -> io::Result<usize> {
+    crate::sys::available_parallelism()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCOPED THREADS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Run a closure with a thread scope
+pub fn scope<'env, F, T>(f: F) -> T
+where
+    F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T,
+{
+    let scope = Scope {
+        data: ScopeData {
+            num_running_threads: 0,
+            main_thread: current(),
+            _marker: core::marker::PhantomData,
+        },
+    };
+    
+    let result = f(&scope);
+    
+    // Wait for all threads to finish
+    scope.data.wait_for_threads();
+    
+    result
+}
+
+/// Thread scope
+pub struct Scope<'scope, 'env: 'scope> {
+    data: ScopeData<'env>,
+}
+
+struct ScopeData<'env> {
+    num_running_threads: usize,
+    main_thread: Thread,
+    _marker: core::marker::PhantomData<&'env mut &'env ()>,
+}
+
+impl<'env> ScopeData<'env> {
+    fn wait_for_threads(&self) {
+        // Wait for all scoped threads to complete
+        while self.num_running_threads > 0 {
+            park();
+        }
+    }
+}
+
+impl<'scope, 'env> Scope<'scope, 'env> {
+    /// Spawn a scoped thread
+    pub fn spawn<F, T>(&'scope self, f: F) -> ScopedJoinHandle<'scope, T>
+    where
+        F: FnOnce() -> T + Send + 'scope,
+        T: Send + 'scope,
+    {
+        Builder::new()
+            .spawn_scoped(self, f)
+            .expect("failed to spawn scoped thread")
+    }
+}
+
+/// Scoped thread join handle
+pub struct ScopedJoinHandle<'scope, T> {
+    inner: crate::sys::JoinHandle<T>,
+    thread: Thread,
+    _marker: core::marker::PhantomData<&'scope ()>,
+}
+
+impl<'scope, T> ScopedJoinHandle<'scope, T> {
+    /// Get a reference to the thread
+    pub fn thread(&self) -> &Thread {
+        &self.thread
+    }
+    
+    /// Wait for the thread to finish
+    pub fn join(self) -> Result<T> {
+        self.inner.join()
+    }
+    
+    /// Check if thread has finished
+    pub fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THREAD LOCAL STORAGE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Thread local storage key
+pub struct LocalKey<T: 'static> {
+    init: fn() -> T,
+    inner: UnsafeCell<Option<T>>,
+}
+
+impl<T: 'static> LocalKey<T> {
+    /// Create a new thread local key
+    pub const fn new(init: fn() -> T) -> Self {
+        LocalKey {
+            init,
+            inner: UnsafeCell::new(None),
+        }
+    }
+    
+    /// Access the thread local value
+    pub fn with<F, R>(&'static self, f: F) -> R
+    where
+        F: FnOnce(&T) -> R,
+    {
+        unsafe {
+            let ptr = self.inner.get();
+            if (*ptr).is_none() {
+                *ptr = Some((self.init)());
+            }
+            f((*ptr).as_ref().unwrap())
+        }
+    }
+    
+    /// Try to access the thread local value
+    pub fn try_with<F, R>(&'static self, f: F) -> core::result::Result<R, AccessError>
+    where
+        F: FnOnce(&T) -> R,
+    {
+        Ok(self.with(f))
+    }
+}
+
+unsafe impl<T: 'static> Sync for LocalKey<T> {}
+
+/// Error accessing thread local
+#[derive(Debug)]
+pub struct AccessError;
+
+/// Macro for declaring thread locals
+#[macro_export]
+macro_rules! thread_local {
+    ($(#[$attr:meta])* $vis:vis static $name:ident: $ty:ty = $init:expr; $($rest:tt)*) => {
+        $(#[$attr])*
+        $vis static $name: $crate::thread::LocalKey<$ty> = $crate::thread::LocalKey::new(|| $init);
+        $crate::thread_local!($($rest)*);
+    };
+    () => {};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_spawn_join() {
+        let handle = spawn(|| 42);
+        assert_eq!(handle.join().unwrap(), 42);
+    }
+    
+    #[test]
+    fn test_thread_name() {
+        let handle = Builder::new()
+            .name("test_thread".to_string())
+            .spawn(|| {
+                assert_eq!(current().name(), Some("test_thread"));
+            })
+            .unwrap();
+        
+        handle.join().unwrap();
+    }
+    
+    #[test]
+    fn test_thread_id() {
+        let id1 = current().id();
+        let id2 = current().id();
+        assert_eq!(id1, id2);
+        
+        let handle = spawn(|| current().id());
+        let other_id = handle.join().unwrap();
+        assert_ne!(id1, other_id);
+    }
+    
+    #[test]
+    fn test_sleep() {
+        let start = Instant::now();
+        sleep(Duration::from_millis(10));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(10));
+    }
+}

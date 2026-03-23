@@ -1,0 +1,663 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Jump Threading Optimization
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Jump threading optimization:
+//   - Conditional jump threading
+//   - Value-based threading
+//   - Block duplication
+//   - Cost analysis
+//   - Profile-guided threading
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::jumpthread
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THREADING OPPORTUNITY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A jump threading opportunity
+#[derive(Debug, Clone)]
+pub struct ThreadingOpportunity {
+    /// Source block
+    pub source: u32,
+    /// Intermediate block (being threaded through)
+    pub intermediate: u32,
+    /// Destination block
+    pub destination: u32,
+    /// Condition value known on this path
+    pub known_value: Option<KnownValue>,
+    /// Cost of threading
+    pub cost: u32,
+    /// Benefit of threading
+    pub benefit: u32,
+}
+
+/// Known value for a variable
+#[derive(Debug, Clone)]
+pub struct KnownValue {
+    pub variable: String,
+    pub value: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JUMP THREADING ANALYZER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Analyzer for finding threading opportunities
+pub struct ThreadingAnalyzer {
+    /// Found opportunities
+    opportunities: Vec<ThreadingOpportunity>,
+    /// Known values at each block entry
+    known_values: BTreeMap<u32, Vec<KnownValue>>,
+    /// CFG edges
+    edges: BTreeMap<u32, Vec<u32>>,
+    /// Reverse edges
+    reverse_edges: BTreeMap<u32, Vec<u32>>,
+}
+
+impl ThreadingAnalyzer {
+    pub fn new() -> Self {
+        ThreadingAnalyzer {
+            opportunities: Vec::new(),
+            known_values: BTreeMap::new(),
+            edges: BTreeMap::new(),
+            reverse_edges: BTreeMap::new(),
+        }
+    }
+    
+    /// Analyze function for threading opportunities
+    pub fn analyze(&mut self, func: &MirFunction) -> &[ThreadingOpportunity] {
+        self.opportunities.clear();
+        self.build_cfg(func);
+        self.compute_known_values(func);
+        self.find_opportunities(func);
+        &self.opportunities
+    }
+    
+    fn build_cfg(&mut self, func: &MirFunction) {
+        self.edges.clear();
+        self.reverse_edges.clear();
+        
+        for block in &func.blocks {
+            let succs = self.get_successors(&block.terminator);
+            self.edges.insert(block.id, succs.clone());
+            
+            for succ in succs {
+                self.reverse_edges.entry(succ)
+                    .or_insert_with(Vec::new)
+                    .push(block.id);
+            }
+        }
+    }
+    
+    fn get_successors(&self, term: &MirTerminator) -> Vec<u32> {
+        match term {
+            MirTerminator::Goto(target) => vec![*target],
+            MirTerminator::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+            MirTerminator::Switch { targets, default, .. } => {
+                let mut succs: Vec<_> = targets.iter().map(|(_, t)| *t).collect();
+                succs.push(*default);
+                succs
+            }
+            _ => vec![],
+        }
+    }
+    
+    fn compute_known_values(&mut self, func: &MirFunction) {
+        self.known_values.clear();
+        
+        // For each conditional branch, propagate known values
+        for block in &func.blocks {
+            if let MirTerminator::Branch { cond, then_bb, else_bb } = &block.terminator {
+                if let MirOperand::Variable(var) = cond {
+                    // On then branch, condition is true (1)
+                    self.known_values.entry(*then_bb)
+                        .or_insert_with(Vec::new)
+                        .push(KnownValue {
+                            variable: var.clone(),
+                            value: 1,
+                        });
+                    
+                    // On else branch, condition is false (0)
+                    self.known_values.entry(*else_bb)
+                        .or_insert_with(Vec::new)
+                        .push(KnownValue {
+                            variable: var.clone(),
+                            value: 0,
+                        });
+                }
+            }
+            
+            // Handle switch statements
+            if let MirTerminator::Switch { value, targets, .. } = &block.terminator {
+                if let MirOperand::Variable(var) = value {
+                    for (case_val, target) in targets {
+                        self.known_values.entry(*target)
+                            .or_insert_with(Vec::new)
+                            .push(KnownValue {
+                                variable: var.clone(),
+                                value: *case_val,
+                            });
+                    }
+                }
+            }
+        }
+    }
+    
+    fn find_opportunities(&mut self, func: &MirFunction) {
+        for block in &func.blocks {
+            // Look for blocks that end with conditional branches
+            if let MirTerminator::Branch { cond, then_bb, else_bb } = &block.terminator {
+                if let MirOperand::Variable(var) = cond {
+                    // Check if we have known value for condition from predecessors
+                    for &pred in self.reverse_edges.get(&block.id).unwrap_or(&vec![]) {
+                        if let Some(known) = self.find_known_value(pred, var) {
+                            // We can thread!
+                            let destination = if known.value != 0 {
+                                *then_bb
+                            } else {
+                                *else_bb
+                            };
+                            
+                            let cost = self.compute_cost(func, block.id);
+                            let benefit = self.compute_benefit(func, block.id);
+                            
+                            if benefit > cost {
+                                self.opportunities.push(ThreadingOpportunity {
+                                    source: pred,
+                                    intermediate: block.id,
+                                    destination,
+                                    known_value: Some(known),
+                                    cost,
+                                    benefit,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    fn find_known_value(&self, block: u32, var: &str) -> Option<KnownValue> {
+        if let Some(known) = self.known_values.get(&block) {
+            for kv in known {
+                if kv.variable == var {
+                    return Some(kv.clone());
+                }
+            }
+        }
+        None
+    }
+    
+    fn compute_cost(&self, func: &MirFunction, block_id: u32) -> u32 {
+        // Cost is size of block being duplicated
+        func.blocks.iter()
+            .find(|b| b.id == block_id)
+            .map(|b| b.statements.len() as u32)
+            .unwrap_or(0)
+    }
+    
+    fn compute_benefit(&self, _func: &MirFunction, _block_id: u32) -> u32 {
+        // Benefit is eliminating a branch
+        // Could be enhanced with profile data
+        2
+    }
+}
+
+impl Default for ThreadingAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JUMP THREADING PASS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Jump threading optimization pass
+pub struct JumpThreading {
+    /// Analyzer
+    analyzer: ThreadingAnalyzer,
+    /// Maximum block size to duplicate
+    max_dup_size: usize,
+    /// Statistics
+    stats: JumpThreadingStats,
+}
+
+/// Statistics for jump threading
+#[derive(Debug, Clone, Default)]
+pub struct JumpThreadingStats {
+    /// Opportunities found
+    pub opportunities_found: usize,
+    /// Threads applied
+    pub threads_applied: usize,
+    /// Blocks duplicated
+    pub blocks_duplicated: usize,
+    /// Branches eliminated
+    pub branches_eliminated: usize,
+}
+
+impl JumpThreading {
+    pub fn new() -> Self {
+        JumpThreading {
+            analyzer: ThreadingAnalyzer::new(),
+            max_dup_size: 20,
+            stats: JumpThreadingStats::default(),
+        }
+    }
+    
+    /// Set maximum block size to duplicate
+    pub fn with_max_dup_size(mut self, size: usize) -> Self {
+        self.max_dup_size = size;
+        self
+    }
+    
+    /// Run jump threading on a function
+    pub fn run(&mut self, func: &mut MirFunction) -> &JumpThreadingStats {
+        self.stats = JumpThreadingStats::default();
+        
+        let mut changed = true;
+        let mut iterations = 0;
+        
+        while changed && iterations < 5 {
+            changed = false;
+            iterations += 1;
+            
+            // Find opportunities
+            let opportunities: Vec<_> = self.analyzer.analyze(func).to_vec();
+            self.stats.opportunities_found += opportunities.len();
+            
+            // Apply threading
+            for opp in opportunities {
+                if self.should_thread(&opp, func) {
+                    self.apply_threading(func, &opp);
+                    changed = true;
+                    self.stats.threads_applied += 1;
+                }
+            }
+        }
+        
+        &self.stats
+    }
+    
+    fn should_thread(&self, opp: &ThreadingOpportunity, func: &MirFunction) -> bool {
+        // Check if block is small enough
+        let block_size = func.blocks.iter()
+            .find(|b| b.id == opp.intermediate)
+            .map(|b| b.statements.len())
+            .unwrap_or(0);
+        
+        block_size <= self.max_dup_size && opp.benefit > opp.cost
+    }
+    
+    fn apply_threading(&mut self, func: &mut MirFunction, opp: &ThreadingOpportunity) {
+        // Find the source block and redirect its edge
+        if let Some(source_block) = func.blocks.iter_mut().find(|b| b.id == opp.source) {
+            // Update terminator to go directly to destination
+            match &mut source_block.terminator {
+                MirTerminator::Goto(target) => {
+                    if *target == opp.intermediate {
+                        *target = opp.destination;
+                        self.stats.branches_eliminated += 1;
+                    }
+                }
+                MirTerminator::Branch { then_bb, else_bb, .. } => {
+                    if *then_bb == opp.intermediate {
+                        *then_bb = opp.destination;
+                    }
+                    if *else_bb == opp.intermediate {
+                        *else_bb = opp.destination;
+                    }
+                }
+                MirTerminator::Switch { targets, default, .. } => {
+                    for (_, target) in targets.iter_mut() {
+                        if *target == opp.intermediate {
+                            *target = opp.destination;
+                        }
+                    }
+                    if *default == opp.intermediate {
+                        *default = opp.destination;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &JumpThreadingStats {
+        &self.stats
+    }
+}
+
+impl Default for JumpThreading {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADVANCED THREADING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Advanced threading with block duplication
+pub struct AdvancedJumpThreading {
+    /// Basic threading pass
+    basic: JumpThreading,
+    /// Enable block duplication
+    enable_duplication: bool,
+    /// Maximum duplication factor
+    max_dup_factor: u32,
+    /// Statistics
+    stats: AdvancedThreadingStats,
+}
+
+/// Statistics for advanced threading
+#[derive(Debug, Clone, Default)]
+pub struct AdvancedThreadingStats {
+    /// Basic threading stats
+    pub basic: JumpThreadingStats,
+    /// Blocks duplicated
+    pub blocks_duplicated: usize,
+    /// Instructions duplicated
+    pub instructions_duplicated: usize,
+}
+
+impl AdvancedJumpThreading {
+    pub fn new() -> Self {
+        AdvancedJumpThreading {
+            basic: JumpThreading::new(),
+            enable_duplication: true,
+            max_dup_factor: 3,
+            stats: AdvancedThreadingStats::default(),
+        }
+    }
+    
+    /// Run advanced jump threading
+    pub fn run(&mut self, func: &mut MirFunction) -> &AdvancedThreadingStats {
+        self.stats = AdvancedThreadingStats::default();
+        
+        // Run basic threading first
+        self.basic.run(func);
+        self.stats.basic = self.basic.stats().clone();
+        
+        // Find more aggressive opportunities if duplication enabled
+        if self.enable_duplication {
+            self.thread_with_duplication(func);
+        }
+        
+        &self.stats
+    }
+    
+    fn thread_with_duplication(&mut self, func: &mut MirFunction) {
+        // Find blocks that could benefit from duplication
+        let candidates: Vec<_> = func.blocks.iter()
+            .filter(|b| self.is_duplication_candidate(b, func))
+            .map(|b| b.id)
+            .collect();
+        
+        for block_id in candidates {
+            if let Some(duplication_info) = self.analyze_duplication(func, block_id) {
+                self.apply_duplication(func, &duplication_info);
+            }
+        }
+    }
+    
+    fn is_duplication_candidate(&self, block: &MirBlock, _func: &MirFunction) -> bool {
+        // Block is a candidate if:
+        // 1. It has multiple predecessors
+        // 2. It's small enough
+        // 3. Threading would be beneficial
+        
+        block.statements.len() <= 10
+    }
+    
+    fn analyze_duplication(&self, func: &MirFunction, block_id: u32) -> Option<DuplicationInfo> {
+        let block = func.blocks.iter().find(|b| b.id == block_id)?;
+        
+        // Find predecessors that would benefit
+        let mut preds_to_dup = Vec::new();
+        
+        // Simplified - real implementation would do more analysis
+        for pred_block in &func.blocks {
+            let succs = self.get_successors(&pred_block.terminator);
+            if succs.contains(&block_id) {
+                preds_to_dup.push(pred_block.id);
+            }
+        }
+        
+        if preds_to_dup.len() >= 2 && preds_to_dup.len() as u32 <= self.max_dup_factor {
+            Some(DuplicationInfo {
+                original: block_id,
+                predecessors: preds_to_dup,
+            })
+        } else {
+            None
+        }
+    }
+    
+    fn apply_duplication(&mut self, func: &mut MirFunction, info: &DuplicationInfo) {
+        let original = func.blocks.iter().find(|b| b.id == info.original);
+        
+        if original.is_none() {
+            return;
+        }
+        
+        let original = original.unwrap().clone();
+        let next_id = func.blocks.iter().map(|b| b.id).max().unwrap_or(0) + 1;
+        
+        // Create copies for each predecessor (except first)
+        for (i, &pred) in info.predecessors.iter().skip(1).enumerate() {
+            let new_id = next_id + i as u32;
+            
+            let mut new_block = original.clone();
+            new_block.id = new_id;
+            
+            func.blocks.push(new_block);
+            self.stats.blocks_duplicated += 1;
+            self.stats.instructions_duplicated += original.statements.len();
+            
+            // Redirect predecessor
+            if let Some(pred_block) = func.blocks.iter_mut().find(|b| b.id == pred) {
+                self.redirect_terminator(&mut pred_block.terminator, info.original, new_id);
+            }
+        }
+    }
+    
+    fn redirect_terminator(&self, term: &mut MirTerminator, from: u32, to: u32) {
+        match term {
+            MirTerminator::Goto(target) => {
+                if *target == from {
+                    *target = to;
+                }
+            }
+            MirTerminator::Branch { then_bb, else_bb, .. } => {
+                if *then_bb == from {
+                    *then_bb = to;
+                }
+                if *else_bb == from {
+                    *else_bb = to;
+                }
+            }
+            MirTerminator::Switch { targets, default, .. } => {
+                for (_, target) in targets.iter_mut() {
+                    if *target == from {
+                        *target = to;
+                    }
+                }
+                if *default == from {
+                    *default = to;
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    fn get_successors(&self, term: &MirTerminator) -> Vec<u32> {
+        match term {
+            MirTerminator::Goto(t) => vec![*t],
+            MirTerminator::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+            MirTerminator::Switch { targets, default, .. } => {
+                let mut s: Vec<_> = targets.iter().map(|(_, t)| *t).collect();
+                s.push(*default);
+                s
+            }
+            _ => vec![],
+        }
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &AdvancedThreadingStats {
+        &self.stats
+    }
+}
+
+impl Default for AdvancedJumpThreading {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Information for block duplication
+#[derive(Debug, Clone)]
+struct DuplicationInfo {
+    /// Original block ID
+    original: u32,
+    /// Predecessors to create copies for
+    predecessors: Vec<u32>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand },
+    Store { ptr: MirOperand, value: MirOperand },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Switch { value: MirOperand, targets: Vec<(i64, u32)>, default: u32 },
+    Return { value: Option<MirOperand> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn create_threadable_func() -> MirFunction {
+        // Block 0: if (x) goto 1 else goto 2
+        // Block 1: if (x) goto 3 else goto 4  <- x is known true here
+        // Block 2: ...
+        // Block 3: ...
+        // Block 4: ...
+        MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![],
+                    terminator: MirTerminator::Branch {
+                        cond: MirOperand::Variable("x".to_string()),
+                        then_bb: 1,
+                        else_bb: 2,
+                    },
+                },
+                MirBlock {
+                    id: 1,
+                    statements: vec![],
+                    terminator: MirTerminator::Branch {
+                        cond: MirOperand::Variable("x".to_string()),
+                        then_bb: 3,
+                        else_bb: 4,
+                    },
+                },
+                MirBlock {
+                    id: 2,
+                    statements: vec![],
+                    terminator: MirTerminator::Return { value: None },
+                },
+                MirBlock {
+                    id: 3,
+                    statements: vec![],
+                    terminator: MirTerminator::Return { value: None },
+                },
+                MirBlock {
+                    id: 4,
+                    statements: vec![],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        }
+    }
+    
+    #[test]
+    fn test_thread_detection() {
+        let func = create_threadable_func();
+        let mut analyzer = ThreadingAnalyzer::new();
+        
+        let opportunities = analyzer.analyze(&func);
+        
+        // Should find opportunity: 0 -> 1 -> 3 (since x is true)
+        assert!(!opportunities.is_empty());
+    }
+    
+    #[test]
+    fn test_jump_threading() {
+        let mut func = create_threadable_func();
+        let mut jt = JumpThreading::new();
+        
+        jt.run(&mut func);
+        
+        // Should have threaded at least one jump
+        assert!(jt.stats().threads_applied >= 1);
+    }
+}

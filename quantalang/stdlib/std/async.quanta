@@ -1,0 +1,1871 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ STANDARD LIBRARY — Async Runtime
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// This module provides a complete async runtime for QuantaLang:
+// - Runtime: The main async executor
+// - spawn: Spawn new async tasks
+// - JoinHandle: Handle to await spawned tasks
+// - sleep: Async sleep function
+// - select!: Race multiple futures
+// - Channels: Async message passing (mpsc, oneshot)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use core::task::{Context, Poll, Waker, RawWaker, RawWakerVTable, Future, Pin};
+use core::marker::{PhantomData, Send, Sync};
+use core::option::{Option, Option::Some, Option::None};
+use core::option::{Result, Result::Ok, Result::Err};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use alloc::sync::Arc;
+use alloc::collections::VecDeque;
+
+use crate::sync::{Mutex, Condvar, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}};
+use crate::thread;
+use crate::time::{Duration, Instant};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TASK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Internal task state
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TaskState {
+    /// Task is ready to be polled
+    Ready,
+    /// Task is waiting for something
+    Waiting,
+    /// Task has completed
+    Completed,
+    /// Task was cancelled
+    Cancelled,
+}
+
+/// A unique identifier for tasks
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct TaskId(u64);
+
+impl TaskId {
+    /// Generate a new unique task ID
+    fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        TaskId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Get the raw ID value
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+/// A type-erased future that can be stored in the runtime's task queue
+struct Task {
+    /// Unique task identifier
+    id: TaskId,
+    /// The boxed future
+    future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    /// Current state
+    state: AtomicUsize,
+    /// Waker to wake this task
+    waker: Option<Waker>,
+}
+
+impl Task {
+    fn new<F>(future: F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        Task {
+            id: TaskId::new(),
+            future: Box::pin(future),
+            state: AtomicUsize::new(TaskState::Ready as usize),
+            waker: None,
+        }
+    }
+
+    fn state(&self) -> TaskState {
+        match self.state.load(Ordering::SeqCst) {
+            0 => TaskState::Ready,
+            1 => TaskState::Waiting,
+            2 => TaskState::Completed,
+            _ => TaskState::Cancelled,
+        }
+    }
+
+    fn set_state(&self, state: TaskState) {
+        self.state.store(state as usize, Ordering::SeqCst);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WAKER IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Shared state for task waking
+struct TaskWaker {
+    /// The task ID this waker is for
+    task_id: TaskId,
+    /// Reference to the runtime's task queue
+    task_queue: Arc<Mutex<VecDeque<TaskId>>>,
+    /// Condvar to notify the runtime
+    notify: Arc<Condvar>,
+}
+
+impl TaskWaker {
+    fn into_waker(self: Arc<Self>) -> Waker {
+        let raw = Arc::into_raw(self) as *const ();
+        let vtable = &TaskWaker::VTABLE;
+        unsafe { Waker::from_raw(RawWaker::new(raw, vtable)) }
+    }
+
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        Self::clone_waker,
+        Self::wake,
+        Self::wake_by_ref,
+        Self::drop_waker,
+    );
+
+    unsafe fn clone_waker(ptr: *const ()) -> RawWaker {
+        let arc = Arc::from_raw(ptr as *const TaskWaker);
+        let cloned = arc.clone();
+        core::mem::forget(arc); // Don't decrement the original
+        RawWaker::new(Arc::into_raw(cloned) as *const (), &Self::VTABLE)
+    }
+
+    unsafe fn wake(ptr: *const ()) {
+        let arc = Arc::from_raw(ptr as *const TaskWaker);
+        arc.wake_task();
+        // arc is dropped here, decrementing the reference count
+    }
+
+    unsafe fn wake_by_ref(ptr: *const ()) {
+        let arc = Arc::from_raw(ptr as *const TaskWaker);
+        arc.wake_task();
+        core::mem::forget(arc); // Don't decrement the reference count
+    }
+
+    unsafe fn drop_waker(ptr: *const ()) {
+        drop(Arc::from_raw(ptr as *const TaskWaker));
+    }
+
+    fn wake_task(&self) {
+        // Add task to the ready queue
+        {
+            let mut queue = self.task_queue.lock();
+            if !queue.contains(&self.task_id) {
+                queue.push_back(self.task_id);
+            }
+        }
+        // Notify the runtime
+        self.notify.notify_one();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RUNTIME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The async runtime configuration
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    /// Number of worker threads (0 = single-threaded)
+    pub worker_threads: usize,
+    /// Name prefix for worker threads
+    pub thread_name_prefix: &'static str,
+    /// Stack size for worker threads
+    pub thread_stack_size: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: 0,
+            thread_name_prefix: "quanta-worker",
+            thread_stack_size: 2 * 1024 * 1024, // 2 MiB
+        }
+    }
+}
+
+/// The QuantaLang async runtime
+///
+/// This is the main executor for running async tasks.
+///
+/// # Examples
+///
+/// ```quanta
+/// use std::async::Runtime;
+///
+/// fn main() {
+///     let rt = Runtime::new();
+///     rt.block_on(async {
+///         println!("Hello from async!");
+///     });
+/// }
+/// ```
+pub struct Runtime {
+    /// Configuration
+    config: RuntimeConfig,
+    /// All tasks in the runtime
+    tasks: Arc<Mutex<Vec<Arc<Mutex<Task>>>>>,
+    /// Queue of task IDs ready to run
+    ready_queue: Arc<Mutex<VecDeque<TaskId>>>,
+    /// Notification condvar
+    notify: Arc<Condvar>,
+    /// Is the runtime shutting down?
+    shutdown: AtomicBool,
+    /// Timer wheel for sleep operations
+    timers: Arc<Mutex<TimerWheel>>,
+}
+
+impl Runtime {
+    /// Create a new runtime with default configuration
+    pub fn new() -> Self {
+        Self::with_config(RuntimeConfig::default())
+    }
+
+    /// Create a new runtime with custom configuration
+    pub fn with_config(config: RuntimeConfig) -> Self {
+        Runtime {
+            config,
+            tasks: Arc::new(Mutex::new(Vec::new())),
+            ready_queue: Arc::new(Mutex::new(VecDeque::new())),
+            notify: Arc::new(Condvar::new()),
+            shutdown: AtomicBool::new(false),
+            timers: Arc::new(Mutex::new(TimerWheel::new())),
+        }
+    }
+
+    /// Run a future to completion on this runtime
+    ///
+    /// This will block the current thread until the future completes.
+    pub fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future + 'static,
+        F::Output: 'static,
+    {
+        // Create a cell to store the result
+        let result: Arc<Mutex<Option<F::Output>>> = Arc::new(Mutex::new(None));
+        let result_clone = result.clone();
+
+        // Wrap the future to store its result
+        let wrapper = async move {
+            let output = future.await;
+            *result_clone.lock() = Some(output);
+        };
+
+        // Create the main task
+        let task = Arc::new(Mutex::new(Task::new(wrapper)));
+        let task_id = task.lock().id;
+
+        // Add task to runtime
+        {
+            let mut tasks = self.tasks.lock();
+            tasks.push(task.clone());
+        }
+
+        // Add to ready queue
+        {
+            let mut queue = self.ready_queue.lock();
+            queue.push_back(task_id);
+        }
+
+        // Run the event loop until the task completes
+        self.run_until_complete(task_id);
+
+        // Extract and return the result
+        let mut result_guard = result.lock();
+        result_guard.take().expect("Future completed without producing a result")
+    }
+
+    /// Spawn a new async task
+    ///
+    /// Returns a JoinHandle that can be awaited to get the task's result.
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        // Create shared state for the join handle
+        let state = Arc::new(JoinState::new());
+        let state_clone = state.clone();
+
+        // Wrap the future to store its result
+        let wrapper = async move {
+            let output = future.await;
+            state_clone.complete(output);
+        };
+
+        // Create and register the task
+        let task = Arc::new(Mutex::new(Task::new(wrapper)));
+        let task_id = task.lock().id;
+
+        {
+            let mut tasks = self.tasks.lock();
+            tasks.push(task);
+        }
+
+        {
+            let mut queue = self.ready_queue.lock();
+            queue.push_back(task_id);
+        }
+
+        // Notify the runtime
+        self.notify.notify_one();
+
+        JoinHandle {
+            id: task_id,
+            state,
+        }
+    }
+
+    /// Spawn a task that runs on the local thread (not Send)
+    pub fn spawn_local<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + 'static,
+        F::Output: 'static,
+    {
+        // For local tasks, we need a different approach since they're not Send
+        // This is a simplified implementation
+        let state = Arc::new(JoinState::new());
+        let state_clone = state.clone();
+
+        // We'll use a thread-local storage approach here
+        // For now, just mark it as Send anyway (unsafe in real impl)
+        let wrapper = async move {
+            let output = future.await;
+            state_clone.complete(output);
+        };
+
+        let task = Arc::new(Mutex::new(Task::new(wrapper)));
+        let task_id = task.lock().id;
+
+        {
+            let mut tasks = self.tasks.lock();
+            tasks.push(task);
+        }
+
+        {
+            let mut queue = self.ready_queue.lock();
+            queue.push_back(task_id);
+        }
+
+        JoinHandle {
+            id: task_id,
+            state,
+        }
+    }
+
+    /// Run the runtime's event loop until the specified task completes
+    fn run_until_complete(&self, target_task: TaskId) {
+        loop {
+            // Check timers and wake expired ones
+            self.process_timers();
+
+            // Get the next task to run
+            let task_id = {
+                let mut queue = self.ready_queue.lock();
+                queue.pop_front()
+            };
+
+            match task_id {
+                Some(id) => {
+                    // Find and poll the task
+                    let task = self.find_task(id);
+                    if let Some(task) = task {
+                        let completed = self.poll_task(&task);
+
+                        // Check if target task completed
+                        if id == target_task && completed {
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    // No ready tasks - wait for notification or timeout
+                    let next_timer = self.timers.lock().next_deadline();
+                    let timeout = next_timer
+                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                        .unwrap_or(Duration::from_millis(100));
+
+                    let queue = self.ready_queue.lock();
+                    if queue.is_empty() {
+                        drop(queue);
+                        let queue = self.ready_queue.lock();
+                        let _ = self.notify.wait_timeout(queue, timeout);
+                    }
+                }
+            }
+
+            // Check for shutdown
+            if self.shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+        }
+    }
+
+    /// Find a task by ID
+    fn find_task(&self, id: TaskId) -> Option<Arc<Mutex<Task>>> {
+        let tasks = self.tasks.lock();
+        tasks.iter().find(|t| t.lock().id == id).cloned()
+    }
+
+    /// Poll a task and return whether it completed
+    fn poll_task(&self, task: &Arc<Mutex<Task>>) -> bool {
+        let task_id = task.lock().id;
+
+        // Create a waker for this task
+        let waker_data = Arc::new(TaskWaker {
+            task_id,
+            task_queue: self.ready_queue.clone(),
+            notify: self.notify.clone(),
+        });
+        let waker = waker_data.into_waker();
+
+        // Poll the future
+        let mut cx = Context::from_waker(&waker);
+        let mut task_guard = task.lock();
+
+        match task_guard.future.as_mut().poll(&mut cx) {
+            Poll::Ready(()) => {
+                task_guard.set_state(TaskState::Completed);
+                true
+            }
+            Poll::Pending => {
+                task_guard.set_state(TaskState::Waiting);
+                false
+            }
+        }
+    }
+
+    /// Process expired timers
+    fn process_timers(&self) {
+        let mut timers = self.timers.lock();
+        let expired = timers.drain_expired();
+        drop(timers);
+
+        for waker in expired {
+            waker.wake();
+        }
+    }
+
+    /// Register a timer to wake the given waker at the specified instant
+    pub(crate) fn register_timer(&self, deadline: Instant, waker: Waker) {
+        let mut timers = self.timers.lock();
+        timers.insert(deadline, waker);
+        self.notify.notify_one();
+    }
+
+    /// Shutdown the runtime
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.notify.notify_all();
+    }
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOIN HANDLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Shared state for a spawned task's result
+struct JoinState<T> {
+    /// The result once available
+    result: Mutex<Option<T>>,
+    /// Whether the task is complete
+    completed: AtomicBool,
+    /// Waker to notify when complete
+    waker: Mutex<Option<Waker>>,
+}
+
+impl<T> JoinState<T> {
+    fn new() -> Self {
+        JoinState {
+            result: Mutex::new(None),
+            completed: AtomicBool::new(false),
+            waker: Mutex::new(None),
+        }
+    }
+
+    fn complete(&self, value: T) {
+        *self.result.lock() = Some(value);
+        self.completed.store(true, Ordering::SeqCst);
+        if let Some(waker) = self.waker.lock().take() {
+            waker.wake();
+        }
+    }
+
+    fn is_completed(&self) -> bool {
+        self.completed.load(Ordering::SeqCst)
+    }
+
+    fn take_result(&self) -> Option<T> {
+        self.result.lock().take()
+    }
+
+    fn set_waker(&self, waker: Waker) {
+        *self.waker.lock() = Some(waker);
+    }
+}
+
+/// Handle to a spawned task
+///
+/// Awaiting a JoinHandle will block until the task completes and return its result.
+///
+/// # Examples
+///
+/// ```quanta
+/// use std::async::{Runtime, spawn};
+///
+/// let rt = Runtime::new();
+/// rt.block_on(async {
+///     let handle = spawn(async {
+///         // Do some work
+///         42
+///     });
+///
+///     let result = handle.await;
+///     assert_eq!(result, Ok(42));
+/// });
+/// ```
+pub struct JoinHandle<T> {
+    id: TaskId,
+    state: Arc<JoinState<T>>,
+}
+
+impl<T> JoinHandle<T> {
+    /// Get the task ID
+    pub fn id(&self) -> TaskId {
+        self.id
+    }
+
+    /// Check if the task has completed
+    pub fn is_finished(&self) -> bool {
+        self.state.is_completed()
+    }
+
+    /// Abort the task
+    ///
+    /// Note: This does not immediately stop the task, but marks it for cancellation.
+    pub fn abort(&self) {
+        // Mark as completed to prevent further polling
+        // The task will see this on next poll
+        self.state.completed.store(true, Ordering::SeqCst);
+    }
+
+    /// Block the current thread until the task completes
+    ///
+    /// This is useful when you need to wait for a task outside of an async context.
+    pub fn blocking_wait(self) -> Result<T, JoinError> {
+        while !self.state.is_completed() {
+            thread::yield_now();
+        }
+        self.state.take_result().ok_or(JoinError::Cancelled)
+    }
+}
+
+impl<T> Future for JoinHandle<T> {
+    type Output = Result<T, JoinError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.state.is_completed() {
+            match self.state.take_result() {
+                Some(result) => Poll::Ready(Ok(result)),
+                None => Poll::Ready(Err(JoinError::Cancelled)),
+            }
+        } else {
+            self.state.set_waker(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+/// Error returned when a task fails to complete
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinError {
+    /// The task was cancelled before completion
+    Cancelled,
+    /// The task panicked
+    Panicked,
+}
+
+impl core::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            JoinError::Cancelled => write!(f, "task was cancelled"),
+            JoinError::Panicked => write!(f, "task panicked"),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIMER WHEEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A timer entry
+struct TimerEntry {
+    deadline: Instant,
+    waker: Waker,
+}
+
+/// Simple timer wheel for scheduling wake-ups
+struct TimerWheel {
+    entries: Vec<TimerEntry>,
+}
+
+impl TimerWheel {
+    fn new() -> Self {
+        TimerWheel {
+            entries: Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, deadline: Instant, waker: Waker) {
+        // Insert in sorted order
+        let pos = self.entries
+            .iter()
+            .position(|e| e.deadline > deadline)
+            .unwrap_or(self.entries.len());
+        self.entries.insert(pos, TimerEntry { deadline, waker });
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.entries.first().map(|e| e.deadline)
+    }
+
+    fn drain_expired(&mut self) -> Vec<Waker> {
+        let now = Instant::now();
+        let expired_count = self.entries
+            .iter()
+            .take_while(|e| e.deadline <= now)
+            .count();
+
+        self.entries
+            .drain(..expired_count)
+            .map(|e| e.waker)
+            .collect()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLEEP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A future that resolves after a specified duration.
+///
+/// Created by the `sleep` function.
+pub struct Sleep {
+    deadline: Instant,
+    registered: bool,
+}
+
+impl Sleep {
+    /// Create a new sleep future
+    pub fn new(duration: Duration) -> Self {
+        Sleep {
+            deadline: Instant::now() + duration,
+            registered: false,
+        }
+    }
+
+    /// Create a sleep that completes at a specific instant
+    pub fn until(deadline: Instant) -> Self {
+        Sleep {
+            deadline,
+            registered: false,
+        }
+    }
+
+    /// Get the deadline for this sleep
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Reset the sleep to complete after a new duration
+    pub fn reset(&mut self, duration: Duration) {
+        self.deadline = Instant::now() + duration;
+        self.registered = false;
+    }
+
+    /// Check if the sleep has expired
+    pub fn is_elapsed(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if Instant::now() >= self.deadline {
+            return Poll::Ready(());
+        }
+
+        // Register with the runtime's timer
+        if !self.registered {
+            // Get the current runtime and register
+            if let Some(rt) = current_runtime() {
+                rt.register_timer(self.deadline, cx.waker().clone());
+                self.registered = true;
+            } else {
+                // No runtime - just poll again later
+                cx.waker().wake_by_ref();
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+/// Pauses execution for the specified duration.
+///
+/// # Examples
+///
+/// ```quanta
+/// use std::async::sleep;
+/// use std::time::Duration;
+///
+/// async fn example() {
+///     println!("Starting...");
+///     sleep(Duration::from_secs(1)).await;
+///     println!("One second later!");
+/// }
+/// ```
+pub fn sleep(duration: Duration) -> Sleep {
+    Sleep::new(duration)
+}
+
+/// Pauses execution until the specified instant.
+pub fn sleep_until(deadline: Instant) -> Sleep {
+    Sleep::until(deadline)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIMEOUT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Error returned when a timeout expires
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Elapsed;
+
+impl core::fmt::Display for Elapsed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "operation timed out")
+    }
+}
+
+/// A future that wraps another future with a timeout.
+pub struct Timeout<F> {
+    future: F,
+    sleep: Sleep,
+}
+
+impl<F: Future> Timeout<F> {
+    /// Create a new timeout future
+    pub fn new(future: F, duration: Duration) -> Self {
+        Timeout {
+            future,
+            sleep: Sleep::new(duration),
+        }
+    }
+}
+
+impl<F: Future + Unpin> Future for Timeout<F> {
+    type Output = Result<F::Output, Elapsed>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        // First, check if the future is ready
+        match Pin::new(&mut this.future).poll(cx) {
+            Poll::Ready(output) => return Poll::Ready(Ok(output)),
+            Poll::Pending => {}
+        }
+
+        // Check if the timeout has elapsed
+        match Pin::new(&mut this.sleep).poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(Elapsed)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Applies a timeout to a future.
+///
+/// If the future does not complete before the timeout, returns an error.
+///
+/// # Examples
+///
+/// ```quanta
+/// use std::async::{timeout, sleep};
+/// use std::time::Duration;
+///
+/// async fn example() {
+///     let result = timeout(Duration::from_millis(100), async {
+///         sleep(Duration::from_secs(1)).await;
+///         42
+///     }).await;
+///
+///     assert!(result.is_err()); // Timed out!
+/// }
+/// ```
+pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
+    Timeout::new(future, duration)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// YIELD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Yield control back to the runtime.
+///
+/// This allows other tasks to run before continuing.
+///
+/// # Examples
+///
+/// ```quanta
+/// use std::async::yield_now;
+///
+/// async fn cooperative_task() {
+///     for i in 0..1000 {
+///         // Do some work
+///         process_item(i);
+///
+///         // Yield periodically to let other tasks run
+///         if i % 100 == 0 {
+///             yield_now().await;
+///         }
+///     }
+/// }
+/// ```
+pub async fn yield_now() {
+    struct YieldNow {
+        yielded: bool,
+    }
+
+    impl Future for YieldNow {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.yielded {
+                Poll::Ready(())
+            } else {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    YieldNow { yielded: false }.await
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHANNEL — ONE-SHOT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A single-value channel
+pub mod oneshot {
+    use super::*;
+
+    /// Error returned when the sender was dropped without sending
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RecvError;
+
+    impl core::fmt::Display for RecvError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "channel closed without sending")
+        }
+    }
+
+    /// Shared state for oneshot channel
+    struct Shared<T> {
+        value: Mutex<Option<T>>,
+        completed: AtomicBool,
+        waker: Mutex<Option<Waker>>,
+        sender_dropped: AtomicBool,
+    }
+
+    /// The sending half of a oneshot channel
+    pub struct Sender<T> {
+        shared: Arc<Shared<T>>,
+    }
+
+    /// The receiving half of a oneshot channel
+    pub struct Receiver<T> {
+        shared: Arc<Shared<T>>,
+    }
+
+    /// Create a new oneshot channel
+    ///
+    /// # Examples
+    ///
+    /// ```quanta
+    /// use std::async::oneshot;
+    ///
+    /// async fn example() {
+    ///     let (tx, rx) = oneshot::channel();
+    ///
+    ///     spawn(async move {
+    ///         tx.send(42);
+    ///     });
+    ///
+    ///     let value = rx.await.unwrap();
+    ///     assert_eq!(value, 42);
+    /// }
+    /// ```
+    pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+        let shared = Arc::new(Shared {
+            value: Mutex::new(None),
+            completed: AtomicBool::new(false),
+            waker: Mutex::new(None),
+            sender_dropped: AtomicBool::new(false),
+        });
+
+        (
+            Sender { shared: shared.clone() },
+            Receiver { shared },
+        )
+    }
+
+    impl<T> Sender<T> {
+        /// Send a value through the channel
+        ///
+        /// Returns `Err(value)` if the receiver was already dropped.
+        pub fn send(self, value: T) -> Result<(), T> {
+            if self.shared.sender_dropped.load(Ordering::SeqCst) {
+                return Err(value);
+            }
+
+            *self.shared.value.lock() = Some(value);
+            self.shared.completed.store(true, Ordering::SeqCst);
+
+            if let Some(waker) = self.shared.waker.lock().take() {
+                waker.wake();
+            }
+
+            Ok(())
+        }
+
+        /// Check if the receiver is still waiting
+        pub fn is_closed(&self) -> bool {
+            // Receiver is closed if it was dropped
+            Arc::strong_count(&self.shared) == 1
+        }
+    }
+
+    impl<T> Drop for Sender<T> {
+        fn drop(&mut self) {
+            self.shared.sender_dropped.store(true, Ordering::SeqCst);
+            if let Some(waker) = self.shared.waker.lock().take() {
+                waker.wake();
+            }
+        }
+    }
+
+    impl<T> Receiver<T> {
+        /// Try to receive the value without blocking
+        pub fn try_recv(&mut self) -> Result<Option<T>, RecvError> {
+            if self.shared.completed.load(Ordering::SeqCst) {
+                Ok(self.shared.value.lock().take())
+            } else if self.shared.sender_dropped.load(Ordering::SeqCst) {
+                Err(RecvError)
+            } else {
+                Ok(None)
+            }
+        }
+
+        /// Block until a value is received
+        pub fn blocking_recv(self) -> Result<T, RecvError> {
+            loop {
+                if self.shared.completed.load(Ordering::SeqCst) {
+                    return self.shared.value.lock().take().ok_or(RecvError);
+                }
+                if self.shared.sender_dropped.load(Ordering::SeqCst) {
+                    return Err(RecvError);
+                }
+                thread::yield_now();
+            }
+        }
+    }
+
+    impl<T> Future for Receiver<T> {
+        type Output = Result<T, RecvError>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.shared.completed.load(Ordering::SeqCst) {
+                match self.shared.value.lock().take() {
+                    Some(value) => Poll::Ready(Ok(value)),
+                    None => Poll::Ready(Err(RecvError)),
+                }
+            } else if self.shared.sender_dropped.load(Ordering::SeqCst) {
+                Poll::Ready(Err(RecvError))
+            } else {
+                *self.shared.waker.lock() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHANNEL — MPSC (Multi-Producer, Single-Consumer)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Multi-producer, single-consumer channel
+pub mod mpsc {
+    use super::*;
+
+    /// Error returned when the channel is closed
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SendError<T>(pub T);
+
+    impl<T> core::fmt::Display for SendError<T> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "channel closed")
+        }
+    }
+
+    /// Error returned when trying to receive from a closed channel
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RecvError;
+
+    /// Shared state for the channel
+    struct Shared<T> {
+        queue: Mutex<VecDeque<T>>,
+        capacity: Option<usize>,
+        closed: AtomicBool,
+        sender_count: AtomicUsize,
+        recv_waker: Mutex<Option<Waker>>,
+        send_wakers: Mutex<VecDeque<Waker>>,
+    }
+
+    /// The sending half of a bounded mpsc channel
+    pub struct Sender<T> {
+        shared: Arc<Shared<T>>,
+    }
+
+    /// The receiving half of an mpsc channel
+    pub struct Receiver<T> {
+        shared: Arc<Shared<T>>,
+    }
+
+    /// Create an unbounded mpsc channel
+    ///
+    /// # Examples
+    ///
+    /// ```quanta
+    /// use std::async::mpsc;
+    ///
+    /// async fn example() {
+    ///     let (tx, mut rx) = mpsc::unbounded();
+    ///
+    ///     tx.send(1).await.unwrap();
+    ///     tx.send(2).await.unwrap();
+    ///
+    ///     assert_eq!(rx.recv().await, Some(1));
+    ///     assert_eq!(rx.recv().await, Some(2));
+    /// }
+    /// ```
+    pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(VecDeque::new()),
+            capacity: None,
+            closed: AtomicBool::new(false),
+            sender_count: AtomicUsize::new(1),
+            recv_waker: Mutex::new(None),
+            send_wakers: Mutex::new(VecDeque::new()),
+        });
+
+        (
+            Sender { shared: shared.clone() },
+            Receiver { shared },
+        )
+    }
+
+    /// Create a bounded mpsc channel with the given capacity
+    pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity: Some(capacity),
+            closed: AtomicBool::new(false),
+            sender_count: AtomicUsize::new(1),
+            recv_waker: Mutex::new(None),
+            send_wakers: Mutex::new(VecDeque::new()),
+        });
+
+        (
+            Sender { shared: shared.clone() },
+            Receiver { shared },
+        )
+    }
+
+    impl<T> Clone for Sender<T> {
+        fn clone(&self) -> Self {
+            self.shared.sender_count.fetch_add(1, Ordering::SeqCst);
+            Sender { shared: self.shared.clone() }
+        }
+    }
+
+    impl<T> Sender<T> {
+        /// Send a value through the channel
+        pub async fn send(&self, value: T) -> Result<(), SendError<T>> {
+            // Check if closed
+            if self.shared.closed.load(Ordering::SeqCst) {
+                return Err(SendError(value));
+            }
+
+            // For bounded channels, wait for capacity
+            if let Some(capacity) = self.shared.capacity {
+                loop {
+                    {
+                        let queue = self.shared.queue.lock();
+                        if queue.len() < capacity {
+                            break;
+                        }
+                    }
+                    // Wait for space
+                    yield_now().await;
+
+                    if self.shared.closed.load(Ordering::SeqCst) {
+                        return Err(SendError(value));
+                    }
+                }
+            }
+
+            // Add to queue
+            {
+                let mut queue = self.shared.queue.lock();
+                queue.push_back(value);
+            }
+
+            // Wake receiver
+            if let Some(waker) = self.shared.recv_waker.lock().take() {
+                waker.wake();
+            }
+
+            Ok(())
+        }
+
+        /// Try to send without blocking
+        pub fn try_send(&self, value: T) -> Result<(), SendError<T>> {
+            if self.shared.closed.load(Ordering::SeqCst) {
+                return Err(SendError(value));
+            }
+
+            if let Some(capacity) = self.shared.capacity {
+                let queue = self.shared.queue.lock();
+                if queue.len() >= capacity {
+                    return Err(SendError(value));
+                }
+            }
+
+            {
+                let mut queue = self.shared.queue.lock();
+                queue.push_back(value);
+            }
+
+            if let Some(waker) = self.shared.recv_waker.lock().take() {
+                waker.wake();
+            }
+
+            Ok(())
+        }
+
+        /// Check if the receiver is still available
+        pub fn is_closed(&self) -> bool {
+            self.shared.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    impl<T> Drop for Sender<T> {
+        fn drop(&mut self) {
+            let prev = self.shared.sender_count.fetch_sub(1, Ordering::SeqCst);
+            if prev == 1 {
+                // Last sender dropped
+                self.shared.closed.store(true, Ordering::SeqCst);
+                if let Some(waker) = self.shared.recv_waker.lock().take() {
+                    waker.wake();
+                }
+            }
+        }
+    }
+
+    impl<T> Receiver<T> {
+        /// Receive a value from the channel
+        pub async fn recv(&mut self) -> Option<T> {
+            loop {
+                // Try to get from queue
+                {
+                    let mut queue = self.shared.queue.lock();
+                    if let Some(value) = queue.pop_front() {
+                        // Wake a sender if any are waiting
+                        if let Some(waker) = self.shared.send_wakers.lock().pop_front() {
+                            waker.wake();
+                        }
+                        return Some(value);
+                    }
+                }
+
+                // Check if closed
+                if self.shared.closed.load(Ordering::SeqCst) {
+                    return None;
+                }
+
+                // Wait for value
+                yield_now().await;
+            }
+        }
+
+        /// Try to receive without blocking
+        pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+            let mut queue = self.shared.queue.lock();
+            match queue.pop_front() {
+                Some(value) => {
+                    if let Some(waker) = self.shared.send_wakers.lock().pop_front() {
+                        waker.wake();
+                    }
+                    Ok(value)
+                }
+                None => {
+                    if self.shared.closed.load(Ordering::SeqCst) {
+                        Err(TryRecvError::Disconnected)
+                    } else {
+                        Err(TryRecvError::Empty)
+                    }
+                }
+            }
+        }
+
+        /// Close the receiving end
+        pub fn close(&mut self) {
+            self.shared.closed.store(true, Ordering::SeqCst);
+            // Wake all waiting senders
+            let mut wakers = self.shared.send_wakers.lock();
+            for waker in wakers.drain(..) {
+                waker.wake();
+            }
+        }
+    }
+
+    impl<T> Drop for Receiver<T> {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+
+    /// Error when trying to receive from an empty channel
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TryRecvError {
+        /// The channel is empty
+        Empty,
+        /// All senders have been dropped
+        Disconnected,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BROADCAST CHANNEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Broadcast channel for multiple subscribers
+pub mod broadcast {
+    use super::*;
+
+    /// Shared state for broadcast channel
+    struct Shared<T: Clone> {
+        /// The buffer of recent messages
+        buffer: Mutex<VecDeque<(u64, T)>>,
+        /// Next message sequence number
+        next_seq: AtomicU64,
+        /// Channel capacity
+        capacity: usize,
+        /// Subscriber wakers
+        wakers: Mutex<Vec<Waker>>,
+        /// Is the channel closed?
+        closed: AtomicBool,
+    }
+
+    /// Sender for broadcast channel
+    pub struct Sender<T: Clone> {
+        shared: Arc<Shared<T>>,
+    }
+
+    /// Receiver for broadcast channel
+    pub struct Receiver<T: Clone> {
+        shared: Arc<Shared<T>>,
+        /// The next sequence number to read
+        next_seq: u64,
+    }
+
+    /// Create a new broadcast channel with the given capacity
+    pub fn channel<T: Clone>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+        let shared = Arc::new(Shared {
+            buffer: Mutex::new(VecDeque::with_capacity(capacity)),
+            next_seq: AtomicU64::new(0),
+            capacity,
+            wakers: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+        });
+
+        (
+            Sender { shared: shared.clone() },
+            Receiver { shared, next_seq: 0 },
+        )
+    }
+
+    impl<T: Clone> Sender<T> {
+        /// Send a value to all receivers
+        pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
+            if self.shared.closed.load(Ordering::SeqCst) {
+                return Err(SendError(value));
+            }
+
+            let seq = self.shared.next_seq.fetch_add(1, Ordering::SeqCst);
+
+            {
+                let mut buffer = self.shared.buffer.lock();
+                if buffer.len() >= self.shared.capacity {
+                    buffer.pop_front();
+                }
+                buffer.push_back((seq, value));
+            }
+
+            // Wake all receivers
+            let wakers: Vec<_> = self.shared.wakers.lock().drain(..).collect();
+            let count = wakers.len();
+            for waker in wakers {
+                waker.wake();
+            }
+
+            Ok(count)
+        }
+
+        /// Subscribe to this broadcast channel
+        pub fn subscribe(&self) -> Receiver<T> {
+            Receiver {
+                shared: self.shared.clone(),
+                next_seq: self.shared.next_seq.load(Ordering::SeqCst),
+            }
+        }
+    }
+
+    /// Send error for broadcast channel
+    #[derive(Debug)]
+    pub struct SendError<T>(pub T);
+
+    impl<T: Clone> Receiver<T> {
+        /// Receive the next message
+        pub async fn recv(&mut self) -> Result<T, RecvError> {
+            loop {
+                {
+                    let buffer = self.shared.buffer.lock();
+                    for (seq, value) in buffer.iter() {
+                        if *seq >= self.next_seq {
+                            self.next_seq = seq + 1;
+                            return Ok(value.clone());
+                        }
+                    }
+                }
+
+                if self.shared.closed.load(Ordering::SeqCst) {
+                    return Err(RecvError::Closed);
+                }
+
+                yield_now().await;
+            }
+        }
+    }
+
+    /// Receive error for broadcast channel
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RecvError {
+        /// The channel was closed
+        Closed,
+        /// Lagged behind and missed messages
+        Lagged(u64),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MUTEX (ASYNC)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// An async-aware mutex
+///
+/// Unlike `std::sync::Mutex`, this mutex is designed for use in async code
+/// and will not block the thread while waiting for the lock.
+pub struct AsyncMutex<T> {
+    inner: Mutex<T>,
+    waiters: Mutex<VecDeque<Waker>>,
+    locked: AtomicBool,
+}
+
+impl<T> AsyncMutex<T> {
+    /// Create a new async mutex
+    pub fn new(value: T) -> Self {
+        AsyncMutex {
+            inner: Mutex::new(value),
+            waiters: Mutex::new(VecDeque::new()),
+            locked: AtomicBool::new(false),
+        }
+    }
+
+    /// Acquire the lock asynchronously
+    pub async fn lock(&self) -> AsyncMutexGuard<'_, T> {
+        loop {
+            // Try to acquire
+            if !self.locked.swap(true, Ordering::Acquire) {
+                return AsyncMutexGuard { mutex: self };
+            }
+
+            // Wait for unlock
+            yield_now().await;
+        }
+    }
+
+    /// Try to acquire the lock without blocking
+    pub fn try_lock(&self) -> Option<AsyncMutexGuard<'_, T>> {
+        if !self.locked.swap(true, Ordering::Acquire) {
+            Some(AsyncMutexGuard { mutex: self })
+        } else {
+            None
+        }
+    }
+
+    /// Get mutable access to the inner value
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut()
+    }
+
+    /// Consume the mutex and return the inner value
+    pub fn into_inner(self) -> T {
+        self.inner.into_inner()
+    }
+}
+
+/// Guard for an async mutex
+pub struct AsyncMutexGuard<'a, T> {
+    mutex: &'a AsyncMutex<T>,
+}
+
+impl<'a, T> Deref for AsyncMutexGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { &*self.mutex.inner.as_ptr() }
+    }
+}
+
+impl<'a, T> DerefMut for AsyncMutexGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.mutex.inner.as_ptr() }
+    }
+}
+
+impl<'a, T> Drop for AsyncMutexGuard<'a, T> {
+    fn drop(&mut self) {
+        self.mutex.locked.store(false, Ordering::Release);
+        // Wake one waiter
+        if let Some(waker) = self.mutex.waiters.lock().pop_front() {
+            waker.wake();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RWLOCK (ASYNC)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// An async-aware read-write lock
+pub struct AsyncRwLock<T> {
+    inner: T,
+    /// Number of readers (negative if writer has lock)
+    state: AtomicIsize,
+    waiters: Mutex<VecDeque<Waker>>,
+}
+
+impl<T> AsyncRwLock<T> {
+    /// Create a new async RwLock
+    pub fn new(value: T) -> Self {
+        AsyncRwLock {
+            inner: value,
+            state: AtomicIsize::new(0),
+            waiters: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Acquire a read lock
+    pub async fn read(&self) -> AsyncRwLockReadGuard<'_, T> {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state >= 0 {
+                // No writer, try to increment reader count
+                if self.state.compare_exchange(
+                    state,
+                    state + 1,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ).is_ok() {
+                    return AsyncRwLockReadGuard { lock: self };
+                }
+            }
+            yield_now().await;
+        }
+    }
+
+    /// Acquire a write lock
+    pub async fn write(&self) -> AsyncRwLockWriteGuard<'_, T> {
+        loop {
+            // Try to acquire exclusive access
+            if self.state.compare_exchange(
+                0,
+                -1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ).is_ok() {
+                return AsyncRwLockWriteGuard { lock: self };
+            }
+            yield_now().await;
+        }
+    }
+}
+
+/// Read guard for async RwLock
+pub struct AsyncRwLockReadGuard<'a, T> {
+    lock: &'a AsyncRwLock<T>,
+}
+
+impl<'a, T> Deref for AsyncRwLockReadGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { &*(&self.lock.inner as *const T) }
+    }
+}
+
+impl<'a, T> Drop for AsyncRwLockReadGuard<'a, T> {
+    fn drop(&mut self) {
+        self.lock.state.fetch_sub(1, Ordering::Release);
+        if let Some(waker) = self.lock.waiters.lock().pop_front() {
+            waker.wake();
+        }
+    }
+}
+
+/// Write guard for async RwLock
+pub struct AsyncRwLockWriteGuard<'a, T> {
+    lock: &'a AsyncRwLock<T>,
+}
+
+impl<'a, T> Deref for AsyncRwLockWriteGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { &*(&self.lock.inner as *const T) }
+    }
+}
+
+impl<'a, T> DerefMut for AsyncRwLockWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *(&self.lock.inner as *const T as *mut T) }
+    }
+}
+
+impl<'a, T> Drop for AsyncRwLockWriteGuard<'a, T> {
+    fn drop(&mut self) {
+        self.lock.state.store(0, Ordering::Release);
+        // Wake all waiters
+        let wakers: Vec<_> = self.lock.waiters.lock().drain(..).collect();
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL RUNTIME ACCESS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Thread-local storage for the current runtime
+thread_local! {
+    static CURRENT_RUNTIME: std::cell::RefCell<Option<Arc<Runtime>>> = std::cell::RefCell::new(None);
+}
+
+/// Get the current runtime
+fn current_runtime() -> Option<Arc<Runtime>> {
+    CURRENT_RUNTIME.with(|rt| rt.borrow().clone())
+}
+
+/// Set the current runtime for this thread
+fn set_current_runtime(runtime: Option<Arc<Runtime>>) {
+    CURRENT_RUNTIME.with(|rt| *rt.borrow_mut() = runtime);
+}
+
+/// Enter the runtime context
+pub struct RuntimeGuard {
+    _private: (),
+}
+
+impl Runtime {
+    /// Enter this runtime's context
+    pub fn enter(&self) -> RuntimeGuard {
+        // This is a simplified implementation
+        RuntimeGuard { _private: () }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPAWN HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Spawn a new async task on the current runtime
+///
+/// # Panics
+///
+/// Panics if called outside of a runtime context.
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    current_runtime()
+        .expect("spawn called outside of runtime context")
+        .spawn(future)
+}
+
+/// Spawn a task that runs on the local thread
+pub fn spawn_local<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    current_runtime()
+        .expect("spawn_local called outside of runtime context")
+        .spawn_local(future)
+}
+
+/// Block on a future from a synchronous context
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    Runtime::new().block_on(future)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SELECT MACRO SUPPORT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A select! branch
+pub struct SelectBranch<F, T> {
+    future: F,
+    _marker: PhantomData<T>,
+}
+
+/// Select between two futures
+pub async fn select2<A, B, T, U>(a: A, b: B) -> Either<T, U>
+where
+    A: Future<Output = T>,
+    B: Future<Output = U>,
+{
+    // Pin both futures
+    let mut a = core::pin::pin!(a);
+    let mut b = core::pin::pin!(b);
+
+    loop {
+        // Check which one is ready first
+        // This is a simplified implementation - a real one would be fairer
+        yield_now().await;
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        if let Poll::Ready(value) = a.as_mut().poll(&mut cx) {
+            return Either::Left(value);
+        }
+
+        if let Poll::Ready(value) = b.as_mut().poll(&mut cx) {
+            return Either::Right(value);
+        }
+    }
+}
+
+/// Result of selecting between two futures
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Either<L, R> {
+    Left(L),
+    Right(R),
+}
+
+impl<L, R> Either<L, R> {
+    /// Returns true if this is `Left`
+    pub fn is_left(&self) -> bool {
+        matches!(self, Either::Left(_))
+    }
+
+    /// Returns true if this is `Right`
+    pub fn is_right(&self) -> bool {
+        matches!(self, Either::Right(_))
+    }
+
+    /// Extract the left value
+    pub fn left(self) -> Option<L> {
+        match self {
+            Either::Left(l) => Some(l),
+            Either::Right(_) => None,
+        }
+    }
+
+    /// Extract the right value
+    pub fn right(self) -> Option<R> {
+        match self {
+            Either::Left(_) => None,
+            Either::Right(r) => Some(r),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOIN COMBINATORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Join two futures, running them concurrently
+pub async fn join<A, B, T, U>(a: A, b: B) -> (T, U)
+where
+    A: Future<Output = T>,
+    B: Future<Output = U>,
+{
+    let mut a = core::pin::pin!(a);
+    let mut b = core::pin::pin!(b);
+
+    let mut a_result: Option<T> = None;
+    let mut b_result: Option<U> = None;
+
+    loop {
+        yield_now().await;
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        if a_result.is_none() {
+            if let Poll::Ready(value) = a.as_mut().poll(&mut cx) {
+                a_result = Some(value);
+            }
+        }
+
+        if b_result.is_none() {
+            if let Poll::Ready(value) = b.as_mut().poll(&mut cx) {
+                b_result = Some(value);
+            }
+        }
+
+        if a_result.is_some() && b_result.is_some() {
+            return (a_result.take().unwrap(), b_result.take().unwrap());
+        }
+    }
+}
+
+/// Join three futures
+pub async fn join3<A, B, C, T, U, V>(a: A, b: B, c: C) -> (T, U, V)
+where
+    A: Future<Output = T>,
+    B: Future<Output = U>,
+    C: Future<Output = V>,
+{
+    let ((t, u), v) = join(join(a, b), c).await;
+    (t, u, v)
+}
+
+/// Join four futures
+pub async fn join4<A, B, C, D, T, U, V, W>(a: A, b: B, c: C, d: D) -> (T, U, V, W)
+where
+    A: Future<Output = T>,
+    B: Future<Output = U>,
+    C: Future<Output = V>,
+    D: Future<Output = W>,
+{
+    let ((t, u), (v, w)) = join(join(a, b), join(c, d)).await;
+    (t, u, v, w)
+}
+
+/// Try to join two futures, short-circuiting on error
+pub async fn try_join<A, B, T, U, E>(a: A, b: B) -> Result<(T, U), E>
+where
+    A: Future<Output = Result<T, E>>,
+    B: Future<Output = Result<U, E>>,
+{
+    let (a_result, b_result) = join(a, b).await;
+    Ok((a_result?, b_result?))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_runtime_creation() {
+        let rt = Runtime::new();
+        assert!(!rt.shutdown.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_block_on_simple() {
+        let rt = Runtime::new();
+        let result = rt.block_on(async { 42 });
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_ready_future() {
+        let rt = Runtime::new();
+        let result = rt.block_on(core::task::ready(123));
+        assert_eq!(result, 123);
+    }
+
+    #[test]
+    fn test_task_id_unique() {
+        let id1 = TaskId::new();
+        let id2 = TaskId::new();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_oneshot_channel() {
+        let rt = Runtime::new();
+        rt.block_on(async {
+            let (tx, rx) = oneshot::channel();
+            tx.send(42).unwrap();
+            let value = rx.await.unwrap();
+            assert_eq!(value, 42);
+        });
+    }
+
+    #[test]
+    fn test_either() {
+        let left: Either<i32, &str> = Either::Left(42);
+        assert!(left.is_left());
+        assert!(!left.is_right());
+        assert_eq!(left.left(), Some(42));
+
+        let right: Either<i32, &str> = Either::Right("hello");
+        assert!(!right.is_left());
+        assert!(right.is_right());
+        assert_eq!(right.right(), Some("hello"));
+    }
+}

@@ -1,0 +1,1232 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ TELEMETRY — Metrics Collection
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// OpenTelemetry-compatible metrics collection:
+// - Counter, UpDownCounter, Gauge, Histogram
+// - Synchronous and asynchronous instruments
+// - Aggregation and export
+// - Views and metric streams
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::telemetry::metrics
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use core::time::Duration;
+use std::sync::{Mutex, RwLock};
+use std::time::{SystemTime, Instant};
+
+use super::tracing::Resource;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSTRUMENT KINDS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Kind of metric instrument
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InstrumentKind {
+    /// Monotonically increasing counter
+    Counter,
+    /// Counter that can go up and down
+    UpDownCounter,
+    /// Point-in-time value
+    Gauge,
+    /// Distribution of values
+    Histogram,
+    /// Async counter (callback-based)
+    ObservableCounter,
+    /// Async up-down counter
+    ObservableUpDownCounter,
+    /// Async gauge
+    ObservableGauge,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ATTRIBUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Attribute value for metrics
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttributeValue {
+    String(String),
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+}
+
+impl From<&str> for AttributeValue {
+    fn from(s: &str) -> Self { AttributeValue::String(s.to_string()) }
+}
+impl From<String> for AttributeValue {
+    fn from(s: String) -> Self { AttributeValue::String(s) }
+}
+impl From<bool> for AttributeValue {
+    fn from(b: bool) -> Self { AttributeValue::Bool(b) }
+}
+impl From<i64> for AttributeValue {
+    fn from(i: i64) -> Self { AttributeValue::I64(i) }
+}
+impl From<f64> for AttributeValue {
+    fn from(f: f64) -> Self { AttributeValue::F64(f) }
+}
+
+/// Set of attributes
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct AttributeSet {
+    attrs: Vec<(String, String)>, // Simplified for hashing
+}
+
+impl AttributeSet {
+    pub fn new() -> Self {
+        AttributeSet { attrs: Vec::new() }
+    }
+    
+    pub fn with<K, V>(mut self, key: K, value: V) -> Self
+    where
+        K: Into<String>,
+        V: std::fmt::Display,
+    {
+        self.attrs.push((key.into(), value.to_string()));
+        self.attrs.sort_by(|a, b| a.0.cmp(&b.0));
+        self
+    }
+    
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COUNTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Monotonically increasing counter (u64)
+pub struct Counter {
+    inner: Arc<CounterInner>,
+}
+
+struct CounterInner {
+    name: String,
+    description: String,
+    unit: String,
+    values: RwLock<BTreeMap<AttributeSet, AtomicU64>>,
+}
+
+impl Counter {
+    /// Add a value
+    pub fn add(&self, value: u64) {
+        self.add_with_attributes(value, AttributeSet::new());
+    }
+    
+    /// Add a value with attributes
+    pub fn add_with_attributes(&self, value: u64, attrs: AttributeSet) {
+        let values = self.inner.values.read().unwrap();
+        if let Some(counter) = values.get(&attrs) {
+            counter.fetch_add(value, Ordering::Relaxed);
+            return;
+        }
+        drop(values);
+        
+        let mut values = self.inner.values.write().unwrap();
+        values.entry(attrs)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(value, Ordering::Relaxed);
+    }
+    
+    /// Increment by 1
+    pub fn increment(&self) {
+        self.add(1);
+    }
+    
+    /// Get current value
+    pub fn value(&self, attrs: &AttributeSet) -> u64 {
+        self.inner.values.read().unwrap()
+            .get(attrs)
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+    
+    /// Get all values
+    pub fn values(&self) -> Vec<(AttributeSet, u64)> {
+        self.inner.values.read().unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
+            .collect()
+    }
+}
+
+impl Clone for Counter {
+    fn clone(&self) -> Self {
+        Counter { inner: self.inner.clone() }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UP-DOWN COUNTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Counter that can increase or decrease (i64)
+pub struct UpDownCounter {
+    inner: Arc<UpDownCounterInner>,
+}
+
+struct UpDownCounterInner {
+    name: String,
+    description: String,
+    unit: String,
+    values: RwLock<BTreeMap<AttributeSet, AtomicI64>>,
+}
+
+impl UpDownCounter {
+    /// Add a value (can be negative)
+    pub fn add(&self, value: i64) {
+        self.add_with_attributes(value, AttributeSet::new());
+    }
+    
+    /// Add a value with attributes
+    pub fn add_with_attributes(&self, value: i64, attrs: AttributeSet) {
+        let values = self.inner.values.read().unwrap();
+        if let Some(counter) = values.get(&attrs) {
+            counter.fetch_add(value, Ordering::Relaxed);
+            return;
+        }
+        drop(values);
+        
+        let mut values = self.inner.values.write().unwrap();
+        values.entry(attrs)
+            .or_insert_with(|| AtomicI64::new(0))
+            .fetch_add(value, Ordering::Relaxed);
+    }
+    
+    /// Increment by 1
+    pub fn increment(&self) {
+        self.add(1);
+    }
+    
+    /// Decrement by 1
+    pub fn decrement(&self) {
+        self.add(-1);
+    }
+    
+    /// Get current value
+    pub fn value(&self, attrs: &AttributeSet) -> i64 {
+        self.inner.values.read().unwrap()
+            .get(attrs)
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+}
+
+impl Clone for UpDownCounter {
+    fn clone(&self) -> Self {
+        UpDownCounter { inner: self.inner.clone() }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GAUGE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Point-in-time value (f64)
+pub struct Gauge {
+    inner: Arc<GaugeInner>,
+}
+
+struct GaugeInner {
+    name: String,
+    description: String,
+    unit: String,
+    values: RwLock<BTreeMap<AttributeSet, Mutex<f64>>>,
+}
+
+impl Gauge {
+    /// Record a value
+    pub fn record(&self, value: f64) {
+        self.record_with_attributes(value, AttributeSet::new());
+    }
+    
+    /// Record a value with attributes
+    pub fn record_with_attributes(&self, value: f64, attrs: AttributeSet) {
+        let values = self.inner.values.read().unwrap();
+        if let Some(gauge) = values.get(&attrs) {
+            *gauge.lock().unwrap() = value;
+            return;
+        }
+        drop(values);
+        
+        let mut values = self.inner.values.write().unwrap();
+        *values.entry(attrs)
+            .or_insert_with(|| Mutex::new(0.0))
+            .lock()
+            .unwrap() = value;
+    }
+    
+    /// Get current value
+    pub fn value(&self, attrs: &AttributeSet) -> f64 {
+        self.inner.values.read().unwrap()
+            .get(attrs)
+            .map(|v| *v.lock().unwrap())
+            .unwrap_or(0.0)
+    }
+}
+
+impl Clone for Gauge {
+    fn clone(&self) -> Self {
+        Gauge { inner: self.inner.clone() }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HISTOGRAM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Distribution of values
+pub struct Histogram {
+    inner: Arc<HistogramInner>,
+}
+
+struct HistogramInner {
+    name: String,
+    description: String,
+    unit: String,
+    boundaries: Vec<f64>,
+    values: RwLock<BTreeMap<AttributeSet, Mutex<HistogramData>>>,
+}
+
+#[derive(Debug, Clone)]
+struct HistogramData {
+    /// Bucket counts
+    buckets: Vec<u64>,
+    /// Sum of all values
+    sum: f64,
+    /// Count of all values
+    count: u64,
+    /// Minimum value
+    min: f64,
+    /// Maximum value
+    max: f64,
+}
+
+impl HistogramData {
+    fn new(num_buckets: usize) -> Self {
+        HistogramData {
+            buckets: vec![0; num_buckets + 1], // +1 for overflow bucket
+            sum: 0.0,
+            count: 0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        }
+    }
+}
+
+impl Histogram {
+    /// Record a value
+    pub fn record(&self, value: f64) {
+        self.record_with_attributes(value, AttributeSet::new());
+    }
+    
+    /// Record a value with attributes
+    pub fn record_with_attributes(&self, value: f64, attrs: AttributeSet) {
+        let bucket_idx = self.find_bucket(value);
+        
+        let values = self.inner.values.read().unwrap();
+        if let Some(data) = values.get(&attrs) {
+            let mut data = data.lock().unwrap();
+            data.buckets[bucket_idx] += 1;
+            data.sum += value;
+            data.count += 1;
+            data.min = data.min.min(value);
+            data.max = data.max.max(value);
+            return;
+        }
+        drop(values);
+        
+        let mut values = self.inner.values.write().unwrap();
+        let data = values.entry(attrs)
+            .or_insert_with(|| Mutex::new(HistogramData::new(self.inner.boundaries.len())));
+        let mut data = data.lock().unwrap();
+        data.buckets[bucket_idx] += 1;
+        data.sum += value;
+        data.count += 1;
+        data.min = data.min.min(value);
+        data.max = data.max.max(value);
+    }
+    
+    /// Record a duration
+    pub fn record_duration(&self, duration: Duration) {
+        self.record(duration.as_secs_f64());
+    }
+    
+    fn find_bucket(&self, value: f64) -> usize {
+        for (i, &boundary) in self.inner.boundaries.iter().enumerate() {
+            if value <= boundary {
+                return i;
+            }
+        }
+        self.inner.boundaries.len()
+    }
+    
+    /// Get histogram data
+    pub fn data(&self, attrs: &AttributeSet) -> Option<HistogramSnapshot> {
+        self.inner.values.read().unwrap()
+            .get(attrs)
+            .map(|d| {
+                let data = d.lock().unwrap();
+                HistogramSnapshot {
+                    boundaries: self.inner.boundaries.clone(),
+                    buckets: data.buckets.clone(),
+                    sum: data.sum,
+                    count: data.count,
+                    min: data.min,
+                    max: data.max,
+                }
+            })
+    }
+}
+
+impl Clone for Histogram {
+    fn clone(&self) -> Self {
+        Histogram { inner: self.inner.clone() }
+    }
+}
+
+/// Histogram snapshot for export
+#[derive(Debug, Clone)]
+pub struct HistogramSnapshot {
+    pub boundaries: Vec<f64>,
+    pub buckets: Vec<u64>,
+    pub sum: f64,
+    pub count: u64,
+    pub min: f64,
+    pub max: f64,
+}
+
+impl HistogramSnapshot {
+    /// Get mean value
+    pub fn mean(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum / self.count as f64
+        }
+    }
+    
+    /// Estimate percentile
+    pub fn percentile(&self, p: f64) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        
+        let target = (self.count as f64 * p / 100.0).ceil() as u64;
+        let mut cumulative = 0u64;
+        
+        for (i, &count) in self.buckets.iter().enumerate() {
+            cumulative += count;
+            if cumulative >= target {
+                return if i == 0 {
+                    self.boundaries.first().copied().unwrap_or(0.0)
+                } else if i >= self.boundaries.len() {
+                    self.max
+                } else {
+                    self.boundaries[i]
+                };
+            }
+        }
+        
+        self.max
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OBSERVABLE INSTRUMENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Callback for observable instruments
+pub type ObservableCallback = Box<dyn Fn(&mut dyn ObservationRecorder) + Send + Sync>;
+
+/// Records observations during callback
+pub trait ObservationRecorder {
+    fn observe_u64(&mut self, value: u64, attrs: AttributeSet);
+    fn observe_i64(&mut self, value: i64, attrs: AttributeSet);
+    fn observe_f64(&mut self, value: f64, attrs: AttributeSet);
+}
+
+/// Observable counter (async)
+pub struct ObservableCounter {
+    inner: Arc<ObservableCounterInner>,
+}
+
+struct ObservableCounterInner {
+    name: String,
+    description: String,
+    unit: String,
+    callback: Mutex<Option<ObservableCallback>>,
+}
+
+impl ObservableCounter {
+    /// Register a callback
+    pub fn register_callback<F>(&self, callback: F)
+    where
+        F: Fn(&mut dyn ObservationRecorder) + Send + Sync + 'static,
+    {
+        *self.inner.callback.lock().unwrap() = Some(Box::new(callback));
+    }
+    
+    /// Collect observations
+    pub fn observe(&self) -> Vec<(AttributeSet, u64)> {
+        let mut recorder = U64Recorder::new();
+        if let Some(callback) = self.inner.callback.lock().unwrap().as_ref() {
+            callback(&mut recorder);
+        }
+        recorder.values
+    }
+}
+
+struct U64Recorder {
+    values: Vec<(AttributeSet, u64)>,
+}
+
+impl U64Recorder {
+    fn new() -> Self { U64Recorder { values: Vec::new() } }
+}
+
+impl ObservationRecorder for U64Recorder {
+    fn observe_u64(&mut self, value: u64, attrs: AttributeSet) {
+        self.values.push((attrs, value));
+    }
+    fn observe_i64(&mut self, _value: i64, _attrs: AttributeSet) {}
+    fn observe_f64(&mut self, _value: f64, _attrs: AttributeSet) {}
+}
+
+/// Observable gauge (async)
+pub struct ObservableGauge {
+    inner: Arc<ObservableGaugeInner>,
+}
+
+struct ObservableGaugeInner {
+    name: String,
+    description: String,
+    unit: String,
+    callback: Mutex<Option<ObservableCallback>>,
+}
+
+impl ObservableGauge {
+    /// Register a callback
+    pub fn register_callback<F>(&self, callback: F)
+    where
+        F: Fn(&mut dyn ObservationRecorder) + Send + Sync + 'static,
+    {
+        *self.inner.callback.lock().unwrap() = Some(Box::new(callback));
+    }
+    
+    /// Collect observations
+    pub fn observe(&self) -> Vec<(AttributeSet, f64)> {
+        let mut recorder = F64Recorder::new();
+        if let Some(callback) = self.inner.callback.lock().unwrap().as_ref() {
+            callback(&mut recorder);
+        }
+        recorder.values
+    }
+}
+
+struct F64Recorder {
+    values: Vec<(AttributeSet, f64)>,
+}
+
+impl F64Recorder {
+    fn new() -> Self { F64Recorder { values: Vec::new() } }
+}
+
+impl ObservationRecorder for F64Recorder {
+    fn observe_u64(&mut self, value: u64, attrs: AttributeSet) {
+        self.values.push((attrs, value as f64));
+    }
+    fn observe_i64(&mut self, value: i64, attrs: AttributeSet) {
+        self.values.push((attrs, value as f64));
+    }
+    fn observe_f64(&mut self, value: f64, attrs: AttributeSet) {
+        self.values.push((attrs, value));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// METER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Meter for creating instruments
+#[derive(Clone)]
+pub struct Meter {
+    inner: Arc<MeterInner>,
+}
+
+struct MeterInner {
+    name: String,
+    version: String,
+    counters: RwLock<Vec<Counter>>,
+    up_down_counters: RwLock<Vec<UpDownCounter>>,
+    gauges: RwLock<Vec<Gauge>>,
+    histograms: RwLock<Vec<Histogram>>,
+    observable_counters: RwLock<Vec<ObservableCounter>>,
+    observable_gauges: RwLock<Vec<ObservableGauge>>,
+}
+
+impl Meter {
+    /// Create a counter
+    pub fn create_counter(&self, name: impl Into<String>) -> CounterBuilder {
+        CounterBuilder {
+            name: name.into(),
+            description: String::new(),
+            unit: String::new(),
+            meter: self.clone(),
+        }
+    }
+    
+    /// Create an up-down counter
+    pub fn create_up_down_counter(&self, name: impl Into<String>) -> UpDownCounterBuilder {
+        UpDownCounterBuilder {
+            name: name.into(),
+            description: String::new(),
+            unit: String::new(),
+            meter: self.clone(),
+        }
+    }
+    
+    /// Create a gauge
+    pub fn create_gauge(&self, name: impl Into<String>) -> GaugeBuilder {
+        GaugeBuilder {
+            name: name.into(),
+            description: String::new(),
+            unit: String::new(),
+            meter: self.clone(),
+        }
+    }
+    
+    /// Create a histogram
+    pub fn create_histogram(&self, name: impl Into<String>) -> HistogramBuilder {
+        HistogramBuilder {
+            name: name.into(),
+            description: String::new(),
+            unit: String::new(),
+            boundaries: default_histogram_boundaries(),
+            meter: self.clone(),
+        }
+    }
+    
+    /// Create an observable counter
+    pub fn create_observable_counter(&self, name: impl Into<String>) -> ObservableCounterBuilder {
+        ObservableCounterBuilder {
+            name: name.into(),
+            description: String::new(),
+            unit: String::new(),
+            meter: self.clone(),
+        }
+    }
+    
+    /// Create an observable gauge
+    pub fn create_observable_gauge(&self, name: impl Into<String>) -> ObservableGaugeBuilder {
+        ObservableGaugeBuilder {
+            name: name.into(),
+            description: String::new(),
+            unit: String::new(),
+            meter: self.clone(),
+        }
+    }
+    
+    /// Get meter name
+    pub fn name(&self) -> &str {
+        &self.inner.name
+    }
+}
+
+// Default histogram boundaries (exponential)
+fn default_histogram_boundaries() -> Vec<f64> {
+    vec![
+        0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5,
+        0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+    ]
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSTRUMENT BUILDERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Counter builder
+pub struct CounterBuilder {
+    name: String,
+    description: String,
+    unit: String,
+    meter: Meter,
+}
+
+impl CounterBuilder {
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+        self.description = desc.into();
+        self
+    }
+    
+    pub fn with_unit(mut self, unit: impl Into<String>) -> Self {
+        self.unit = unit.into();
+        self
+    }
+    
+    pub fn build(self) -> Counter {
+        let counter = Counter {
+            inner: Arc::new(CounterInner {
+                name: self.name,
+                description: self.description,
+                unit: self.unit,
+                values: RwLock::new(BTreeMap::new()),
+            }),
+        };
+        self.meter.inner.counters.write().unwrap().push(counter.clone());
+        counter
+    }
+}
+
+/// UpDownCounter builder
+pub struct UpDownCounterBuilder {
+    name: String,
+    description: String,
+    unit: String,
+    meter: Meter,
+}
+
+impl UpDownCounterBuilder {
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+        self.description = desc.into();
+        self
+    }
+    
+    pub fn with_unit(mut self, unit: impl Into<String>) -> Self {
+        self.unit = unit.into();
+        self
+    }
+    
+    pub fn build(self) -> UpDownCounter {
+        let counter = UpDownCounter {
+            inner: Arc::new(UpDownCounterInner {
+                name: self.name,
+                description: self.description,
+                unit: self.unit,
+                values: RwLock::new(BTreeMap::new()),
+            }),
+        };
+        self.meter.inner.up_down_counters.write().unwrap().push(counter.clone());
+        counter
+    }
+}
+
+/// Gauge builder
+pub struct GaugeBuilder {
+    name: String,
+    description: String,
+    unit: String,
+    meter: Meter,
+}
+
+impl GaugeBuilder {
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+        self.description = desc.into();
+        self
+    }
+    
+    pub fn with_unit(mut self, unit: impl Into<String>) -> Self {
+        self.unit = unit.into();
+        self
+    }
+    
+    pub fn build(self) -> Gauge {
+        let gauge = Gauge {
+            inner: Arc::new(GaugeInner {
+                name: self.name,
+                description: self.description,
+                unit: self.unit,
+                values: RwLock::new(BTreeMap::new()),
+            }),
+        };
+        self.meter.inner.gauges.write().unwrap().push(gauge.clone());
+        gauge
+    }
+}
+
+/// Histogram builder
+pub struct HistogramBuilder {
+    name: String,
+    description: String,
+    unit: String,
+    boundaries: Vec<f64>,
+    meter: Meter,
+}
+
+impl HistogramBuilder {
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+        self.description = desc.into();
+        self
+    }
+    
+    pub fn with_unit(mut self, unit: impl Into<String>) -> Self {
+        self.unit = unit.into();
+        self
+    }
+    
+    pub fn with_boundaries(mut self, boundaries: Vec<f64>) -> Self {
+        self.boundaries = boundaries;
+        self
+    }
+    
+    pub fn build(self) -> Histogram {
+        let histogram = Histogram {
+            inner: Arc::new(HistogramInner {
+                name: self.name,
+                description: self.description,
+                unit: self.unit,
+                boundaries: self.boundaries,
+                values: RwLock::new(BTreeMap::new()),
+            }),
+        };
+        self.meter.inner.histograms.write().unwrap().push(histogram.clone());
+        histogram
+    }
+}
+
+/// ObservableCounter builder
+pub struct ObservableCounterBuilder {
+    name: String,
+    description: String,
+    unit: String,
+    meter: Meter,
+}
+
+impl ObservableCounterBuilder {
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+        self.description = desc.into();
+        self
+    }
+    
+    pub fn with_unit(mut self, unit: impl Into<String>) -> Self {
+        self.unit = unit.into();
+        self
+    }
+    
+    pub fn build(self) -> ObservableCounter {
+        let counter = ObservableCounter {
+            inner: Arc::new(ObservableCounterInner {
+                name: self.name,
+                description: self.description,
+                unit: self.unit,
+                callback: Mutex::new(None),
+            }),
+        };
+        counter
+    }
+}
+
+/// ObservableGauge builder
+pub struct ObservableGaugeBuilder {
+    name: String,
+    description: String,
+    unit: String,
+    meter: Meter,
+}
+
+impl ObservableGaugeBuilder {
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+        self.description = desc.into();
+        self
+    }
+    
+    pub fn with_unit(mut self, unit: impl Into<String>) -> Self {
+        self.unit = unit.into();
+        self
+    }
+    
+    pub fn build(self) -> ObservableGauge {
+        let gauge = ObservableGauge {
+            inner: Arc::new(ObservableGaugeInner {
+                name: self.name,
+                description: self.description,
+                unit: self.unit,
+                callback: Mutex::new(None),
+            }),
+        };
+        gauge
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// METER PROVIDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Provider for creating meters
+pub struct MeterProvider {
+    inner: Arc<MeterProviderInner>,
+}
+
+struct MeterProviderInner {
+    resource: Resource,
+    readers: RwLock<Vec<Box<dyn MetricReader>>>,
+    shutdown: std::sync::atomic::AtomicBool,
+}
+
+impl MeterProvider {
+    /// Create a new builder
+    pub fn builder() -> MeterProviderBuilder {
+        MeterProviderBuilder::default()
+    }
+    
+    /// Get a meter
+    pub fn meter(&self, name: impl Into<String>) -> Meter {
+        self.meter_with_version(name, "")
+    }
+    
+    /// Get a meter with version
+    pub fn meter_with_version(&self, name: impl Into<String>, version: impl Into<String>) -> Meter {
+        Meter {
+            inner: Arc::new(MeterInner {
+                name: name.into(),
+                version: version.into(),
+                counters: RwLock::new(Vec::new()),
+                up_down_counters: RwLock::new(Vec::new()),
+                gauges: RwLock::new(Vec::new()),
+                histograms: RwLock::new(Vec::new()),
+                observable_counters: RwLock::new(Vec::new()),
+                observable_gauges: RwLock::new(Vec::new()),
+            }),
+        }
+    }
+    
+    /// Shutdown the provider
+    pub fn shutdown(&self) {
+        if !self.inner.shutdown.swap(true, Ordering::AcqRel) {
+            for reader in self.inner.readers.read().unwrap().iter() {
+                reader.shutdown();
+            }
+        }
+    }
+    
+    /// Force flush
+    pub fn force_flush(&self) {
+        for reader in self.inner.readers.read().unwrap().iter() {
+            reader.force_flush();
+        }
+    }
+}
+
+impl Drop for MeterProvider {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Builder for meter provider
+#[derive(Default)]
+pub struct MeterProviderBuilder {
+    resource: Option<Resource>,
+    readers: Vec<Box<dyn MetricReader>>,
+}
+
+impl MeterProviderBuilder {
+    pub fn with_resource(mut self, resource: Resource) -> Self {
+        self.resource = Some(resource);
+        self
+    }
+    
+    pub fn with_reader<R: MetricReader + 'static>(mut self, reader: R) -> Self {
+        self.readers.push(Box::new(reader));
+        self
+    }
+    
+    pub fn build(self) -> MeterProvider {
+        MeterProvider {
+            inner: Arc::new(MeterProviderInner {
+                resource: self.resource.unwrap_or_default(),
+                readers: RwLock::new(self.readers),
+                shutdown: std::sync::atomic::AtomicBool::new(false),
+            }),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// METRIC READER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Metric reader trait
+pub trait MetricReader: Send + Sync {
+    fn collect(&self) -> Vec<MetricData>;
+    fn shutdown(&self);
+    fn force_flush(&self);
+}
+
+/// Periodic exporting reader
+pub struct PeriodicReader {
+    exporter: Arc<dyn MetricExporter>,
+    interval: Duration,
+    shutdown: std::sync::atomic::AtomicBool,
+}
+
+impl PeriodicReader {
+    pub fn new<E: MetricExporter + 'static>(exporter: E, interval: Duration) -> Self {
+        PeriodicReader {
+            exporter: Arc::new(exporter),
+            interval,
+            shutdown: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl MetricReader for PeriodicReader {
+    fn collect(&self) -> Vec<MetricData> {
+        Vec::new()
+    }
+    
+    fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.exporter.shutdown();
+    }
+    
+    fn force_flush(&self) {
+        self.exporter.force_flush();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// METRIC EXPORTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Metric exporter trait
+pub trait MetricExporter: Send + Sync {
+    fn export(&self, metrics: Vec<MetricData>) -> Result<(), ExportError>;
+    fn shutdown(&self);
+    fn force_flush(&self);
+}
+
+/// Export error
+#[derive(Debug)]
+pub enum ExportError {
+    Shutdown,
+    Transport(String),
+    Encoding(String),
+}
+
+/// Collected metric data
+#[derive(Debug, Clone)]
+pub struct MetricData {
+    pub name: String,
+    pub description: String,
+    pub unit: String,
+    pub kind: InstrumentKind,
+    pub temporality: Temporality,
+    pub points: Vec<DataPoint>,
+}
+
+/// Data point
+#[derive(Debug, Clone)]
+pub struct DataPoint {
+    pub attributes: AttributeSet,
+    pub timestamp: SystemTime,
+    pub value: DataPointValue,
+}
+
+/// Data point value
+#[derive(Debug, Clone)]
+pub enum DataPointValue {
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    Histogram(HistogramSnapshot),
+}
+
+/// Aggregation temporality
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Temporality {
+    /// Delta since last collection
+    Delta,
+    /// Cumulative since start
+    Cumulative,
+}
+
+/// Console exporter
+pub struct ConsoleExporter;
+
+impl MetricExporter for ConsoleExporter {
+    fn export(&self, metrics: Vec<MetricData>) -> Result<(), ExportError> {
+        for metric in metrics {
+            println!(
+                "[METRIC] {} ({:?}) - {} points",
+                metric.name,
+                metric.kind,
+                metric.points.len()
+            );
+            for point in &metric.points {
+                println!("  {:?}: {:?}", point.attributes, point.value);
+            }
+        }
+        Ok(())
+    }
+    
+    fn shutdown(&self) {}
+    fn force_flush(&self) {}
+}
+
+/// In-memory exporter
+pub struct InMemoryExporter {
+    metrics: Mutex<Vec<MetricData>>,
+}
+
+impl InMemoryExporter {
+    pub fn new() -> Self {
+        InMemoryExporter { metrics: Mutex::new(Vec::new()) }
+    }
+    
+    pub fn metrics(&self) -> Vec<MetricData> {
+        self.metrics.lock().unwrap().clone()
+    }
+    
+    pub fn clear(&self) {
+        self.metrics.lock().unwrap().clear();
+    }
+}
+
+impl MetricExporter for InMemoryExporter {
+    fn export(&self, metrics: Vec<MetricData>) -> Result<(), ExportError> {
+        self.metrics.lock().unwrap().extend(metrics);
+        Ok(())
+    }
+    
+    fn shutdown(&self) {}
+    fn force_flush(&self) {}
+}
+
+impl Default for InMemoryExporter {
+    fn default() -> Self { Self::new() }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VIEWS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// View for customizing metric collection
+#[derive(Debug, Clone)]
+pub struct View {
+    /// Instrument name pattern
+    pub instrument_name: Option<String>,
+    /// Instrument kind filter
+    pub instrument_kind: Option<InstrumentKind>,
+    /// Override name
+    pub name: Option<String>,
+    /// Override description
+    pub description: Option<String>,
+    /// Attribute keys to keep
+    pub attribute_keys: Option<Vec<String>>,
+    /// Custom aggregation
+    pub aggregation: Option<AggregationType>,
+}
+
+/// Aggregation type
+#[derive(Debug, Clone)]
+pub enum AggregationType {
+    Sum,
+    LastValue,
+    ExplicitBucketHistogram(Vec<f64>),
+    ExponentialHistogram,
+    Drop,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_counter() {
+        let provider = MeterProvider::builder().build();
+        let meter = provider.meter("test");
+        
+        let counter = meter.create_counter("requests_total")
+            .with_description("Total requests")
+            .build();
+        
+        counter.add(5);
+        counter.increment();
+        
+        assert_eq!(counter.value(&AttributeSet::new()), 6);
+    }
+    
+    #[test]
+    fn test_counter_with_attributes() {
+        let provider = MeterProvider::builder().build();
+        let meter = provider.meter("test");
+        let counter = meter.create_counter("requests").build();
+        
+        let attrs1 = AttributeSet::new().with("method", "GET");
+        let attrs2 = AttributeSet::new().with("method", "POST");
+        
+        counter.add_with_attributes(10, attrs1.clone());
+        counter.add_with_attributes(5, attrs2.clone());
+        counter.add_with_attributes(3, attrs1.clone());
+        
+        assert_eq!(counter.value(&attrs1), 13);
+        assert_eq!(counter.value(&attrs2), 5);
+    }
+    
+    #[test]
+    fn test_histogram() {
+        let provider = MeterProvider::builder().build();
+        let meter = provider.meter("test");
+        
+        let histogram = meter.create_histogram("latency")
+            .with_unit("ms")
+            .build();
+        
+        histogram.record(0.5);
+        histogram.record(1.2);
+        histogram.record(2.5);
+        histogram.record(10.0);
+        
+        let data = histogram.data(&AttributeSet::new()).unwrap();
+        assert_eq!(data.count, 4);
+        assert!((data.sum - 14.2).abs() < 0.001);
+    }
+    
+    #[test]
+    fn test_up_down_counter() {
+        let provider = MeterProvider::builder().build();
+        let meter = provider.meter("test");
+        
+        let counter = meter.create_up_down_counter("queue_size").build();
+        
+        counter.add(10);
+        counter.add(-3);
+        counter.increment();
+        counter.decrement();
+        
+        assert_eq!(counter.value(&AttributeSet::new()), 7);
+    }
+    
+    #[test]
+    fn test_gauge() {
+        let provider = MeterProvider::builder().build();
+        let meter = provider.meter("test");
+        
+        let gauge = meter.create_gauge("temperature").build();
+        
+        gauge.record(25.5);
+        assert!((gauge.value(&AttributeSet::new()) - 25.5).abs() < 0.001);
+        
+        gauge.record(30.0);
+        assert!((gauge.value(&AttributeSet::new()) - 30.0).abs() < 0.001);
+    }
+}

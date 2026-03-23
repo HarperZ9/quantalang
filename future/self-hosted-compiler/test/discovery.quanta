@@ -1,0 +1,687 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ TEST RUNNER — Discovery
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Test discovery: finds tests in source files by parsing #[test] attributes.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::test::discovery
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::fs;
+use core::time::Duration;
+use crate::test::config::{
+    TestDescriptor, TestSuite, TestKind, TestAttribute, ShouldPanic,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEST DISCOVERY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Discovers tests in a project
+pub struct TestDiscovery {
+    /// Root directory
+    root: PathBuf,
+    
+    /// Discovered test suites
+    suites: Vec<TestSuite>,
+    
+    /// Source file cache
+    source_cache: BTreeMap<PathBuf, String>,
+    
+    /// Discovery options
+    options: DiscoveryOptions,
+}
+
+/// Discovery options
+#[derive(Debug, Clone)]
+pub struct DiscoveryOptions {
+    /// Include doc tests
+    pub include_doc_tests: bool,
+    
+    /// Include integration tests
+    pub include_integration: bool,
+    
+    /// Include examples
+    pub include_examples: bool,
+    
+    /// Include benchmarks
+    pub include_benches: bool,
+    
+    /// Recurse into subdirectories
+    pub recurse: bool,
+    
+    /// File patterns to include
+    pub include_patterns: Vec<String>,
+    
+    /// File patterns to exclude
+    pub exclude_patterns: Vec<String>,
+}
+
+impl Default for DiscoveryOptions {
+    fn default() -> Self {
+        DiscoveryOptions {
+            include_doc_tests: true,
+            include_integration: true,
+            include_examples: false,
+            include_benches: false,
+            recurse: true,
+            include_patterns: vec!["*.quanta".to_string()],
+            exclude_patterns: vec!["target/*".to_string()],
+        }
+    }
+}
+
+impl TestDiscovery {
+    /// Create discovery for project root
+    pub fn new(root: &Path) -> Self {
+        TestDiscovery {
+            root: root.to_path_buf(),
+            suites: Vec::new(),
+            source_cache: BTreeMap::new(),
+            options: DiscoveryOptions::default(),
+        }
+    }
+    
+    /// Set discovery options
+    pub fn with_options(mut self, options: DiscoveryOptions) -> Self {
+        self.options = options;
+        self
+    }
+    
+    /// Discover all tests
+    pub fn discover(&mut self) -> Result<&[TestSuite], DiscoveryError> {
+        self.suites.clear();
+        
+        // Discover unit tests in src/
+        let src_dir = self.root.join("src");
+        if src_dir.exists() {
+            self.discover_in_directory(&src_dir, TestKind::Unit)?;
+        }
+        
+        // Discover integration tests in tests/
+        if self.options.include_integration {
+            let tests_dir = self.root.join("tests");
+            if tests_dir.exists() {
+                self.discover_in_directory(&tests_dir, TestKind::Integration)?;
+            }
+        }
+        
+        // Discover benchmarks in benches/
+        if self.options.include_benches {
+            let benches_dir = self.root.join("benches");
+            if benches_dir.exists() {
+                self.discover_in_directory(&benches_dir, TestKind::Bench)?;
+            }
+        }
+        
+        // Discover examples
+        if self.options.include_examples {
+            let examples_dir = self.root.join("examples");
+            if examples_dir.exists() {
+                self.discover_in_directory(&examples_dir, TestKind::Example)?;
+            }
+        }
+        
+        Ok(&self.suites)
+    }
+    
+    /// Discover tests in a directory
+    fn discover_in_directory(&mut self, dir: &Path, kind: TestKind) -> Result<(), DiscoveryError> {
+        let entries = fs::read_dir(dir)
+            .map_err(|e| DiscoveryError::Io(e.to_string()))?;
+        
+        for entry in entries {
+            let entry = entry.map_err(|e| DiscoveryError::Io(e.to_string()))?;
+            let path = entry.path();
+            
+            // Skip excluded patterns
+            if self.should_exclude(&path) {
+                continue;
+            }
+            
+            if path.is_file() && self.is_test_file(&path) {
+                self.discover_in_file(&path, kind)?;
+            } else if path.is_dir() && self.options.recurse {
+                self.discover_in_directory(&path, kind)?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Discover tests in a single file
+    fn discover_in_file(&mut self, path: &Path, kind: TestKind) -> Result<(), DiscoveryError> {
+        let source = self.read_source(path)?;
+        let module_name = self.path_to_module(path);
+        
+        let mut suite = TestSuite::new(&module_name);
+        
+        // Parse test functions
+        let tests = parse_tests(&source, &module_name, path, kind);
+        for test in tests {
+            suite.add_test(test);
+        }
+        
+        // Parse doc tests if enabled
+        if self.options.include_doc_tests {
+            let doc_tests = parse_doc_tests(&source, &module_name, path);
+            for test in doc_tests {
+                suite.add_test(test);
+            }
+        }
+        
+        if !suite.tests.is_empty() {
+            self.suites.push(suite);
+        }
+        
+        Ok(())
+    }
+    
+    /// Read source file (with caching)
+    fn read_source(&mut self, path: &Path) -> Result<String, DiscoveryError> {
+        if let Some(source) = self.source_cache.get(path) {
+            return Ok(source.clone());
+        }
+        
+        let source = fs::read_to_string(path)
+            .map_err(|e| DiscoveryError::Io(e.to_string()))?;
+        
+        self.source_cache.insert(path.to_path_buf(), source.clone());
+        Ok(source)
+    }
+    
+    /// Convert file path to module name
+    fn path_to_module(&self, path: &Path) -> String {
+        let relative = path.strip_prefix(&self.root)
+            .unwrap_or(path);
+        
+        let mut module = String::new();
+        
+        for component in relative.components() {
+            if let std::path::Component::Normal(s) = component {
+                if let Some(name) = s.to_str() {
+                    if !module.is_empty() {
+                        module.push_str("::");
+                    }
+                    // Remove .quanta extension and src/ prefix
+                    let name = name.trim_end_matches(".quanta");
+                    if name != "src" && name != "lib" && name != "main" && name != "mod" {
+                        module.push_str(name);
+                    }
+                }
+            }
+        }
+        
+        if module.is_empty() {
+            module = "crate".to_string();
+        }
+        
+        module
+    }
+    
+    /// Check if path matches exclude patterns
+    fn should_exclude(&self, path: &Path) -> bool {
+        let path_str = path.to_string_lossy();
+        
+        for pattern in &self.options.exclude_patterns {
+            if glob_match(pattern, &path_str) {
+                return true;
+            }
+        }
+        
+        // Always exclude hidden files and target/
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with('.') || name == "target" {
+                return true;
+            }
+        }
+        
+        false
+    }
+    
+    /// Check if file is a test file
+    fn is_test_file(&self, path: &Path) -> bool {
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        
+        // Check include patterns
+        for pattern in &self.options.include_patterns {
+            if glob_match(pattern, name) {
+                return true;
+            }
+        }
+        
+        // Default: .quanta files
+        name.ends_with(".quanta")
+    }
+    
+    /// Get all discovered tests
+    pub fn all_tests(&self) -> Vec<&TestDescriptor> {
+        self.suites.iter()
+            .flat_map(|s| &s.tests)
+            .collect()
+    }
+    
+    /// Get test count
+    pub fn test_count(&self) -> usize {
+        self.suites.iter()
+            .map(|s| s.test_count())
+            .sum()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEST PARSER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parse test functions from source
+fn parse_tests(source: &str, module: &str, path: &Path, kind: TestKind) -> Vec<TestDescriptor> {
+    let mut tests = Vec::new();
+    let mut current_attrs: Vec<TestAttribute> = Vec::new();
+    let mut in_test_block = false;
+    let mut line_num = 0;
+    
+    for line in source.lines() {
+        line_num += 1;
+        let trimmed = line.trim();
+        
+        // Parse attributes
+        if trimmed.starts_with("#[") {
+            if let Some(attr) = parse_attribute(trimmed) {
+                current_attrs.push(attr);
+            }
+            continue;
+        }
+        
+        // Check for #[cfg(test)] module
+        if trimmed.starts_with("mod tests") || trimmed.contains("#[cfg(test)]") {
+            in_test_block = true;
+        }
+        
+        // Parse function declaration
+        if (trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ") ||
+            trimmed.starts_with("async fn ") || trimmed.starts_with("pub async fn ")) &&
+           has_test_attribute(&current_attrs) {
+            
+            if let Some(fn_name) = extract_function_name(trimmed) {
+                let mut test = TestDescriptor::new(
+                    &format!("{}::{}", module, fn_name),
+                    module,
+                    &fn_name,
+                );
+                
+                test.file = path.to_string_lossy().to_string();
+                test.line = line_num;
+                test.kind = kind;
+                test.is_async = trimmed.contains("async fn");
+                
+                // Apply attributes
+                for attr in &current_attrs {
+                    match attr {
+                        TestAttribute::Ignore(reason) => {
+                            test.ignored = true;
+                            test.ignore_reason = reason.clone();
+                        }
+                        TestAttribute::ShouldPanic(expected) => {
+                            test.should_panic = Some(ShouldPanic {
+                                expected: expected.clone(),
+                            });
+                        }
+                        TestAttribute::Timeout(dur) => {
+                            test.timeout = Some(*dur);
+                        }
+                        _ => {}
+                    }
+                    test.attributes.push(attr.clone());
+                }
+                
+                tests.push(test);
+            }
+        }
+        
+        // Clear attributes if not consumed
+        if !trimmed.starts_with("#[") && !trimmed.is_empty() {
+            current_attrs.clear();
+        }
+    }
+    
+    tests
+}
+
+/// Parse doc tests from source
+fn parse_doc_tests(source: &str, module: &str, path: &Path) -> Vec<TestDescriptor> {
+    let mut tests = Vec::new();
+    let mut in_doc_comment = false;
+    let mut in_code_block = false;
+    let mut code_block_start = 0;
+    let mut code_block_content = String::new();
+    let mut doc_test_count = 0;
+    let mut line_num = 0;
+    
+    for line in source.lines() {
+        line_num += 1;
+        let trimmed = line.trim();
+        
+        // Track doc comments
+        if trimmed.starts_with("///") || trimmed.starts_with("//!") {
+            in_doc_comment = true;
+            let content = trimmed.trim_start_matches('/').trim_start_matches('!').trim();
+            
+            // Check for code block start
+            if content.starts_with("```") && !in_code_block {
+                // Check if it's a testable code block
+                let lang = content.trim_start_matches('`').trim();
+                if lang.is_empty() || lang == "quanta" || lang == "rust" ||
+                   !lang.starts_with("ignore") && !lang.starts_with("no_run") {
+                    in_code_block = true;
+                    code_block_start = line_num;
+                    code_block_content.clear();
+                }
+            } else if content.starts_with("```") && in_code_block {
+                // Code block end - create doc test
+                if !code_block_content.trim().is_empty() {
+                    doc_test_count += 1;
+                    let test_name = format!("{}::doc_test_{}", module, doc_test_count);
+                    
+                    let mut test = TestDescriptor::new(&test_name, module, &format!("doc_test_{}", doc_test_count));
+                    test.file = path.to_string_lossy().to_string();
+                    test.line = code_block_start;
+                    test.kind = TestKind::Doc;
+                    
+                    tests.push(test);
+                }
+                in_code_block = false;
+            } else if in_code_block {
+                code_block_content.push_str(content);
+                code_block_content.push('\n');
+            }
+        } else {
+            in_doc_comment = false;
+            in_code_block = false;
+        }
+    }
+    
+    tests
+}
+
+/// Parse a single attribute
+fn parse_attribute(line: &str) -> Option<TestAttribute> {
+    let line = line.trim();
+    
+    if !line.starts_with("#[") || !line.ends_with(']') {
+        return None;
+    }
+    
+    let content = &line[2..line.len()-1];
+    
+    // #[test]
+    if content == "test" {
+        return Some(TestAttribute::Custom("test".to_string(), None));
+    }
+    
+    // #[bench]
+    if content == "bench" {
+        return Some(TestAttribute::Custom("bench".to_string(), None));
+    }
+    
+    // #[ignore] or #[ignore = "reason"]
+    if content == "ignore" {
+        return Some(TestAttribute::Ignore(None));
+    }
+    if content.starts_with("ignore") {
+        let reason = extract_attr_value(content, "ignore");
+        return Some(TestAttribute::Ignore(reason));
+    }
+    
+    // #[should_panic] or #[should_panic(expected = "...")]
+    if content == "should_panic" {
+        return Some(TestAttribute::ShouldPanic(None));
+    }
+    if content.starts_with("should_panic") {
+        let expected = extract_attr_value(content, "expected");
+        return Some(TestAttribute::ShouldPanic(expected));
+    }
+    
+    // #[timeout(duration)]
+    if content.starts_with("timeout") {
+        if let Some(value) = extract_attr_value(content, "timeout") {
+            if let Some(dur) = parse_duration(&value) {
+                return Some(TestAttribute::Timeout(dur));
+            }
+        }
+    }
+    
+    // #[serial]
+    if content == "serial" {
+        return Some(TestAttribute::Serial);
+    }
+    
+    // #[parallel]
+    if content == "parallel" {
+        return Some(TestAttribute::Parallel);
+    }
+    
+    None
+}
+
+/// Check if attributes include #[test] or #[bench]
+fn has_test_attribute(attrs: &[TestAttribute]) -> bool {
+    attrs.iter().any(|a| {
+        matches!(a, TestAttribute::Custom(name, _) if name == "test" || name == "bench")
+    })
+}
+
+/// Extract function name from declaration
+fn extract_function_name(line: &str) -> Option<String> {
+    // Find "fn " and extract name before "("
+    let fn_idx = line.find("fn ")?;
+    let after_fn = &line[fn_idx + 3..];
+    let paren_idx = after_fn.find('(')?;
+    let name = after_fn[..paren_idx].trim();
+    
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Extract attribute value
+fn extract_attr_value(content: &str, key: &str) -> Option<String> {
+    // Handle #[attr = "value"]
+    if let Some(eq_idx) = content.find('=') {
+        let value = content[eq_idx + 1..].trim();
+        let value = value.trim_matches('"');
+        return Some(value.to_string());
+    }
+    
+    // Handle #[attr(key = "value")]
+    if let Some(paren_start) = content.find('(') {
+        let inner = &content[paren_start + 1..content.len() - 1];
+        
+        // Look for key = "value"
+        for part in inner.split(',') {
+            let part = part.trim();
+            if let Some(eq_idx) = part.find('=') {
+                let k = part[..eq_idx].trim();
+                if k == key {
+                    let v = part[eq_idx + 1..].trim().trim_matches('"');
+                    return Some(v.to_string());
+                }
+            }
+        }
+        
+        // No key, just value
+        let value = inner.trim().trim_matches('"');
+        return Some(value.to_string());
+    }
+    
+    None
+}
+
+/// Parse duration string (e.g., "5s", "100ms")
+fn parse_duration(s: &str) -> Option<Duration> {
+    let s = s.trim();
+    
+    if s.ends_with("ms") {
+        let num: u64 = s[..s.len()-2].parse().ok()?;
+        return Some(Duration::from_millis(num));
+    }
+    
+    if s.ends_with("s") {
+        let num: u64 = s[..s.len()-1].parse().ok()?;
+        return Some(Duration::from_secs(num));
+    }
+    
+    if s.ends_with("m") {
+        let num: u64 = s[..s.len()-1].parse().ok()?;
+        return Some(Duration::from_secs(num * 60));
+    }
+    
+    // Plain number = seconds
+    let num: u64 = s.parse().ok()?;
+    Some(Duration::from_secs(num))
+}
+
+/// Simple glob matching
+fn glob_match(pattern: &str, text: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    
+    if pattern.starts_with("*.") {
+        let ext = &pattern[1..];
+        return text.ends_with(ext);
+    }
+    
+    if pattern.ends_with("/*") {
+        let prefix = &pattern[..pattern.len()-2];
+        return text.starts_with(prefix);
+    }
+    
+    pattern == text
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum DiscoveryError {
+    Io(String),
+    Parse(String),
+}
+
+impl std::fmt::Display for DiscoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiscoveryError::Io(msg) => write!(f, "I/O error: {}", msg),
+            DiscoveryError::Parse(msg) => write!(f, "parse error: {}", msg),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_parse_attribute_test() {
+        let attr = parse_attribute("#[test]");
+        assert!(matches!(attr, Some(TestAttribute::Custom(name, _)) if name == "test"));
+    }
+    
+    #[test]
+    fn test_parse_attribute_ignore() {
+        let attr = parse_attribute("#[ignore]");
+        assert!(matches!(attr, Some(TestAttribute::Ignore(None))));
+        
+        let attr = parse_attribute("#[ignore = \"not ready\"]");
+        assert!(matches!(attr, Some(TestAttribute::Ignore(Some(r))) if r == "not ready"));
+    }
+    
+    #[test]
+    fn test_parse_attribute_should_panic() {
+        let attr = parse_attribute("#[should_panic]");
+        assert!(matches!(attr, Some(TestAttribute::ShouldPanic(None))));
+        
+        let attr = parse_attribute("#[should_panic(expected = \"oops\")]");
+        assert!(matches!(attr, Some(TestAttribute::ShouldPanic(Some(e))) if e == "oops"));
+    }
+    
+    #[test]
+    fn test_parse_attribute_timeout() {
+        let attr = parse_attribute("#[timeout(5s)]");
+        assert!(matches!(attr, Some(TestAttribute::Timeout(d)) if d == Duration::from_secs(5)));
+        
+        let attr = parse_attribute("#[timeout(100ms)]");
+        assert!(matches!(attr, Some(TestAttribute::Timeout(d)) if d == Duration::from_millis(100)));
+    }
+    
+    #[test]
+    fn test_extract_function_name() {
+        assert_eq!(extract_function_name("fn test_foo()"), Some("test_foo".to_string()));
+        assert_eq!(extract_function_name("pub fn test_bar()"), Some("test_bar".to_string()));
+        assert_eq!(extract_function_name("async fn test_async()"), Some("test_async".to_string()));
+    }
+    
+    #[test]
+    fn test_parse_duration() {
+        assert_eq!(parse_duration("5s"), Some(Duration::from_secs(5)));
+        assert_eq!(parse_duration("100ms"), Some(Duration::from_millis(100)));
+        assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_duration("30"), Some(Duration::from_secs(30)));
+    }
+    
+    #[test]
+    fn test_glob_match() {
+        assert!(glob_match("*.quanta", "test.quanta"));
+        assert!(!glob_match("*.quanta", "test.rs"));
+        assert!(glob_match("target/*", "target/debug"));
+        assert!(glob_match("*", "anything"));
+    }
+    
+    #[test]
+    fn test_parse_tests() {
+        let source = r#"
+#[test]
+fn test_simple() {
+    assert!(true);
+}
+
+#[test]
+#[ignore = "not ready"]
+fn test_ignored() {
+    todo!()
+}
+
+#[test]
+#[should_panic(expected = "boom")]
+fn test_panic() {
+    panic!("boom");
+}
+"#;
+        
+        let tests = parse_tests(source, "crate::tests", Path::new("test.quanta"), TestKind::Unit);
+        
+        assert_eq!(tests.len(), 3);
+        assert_eq!(tests[0].fn_name, "test_simple");
+        assert_eq!(tests[1].fn_name, "test_ignored");
+        assert!(tests[1].ignored);
+        assert_eq!(tests[2].fn_name, "test_panic");
+        assert!(tests[2].should_panic.is_some());
+    }
+}

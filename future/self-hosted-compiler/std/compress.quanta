@@ -1,0 +1,1295 @@
+/// QuantaLang Standard Library - Compression
+/// DEFLATE, gzip, and zlib compression/decompression
+module std::compress;
+
+use std::vec::Vec;
+use std::result::Result;
+use std::io::{Read, Write, BufReader, BufWriter};
+use std::fmt::{Debug, Display};
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+/// Compression/decompression error
+#[derive(Clone, Debug)]
+pub struct Error {
+    kind: ErrorKind,
+    message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Invalid compressed data
+    InvalidData,
+    /// Unexpected end of input
+    UnexpectedEof,
+    /// Checksum mismatch
+    ChecksumMismatch,
+    /// Invalid header
+    InvalidHeader,
+    /// Buffer too small
+    BufferTooSmall,
+    /// I/O error
+    Io,
+    /// Unsupported feature
+    Unsupported,
+}
+
+impl Error {
+    fn new(kind: ErrorKind, message: &str) -> Self {
+        Error {
+            kind,
+            message: message.to_string(),
+        }
+    }
+    
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "compression error: {}", self.message)
+    }
+}
+
+impl std::error::Error for Error {}
+
+// ============================================================================
+// Compression Level
+// ============================================================================
+
+/// Compression level (0-9)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Level(u8);
+
+impl Level {
+    /// No compression (fastest)
+    pub const NONE: Level = Level(0);
+    /// Best speed
+    pub const FAST: Level = Level(1);
+    /// Default compression (balance of speed and size)
+    pub const DEFAULT: Level = Level(6);
+    /// Best compression (slowest)
+    pub const BEST: Level = Level(9);
+    
+    /// Create custom level (0-9)
+    pub fn new(level: u8) -> Self {
+        Level(level.min(9))
+    }
+    
+    pub fn value(&self) -> u8 {
+        self.0
+    }
+}
+
+impl Default for Level {
+    fn default() -> Self {
+        Level::DEFAULT
+    }
+}
+
+// ============================================================================
+// DEFLATE Implementation
+// ============================================================================
+
+/// DEFLATE compressor
+pub struct DeflateEncoder<W: Write> {
+    writer: W,
+    level: Level,
+    buffer: Vec<u8>,
+    hash_table: Vec<u16>,
+    hash_prev: Vec<u16>,
+    window: Vec<u8>,
+    window_pos: usize,
+    bits: u32,
+    bit_count: u8,
+}
+
+impl<W: Write> DeflateEncoder<W> {
+    const WINDOW_SIZE: usize = 32768;
+    const HASH_SIZE: usize = 32768;
+    const MIN_MATCH: usize = 3;
+    const MAX_MATCH: usize = 258;
+    
+    /// Create new DEFLATE encoder
+    pub fn new(writer: W, level: Level) -> Self {
+        DeflateEncoder {
+            writer,
+            level,
+            buffer: Vec::new(),
+            hash_table: vec![0; Self::HASH_SIZE],
+            hash_prev: vec![0; Self::WINDOW_SIZE],
+            window: vec![0; Self::WINDOW_SIZE * 2],
+            window_pos: 0,
+            bits: 0,
+            bit_count: 0,
+        }
+    }
+    
+    /// Write data to compress
+    pub fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
+        self.buffer.extend_from_slice(data);
+        
+        // Compress when buffer is large enough
+        while self.buffer.len() >= Self::WINDOW_SIZE {
+            self.compress_block(false)?;
+        }
+        
+        Ok(data.len())
+    }
+    
+    /// Finish compression and return writer
+    pub fn finish(mut self) -> Result<W, Error> {
+        // Compress remaining data
+        if !self.buffer.is_empty() {
+            self.compress_block(true)?;
+        } else {
+            // Write empty final block
+            self.write_bits(1, 1)?; // BFINAL = 1
+            self.write_bits(0, 2)?; // BTYPE = 0 (stored)
+            self.flush_bits()?;
+            self.writer.write_all(&[0, 0, 0xff, 0xff]).map_err(|_| {
+                Error::new(ErrorKind::Io, "write failed")
+            })?;
+        }
+        
+        Ok(self.writer)
+    }
+    
+    fn compress_block(&mut self, is_final: bool) -> Result<(), Error> {
+        let data: Vec<u8> = self.buffer.drain(..).collect();
+        
+        if self.level == Level::NONE {
+            self.write_stored_block(&data, is_final)?;
+        } else {
+            self.write_dynamic_block(&data, is_final)?;
+        }
+        
+        Ok(())
+    }
+    
+    fn write_stored_block(&mut self, data: &[u8], is_final: bool) -> Result<(), Error> {
+        // Split into 65535-byte chunks
+        let chunks: Vec<&[u8]> = data.chunks(65535).collect();
+        
+        for (i, chunk) in chunks.iter().enumerate() {
+            let final_chunk = is_final && i == chunks.len() - 1;
+            
+            self.write_bits(if final_chunk { 1 } else { 0 }, 1)?;
+            self.write_bits(0, 2)?; // BTYPE = 0
+            self.flush_bits()?;
+            
+            let len = chunk.len() as u16;
+            let nlen = !len;
+            
+            self.writer.write_all(&len.to_le_bytes()).map_err(|_| {
+                Error::new(ErrorKind::Io, "write failed")
+            })?;
+            self.writer.write_all(&nlen.to_le_bytes()).map_err(|_| {
+                Error::new(ErrorKind::Io, "write failed")
+            })?;
+            self.writer.write_all(chunk).map_err(|_| {
+                Error::new(ErrorKind::Io, "write failed")
+            })?;
+        }
+        
+        Ok(())
+    }
+    
+    fn write_dynamic_block(&mut self, data: &[u8], is_final: bool) -> Result<(), Error> {
+        // For simplicity, use fixed Huffman codes
+        self.write_bits(if is_final { 1 } else { 0 }, 1)?;
+        self.write_bits(1, 2)?; // BTYPE = 1 (fixed Huffman)
+        
+        // Compress using LZ77 + fixed Huffman
+        let mut pos = 0;
+        
+        while pos < data.len() {
+            // Try to find match
+            let (match_len, match_dist) = if self.level.0 > 0 {
+                self.find_match(&data, pos)
+            } else {
+                (0, 0)
+            };
+            
+            if match_len >= Self::MIN_MATCH {
+                // Write length/distance pair
+                self.write_length(match_len)?;
+                self.write_distance(match_dist)?;
+                pos += match_len;
+            } else {
+                // Write literal
+                self.write_literal(data[pos])?;
+                pos += 1;
+            }
+        }
+        
+        // Write end of block
+        self.write_literal_code(256)?; // End of block symbol
+        
+        Ok(())
+    }
+    
+    fn find_match(&mut self, data: &[u8], pos: usize) -> (usize, usize) {
+        if pos + Self::MIN_MATCH > data.len() {
+            return (0, 0);
+        }
+        
+        let hash = self.hash(&data[pos..pos + Self::MIN_MATCH]);
+        let max_dist = pos.min(Self::WINDOW_SIZE);
+        
+        let mut best_len = 0;
+        let mut best_dist = 0;
+        
+        // Simple matching (could use hash chain for better performance)
+        let search_depth = match self.level.0 {
+            1..=3 => 4,
+            4..=6 => 16,
+            _ => 128,
+        };
+        
+        for dist in 1..=max_dist.min(search_depth) {
+            let match_pos = pos - dist;
+            let mut len = 0;
+            
+            while pos + len < data.len() 
+                && len < Self::MAX_MATCH 
+                && data[match_pos + len] == data[pos + len] 
+            {
+                len += 1;
+            }
+            
+            if len > best_len {
+                best_len = len;
+                best_dist = dist;
+            }
+        }
+        
+        if best_len >= Self::MIN_MATCH {
+            (best_len, best_dist)
+        } else {
+            (0, 0)
+        }
+    }
+    
+    fn hash(&self, data: &[u8]) -> usize {
+        let mut h = 0usize;
+        for &b in data.iter().take(3) {
+            h = (h << 5) ^ (b as usize);
+        }
+        h & (Self::HASH_SIZE - 1)
+    }
+    
+    fn write_literal(&mut self, byte: u8) -> Result<(), Error> {
+        self.write_literal_code(byte as u16)
+    }
+    
+    fn write_literal_code(&mut self, code: u16) -> Result<(), Error> {
+        // Fixed Huffman codes for literals (RFC 1951)
+        if code <= 143 {
+            // 8-bit codes: 00110000 - 10111111
+            self.write_bits_rev((0b00110000 + code) as u32, 8)
+        } else if code <= 255 {
+            // 9-bit codes: 110010000 - 111111111
+            self.write_bits_rev((0b110010000 + code - 144) as u32, 9)
+        } else if code <= 279 {
+            // 7-bit codes: 0000000 - 0010111
+            self.write_bits_rev((code - 256) as u32, 7)
+        } else {
+            // 8-bit codes: 11000000 - 11000111
+            self.write_bits_rev((0b11000000 + code - 280) as u32, 8)
+        }
+    }
+    
+    fn write_length(&mut self, len: usize) -> Result<(), Error> {
+        // Length codes (257-285)
+        let (code, extra_bits, extra_value) = match len {
+            3 => (257, 0, 0),
+            4 => (258, 0, 0),
+            5 => (259, 0, 0),
+            6 => (260, 0, 0),
+            7 => (261, 0, 0),
+            8 => (262, 0, 0),
+            9 => (263, 0, 0),
+            10 => (264, 0, 0),
+            11..=12 => (265, 1, len - 11),
+            13..=14 => (266, 1, len - 13),
+            15..=16 => (267, 1, len - 15),
+            17..=18 => (268, 1, len - 17),
+            19..=22 => (269, 2, len - 19),
+            23..=26 => (270, 2, len - 23),
+            27..=30 => (271, 2, len - 27),
+            31..=34 => (272, 2, len - 31),
+            35..=42 => (273, 3, len - 35),
+            43..=50 => (274, 3, len - 43),
+            51..=58 => (275, 3, len - 51),
+            59..=66 => (276, 3, len - 59),
+            67..=82 => (277, 4, len - 67),
+            83..=98 => (278, 4, len - 83),
+            99..=114 => (279, 4, len - 99),
+            115..=130 => (280, 4, len - 115),
+            131..=162 => (281, 5, len - 131),
+            163..=194 => (282, 5, len - 163),
+            195..=226 => (283, 5, len - 195),
+            227..=257 => (284, 5, len - 227),
+            258 => (285, 0, 0),
+            _ => return Err(Error::new(ErrorKind::InvalidData, "invalid length")),
+        };
+        
+        self.write_literal_code(code)?;
+        if extra_bits > 0 {
+            self.write_bits(extra_value as u32, extra_bits)?;
+        }
+        
+        Ok(())
+    }
+    
+    fn write_distance(&mut self, dist: usize) -> Result<(), Error> {
+        // Distance codes (0-29) with extra bits
+        let (code, extra_bits, extra_value) = match dist {
+            1 => (0, 0, 0),
+            2 => (1, 0, 0),
+            3 => (2, 0, 0),
+            4 => (3, 0, 0),
+            5..=6 => (4, 1, dist - 5),
+            7..=8 => (5, 1, dist - 7),
+            9..=12 => (6, 2, dist - 9),
+            13..=16 => (7, 2, dist - 13),
+            17..=24 => (8, 3, dist - 17),
+            25..=32 => (9, 3, dist - 25),
+            33..=48 => (10, 4, dist - 33),
+            49..=64 => (11, 4, dist - 49),
+            65..=96 => (12, 5, dist - 65),
+            97..=128 => (13, 5, dist - 97),
+            129..=192 => (14, 6, dist - 129),
+            193..=256 => (15, 6, dist - 193),
+            257..=384 => (16, 7, dist - 257),
+            385..=512 => (17, 7, dist - 385),
+            513..=768 => (18, 8, dist - 513),
+            769..=1024 => (19, 8, dist - 769),
+            1025..=1536 => (20, 9, dist - 1025),
+            1537..=2048 => (21, 9, dist - 1537),
+            2049..=3072 => (22, 10, dist - 2049),
+            3073..=4096 => (23, 10, dist - 3073),
+            4097..=6144 => (24, 11, dist - 4097),
+            6145..=8192 => (25, 11, dist - 6145),
+            8193..=12288 => (26, 12, dist - 8193),
+            12289..=16384 => (27, 12, dist - 12289),
+            16385..=24576 => (28, 13, dist - 16385),
+            24577..=32768 => (29, 13, dist - 24577),
+            _ => return Err(Error::new(ErrorKind::InvalidData, "invalid distance")),
+        };
+        
+        // Distance codes are 5 bits, reversed
+        self.write_bits_rev(code, 5)?;
+        if extra_bits > 0 {
+            self.write_bits(extra_value as u32, extra_bits)?;
+        }
+        
+        Ok(())
+    }
+    
+    fn write_bits(&mut self, value: u32, count: u8) -> Result<(), Error> {
+        self.bits |= value << self.bit_count;
+        self.bit_count += count;
+        
+        while self.bit_count >= 8 {
+            self.writer.write_all(&[(self.bits & 0xFF) as u8]).map_err(|_| {
+                Error::new(ErrorKind::Io, "write failed")
+            })?;
+            self.bits >>= 8;
+            self.bit_count -= 8;
+        }
+        
+        Ok(())
+    }
+    
+    fn write_bits_rev(&mut self, value: u32, count: u8) -> Result<(), Error> {
+        // Reverse bit order
+        let mut rev = 0u32;
+        let mut v = value;
+        for _ in 0..count {
+            rev = (rev << 1) | (v & 1);
+            v >>= 1;
+        }
+        self.write_bits(rev, count)
+    }
+    
+    fn flush_bits(&mut self) -> Result<(), Error> {
+        if self.bit_count > 0 {
+            self.writer.write_all(&[(self.bits & 0xFF) as u8]).map_err(|_| {
+                Error::new(ErrorKind::Io, "write failed")
+            })?;
+            self.bits = 0;
+            self.bit_count = 0;
+        }
+        Ok(())
+    }
+}
+
+/// DEFLATE decompressor
+pub struct DeflateDecoder<R: Read> {
+    reader: R,
+    buffer: Vec<u8>,
+    output: Vec<u8>,
+    bits: u32,
+    bit_count: u8,
+    finished: bool,
+}
+
+impl<R: Read> DeflateDecoder<R> {
+    const WINDOW_SIZE: usize = 32768;
+    
+    /// Create new DEFLATE decoder
+    pub fn new(reader: R) -> Self {
+        DeflateDecoder {
+            reader,
+            buffer: Vec::new(),
+            output: Vec::with_capacity(Self::WINDOW_SIZE),
+            bits: 0,
+            bit_count: 0,
+            finished: false,
+        }
+    }
+    
+    /// Read decompressed data
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        // Decompress until we have enough data
+        while self.buffer.len() < buf.len() && !self.finished {
+            self.decode_block()?;
+        }
+        
+        let to_copy = buf.len().min(self.buffer.len());
+        buf[..to_copy].copy_from_slice(&self.buffer[..to_copy]);
+        self.buffer.drain(..to_copy);
+        
+        Ok(to_copy)
+    }
+    
+    /// Decompress all data
+    pub fn decompress_all(&mut self) -> Result<Vec<u8>, Error> {
+        while !self.finished {
+            self.decode_block()?;
+        }
+        
+        Ok(std::mem::take(&mut self.buffer))
+    }
+    
+    fn decode_block(&mut self) -> Result<(), Error> {
+        let bfinal = self.read_bits(1)?;
+        let btype = self.read_bits(2)?;
+        
+        match btype {
+            0 => self.decode_stored()?,
+            1 => self.decode_fixed()?,
+            2 => self.decode_dynamic()?,
+            _ => return Err(Error::new(ErrorKind::InvalidData, "invalid block type")),
+        }
+        
+        if bfinal == 1 {
+            self.finished = true;
+        }
+        
+        Ok(())
+    }
+    
+    fn decode_stored(&mut self) -> Result<(), Error> {
+        // Discard remaining bits in current byte
+        self.bits = 0;
+        self.bit_count = 0;
+        
+        let mut len_buf = [0u8; 2];
+        self.reader.read_exact(&mut len_buf).map_err(|_| {
+            Error::new(ErrorKind::UnexpectedEof, "unexpected end of input")
+        })?;
+        let len = u16::from_le_bytes(len_buf) as usize;
+        
+        let mut nlen_buf = [0u8; 2];
+        self.reader.read_exact(&mut nlen_buf).map_err(|_| {
+            Error::new(ErrorKind::UnexpectedEof, "unexpected end of input")
+        })?;
+        let nlen = u16::from_le_bytes(nlen_buf);
+        
+        if len != (!nlen) as usize {
+            return Err(Error::new(ErrorKind::InvalidData, "stored block length mismatch"));
+        }
+        
+        let mut data = vec![0u8; len];
+        self.reader.read_exact(&mut data).map_err(|_| {
+            Error::new(ErrorKind::UnexpectedEof, "unexpected end of input")
+        })?;
+        
+        self.buffer.extend_from_slice(&data);
+        self.output.extend_from_slice(&data);
+        
+        Ok(())
+    }
+    
+    fn decode_fixed(&mut self) -> Result<(), Error> {
+        loop {
+            let code = self.decode_fixed_literal()?;
+            
+            if code < 256 {
+                // Literal byte
+                self.buffer.push(code as u8);
+                self.output.push(code as u8);
+            } else if code == 256 {
+                // End of block
+                break;
+            } else {
+                // Length/distance pair
+                let length = self.decode_length(code)?;
+                let dist_code = self.read_bits_rev(5)?;
+                let distance = self.decode_distance(dist_code)?;
+                
+                // Copy from output buffer
+                self.copy_match(length, distance)?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn decode_dynamic(&mut self) -> Result<(), Error> {
+        // Read code lengths
+        let hlit = self.read_bits(5)? as usize + 257;
+        let hdist = self.read_bits(5)? as usize + 1;
+        let hclen = self.read_bits(4)? as usize + 4;
+        
+        // Read code length code lengths
+        const CL_ORDER: [usize; 19] = [
+            16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+        ];
+        
+        let mut cl_lengths = [0u8; 19];
+        for i in 0..hclen {
+            cl_lengths[CL_ORDER[i]] = self.read_bits(3)? as u8;
+        }
+        
+        // Build code length decoder
+        let cl_codes = build_huffman_codes(&cl_lengths);
+        
+        // Read literal/length and distance code lengths
+        let mut lengths = vec![0u8; hlit + hdist];
+        let mut i = 0;
+        
+        while i < lengths.len() {
+            let sym = self.decode_huffman(&cl_codes)?;
+            
+            match sym {
+                0..=15 => {
+                    lengths[i] = sym as u8;
+                    i += 1;
+                }
+                16 => {
+                    let repeat = self.read_bits(2)? as usize + 3;
+                    let value = if i > 0 { lengths[i - 1] } else { 0 };
+                    for _ in 0..repeat {
+                        if i < lengths.len() {
+                            lengths[i] = value;
+                            i += 1;
+                        }
+                    }
+                }
+                17 => {
+                    let repeat = self.read_bits(3)? as usize + 3;
+                    for _ in 0..repeat {
+                        if i < lengths.len() {
+                            lengths[i] = 0;
+                            i += 1;
+                        }
+                    }
+                }
+                18 => {
+                    let repeat = self.read_bits(7)? as usize + 11;
+                    for _ in 0..repeat {
+                        if i < lengths.len() {
+                            lengths[i] = 0;
+                            i += 1;
+                        }
+                    }
+                }
+                _ => return Err(Error::new(ErrorKind::InvalidData, "invalid code length code")),
+            }
+        }
+        
+        // Build literal/length and distance decoders
+        let lit_codes = build_huffman_codes(&lengths[..hlit]);
+        let dist_codes = build_huffman_codes(&lengths[hlit..]);
+        
+        // Decode block
+        loop {
+            let code = self.decode_huffman(&lit_codes)?;
+            
+            if code < 256 {
+                self.buffer.push(code as u8);
+                self.output.push(code as u8);
+            } else if code == 256 {
+                break;
+            } else {
+                let length = self.decode_length(code as u16)?;
+                let dist_code = self.decode_huffman(&dist_codes)?;
+                let distance = self.decode_distance(dist_code as u16)?;
+                
+                self.copy_match(length, distance)?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn decode_fixed_literal(&mut self) -> Result<u16, Error> {
+        // Read up to 9 bits and decode fixed Huffman
+        let mut code = 0u16;
+        
+        // Try 7-bit codes first (256-279)
+        code = self.read_bits_rev(7)? as u16;
+        if code <= 23 {
+            return Ok(256 + code);
+        }
+        
+        // Read one more bit for 8-bit codes
+        code = (code << 1) | self.read_bits(1)? as u16;
+        
+        if code >= 48 && code <= 191 {
+            // 0-143
+            return Ok(code - 48);
+        } else if code >= 192 && code <= 199 {
+            // 280-287
+            return Ok(280 + code - 192);
+        }
+        
+        // Read one more bit for 9-bit codes
+        code = (code << 1) | self.read_bits(1)? as u16;
+        
+        if code >= 400 && code <= 511 {
+            // 144-255
+            return Ok(144 + code - 400);
+        }
+        
+        Err(Error::new(ErrorKind::InvalidData, "invalid fixed huffman code"))
+    }
+    
+    fn decode_length(&mut self, code: u16) -> Result<usize, Error> {
+        let (base, extra) = match code {
+            257 => (3, 0),
+            258 => (4, 0),
+            259 => (5, 0),
+            260 => (6, 0),
+            261 => (7, 0),
+            262 => (8, 0),
+            263 => (9, 0),
+            264 => (10, 0),
+            265 => (11, 1),
+            266 => (13, 1),
+            267 => (15, 1),
+            268 => (17, 1),
+            269 => (19, 2),
+            270 => (23, 2),
+            271 => (27, 2),
+            272 => (31, 2),
+            273 => (35, 3),
+            274 => (43, 3),
+            275 => (51, 3),
+            276 => (59, 3),
+            277 => (67, 4),
+            278 => (83, 4),
+            279 => (99, 4),
+            280 => (115, 4),
+            281 => (131, 5),
+            282 => (163, 5),
+            283 => (195, 5),
+            284 => (227, 5),
+            285 => (258, 0),
+            _ => return Err(Error::new(ErrorKind::InvalidData, "invalid length code")),
+        };
+        
+        let extra_val = if extra > 0 { self.read_bits(extra)? } else { 0 };
+        Ok(base + extra_val as usize)
+    }
+    
+    fn decode_distance(&mut self, code: u16) -> Result<usize, Error> {
+        let (base, extra) = match code {
+            0 => (1, 0),
+            1 => (2, 0),
+            2 => (3, 0),
+            3 => (4, 0),
+            4 => (5, 1),
+            5 => (7, 1),
+            6 => (9, 2),
+            7 => (13, 2),
+            8 => (17, 3),
+            9 => (25, 3),
+            10 => (33, 4),
+            11 => (49, 4),
+            12 => (65, 5),
+            13 => (97, 5),
+            14 => (129, 6),
+            15 => (193, 6),
+            16 => (257, 7),
+            17 => (385, 7),
+            18 => (513, 8),
+            19 => (769, 8),
+            20 => (1025, 9),
+            21 => (1537, 9),
+            22 => (2049, 10),
+            23 => (3073, 10),
+            24 => (4097, 11),
+            25 => (6145, 11),
+            26 => (8193, 12),
+            27 => (12289, 12),
+            28 => (16385, 13),
+            29 => (24577, 13),
+            _ => return Err(Error::new(ErrorKind::InvalidData, "invalid distance code")),
+        };
+        
+        let extra_val = if extra > 0 { self.read_bits(extra)? } else { 0 };
+        Ok(base + extra_val as usize)
+    }
+    
+    fn decode_huffman(&mut self, codes: &[(u16, u8)]) -> Result<usize, Error> {
+        let mut code = 0u32;
+        let mut len = 0u8;
+        
+        loop {
+            code = (code << 1) | self.read_bits(1)?;
+            len += 1;
+            
+            for (i, &(c, l)) in codes.iter().enumerate() {
+                if l == len && c as u32 == code {
+                    return Ok(i);
+                }
+            }
+            
+            if len > 15 {
+                return Err(Error::new(ErrorKind::InvalidData, "invalid huffman code"));
+            }
+        }
+    }
+    
+    fn copy_match(&mut self, length: usize, distance: usize) -> Result<(), Error> {
+        if distance > self.output.len() {
+            return Err(Error::new(ErrorKind::InvalidData, "distance too far back"));
+        }
+        
+        let start = self.output.len() - distance;
+        
+        for i in 0..length {
+            let byte = self.output[start + (i % distance)];
+            self.buffer.push(byte);
+            self.output.push(byte);
+        }
+        
+        Ok(())
+    }
+    
+    fn read_bits(&mut self, count: u8) -> Result<u32, Error> {
+        while self.bit_count < count {
+            let mut byte = [0u8; 1];
+            self.reader.read_exact(&mut byte).map_err(|_| {
+                Error::new(ErrorKind::UnexpectedEof, "unexpected end of input")
+            })?;
+            self.bits |= (byte[0] as u32) << self.bit_count;
+            self.bit_count += 8;
+        }
+        
+        let result = self.bits & ((1 << count) - 1);
+        self.bits >>= count;
+        self.bit_count -= count;
+        
+        Ok(result)
+    }
+    
+    fn read_bits_rev(&mut self, count: u8) -> Result<u32, Error> {
+        let value = self.read_bits(count)?;
+        let mut rev = 0u32;
+        let mut v = value;
+        for _ in 0..count {
+            rev = (rev << 1) | (v & 1);
+            v >>= 1;
+        }
+        Ok(rev)
+    }
+}
+
+fn build_huffman_codes(lengths: &[u8]) -> Vec<(u16, u8)> {
+    let max_len = lengths.iter().copied().max().unwrap_or(0) as usize;
+    
+    // Count codes of each length
+    let mut bl_count = vec![0u16; max_len + 1];
+    for &len in lengths {
+        if len > 0 {
+            bl_count[len as usize] += 1;
+        }
+    }
+    
+    // Find starting code for each length
+    let mut next_code = vec![0u16; max_len + 1];
+    let mut code = 0u16;
+    for bits in 1..=max_len {
+        code = (code + bl_count[bits - 1]) << 1;
+        next_code[bits] = code;
+    }
+    
+    // Assign codes
+    let mut codes = vec![(0u16, 0u8); lengths.len()];
+    for (i, &len) in lengths.iter().enumerate() {
+        if len > 0 {
+            codes[i] = (next_code[len as usize], len);
+            next_code[len as usize] += 1;
+        }
+    }
+    
+    codes
+}
+
+// ============================================================================
+// gzip Format
+// ============================================================================
+
+/// gzip compressor
+pub struct GzipEncoder<W: Write> {
+    inner: DeflateEncoder<W>,
+    crc: u32,
+    size: u32,
+}
+
+impl<W: Write> GzipEncoder<W> {
+    /// Create new gzip encoder
+    pub fn new(writer: W, level: Level) -> Result<Self, Error> {
+        let mut w = writer;
+        
+        // Write gzip header
+        let header = [
+            0x1f, 0x8b, // Magic number
+            0x08,       // Compression method (deflate)
+            0x00,       // Flags
+            0, 0, 0, 0, // Modification time
+            0x00,       // Extra flags
+            0xff,       // OS (unknown)
+        ];
+        
+        w.write_all(&header).map_err(|_| Error::new(ErrorKind::Io, "write failed"))?;
+        
+        Ok(GzipEncoder {
+            inner: DeflateEncoder::new(w, level),
+            crc: 0xFFFFFFFF,
+            size: 0,
+        })
+    }
+    
+    /// Write data to compress
+    pub fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
+        // Update CRC
+        for &byte in data {
+            self.crc = crc32_update(self.crc, byte);
+            self.size = self.size.wrapping_add(1);
+        }
+        
+        self.inner.write(data)
+    }
+    
+    /// Finish compression
+    pub fn finish(self) -> Result<W, Error> {
+        let mut writer = self.inner.finish()?;
+        
+        // Write CRC32 and size
+        let crc = !self.crc;
+        writer.write_all(&crc.to_le_bytes()).map_err(|_| {
+            Error::new(ErrorKind::Io, "write failed")
+        })?;
+        writer.write_all(&self.size.to_le_bytes()).map_err(|_| {
+            Error::new(ErrorKind::Io, "write failed")
+        })?;
+        
+        Ok(writer)
+    }
+}
+
+/// gzip decompressor
+pub struct GzipDecoder<R: Read> {
+    inner: DeflateDecoder<R>,
+    expected_crc: u32,
+    expected_size: u32,
+}
+
+impl<R: Read> GzipDecoder<R> {
+    /// Create new gzip decoder
+    pub fn new(mut reader: R) -> Result<Self, Error> {
+        // Read and validate header
+        let mut header = [0u8; 10];
+        reader.read_exact(&mut header).map_err(|_| {
+            Error::new(ErrorKind::UnexpectedEof, "incomplete gzip header")
+        })?;
+        
+        if header[0] != 0x1f || header[1] != 0x8b {
+            return Err(Error::new(ErrorKind::InvalidHeader, "invalid gzip magic"));
+        }
+        
+        if header[2] != 0x08 {
+            return Err(Error::new(ErrorKind::Unsupported, "unsupported compression method"));
+        }
+        
+        let flags = header[3];
+        
+        // Skip optional fields
+        if flags & 0x04 != 0 {
+            // FEXTRA
+            let mut len = [0u8; 2];
+            reader.read_exact(&mut len).map_err(|_| {
+                Error::new(ErrorKind::UnexpectedEof, "incomplete header")
+            })?;
+            let extra_len = u16::from_le_bytes(len) as usize;
+            let mut extra = vec![0u8; extra_len];
+            reader.read_exact(&mut extra).map_err(|_| {
+                Error::new(ErrorKind::UnexpectedEof, "incomplete header")
+            })?;
+        }
+        
+        if flags & 0x08 != 0 {
+            // FNAME
+            loop {
+                let mut byte = [0u8; 1];
+                reader.read_exact(&mut byte).map_err(|_| {
+                    Error::new(ErrorKind::UnexpectedEof, "incomplete header")
+                })?;
+                if byte[0] == 0 {
+                    break;
+                }
+            }
+        }
+        
+        if flags & 0x10 != 0 {
+            // FCOMMENT
+            loop {
+                let mut byte = [0u8; 1];
+                reader.read_exact(&mut byte).map_err(|_| {
+                    Error::new(ErrorKind::UnexpectedEof, "incomplete header")
+                })?;
+                if byte[0] == 0 {
+                    break;
+                }
+            }
+        }
+        
+        if flags & 0x02 != 0 {
+            // FHCRC
+            let mut crc = [0u8; 2];
+            reader.read_exact(&mut crc).map_err(|_| {
+                Error::new(ErrorKind::UnexpectedEof, "incomplete header")
+            })?;
+        }
+        
+        Ok(GzipDecoder {
+            inner: DeflateDecoder::new(reader),
+            expected_crc: 0,
+            expected_size: 0,
+        })
+    }
+    
+    /// Decompress all data
+    pub fn decompress_all(&mut self) -> Result<Vec<u8>, Error> {
+        self.inner.decompress_all()
+    }
+}
+
+// ============================================================================
+// zlib Format
+// ============================================================================
+
+/// zlib compressor
+pub struct ZlibEncoder<W: Write> {
+    inner: DeflateEncoder<W>,
+    adler: u32,
+}
+
+impl<W: Write> ZlibEncoder<W> {
+    /// Create new zlib encoder
+    pub fn new(writer: W, level: Level) -> Result<Self, Error> {
+        let mut w = writer;
+        
+        // Write zlib header
+        let cmf = 0x78; // Compression method = deflate, window size = 32K
+        let flg = match level.0 {
+            0..=1 => 0x01,
+            2..=5 => 0x5e,
+            6 => 0x9c,
+            _ => 0xda,
+        };
+        
+        // Adjust for checksum
+        let check = ((cmf as u16) << 8 | flg as u16) % 31;
+        let flg = if check == 0 { flg } else { flg + (31 - check) as u8 };
+        
+        w.write_all(&[cmf, flg]).map_err(|_| Error::new(ErrorKind::Io, "write failed"))?;
+        
+        Ok(ZlibEncoder {
+            inner: DeflateEncoder::new(w, level),
+            adler: 1,
+        })
+    }
+    
+    /// Write data to compress
+    pub fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
+        // Update Adler-32
+        self.adler = adler32_update(self.adler, data);
+        self.inner.write(data)
+    }
+    
+    /// Finish compression
+    pub fn finish(self) -> Result<W, Error> {
+        let mut writer = self.inner.finish()?;
+        
+        // Write Adler-32 checksum
+        writer.write_all(&self.adler.to_be_bytes()).map_err(|_| {
+            Error::new(ErrorKind::Io, "write failed")
+        })?;
+        
+        Ok(writer)
+    }
+}
+
+/// zlib decompressor
+pub struct ZlibDecoder<R: Read> {
+    inner: DeflateDecoder<R>,
+}
+
+impl<R: Read> ZlibDecoder<R> {
+    /// Create new zlib decoder
+    pub fn new(mut reader: R) -> Result<Self, Error> {
+        // Read and validate header
+        let mut header = [0u8; 2];
+        reader.read_exact(&mut header).map_err(|_| {
+            Error::new(ErrorKind::UnexpectedEof, "incomplete zlib header")
+        })?;
+        
+        let cmf = header[0];
+        let flg = header[1];
+        
+        // Check header
+        let check = ((cmf as u16) << 8 | flg as u16) % 31;
+        if check != 0 {
+            return Err(Error::new(ErrorKind::InvalidHeader, "invalid zlib header checksum"));
+        }
+        
+        let cm = cmf & 0x0f;
+        if cm != 8 {
+            return Err(Error::new(ErrorKind::Unsupported, "unsupported compression method"));
+        }
+        
+        if flg & 0x20 != 0 {
+            // FDICT - preset dictionary not supported
+            return Err(Error::new(ErrorKind::Unsupported, "preset dictionary not supported"));
+        }
+        
+        Ok(ZlibDecoder {
+            inner: DeflateDecoder::new(reader),
+        })
+    }
+    
+    /// Decompress all data
+    pub fn decompress_all(&mut self) -> Result<Vec<u8>, Error> {
+        self.inner.decompress_all()
+    }
+}
+
+// ============================================================================
+// Checksums
+// ============================================================================
+
+/// CRC-32 lookup table
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xedb88320;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+fn crc32_update(crc: u32, byte: u8) -> u32 {
+    CRC32_TABLE[((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8)
+}
+
+/// Compute CRC-32 of data
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFFFFFF;
+    for &byte in data {
+        crc = crc32_update(crc, byte);
+    }
+    !crc
+}
+
+fn adler32_update(adler: u32, data: &[u8]) -> u32 {
+    const MOD: u32 = 65521;
+    
+    let mut a = adler & 0xffff;
+    let mut b = (adler >> 16) & 0xffff;
+    
+    for &byte in data {
+        a = (a + byte as u32) % MOD;
+        b = (b + a) % MOD;
+    }
+    
+    (b << 16) | a
+}
+
+/// Compute Adler-32 of data
+pub fn adler32(data: &[u8]) -> u32 {
+    adler32_update(1, data)
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+/// Compress data using DEFLATE
+pub fn deflate_compress(data: &[u8], level: Level) -> Result<Vec<u8>, Error> {
+    let mut output = Vec::new();
+    let mut encoder = DeflateEncoder::new(&mut output, level);
+    encoder.write(data)?;
+    encoder.finish()?;
+    Ok(output)
+}
+
+/// Decompress DEFLATE data
+pub fn deflate_decompress(data: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut decoder = DeflateDecoder::new(data);
+    decoder.decompress_all()
+}
+
+/// Compress data using gzip
+pub fn gzip_compress(data: &[u8], level: Level) -> Result<Vec<u8>, Error> {
+    let mut output = Vec::new();
+    let mut encoder = GzipEncoder::new(&mut output, level)?;
+    encoder.write(data)?;
+    encoder.finish()?;
+    Ok(output)
+}
+
+/// Decompress gzip data
+pub fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut decoder = GzipDecoder::new(data)?;
+    decoder.decompress_all()
+}
+
+/// Compress data using zlib
+pub fn zlib_compress(data: &[u8], level: Level) -> Result<Vec<u8>, Error> {
+    let mut output = Vec::new();
+    let mut encoder = ZlibEncoder::new(&mut output, level)?;
+    encoder.write(data)?;
+    encoder.finish()?;
+    Ok(output)
+}
+
+/// Decompress zlib data
+pub fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut decoder = ZlibDecoder::new(data)?;
+    decoder.decompress_all()
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_crc32() {
+        assert_eq!(crc32(b""), 0);
+        assert_eq!(crc32(b"123456789"), 0xcbf43926);
+    }
+    
+    #[test]
+    fn test_adler32() {
+        assert_eq!(adler32(b""), 1);
+        assert_eq!(adler32(b"Wikipedia"), 0x11e60398);
+    }
+    
+    #[test]
+    fn test_deflate_roundtrip() {
+        let data = b"Hello, World! This is a test of DEFLATE compression.";
+        
+        let compressed = deflate_compress(data, Level::DEFAULT).unwrap();
+        let decompressed = deflate_decompress(&compressed).unwrap();
+        
+        assert_eq!(&decompressed, data);
+    }
+    
+    #[test]
+    fn test_deflate_stored() {
+        let data = b"Small data";
+        
+        let compressed = deflate_compress(data, Level::NONE).unwrap();
+        let decompressed = deflate_decompress(&compressed).unwrap();
+        
+        assert_eq!(&decompressed, data);
+    }
+    
+    #[test]
+    fn test_gzip_roundtrip() {
+        let data = b"Test data for gzip compression.";
+        
+        let compressed = gzip_compress(data, Level::DEFAULT).unwrap();
+        
+        // Check gzip magic
+        assert_eq!(&compressed[0..2], &[0x1f, 0x8b]);
+        
+        let decompressed = gzip_decompress(&compressed).unwrap();
+        assert_eq!(&decompressed, data);
+    }
+    
+    #[test]
+    fn test_zlib_roundtrip() {
+        let data = b"Test data for zlib compression.";
+        
+        let compressed = zlib_compress(data, Level::DEFAULT).unwrap();
+        
+        // Check zlib header
+        assert_eq!(compressed[0] & 0x0f, 0x08); // Deflate method
+        
+        let decompressed = zlib_decompress(&compressed).unwrap();
+        assert_eq!(&decompressed, data);
+    }
+    
+    #[test]
+    fn test_large_data() {
+        let data: Vec<u8> = (0..100000).map(|i| (i % 256) as u8).collect();
+        
+        let compressed = deflate_compress(&data, Level::BEST).unwrap();
+        let decompressed = deflate_decompress(&compressed).unwrap();
+        
+        assert_eq!(decompressed, data);
+        assert!(compressed.len() < data.len()); // Should compress
+    }
+    
+    #[test]
+    fn test_compression_levels() {
+        let data = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        
+        let none = deflate_compress(data, Level::NONE).unwrap();
+        let fast = deflate_compress(data, Level::FAST).unwrap();
+        let best = deflate_compress(data, Level::BEST).unwrap();
+        
+        // All should decompress to same data
+        assert_eq!(deflate_decompress(&none).unwrap(), data);
+        assert_eq!(deflate_decompress(&fast).unwrap(), data);
+        assert_eq!(deflate_decompress(&best).unwrap(), data);
+    }
+}

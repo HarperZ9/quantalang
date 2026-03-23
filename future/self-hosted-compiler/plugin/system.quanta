@@ -1,0 +1,968 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ PLUGIN — Plugin System Infrastructure
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Compiler plugin system for extensibility:
+// - Procedural macro support
+// - Custom lint rules
+// - Code generation plugins
+// - Analysis passes
+// - Build system extensions
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::plugin::system
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::sync::Arc;
+use alloc::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+use std::any::Any;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLUGIN METADATA
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Plugin metadata declaration
+#[derive(Debug, Clone)]
+pub struct PluginMetadata {
+    /// Plugin name
+    pub name: String,
+    
+    /// Plugin version
+    pub version: PluginVersion,
+    
+    /// Plugin description
+    pub description: String,
+    
+    /// Authors
+    pub authors: Vec<String>,
+    
+    /// License (SPDX identifier)
+    pub license: String,
+    
+    /// Repository URL
+    pub repository: Option<String>,
+    
+    /// Required compiler version
+    pub required_compiler: VersionRequirement,
+    
+    /// Plugin capabilities
+    pub capabilities: Vec<PluginCapability>,
+    
+    /// Dependencies on other plugins
+    pub dependencies: Vec<PluginDependency>,
+}
+
+/// Plugin version (semver)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PluginVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
+impl PluginVersion {
+    pub fn new(major: u32, minor: u32, patch: u32) -> Self {
+        PluginVersion { major, minor, patch }
+    }
+    
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.strip_prefix('v').unwrap_or(s);
+        let parts: Vec<&str> = s.split('.').collect();
+        
+        if parts.len() >= 2 {
+            let major = parts[0].parse().ok()?;
+            let minor = parts[1].parse().ok()?;
+            let patch = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
+            Some(PluginVersion { major, minor, patch })
+        } else {
+            None
+        }
+    }
+    
+    pub fn satisfies(&self, req: &VersionRequirement) -> bool {
+        match req {
+            VersionRequirement::Exact(v) => self == v,
+            VersionRequirement::Caret(v) => {
+                self.major == v.major && (self.minor, self.patch) >= (v.minor, v.patch)
+            }
+            VersionRequirement::Tilde(v) => {
+                self.major == v.major && self.minor == v.minor && self.patch >= v.patch
+            }
+            VersionRequirement::Range { min, max } => {
+                self >= min && self < max
+            }
+            VersionRequirement::Any => true,
+        }
+    }
+}
+
+impl std::fmt::Display for PluginVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// Version requirement
+#[derive(Debug, Clone)]
+pub enum VersionRequirement {
+    /// Exact version: =1.0.0
+    Exact(PluginVersion),
+    /// Caret: ^1.0.0 (compatible)
+    Caret(PluginVersion),
+    /// Tilde: ~1.0.0 (same minor)
+    Tilde(PluginVersion),
+    /// Range: >=1.0.0 <2.0.0
+    Range { min: PluginVersion, max: PluginVersion },
+    /// Any version
+    Any,
+}
+
+/// Plugin capability
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginCapability {
+    /// Derive macro
+    DeriveMacro,
+    /// Attribute macro
+    AttributeMacro,
+    /// Function-like macro
+    FunctionMacro,
+    /// Custom lint
+    Lint,
+    /// Code generator
+    CodeGen,
+    /// Optimizer pass
+    Optimizer,
+    /// Analysis pass
+    Analysis,
+    /// Build system hook
+    Build,
+    /// Language server extension
+    LanguageServer,
+    /// Debugger extension
+    Debugger,
+}
+
+/// Plugin dependency
+#[derive(Debug, Clone)]
+pub struct PluginDependency {
+    pub name: String,
+    pub version: VersionRequirement,
+    pub optional: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLUGIN TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Main plugin trait
+pub trait Plugin: Send + Sync {
+    /// Get plugin metadata
+    fn metadata(&self) -> &PluginMetadata;
+    
+    /// Initialize plugin
+    fn initialize(&mut self, ctx: &mut PluginContext) -> Result<(), PluginError>;
+    
+    /// Finalize plugin
+    fn finalize(&mut self, ctx: &mut PluginContext) -> Result<(), PluginError>;
+    
+    /// Register capabilities with the compiler
+    fn register(&self, registry: &mut PluginRegistry) -> Result<(), PluginError>;
+    
+    /// Get plugin as Any for downcasting
+    fn as_any(&self) -> &dyn Any;
+    
+    /// Get mutable Any reference
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+/// Plugin context for initialization
+pub struct PluginContext {
+    /// Compiler version
+    pub compiler_version: PluginVersion,
+    
+    /// Plugin directory
+    pub plugin_dir: PathBuf,
+    
+    /// Cache directory
+    pub cache_dir: PathBuf,
+    
+    /// Configuration
+    pub config: BTreeMap<String, String>,
+    
+    /// Logger
+    pub logger: Box<dyn PluginLogger>,
+}
+
+/// Plugin logging interface
+pub trait PluginLogger: Send + Sync {
+    fn debug(&self, msg: &str);
+    fn info(&self, msg: &str);
+    fn warn(&self, msg: &str);
+    fn error(&self, msg: &str);
+}
+
+/// Default console logger
+pub struct ConsoleLogger;
+
+impl PluginLogger for ConsoleLogger {
+    fn debug(&self, msg: &str) {
+        println!("[DEBUG] {}", msg);
+    }
+    
+    fn info(&self, msg: &str) {
+        println!("[INFO] {}", msg);
+    }
+    
+    fn warn(&self, msg: &str) {
+        eprintln!("[WARN] {}", msg);
+    }
+    
+    fn error(&self, msg: &str) {
+        eprintln!("[ERROR] {}", msg);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MACRO PLUGINS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Token stream for macro processing
+#[derive(Debug, Clone)]
+pub struct TokenStream {
+    pub tokens: Vec<Token>,
+}
+
+/// Token representation
+#[derive(Debug, Clone)]
+pub enum Token {
+    Ident(String),
+    Punct(char),
+    Literal(Literal),
+    Group { delimiter: Delimiter, tokens: TokenStream },
+}
+
+#[derive(Debug, Clone)]
+pub enum Literal {
+    String(String),
+    Integer(i64),
+    Float(f64),
+    Bool(bool),
+    Char(char),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delimiter {
+    Parenthesis, // ()
+    Bracket,     // []
+    Brace,       // {}
+    None,        // invisible
+}
+
+impl TokenStream {
+    pub fn new() -> Self {
+        TokenStream { tokens: Vec::new() }
+    }
+    
+    pub fn from_str(s: &str) -> Self {
+        // Simplified tokenizer
+        let mut tokens = Vec::new();
+        
+        for word in s.split_whitespace() {
+            if let Ok(n) = word.parse::<i64>() {
+                tokens.push(Token::Literal(Literal::Integer(n)));
+            } else if let Ok(f) = word.parse::<f64>() {
+                tokens.push(Token::Literal(Literal::Float(f)));
+            } else {
+                tokens.push(Token::Ident(word.to_string()));
+            }
+        }
+        
+        TokenStream { tokens }
+    }
+    
+    pub fn push(&mut self, token: Token) {
+        self.tokens.push(token);
+    }
+    
+    pub fn extend(&mut self, other: TokenStream) {
+        self.tokens.extend(other.tokens);
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+}
+
+impl Default for TokenStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Derive macro trait
+pub trait DeriveMacro: Send + Sync {
+    /// Macro name
+    fn name(&self) -> &str;
+    
+    /// Process derive
+    fn derive(&self, input: &DeriveInput) -> Result<TokenStream, MacroError>;
+    
+    /// Helper attributes supported
+    fn helper_attributes(&self) -> Vec<&str> {
+        Vec::new()
+    }
+}
+
+/// Input to derive macro
+#[derive(Debug, Clone)]
+pub struct DeriveInput {
+    /// Item name
+    pub ident: String,
+    
+    /// Generics
+    pub generics: Generics,
+    
+    /// Item data
+    pub data: DeriveData,
+    
+    /// Attributes
+    pub attrs: Vec<Attribute>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Generics {
+    pub params: Vec<GenericParam>,
+    pub where_clause: Option<WhereClause>,
+}
+
+#[derive(Debug, Clone)]
+pub enum GenericParam {
+    Type { name: String, bounds: Vec<String> },
+    Lifetime { name: String, bounds: Vec<String> },
+    Const { name: String, ty: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct WhereClause {
+    pub predicates: Vec<WherePredicate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WherePredicate {
+    pub bounded_ty: String,
+    pub bounds: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeriveData {
+    Struct(StructData),
+    Enum(EnumData),
+}
+
+#[derive(Debug, Clone)]
+pub struct StructData {
+    pub fields: Fields,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumData {
+    pub variants: Vec<Variant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Variant {
+    pub ident: String,
+    pub fields: Fields,
+    pub discriminant: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Fields {
+    Named(Vec<Field>),
+    Unnamed(Vec<Field>),
+    Unit,
+}
+
+#[derive(Debug, Clone)]
+pub struct Field {
+    pub ident: Option<String>,
+    pub ty: String,
+    pub attrs: Vec<Attribute>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Attribute {
+    pub path: String,
+    pub tokens: TokenStream,
+}
+
+/// Attribute macro trait
+pub trait AttributeMacro: Send + Sync {
+    /// Macro name
+    fn name(&self) -> &str;
+    
+    /// Process attribute
+    fn expand(
+        &self,
+        attr: TokenStream,
+        item: TokenStream,
+    ) -> Result<TokenStream, MacroError>;
+}
+
+/// Function-like macro trait
+pub trait FunctionMacro: Send + Sync {
+    /// Macro name
+    fn name(&self) -> &str;
+    
+    /// Expand macro
+    fn expand(&self, input: TokenStream) -> Result<TokenStream, MacroError>;
+}
+
+/// Macro error
+#[derive(Debug)]
+pub struct MacroError {
+    pub message: String,
+    pub span: Option<Span>,
+    pub help: Option<String>,
+}
+
+impl MacroError {
+    pub fn new(message: impl Into<String>) -> Self {
+        MacroError {
+            message: message.into(),
+            span: None,
+            help: None,
+        }
+    }
+    
+    pub fn with_span(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
+    }
+    
+    pub fn with_help(mut self, help: impl Into<String>) -> Self {
+        self.help = Some(help.into());
+        self
+    }
+}
+
+/// Source span
+#[derive(Debug, Clone, Copy)]
+pub struct Span {
+    pub start: u32,
+    pub end: u32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINT PLUGINS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Custom lint trait
+pub trait LintPass: Send + Sync {
+    /// Lint name
+    fn name(&self) -> &str;
+    
+    /// Default lint level
+    fn default_level(&self) -> LintLevel;
+    
+    /// Lint description
+    fn description(&self) -> &str;
+    
+    /// Check AST node
+    fn check(&self, ctx: &LintContext, node: &dyn Any) -> Vec<LintDiagnostic>;
+}
+
+/// Lint severity level
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LintLevel {
+    Allow,
+    Warn,
+    Deny,
+    Forbid,
+}
+
+/// Lint context
+pub struct LintContext<'a> {
+    /// Source file path
+    pub file: &'a Path,
+    
+    /// Source content
+    pub source: &'a str,
+    
+    /// Lint configuration
+    pub config: &'a LintConfig,
+}
+
+/// Lint configuration
+#[derive(Debug, Clone, Default)]
+pub struct LintConfig {
+    pub levels: BTreeMap<String, LintLevel>,
+}
+
+/// Lint diagnostic
+#[derive(Debug, Clone)]
+pub struct LintDiagnostic {
+    pub lint: String,
+    pub level: LintLevel,
+    pub message: String,
+    pub span: Span,
+    pub notes: Vec<String>,
+    pub suggestions: Vec<LintSuggestion>,
+}
+
+/// Lint suggestion
+#[derive(Debug, Clone)]
+pub struct LintSuggestion {
+    pub message: String,
+    pub replacement: String,
+    pub span: Span,
+    pub applicability: Applicability,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Applicability {
+    MachineApplicable,
+    MaybeIncorrect,
+    HasPlaceholders,
+    Unspecified,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CODE GENERATION PLUGINS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Code generation pass
+pub trait CodeGenPass: Send + Sync {
+    /// Pass name
+    fn name(&self) -> &str;
+    
+    /// Priority (lower runs first)
+    fn priority(&self) -> i32 { 0 }
+    
+    /// Transform MIR
+    fn transform_mir(&self, ctx: &mut CodeGenContext, mir: &mut MirModule) -> Result<(), CodeGenError>;
+}
+
+/// Code generation context
+pub struct CodeGenContext {
+    /// Target triple
+    pub target: String,
+    
+    /// Optimization level
+    pub opt_level: OptLevel,
+    
+    /// Debug info
+    pub debug_info: bool,
+    
+    /// Plugin data
+    pub data: BTreeMap<String, Box<dyn Any + Send + Sync>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum OptLevel {
+    O0, O1, O2, O3, Os, Oz,
+}
+
+/// MIR module (simplified)
+pub struct MirModule {
+    pub name: String,
+    pub functions: Vec<MirFunction>,
+}
+
+pub struct MirFunction {
+    pub name: String,
+    pub signature: String,
+    pub body: Vec<MirBasicBlock>,
+}
+
+pub struct MirBasicBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+pub struct MirStatement {
+    pub kind: MirStatementKind,
+}
+
+pub enum MirStatementKind {
+    Assign { place: String, value: String },
+    Call { func: String, args: Vec<String>, dest: Option<String> },
+    Nop,
+}
+
+pub enum MirTerminator {
+    Return,
+    Goto(u32),
+    SwitchInt { discriminant: String, targets: Vec<(i64, u32)>, otherwise: u32 },
+    Unreachable,
+}
+
+#[derive(Debug)]
+pub struct CodeGenError {
+    pub message: String,
+    pub pass: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLUGIN REGISTRY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Plugin registry
+pub struct PluginRegistry {
+    /// Loaded plugins
+    plugins: Vec<Arc<RwLock<dyn Plugin>>>,
+    
+    /// Derive macros
+    derive_macros: BTreeMap<String, Arc<dyn DeriveMacro>>,
+    
+    /// Attribute macros
+    attr_macros: BTreeMap<String, Arc<dyn AttributeMacro>>,
+    
+    /// Function macros
+    fn_macros: BTreeMap<String, Arc<dyn FunctionMacro>>,
+    
+    /// Lint passes
+    lint_passes: Vec<Arc<dyn LintPass>>,
+    
+    /// Code generation passes
+    codegen_passes: Vec<Arc<dyn CodeGenPass>>,
+}
+
+impl PluginRegistry {
+    pub fn new() -> Self {
+        PluginRegistry {
+            plugins: Vec::new(),
+            derive_macros: BTreeMap::new(),
+            attr_macros: BTreeMap::new(),
+            fn_macros: BTreeMap::new(),
+            lint_passes: Vec::new(),
+            codegen_passes: Vec::new(),
+        }
+    }
+    
+    /// Register derive macro
+    pub fn register_derive(&mut self, mac: Arc<dyn DeriveMacro>) {
+        self.derive_macros.insert(mac.name().to_string(), mac);
+    }
+    
+    /// Register attribute macro
+    pub fn register_attr(&mut self, mac: Arc<dyn AttributeMacro>) {
+        self.attr_macros.insert(mac.name().to_string(), mac);
+    }
+    
+    /// Register function macro
+    pub fn register_fn(&mut self, mac: Arc<dyn FunctionMacro>) {
+        self.fn_macros.insert(mac.name().to_string(), mac);
+    }
+    
+    /// Register lint pass
+    pub fn register_lint(&mut self, lint: Arc<dyn LintPass>) {
+        self.lint_passes.push(lint);
+    }
+    
+    /// Register code generation pass
+    pub fn register_codegen(&mut self, pass: Arc<dyn CodeGenPass>) {
+        self.codegen_passes.push(pass);
+        // Sort by priority
+        self.codegen_passes.sort_by_key(|p| p.priority());
+    }
+    
+    /// Get derive macro
+    pub fn get_derive(&self, name: &str) -> Option<&Arc<dyn DeriveMacro>> {
+        self.derive_macros.get(name)
+    }
+    
+    /// Get attribute macro
+    pub fn get_attr(&self, name: &str) -> Option<&Arc<dyn AttributeMacro>> {
+        self.attr_macros.get(name)
+    }
+    
+    /// Get function macro
+    pub fn get_fn(&self, name: &str) -> Option<&Arc<dyn FunctionMacro>> {
+        self.fn_macros.get(name)
+    }
+    
+    /// Get all lint passes
+    pub fn lint_passes(&self) -> &[Arc<dyn LintPass>] {
+        &self.lint_passes
+    }
+    
+    /// Get codegen passes
+    pub fn codegen_passes(&self) -> &[Arc<dyn CodeGenPass>] {
+        &self.codegen_passes
+    }
+    
+    /// List all registered macros
+    pub fn list_macros(&self) -> Vec<MacroInfo> {
+        let mut result = Vec::new();
+        
+        for (name, _) in &self.derive_macros {
+            result.push(MacroInfo {
+                name: name.clone(),
+                kind: MacroKind::Derive,
+            });
+        }
+        
+        for (name, _) in &self.attr_macros {
+            result.push(MacroInfo {
+                name: name.clone(),
+                kind: MacroKind::Attribute,
+            });
+        }
+        
+        for (name, _) in &self.fn_macros {
+            result.push(MacroInfo {
+                name: name.clone(),
+                kind: MacroKind::Function,
+            });
+        }
+        
+        result
+    }
+}
+
+impl Default for PluginRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Macro information
+#[derive(Debug, Clone)]
+pub struct MacroInfo {
+    pub name: String,
+    pub kind: MacroKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MacroKind {
+    Derive,
+    Attribute,
+    Function,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLUGIN LOADER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Plugin loader
+pub struct PluginLoader {
+    /// Search paths
+    search_paths: Vec<PathBuf>,
+    
+    /// Loaded plugin libraries
+    loaded: BTreeMap<String, LoadedPlugin>,
+    
+    /// Registry
+    registry: PluginRegistry,
+}
+
+struct LoadedPlugin {
+    metadata: PluginMetadata,
+    path: PathBuf,
+}
+
+impl PluginLoader {
+    pub fn new() -> Self {
+        PluginLoader {
+            search_paths: Vec::new(),
+            loaded: BTreeMap::new(),
+            registry: PluginRegistry::new(),
+        }
+    }
+    
+    /// Add search path
+    pub fn add_search_path(&mut self, path: PathBuf) {
+        self.search_paths.push(path);
+    }
+    
+    /// Load plugin by name
+    pub fn load(&mut self, name: &str) -> Result<(), PluginError> {
+        if self.loaded.contains_key(name) {
+            return Ok(());
+        }
+        
+        // Find plugin
+        let plugin_path = self.find_plugin(name)?;
+        
+        // Load and initialize
+        // Real implementation would use libloading
+        let metadata = self.load_metadata(&plugin_path)?;
+        
+        // Check dependencies
+        for dep in &metadata.dependencies {
+            if !dep.optional {
+                self.load(&dep.name)?;
+            }
+        }
+        
+        self.loaded.insert(name.to_string(), LoadedPlugin {
+            metadata,
+            path: plugin_path,
+        });
+        
+        Ok(())
+    }
+    
+    fn find_plugin(&self, name: &str) -> Result<PathBuf, PluginError> {
+        for search_path in &self.search_paths {
+            let plugin_path = search_path.join(name);
+            
+            // Try various extensions
+            for ext in &["so", "dylib", "dll", "wasm"] {
+                let path = plugin_path.with_extension(ext);
+                if path.exists() {
+                    return Ok(path);
+                }
+            }
+        }
+        
+        Err(PluginError::NotFound(name.to_string()))
+    }
+    
+    fn load_metadata(&self, _path: &Path) -> Result<PluginMetadata, PluginError> {
+        // Real implementation would read from plugin
+        Ok(PluginMetadata {
+            name: "unknown".to_string(),
+            version: PluginVersion::new(0, 0, 1),
+            description: String::new(),
+            authors: Vec::new(),
+            license: "MIT".to_string(),
+            repository: None,
+            required_compiler: VersionRequirement::Any,
+            capabilities: Vec::new(),
+            dependencies: Vec::new(),
+        })
+    }
+    
+    /// Get registry
+    pub fn registry(&self) -> &PluginRegistry {
+        &self.registry
+    }
+    
+    /// Get mutable registry
+    pub fn registry_mut(&mut self) -> &mut PluginRegistry {
+        &mut self.registry
+    }
+    
+    /// List loaded plugins
+    pub fn list_loaded(&self) -> Vec<&PluginMetadata> {
+        self.loaded.values().map(|p| &p.metadata).collect()
+    }
+}
+
+impl Default for PluginLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum PluginError {
+    NotFound(String),
+    LoadError(String),
+    InitError(String),
+    VersionMismatch { required: String, found: String },
+    DependencyError(String),
+    InvalidMetadata(String),
+}
+
+impl std::fmt::Display for PluginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(n) => write!(f, "plugin not found: {}", n),
+            Self::LoadError(m) => write!(f, "failed to load plugin: {}", m),
+            Self::InitError(m) => write!(f, "plugin initialization failed: {}", m),
+            Self::VersionMismatch { required, found } => {
+                write!(f, "version mismatch: required {}, found {}", required, found)
+            }
+            Self::DependencyError(m) => write!(f, "dependency error: {}", m),
+            Self::InvalidMetadata(m) => write!(f, "invalid plugin metadata: {}", m),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_plugin_version() {
+        let v = PluginVersion::new(1, 2, 3);
+        assert_eq!(v.to_string(), "1.2.3");
+        
+        let parsed = PluginVersion::parse("v1.2.3").unwrap();
+        assert_eq!(v, parsed);
+    }
+    
+    #[test]
+    fn test_version_requirement() {
+        let v = PluginVersion::new(1, 5, 0);
+        
+        assert!(v.satisfies(&VersionRequirement::Caret(PluginVersion::new(1, 0, 0))));
+        assert!(!v.satisfies(&VersionRequirement::Caret(PluginVersion::new(2, 0, 0))));
+        
+        assert!(v.satisfies(&VersionRequirement::Tilde(PluginVersion::new(1, 5, 0))));
+        assert!(!v.satisfies(&VersionRequirement::Tilde(PluginVersion::new(1, 4, 0))));
+    }
+    
+    #[test]
+    fn test_token_stream() {
+        let ts = TokenStream::from_str("foo 42 bar");
+        assert_eq!(ts.tokens.len(), 3);
+    }
+    
+    #[test]
+    fn test_plugin_registry() {
+        let mut registry = PluginRegistry::new();
+        
+        struct TestDerive;
+        impl DeriveMacro for TestDerive {
+            fn name(&self) -> &str { "Test" }
+            fn derive(&self, _: &DeriveInput) -> Result<TokenStream, MacroError> {
+                Ok(TokenStream::new())
+            }
+        }
+        
+        registry.register_derive(Arc::new(TestDerive));
+        assert!(registry.get_derive("Test").is_some());
+        assert!(registry.get_derive("Unknown").is_none());
+    }
+    
+    #[test]
+    fn test_macro_info() {
+        let mut registry = PluginRegistry::new();
+        
+        struct TestFn;
+        impl FunctionMacro for TestFn {
+            fn name(&self) -> &str { "test!" }
+            fn expand(&self, _: TokenStream) -> Result<TokenStream, MacroError> {
+                Ok(TokenStream::new())
+            }
+        }
+        
+        registry.register_fn(Arc::new(TestFn));
+        
+        let macros = registry.list_macros();
+        assert_eq!(macros.len(), 1);
+        assert_eq!(macros[0].name, "test!");
+    }
+}

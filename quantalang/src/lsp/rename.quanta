@@ -1,0 +1,750 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ LSP — Rename Provider
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Comprehensive rename support:
+// - Prepare rename (validation)
+// - Single-file rename
+// - Cross-file workspace rename
+// - Conflict detection
+// - Preview changes
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::lsp::rename
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Position
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Position {
+    pub line: u32,
+    pub character: u32,
+}
+
+impl Position {
+    pub fn new(line: u32, character: u32) -> Self {
+        Position { line, character }
+    }
+}
+
+/// Range
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Range {
+    pub start: Position,
+    pub end: Position,
+}
+
+impl Range {
+    pub fn new(start: Position, end: Position) -> Self {
+        Range { start, end }
+    }
+    
+    pub fn contains(&self, pos: Position) -> bool {
+        pos >= self.start && pos < self.end
+    }
+}
+
+/// Text edit
+#[derive(Debug, Clone)]
+pub struct TextEdit {
+    pub range: Range,
+    pub new_text: String,
+}
+
+impl TextEdit {
+    pub fn new(range: Range, new_text: impl Into<String>) -> Self {
+        TextEdit {
+            range,
+            new_text: new_text.into(),
+        }
+    }
+    
+    pub fn replace(range: Range, new_text: impl Into<String>) -> Self {
+        Self::new(range, new_text)
+    }
+}
+
+/// Text document edit
+#[derive(Debug, Clone)]
+pub struct TextDocumentEdit {
+    pub uri: String,
+    pub version: Option<i32>,
+    pub edits: Vec<TextEdit>,
+}
+
+/// Workspace edit
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceEdit {
+    /// Document changes (preferred)
+    pub document_changes: Vec<TextDocumentEdit>,
+    /// Simple changes (fallback)
+    pub changes: BTreeMap<String, Vec<TextEdit>>,
+    /// Change annotations
+    pub change_annotations: BTreeMap<String, ChangeAnnotation>,
+}
+
+impl WorkspaceEdit {
+    pub fn new() -> Self {
+        WorkspaceEdit::default()
+    }
+    
+    pub fn add_edit(&mut self, uri: impl Into<String>, edit: TextEdit) {
+        self.changes
+            .entry(uri.into())
+            .or_insert_with(Vec::new)
+            .push(edit);
+    }
+    
+    pub fn add_document_edit(&mut self, doc_edit: TextDocumentEdit) {
+        self.document_changes.push(doc_edit);
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.document_changes.is_empty() && self.changes.is_empty()
+    }
+    
+    pub fn file_count(&self) -> usize {
+        if !self.document_changes.is_empty() {
+            self.document_changes.len()
+        } else {
+            self.changes.len()
+        }
+    }
+    
+    pub fn edit_count(&self) -> usize {
+        if !self.document_changes.is_empty() {
+            self.document_changes.iter().map(|d| d.edits.len()).sum()
+        } else {
+            self.changes.values().map(|v| v.len()).sum()
+        }
+    }
+}
+
+/// Change annotation
+#[derive(Debug, Clone)]
+pub struct ChangeAnnotation {
+    pub label: String,
+    pub needs_confirmation: bool,
+    pub description: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PREPARE RENAME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Prepare rename result
+#[derive(Debug, Clone)]
+pub enum PrepareRenameResult {
+    /// Simple range
+    Range(Range),
+    /// Range with placeholder
+    RangeWithPlaceholder { range: Range, placeholder: String },
+    /// Default behavior (use word at position)
+    DefaultBehavior,
+}
+
+/// Prepare rename error
+#[derive(Debug, Clone)]
+pub struct PrepareRenameError {
+    pub message: String,
+}
+
+impl PrepareRenameError {
+    pub fn new(message: impl Into<String>) -> Self {
+        PrepareRenameError { message: message.into() }
+    }
+    
+    pub fn not_renameable() -> Self {
+        Self::new("This element cannot be renamed")
+    }
+    
+    pub fn keyword() -> Self {
+        Self::new("Cannot rename keywords")
+    }
+    
+    pub fn builtin() -> Self {
+        Self::new("Cannot rename built-in types or functions")
+    }
+    
+    pub fn external() -> Self {
+        Self::new("Cannot rename items from external crates")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SYMBOL INFORMATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Symbol identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SymbolId(pub u64);
+
+/// Symbol kind for rename validation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolKind {
+    Variable,
+    Parameter,
+    Function,
+    Method,
+    Struct,
+    Enum,
+    Variant,
+    Field,
+    Trait,
+    TypeAlias,
+    TypeParameter,
+    Lifetime,
+    Const,
+    Static,
+    Module,
+    Macro,
+    Label,
+}
+
+impl SymbolKind {
+    pub fn is_type(&self) -> bool {
+        matches!(self, 
+            SymbolKind::Struct | 
+            SymbolKind::Enum | 
+            SymbolKind::Trait | 
+            SymbolKind::TypeAlias |
+            SymbolKind::TypeParameter
+        )
+    }
+    
+    pub fn requires_pascal_case(&self) -> bool {
+        matches!(self,
+            SymbolKind::Struct |
+            SymbolKind::Enum |
+            SymbolKind::Variant |
+            SymbolKind::Trait |
+            SymbolKind::TypeAlias |
+            SymbolKind::TypeParameter
+        )
+    }
+    
+    pub fn requires_snake_case(&self) -> bool {
+        matches!(self,
+            SymbolKind::Variable |
+            SymbolKind::Parameter |
+            SymbolKind::Function |
+            SymbolKind::Method |
+            SymbolKind::Field |
+            SymbolKind::Module |
+            SymbolKind::Const |
+            SymbolKind::Static
+        )
+    }
+}
+
+/// Symbol for rename
+#[derive(Debug, Clone)]
+pub struct RenameSymbol {
+    pub id: SymbolId,
+    pub name: String,
+    pub kind: SymbolKind,
+    pub definition: SymbolLocation,
+    pub references: Vec<SymbolLocation>,
+    pub is_public: bool,
+    pub is_external: bool,
+    pub is_builtin: bool,
+}
+
+/// Symbol location
+#[derive(Debug, Clone)]
+pub struct SymbolLocation {
+    pub uri: String,
+    pub range: Range,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RENAME PROVIDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Rename provider configuration
+#[derive(Debug, Clone)]
+pub struct RenameConfig {
+    /// Prepare rename support
+    pub prepare_support: bool,
+    /// Honor prepare result
+    pub honor_prepare: bool,
+    /// Validate new name
+    pub validate_name: bool,
+    /// Require confirmation for public symbols
+    pub confirm_public: bool,
+    /// Preview changes
+    pub preview: bool,
+}
+
+impl Default for RenameConfig {
+    fn default() -> Self {
+        RenameConfig {
+            prepare_support: true,
+            honor_prepare: true,
+            validate_name: true,
+            confirm_public: true,
+            preview: true,
+        }
+    }
+}
+
+/// Rename provider
+pub struct RenameProvider {
+    config: RenameConfig,
+    /// Symbol database
+    symbols: Arc<SymbolDatabase>,
+}
+
+impl RenameProvider {
+    pub fn new(config: RenameConfig, symbols: Arc<SymbolDatabase>) -> Self {
+        RenameProvider { config, symbols }
+    }
+    
+    /// Prepare rename at position
+    pub fn prepare_rename(
+        &self,
+        uri: &str,
+        position: Position,
+    ) -> Result<PrepareRenameResult, PrepareRenameError> {
+        // Find symbol at position
+        let symbol = self.symbols.symbol_at(uri, position)
+            .ok_or_else(PrepareRenameError::not_renameable)?;
+        
+        // Check if renameable
+        self.validate_renameable(&symbol)?;
+        
+        Ok(PrepareRenameResult::RangeWithPlaceholder {
+            range: symbol.definition.range,
+            placeholder: symbol.name.clone(),
+        })
+    }
+    
+    /// Perform rename
+    pub fn rename(
+        &self,
+        uri: &str,
+        position: Position,
+        new_name: &str,
+    ) -> Result<WorkspaceEdit, RenameError> {
+        // Find symbol
+        let symbol = self.symbols.symbol_at(uri, position)
+            .ok_or(RenameError::SymbolNotFound)?;
+        
+        // Validate renameable
+        self.validate_renameable(&symbol)
+            .map_err(|e| RenameError::NotRenameable(e.message))?;
+        
+        // Validate new name
+        if self.config.validate_name {
+            self.validate_new_name(new_name, symbol.kind)?;
+        }
+        
+        // Check for conflicts
+        self.check_conflicts(&symbol, new_name)?;
+        
+        // Build workspace edit
+        let edit = self.build_workspace_edit(&symbol, new_name);
+        
+        Ok(edit)
+    }
+    
+    fn validate_renameable(&self, symbol: &RenameSymbol) -> Result<(), PrepareRenameError> {
+        if symbol.is_builtin {
+            return Err(PrepareRenameError::builtin());
+        }
+        
+        if symbol.is_external {
+            return Err(PrepareRenameError::external());
+        }
+        
+        // Check for keywords
+        if is_keyword(&symbol.name) {
+            return Err(PrepareRenameError::keyword());
+        }
+        
+        Ok(())
+    }
+    
+    fn validate_new_name(&self, name: &str, kind: SymbolKind) -> Result<(), RenameError> {
+        // Check not empty
+        if name.is_empty() {
+            return Err(RenameError::InvalidName("Name cannot be empty".to_string()));
+        }
+        
+        // Check valid identifier
+        if !is_valid_identifier(name) {
+            return Err(RenameError::InvalidName(
+                format!("'{}' is not a valid identifier", name)
+            ));
+        }
+        
+        // Check not keyword
+        if is_keyword(name) {
+            return Err(RenameError::InvalidName(
+                format!("'{}' is a reserved keyword", name)
+            ));
+        }
+        
+        // Check naming convention
+        if kind.requires_pascal_case() && !is_pascal_case(name) {
+            // Warning, not error
+        }
+        
+        if kind.requires_snake_case() && !is_snake_case(name) {
+            // Warning, not error
+        }
+        
+        Ok(())
+    }
+    
+    fn check_conflicts(&self, symbol: &RenameSymbol, new_name: &str) -> Result<(), RenameError> {
+        // Check for name conflicts in same scope
+        let conflicts = self.symbols.find_conflicts(symbol, new_name);
+        
+        if !conflicts.is_empty() {
+            return Err(RenameError::Conflict {
+                existing_name: conflicts[0].name.clone(),
+                location: conflicts[0].definition.clone(),
+            });
+        }
+        
+        Ok(())
+    }
+    
+    fn build_workspace_edit(&self, symbol: &RenameSymbol, new_name: &str) -> WorkspaceEdit {
+        let mut edit = WorkspaceEdit::new();
+        
+        // Group edits by file
+        let mut by_file: BTreeMap<String, Vec<TextEdit>> = BTreeMap::new();
+        
+        // Add definition
+        by_file.entry(symbol.definition.uri.clone())
+            .or_insert_with(Vec::new)
+            .push(TextEdit::replace(symbol.definition.range, new_name));
+        
+        // Add references
+        for reference in &symbol.references {
+            by_file.entry(reference.uri.clone())
+                .or_insert_with(Vec::new)
+                .push(TextEdit::replace(reference.range, new_name));
+        }
+        
+        // Build document edits
+        for (uri, edits) in by_file {
+            // Sort edits by position (reverse order for safe application)
+            let mut sorted_edits = edits;
+            sorted_edits.sort_by(|a, b| {
+                b.range.start.cmp(&a.range.start)
+            });
+            
+            edit.add_document_edit(TextDocumentEdit {
+                uri,
+                version: None,
+                edits: sorted_edits,
+            });
+        }
+        
+        // Add annotation for public symbols
+        if symbol.is_public && self.config.confirm_public {
+            edit.change_annotations.insert(
+                "rename-public".to_string(),
+                ChangeAnnotation {
+                    label: "Rename public symbol".to_string(),
+                    needs_confirmation: true,
+                    description: Some(format!(
+                        "This will rename '{}' to '{}' across {} files",
+                        symbol.name,
+                        new_name,
+                        edit.file_count()
+                    )),
+                },
+            );
+        }
+        
+        edit
+    }
+}
+
+/// Rename error
+#[derive(Debug, Clone)]
+pub enum RenameError {
+    SymbolNotFound,
+    NotRenameable(String),
+    InvalidName(String),
+    Conflict { existing_name: String, location: SymbolLocation },
+    IoError(String),
+}
+
+impl std::fmt::Display for RenameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SymbolNotFound => write!(f, "No symbol found at position"),
+            Self::NotRenameable(msg) => write!(f, "Cannot rename: {}", msg),
+            Self::InvalidName(msg) => write!(f, "Invalid name: {}", msg),
+            Self::Conflict { existing_name, location } => {
+                write!(f, "Name '{}' already exists at {}:{}",
+                    existing_name, location.uri, location.range.start.line)
+            }
+            Self::IoError(msg) => write!(f, "I/O error: {}", msg),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SYMBOL DATABASE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Symbol database for rename
+pub struct SymbolDatabase {
+    /// All symbols
+    symbols: BTreeMap<SymbolId, RenameSymbol>,
+    
+    /// Position index: uri -> [(range, symbol_id)]
+    position_index: BTreeMap<String, Vec<(Range, SymbolId)>>,
+    
+    /// Scope tree for conflict detection
+    scopes: BTreeMap<String, ScopeTree>,
+}
+
+/// Scope tree for a file
+#[derive(Debug, Clone, Default)]
+pub struct ScopeTree {
+    pub root: Scope,
+}
+
+/// Scope
+#[derive(Debug, Clone, Default)]
+pub struct Scope {
+    pub range: Option<Range>,
+    pub symbols: BTreeSet<SymbolId>,
+    pub children: Vec<Scope>,
+}
+
+impl SymbolDatabase {
+    pub fn new() -> Self {
+        SymbolDatabase {
+            symbols: BTreeMap::new(),
+            position_index: BTreeMap::new(),
+            scopes: BTreeMap::new(),
+        }
+    }
+    
+    pub fn add_symbol(&mut self, symbol: RenameSymbol) {
+        let id = symbol.id;
+        let uri = symbol.definition.uri.clone();
+        let range = symbol.definition.range;
+        
+        // Add to symbols
+        self.symbols.insert(id, symbol.clone());
+        
+        // Add definition to position index
+        self.position_index
+            .entry(uri.clone())
+            .or_insert_with(Vec::new)
+            .push((range, id));
+        
+        // Add references to position index
+        for reference in &symbol.references {
+            self.position_index
+                .entry(reference.uri.clone())
+                .or_insert_with(Vec::new)
+                .push((reference.range, id));
+        }
+    }
+    
+    pub fn symbol_at(&self, uri: &str, pos: Position) -> Option<RenameSymbol> {
+        let locations = self.position_index.get(uri)?;
+        
+        for (range, id) in locations {
+            if range.contains(pos) {
+                return self.symbols.get(id).cloned();
+            }
+        }
+        
+        None
+    }
+    
+    pub fn find_conflicts(&self, symbol: &RenameSymbol, new_name: &str) -> Vec<RenameSymbol> {
+        // Find symbols with same name in overlapping scopes
+        self.symbols.values()
+            .filter(|s| {
+                s.id != symbol.id &&
+                s.name == new_name &&
+                self.scopes_overlap(symbol, s)
+            })
+            .cloned()
+            .collect()
+    }
+    
+    fn scopes_overlap(&self, a: &RenameSymbol, b: &RenameSymbol) -> bool {
+        // Simplified: check if in same file
+        // Full implementation would check scope hierarchy
+        a.definition.uri == b.definition.uri
+    }
+}
+
+impl Default for SymbolDatabase {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn is_keyword(name: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "as", "async", "await", "break", "const", "continue", "crate", "dyn",
+        "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in",
+        "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+        "self", "Self", "static", "struct", "super", "trait", "true", "type",
+        "unsafe", "use", "where", "while", "yield",
+        // QuantaLang additions
+        "effect", "handler", "perform", "resume", "contract", "requires",
+        "ensures", "invariant",
+    ];
+    
+    KEYWORDS.contains(&name)
+}
+
+fn is_valid_identifier(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    
+    let mut chars = name.chars();
+    
+    // First character: letter or underscore
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    
+    // Remaining: alphanumeric or underscore
+    chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn is_pascal_case(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    
+    // First char uppercase
+    let first = name.chars().next().unwrap();
+    if !first.is_uppercase() {
+        return false;
+    }
+    
+    // No underscores (except leading for private)
+    !name.trim_start_matches('_').contains('_')
+}
+
+fn is_snake_case(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    
+    // All lowercase or underscore
+    name.chars().all(|c| c.is_lowercase() || c.is_numeric() || c == '_')
+}
+
+fn is_screaming_snake_case(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    
+    // All uppercase or underscore
+    name.chars().all(|c| c.is_uppercase() || c.is_numeric() || c == '_')
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_is_keyword() {
+        assert!(is_keyword("fn"));
+        assert!(is_keyword("struct"));
+        assert!(is_keyword("effect"));
+        assert!(!is_keyword("foo"));
+        assert!(!is_keyword("myFunction"));
+    }
+    
+    #[test]
+    fn test_is_valid_identifier() {
+        assert!(is_valid_identifier("foo"));
+        assert!(is_valid_identifier("_bar"));
+        assert!(is_valid_identifier("baz123"));
+        assert!(is_valid_identifier("_"));
+        
+        assert!(!is_valid_identifier(""));
+        assert!(!is_valid_identifier("123foo"));
+        assert!(!is_valid_identifier("foo-bar"));
+        assert!(!is_valid_identifier("foo bar"));
+    }
+    
+    #[test]
+    fn test_is_pascal_case() {
+        assert!(is_pascal_case("MyType"));
+        assert!(is_pascal_case("HTTPServer"));
+        assert!(is_pascal_case("A"));
+        
+        assert!(!is_pascal_case("myType"));
+        assert!(!is_pascal_case("my_type"));
+        assert!(!is_pascal_case("MY_TYPE"));
+    }
+    
+    #[test]
+    fn test_is_snake_case() {
+        assert!(is_snake_case("my_function"));
+        assert!(is_snake_case("foo"));
+        assert!(is_snake_case("a_b_c"));
+        
+        assert!(!is_snake_case("myFunction"));
+        assert!(!is_snake_case("MyFunction"));
+        assert!(!is_snake_case("MY_FUNCTION"));
+    }
+    
+    #[test]
+    fn test_workspace_edit() {
+        let mut edit = WorkspaceEdit::new();
+        
+        edit.add_edit("file:///test.qn", TextEdit::new(
+            Range::new(Position::new(0, 4), Position::new(0, 7)),
+            "bar"
+        ));
+        
+        edit.add_edit("file:///test.qn", TextEdit::new(
+            Range::new(Position::new(5, 8), Position::new(5, 11)),
+            "bar"
+        ));
+        
+        assert_eq!(edit.file_count(), 1);
+        assert_eq!(edit.edit_count(), 2);
+    }
+    
+    #[test]
+    fn test_symbol_kind() {
+        assert!(SymbolKind::Struct.is_type());
+        assert!(SymbolKind::Struct.requires_pascal_case());
+        
+        assert!(!SymbolKind::Function.is_type());
+        assert!(SymbolKind::Function.requires_snake_case());
+    }
+}

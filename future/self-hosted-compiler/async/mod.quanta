@@ -1,0 +1,697 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ ASYNC — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// High-performance async runtime for QuantaLang.
+//
+// Features:
+// - Work-stealing thread pool executor
+// - Multi-platform I/O (epoll/kqueue/IOCP)
+// - Async channels (MPSC, oneshot, broadcast, watch)
+// - Async sync primitives (Mutex, RwLock, Semaphore)
+// - Timer support with hierarchical timing wheel
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang Async Runtime
+//!
+//! A high-performance async runtime with work-stealing executor.
+//!
+//! ## Quick Start
+//!
+//! ```quanta
+//! use quantalang::async::{spawn, sleep};
+//! use quantalang::async::time::Duration;
+//!
+//! async fn main() {
+//!     // Spawn a concurrent task
+//!     let handle = spawn(async {
+//!         sleep(Duration::from_secs(1)).await;
+//!         42
+//!     });
+//!
+//!     // Wait for result
+//!     let result = handle.await;
+//!     println!("Got: {}", result);
+//! }
+//! ```
+//!
+//! ## Channels
+//!
+//! ```quanta
+//! use quantalang::async::channel;
+//!
+//! let (tx, rx) = channel::unbounded();
+//!
+//! spawn(async move {
+//!     tx.send("hello").await.unwrap();
+//! });
+//!
+//! let msg = rx.recv().await.unwrap();
+//! ```
+//!
+//! ## I/O
+//!
+//! ```quanta
+//! use quantalang::async::net::TcpStream;
+//!
+//! let stream = TcpStream::connect("127.0.0.1:8080").await?;
+//! stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await?;
+//! ```
+
+module quantalang::async
+
+// Submodules
+pub mod executor;
+pub mod task;
+pub mod waker;
+pub mod timer;
+pub mod io;
+pub mod channel;
+pub mod sync;
+
+// Re-exports from executor
+pub use executor::{
+    Runtime, ExecutorConfig, Handle, LocalExecutor,
+    ExecutorMetrics, ShutdownError,
+};
+
+// Re-exports from task
+pub use task::{
+    Task, TaskId, TaskState, TaskPriority, JoinHandle, JoinError,
+    AbortHandle,
+};
+
+// Re-exports from waker
+pub use waker::{Waker, WakerRef, RawWaker, RawWakerVTable};
+
+// Re-exports from timer
+pub use timer::{
+    Timer, TimerHandle, Sleep, Timeout, Interval,
+    Instant, Duration,
+};
+
+// Re-exports from io
+pub use io::{
+    Reactor, ReactorConfig, Interest, Event, Token, Events,
+    IoDriver, IoSource, Poll, AsyncRead, AsyncWrite,
+    IoError, IoErrorKind,
+};
+
+// Re-exports from channel
+pub use channel::{
+    // MPSC
+    unbounded, bounded,
+    Sender, Receiver, BoundedSender, BoundedReceiver,
+    // Oneshot
+    oneshot, OneshotSender, OneshotReceiver,
+    // Broadcast
+    broadcast, BroadcastSender, BroadcastReceiver,
+    // Watch
+    watch, WatchSender, WatchReceiver,
+    // Errors
+    SendError, TrySendError, TryRecvError,
+};
+
+// Re-exports from sync
+pub use sync::{
+    Mutex, MutexGuard, OwnedMutexGuard,
+    RwLock, RwLockReadGuard, RwLockWriteGuard,
+    Semaphore, SemaphorePermit, OwnedSemaphorePermit,
+    Barrier, BarrierWaitResult,
+    Notify, OnceCell,
+    AcquireError,
+};
+
+use alloc::sync::Arc;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll as StdPoll};
+use std::thread;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL RUNTIME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static mut GLOBAL_RUNTIME: Option<Runtime> = None;
+static RUNTIME_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Initialize the global runtime
+fn init_global_runtime() {
+    RUNTIME_INIT.call_once(|| {
+        let config = ExecutorConfig::default();
+        let runtime = Runtime::new(config).expect("failed to create runtime");
+        unsafe { GLOBAL_RUNTIME = Some(runtime) };
+    });
+}
+
+/// Get the global runtime handle
+pub fn runtime() -> &'static Runtime {
+    init_global_runtime();
+    unsafe { GLOBAL_RUNTIME.as_ref().unwrap() }
+}
+
+/// Enter the runtime context
+pub fn enter() -> RuntimeGuard {
+    RuntimeGuard { _private: () }
+}
+
+/// Guard that maintains runtime context
+pub struct RuntimeGuard {
+    _private: (),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPAWN API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Spawn a future on the runtime
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    runtime().spawn(future)
+}
+
+/// Spawn a future with specific priority
+pub fn spawn_with_priority<F>(future: F, priority: TaskPriority) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    runtime().spawn_with_priority(future, priority)
+}
+
+/// Spawn a blocking task on a dedicated thread pool
+pub fn spawn_blocking<F, R>(f: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    runtime().spawn_blocking(f)
+}
+
+/// Spawn a local (non-Send) future
+pub fn spawn_local<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    // Local executor needed
+    unimplemented!("spawn_local requires local executor context")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BLOCK_ON
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Block the current thread until the future completes
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    runtime().block_on(future)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIME API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Sleep for a duration
+pub fn sleep(duration: Duration) -> Sleep {
+    timer::sleep(duration)
+}
+
+/// Sleep until an instant
+pub fn sleep_until(instant: Instant) -> Sleep {
+    timer::sleep_until(instant)
+}
+
+/// Create a timeout for a future
+pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
+    timer::timeout(duration, future)
+}
+
+/// Create an interval timer
+pub fn interval(period: Duration) -> Interval {
+    timer::interval(period)
+}
+
+/// Create an interval starting at a specific time
+pub fn interval_at(start: Instant, period: Duration) -> Interval {
+    timer::interval_at(start, period)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// YIELD API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Yield execution back to the runtime
+pub async fn yield_now() {
+    YieldNow { yielded: false }.await
+}
+
+struct YieldNow {
+    yielded: bool,
+}
+
+impl Future for YieldNow {
+    type Output = ();
+    
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<()> {
+        if self.yielded {
+            StdPoll::Ready(())
+        } else {
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            StdPoll::Pending
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SELECT MACRO SUPPORT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Select over multiple futures (returns first to complete)
+pub struct Select<A, B> {
+    a: Option<A>,
+    b: Option<B>,
+}
+
+impl<A, B> Select<A, B> {
+    pub fn new(a: A, b: B) -> Self {
+        Select {
+            a: Some(a),
+            b: Some(b),
+        }
+    }
+}
+
+/// Result of a select operation
+pub enum Either<A, B> {
+    Left(A),
+    Right(B),
+}
+
+impl<A: Future + Unpin, B: Future + Unpin> Future for Select<A, B> {
+    type Output = Either<A::Output, B::Output>;
+    
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
+        // Poll first future
+        if let Some(ref mut a) = self.a {
+            if let StdPoll::Ready(output) = Pin::new(a).poll(cx) {
+                self.a = None;
+                return StdPoll::Ready(Either::Left(output));
+            }
+        }
+        
+        // Poll second future
+        if let Some(ref mut b) = self.b {
+            if let StdPoll::Ready(output) = Pin::new(b).poll(cx) {
+                self.b = None;
+                return StdPoll::Ready(Either::Right(output));
+            }
+        }
+        
+        StdPoll::Pending
+    }
+}
+
+/// Select between two futures
+pub fn select<A, B>(a: A, b: B) -> Select<A, B>
+where
+    A: Future + Unpin,
+    B: Future + Unpin,
+{
+    Select::new(a, b)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOIN UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Join two futures (wait for both to complete)
+pub struct Join<A, B> {
+    a: MaybeDone<A>,
+    b: MaybeDone<B>,
+}
+
+enum MaybeDone<F: Future> {
+    Pending(F),
+    Done(F::Output),
+    Gone,
+}
+
+impl<A: Future + Unpin, B: Future + Unpin> Future for Join<A, B> {
+    type Output = (A::Output, B::Output);
+    
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
+        let mut a_done = false;
+        let mut b_done = false;
+        
+        // Poll first
+        if let MaybeDone::Pending(ref mut f) = self.a {
+            if let StdPoll::Ready(output) = Pin::new(f).poll(cx) {
+                self.a = MaybeDone::Done(output);
+            }
+        }
+        if matches!(self.a, MaybeDone::Done(_)) {
+            a_done = true;
+        }
+        
+        // Poll second
+        if let MaybeDone::Pending(ref mut f) = self.b {
+            if let StdPoll::Ready(output) = Pin::new(f).poll(cx) {
+                self.b = MaybeDone::Done(output);
+            }
+        }
+        if matches!(self.b, MaybeDone::Done(_)) {
+            b_done = true;
+        }
+        
+        if a_done && b_done {
+            let a = match std::mem::replace(&mut self.a, MaybeDone::Gone) {
+                MaybeDone::Done(v) => v,
+                _ => unreachable!(),
+            };
+            let b = match std::mem::replace(&mut self.b, MaybeDone::Gone) {
+                MaybeDone::Done(v) => v,
+                _ => unreachable!(),
+            };
+            StdPoll::Ready((a, b))
+        } else {
+            StdPoll::Pending
+        }
+    }
+}
+
+/// Join two futures
+pub fn join<A, B>(a: A, b: B) -> Join<A, B>
+where
+    A: Future + Unpin,
+    B: Future + Unpin,
+{
+    Join {
+        a: MaybeDone::Pending(a),
+        b: MaybeDone::Pending(b),
+    }
+}
+
+/// Join multiple futures (vec version)
+pub async fn join_all<F>(futures: Vec<F>) -> Vec<F::Output>
+where
+    F: Future,
+{
+    let mut results = Vec::with_capacity(futures.len());
+    
+    // Simple sequential for now
+    for future in futures {
+        results.push(future.await);
+    }
+    
+    results
+}
+
+/// Try to join multiple fallible futures
+pub async fn try_join_all<F, T, E>(futures: Vec<F>) -> Result<Vec<T>, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let mut results = Vec::with_capacity(futures.len());
+    
+    for future in futures {
+        results.push(future.await?);
+    }
+    
+    Ok(results)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TASK LOCAL STORAGE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Task-local storage key
+pub struct LocalKey<T: 'static> {
+    init: fn() -> T,
+}
+
+impl<T: 'static> LocalKey<T> {
+    /// Create a new task-local key
+    pub const fn new(init: fn() -> T) -> Self {
+        LocalKey { init }
+    }
+    
+    /// Access the task-local value
+    pub fn with<F, R>(&'static self, f: F) -> R
+    where
+        F: FnOnce(&T) -> R,
+    {
+        // Would use actual task-local storage
+        let value = (self.init)();
+        f(&value)
+    }
+    
+    /// Try to access the task-local value
+    pub fn try_with<F, R>(&'static self, f: F) -> Result<R, AccessError>
+    where
+        F: FnOnce(&T) -> R,
+    {
+        Ok(self.with(f))
+    }
+}
+
+/// Error accessing task local
+#[derive(Debug, Clone)]
+pub struct AccessError;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCOPED TASKS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A scope for spawning tasks with bounded lifetimes
+pub struct Scope<'scope, 'env: 'scope> {
+    handles: Vec<JoinHandle<()>>,
+    _marker: std::marker::PhantomData<(&'scope (), &'env ())>,
+}
+
+/// Run scoped async tasks
+pub fn scope<'env, F, R>(f: F) -> R
+where
+    F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> R,
+{
+    let scope = Scope {
+        handles: Vec::new(),
+        _marker: std::marker::PhantomData,
+    };
+    
+    let result = f(&scope);
+    
+    // Wait for all spawned tasks
+    for handle in scope.handles {
+        let _ = block_on(handle);
+    }
+    
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UNCONSTRAINED
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Run a future without cooperative scheduling
+pub async fn unconstrained<F: Future>(future: F) -> F::Output {
+    Unconstrained { inner: future }.await
+}
+
+struct Unconstrained<F> {
+    inner: F,
+}
+
+impl<F: Future> Future for Unconstrained<F> {
+    type Output = F::Output;
+    
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
+        // Safety: we don't move the inner future
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
+        
+        // Poll without budget constraints
+        inner.poll(cx)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RUNTIME BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Builder for configuring a runtime
+pub struct RuntimeBuilder {
+    config: ExecutorConfig,
+}
+
+impl RuntimeBuilder {
+    /// Create a new runtime builder
+    pub fn new() -> Self {
+        RuntimeBuilder {
+            config: ExecutorConfig::default(),
+        }
+    }
+    
+    /// Create a multi-threaded runtime builder
+    pub fn new_multi_thread() -> Self {
+        let mut config = ExecutorConfig::default();
+        config.worker_threads = num_cpus();
+        RuntimeBuilder { config }
+    }
+    
+    /// Create a current-thread runtime builder
+    pub fn new_current_thread() -> Self {
+        let mut config = ExecutorConfig::default();
+        config.worker_threads = 1;
+        RuntimeBuilder { config }
+    }
+    
+    /// Set number of worker threads
+    pub fn worker_threads(mut self, n: usize) -> Self {
+        self.config.worker_threads = n;
+        self
+    }
+    
+    /// Set maximum blocking threads
+    pub fn max_blocking_threads(mut self, n: usize) -> Self {
+        self.config.max_blocking_threads = n;
+        self
+    }
+    
+    /// Enable I/O driver
+    pub fn enable_io(mut self) -> Self {
+        self.config.enable_io = true;
+        self
+    }
+    
+    /// Enable time driver
+    pub fn enable_time(mut self) -> Self {
+        self.config.enable_timer = true;
+        self
+    }
+    
+    /// Enable all features
+    pub fn enable_all(mut self) -> Self {
+        self.config.enable_io = true;
+        self.config.enable_timer = true;
+        self
+    }
+    
+    /// Set thread name prefix
+    pub fn thread_name(mut self, name: impl Into<String>) -> Self {
+        self.config.thread_name = name.into();
+        self
+    }
+    
+    /// Set thread stack size
+    pub fn thread_stack_size(mut self, size: usize) -> Self {
+        self.config.thread_stack_size = size;
+        self
+    }
+    
+    /// Build the runtime
+    pub fn build(self) -> Result<Runtime, RuntimeError> {
+        Runtime::new(self.config).map_err(|e| RuntimeError::Build(e.to_string()))
+    }
+}
+
+impl Default for RuntimeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Runtime error
+#[derive(Debug, Clone)]
+pub enum RuntimeError {
+    Build(String),
+    Shutdown(String),
+}
+
+impl std::fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Build(e) => write!(f, "runtime build error: {}", e),
+            Self::Shutdown(e) => write!(f, "runtime shutdown error: {}", e),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Get the number of available CPUs
+pub fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Common async types and traits
+pub mod prelude {
+    pub use super::{
+        spawn, spawn_blocking, block_on, yield_now,
+        sleep, timeout, interval,
+        select, join, join_all, try_join_all,
+        unbounded, bounded, oneshot, broadcast, watch,
+        Mutex, RwLock, Semaphore, Barrier, Notify,
+        JoinHandle, Duration, Instant,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_yield_now() {
+        block_on(async {
+            yield_now().await;
+        });
+    }
+    
+    #[test]
+    fn test_runtime_builder() {
+        let builder = RuntimeBuilder::new()
+            .worker_threads(4)
+            .enable_all();
+        
+        assert_eq!(builder.config.worker_threads, 4);
+    }
+    
+    #[test]
+    fn test_num_cpus() {
+        let cpus = num_cpus();
+        assert!(cpus >= 1);
+    }
+    
+    #[test]
+    fn test_either() {
+        let left: Either<i32, &str> = Either::Left(42);
+        assert!(matches!(left, Either::Left(42)));
+        
+        let right: Either<i32, &str> = Either::Right("hello");
+        assert!(matches!(right, Either::Right("hello")));
+    }
+}

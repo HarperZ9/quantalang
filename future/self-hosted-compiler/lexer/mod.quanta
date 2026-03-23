@@ -1,0 +1,991 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// HARPER™ LEXER - Tokenization Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Quanta. All Rights Reserved.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quanta::lexer
+
+use std::collections::HashMap
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TOKEN DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Token types in Quanta
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenKind {
+    // Literals
+    IntLiteral(i128),
+    FloatLiteral(f64),
+    StringLiteral(String),
+    CharLiteral(char),
+    ByteStringLiteral(Vec<u8>),
+    RawStringLiteral(String),
+    BoolLiteral(bool),
+    
+    // Identifiers
+    Ident(String),
+    Lifetime(String),
+    
+    // Keywords
+    Keyword(Keyword),
+    
+    // Operators
+    Plus, Minus, Star, Slash, Percent, Caret,
+    And, Or, Not, Tilde,
+    Eq, Ne, Lt, Le, Gt, Ge,
+    AndAnd, OrOr,
+    Shl, Shr,
+    PlusEq, MinusEq, StarEq, SlashEq, PercentEq, CaretEq,
+    AndEq, OrEq, ShlEq, ShrEq,
+    Assign,
+    Arrow, FatArrow, Pipe, DoubleColon,
+    Dot, DotDot, DotDotDot, DotDotEq,
+    Question, At, Pound, Dollar,
+    
+    // Delimiters
+    LParen, RParen,
+    LBracket, RBracket,
+    LBrace, RBrace,
+    
+    // Punctuation
+    Comma, Colon, Semi, ColonColon,
+    
+    // Special
+    Eof,
+    Newline,
+    Whitespace,
+    Comment(String),
+    DocComment(String),
+    
+    // DSL blocks (for embedded languages)
+    DslBlock(String, String),  // (dsl_name, content)
+}
+
+/// Keywords in Quanta
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Keyword {
+    // Declarations
+    Fn, Struct, Enum, Trait, Impl, Type, Const, Static, Let, Mut,
+    Pub, Mod, Use, As, Crate, Super, Self_, SelfType,
+    
+    // Control flow
+    If, Else, Match, Loop, While, For, In, Break, Continue, Return,
+    
+    // Expressions
+    True, False, Where,
+    
+    // Memory & Safety
+    Ref, Move, Box, Unsafe, Extern,
+    
+    // Async
+    Async, Await,
+    
+    // Types
+    Dyn, Typeof, Sizeof,
+    
+    // Effect system
+    With, Effect, Handle, Resume,
+    
+    // AI constructs
+    AI, Neural, Infer,
+    
+    // Macros
+    Macro, MacroRules,
+}
+
+impl Keyword {
+    pub fn from_str(s: &str) -> Option<Keyword> {
+        match s {
+            "fn" => Some(Keyword::Fn),
+            "struct" => Some(Keyword::Struct),
+            "enum" => Some(Keyword::Enum),
+            "trait" => Some(Keyword::Trait),
+            "impl" => Some(Keyword::Impl),
+            "type" => Some(Keyword::Type),
+            "const" => Some(Keyword::Const),
+            "static" => Some(Keyword::Static),
+            "let" => Some(Keyword::Let),
+            "mut" => Some(Keyword::Mut),
+            "pub" => Some(Keyword::Pub),
+            "mod" => Some(Keyword::Mod),
+            "use" => Some(Keyword::Use),
+            "as" => Some(Keyword::As),
+            "crate" => Some(Keyword::Crate),
+            "super" => Some(Keyword::Super),
+            "self" => Some(Keyword::Self_),
+            "Self" => Some(Keyword::SelfType),
+            "if" => Some(Keyword::If),
+            "else" => Some(Keyword::Else),
+            "match" => Some(Keyword::Match),
+            "loop" => Some(Keyword::Loop),
+            "while" => Some(Keyword::While),
+            "for" => Some(Keyword::For),
+            "in" => Some(Keyword::In),
+            "break" => Some(Keyword::Break),
+            "continue" => Some(Keyword::Continue),
+            "return" => Some(Keyword::Return),
+            "true" => Some(Keyword::True),
+            "false" => Some(Keyword::False),
+            "where" => Some(Keyword::Where),
+            "ref" => Some(Keyword::Ref),
+            "move" => Some(Keyword::Move),
+            "box" => Some(Keyword::Box),
+            "unsafe" => Some(Keyword::Unsafe),
+            "extern" => Some(Keyword::Extern),
+            "async" => Some(Keyword::Async),
+            "await" => Some(Keyword::Await),
+            "dyn" => Some(Keyword::Dyn),
+            "typeof" => Some(Keyword::Typeof),
+            "sizeof" => Some(Keyword::Sizeof),
+            "with" => Some(Keyword::With),
+            "effect" => Some(Keyword::Effect),
+            "handle" => Some(Keyword::Handle),
+            "resume" => Some(Keyword::Resume),
+            "ai" => Some(Keyword::AI),
+            "neural" => Some(Keyword::Neural),
+            "infer" => Some(Keyword::Infer),
+            "macro" => Some(Keyword::Macro),
+            "macro_rules" => Some(Keyword::MacroRules),
+            _ => None,
+        }
+    }
+}
+
+/// A token with its location
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub span: Span,
+    pub literal: String,
+}
+
+impl Token {
+    pub fn new(kind: TokenKind, span: Span, literal: String) -> Self {
+        Token { kind, span, literal }
+    }
+    
+    pub fn eof(pos: Position) -> Self {
+        Token {
+            kind: TokenKind::Eof,
+            span: Span { 
+                file: String::new(), 
+                start: pos.clone(), 
+                end: pos 
+            },
+            literal: String::new(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LEXER IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The main lexer struct
+pub struct Lexer {
+    source: Vec<char>,
+    file: String,
+    pos: usize,
+    line: u32,
+    column: u32,
+    tokens: Vec<Token>,
+    errors: Vec<LexerError>,
+}
+
+impl Lexer {
+    /// Create a new lexer for the given source
+    pub fn new(source: &str, file: &str) -> Self {
+        Lexer {
+            source: source.chars().collect(),
+            file: file.to_string(),
+            pos: 0,
+            line: 1,
+            column: 1,
+            tokens: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+    
+    /// Tokenize the entire source
+    pub fn tokenize(&mut self) -> Result<Vec<Token>, Vec<LexerError>> {
+        while !self.is_at_end() {
+            self.skip_whitespace_and_comments();
+            
+            if self.is_at_end() {
+                break;
+            }
+            
+            match self.scan_token() {
+                Ok(token) => self.tokens.push(token),
+                Err(e) => self.errors.push(e),
+            }
+        }
+        
+        // Add EOF token
+        self.tokens.push(Token::eof(self.current_position()));
+        
+        if self.errors.is_empty() {
+            Ok(self.tokens.clone())
+        } else {
+            Err(self.errors.clone())
+        }
+    }
+    
+    /// Scan a single token
+    fn scan_token(&mut self) -> Result<Token, LexerError> {
+        let start = self.current_position();
+        let c = self.advance();
+        
+        match c {
+            // Single character tokens
+            '(' => Ok(self.make_token(TokenKind::LParen, start)),
+            ')' => Ok(self.make_token(TokenKind::RParen, start)),
+            '[' => Ok(self.make_token(TokenKind::LBracket, start)),
+            ']' => Ok(self.make_token(TokenKind::RBracket, start)),
+            '{' => Ok(self.make_token(TokenKind::LBrace, start)),
+            '}' => Ok(self.make_token(TokenKind::RBrace, start)),
+            ',' => Ok(self.make_token(TokenKind::Comma, start)),
+            ';' => Ok(self.make_token(TokenKind::Semi, start)),
+            '~' => Ok(self.make_token(TokenKind::Tilde, start)),
+            '?' => Ok(self.make_token(TokenKind::Question, start)),
+            '@' => Ok(self.make_token(TokenKind::At, start)),
+            '#' => Ok(self.make_token(TokenKind::Pound, start)),
+            '$' => Ok(self.make_token(TokenKind::Dollar, start)),
+            
+            // Potentially multi-character tokens
+            '+' => self.scan_compound(start, '+', TokenKind::Plus, 
+                                      &[('=', TokenKind::PlusEq)]),
+            '-' => self.scan_compound(start, '-', TokenKind::Minus,
+                                      &[('=', TokenKind::MinusEq), ('>', TokenKind::Arrow)]),
+            '*' => self.scan_compound(start, '*', TokenKind::Star,
+                                      &[('=', TokenKind::StarEq)]),
+            '/' => self.scan_compound(start, '/', TokenKind::Slash,
+                                      &[('=', TokenKind::SlashEq)]),
+            '%' => self.scan_compound(start, '%', TokenKind::Percent,
+                                      &[('=', TokenKind::PercentEq)]),
+            '^' => self.scan_compound(start, '^', TokenKind::Caret,
+                                      &[('=', TokenKind::CaretEq)]),
+            
+            '&' => self.scan_compound(start, '&', TokenKind::And,
+                                      &[('&', TokenKind::AndAnd), ('=', TokenKind::AndEq)]),
+            '|' => self.scan_compound(start, '|', TokenKind::Or,
+                                      &[('|', TokenKind::OrOr), ('=', TokenKind::OrEq), 
+                                        ('>', TokenKind::Pipe)]),
+            '!' => self.scan_compound(start, '!', TokenKind::Not,
+                                      &[('=', TokenKind::Ne)]),
+            
+            '=' => self.scan_compound(start, '=', TokenKind::Assign,
+                                      &[('=', TokenKind::Eq), ('>', TokenKind::FatArrow)]),
+            '<' => self.scan_angle(start),
+            '>' => self.scan_angle_close(start),
+            
+            ':' => self.scan_colon(start),
+            '.' => self.scan_dot(start),
+            
+            // Strings
+            '"' => self.scan_string(start),
+            '\'' => self.scan_char_or_lifetime(start),
+            'r' if self.check('#') || self.check('"') => self.scan_raw_string(start),
+            'b' if self.check('"') => self.scan_byte_string(start),
+            
+            // Numbers
+            '0'..='9' => self.scan_number(start, c),
+            
+            // Identifiers and keywords
+            'a'..='z' | 'A'..='Z' | '_' => self.scan_identifier(start, c),
+            
+            _ => Err(LexerError {
+                message: format!("Unexpected character: '{}'", c),
+                span: Span {
+                    file: self.file.clone(),
+                    start,
+                    end: self.current_position(),
+                },
+                kind: LexerErrorKind::UnexpectedChar(c),
+            }),
+        }
+    }
+    
+    /// Scan a potentially compound operator
+    fn scan_compound(&mut self, start: Position, first: char, 
+                     single: TokenKind, compounds: &[(char, TokenKind)]) 
+                     -> Result<Token, LexerError> {
+        for (second, kind) in compounds {
+            if self.check(*second) {
+                self.advance();
+                return Ok(self.make_token(kind.clone(), start));
+            }
+        }
+        Ok(self.make_token(single, start))
+    }
+    
+    /// Scan < and related operators
+    fn scan_angle(&mut self, start: Position) -> Result<Token, LexerError> {
+        if self.check('<') {
+            self.advance();
+            if self.check('=') {
+                self.advance();
+                return Ok(self.make_token(TokenKind::ShlEq, start));
+            }
+            return Ok(self.make_token(TokenKind::Shl, start));
+        }
+        if self.check('=') {
+            self.advance();
+            return Ok(self.make_token(TokenKind::Le, start));
+        }
+        Ok(self.make_token(TokenKind::Lt, start))
+    }
+    
+    /// Scan > and related operators
+    fn scan_angle_close(&mut self, start: Position) -> Result<Token, LexerError> {
+        if self.check('>') {
+            self.advance();
+            if self.check('=') {
+                self.advance();
+                return Ok(self.make_token(TokenKind::ShrEq, start));
+            }
+            return Ok(self.make_token(TokenKind::Shr, start));
+        }
+        if self.check('=') {
+            self.advance();
+            return Ok(self.make_token(TokenKind::Ge, start));
+        }
+        Ok(self.make_token(TokenKind::Gt, start))
+    }
+    
+    /// Scan : and ::
+    fn scan_colon(&mut self, start: Position) -> Result<Token, LexerError> {
+        if self.check(':') {
+            self.advance();
+            return Ok(self.make_token(TokenKind::ColonColon, start));
+        }
+        Ok(self.make_token(TokenKind::Colon, start))
+    }
+    
+    /// Scan . and range operators
+    fn scan_dot(&mut self, start: Position) -> Result<Token, LexerError> {
+        if self.check('.') {
+            self.advance();
+            if self.check('.') {
+                self.advance();
+                return Ok(self.make_token(TokenKind::DotDotDot, start));
+            }
+            if self.check('=') {
+                self.advance();
+                return Ok(self.make_token(TokenKind::DotDotEq, start));
+            }
+            return Ok(self.make_token(TokenKind::DotDot, start));
+        }
+        Ok(self.make_token(TokenKind::Dot, start))
+    }
+    
+    /// Scan a string literal
+    fn scan_string(&mut self, start: Position) -> Result<Token, LexerError> {
+        let mut value = String::new();
+        
+        while !self.is_at_end() && !self.check('"') {
+            if self.check('\\') {
+                self.advance();
+                value.push(self.scan_escape()?);
+            } else if self.check('\n') {
+                self.line += 1;
+                self.column = 1;
+                value.push(self.advance());
+            } else {
+                value.push(self.advance());
+            }
+        }
+        
+        if self.is_at_end() {
+            return Err(LexerError {
+                message: "Unterminated string literal".to_string(),
+                span: Span {
+                    file: self.file.clone(),
+                    start,
+                    end: self.current_position(),
+                },
+                kind: LexerErrorKind::UnterminatedString,
+            });
+        }
+        
+        self.advance(); // Closing "
+        Ok(self.make_token(TokenKind::StringLiteral(value), start))
+    }
+    
+    /// Scan escape sequence
+    fn scan_escape(&mut self) -> Result<char, LexerError> {
+        let c = self.advance();
+        match c {
+            'n' => Ok('\n'),
+            'r' => Ok('\r'),
+            't' => Ok('\t'),
+            '\\' => Ok('\\'),
+            '"' => Ok('"'),
+            '\'' => Ok('\''),
+            '0' => Ok('\0'),
+            'x' => {
+                // \xNN - hex escape
+                let hi = self.advance();
+                let lo = self.advance();
+                let value = u8::from_str_radix(&format!("{}{}", hi, lo), 16)
+                    .map_err(|_| LexerError {
+                        message: "Invalid hex escape".to_string(),
+                        span: Span {
+                            file: self.file.clone(),
+                            start: self.current_position(),
+                            end: self.current_position(),
+                        },
+                        kind: LexerErrorKind::InvalidEscape,
+                    })?;
+                Ok(value as char)
+            }
+            'u' => {
+                // \u{NNNN} - unicode escape
+                if self.advance() != '{' {
+                    return Err(LexerError {
+                        message: "Expected '{' after \\u".to_string(),
+                        span: Span {
+                            file: self.file.clone(),
+                            start: self.current_position(),
+                            end: self.current_position(),
+                        },
+                        kind: LexerErrorKind::InvalidEscape,
+                    });
+                }
+                let mut hex = String::new();
+                while !self.check('}') && !self.is_at_end() {
+                    hex.push(self.advance());
+                }
+                self.advance(); // }
+                let value = u32::from_str_radix(&hex, 16)
+                    .map_err(|_| LexerError {
+                        message: "Invalid unicode escape".to_string(),
+                        span: Span {
+                            file: self.file.clone(),
+                            start: self.current_position(),
+                            end: self.current_position(),
+                        },
+                        kind: LexerErrorKind::InvalidEscape,
+                    })?;
+                char::from_u32(value).ok_or(LexerError {
+                    message: "Invalid unicode code point".to_string(),
+                    span: Span {
+                        file: self.file.clone(),
+                        start: self.current_position(),
+                        end: self.current_position(),
+                    },
+                    kind: LexerErrorKind::InvalidEscape,
+                })
+            }
+            _ => Err(LexerError {
+                message: format!("Unknown escape sequence: \\{}", c),
+                span: Span {
+                    file: self.file.clone(),
+                    start: self.current_position(),
+                    end: self.current_position(),
+                },
+                kind: LexerErrorKind::InvalidEscape,
+            }),
+        }
+    }
+    
+    /// Scan character literal or lifetime
+    fn scan_char_or_lifetime(&mut self, start: Position) -> Result<Token, LexerError> {
+        // Check if it's a lifetime
+        if self.peek().is_alphabetic() || self.check('_') {
+            let mut name = String::new();
+            while self.peek().is_alphanumeric() || self.check('_') {
+                name.push(self.advance());
+            }
+            // If followed by ' it's a char, otherwise lifetime
+            if !self.check('\'') {
+                return Ok(self.make_token(TokenKind::Lifetime(name), start));
+            }
+        }
+        
+        // It's a char literal
+        let c = if self.check('\\') {
+            self.advance();
+            self.scan_escape()?
+        } else {
+            self.advance()
+        };
+        
+        if !self.check('\'') {
+            return Err(LexerError {
+                message: "Unterminated character literal".to_string(),
+                span: Span {
+                    file: self.file.clone(),
+                    start,
+                    end: self.current_position(),
+                },
+                kind: LexerErrorKind::UnterminatedString,
+            });
+        }
+        self.advance(); // Closing '
+        
+        Ok(self.make_token(TokenKind::CharLiteral(c), start))
+    }
+    
+    /// Scan raw string literal
+    fn scan_raw_string(&mut self, start: Position) -> Result<Token, LexerError> {
+        // Count # characters
+        let mut hash_count = 0;
+        while self.check('#') {
+            self.advance();
+            hash_count += 1;
+        }
+        
+        if !self.check('"') {
+            return Err(LexerError {
+                message: "Expected '\"' after r#".to_string(),
+                span: Span {
+                    file: self.file.clone(),
+                    start,
+                    end: self.current_position(),
+                },
+                kind: LexerErrorKind::UnterminatedString,
+            });
+        }
+        self.advance(); // Opening "
+        
+        let mut value = String::new();
+        
+        loop {
+            if self.is_at_end() {
+                return Err(LexerError {
+                    message: "Unterminated raw string literal".to_string(),
+                    span: Span {
+                        file: self.file.clone(),
+                        start,
+                        end: self.current_position(),
+                    },
+                    kind: LexerErrorKind::UnterminatedString,
+                });
+            }
+            
+            if self.check('"') {
+                self.advance();
+                // Check for matching # count
+                let mut closing_hashes = 0;
+                while closing_hashes < hash_count && self.check('#') {
+                    self.advance();
+                    closing_hashes += 1;
+                }
+                if closing_hashes == hash_count {
+                    break;
+                }
+                // Not enough #, add to value
+                value.push('"');
+                for _ in 0..closing_hashes {
+                    value.push('#');
+                }
+            } else {
+                if self.check('\n') {
+                    self.line += 1;
+                    self.column = 1;
+                }
+                value.push(self.advance());
+            }
+        }
+        
+        Ok(self.make_token(TokenKind::RawStringLiteral(value), start))
+    }
+    
+    /// Scan byte string literal
+    fn scan_byte_string(&mut self, start: Position) -> Result<Token, LexerError> {
+        self.advance(); // Skip "
+        
+        let mut value = Vec::new();
+        
+        while !self.is_at_end() && !self.check('"') {
+            if self.check('\\') {
+                self.advance();
+                value.push(self.scan_escape()? as u8);
+            } else {
+                value.push(self.advance() as u8);
+            }
+        }
+        
+        if self.is_at_end() {
+            return Err(LexerError {
+                message: "Unterminated byte string literal".to_string(),
+                span: Span {
+                    file: self.file.clone(),
+                    start,
+                    end: self.current_position(),
+                },
+                kind: LexerErrorKind::UnterminatedString,
+            });
+        }
+        
+        self.advance(); // Closing "
+        Ok(self.make_token(TokenKind::ByteStringLiteral(value), start))
+    }
+    
+    /// Scan a number literal
+    fn scan_number(&mut self, start: Position, first: char) -> Result<Token, LexerError> {
+        let mut value = String::from(first);
+        let mut is_float = false;
+        let mut radix = 10;
+        
+        // Check for radix prefix
+        if first == '0' && !self.is_at_end() {
+            match self.peek() {
+                'x' | 'X' => {
+                    radix = 16;
+                    value.push(self.advance());
+                }
+                'o' | 'O' => {
+                    radix = 8;
+                    value.push(self.advance());
+                }
+                'b' | 'B' => {
+                    radix = 2;
+                    value.push(self.advance());
+                }
+                _ => {}
+            }
+        }
+        
+        // Scan digits
+        while !self.is_at_end() {
+            let c = self.peek();
+            if c.is_digit(radix) || c == '_' {
+                if c != '_' {
+                    value.push(c);
+                }
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        
+        // Check for decimal point (only for base 10)
+        if radix == 10 && self.check('.') && !self.check_next('.') {
+            is_float = true;
+            value.push(self.advance());
+            
+            while !self.is_at_end() {
+                let c = self.peek();
+                if c.is_digit(10) || c == '_' {
+                    if c != '_' {
+                        value.push(c);
+                    }
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        
+        // Check for exponent
+        if radix == 10 && (self.check('e') || self.check('E')) {
+            is_float = true;
+            value.push(self.advance());
+            
+            if self.check('+') || self.check('-') {
+                value.push(self.advance());
+            }
+            
+            while !self.is_at_end() && self.peek().is_digit(10) {
+                value.push(self.advance());
+            }
+        }
+        
+        // Parse the value
+        if is_float {
+            match value.parse::<f64>() {
+                Ok(f) => Ok(self.make_token(TokenKind::FloatLiteral(f), start)),
+                Err(_) => Err(LexerError {
+                    message: format!("Invalid float literal: {}", value),
+                    span: Span {
+                        file: self.file.clone(),
+                        start,
+                        end: self.current_position(),
+                    },
+                    kind: LexerErrorKind::InvalidNumber,
+                }),
+            }
+        } else {
+            // Remove radix prefix for parsing
+            let parse_str = if radix != 10 { &value[2..] } else { &value };
+            match i128::from_str_radix(parse_str, radix) {
+                Ok(i) => Ok(self.make_token(TokenKind::IntLiteral(i), start)),
+                Err(_) => Err(LexerError {
+                    message: format!("Invalid integer literal: {}", value),
+                    span: Span {
+                        file: self.file.clone(),
+                        start,
+                        end: self.current_position(),
+                    },
+                    kind: LexerErrorKind::InvalidNumber,
+                }),
+            }
+        }
+    }
+    
+    /// Scan an identifier or keyword
+    fn scan_identifier(&mut self, start: Position, first: char) -> Result<Token, LexerError> {
+        let mut value = String::from(first);
+        
+        while !self.is_at_end() {
+            let c = self.peek();
+            if c.is_alphanumeric() || c == '_' {
+                value.push(self.advance());
+            } else {
+                break;
+            }
+        }
+        
+        // Check for keyword
+        if let Some(kw) = Keyword::from_str(&value) {
+            // Special case for true/false
+            match kw {
+                Keyword::True => return Ok(self.make_token(TokenKind::BoolLiteral(true), start)),
+                Keyword::False => return Ok(self.make_token(TokenKind::BoolLiteral(false), start)),
+                _ => return Ok(self.make_token(TokenKind::Keyword(kw), start)),
+            }
+        }
+        
+        // Check for DSL macro invocation
+        if self.check('!') {
+            // This is a macro - check if it's a known DSL
+            let dsl_names = ["sql", "regex", "math", "finance", "glsl", "shell", "json"];
+            if dsl_names.contains(&value.as_str()) {
+                return self.scan_dsl_block(start, value);
+            }
+        }
+        
+        Ok(self.make_token(TokenKind::Ident(value), start))
+    }
+    
+    /// Scan DSL block content
+    fn scan_dsl_block(&mut self, start: Position, name: String) -> Result<Token, LexerError> {
+        self.advance(); // Skip !
+        
+        // Determine delimiter
+        let (open, close) = if self.check('{') {
+            ('{', '}')
+        } else if self.check('(') {
+            ('(', ')')
+        } else if self.check('[') {
+            ('[', ']')
+        } else {
+            return Err(LexerError {
+                message: format!("Expected delimiter after {}!", name),
+                span: Span {
+                    file: self.file.clone(),
+                    start,
+                    end: self.current_position(),
+                },
+                kind: LexerErrorKind::UnexpectedChar(self.peek()),
+            });
+        };
+        
+        self.advance(); // Opening delimiter
+        
+        let mut content = String::new();
+        let mut depth = 1;
+        
+        while !self.is_at_end() && depth > 0 {
+            let c = self.advance();
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            if c == '\n' {
+                self.line += 1;
+                self.column = 1;
+            }
+            if depth > 0 {
+                content.push(c);
+            }
+        }
+        
+        Ok(self.make_token(TokenKind::DslBlock(name, content), start))
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HELPER METHODS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn skip_whitespace_and_comments(&mut self) {
+        loop {
+            if self.is_at_end() {
+                break;
+            }
+            
+            match self.peek() {
+                ' ' | '\t' | '\r' => {
+                    self.advance();
+                }
+                '\n' => {
+                    self.advance();
+                    self.line += 1;
+                    self.column = 1;
+                }
+                '/' => {
+                    if self.check_next('/') {
+                        // Line comment
+                        while !self.is_at_end() && !self.check('\n') {
+                            self.advance();
+                        }
+                    } else if self.check_next('*') {
+                        // Block comment
+                        self.advance(); // /
+                        self.advance(); // *
+                        let mut depth = 1;
+                        while !self.is_at_end() && depth > 0 {
+                            if self.check('*') && self.check_next('/') {
+                                self.advance();
+                                self.advance();
+                                depth -= 1;
+                            } else if self.check('/') && self.check_next('*') {
+                                self.advance();
+                                self.advance();
+                                depth += 1;
+                            } else {
+                                if self.check('\n') {
+                                    self.line += 1;
+                                    self.column = 1;
+                                }
+                                self.advance();
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+    
+    fn is_at_end(&self) -> bool {
+        self.pos >= self.source.len()
+    }
+    
+    fn peek(&self) -> char {
+        if self.is_at_end() {
+            '\0'
+        } else {
+            self.source[self.pos]
+        }
+    }
+    
+    fn check(&self, expected: char) -> bool {
+        !self.is_at_end() && self.source[self.pos] == expected
+    }
+    
+    fn check_next(&self, expected: char) -> bool {
+        self.pos + 1 < self.source.len() && self.source[self.pos + 1] == expected
+    }
+    
+    fn advance(&mut self) -> char {
+        let c = self.source[self.pos];
+        self.pos += 1;
+        self.column += 1;
+        c
+    }
+    
+    fn current_position(&self) -> Position {
+        Position {
+            line: self.line,
+            column: self.column,
+            offset: self.pos as u32,
+        }
+    }
+    
+    fn make_token(&self, kind: TokenKind, start: Position) -> Token {
+        let end = self.current_position();
+        let literal = self.source[start.offset as usize..end.offset as usize]
+            .iter()
+            .collect();
+        Token {
+            kind,
+            span: Span {
+                file: self.file.clone(),
+                start,
+                end,
+            },
+            literal,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PUBLIC API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Tokenize source code
+pub fn tokenize(source: &str) -> Result<Vec<Token>, Vec<LexerError>> {
+    let mut lexer = Lexer::new(source, "<input>");
+    lexer.tokenize()
+}
+
+/// Tokenize source code with file name
+pub fn tokenize_file(source: &str, file: &str) -> Result<Vec<Token>, Vec<LexerError>> {
+    let mut lexer = Lexer::new(source, file);
+    lexer.tokenize()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*
+    
+    #[test]
+    fn test_basic_tokens() {
+        let tokens = tokenize("let x = 42").unwrap();
+        assert_eq!(tokens.len(), 5); // let, x, =, 42, EOF
+    }
+    
+    #[test]
+    fn test_string_literal() {
+        let tokens = tokenize(r#""hello world""#).unwrap();
+        match &tokens[0].kind {
+            TokenKind::StringLiteral(s) => assert_eq!(s, "hello world"),
+            _ => panic!("Expected string literal"),
+        }
+    }
+    
+    #[test]
+    fn test_number_literals() {
+        let tokens = tokenize("42 3.14 0xFF 0b1010").unwrap();
+        assert_eq!(tokens.len(), 5);
+    }
+    
+    #[test]
+    fn test_operators() {
+        let tokens = tokenize("+ - * / == != <= >=").unwrap();
+        assert_eq!(tokens.len(), 9);
+    }
+    
+    #[test]
+    fn test_keywords() {
+        let tokens = tokenize("fn struct enum trait impl").unwrap();
+        assert_eq!(tokens.len(), 6);
+    }
+    
+    #[test]
+    fn test_dsl_block() {
+        let tokens = tokenize(r#"sql! { SELECT * FROM users }"#).unwrap();
+        match &tokens[0].kind {
+            TokenKind::DslBlock(name, content) => {
+                assert_eq!(name, "sql");
+                assert!(content.contains("SELECT"));
+            }
+            _ => panic!("Expected DSL block"),
+        }
+    }
+}

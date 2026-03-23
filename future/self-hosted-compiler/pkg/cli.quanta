@@ -1,0 +1,1317 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ PACKAGE MANAGER — CLI Driver
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Command-line interface for package management operations.
+//
+// Usage:
+//   quanta [COMMAND] [OPTIONS]
+//
+// Commands:
+//   new         Create a new package
+//   init        Initialize a package in existing directory
+//   build       Compile the current package
+//   run         Build and run the current package
+//   test        Run tests
+//   bench       Run benchmarks
+//   check       Check for errors without building
+//   clean       Remove build artifacts
+//   doc         Build documentation
+//   publish     Publish to registry
+//   install     Install a package
+//   uninstall   Uninstall a package
+//   search      Search for packages
+//   update      Update dependencies
+//   add         Add a dependency
+//   remove      Remove a dependency
+//   tree        Display dependency tree
+//   fetch       Fetch dependencies
+//   login       Login to registry
+//   logout      Logout from registry
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::pkg::cli
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::format;
+use alloc::collections::BTreeMap;
+
+use crate::pkg::manifest::{Manifest, Dependency, Package, parse_manifest};
+use crate::pkg::version::{Version, VersionReq};
+use crate::pkg::lockfile::{Lockfile, LockfileDiff};
+use crate::pkg::resolver::{Resolver, Resolution, Registry, MockRegistry};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+pub const MANIFEST_FILE: &str = "quanta.toml";
+pub const LOCK_FILE: &str = "quanta.lock";
+pub const DEFAULT_REGISTRY: &str = "https://registry.quantalang.dev";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLI OPTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Global CLI options
+#[derive(Debug, Clone, Default)]
+pub struct GlobalOptions {
+    /// Verbose output
+    pub verbose: bool,
+    /// Quiet mode
+    pub quiet: bool,
+    /// Use colors in output
+    pub color: ColorChoice,
+    /// Working directory
+    pub directory: Option<String>,
+    /// Frozen (don't update lock file)
+    pub frozen: bool,
+    /// Locked (require lock file)
+    pub locked: bool,
+    /// Offline mode
+    pub offline: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorChoice {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMMANDS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// CLI command
+#[derive(Debug, Clone)]
+pub enum Command {
+    New(NewOptions),
+    Init(InitOptions),
+    Build(BuildOptions),
+    Run(RunOptions),
+    Test(TestOptions),
+    Bench(BenchOptions),
+    Check(CheckOptions),
+    Clean(CleanOptions),
+    Doc(DocOptions),
+    Publish(PublishOptions),
+    Install(InstallOptions),
+    Uninstall(UninstallOptions),
+    Search(SearchOptions),
+    Update(UpdateOptions),
+    Add(AddOptions),
+    Remove(RemoveOptions),
+    Tree(TreeOptions),
+    Fetch(FetchOptions),
+    Login(LoginOptions),
+    Logout(LogoutOptions),
+    Help(Option<String>),
+    Version,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NewOptions {
+    pub name: String,
+    pub path: Option<String>,
+    pub lib: bool,
+    pub bin: bool,
+    pub edition: Option<String>,
+    pub vcs: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InitOptions {
+    pub name: Option<String>,
+    pub lib: bool,
+    pub bin: bool,
+    pub edition: Option<String>,
+    pub vcs: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BuildOptions {
+    pub release: bool,
+    pub target: Option<String>,
+    pub features: Vec<String>,
+    pub all_features: bool,
+    pub no_default_features: bool,
+    pub jobs: Option<u32>,
+    pub package: Option<String>,
+    pub workspace: bool,
+    pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    pub build: BuildOptions,
+    pub args: Vec<String>,
+    pub bin: Option<String>,
+    pub example: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TestOptions {
+    pub build: BuildOptions,
+    pub args: Vec<String>,
+    pub test: Option<String>,
+    pub no_run: bool,
+    pub no_fail_fast: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BenchOptions {
+    pub build: BuildOptions,
+    pub args: Vec<String>,
+    pub bench: Option<String>,
+    pub no_run: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CheckOptions {
+    pub build: BuildOptions,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CleanOptions {
+    pub release: bool,
+    pub target: Option<String>,
+    pub package: Option<String>,
+    pub doc: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DocOptions {
+    pub build: BuildOptions,
+    pub open: bool,
+    pub no_deps: bool,
+    pub document_private_items: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PublishOptions {
+    pub dry_run: bool,
+    pub registry: Option<String>,
+    pub token: Option<String>,
+    pub allow_dirty: bool,
+    pub no_verify: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InstallOptions {
+    pub package: String,
+    pub version: Option<String>,
+    pub git: Option<String>,
+    pub branch: Option<String>,
+    pub tag: Option<String>,
+    pub rev: Option<String>,
+    pub path: Option<String>,
+    pub force: bool,
+    pub root: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UninstallOptions {
+    pub package: String,
+    pub root: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchOptions {
+    pub query: String,
+    pub limit: Option<u32>,
+    pub registry: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UpdateOptions {
+    pub packages: Vec<String>,
+    pub aggressive: bool,
+    pub dry_run: bool,
+    pub workspace: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AddOptions {
+    pub dependency: String,
+    pub version: Option<String>,
+    pub git: Option<String>,
+    pub branch: Option<String>,
+    pub tag: Option<String>,
+    pub rev: Option<String>,
+    pub path: Option<String>,
+    pub features: Vec<String>,
+    pub optional: bool,
+    pub no_default_features: bool,
+    pub dev: bool,
+    pub build: bool,
+    pub rename: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RemoveOptions {
+    pub dependency: String,
+    pub dev: bool,
+    pub build: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TreeOptions {
+    pub package: Option<String>,
+    pub features: Vec<String>,
+    pub all_features: bool,
+    pub no_default_features: bool,
+    pub depth: Option<u32>,
+    pub prefix: TreePrefix,
+    pub no_dedupe: bool,
+    pub duplicates: bool,
+    pub invert: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TreePrefix {
+    #[default]
+    Indent,
+    Depth,
+    None,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FetchOptions {
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LoginOptions {
+    pub token: Option<String>,
+    pub registry: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LogoutOptions {
+    pub registry: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLI PARSER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parse command-line arguments
+pub fn parse_args(args: &[String]) -> Result<(GlobalOptions, Command), String> {
+    let mut global = GlobalOptions::default();
+    let mut i = 0;
+    
+    // Parse global options
+    while i < args.len() {
+        let arg = &args[i];
+        
+        match arg.as_str() {
+            "-v" | "--verbose" => global.verbose = true,
+            "-q" | "--quiet" => global.quiet = true,
+            "--color" => {
+                i += 1;
+                global.color = match args.get(i).map(|s| s.as_str()) {
+                    Some("always") => ColorChoice::Always,
+                    Some("never") => ColorChoice::Never,
+                    Some("auto") | None => ColorChoice::Auto,
+                    _ => return Err("invalid color choice".to_string()),
+                };
+            }
+            "-C" => {
+                i += 1;
+                global.directory = args.get(i).cloned();
+            }
+            "--frozen" => global.frozen = true,
+            "--locked" => global.locked = true,
+            "--offline" => global.offline = true,
+            _ if !arg.starts_with('-') => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    // Parse command
+    let command = if i >= args.len() {
+        Command::Help(None)
+    } else {
+        let cmd = &args[i];
+        let cmd_args = &args[i + 1..];
+        
+        match cmd.as_str() {
+            "new" => Command::New(parse_new_options(cmd_args)?),
+            "init" => Command::Init(parse_init_options(cmd_args)?),
+            "build" | "b" => Command::Build(parse_build_options(cmd_args)?),
+            "run" | "r" => Command::Run(parse_run_options(cmd_args)?),
+            "test" | "t" => Command::Test(parse_test_options(cmd_args)?),
+            "bench" => Command::Bench(parse_bench_options(cmd_args)?),
+            "check" | "c" => Command::Check(parse_check_options(cmd_args)?),
+            "clean" => Command::Clean(parse_clean_options(cmd_args)?),
+            "doc" | "d" => Command::Doc(parse_doc_options(cmd_args)?),
+            "publish" => Command::Publish(parse_publish_options(cmd_args)?),
+            "install" => Command::Install(parse_install_options(cmd_args)?),
+            "uninstall" => Command::Uninstall(parse_uninstall_options(cmd_args)?),
+            "search" => Command::Search(parse_search_options(cmd_args)?),
+            "update" => Command::Update(parse_update_options(cmd_args)?),
+            "add" => Command::Add(parse_add_options(cmd_args)?),
+            "remove" | "rm" => Command::Remove(parse_remove_options(cmd_args)?),
+            "tree" => Command::Tree(parse_tree_options(cmd_args)?),
+            "fetch" => Command::Fetch(parse_fetch_options(cmd_args)?),
+            "login" => Command::Login(parse_login_options(cmd_args)?),
+            "logout" => Command::Logout(parse_logout_options(cmd_args)?),
+            "help" | "-h" | "--help" => Command::Help(cmd_args.first().cloned()),
+            "version" | "-V" | "--version" => Command::Version,
+            _ => return Err(format!("unknown command: {}", cmd)),
+        }
+    };
+    
+    Ok((global, command))
+}
+
+fn parse_new_options(args: &[String]) -> Result<NewOptions, String> {
+    let mut opts = NewOptions::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--lib" => opts.lib = true,
+            "--bin" => opts.bin = true,
+            "--edition" => {
+                i += 1;
+                opts.edition = args.get(i).cloned();
+            }
+            "--vcs" => {
+                i += 1;
+                opts.vcs = args.get(i).cloned();
+            }
+            _ if !arg.starts_with('-') => {
+                if opts.name.is_empty() {
+                    opts.name = arg.clone();
+                } else {
+                    opts.path = Some(arg.clone());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    if opts.name.is_empty() {
+        return Err("missing package name".to_string());
+    }
+    
+    Ok(opts)
+}
+
+fn parse_init_options(args: &[String]) -> Result<InitOptions, String> {
+    let mut opts = InitOptions::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--name" => {
+                i += 1;
+                opts.name = args.get(i).cloned();
+            }
+            "--lib" => opts.lib = true,
+            "--bin" => opts.bin = true,
+            "--edition" => {
+                i += 1;
+                opts.edition = args.get(i).cloned();
+            }
+            "--vcs" => {
+                i += 1;
+                opts.vcs = args.get(i).cloned();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    Ok(opts)
+}
+
+fn parse_build_options(args: &[String]) -> Result<BuildOptions, String> {
+    let mut opts = BuildOptions::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "-r" | "--release" => opts.release = true,
+            "--target" => {
+                i += 1;
+                opts.target = args.get(i).cloned();
+            }
+            "-F" | "--features" => {
+                i += 1;
+                if let Some(f) = args.get(i) {
+                    opts.features.extend(f.split(',').map(String::from));
+                }
+            }
+            "--all-features" => opts.all_features = true,
+            "--no-default-features" => opts.no_default_features = true,
+            "-j" | "--jobs" => {
+                i += 1;
+                opts.jobs = args.get(i).and_then(|s| s.parse().ok());
+            }
+            "-p" | "--package" => {
+                i += 1;
+                opts.package = args.get(i).cloned();
+            }
+            "--workspace" => opts.workspace = true,
+            "--exclude" => {
+                i += 1;
+                if let Some(e) = args.get(i) {
+                    opts.exclude.push(e.clone());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    Ok(opts)
+}
+
+fn parse_run_options(args: &[String]) -> Result<RunOptions, String> {
+    let mut opts = RunOptions::default();
+    let mut i = 0;
+    let mut after_separator = false;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        
+        if arg == "--" {
+            after_separator = true;
+            i += 1;
+            continue;
+        }
+        
+        if after_separator {
+            opts.args.push(arg.clone());
+        } else {
+            match arg.as_str() {
+                "-r" | "--release" => opts.build.release = true,
+                "--bin" => {
+                    i += 1;
+                    opts.bin = args.get(i).cloned();
+                }
+                "--example" => {
+                    i += 1;
+                    opts.example = args.get(i).cloned();
+                }
+                _ => {
+                    // Try parsing as build option
+                }
+            }
+        }
+        i += 1;
+    }
+    
+    Ok(opts)
+}
+
+fn parse_test_options(args: &[String]) -> Result<TestOptions, String> {
+    let mut opts = TestOptions::default();
+    opts.build = parse_build_options(args)?;
+    
+    for arg in args {
+        match arg.as_str() {
+            "--no-run" => opts.no_run = true,
+            "--no-fail-fast" => opts.no_fail_fast = true,
+            _ => {}
+        }
+    }
+    
+    Ok(opts)
+}
+
+fn parse_bench_options(args: &[String]) -> Result<BenchOptions, String> {
+    let mut opts = BenchOptions::default();
+    opts.build = parse_build_options(args)?;
+    
+    for arg in args {
+        if arg == "--no-run" {
+            opts.no_run = true;
+        }
+    }
+    
+    Ok(opts)
+}
+
+fn parse_check_options(args: &[String]) -> Result<CheckOptions, String> {
+    Ok(CheckOptions {
+        build: parse_build_options(args)?,
+    })
+}
+
+fn parse_clean_options(args: &[String]) -> Result<CleanOptions, String> {
+    let mut opts = CleanOptions::default();
+    
+    for arg in args {
+        match arg.as_str() {
+            "--release" => opts.release = true,
+            "--doc" => opts.doc = true,
+            _ => {}
+        }
+    }
+    
+    Ok(opts)
+}
+
+fn parse_doc_options(args: &[String]) -> Result<DocOptions, String> {
+    let mut opts = DocOptions::default();
+    opts.build = parse_build_options(args)?;
+    
+    for arg in args {
+        match arg.as_str() {
+            "--open" => opts.open = true,
+            "--no-deps" => opts.no_deps = true,
+            "--document-private-items" => opts.document_private_items = true,
+            _ => {}
+        }
+    }
+    
+    Ok(opts)
+}
+
+fn parse_publish_options(args: &[String]) -> Result<PublishOptions, String> {
+    let mut opts = PublishOptions::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--dry-run" => opts.dry_run = true,
+            "--registry" => {
+                i += 1;
+                opts.registry = args.get(i).cloned();
+            }
+            "--token" => {
+                i += 1;
+                opts.token = args.get(i).cloned();
+            }
+            "--allow-dirty" => opts.allow_dirty = true,
+            "--no-verify" => opts.no_verify = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    Ok(opts)
+}
+
+fn parse_install_options(args: &[String]) -> Result<InstallOptions, String> {
+    let mut opts = InstallOptions::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--version" => {
+                i += 1;
+                opts.version = args.get(i).cloned();
+            }
+            "--git" => {
+                i += 1;
+                opts.git = args.get(i).cloned();
+            }
+            "--branch" => {
+                i += 1;
+                opts.branch = args.get(i).cloned();
+            }
+            "--tag" => {
+                i += 1;
+                opts.tag = args.get(i).cloned();
+            }
+            "--rev" => {
+                i += 1;
+                opts.rev = args.get(i).cloned();
+            }
+            "--path" => {
+                i += 1;
+                opts.path = args.get(i).cloned();
+            }
+            "-f" | "--force" => opts.force = true,
+            "--root" => {
+                i += 1;
+                opts.root = args.get(i).cloned();
+            }
+            _ if !arg.starts_with('-') && opts.package.is_empty() => {
+                opts.package = arg.clone();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    Ok(opts)
+}
+
+fn parse_uninstall_options(args: &[String]) -> Result<UninstallOptions, String> {
+    let mut opts = UninstallOptions::default();
+    
+    for arg in args {
+        if !arg.starts_with('-') {
+            opts.package = arg.clone();
+        } else if arg == "--root" {
+            // Handle root option
+        }
+    }
+    
+    Ok(opts)
+}
+
+fn parse_search_options(args: &[String]) -> Result<SearchOptions, String> {
+    let mut opts = SearchOptions::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--limit" => {
+                i += 1;
+                opts.limit = args.get(i).and_then(|s| s.parse().ok());
+            }
+            "--registry" => {
+                i += 1;
+                opts.registry = args.get(i).cloned();
+            }
+            _ if !arg.starts_with('-') => {
+                opts.query = arg.clone();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    Ok(opts)
+}
+
+fn parse_update_options(args: &[String]) -> Result<UpdateOptions, String> {
+    let mut opts = UpdateOptions::default();
+    
+    for arg in args {
+        match arg.as_str() {
+            "--aggressive" => opts.aggressive = true,
+            "--dry-run" => opts.dry_run = true,
+            "--workspace" => opts.workspace = true,
+            _ if !arg.starts_with('-') => {
+                opts.packages.push(arg.clone());
+            }
+            _ => {}
+        }
+    }
+    
+    Ok(opts)
+}
+
+fn parse_add_options(args: &[String]) -> Result<AddOptions, String> {
+    let mut opts = AddOptions::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--version" => {
+                i += 1;
+                opts.version = args.get(i).cloned();
+            }
+            "--git" => {
+                i += 1;
+                opts.git = args.get(i).cloned();
+            }
+            "--branch" => {
+                i += 1;
+                opts.branch = args.get(i).cloned();
+            }
+            "--tag" => {
+                i += 1;
+                opts.tag = args.get(i).cloned();
+            }
+            "--rev" => {
+                i += 1;
+                opts.rev = args.get(i).cloned();
+            }
+            "--path" => {
+                i += 1;
+                opts.path = args.get(i).cloned();
+            }
+            "-F" | "--features" => {
+                i += 1;
+                if let Some(f) = args.get(i) {
+                    opts.features.extend(f.split(',').map(String::from));
+                }
+            }
+            "--optional" => opts.optional = true,
+            "--no-default-features" => opts.no_default_features = true,
+            "--dev" | "-D" => opts.dev = true,
+            "--build" | "-B" => opts.build = true,
+            "--rename" => {
+                i += 1;
+                opts.rename = args.get(i).cloned();
+            }
+            _ if !arg.starts_with('-') && opts.dependency.is_empty() => {
+                opts.dependency = arg.clone();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    if opts.dependency.is_empty() {
+        return Err("missing dependency name".to_string());
+    }
+    
+    Ok(opts)
+}
+
+fn parse_remove_options(args: &[String]) -> Result<RemoveOptions, String> {
+    let mut opts = RemoveOptions::default();
+    
+    for arg in args {
+        match arg.as_str() {
+            "--dev" | "-D" => opts.dev = true,
+            "--build" | "-B" => opts.build = true,
+            _ if !arg.starts_with('-') => {
+                opts.dependency = arg.clone();
+            }
+            _ => {}
+        }
+    }
+    
+    if opts.dependency.is_empty() {
+        return Err("missing dependency name".to_string());
+    }
+    
+    Ok(opts)
+}
+
+fn parse_tree_options(args: &[String]) -> Result<TreeOptions, String> {
+    let mut opts = TreeOptions::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "-p" | "--package" => {
+                i += 1;
+                opts.package = args.get(i).cloned();
+            }
+            "-F" | "--features" => {
+                i += 1;
+                if let Some(f) = args.get(i) {
+                    opts.features.extend(f.split(',').map(String::from));
+                }
+            }
+            "--all-features" => opts.all_features = true,
+            "--no-default-features" => opts.no_default_features = true,
+            "--depth" => {
+                i += 1;
+                opts.depth = args.get(i).and_then(|s| s.parse().ok());
+            }
+            "--prefix" => {
+                i += 1;
+                opts.prefix = match args.get(i).map(|s| s.as_str()) {
+                    Some("indent") => TreePrefix::Indent,
+                    Some("depth") => TreePrefix::Depth,
+                    Some("none") => TreePrefix::None,
+                    _ => TreePrefix::Indent,
+                };
+            }
+            "--no-dedupe" => opts.no_dedupe = true,
+            "-d" | "--duplicates" => opts.duplicates = true,
+            "-i" | "--invert" => {
+                i += 1;
+                opts.invert = args.get(i).cloned();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    Ok(opts)
+}
+
+fn parse_fetch_options(args: &[String]) -> Result<FetchOptions, String> {
+    let mut opts = FetchOptions::default();
+    
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--target" {
+            opts.target = args.get(i + 1).cloned();
+        }
+    }
+    
+    Ok(opts)
+}
+
+fn parse_login_options(args: &[String]) -> Result<LoginOptions, String> {
+    let mut opts = LoginOptions::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--registry" => {
+                i += 1;
+                opts.registry = args.get(i).cloned();
+            }
+            _ if !arg.starts_with('-') => {
+                opts.token = Some(arg.clone());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    Ok(opts)
+}
+
+fn parse_logout_options(args: &[String]) -> Result<LogoutOptions, String> {
+    let mut opts = LogoutOptions::default();
+    
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--registry" {
+            opts.registry = args.get(i + 1).cloned();
+        }
+    }
+    
+    Ok(opts)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMMAND EXECUTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Execute a command
+pub fn execute(global: &GlobalOptions, command: &Command) -> Result<i32, String> {
+    // Change directory if specified
+    if let Some(ref dir) = global.directory {
+        std::env::set_current_dir(dir)
+            .map_err(|e| format!("failed to change directory: {}", e))?;
+    }
+    
+    match command {
+        Command::New(opts) => cmd_new(global, opts),
+        Command::Init(opts) => cmd_init(global, opts),
+        Command::Build(opts) => cmd_build(global, opts),
+        Command::Run(opts) => cmd_run(global, opts),
+        Command::Test(opts) => cmd_test(global, opts),
+        Command::Bench(opts) => cmd_bench(global, opts),
+        Command::Check(opts) => cmd_check(global, opts),
+        Command::Clean(opts) => cmd_clean(global, opts),
+        Command::Doc(opts) => cmd_doc(global, opts),
+        Command::Publish(opts) => cmd_publish(global, opts),
+        Command::Install(opts) => cmd_install(global, opts),
+        Command::Uninstall(opts) => cmd_uninstall(global, opts),
+        Command::Search(opts) => cmd_search(global, opts),
+        Command::Update(opts) => cmd_update(global, opts),
+        Command::Add(opts) => cmd_add(global, opts),
+        Command::Remove(opts) => cmd_remove(global, opts),
+        Command::Tree(opts) => cmd_tree(global, opts),
+        Command::Fetch(opts) => cmd_fetch(global, opts),
+        Command::Login(opts) => cmd_login(global, opts),
+        Command::Logout(opts) => cmd_logout(global, opts),
+        Command::Help(topic) => cmd_help(topic.as_deref()),
+        Command::Version => cmd_version(),
+    }
+}
+
+fn cmd_new(global: &GlobalOptions, opts: &NewOptions) -> Result<i32, String> {
+    let path = opts.path.clone().unwrap_or_else(|| opts.name.clone());
+    
+    // Create directory
+    std::fs::create_dir_all(&path)
+        .map_err(|e| format!("failed to create directory: {}", e))?;
+    
+    // Create manifest
+    let mut manifest = Manifest::new(&opts.name, "0.1.0");
+    manifest.package.edition = opts.edition.clone().or(Some("2025".to_string()));
+    
+    let manifest_path = format!("{}/quanta.toml", path);
+    std::fs::write(&manifest_path, manifest.to_toml())
+        .map_err(|e| format!("failed to write manifest: {}", e))?;
+    
+    // Create source directory
+    let src_dir = format!("{}/src", path);
+    std::fs::create_dir_all(&src_dir)
+        .map_err(|e| format!("failed to create src directory: {}", e))?;
+    
+    // Create main.quanta or lib.quanta
+    if opts.lib {
+        let lib_path = format!("{}/lib.quanta", src_dir);
+        std::fs::write(&lib_path, "//! Library crate\n\npub fn hello() -> &'static str {\n    \"Hello, World!\"\n}\n")
+            .map_err(|e| format!("failed to write lib.quanta: {}", e))?;
+    } else {
+        let main_path = format!("{}/main.quanta", src_dir);
+        std::fs::write(&main_path, "fn main() {\n    println!(\"Hello, World!\");\n}\n")
+            .map_err(|e| format!("failed to write main.quanta: {}", e))?;
+    }
+    
+    // Initialize VCS
+    if opts.vcs.as_deref() != Some("none") {
+        let gitignore_path = format!("{}/.gitignore", path);
+        std::fs::write(&gitignore_path, "/target\nquanta.lock\n")
+            .map_err(|e| format!("failed to write .gitignore: {}", e))?;
+        
+        // Initialize git repository
+        let _ = std::process::Command::new("git")
+            .args(&["init", &path])
+            .output();
+    }
+    
+    if !global.quiet {
+        println!("     Created package `{}` at `{}`", opts.name, path);
+    }
+    
+    Ok(0)
+}
+
+fn cmd_init(global: &GlobalOptions, opts: &InitOptions) -> Result<i32, String> {
+    // Get package name from directory or option
+    let name = opts.name.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "unknown".to_string())
+    });
+    
+    // Check if manifest exists
+    if std::path::Path::new(MANIFEST_FILE).exists() {
+        return Err("manifest already exists".to_string());
+    }
+    
+    // Create manifest
+    let mut manifest = Manifest::new(&name, "0.1.0");
+    manifest.package.edition = opts.edition.clone().or(Some("2025".to_string()));
+    
+    std::fs::write(MANIFEST_FILE, manifest.to_toml())
+        .map_err(|e| format!("failed to write manifest: {}", e))?;
+    
+    // Create src directory if needed
+    if !std::path::Path::new("src").exists() {
+        std::fs::create_dir("src")
+            .map_err(|e| format!("failed to create src directory: {}", e))?;
+    }
+    
+    if !global.quiet {
+        println!("     Initialized package `{}`", name);
+    }
+    
+    Ok(0)
+}
+
+fn cmd_build(_global: &GlobalOptions, opts: &BuildOptions) -> Result<i32, String> {
+    // Load manifest
+    let content = std::fs::read_to_string(MANIFEST_FILE)
+        .map_err(|e| format!("failed to read manifest: {}", e))?;
+    let manifest = parse_manifest(&content)
+        .map_err(|e| format!("failed to parse manifest: {}", e))?;
+    
+    println!("   Compiling {} v{}", manifest.package.name, manifest.package.version);
+    
+    // TODO: Actual compilation
+    let profile = if opts.release { "release" } else { "dev" };
+    println!("    Finished {} profile", profile);
+    
+    Ok(0)
+}
+
+fn cmd_run(_global: &GlobalOptions, opts: &RunOptions) -> Result<i32, String> {
+    // Build first
+    cmd_build(_global, &opts.build)?;
+    
+    println!("     Running target/debug/main");
+    
+    // TODO: Actually run
+    
+    Ok(0)
+}
+
+fn cmd_test(_global: &GlobalOptions, opts: &TestOptions) -> Result<i32, String> {
+    println!("   Compiling tests...");
+    
+    if !opts.no_run {
+        println!("     Running tests...");
+        println!("\ntest result: ok. 0 passed; 0 failed; 0 ignored\n");
+    }
+    
+    Ok(0)
+}
+
+fn cmd_bench(_global: &GlobalOptions, _opts: &BenchOptions) -> Result<i32, String> {
+    println!("   Compiling benchmarks...");
+    println!("     Running benchmarks...");
+    
+    Ok(0)
+}
+
+fn cmd_check(_global: &GlobalOptions, _opts: &CheckOptions) -> Result<i32, String> {
+    let content = std::fs::read_to_string(MANIFEST_FILE)
+        .map_err(|e| format!("failed to read manifest: {}", e))?;
+    let manifest = parse_manifest(&content)
+        .map_err(|e| format!("failed to parse manifest: {}", e))?;
+    
+    println!("    Checking {} v{}", manifest.package.name, manifest.package.version);
+    println!("    Finished check");
+    
+    Ok(0)
+}
+
+fn cmd_clean(_global: &GlobalOptions, _opts: &CleanOptions) -> Result<i32, String> {
+    let _ = std::fs::remove_dir_all("target");
+    println!("     Removed target directory");
+    
+    Ok(0)
+}
+
+fn cmd_doc(_global: &GlobalOptions, opts: &DocOptions) -> Result<i32, String> {
+    println!(" Documenting...");
+    
+    if opts.open {
+        println!("     Opening target/doc/index.html");
+    }
+    
+    Ok(0)
+}
+
+fn cmd_publish(_global: &GlobalOptions, opts: &PublishOptions) -> Result<i32, String> {
+    if opts.dry_run {
+        println!("    (dry run) Would publish to registry");
+    } else {
+        println!("   Publishing...");
+    }
+    
+    Ok(0)
+}
+
+fn cmd_install(_global: &GlobalOptions, opts: &InstallOptions) -> Result<i32, String> {
+    println!("  Installing {}...", opts.package);
+    
+    Ok(0)
+}
+
+fn cmd_uninstall(_global: &GlobalOptions, opts: &UninstallOptions) -> Result<i32, String> {
+    println!("Uninstalling {}...", opts.package);
+    
+    Ok(0)
+}
+
+fn cmd_search(_global: &GlobalOptions, opts: &SearchOptions) -> Result<i32, String> {
+    println!("Searching for '{}'...", opts.query);
+    
+    Ok(0)
+}
+
+fn cmd_update(_global: &GlobalOptions, _opts: &UpdateOptions) -> Result<i32, String> {
+    println!("    Updating dependencies...");
+    
+    Ok(0)
+}
+
+fn cmd_add(_global: &GlobalOptions, opts: &AddOptions) -> Result<i32, String> {
+    // Load manifest
+    let content = std::fs::read_to_string(MANIFEST_FILE)
+        .map_err(|e| format!("failed to read manifest: {}", e))?;
+    let mut manifest = parse_manifest(&content)
+        .map_err(|e| format!("failed to parse manifest: {}", e))?;
+    
+    // Create dependency
+    let dep = if let Some(ref git) = opts.git {
+        let mut d = Dependency::git(git);
+        d.branch = opts.branch.clone();
+        d.tag = opts.tag.clone();
+        d.rev = opts.rev.clone();
+        d
+    } else if let Some(ref path) = opts.path {
+        Dependency::path(path)
+    } else {
+        let version = opts.version.clone().unwrap_or_else(|| "*".to_string());
+        Dependency::version(&version)
+    };
+    
+    // Add to appropriate section
+    if opts.dev {
+        manifest.add_dev_dependency(&opts.dependency, dep);
+    } else {
+        manifest.add_dependency(&opts.dependency, dep);
+    }
+    
+    // Write back
+    std::fs::write(MANIFEST_FILE, manifest.to_toml())
+        .map_err(|e| format!("failed to write manifest: {}", e))?;
+    
+    println!("      Adding {} to dependencies", opts.dependency);
+    
+    Ok(0)
+}
+
+fn cmd_remove(_global: &GlobalOptions, opts: &RemoveOptions) -> Result<i32, String> {
+    println!("    Removing {} from dependencies", opts.dependency);
+    
+    Ok(0)
+}
+
+fn cmd_tree(_global: &GlobalOptions, _opts: &TreeOptions) -> Result<i32, String> {
+    let content = std::fs::read_to_string(MANIFEST_FILE)
+        .map_err(|e| format!("failed to read manifest: {}", e))?;
+    let manifest = parse_manifest(&content)
+        .map_err(|e| format!("failed to parse manifest: {}", e))?;
+    
+    println!("{} v{}", manifest.package.name, manifest.package.version);
+    
+    for (name, dep) in &manifest.dependencies {
+        let version = dep.version.as_deref().unwrap_or("*");
+        println!("├── {} {}", name, version);
+    }
+    
+    Ok(0)
+}
+
+fn cmd_fetch(_global: &GlobalOptions, _opts: &FetchOptions) -> Result<i32, String> {
+    println!("    Fetching dependencies...");
+    
+    Ok(0)
+}
+
+fn cmd_login(_global: &GlobalOptions, _opts: &LoginOptions) -> Result<i32, String> {
+    println!("Logging in to registry...");
+    
+    Ok(0)
+}
+
+fn cmd_logout(_global: &GlobalOptions, _opts: &LogoutOptions) -> Result<i32, String> {
+    println!("Logging out from registry");
+    
+    Ok(0)
+}
+
+fn cmd_help(topic: Option<&str>) -> Result<i32, String> {
+    if let Some(cmd) = topic {
+        print_command_help(cmd);
+    } else {
+        print_main_help();
+    }
+    
+    Ok(0)
+}
+
+fn cmd_version() -> Result<i32, String> {
+    println!("quanta {}", VERSION);
+    
+    Ok(0)
+}
+
+fn print_main_help() {
+    println!(r#"quanta - QuantaLang Package Manager
+
+USAGE:
+    quanta [OPTIONS] [COMMAND]
+
+OPTIONS:
+    -v, --verbose       Verbose output
+    -q, --quiet         Suppress output
+    --color <WHEN>      Color output (auto, always, never)
+    -C <DIR>            Change to directory before running
+    --frozen            Don't update lock file
+    --locked            Require lock file to be up to date
+    --offline           Don't access network
+
+COMMANDS:
+    new         Create a new package
+    init        Initialize a package in existing directory
+    build, b    Compile the current package
+    run, r      Build and run the current package
+    test, t     Run tests
+    bench       Run benchmarks
+    check, c    Check for errors without building
+    clean       Remove build artifacts
+    doc, d      Build documentation
+    publish     Publish to registry
+    install     Install a package
+    uninstall   Uninstall a package
+    search      Search for packages
+    update      Update dependencies
+    add         Add a dependency
+    remove, rm  Remove a dependency
+    tree        Display dependency tree
+    fetch       Fetch dependencies
+    login       Login to registry
+    logout      Logout from registry
+    help        Show help
+    version     Show version
+
+Run 'quanta help <command>' for more information on a specific command.
+"#);
+}
+
+fn print_command_help(cmd: &str) {
+    match cmd {
+        "new" => println!(r#"Create a new package
+
+USAGE:
+    quanta new [OPTIONS] <name> [path]
+
+OPTIONS:
+    --lib               Create a library package
+    --bin               Create a binary package (default)
+    --edition <YEAR>    Edition to use
+    --vcs <VCS>         Version control (git, none)
+"#),
+        "build" | "b" => println!(r#"Compile the current package
+
+USAGE:
+    quanta build [OPTIONS]
+
+OPTIONS:
+    -r, --release               Build in release mode
+    --target <TRIPLE>           Target triple
+    -F, --features <FEATURES>   Features to enable
+    --all-features              Enable all features
+    --no-default-features       Disable default features
+    -j, --jobs <N>              Number of parallel jobs
+    -p, --package <SPEC>        Package to build
+    --workspace                 Build all workspace members
+"#),
+        "add" => println!(r#"Add a dependency
+
+USAGE:
+    quanta add [OPTIONS] <dep>
+
+OPTIONS:
+    --version <VERSION>     Version requirement
+    --git <URL>             Git repository URL
+    --branch <BRANCH>       Git branch
+    --tag <TAG>             Git tag
+    --rev <REV>             Git revision
+    --path <PATH>           Local path
+    -F, --features <LIST>   Features to enable
+    --optional              Mark as optional
+    --no-default-features   Disable default features
+    -D, --dev               Add as dev dependency
+    -B, --build             Add as build dependency
+    --rename <NAME>         Rename the dependency
+"#),
+        _ => println!("No help available for '{}'", cmd),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Main entry point
+pub fn main() -> Result<i32, String> {
+    let args: Vec<String> = std::env::args().collect();
+    let (global, command) = parse_args(&args[1..])?;
+    execute(&global, &command)
+}

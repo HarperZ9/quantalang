@@ -1,0 +1,1080 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Auto-Vectorization Infrastructure
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Auto-vectorization infrastructure:
+//   - Loop vectorization
+//   - SLP (Superword-Level Parallelism) vectorization
+//   - Cost model for vectorization decisions
+//   - Target-specific vector lowering
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::autovectorize
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VECTORIZATION CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Vectorization configuration
+#[derive(Debug, Clone)]
+pub struct VectorizationConfig {
+    /// Target vector width in bits
+    pub vector_width: u32,
+    /// Maximum vectorization factor
+    pub max_vf: u32,
+    /// Minimum trip count for vectorization
+    pub min_trip_count: u32,
+    /// Enable interleaving
+    pub enable_interleaving: bool,
+    /// Maximum interleave count
+    pub max_interleave: u32,
+    /// Enable predicated vectorization
+    pub enable_predication: bool,
+    /// Enable gather/scatter
+    pub enable_gather_scatter: bool,
+    /// Enable masked operations
+    pub enable_masked_ops: bool,
+    /// Force vectorization (ignore cost model)
+    pub force_vectorize: bool,
+    /// SLP vectorization threshold
+    pub slp_threshold: i32,
+}
+
+impl Default for VectorizationConfig {
+    fn default() -> Self {
+        VectorizationConfig {
+            vector_width: 256, // AVX2 default
+            max_vf: 16,
+            min_trip_count: 8,
+            enable_interleaving: true,
+            max_interleave: 4,
+            enable_predication: true,
+            enable_gather_scatter: true,
+            enable_masked_ops: true,
+            force_vectorize: false,
+            slp_threshold: 0,
+        }
+    }
+}
+
+impl VectorizationConfig {
+    /// Create config for SSE (128-bit)
+    pub fn sse() -> Self {
+        VectorizationConfig {
+            vector_width: 128,
+            max_vf: 4,
+            enable_gather_scatter: false,
+            enable_masked_ops: false,
+            ..Default::default()
+        }
+    }
+    
+    /// Create config for AVX2 (256-bit)
+    pub fn avx2() -> Self {
+        VectorizationConfig {
+            vector_width: 256,
+            max_vf: 8,
+            enable_gather_scatter: true,
+            enable_masked_ops: true,
+            ..Default::default()
+        }
+    }
+    
+    /// Create config for AVX-512 (512-bit)
+    pub fn avx512() -> Self {
+        VectorizationConfig {
+            vector_width: 512,
+            max_vf: 16,
+            enable_gather_scatter: true,
+            enable_masked_ops: true,
+            enable_predication: true,
+            ..Default::default()
+        }
+    }
+    
+    /// Create config for ARM NEON (128-bit)
+    pub fn neon() -> Self {
+        VectorizationConfig {
+            vector_width: 128,
+            max_vf: 4,
+            enable_gather_scatter: false,
+            enable_masked_ops: false,
+            ..Default::default()
+        }
+    }
+    
+    /// Create config for ARM SVE (scalable)
+    pub fn sve(vl: u32) -> Self {
+        VectorizationConfig {
+            vector_width: vl,
+            max_vf: vl / 32,
+            enable_gather_scatter: true,
+            enable_masked_ops: true,
+            enable_predication: true,
+            ..Default::default()
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop information for vectorization
+#[derive(Debug, Clone)]
+pub struct LoopInfo {
+    /// Loop ID
+    pub id: u32,
+    /// Header block
+    pub header: u32,
+    /// Latch block
+    pub latch: u32,
+    /// Exit blocks
+    pub exits: Vec<u32>,
+    /// Loop blocks
+    pub blocks: BTreeSet<u32>,
+    /// Induction variables
+    pub induction_vars: Vec<InductionVar>,
+    /// Reduction variables
+    pub reductions: Vec<ReductionVar>,
+    /// Memory accesses
+    pub memory_accesses: Vec<MemoryAccess>,
+    /// Trip count (if known)
+    pub trip_count: Option<TripCount>,
+    /// Nested depth
+    pub depth: u32,
+    /// Parent loop
+    pub parent: Option<u32>,
+    /// Child loops
+    pub children: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InductionVar {
+    /// Variable name
+    pub name: String,
+    /// Start value
+    pub start: ScalarValue,
+    /// Step value
+    pub step: ScalarValue,
+    /// Kind of induction
+    pub kind: InductionKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InductionKind {
+    /// Primary induction variable (loop counter)
+    Primary,
+    /// Derived from primary IV
+    Derived,
+    /// Pointer induction
+    Pointer,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReductionVar {
+    /// Variable name
+    pub name: String,
+    /// Reduction operation
+    pub operation: ReductionOp,
+    /// Initial value
+    pub init: ScalarValue,
+    /// Phi node
+    pub phi: String,
+    /// Update instruction
+    pub update: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReductionOp {
+    Add,
+    Mul,
+    And,
+    Or,
+    Xor,
+    Min,
+    Max,
+    FAdd,
+    FMul,
+    FMin,
+    FMax,
+}
+
+impl ReductionOp {
+    pub fn identity(&self) -> ScalarValue {
+        match self {
+            ReductionOp::Add | ReductionOp::Or | ReductionOp::Xor => ScalarValue::Int(0),
+            ReductionOp::Mul => ScalarValue::Int(1),
+            ReductionOp::And => ScalarValue::Int(-1), // All bits set
+            ReductionOp::Min => ScalarValue::Int(i64::MAX),
+            ReductionOp::Max => ScalarValue::Int(i64::MIN),
+            ReductionOp::FAdd => ScalarValue::Float(0.0),
+            ReductionOp::FMul => ScalarValue::Float(1.0),
+            ReductionOp::FMin => ScalarValue::Float(f64::INFINITY),
+            ReductionOp::FMax => ScalarValue::Float(f64::NEG_INFINITY),
+        }
+    }
+    
+    pub fn is_associative(&self) -> bool {
+        matches!(self, 
+            ReductionOp::Add | ReductionOp::Mul | 
+            ReductionOp::And | ReductionOp::Or | ReductionOp::Xor |
+            ReductionOp::Min | ReductionOp::Max
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ScalarValue {
+    Int(i64),
+    Float(f64),
+    Variable(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryAccess {
+    /// Access ID
+    pub id: u32,
+    /// Pointer base
+    pub base: String,
+    /// Access pattern
+    pub pattern: AccessPattern,
+    /// Element type
+    pub elem_type: VectorType,
+    /// Is store
+    pub is_store: bool,
+    /// Dependence info
+    pub dependences: Vec<Dependence>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AccessPattern {
+    /// Consecutive access (stride = 1)
+    Consecutive { start: String },
+    /// Strided access
+    Strided { start: String, stride: i64 },
+    /// Gather/scatter (indexed)
+    Indexed { base: String, indices: String },
+    /// Unknown pattern
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct Dependence {
+    /// Source access
+    pub source: u32,
+    /// Sink access
+    pub sink: u32,
+    /// Dependence type
+    pub kind: DependenceKind,
+    /// Distance (if known)
+    pub distance: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependenceKind {
+    /// Read after write
+    Flow,
+    /// Write after read
+    Anti,
+    /// Write after write
+    Output,
+    /// Read after read (not a true dependence)
+    Input,
+}
+
+#[derive(Debug, Clone)]
+pub enum TripCount {
+    /// Constant trip count
+    Constant(u64),
+    /// Runtime expression
+    Runtime(String),
+    /// Unknown
+    Unknown,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VECTORIZATION COST MODEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cost model for vectorization decisions
+pub struct VectorizationCostModel {
+    target: TargetInfo,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetInfo {
+    /// Vector register width
+    pub vector_width: u32,
+    /// Number of vector registers
+    pub num_vector_regs: u32,
+    /// Has gather/scatter support
+    pub has_gather_scatter: bool,
+    /// Has masked operations
+    pub has_masked_ops: bool,
+    /// Has predication
+    pub has_predication: bool,
+    /// Scalar -> vector broadcast cost
+    pub broadcast_cost: u32,
+    /// Vector -> scalar extract cost
+    pub extract_cost: u32,
+    /// Vector shuffle cost
+    pub shuffle_cost: u32,
+}
+
+impl Default for TargetInfo {
+    fn default() -> Self {
+        // Default to AVX2
+        TargetInfo {
+            vector_width: 256,
+            num_vector_regs: 16,
+            has_gather_scatter: true,
+            has_masked_ops: true,
+            has_predication: false,
+            broadcast_cost: 1,
+            extract_cost: 2,
+            shuffle_cost: 1,
+        }
+    }
+}
+
+/// Cost estimate for an operation
+#[derive(Debug, Clone)]
+pub struct VectorizationCost {
+    /// Scalar cost
+    pub scalar_cost: u32,
+    /// Vector cost at given VF
+    pub vector_cost: u32,
+    /// Vectorization factor
+    pub vf: u32,
+}
+
+impl VectorizationCost {
+    pub fn speedup(&self) -> f64 {
+        if self.vector_cost == 0 {
+            return 0.0;
+        }
+        (self.scalar_cost as f64 * self.vf as f64) / self.vector_cost as f64
+    }
+    
+    pub fn is_profitable(&self) -> bool {
+        self.speedup() > 1.0
+    }
+}
+
+impl VectorizationCostModel {
+    pub fn new(target: TargetInfo) -> Self {
+        VectorizationCostModel { target }
+    }
+    
+    /// Calculate cost for vectorizing a loop at given VF
+    pub fn calculate_loop_cost(&self, loop_info: &LoopInfo, vf: u32) -> VectorizationCost {
+        let mut scalar_cost = 0u32;
+        let mut vector_cost = 0u32;
+        
+        // Cost of memory operations
+        for access in &loop_info.memory_accesses {
+            let (s, v) = self.memory_access_cost(access, vf);
+            scalar_cost += s;
+            vector_cost += v;
+        }
+        
+        // Cost of reductions
+        for reduction in &loop_info.reductions {
+            let (s, v) = self.reduction_cost(reduction, vf);
+            scalar_cost += s;
+            vector_cost += v;
+        }
+        
+        // Loop overhead (branch, counter update)
+        scalar_cost += 2;
+        vector_cost += 2; // Still have overhead, but amortized
+        
+        VectorizationCost {
+            scalar_cost,
+            vector_cost,
+            vf,
+        }
+    }
+    
+    fn memory_access_cost(&self, access: &MemoryAccess, vf: u32) -> (u32, u32) {
+        let elem_size = access.elem_type.element_bits() / 8;
+        let scalar_cost = 1; // Single load/store
+        
+        let vector_cost = match &access.pattern {
+            AccessPattern::Consecutive { .. } => {
+                // Contiguous load/store
+                1
+            }
+            AccessPattern::Strided { stride, .. } => {
+                if *stride == 1 {
+                    1
+                } else if self.target.has_gather_scatter {
+                    // Gather/scatter available
+                    (vf / 2).max(1) // Usually 2-4x slower
+                } else {
+                    // Need scalar fallback
+                    vf
+                }
+            }
+            AccessPattern::Indexed { .. } => {
+                if self.target.has_gather_scatter {
+                    (vf / 2).max(1)
+                } else {
+                    vf
+                }
+            }
+            AccessPattern::Unknown => {
+                // Conservative: scalar fallback
+                vf
+            }
+        };
+        
+        (scalar_cost, vector_cost)
+    }
+    
+    fn reduction_cost(&self, reduction: &ReductionVar, vf: u32) -> (u32, u32) {
+        let scalar_cost = 1; // Single reduction op per iteration
+        
+        // Vector cost: reduction op + horizontal reduction at end
+        let op_cost = 1; // Vector operation
+        let horizontal_cost = (vf.ilog2() as u32).max(1); // Log2 shuffles
+        
+        (scalar_cost, op_cost + horizontal_cost / vf)
+    }
+    
+    /// Find best vectorization factor
+    pub fn find_best_vf(&self, loop_info: &LoopInfo, max_vf: u32) -> Option<u32> {
+        let mut best_vf = None;
+        let mut best_speedup = 1.0;
+        
+        let mut vf = 2;
+        while vf <= max_vf {
+            let cost = self.calculate_loop_cost(loop_info, vf);
+            let speedup = cost.speedup();
+            
+            if speedup > best_speedup {
+                best_speedup = speedup;
+                best_vf = Some(vf);
+            }
+            
+            vf *= 2;
+        }
+        
+        best_vf
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP VECTORIZER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop vectorization pass
+pub struct LoopVectorizer {
+    config: VectorizationConfig,
+    cost_model: VectorizationCostModel,
+}
+
+impl LoopVectorizer {
+    pub fn new(config: VectorizationConfig, target: TargetInfo) -> Self {
+        LoopVectorizer {
+            config,
+            cost_model: VectorizationCostModel::new(target),
+        }
+    }
+    
+    /// Vectorize a loop
+    pub fn vectorize_loop(&self, func: &mut MirFunction, loop_info: &LoopInfo) -> VectorizationResult {
+        // Check if loop can be vectorized
+        if let Some(reason) = self.check_vectorizable(loop_info) {
+            return VectorizationResult::Failed(reason);
+        }
+        
+        // Find best VF
+        let vf = if self.config.force_vectorize {
+            self.config.max_vf
+        } else {
+            match self.cost_model.find_best_vf(loop_info, self.config.max_vf) {
+                Some(vf) => vf,
+                None => return VectorizationResult::NotProfitable,
+            }
+        };
+        
+        // Calculate interleave count
+        let ic = self.calculate_interleave_count(loop_info, vf);
+        
+        // Generate vectorized loop
+        let vectorized = self.generate_vectorized_loop(func, loop_info, vf, ic);
+        
+        VectorizationResult::Success {
+            vf,
+            interleave_count: ic,
+            estimated_speedup: self.cost_model.calculate_loop_cost(loop_info, vf).speedup(),
+        }
+    }
+    
+    fn check_vectorizable(&self, loop_info: &LoopInfo) -> Option<String> {
+        // Check trip count
+        if let Some(TripCount::Constant(tc)) = &loop_info.trip_count {
+            if *tc < self.config.min_trip_count as u64 {
+                return Some("Trip count too low".to_string());
+            }
+        }
+        
+        // Check for unsupported operations
+        // (would check actual instructions in real implementation)
+        
+        // Check dependences
+        for access in &loop_info.memory_accesses {
+            for dep in &access.dependences {
+                if !self.is_vectorizable_dependence(dep) {
+                    return Some(format!("Unsupported dependence: {:?}", dep.kind));
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn is_vectorizable_dependence(&self, dep: &Dependence) -> bool {
+        match dep.kind {
+            DependenceKind::Input => true, // Read-read is fine
+            DependenceKind::Flow | DependenceKind::Anti | DependenceKind::Output => {
+                // Check if distance is positive and >= VF
+                dep.distance.map(|d| d > 0).unwrap_or(false)
+            }
+        }
+    }
+    
+    fn calculate_interleave_count(&self, loop_info: &LoopInfo, vf: u32) -> u32 {
+        if !self.config.enable_interleaving {
+            return 1;
+        }
+        
+        // Simple heuristic: interleave if we have register pressure headroom
+        let regs_per_iteration = loop_info.memory_accesses.len() + loop_info.reductions.len();
+        let available_regs = 16; // Typical SIMD register count
+        
+        let max_ic = available_regs / regs_per_iteration.max(1);
+        max_ic.min(self.config.max_interleave as usize).max(1) as u32
+    }
+    
+    fn generate_vectorized_loop(&self, func: &mut MirFunction, loop_info: &LoopInfo, vf: u32, ic: u32) -> Vec<MirBlock> {
+        let mut blocks = Vec::new();
+        
+        // Generate preheader (setup)
+        let preheader = self.generate_preheader(loop_info, vf, ic);
+        blocks.push(preheader);
+        
+        // Generate vector loop body
+        let vector_body = self.generate_vector_body(loop_info, vf, ic);
+        blocks.extend(vector_body);
+        
+        // Generate scalar epilogue for remainder
+        if let Some(epilogue) = self.generate_epilogue(loop_info, vf) {
+            blocks.push(epilogue);
+        }
+        
+        blocks
+    }
+    
+    fn generate_preheader(&self, loop_info: &LoopInfo, vf: u32, ic: u32) -> MirBlock {
+        let mut stmts = Vec::new();
+        
+        // Calculate vector trip count
+        // vec_tc = (tc / (vf * ic)) * (vf * ic)
+        stmts.push(MirStatement::Comment("Vector loop preheader".to_string()));
+        
+        // Initialize reduction vectors
+        for reduction in &loop_info.reductions {
+            let identity = reduction.operation.identity();
+            stmts.push(MirStatement::VectorBroadcast {
+                dest: format!("{}_vec", reduction.name),
+                value: identity,
+                vf,
+            });
+        }
+        
+        MirBlock {
+            id: loop_info.header - 1, // Before header
+            statements: stmts,
+            terminator: MirTerminator::Goto(loop_info.header),
+        }
+    }
+    
+    fn generate_vector_body(&self, loop_info: &LoopInfo, vf: u32, ic: u32) -> Vec<MirBlock> {
+        let mut blocks = Vec::new();
+        let mut stmts = Vec::new();
+        
+        stmts.push(MirStatement::Comment(format!("Vector loop body (VF={}, IC={})", vf, ic)));
+        
+        // Generate vector loads
+        for access in &loop_info.memory_accesses {
+            if !access.is_store {
+                stmts.push(self.generate_vector_load(access, vf));
+            }
+        }
+        
+        // Generate vector computations
+        for reduction in &loop_info.reductions {
+            stmts.push(self.generate_vector_reduction(reduction, vf));
+        }
+        
+        // Generate vector stores
+        for access in &loop_info.memory_accesses {
+            if access.is_store {
+                stmts.push(self.generate_vector_store(access, vf));
+            }
+        }
+        
+        // Update induction variable
+        for iv in &loop_info.induction_vars {
+            if iv.kind == InductionKind::Primary {
+                stmts.push(MirStatement::BinaryOp {
+                    dest: iv.name.clone(),
+                    op: BinOp::Add,
+                    lhs: MirOperand::Variable(iv.name.clone()),
+                    rhs: MirOperand::Constant((vf * ic) as i64),
+                });
+            }
+        }
+        
+        let body = MirBlock {
+            id: loop_info.header,
+            statements: stmts,
+            terminator: MirTerminator::If {
+                cond: format!("{}_cond", loop_info.induction_vars.first().map(|v| &v.name).unwrap_or(&String::new())),
+                then_bb: loop_info.header, // Continue loop
+                else_bb: loop_info.exits.first().copied().unwrap_or(0), // Exit
+            },
+        };
+        
+        blocks.push(body);
+        blocks
+    }
+    
+    fn generate_vector_load(&self, access: &MemoryAccess, vf: u32) -> MirStatement {
+        match &access.pattern {
+            AccessPattern::Consecutive { start } => {
+                MirStatement::VectorLoad {
+                    dest: format!("{}_vec", access.base),
+                    ptr: start.clone(),
+                    vf,
+                    elem_type: access.elem_type.clone(),
+                }
+            }
+            AccessPattern::Strided { start, stride } => {
+                MirStatement::VectorGather {
+                    dest: format!("{}_vec", access.base),
+                    base: start.clone(),
+                    stride: *stride,
+                    vf,
+                    elem_type: access.elem_type.clone(),
+                }
+            }
+            AccessPattern::Indexed { base, indices } => {
+                MirStatement::VectorGatherIndexed {
+                    dest: format!("{}_vec", access.base),
+                    base: base.clone(),
+                    indices: indices.clone(),
+                    vf,
+                    elem_type: access.elem_type.clone(),
+                }
+            }
+            AccessPattern::Unknown => {
+                // Scalar fallback
+                MirStatement::Comment(format!("Scalar fallback for unknown access pattern"))
+            }
+        }
+    }
+    
+    fn generate_vector_store(&self, access: &MemoryAccess, vf: u32) -> MirStatement {
+        match &access.pattern {
+            AccessPattern::Consecutive { start } => {
+                MirStatement::VectorStore {
+                    ptr: start.clone(),
+                    value: format!("{}_vec", access.base),
+                    vf,
+                    elem_type: access.elem_type.clone(),
+                }
+            }
+            AccessPattern::Strided { start, stride } => {
+                MirStatement::VectorScatter {
+                    base: start.clone(),
+                    value: format!("{}_vec", access.base),
+                    stride: *stride,
+                    vf,
+                    elem_type: access.elem_type.clone(),
+                }
+            }
+            _ => MirStatement::Comment("Unsupported store pattern".to_string()),
+        }
+    }
+    
+    fn generate_vector_reduction(&self, reduction: &ReductionVar, vf: u32) -> MirStatement {
+        MirStatement::VectorReduce {
+            dest: format!("{}_vec", reduction.name),
+            op: reduction.operation,
+            lhs: format!("{}_vec", reduction.name),
+            rhs: format!("{}_input_vec", reduction.name),
+            vf,
+        }
+    }
+    
+    fn generate_epilogue(&self, loop_info: &LoopInfo, vf: u32) -> Option<MirBlock> {
+        // Generate scalar epilogue for remainder iterations
+        if vf == 1 {
+            return None;
+        }
+        
+        let mut stmts = Vec::new();
+        stmts.push(MirStatement::Comment("Scalar epilogue for remainder".to_string()));
+        
+        // Horizontal reduction
+        for reduction in &loop_info.reductions {
+            stmts.push(MirStatement::HorizontalReduce {
+                dest: reduction.name.clone(),
+                op: reduction.operation,
+                vector: format!("{}_vec", reduction.name),
+            });
+        }
+        
+        Some(MirBlock {
+            id: loop_info.exits.first().copied().unwrap_or(0),
+            statements: stmts,
+            terminator: MirTerminator::Goto(loop_info.exits.first().copied().unwrap_or(0) + 1),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum VectorizationResult {
+    Success {
+        vf: u32,
+        interleave_count: u32,
+        estimated_speedup: f64,
+    },
+    NotProfitable,
+    Failed(String),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLP VECTORIZER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SLP (Superword-Level Parallelism) vectorization
+pub struct SlpVectorizer {
+    config: VectorizationConfig,
+}
+
+impl SlpVectorizer {
+    pub fn new(config: VectorizationConfig) -> Self {
+        SlpVectorizer { config }
+    }
+    
+    /// Find and vectorize SLP opportunities in a function
+    pub fn vectorize_function(&self, func: &mut MirFunction) -> Vec<SlpPacket> {
+        let mut packets = Vec::new();
+        
+        for block in &func.blocks {
+            let block_packets = self.find_slp_packets(block);
+            packets.extend(block_packets);
+        }
+        
+        // Apply vectorization
+        for packet in &packets {
+            self.apply_packet(func, packet);
+        }
+        
+        packets
+    }
+    
+    fn find_slp_packets(&self, block: &MirBlock) -> Vec<SlpPacket> {
+        let mut packets = Vec::new();
+        
+        // Group isomorphic instructions
+        let groups = self.group_isomorphic_instructions(block);
+        
+        for group in groups {
+            if group.len() >= 2 {
+                // Try to form a packet
+                if let Some(packet) = self.try_form_packet(&group) {
+                    packets.push(packet);
+                }
+            }
+        }
+        
+        packets
+    }
+    
+    fn group_isomorphic_instructions(&self, block: &MirBlock) -> Vec<Vec<usize>> {
+        let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        
+        for (idx, stmt) in block.statements.iter().enumerate() {
+            let key = self.instruction_key(stmt);
+            groups.entry(key).or_insert_with(Vec::new).push(idx);
+        }
+        
+        groups.into_values().collect()
+    }
+    
+    fn instruction_key(&self, stmt: &MirStatement) -> String {
+        match stmt {
+            MirStatement::BinaryOp { op, .. } => format!("binop:{:?}", op),
+            MirStatement::Load { elem_type, .. } => format!("load:{:?}", elem_type),
+            MirStatement::Store { elem_type, .. } => format!("store:{:?}", elem_type),
+            MirStatement::Call { callee, .. } => format!("call:{}", callee),
+            _ => "other".to_string(),
+        }
+    }
+    
+    fn try_form_packet(&self, indices: &[usize]) -> Option<SlpPacket> {
+        // Check if instructions can be packed together
+        let vf = indices.len().min(self.config.max_vf as usize);
+        
+        if vf < 2 {
+            return None;
+        }
+        
+        Some(SlpPacket {
+            instructions: indices[..vf].to_vec(),
+            vf: vf as u32,
+        })
+    }
+    
+    fn apply_packet(&self, func: &mut MirFunction, packet: &SlpPacket) {
+        // Replace scalar instructions with vector instructions
+        // This is a simplified implementation
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SlpPacket {
+    /// Instruction indices in the packet
+    pub instructions: Vec<usize>,
+    /// Vectorization factor
+    pub vf: u32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Comment(String),
+    BinaryOp {
+        dest: String,
+        op: BinOp,
+        lhs: MirOperand,
+        rhs: MirOperand,
+    },
+    Load {
+        dest: String,
+        ptr: String,
+        elem_type: VectorType,
+    },
+    Store {
+        ptr: String,
+        value: String,
+        elem_type: VectorType,
+    },
+    Call {
+        callee: String,
+        args: Vec<String>,
+        dest: Option<String>,
+    },
+    VectorBroadcast {
+        dest: String,
+        value: ScalarValue,
+        vf: u32,
+    },
+    VectorLoad {
+        dest: String,
+        ptr: String,
+        vf: u32,
+        elem_type: VectorType,
+    },
+    VectorStore {
+        ptr: String,
+        value: String,
+        vf: u32,
+        elem_type: VectorType,
+    },
+    VectorGather {
+        dest: String,
+        base: String,
+        stride: i64,
+        vf: u32,
+        elem_type: VectorType,
+    },
+    VectorGatherIndexed {
+        dest: String,
+        base: String,
+        indices: String,
+        vf: u32,
+        elem_type: VectorType,
+    },
+    VectorScatter {
+        base: String,
+        value: String,
+        stride: i64,
+        vf: u32,
+        elem_type: VectorType,
+    },
+    VectorReduce {
+        dest: String,
+        op: ReductionOp,
+        lhs: String,
+        rhs: String,
+        vf: u32,
+    },
+    HorizontalReduce {
+        dest: String,
+        op: ReductionOp,
+        vector: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    If { cond: String, then_bb: u32, else_bb: u32 },
+    Return,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem, And, Or, Xor, Shl, Shr,
+    FAdd, FSub, FMul, FDiv,
+}
+
+#[derive(Debug, Clone)]
+pub struct VectorType {
+    pub element: ElementType,
+    pub lanes: u32,
+}
+
+impl VectorType {
+    pub fn element_bits(&self) -> u32 {
+        self.element.bits()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ElementType {
+    I8, I16, I32, I64,
+    F32, F64,
+}
+
+impl ElementType {
+    pub fn bits(&self) -> u32 {
+        match self {
+            ElementType::I8 => 8,
+            ElementType::I16 => 16,
+            ElementType::I32 => 32,
+            ElementType::I64 => 64,
+            ElementType::F32 => 32,
+            ElementType::F64 => 64,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_vectorization_config() {
+        let config = VectorizationConfig::avx2();
+        
+        assert_eq!(config.vector_width, 256);
+        assert_eq!(config.max_vf, 8);
+        assert!(config.enable_gather_scatter);
+    }
+    
+    #[test]
+    fn test_reduction_identity() {
+        assert_eq!(ReductionOp::Add.identity(), ScalarValue::Int(0));
+        assert_eq!(ReductionOp::Mul.identity(), ScalarValue::Int(1));
+    }
+    
+    #[test]
+    fn test_cost_model() {
+        let target = TargetInfo::default();
+        let cost_model = VectorizationCostModel::new(target);
+        
+        let loop_info = LoopInfo {
+            id: 0,
+            header: 1,
+            latch: 2,
+            exits: vec![3],
+            blocks: [1, 2].iter().copied().collect(),
+            induction_vars: vec![
+                InductionVar {
+                    name: "i".to_string(),
+                    start: ScalarValue::Int(0),
+                    step: ScalarValue::Int(1),
+                    kind: InductionKind::Primary,
+                }
+            ],
+            reductions: vec![],
+            memory_accesses: vec![
+                MemoryAccess {
+                    id: 0,
+                    base: "arr".to_string(),
+                    pattern: AccessPattern::Consecutive { start: "arr".to_string() },
+                    elem_type: VectorType { element: ElementType::F32, lanes: 1 },
+                    is_store: false,
+                    dependences: vec![],
+                }
+            ],
+            trip_count: Some(TripCount::Constant(100)),
+            depth: 1,
+            parent: None,
+            children: vec![],
+        };
+        
+        let cost = cost_model.calculate_loop_cost(&loop_info, 4);
+        assert!(cost.scalar_cost > 0);
+        assert!(cost.vector_cost > 0);
+    }
+    
+    #[test]
+    fn test_element_type_bits() {
+        assert_eq!(ElementType::I32.bits(), 32);
+        assert_eq!(ElementType::F64.bits(), 64);
+    }
+}

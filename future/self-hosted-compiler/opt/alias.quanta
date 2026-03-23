@@ -1,0 +1,929 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Alias Analysis
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Alias analysis infrastructure:
+//   - Basic alias analysis
+//   - Type-based alias analysis (TBAA)
+//   - Steensgaard's analysis
+//   - Andersen's analysis
+//   - Mod/Ref analysis
+//   - Memory SSA
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::alias
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALIAS RESULT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Result of alias query
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AliasResult {
+    /// Definitely do not alias
+    NoAlias,
+    /// May or may not alias
+    MayAlias,
+    /// Partially overlap
+    PartialAlias,
+    /// Definitely alias (same location)
+    MustAlias,
+}
+
+impl AliasResult {
+    /// Combine two alias results (conservative)
+    pub fn merge(self, other: AliasResult) -> AliasResult {
+        match (self, other) {
+            (AliasResult::NoAlias, AliasResult::NoAlias) => AliasResult::NoAlias,
+            (AliasResult::MustAlias, AliasResult::MustAlias) => AliasResult::MustAlias,
+            _ => AliasResult::MayAlias,
+        }
+    }
+    
+    pub fn is_no_alias(self) -> bool {
+        self == AliasResult::NoAlias
+    }
+    
+    pub fn is_must_alias(self) -> bool {
+        self == AliasResult::MustAlias
+    }
+}
+
+/// Mod/Ref behavior for function calls
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModRefBehavior {
+    /// Function does not access memory
+    NoModRef,
+    /// Function only reads memory
+    Ref,
+    /// Function only writes memory
+    Mod,
+    /// Function reads and writes memory
+    ModRef,
+    /// Function only accesses argument pointees
+    ArgMemOnly,
+    /// Function only accesses inaccessible memory
+    InaccessibleMemOnly,
+    /// Function accesses argument pointees and inaccessible memory
+    InaccessibleOrArgMemOnly,
+}
+
+impl ModRefBehavior {
+    pub fn does_ref(self) -> bool {
+        matches!(self, ModRefBehavior::Ref | ModRefBehavior::ModRef | 
+                      ModRefBehavior::ArgMemOnly | ModRefBehavior::InaccessibleOrArgMemOnly)
+    }
+    
+    pub fn does_mod(self) -> bool {
+        matches!(self, ModRefBehavior::Mod | ModRefBehavior::ModRef |
+                      ModRefBehavior::ArgMemOnly | ModRefBehavior::InaccessibleOrArgMemOnly)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY LOCATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Memory location for alias queries
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MemoryLocation {
+    /// Base pointer
+    pub ptr: PointerValue,
+    /// Size of access (None = unknown)
+    pub size: Option<u64>,
+    /// Access is atomic
+    pub is_atomic: bool,
+    /// TBAA metadata
+    pub tbaa: Option<TbaaNode>,
+}
+
+impl MemoryLocation {
+    pub fn new(ptr: PointerValue, size: u64) -> Self {
+        MemoryLocation {
+            ptr,
+            size: Some(size),
+            is_atomic: false,
+            tbaa: None,
+        }
+    }
+    
+    pub fn unknown_size(ptr: PointerValue) -> Self {
+        MemoryLocation {
+            ptr,
+            size: None,
+            is_atomic: false,
+            tbaa: None,
+        }
+    }
+    
+    pub fn with_tbaa(mut self, tbaa: TbaaNode) -> Self {
+        self.tbaa = Some(tbaa);
+        self
+    }
+}
+
+/// Pointer value for alias analysis
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PointerValue {
+    /// Named variable
+    Variable(String),
+    /// Global variable
+    Global(String),
+    /// Allocation
+    Alloc(AllocId),
+    /// GetElementPtr result
+    Gep { base: Box<PointerValue>, offset: i64 },
+    /// Cast result
+    Cast(Box<PointerValue>),
+    /// Phi result
+    Phi(Vec<PointerValue>),
+    /// Null pointer
+    Null,
+    /// Unknown pointer
+    Unknown,
+}
+
+/// Allocation ID
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AllocId(pub u64);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BASIC ALIAS ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Basic alias analysis implementation
+pub struct BasicAliasAnalysis {
+    /// Known no-alias pairs (from restrict, etc.)
+    no_alias_scopes: BTreeSet<(String, String)>,
+}
+
+impl BasicAliasAnalysis {
+    pub fn new() -> Self {
+        BasicAliasAnalysis {
+            no_alias_scopes: BTreeSet::new(),
+        }
+    }
+    
+    /// Query alias relationship
+    pub fn alias(&self, loc_a: &MemoryLocation, loc_b: &MemoryLocation) -> AliasResult {
+        // Same pointer is MustAlias
+        if loc_a.ptr == loc_b.ptr {
+            return if self.sizes_overlap(loc_a, loc_b) {
+                AliasResult::MustAlias
+            } else {
+                AliasResult::NoAlias
+            };
+        }
+        
+        // Null doesn't alias anything
+        if matches!(&loc_a.ptr, PointerValue::Null) || 
+           matches!(&loc_b.ptr, PointerValue::Null) {
+            return AliasResult::NoAlias;
+        }
+        
+        // Check no-alias scopes
+        if self.in_no_alias_scope(&loc_a.ptr, &loc_b.ptr) {
+            return AliasResult::NoAlias;
+        }
+        
+        // Check TBAA
+        if let (Some(tbaa_a), Some(tbaa_b)) = (&loc_a.tbaa, &loc_b.tbaa) {
+            if !tbaa_a.may_alias(tbaa_b) {
+                return AliasResult::NoAlias;
+            }
+        }
+        
+        // Different allocation sites
+        if let (PointerValue::Alloc(a), PointerValue::Alloc(b)) = (&loc_a.ptr, &loc_b.ptr) {
+            if a != b {
+                return AliasResult::NoAlias;
+            }
+        }
+        
+        // Globals don't alias stack allocations
+        if self.is_global(&loc_a.ptr) && self.is_stack_alloc(&loc_b.ptr) {
+            return AliasResult::NoAlias;
+        }
+        if self.is_global(&loc_b.ptr) && self.is_stack_alloc(&loc_a.ptr) {
+            return AliasResult::NoAlias;
+        }
+        
+        // Check GEP-based disjointness
+        if let Some(result) = self.gep_alias(&loc_a.ptr, loc_a.size, &loc_b.ptr, loc_b.size) {
+            return result;
+        }
+        
+        AliasResult::MayAlias
+    }
+    
+    fn sizes_overlap(&self, loc_a: &MemoryLocation, loc_b: &MemoryLocation) -> bool {
+        // If either size is unknown, assume overlap
+        match (loc_a.size, loc_b.size) {
+            (Some(0), _) | (_, Some(0)) => false,
+            _ => true,
+        }
+    }
+    
+    fn in_no_alias_scope(&self, ptr_a: &PointerValue, ptr_b: &PointerValue) -> bool {
+        if let (PointerValue::Variable(a), PointerValue::Variable(b)) = (ptr_a, ptr_b) {
+            self.no_alias_scopes.contains(&(a.clone(), b.clone())) ||
+            self.no_alias_scopes.contains(&(b.clone(), a.clone()))
+        } else {
+            false
+        }
+    }
+    
+    fn is_global(&self, ptr: &PointerValue) -> bool {
+        matches!(ptr, PointerValue::Global(_))
+    }
+    
+    fn is_stack_alloc(&self, ptr: &PointerValue) -> bool {
+        matches!(ptr, PointerValue::Alloc(_))
+    }
+    
+    fn gep_alias(&self, ptr_a: &PointerValue, size_a: Option<u64>, 
+                 ptr_b: &PointerValue, size_b: Option<u64>) -> Option<AliasResult> {
+        // Check if both are GEPs from the same base
+        if let (PointerValue::Gep { base: base_a, offset: off_a },
+                PointerValue::Gep { base: base_b, offset: off_b }) = (ptr_a, ptr_b) {
+            if base_a == base_b {
+                // Same base, check if ranges overlap
+                if let (Some(sa), Some(sb)) = (size_a, size_b) {
+                    let end_a = off_a + sa as i64;
+                    let end_b = off_b + sb as i64;
+                    
+                    if end_a <= *off_b || end_b <= *off_a {
+                        return Some(AliasResult::NoAlias);
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    /// Add a no-alias relationship
+    pub fn add_no_alias(&mut self, a: impl Into<String>, b: impl Into<String>) {
+        self.no_alias_scopes.insert((a.into(), b.into()));
+    }
+    
+    /// Get mod/ref behavior for a function call
+    pub fn get_mod_ref(&self, callee: &str) -> ModRefBehavior {
+        // Check known pure functions
+        match callee {
+            "sqrt" | "sin" | "cos" | "exp" | "log" | "abs" |
+            "strlen" | "strcmp" => ModRefBehavior::Ref,
+            
+            "memcpy" | "memmove" | "memset" => ModRefBehavior::ModRef,
+            
+            "malloc" | "calloc" | "realloc" => ModRefBehavior::InaccessibleMemOnly,
+            
+            "free" => ModRefBehavior::ArgMemOnly,
+            
+            _ => ModRefBehavior::ModRef,
+        }
+    }
+}
+
+impl Default for BasicAliasAnalysis {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE-BASED ALIAS ANALYSIS (TBAA)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// TBAA node in the type hierarchy
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TbaaNode {
+    /// Node name
+    pub name: String,
+    /// Parent in hierarchy (None = root)
+    pub parent: Option<Box<TbaaNode>>,
+    /// Is this a scalar type (leaf)
+    pub is_scalar: bool,
+    /// Offset within parent for struct access paths
+    pub offset: Option<u64>,
+}
+
+impl TbaaNode {
+    /// Create root node
+    pub fn root(name: impl Into<String>) -> Self {
+        TbaaNode {
+            name: name.into(),
+            parent: None,
+            is_scalar: false,
+            offset: None,
+        }
+    }
+    
+    /// Create scalar type node
+    pub fn scalar(name: impl Into<String>, parent: TbaaNode) -> Self {
+        TbaaNode {
+            name: name.into(),
+            parent: Some(Box::new(parent)),
+            is_scalar: true,
+            offset: None,
+        }
+    }
+    
+    /// Create struct field access node
+    pub fn struct_field(name: impl Into<String>, parent: TbaaNode, offset: u64) -> Self {
+        TbaaNode {
+            name: name.into(),
+            parent: Some(Box::new(parent)),
+            is_scalar: false,
+            offset: Some(offset),
+        }
+    }
+    
+    /// Check if two TBAA nodes may alias
+    pub fn may_alias(&self, other: &TbaaNode) -> bool {
+        // If either is an ancestor of the other, they may alias
+        if self.is_ancestor_of(other) || other.is_ancestor_of(self) {
+            return true;
+        }
+        
+        // If they share a common ancestor but are different branches, no alias
+        // (strict aliasing rule)
+        if self.is_scalar && other.is_scalar {
+            return false;
+        }
+        
+        true
+    }
+    
+    /// Check if self is an ancestor of other
+    pub fn is_ancestor_of(&self, other: &TbaaNode) -> bool {
+        let mut current = other;
+        
+        loop {
+            if current == self {
+                return true;
+            }
+            
+            match &current.parent {
+                Some(p) => current = p,
+                None => return false,
+            }
+        }
+    }
+}
+
+/// TBAA type hierarchy
+pub struct TbaaHierarchy {
+    /// Root node
+    pub root: TbaaNode,
+    /// Named nodes
+    nodes: BTreeMap<String, TbaaNode>,
+}
+
+impl TbaaHierarchy {
+    pub fn new() -> Self {
+        let root = TbaaNode::root("omnipotent char");
+        let mut nodes = BTreeMap::new();
+        nodes.insert(root.name.clone(), root.clone());
+        
+        TbaaHierarchy { root, nodes }
+    }
+    
+    /// Add C/C++ compatible type nodes
+    pub fn add_c_types(&mut self) {
+        let char_type = TbaaNode::scalar("char", self.root.clone());
+        let short_type = TbaaNode::scalar("short", self.root.clone());
+        let int_type = TbaaNode::scalar("int", self.root.clone());
+        let long_type = TbaaNode::scalar("long", self.root.clone());
+        let float_type = TbaaNode::scalar("float", self.root.clone());
+        let double_type = TbaaNode::scalar("double", self.root.clone());
+        let ptr_type = TbaaNode::scalar("any pointer", self.root.clone());
+        
+        self.nodes.insert("char".to_string(), char_type);
+        self.nodes.insert("short".to_string(), short_type);
+        self.nodes.insert("int".to_string(), int_type);
+        self.nodes.insert("long".to_string(), long_type);
+        self.nodes.insert("float".to_string(), float_type);
+        self.nodes.insert("double".to_string(), double_type);
+        self.nodes.insert("any pointer".to_string(), ptr_type);
+    }
+    
+    /// Get TBAA node for a type
+    pub fn get(&self, name: &str) -> Option<&TbaaNode> {
+        self.nodes.get(name)
+    }
+    
+    /// Add a new type node
+    pub fn add(&mut self, name: impl Into<String>, node: TbaaNode) {
+        self.nodes.insert(name.into(), node);
+    }
+}
+
+impl Default for TbaaHierarchy {
+    fn default() -> Self {
+        let mut h = Self::new();
+        h.add_c_types();
+        h
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ANDERSEN'S ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Points-to set
+#[derive(Debug, Clone, Default)]
+pub struct PointsToSet {
+    locations: BTreeSet<AbstractLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AbstractLocation {
+    /// Stack allocation
+    Stack(AllocId),
+    /// Heap allocation
+    Heap(AllocId),
+    /// Global variable
+    Global(String),
+    /// Unknown location
+    Unknown,
+}
+
+impl PointsToSet {
+    pub fn new() -> Self {
+        PointsToSet::default()
+    }
+    
+    pub fn insert(&mut self, loc: AbstractLocation) {
+        self.locations.insert(loc);
+    }
+    
+    pub fn union(&mut self, other: &PointsToSet) -> bool {
+        let old_len = self.locations.len();
+        self.locations.extend(other.locations.iter().cloned());
+        self.locations.len() > old_len
+    }
+    
+    pub fn contains(&self, loc: &AbstractLocation) -> bool {
+        self.locations.contains(loc)
+    }
+    
+    pub fn iter(&self) -> impl Iterator<Item = &AbstractLocation> {
+        self.locations.iter()
+    }
+    
+    pub fn len(&self) -> usize {
+        self.locations.len()
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.locations.is_empty()
+    }
+}
+
+/// Andersen's inclusion-based points-to analysis
+pub struct AndersensAnalysis {
+    /// Points-to sets for variables
+    points_to: BTreeMap<String, PointsToSet>,
+    /// Constraints
+    constraints: Vec<Constraint>,
+    /// Worklist for propagation
+    worklist: Vec<String>,
+    /// Next allocation ID
+    next_alloc_id: u64,
+}
+
+#[derive(Debug, Clone)]
+enum Constraint {
+    /// p = &x: p points to x
+    AddressOf { pointer: String, target: AbstractLocation },
+    /// p = q: p points to whatever q points to
+    Copy { dest: String, src: String },
+    /// p = *q: p points to what q's pointees point to
+    Load { dest: String, src: String },
+    /// *p = q: p's pointees point to what q points to
+    Store { dest: String, src: String },
+}
+
+impl AndersensAnalysis {
+    pub fn new() -> Self {
+        AndersensAnalysis {
+            points_to: BTreeMap::new(),
+            constraints: Vec::new(),
+            worklist: Vec::new(),
+            next_alloc_id: 0,
+        }
+    }
+    
+    /// Analyze a module
+    pub fn analyze(&mut self, module: &MirModule) {
+        // Collect constraints
+        for func in &module.functions {
+            self.collect_constraints(func);
+        }
+        
+        // Solve constraints
+        self.solve();
+    }
+    
+    fn collect_constraints(&mut self, func: &MirFunction) {
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                match stmt {
+                    MirStatement::Alloca { dest, .. } => {
+                        let alloc_id = AllocId(self.next_alloc_id);
+                        self.next_alloc_id += 1;
+                        
+                        self.constraints.push(Constraint::AddressOf {
+                            pointer: dest.clone(),
+                            target: AbstractLocation::Stack(alloc_id),
+                        });
+                    }
+                    MirStatement::Assign { dest, value } => {
+                        if let MirOperand::Variable(src) = value {
+                            self.constraints.push(Constraint::Copy {
+                                dest: dest.clone(),
+                                src: src.clone(),
+                            });
+                        }
+                    }
+                    MirStatement::Load { dest, ptr, .. } => {
+                        if let MirOperand::Variable(p) = ptr {
+                            self.constraints.push(Constraint::Load {
+                                dest: dest.clone(),
+                                src: p.clone(),
+                            });
+                        }
+                    }
+                    MirStatement::Store { ptr, value, .. } => {
+                        if let (MirOperand::Variable(p), MirOperand::Variable(v)) = (ptr, value) {
+                            self.constraints.push(Constraint::Store {
+                                dest: p.clone(),
+                                src: v.clone(),
+                            });
+                        }
+                    }
+                    MirStatement::Call { dest, callee, args } => {
+                        // Model function call effects
+                        // This is simplified; full analysis would handle function summaries
+                        if let Some(d) = dest {
+                            self.points_to.entry(d.clone()).or_default()
+                                .insert(AbstractLocation::Unknown);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    
+    fn solve(&mut self) {
+        // Initialize worklist
+        for (var, _) in &self.points_to {
+            self.worklist.push(var.clone());
+        }
+        
+        // Process constraints until fixed point
+        let mut changed = true;
+        while changed {
+            changed = false;
+            
+            for constraint in self.constraints.clone() {
+                changed |= self.apply_constraint(&constraint);
+            }
+        }
+    }
+    
+    fn apply_constraint(&mut self, constraint: &Constraint) -> bool {
+        match constraint {
+            Constraint::AddressOf { pointer, target } => {
+                self.points_to.entry(pointer.clone()).or_default()
+                    .insert(target.clone())
+            }
+            Constraint::Copy { dest, src } => {
+                let src_pts = self.points_to.get(src).cloned().unwrap_or_default();
+                self.points_to.entry(dest.clone()).or_default()
+                    .union(&src_pts)
+            }
+            Constraint::Load { dest, src } => {
+                // dest = *src means dest points to what src's pointees point to
+                let mut changed = false;
+                
+                if let Some(src_pts) = self.points_to.get(src).cloned() {
+                    for loc in src_pts.iter() {
+                        if let AbstractLocation::Stack(id) | AbstractLocation::Heap(id) = loc {
+                            // Find what this location points to
+                            let loc_name = format!("mem_{}", id.0);
+                            if let Some(loc_pts) = self.points_to.get(&loc_name).cloned() {
+                                changed |= self.points_to.entry(dest.clone()).or_default()
+                                    .union(&loc_pts);
+                            }
+                        }
+                    }
+                }
+                
+                changed
+            }
+            Constraint::Store { dest, src } => {
+                // *dest = src means dest's pointees point to what src points to
+                let mut changed = false;
+                
+                if let (Some(dest_pts), Some(src_pts)) = 
+                    (self.points_to.get(dest).cloned(), self.points_to.get(src).cloned()) 
+                {
+                    for loc in dest_pts.iter() {
+                        if let AbstractLocation::Stack(id) | AbstractLocation::Heap(id) = loc {
+                            let loc_name = format!("mem_{}", id.0);
+                            changed |= self.points_to.entry(loc_name).or_default()
+                                .union(&src_pts);
+                        }
+                    }
+                }
+                
+                changed
+            }
+        }
+    }
+    
+    /// Query points-to set for a variable
+    pub fn points_to(&self, var: &str) -> &PointsToSet {
+        static EMPTY: PointsToSet = PointsToSet { locations: BTreeSet::new() };
+        self.points_to.get(var).unwrap_or(&EMPTY)
+    }
+    
+    /// Check if two pointers may alias
+    pub fn may_alias(&self, ptr_a: &str, ptr_b: &str) -> bool {
+        let pts_a = self.points_to(ptr_a);
+        let pts_b = self.points_to(ptr_b);
+        
+        // Check for intersection
+        for loc in pts_a.iter() {
+            if pts_b.contains(loc) {
+                return true;
+            }
+        }
+        
+        false
+    }
+}
+
+impl Default for AndersensAnalysis {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY SSA
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Memory SSA representation
+pub struct MemorySSA {
+    /// Memory definitions
+    defs: BTreeMap<u32, MemoryDef>,
+    /// Memory uses
+    uses: BTreeMap<u32, MemoryUse>,
+    /// Memory phis
+    phis: BTreeMap<u32, MemoryPhi>,
+    /// Live-on-entry definition
+    live_on_entry: u32,
+    /// Next ID
+    next_id: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryDef {
+    pub id: u32,
+    pub defining_access: u32,
+    pub instruction: InstructionRef,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryUse {
+    pub id: u32,
+    pub defining_access: u32,
+    pub instruction: InstructionRef,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryPhi {
+    pub id: u32,
+    pub block: u32,
+    pub incoming: Vec<(u32, u32)>, // (predecessor_block, defining_access)
+}
+
+#[derive(Debug, Clone)]
+pub struct InstructionRef {
+    pub block: u32,
+    pub index: usize,
+}
+
+impl MemorySSA {
+    pub fn new() -> Self {
+        MemorySSA {
+            defs: BTreeMap::new(),
+            uses: BTreeMap::new(),
+            phis: BTreeMap::new(),
+            live_on_entry: 0,
+            next_id: 1,
+        }
+    }
+    
+    /// Build Memory SSA for a function
+    pub fn build(func: &MirFunction, aa: &BasicAliasAnalysis) -> Self {
+        let mut mssa = MemorySSA::new();
+        
+        // First pass: identify memory operations
+        for (block_idx, block) in func.blocks.iter().enumerate() {
+            for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+                let instr = InstructionRef {
+                    block: block_idx as u32,
+                    index: stmt_idx,
+                };
+                
+                match stmt {
+                    MirStatement::Load { .. } => {
+                        mssa.add_use(instr);
+                    }
+                    MirStatement::Store { .. } | MirStatement::Call { .. } => {
+                        mssa.add_def(instr);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
+        // Second pass: compute reaching definitions
+        mssa.compute_reaching_defs(func);
+        
+        mssa
+    }
+    
+    fn add_def(&mut self, instruction: InstructionRef) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        
+        self.defs.insert(id, MemoryDef {
+            id,
+            defining_access: self.live_on_entry,
+            instruction,
+        });
+        
+        id
+    }
+    
+    fn add_use(&mut self, instruction: InstructionRef) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        
+        self.uses.insert(id, MemoryUse {
+            id,
+            defining_access: self.live_on_entry,
+            instruction,
+        });
+        
+        id
+    }
+    
+    fn compute_reaching_defs(&mut self, _func: &MirFunction) {
+        // Would compute actual reaching definitions using dominance
+    }
+    
+    /// Get the clobbering access for a memory use
+    pub fn get_clobbering_access(&self, use_id: u32) -> Option<u32> {
+        self.uses.get(&use_id).map(|u| u.defining_access)
+    }
+    
+    /// Check if a def may clobber a use
+    pub fn def_clobbers_use(&self, def_id: u32, use_id: u32, aa: &BasicAliasAnalysis) -> bool {
+        // Would check using alias analysis
+        true
+    }
+    
+    /// Get memory definition
+    pub fn get_def(&self, id: u32) -> Option<&MemoryDef> {
+        self.defs.get(&id)
+    }
+    
+    /// Get memory use
+    pub fn get_use(&self, id: u32) -> Option<&MemoryUse> {
+        self.uses.get(&id)
+    }
+}
+
+impl Default for MemorySSA {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirModule {
+    pub functions: Vec<MirFunction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Alloca { dest: String, size: usize },
+    Assign { dest: String, value: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_alias_result_merge() {
+        assert_eq!(AliasResult::NoAlias.merge(AliasResult::NoAlias), AliasResult::NoAlias);
+        assert_eq!(AliasResult::NoAlias.merge(AliasResult::MayAlias), AliasResult::MayAlias);
+        assert_eq!(AliasResult::MustAlias.merge(AliasResult::MustAlias), AliasResult::MustAlias);
+    }
+    
+    #[test]
+    fn test_basic_alias_analysis() {
+        let aa = BasicAliasAnalysis::new();
+        
+        let loc_a = MemoryLocation::new(PointerValue::Alloc(AllocId(1)), 8);
+        let loc_b = MemoryLocation::new(PointerValue::Alloc(AllocId(2)), 8);
+        
+        // Different allocations don't alias
+        assert_eq!(aa.alias(&loc_a, &loc_b), AliasResult::NoAlias);
+        
+        // Same allocation is MustAlias
+        assert_eq!(aa.alias(&loc_a, &loc_a), AliasResult::MustAlias);
+    }
+    
+    #[test]
+    fn test_tbaa_aliasing() {
+        let hierarchy = TbaaHierarchy::default();
+        
+        let int_type = hierarchy.get("int").unwrap();
+        let float_type = hierarchy.get("float").unwrap();
+        
+        // Different scalar types don't alias
+        assert!(!int_type.may_alias(float_type));
+    }
+    
+    #[test]
+    fn test_points_to_set() {
+        let mut pts = PointsToSet::new();
+        
+        pts.insert(AbstractLocation::Stack(AllocId(1)));
+        pts.insert(AbstractLocation::Stack(AllocId(2)));
+        
+        assert!(pts.contains(&AbstractLocation::Stack(AllocId(1))));
+        assert!(!pts.contains(&AbstractLocation::Heap(AllocId(1))));
+        assert_eq!(pts.len(), 2);
+    }
+    
+    #[test]
+    fn test_mod_ref_behavior() {
+        let aa = BasicAliasAnalysis::new();
+        
+        assert!(aa.get_mod_ref("strlen").does_ref());
+        assert!(!aa.get_mod_ref("strlen").does_mod());
+        
+        assert!(aa.get_mod_ref("memcpy").does_ref());
+        assert!(aa.get_mod_ref("memcpy").does_mod());
+    }
+}

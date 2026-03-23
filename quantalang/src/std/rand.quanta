@@ -1,0 +1,998 @@
+/// QuantaLang Standard Library - Random Number Generation
+/// Pseudo-random and cryptographic random number generation
+module std::rand;
+
+use std::option::Option;
+use std::result::Result;
+use std::vec::Vec;
+use std::time::Instant;
+use std::fmt::{Debug, Display};
+
+// ============================================================================
+// Rng Trait
+// ============================================================================
+
+/// Core trait for random number generators
+pub trait Rng {
+    /// Generate next u64 value
+    fn next_u64(&mut self) -> u64;
+    
+    /// Generate next u32 value
+    fn next_u32(&mut self) -> u32 {
+        self.next_u64() as u32
+    }
+    
+    /// Fill byte slice with random data
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        let mut i = 0;
+        while i + 8 <= dest.len() {
+            let bytes = self.next_u64().to_le_bytes();
+            dest[i..i + 8].copy_from_slice(&bytes);
+            i += 8;
+        }
+        
+        if i < dest.len() {
+            let bytes = self.next_u64().to_le_bytes();
+            let remaining = dest.len() - i;
+            dest[i..].copy_from_slice(&bytes[..remaining]);
+        }
+    }
+    
+    /// Try to fill bytes, returning error on failure
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+    
+    /// Generate random bool
+    fn gen_bool(&mut self) -> bool {
+        self.next_u64() & 1 == 1
+    }
+    
+    /// Generate random bool with probability p
+    fn gen_bool_with_prob(&mut self, p: f64) -> bool {
+        self.gen_f64() < p
+    }
+    
+    /// Generate random u8
+    fn gen_u8(&mut self) -> u8 {
+        self.next_u64() as u8
+    }
+    
+    /// Generate random u16
+    fn gen_u16(&mut self) -> u16 {
+        self.next_u64() as u16
+    }
+    
+    /// Generate random u32
+    fn gen_u32(&mut self) -> u32 {
+        self.next_u32()
+    }
+    
+    /// Generate random u64
+    fn gen_u64(&mut self) -> u64 {
+        self.next_u64()
+    }
+    
+    /// Generate random u128
+    fn gen_u128(&mut self) -> u128 {
+        let high = self.next_u64() as u128;
+        let low = self.next_u64() as u128;
+        (high << 64) | low
+    }
+    
+    /// Generate random usize
+    fn gen_usize(&mut self) -> usize {
+        self.next_u64() as usize
+    }
+    
+    /// Generate random i8
+    fn gen_i8(&mut self) -> i8 {
+        self.next_u64() as i8
+    }
+    
+    /// Generate random i16
+    fn gen_i16(&mut self) -> i16 {
+        self.next_u64() as i16
+    }
+    
+    /// Generate random i32
+    fn gen_i32(&mut self) -> i32 {
+        self.next_u32() as i32
+    }
+    
+    /// Generate random i64
+    fn gen_i64(&mut self) -> i64 {
+        self.next_u64() as i64
+    }
+    
+    /// Generate random i128
+    fn gen_i128(&mut self) -> i128 {
+        self.gen_u128() as i128
+    }
+    
+    /// Generate random isize
+    fn gen_isize(&mut self) -> isize {
+        self.next_u64() as isize
+    }
+    
+    /// Generate random f32 in [0, 1)
+    fn gen_f32(&mut self) -> f32 {
+        (self.next_u32() >> 8) as f32 * (1.0 / (1u32 << 24) as f32)
+    }
+    
+    /// Generate random f64 in [0, 1)
+    fn gen_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+    
+    /// Generate random value in range [low, high)
+    fn gen_range_u64(&mut self, low: u64, high: u64) -> u64 {
+        assert!(low < high, "empty range");
+        let range = high - low;
+        low + self.next_u64() % range
+    }
+    
+    /// Generate random value in range [low, high)
+    fn gen_range_i64(&mut self, low: i64, high: i64) -> i64 {
+        assert!(low < high, "empty range");
+        let range = (high - low) as u64;
+        low + (self.next_u64() % range) as i64
+    }
+    
+    /// Generate random value in range [low, high)
+    fn gen_range_f64(&mut self, low: f64, high: f64) -> f64 {
+        assert!(low < high, "empty range");
+        low + self.gen_f64() * (high - low)
+    }
+    
+    /// Generate random char
+    fn gen_char(&mut self) -> char {
+        loop {
+            let n = self.next_u32() & 0x1FFFFF;
+            if let Some(c) = char::from_u32(n) {
+                return c;
+            }
+        }
+    }
+    
+    /// Generate random alphanumeric char
+    fn gen_alphanumeric(&mut self) -> char {
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let idx = self.gen_range_u64(0, CHARS.len() as u64) as usize;
+        CHARS[idx] as char
+    }
+    
+    /// Choose random element from slice
+    fn choose<'a, T>(&mut self, slice: &'a [T]) -> Option<&'a T> {
+        if slice.is_empty() {
+            None
+        } else {
+            let idx = self.gen_range_u64(0, slice.len() as u64) as usize;
+            Some(&slice[idx])
+        }
+    }
+    
+    /// Choose random element mutably
+    fn choose_mut<'a, T>(&mut self, slice: &'a mut [T]) -> Option<&'a mut T> {
+        if slice.is_empty() {
+            None
+        } else {
+            let idx = self.gen_range_u64(0, slice.len() as u64) as usize;
+            Some(&mut slice[idx])
+        }
+    }
+    
+    /// Shuffle slice in place (Fisher-Yates)
+    fn shuffle<T>(&mut self, slice: &mut [T]) {
+        for i in (1..slice.len()).rev() {
+            let j = self.gen_range_u64(0, (i + 1) as u64) as usize;
+            slice.swap(i, j);
+        }
+    }
+    
+    /// Sample n elements without replacement
+    fn sample<T: Clone>(&mut self, slice: &[T], n: usize) -> Vec<T> {
+        let n = n.min(slice.len());
+        let mut indices: Vec<usize> = (0..slice.len()).collect();
+        self.shuffle(&mut indices);
+        indices.truncate(n);
+        indices.into_iter().map(|i| slice[i].clone()).collect()
+    }
+}
+
+// ============================================================================
+// Error Type
+// ============================================================================
+
+/// Error from random number generation
+#[derive(Clone, Debug)]
+pub struct Error {
+    message: String,
+}
+
+impl Error {
+    fn new(message: &str) -> Self {
+        Error { message: message.to_string() }
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "random error: {}", self.message)
+    }
+}
+
+impl std::error::Error for Error {}
+
+// ============================================================================
+// Xoshiro256** Generator (Fast, High-Quality)
+// ============================================================================
+
+/// Xoshiro256** - Fast, high-quality PRNG
+/// Period: 2^256 - 1
+/// State: 256 bits
+#[derive(Clone)]
+pub struct Xoshiro256StarStar {
+    s: [u64; 4],
+}
+
+impl Xoshiro256StarStar {
+    /// Create with seed
+    pub fn new(seed: u64) -> Self {
+        // Use SplitMix64 to initialize state
+        let mut sm = SplitMix64::new(seed);
+        Self {
+            s: [sm.next_u64(), sm.next_u64(), sm.next_u64(), sm.next_u64()],
+        }
+    }
+    
+    /// Create from state
+    pub fn from_state(state: [u64; 4]) -> Self {
+        Self { s: state }
+    }
+    
+    /// Create from entropy (current time)
+    pub fn from_entropy() -> Self {
+        let t = Instant::now();
+        // Use address of stack variable for more entropy
+        let stack_addr = &t as *const _ as u64;
+        let seed = unsafe { __entropy_u64() } ^ stack_addr;
+        Self::new(seed)
+    }
+    
+    /// Get current state
+    pub fn state(&self) -> [u64; 4] {
+        self.s
+    }
+    
+    /// Jump forward 2^128 steps
+    pub fn jump(&mut self) {
+        const JUMP: [u64; 4] = [
+            0x180ec6d33cfd0aba,
+            0xd5a61266f0c9392c,
+            0xa9582618e03fc9aa,
+            0x39abdc4529b1661c,
+        ];
+        
+        let mut s0 = 0u64;
+        let mut s1 = 0u64;
+        let mut s2 = 0u64;
+        let mut s3 = 0u64;
+        
+        for j in JUMP.iter() {
+            for b in 0..64 {
+                if (j >> b) & 1 != 0 {
+                    s0 ^= self.s[0];
+                    s1 ^= self.s[1];
+                    s2 ^= self.s[2];
+                    s3 ^= self.s[3];
+                }
+                self.next_u64();
+            }
+        }
+        
+        self.s[0] = s0;
+        self.s[1] = s1;
+        self.s[2] = s2;
+        self.s[3] = s3;
+    }
+    
+    /// Jump forward 2^192 steps (for parallel streams)
+    pub fn long_jump(&mut self) {
+        const LONG_JUMP: [u64; 4] = [
+            0x76e15d3efefdcbbf,
+            0xc5004e441c522fb3,
+            0x77710069854ee241,
+            0x39109bb02acbe635,
+        ];
+        
+        let mut s0 = 0u64;
+        let mut s1 = 0u64;
+        let mut s2 = 0u64;
+        let mut s3 = 0u64;
+        
+        for j in LONG_JUMP.iter() {
+            for b in 0..64 {
+                if (j >> b) & 1 != 0 {
+                    s0 ^= self.s[0];
+                    s1 ^= self.s[1];
+                    s2 ^= self.s[2];
+                    s3 ^= self.s[3];
+                }
+                self.next_u64();
+            }
+        }
+        
+        self.s[0] = s0;
+        self.s[1] = s1;
+        self.s[2] = s2;
+        self.s[3] = s3;
+    }
+}
+
+impl Rng for Xoshiro256StarStar {
+    fn next_u64(&mut self) -> u64 {
+        let result = self.s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+        let t = self.s[1] << 17;
+        
+        self.s[2] ^= self.s[0];
+        self.s[3] ^= self.s[1];
+        self.s[1] ^= self.s[2];
+        self.s[0] ^= self.s[3];
+        
+        self.s[2] ^= t;
+        self.s[3] = self.s[3].rotate_left(45);
+        
+        result
+    }
+}
+
+impl Default for Xoshiro256StarStar {
+    fn default() -> Self {
+        Self::from_entropy()
+    }
+}
+
+impl Debug for Xoshiro256StarStar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Xoshiro256StarStar {{ ... }}")
+    }
+}
+
+// ============================================================================
+// SplitMix64 (Seeding Helper)
+// ============================================================================
+
+/// SplitMix64 - Simple generator for seeding other PRNGs
+#[derive(Clone)]
+pub struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    pub fn new(seed: u64) -> Self {
+        SplitMix64 { state: seed }
+    }
+}
+
+impl Rng for SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+}
+
+// ============================================================================
+// PCG Generator (Compact, Good Statistical Quality)
+// ============================================================================
+
+/// PCG-XSH-RR - Permuted Congruential Generator
+/// Period: 2^64
+/// State: 128 bits
+#[derive(Clone)]
+pub struct Pcg64 {
+    state: u128,
+    inc: u128,
+}
+
+impl Pcg64 {
+    /// Create with seed and stream
+    pub fn new(seed: u64, stream: u64) -> Self {
+        let mut rng = Pcg64 {
+            state: 0,
+            inc: (stream as u128) << 1 | 1,
+        };
+        rng.next_u64();
+        rng.state = rng.state.wrapping_add(seed as u128);
+        rng.next_u64();
+        rng
+    }
+    
+    /// Create from entropy
+    pub fn from_entropy() -> Self {
+        let seed = unsafe { __entropy_u64() };
+        let stream = unsafe { __entropy_u64() };
+        Self::new(seed, stream)
+    }
+}
+
+impl Rng for Pcg64 {
+    fn next_u64(&mut self) -> u64 {
+        let old = self.state;
+        self.state = old
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(self.inc);
+        
+        let xorshifted = ((old >> 18) ^ old) >> 27;
+        let rot = (old >> 59) as u32;
+        ((xorshifted >> rot) | (xorshifted << ((!rot).wrapping_add(1) & 31))) as u64
+    }
+}
+
+impl Default for Pcg64 {
+    fn default() -> Self {
+        Self::from_entropy()
+    }
+}
+
+// ============================================================================
+// ChaCha Generator (Cryptographically Secure)
+// ============================================================================
+
+/// ChaCha20 - Cryptographically secure PRNG
+/// Based on the ChaCha20 stream cipher
+#[derive(Clone)]
+pub struct ChaCha20Rng {
+    key: [u32; 8],
+    counter: u64,
+    buffer: [u8; 64],
+    buffer_pos: usize,
+}
+
+impl ChaCha20Rng {
+    /// Create with 256-bit key
+    pub fn new(key: [u8; 32]) -> Self {
+        let mut key_words = [0u32; 8];
+        for i in 0..8 {
+            key_words[i] = u32::from_le_bytes([
+                key[i * 4],
+                key[i * 4 + 1],
+                key[i * 4 + 2],
+                key[i * 4 + 3],
+            ]);
+        }
+        
+        ChaCha20Rng {
+            key: key_words,
+            counter: 0,
+            buffer: [0; 64],
+            buffer_pos: 64, // Force refill on first use
+        }
+    }
+    
+    /// Create from entropy (system random)
+    pub fn from_entropy() -> Result<Self, Error> {
+        let mut key = [0u8; 32];
+        getrandom(&mut key)?;
+        Ok(Self::new(key))
+    }
+    
+    /// Create with seed (uses key derivation)
+    pub fn from_seed(seed: u64) -> Self {
+        let mut key = [0u8; 32];
+        let mut sm = SplitMix64::new(seed);
+        sm.fill_bytes(&mut key);
+        Self::new(key)
+    }
+    
+    fn refill_buffer(&mut self) {
+        // ChaCha20 quarter round
+        #[inline]
+        fn quarter_round(a: &mut u32, b: &mut u32, c: &mut u32, d: &mut u32) {
+            *a = a.wrapping_add(*b); *d ^= *a; *d = d.rotate_left(16);
+            *c = c.wrapping_add(*d); *b ^= *c; *b = b.rotate_left(12);
+            *a = a.wrapping_add(*b); *d ^= *a; *d = d.rotate_left(8);
+            *c = c.wrapping_add(*d); *b ^= *c; *b = b.rotate_left(7);
+        }
+        
+        // Constants "expand 32-byte k"
+        let mut state: [u32; 16] = [
+            0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
+            self.key[0], self.key[1], self.key[2], self.key[3],
+            self.key[4], self.key[5], self.key[6], self.key[7],
+            self.counter as u32,
+            (self.counter >> 32) as u32,
+            0, 0, // Nonce (zeros for RNG use)
+        ];
+        
+        let initial = state;
+        
+        // 20 rounds (10 double rounds)
+        for _ in 0..10 {
+            // Column rounds
+            quarter_round(&mut state[0], &mut state[4], &mut state[8], &mut state[12]);
+            quarter_round(&mut state[1], &mut state[5], &mut state[9], &mut state[13]);
+            quarter_round(&mut state[2], &mut state[6], &mut state[10], &mut state[14]);
+            quarter_round(&mut state[3], &mut state[7], &mut state[11], &mut state[15]);
+            // Diagonal rounds
+            quarter_round(&mut state[0], &mut state[5], &mut state[10], &mut state[15]);
+            quarter_round(&mut state[1], &mut state[6], &mut state[11], &mut state[12]);
+            quarter_round(&mut state[2], &mut state[7], &mut state[8], &mut state[13]);
+            quarter_round(&mut state[3], &mut state[4], &mut state[9], &mut state[14]);
+        }
+        
+        // Add initial state
+        for i in 0..16 {
+            state[i] = state[i].wrapping_add(initial[i]);
+        }
+        
+        // Convert to bytes
+        for (i, word) in state.iter().enumerate() {
+            let bytes = word.to_le_bytes();
+            self.buffer[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+        }
+        
+        self.counter += 1;
+        self.buffer_pos = 0;
+    }
+}
+
+impl Rng for ChaCha20Rng {
+    fn next_u64(&mut self) -> u64 {
+        let mut bytes = [0u8; 8];
+        self.fill_bytes(&mut bytes);
+        u64::from_le_bytes(bytes)
+    }
+    
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        let mut remaining = dest.len();
+        let mut offset = 0;
+        
+        while remaining > 0 {
+            if self.buffer_pos >= 64 {
+                self.refill_buffer();
+            }
+            
+            let available = 64 - self.buffer_pos;
+            let to_copy = remaining.min(available);
+            
+            dest[offset..offset + to_copy]
+                .copy_from_slice(&self.buffer[self.buffer_pos..self.buffer_pos + to_copy]);
+            
+            self.buffer_pos += to_copy;
+            offset += to_copy;
+            remaining -= to_copy;
+        }
+    }
+}
+
+// ============================================================================
+// Thread-Local Default Generator
+// ============================================================================
+
+/// Get thread-local random number generator
+pub fn thread_rng() -> ThreadRng {
+    ThreadRng::new()
+}
+
+/// Thread-local random number generator wrapper
+pub struct ThreadRng {
+    inner: Xoshiro256StarStar,
+}
+
+impl ThreadRng {
+    fn new() -> Self {
+        // In real implementation, would use thread-local storage
+        ThreadRng {
+            inner: Xoshiro256StarStar::from_entropy(),
+        }
+    }
+}
+
+impl Rng for ThreadRng {
+    fn next_u64(&mut self) -> u64 {
+        self.inner.next_u64()
+    }
+    
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.inner.fill_bytes(dest)
+    }
+}
+
+// ============================================================================
+// Cryptographic Random
+// ============================================================================
+
+/// Fill buffer with cryptographically secure random bytes
+pub fn getrandom(dest: &mut [u8]) -> Result<(), Error> {
+    let result = unsafe { __getrandom(dest.as_mut_ptr(), dest.len()) };
+    if result < 0 {
+        Err(Error::new("failed to get random bytes from OS"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Get single cryptographically secure random u64
+pub fn random_u64() -> Result<u64, Error> {
+    let mut bytes = [0u8; 8];
+    getrandom(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+// ============================================================================
+// Distributions
+// ============================================================================
+
+/// Uniform distribution over a range
+pub struct Uniform<T> {
+    low: T,
+    high: T,
+}
+
+impl Uniform<u64> {
+    pub fn new(low: u64, high: u64) -> Self {
+        assert!(low < high);
+        Uniform { low, high }
+    }
+    
+    pub fn sample<R: Rng>(&self, rng: &mut R) -> u64 {
+        rng.gen_range_u64(self.low, self.high)
+    }
+}
+
+impl Uniform<f64> {
+    pub fn new(low: f64, high: f64) -> Self {
+        assert!(low < high);
+        Uniform { low, high }
+    }
+    
+    pub fn sample<R: Rng>(&self, rng: &mut R) -> f64 {
+        rng.gen_range_f64(self.low, self.high)
+    }
+}
+
+/// Standard normal distribution (mean 0, std 1)
+pub struct StandardNormal;
+
+impl StandardNormal {
+    pub fn sample<R: Rng>(&self, rng: &mut R) -> f64 {
+        // Box-Muller transform
+        let u1 = rng.gen_f64();
+        let u2 = rng.gen_f64();
+        
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f64::consts::PI * u2;
+        
+        r * theta.cos()
+    }
+}
+
+/// Normal distribution with mean and standard deviation
+pub struct Normal {
+    mean: f64,
+    std_dev: f64,
+}
+
+impl Normal {
+    pub fn new(mean: f64, std_dev: f64) -> Self {
+        assert!(std_dev > 0.0);
+        Normal { mean, std_dev }
+    }
+    
+    pub fn sample<R: Rng>(&self, rng: &mut R) -> f64 {
+        self.mean + self.std_dev * StandardNormal.sample(rng)
+    }
+}
+
+/// Exponential distribution
+pub struct Exp {
+    lambda: f64,
+}
+
+impl Exp {
+    pub fn new(lambda: f64) -> Self {
+        assert!(lambda > 0.0);
+        Exp { lambda }
+    }
+    
+    pub fn sample<R: Rng>(&self, rng: &mut R) -> f64 {
+        -rng.gen_f64().ln() / self.lambda
+    }
+}
+
+/// Bernoulli distribution (coin flip with probability p)
+pub struct Bernoulli {
+    p: f64,
+}
+
+impl Bernoulli {
+    pub fn new(p: f64) -> Self {
+        assert!(p >= 0.0 && p <= 1.0);
+        Bernoulli { p }
+    }
+    
+    pub fn sample<R: Rng>(&self, rng: &mut R) -> bool {
+        rng.gen_f64() < self.p
+    }
+}
+
+/// Weighted index selection
+pub struct WeightedIndex {
+    cumulative: Vec<f64>,
+}
+
+impl WeightedIndex {
+    pub fn new(weights: &[f64]) -> Result<Self, Error> {
+        if weights.is_empty() {
+            return Err(Error::new("empty weights"));
+        }
+        
+        let mut cumulative = Vec::with_capacity(weights.len());
+        let mut sum = 0.0;
+        
+        for &w in weights {
+            if w < 0.0 {
+                return Err(Error::new("negative weight"));
+            }
+            sum += w;
+            cumulative.push(sum);
+        }
+        
+        if sum <= 0.0 {
+            return Err(Error::new("total weight must be positive"));
+        }
+        
+        // Normalize
+        for c in &mut cumulative {
+            *c /= sum;
+        }
+        
+        Ok(WeightedIndex { cumulative })
+    }
+    
+    pub fn sample<R: Rng>(&self, rng: &mut R) -> usize {
+        let r = rng.gen_f64();
+        self.cumulative.iter()
+            .position(|&c| r < c)
+            .unwrap_or(self.cumulative.len() - 1)
+    }
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+/// Generate random value using thread-local RNG
+pub fn random<T: Random>() -> T {
+    T::random(&mut thread_rng())
+}
+
+/// Generate random value in range
+pub fn random_range(low: u64, high: u64) -> u64 {
+    thread_rng().gen_range_u64(low, high)
+}
+
+/// Shuffle slice using thread-local RNG
+pub fn shuffle<T>(slice: &mut [T]) {
+    thread_rng().shuffle(slice)
+}
+
+/// Choose random element
+pub fn choose<T>(slice: &[T]) -> Option<&T> {
+    thread_rng().choose(slice)
+}
+
+/// Trait for types that can be randomly generated
+pub trait Random: Sized {
+    fn random<R: Rng>(rng: &mut R) -> Self;
+}
+
+impl Random for bool {
+    fn random<R: Rng>(rng: &mut R) -> Self {
+        rng.gen_bool()
+    }
+}
+
+impl Random for u8 {
+    fn random<R: Rng>(rng: &mut R) -> Self {
+        rng.gen_u8()
+    }
+}
+
+impl Random for u16 {
+    fn random<R: Rng>(rng: &mut R) -> Self {
+        rng.gen_u16()
+    }
+}
+
+impl Random for u32 {
+    fn random<R: Rng>(rng: &mut R) -> Self {
+        rng.gen_u32()
+    }
+}
+
+impl Random for u64 {
+    fn random<R: Rng>(rng: &mut R) -> Self {
+        rng.gen_u64()
+    }
+}
+
+impl Random for f32 {
+    fn random<R: Rng>(rng: &mut R) -> Self {
+        rng.gen_f32()
+    }
+}
+
+impl Random for f64 {
+    fn random<R: Rng>(rng: &mut R) -> Self {
+        rng.gen_f64()
+    }
+}
+
+impl Random for char {
+    fn random<R: Rng>(rng: &mut R) -> Self {
+        rng.gen_alphanumeric()
+    }
+}
+
+// ============================================================================
+// External Declarations
+// ============================================================================
+
+extern "C" {
+    fn __entropy_u64() -> u64;
+    fn __getrandom(buf: *mut u8, len: usize) -> i32;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_xoshiro_basic() {
+        let mut rng = Xoshiro256StarStar::new(42);
+        let a = rng.next_u64();
+        let b = rng.next_u64();
+        assert_ne!(a, b);
+    }
+    
+    #[test]
+    fn test_xoshiro_reproducible() {
+        let mut rng1 = Xoshiro256StarStar::new(12345);
+        let mut rng2 = Xoshiro256StarStar::new(12345);
+        
+        for _ in 0..100 {
+            assert_eq!(rng1.next_u64(), rng2.next_u64());
+        }
+    }
+    
+    #[test]
+    fn test_gen_range() {
+        let mut rng = Xoshiro256StarStar::new(42);
+        
+        for _ in 0..1000 {
+            let n = rng.gen_range_u64(10, 20);
+            assert!(n >= 10 && n < 20);
+        }
+    }
+    
+    #[test]
+    fn test_gen_f64_range() {
+        let mut rng = Xoshiro256StarStar::new(42);
+        
+        for _ in 0..1000 {
+            let f = rng.gen_f64();
+            assert!(f >= 0.0 && f < 1.0);
+        }
+    }
+    
+    #[test]
+    fn test_shuffle() {
+        let mut rng = Xoshiro256StarStar::new(42);
+        let mut arr = [1, 2, 3, 4, 5];
+        let original = arr;
+        
+        rng.shuffle(&mut arr);
+        
+        // Should contain same elements
+        arr.sort();
+        assert_eq!(arr, [1, 2, 3, 4, 5]);
+    }
+    
+    #[test]
+    fn test_choose() {
+        let mut rng = Xoshiro256StarStar::new(42);
+        let arr = [1, 2, 3, 4, 5];
+        
+        for _ in 0..100 {
+            let choice = rng.choose(&arr).unwrap();
+            assert!(arr.contains(choice));
+        }
+    }
+    
+    #[test]
+    fn test_fill_bytes() {
+        let mut rng = Xoshiro256StarStar::new(42);
+        let mut buf1 = [0u8; 32];
+        let mut buf2 = [0u8; 32];
+        
+        rng.fill_bytes(&mut buf1);
+        rng.fill_bytes(&mut buf2);
+        
+        assert_ne!(buf1, buf2);
+        assert_ne!(buf1, [0u8; 32]);
+    }
+    
+    #[test]
+    fn test_pcg() {
+        let mut rng = Pcg64::new(42, 1);
+        let a = rng.next_u64();
+        let b = rng.next_u64();
+        assert_ne!(a, b);
+    }
+    
+    #[test]
+    fn test_chacha() {
+        let key = [0u8; 32];
+        let mut rng = ChaCha20Rng::new(key);
+        
+        let a = rng.next_u64();
+        let b = rng.next_u64();
+        assert_ne!(a, b);
+    }
+    
+    #[test]
+    fn test_normal_distribution() {
+        let mut rng = Xoshiro256StarStar::new(42);
+        let normal = Normal::new(0.0, 1.0);
+        
+        let mut sum = 0.0;
+        let n = 10000;
+        
+        for _ in 0..n {
+            sum += normal.sample(&mut rng);
+        }
+        
+        let mean = sum / n as f64;
+        // Should be close to 0
+        assert!(mean.abs() < 0.1);
+    }
+    
+    #[test]
+    fn test_weighted_index() {
+        let mut rng = Xoshiro256StarStar::new(42);
+        let weights = WeightedIndex::new(&[1.0, 2.0, 7.0]).unwrap();
+        
+        let mut counts = [0; 3];
+        let n = 10000;
+        
+        for _ in 0..n {
+            let idx = weights.sample(&mut rng);
+            counts[idx] += 1;
+        }
+        
+        // Index 2 should be picked ~70% of time
+        let ratio = counts[2] as f64 / n as f64;
+        assert!(ratio > 0.6 && ratio < 0.8);
+    }
+    
+    #[test]
+    fn test_jump() {
+        let mut rng1 = Xoshiro256StarStar::new(42);
+        let mut rng2 = Xoshiro256StarStar::new(42);
+        
+        rng1.jump();
+        
+        // After jump, sequences should differ
+        assert_ne!(rng1.next_u64(), rng2.next_u64());
+    }
+}

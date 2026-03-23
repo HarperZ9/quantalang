@@ -1,0 +1,1103 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ FFI — Dynamic Binding System
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Dynamic library loading and symbol resolution:
+// - Cross-platform library loading (dlopen, LoadLibrary)
+// - Symbol resolution with mangling support
+// - Lazy and eager binding modes
+// - Version resolution for shared libraries
+// - Binding generation from header files
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::ffi::bindings
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
+use super::types::{
+    Abi, ForeignType, FunctionSignature, Parameter, StructType, EnumType,
+    TargetInfo, Architecture, OperatingSystem,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIBRARY HANDLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Handle to a dynamically loaded library
+pub struct Library {
+    /// Library path
+    path: PathBuf,
+    /// Platform-specific handle
+    handle: LibraryHandle,
+    /// Cached symbols
+    symbols: RwLock<BTreeMap<String, Symbol>>,
+    /// Library metadata
+    metadata: LibraryMetadata,
+}
+
+/// Platform-specific library handle
+#[cfg(unix)]
+type RawHandle = *mut std::ffi::c_void;
+
+#[cfg(windows)]
+type RawHandle = *mut std::ffi::c_void; // HMODULE
+
+struct LibraryHandle {
+    raw: RawHandle,
+}
+
+// Safety: Library handles are thread-safe
+unsafe impl Send for LibraryHandle {}
+unsafe impl Sync for LibraryHandle {}
+
+impl Library {
+    /// Load a library by name or path
+    pub fn load(name: &str) -> Result<Self, LibraryError> {
+        let path = resolve_library_path(name)?;
+        Self::load_path(&path)
+    }
+    
+    /// Load a library from a specific path
+    pub fn load_path(path: &Path) -> Result<Self, LibraryError> {
+        let handle = load_library(path)?;
+        
+        Ok(Library {
+            path: path.to_path_buf(),
+            handle,
+            symbols: RwLock::new(BTreeMap::new()),
+            metadata: LibraryMetadata::from_path(path),
+        })
+    }
+    
+    /// Load with specific options
+    pub fn load_with_options(path: &Path, options: LoadOptions) -> Result<Self, LibraryError> {
+        let handle = load_library_with_options(path, &options)?;
+        
+        Ok(Library {
+            path: path.to_path_buf(),
+            handle,
+            symbols: RwLock::new(BTreeMap::new()),
+            metadata: LibraryMetadata::from_path(path),
+        })
+    }
+    
+    /// Get a symbol by name
+    pub fn get_symbol<T>(&self, name: &str) -> Result<*const T, LibraryError> {
+        // Check cache first
+        {
+            let cache = self.symbols.read().unwrap();
+            if let Some(sym) = cache.get(name) {
+                return Ok(sym.address as *const T);
+            }
+        }
+        
+        // Lookup and cache
+        let address = lookup_symbol(self.handle.raw, name)?;
+        
+        {
+            let mut cache = self.symbols.write().unwrap();
+            cache.insert(name.to_string(), Symbol {
+                name: name.to_string(),
+                address,
+                size: None,
+            });
+        }
+        
+        Ok(address as *const T)
+    }
+    
+    /// Get a function pointer
+    pub fn get_function<F>(&self, name: &str) -> Result<F, LibraryError>
+    where
+        F: Copy,
+    {
+        let ptr = self.get_symbol::<()>(name)?;
+        // Safety: Caller guarantees type matches
+        Ok(unsafe { std::mem::transmute_copy(&ptr) })
+    }
+    
+    /// Check if symbol exists
+    pub fn has_symbol(&self, name: &str) -> bool {
+        lookup_symbol(self.handle.raw, name).is_ok()
+    }
+    
+    /// Get library path
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    
+    /// Get library metadata
+    pub fn metadata(&self) -> &LibraryMetadata {
+        &self.metadata
+    }
+    
+    /// List exported symbols (if available)
+    pub fn symbols(&self) -> Result<Vec<String>, LibraryError> {
+        list_symbols(self.handle.raw, &self.path)
+    }
+}
+
+impl Drop for Library {
+    fn drop(&mut self) {
+        if !self.handle.raw.is_null() {
+            unload_library(self.handle.raw);
+        }
+    }
+}
+
+/// Library metadata
+#[derive(Debug, Clone)]
+pub struct LibraryMetadata {
+    pub name: String,
+    pub version: Option<String>,
+    pub soname: Option<String>,
+    pub dependencies: Vec<String>,
+}
+
+impl LibraryMetadata {
+    fn from_path(path: &Path) -> Self {
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        
+        // Extract version from filename (e.g., libfoo.so.1.2.3)
+        let version = extract_version(&name);
+        
+        LibraryMetadata {
+            name,
+            version,
+            soname: None,
+            dependencies: Vec::new(),
+        }
+    }
+}
+
+/// Library loading options
+#[derive(Debug, Clone, Default)]
+pub struct LoadOptions {
+    /// Bind symbols lazily (RTLD_LAZY) vs immediately (RTLD_NOW)
+    pub lazy: bool,
+    /// Make symbols available globally (RTLD_GLOBAL)
+    pub global: bool,
+    /// Do not load dependencies
+    pub no_load_deps: bool,
+    /// Search paths
+    pub search_paths: Vec<PathBuf>,
+}
+
+/// Loaded symbol information
+#[derive(Debug, Clone)]
+pub struct Symbol {
+    pub name: String,
+    pub address: usize,
+    pub size: Option<usize>,
+}
+
+/// Library loading error
+#[derive(Debug, Clone)]
+pub enum LibraryError {
+    NotFound(String),
+    LoadFailed(String),
+    SymbolNotFound(String),
+    VersionMismatch { expected: String, found: String },
+    InvalidPath(String),
+    PlatformError(String),
+}
+
+impl std::fmt::Display for LibraryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LibraryError::NotFound(name) => write!(f, "library not found: {}", name),
+            LibraryError::LoadFailed(msg) => write!(f, "failed to load library: {}", msg),
+            LibraryError::SymbolNotFound(name) => write!(f, "symbol not found: {}", name),
+            LibraryError::VersionMismatch { expected, found } => {
+                write!(f, "version mismatch: expected {}, found {}", expected, found)
+            }
+            LibraryError::InvalidPath(path) => write!(f, "invalid library path: {}", path),
+            LibraryError::PlatformError(msg) => write!(f, "platform error: {}", msg),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLATFORM-SPECIFIC IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(unix)]
+mod platform {
+    use super::*;
+    use std::ffi::{CStr, CString};
+    use std::os::raw::{c_char, c_int, c_void};
+    
+    // libc bindings
+    extern "C" {
+        fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+        fn dlclose(handle: *mut c_void) -> c_int;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        fn dlerror() -> *const c_char;
+    }
+    
+    const RTLD_LAZY: c_int = 0x00001;
+    const RTLD_NOW: c_int = 0x00002;
+    const RTLD_GLOBAL: c_int = 0x00100;
+    const RTLD_LOCAL: c_int = 0x00000;
+    const RTLD_NOLOAD: c_int = 0x00004;
+    
+    pub fn load_library(path: &Path) -> Result<LibraryHandle, LibraryError> {
+        load_library_with_options(path, &LoadOptions::default())
+    }
+    
+    pub fn load_library_with_options(path: &Path, options: &LoadOptions) -> Result<LibraryHandle, LibraryError> {
+        let path_str = path.to_str()
+            .ok_or_else(|| LibraryError::InvalidPath(path.display().to_string()))?;
+        
+        let c_path = CString::new(path_str)
+            .map_err(|_| LibraryError::InvalidPath(path_str.to_string()))?;
+        
+        let mut flags = if options.lazy { RTLD_LAZY } else { RTLD_NOW };
+        if options.global {
+            flags |= RTLD_GLOBAL;
+        } else {
+            flags |= RTLD_LOCAL;
+        }
+        
+        let handle = unsafe { dlopen(c_path.as_ptr(), flags) };
+        
+        if handle.is_null() {
+            let error = unsafe {
+                let err = dlerror();
+                if err.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    CStr::from_ptr(err).to_string_lossy().into_owned()
+                }
+            };
+            return Err(LibraryError::LoadFailed(error));
+        }
+        
+        Ok(LibraryHandle { raw: handle })
+    }
+    
+    pub fn unload_library(handle: RawHandle) {
+        unsafe { dlclose(handle); }
+    }
+    
+    pub fn lookup_symbol(handle: RawHandle, name: &str) -> Result<usize, LibraryError> {
+        let c_name = CString::new(name)
+            .map_err(|_| LibraryError::SymbolNotFound(name.to_string()))?;
+        
+        // Clear any existing error
+        unsafe { dlerror(); }
+        
+        let symbol = unsafe { dlsym(handle, c_name.as_ptr()) };
+        
+        // Check for error (symbol can legitimately be NULL)
+        let error = unsafe { dlerror() };
+        if !error.is_null() {
+            let err_str = unsafe { CStr::from_ptr(error).to_string_lossy().into_owned() };
+            return Err(LibraryError::SymbolNotFound(err_str));
+        }
+        
+        Ok(symbol as usize)
+    }
+    
+    pub fn list_symbols(handle: RawHandle, path: &Path) -> Result<Vec<String>, LibraryError> {
+        // On Linux, we can use dl_iterate_phdr or parse ELF directly
+        // For now, return an empty list (would need platform-specific implementation)
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    
+    // Win32 bindings
+    extern "system" {
+        fn LoadLibraryW(lpLibFileName: *const u16) -> *mut std::ffi::c_void;
+        fn FreeLibrary(hLibModule: *mut std::ffi::c_void) -> i32;
+        fn GetProcAddress(hModule: *mut std::ffi::c_void, lpProcName: *const i8) -> *mut std::ffi::c_void;
+        fn GetLastError() -> u32;
+    }
+    
+    pub fn load_library(path: &Path) -> Result<LibraryHandle, LibraryError> {
+        load_library_with_options(path, &LoadOptions::default())
+    }
+    
+    pub fn load_library_with_options(path: &Path, _options: &LoadOptions) -> Result<LibraryHandle, LibraryError> {
+        let wide: Vec<u16> = OsStr::new(path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        
+        let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+        
+        if handle.is_null() {
+            let error = unsafe { GetLastError() };
+            return Err(LibraryError::LoadFailed(format!("error code: {}", error)));
+        }
+        
+        Ok(LibraryHandle { raw: handle })
+    }
+    
+    pub fn unload_library(handle: RawHandle) {
+        unsafe { FreeLibrary(handle); }
+    }
+    
+    pub fn lookup_symbol(handle: RawHandle, name: &str) -> Result<usize, LibraryError> {
+        let c_name = std::ffi::CString::new(name)
+            .map_err(|_| LibraryError::SymbolNotFound(name.to_string()))?;
+        
+        let symbol = unsafe { GetProcAddress(handle, c_name.as_ptr()) };
+        
+        if symbol.is_null() {
+            return Err(LibraryError::SymbolNotFound(name.to_string()));
+        }
+        
+        Ok(symbol as usize)
+    }
+    
+    pub fn list_symbols(_handle: RawHandle, _path: &Path) -> Result<Vec<String>, LibraryError> {
+        // Would need to parse PE exports
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod platform {
+    use super::*;
+    
+    pub fn load_library(path: &Path) -> Result<LibraryHandle, LibraryError> {
+        Err(LibraryError::PlatformError("unsupported platform".to_string()))
+    }
+    
+    pub fn load_library_with_options(path: &Path, _options: &LoadOptions) -> Result<LibraryHandle, LibraryError> {
+        Err(LibraryError::PlatformError("unsupported platform".to_string()))
+    }
+    
+    pub fn unload_library(_handle: RawHandle) {}
+    
+    pub fn lookup_symbol(_handle: RawHandle, name: &str) -> Result<usize, LibraryError> {
+        Err(LibraryError::PlatformError("unsupported platform".to_string()))
+    }
+    
+    pub fn list_symbols(_handle: RawHandle, _path: &Path) -> Result<Vec<String>, LibraryError> {
+        Ok(Vec::new())
+    }
+}
+
+use platform::*;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIBRARY PATH RESOLUTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Resolve library name to full path
+fn resolve_library_path(name: &str) -> Result<PathBuf, LibraryError> {
+    // Already a path
+    if name.contains('/') || name.contains('\\') {
+        let path = PathBuf::from(name);
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(LibraryError::NotFound(name.to_string()));
+    }
+    
+    let target = TargetInfo::current();
+    let search_paths = get_library_search_paths(&target);
+    let candidates = generate_library_names(name, &target);
+    
+    for search_path in &search_paths {
+        for candidate in &candidates {
+            let full_path = search_path.join(candidate);
+            if full_path.exists() {
+                return Ok(full_path);
+            }
+        }
+    }
+    
+    Err(LibraryError::NotFound(name.to_string()))
+}
+
+/// Get platform library search paths
+fn get_library_search_paths(target: &TargetInfo) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    
+    // Current directory
+    if let Ok(cwd) = std::env::current_dir() {
+        paths.push(cwd);
+    }
+    
+    match target.os {
+        OperatingSystem::Linux | OperatingSystem::FreeBSD => {
+            // LD_LIBRARY_PATH
+            if let Ok(ld_path) = std::env::var("LD_LIBRARY_PATH") {
+                paths.extend(ld_path.split(':').map(PathBuf::from));
+            }
+            
+            // Standard paths
+            paths.push(PathBuf::from("/lib"));
+            paths.push(PathBuf::from("/usr/lib"));
+            paths.push(PathBuf::from("/usr/local/lib"));
+            
+            // Architecture-specific
+            if target.arch == Architecture::X86_64 {
+                paths.push(PathBuf::from("/lib/x86_64-linux-gnu"));
+                paths.push(PathBuf::from("/usr/lib/x86_64-linux-gnu"));
+                paths.push(PathBuf::from("/lib64"));
+                paths.push(PathBuf::from("/usr/lib64"));
+            } else if target.arch == Architecture::Aarch64 {
+                paths.push(PathBuf::from("/lib/aarch64-linux-gnu"));
+                paths.push(PathBuf::from("/usr/lib/aarch64-linux-gnu"));
+            }
+        }
+        OperatingSystem::MacOS => {
+            // DYLD_LIBRARY_PATH
+            if let Ok(dyld_path) = std::env::var("DYLD_LIBRARY_PATH") {
+                paths.extend(dyld_path.split(':').map(PathBuf::from));
+            }
+            
+            paths.push(PathBuf::from("/usr/lib"));
+            paths.push(PathBuf::from("/usr/local/lib"));
+            paths.push(PathBuf::from("/opt/homebrew/lib")); // Apple Silicon
+            paths.push(PathBuf::from("/opt/local/lib")); // MacPorts
+        }
+        OperatingSystem::Windows => {
+            // PATH
+            if let Ok(path) = std::env::var("PATH") {
+                paths.extend(path.split(';').map(PathBuf::from));
+            }
+            
+            // System directories
+            if let Ok(sys) = std::env::var("SYSTEMROOT") {
+                paths.push(PathBuf::from(&sys).join("System32"));
+                paths.push(PathBuf::from(&sys).join("SysWOW64"));
+            }
+        }
+        _ => {}
+    }
+    
+    paths
+}
+
+/// Generate possible library filenames
+fn generate_library_names(name: &str, target: &TargetInfo) -> Vec<String> {
+    let mut names = Vec::new();
+    
+    // Already has extension
+    if name.contains('.') {
+        names.push(name.to_string());
+    }
+    
+    match target.os {
+        OperatingSystem::Linux | OperatingSystem::FreeBSD => {
+            names.push(format!("lib{}.so", name));
+            names.push(format!("{}.so", name));
+            // Versioned
+            for v in ["6", "5", "4", "3", "2", "1", "0"] {
+                names.push(format!("lib{}.so.{}", name, v));
+            }
+        }
+        OperatingSystem::MacOS => {
+            names.push(format!("lib{}.dylib", name));
+            names.push(format!("{}.dylib", name));
+            // Framework
+            names.push(format!("{}.framework/{}", name, name));
+        }
+        OperatingSystem::Windows => {
+            names.push(format!("{}.dll", name));
+            names.push(format!("lib{}.dll", name));
+        }
+        _ => {
+            names.push(name.to_string());
+        }
+    }
+    
+    names
+}
+
+/// Extract version from library filename
+fn extract_version(filename: &str) -> Option<String> {
+    // libfoo.so.1.2.3 -> Some("1.2.3")
+    // libfoo.1.dylib -> Some("1")
+    let parts: Vec<&str> = filename.split('.').collect();
+    
+    for (i, part) in parts.iter().enumerate() {
+        if part.chars().all(|c| c.is_ascii_digit()) {
+            let version_parts: Vec<&str> = parts[i..].iter()
+                .take_while(|p| p.chars().all(|c| c.is_ascii_digit() || c == '_'))
+                .copied()
+                .collect();
+            if !version_parts.is_empty() {
+                return Some(version_parts.join("."));
+            }
+        }
+    }
+    
+    None
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SYMBOL MANGLING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Symbol mangling schemes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mangling {
+    /// No mangling (C)
+    None,
+    /// Leading underscore (macOS, Windows 32-bit)
+    LeadingUnderscore,
+    /// Itanium C++ mangling (Linux, macOS)
+    ItaniumCxx,
+    /// Microsoft C++ mangling (Windows)
+    MicrosoftCxx,
+    /// Rust mangling
+    Rust,
+}
+
+impl Mangling {
+    /// Get default mangling for target
+    pub fn for_target(target: &TargetInfo, lang: Language) -> Self {
+        match (lang, target.os) {
+            (Language::C, OperatingSystem::MacOS) => Mangling::LeadingUnderscore,
+            (Language::C, OperatingSystem::Windows) if target.arch == Architecture::X86 => {
+                Mangling::LeadingUnderscore
+            }
+            (Language::C, _) => Mangling::None,
+            (Language::Cxx, OperatingSystem::Windows) => Mangling::MicrosoftCxx,
+            (Language::Cxx, _) => Mangling::ItaniumCxx,
+            (Language::Rust, _) => Mangling::Rust,
+        }
+    }
+    
+    /// Mangle a symbol name
+    pub fn mangle(&self, name: &str) -> String {
+        match self {
+            Mangling::None => name.to_string(),
+            Mangling::LeadingUnderscore => format!("_{}", name),
+            Mangling::ItaniumCxx => mangle_itanium(name),
+            Mangling::MicrosoftCxx => mangle_microsoft(name),
+            Mangling::Rust => mangle_rust(name),
+        }
+    }
+    
+    /// Demangle a symbol name
+    pub fn demangle(&self, name: &str) -> String {
+        match self {
+            Mangling::None => name.to_string(),
+            Mangling::LeadingUnderscore => {
+                name.strip_prefix('_').unwrap_or(name).to_string()
+            }
+            Mangling::ItaniumCxx => demangle_itanium(name),
+            Mangling::MicrosoftCxx => demangle_microsoft(name),
+            Mangling::Rust => demangle_rust(name),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    C,
+    Cxx,
+    Rust,
+}
+
+// Simplified mangling implementations
+fn mangle_itanium(name: &str) -> String {
+    // Full Itanium mangling is complex; this is simplified
+    if name.contains("::") {
+        let parts: Vec<&str> = name.split("::").collect();
+        let mut mangled = String::from("_Z");
+        for part in &parts[..parts.len()-1] {
+            mangled.push_str(&format!("N{}{}", part.len(), part));
+        }
+        if let Some(last) = parts.last() {
+            mangled.push_str(&format!("{}{}", last.len(), last));
+        }
+        mangled.push('E');
+        mangled
+    } else {
+        format!("_Z{}{}", name.len(), name)
+    }
+}
+
+fn demangle_itanium(name: &str) -> String {
+    // Simplified demangling
+    if !name.starts_with("_Z") {
+        return name.to_string();
+    }
+    // Would implement full demangling here
+    name.to_string()
+}
+
+fn mangle_microsoft(name: &str) -> String {
+    // Microsoft mangling is very different
+    format!("?{}@@", name)
+}
+
+fn demangle_microsoft(name: &str) -> String {
+    if !name.starts_with('?') {
+        return name.to_string();
+    }
+    name.to_string()
+}
+
+fn mangle_rust(name: &str) -> String {
+    format!("_R{}{}", name.len(), name)
+}
+
+fn demangle_rust(name: &str) -> String {
+    if !name.starts_with("_R") {
+        return name.to_string();
+    }
+    name.to_string()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BINDING DEFINITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// FFI binding definition
+#[derive(Debug, Clone)]
+pub struct Binding {
+    /// Binding name
+    pub name: String,
+    /// Library to link
+    pub library: String,
+    /// Functions
+    pub functions: Vec<FunctionBinding>,
+    /// Types
+    pub types: Vec<TypeBinding>,
+    /// Constants
+    pub constants: Vec<ConstantBinding>,
+    /// Static variables
+    pub statics: Vec<StaticBinding>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionBinding {
+    pub name: String,
+    pub symbol: String,
+    pub signature: FunctionSignature,
+    pub safety: Safety,
+    pub doc: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeBinding {
+    pub name: String,
+    pub kind: TypeBindingKind,
+    pub doc: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeBindingKind {
+    Struct(StructType),
+    Enum(EnumType),
+    Alias(String, ForeignType),
+    Opaque,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstantBinding {
+    pub name: String,
+    pub ty: ForeignType,
+    pub value: ConstantValue,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConstantValue {
+    Integer(i64),
+    Float(f64),
+    String(String),
+    Expr(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticBinding {
+    pub name: String,
+    pub symbol: String,
+    pub ty: ForeignType,
+    pub mutable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Safety {
+    Safe,
+    Unsafe,
+}
+
+impl Binding {
+    pub fn new(name: impl Into<String>, library: impl Into<String>) -> Self {
+        Binding {
+            name: name.into(),
+            library: library.into(),
+            functions: Vec::new(),
+            types: Vec::new(),
+            constants: Vec::new(),
+            statics: Vec::new(),
+        }
+    }
+    
+    pub fn function(mut self, binding: FunctionBinding) -> Self {
+        self.functions.push(binding);
+        self
+    }
+    
+    pub fn type_binding(mut self, binding: TypeBinding) -> Self {
+        self.types.push(binding);
+        self
+    }
+    
+    pub fn constant(mut self, binding: ConstantBinding) -> Self {
+        self.constants.push(binding);
+        self
+    }
+    
+    pub fn static_var(mut self, binding: StaticBinding) -> Self {
+        self.statics.push(binding);
+        self
+    }
+    
+    /// Generate Quanta binding code
+    pub fn generate_quanta(&self) -> String {
+        let mut code = String::with_capacity(8192);
+        
+        code.push_str(&format!("// Auto-generated FFI bindings for {}\n", self.name));
+        code.push_str(&format!("// Library: {}\n\n", self.library));
+        
+        code.push_str(&format!("#[link(name = \"{}\")]\n", self.library));
+        code.push_str("extern \"C\" {\n");
+        
+        // Functions
+        for func in &self.functions {
+            if let Some(ref doc) = func.doc {
+                code.push_str(&format!("    /// {}\n", doc));
+            }
+            
+            let params: Vec<String> = func.signature.parameters.iter()
+                .map(|p| format!("{}: {}", p.name, p.ty.to_quanta_type()))
+                .collect();
+            
+            let ret = if matches!(func.signature.return_type, ForeignType::Void) {
+                String::new()
+            } else {
+                format!(" -> {}", func.signature.return_type.to_quanta_type())
+            };
+            
+            let safety = if func.safety == Safety::Unsafe { "unsafe " } else { "" };
+            
+            code.push_str(&format!(
+                "    {}fn {}({}){};\n",
+                safety,
+                func.name,
+                params.join(", "),
+                ret
+            ));
+        }
+        
+        // Statics
+        for s in &self.statics {
+            let mutability = if s.mutable { "mut " } else { "" };
+            code.push_str(&format!(
+                "    static {}{}: {};\n",
+                mutability,
+                s.name,
+                s.ty.to_quanta_type()
+            ));
+        }
+        
+        code.push_str("}\n\n");
+        
+        // Types
+        for ty in &self.types {
+            if let Some(ref doc) = ty.doc {
+                code.push_str(&format!("/// {}\n", doc));
+            }
+            
+            match &ty.kind {
+                TypeBindingKind::Struct(s) => {
+                    code.push_str("#[repr(C)]\n");
+                    code.push_str(&format!("pub struct {} {{\n", ty.name));
+                    for field in &s.fields {
+                        code.push_str(&format!(
+                            "    pub {}: {},\n",
+                            field.name,
+                            field.ty.to_quanta_type()
+                        ));
+                    }
+                    code.push_str("}\n\n");
+                }
+                TypeBindingKind::Enum(e) => {
+                    code.push_str("#[repr(C)]\n");
+                    code.push_str(&format!("pub enum {} {{\n", ty.name));
+                    for variant in &e.variants {
+                        code.push_str(&format!(
+                            "    {} = {},\n",
+                            variant.name,
+                            variant.value
+                        ));
+                    }
+                    code.push_str("}\n\n");
+                }
+                TypeBindingKind::Alias(name, foreign_ty) => {
+                    code.push_str(&format!(
+                        "pub type {} = {};\n\n",
+                        name,
+                        foreign_ty.to_quanta_type()
+                    ));
+                }
+                TypeBindingKind::Opaque => {
+                    code.push_str(&format!(
+                        "pub struct {} {{ _opaque: [u8; 0] }}\n\n",
+                        ty.name
+                    ));
+                }
+            }
+        }
+        
+        // Constants
+        for c in &self.constants {
+            let value_str = match &c.value {
+                ConstantValue::Integer(i) => i.to_string(),
+                ConstantValue::Float(f) => format!("{:.6}", f),
+                ConstantValue::String(s) => format!("\"{}\"", s),
+                ConstantValue::Expr(e) => e.clone(),
+            };
+            code.push_str(&format!(
+                "pub const {}: {} = {};\n",
+                c.name,
+                c.ty.to_quanta_type(),
+                value_str
+            ));
+        }
+        
+        code
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BINDING GENERATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Binding generator from C headers
+pub struct BindingGenerator {
+    target: TargetInfo,
+    include_paths: Vec<PathBuf>,
+    defines: BTreeMap<String, String>,
+    blocklist: Vec<String>,
+    allowlist: Vec<String>,
+}
+
+impl BindingGenerator {
+    pub fn new(target: TargetInfo) -> Self {
+        BindingGenerator {
+            target,
+            include_paths: Vec::new(),
+            defines: BTreeMap::new(),
+            blocklist: Vec::new(),
+            allowlist: Vec::new(),
+        }
+    }
+    
+    pub fn include_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.include_paths.push(path.into());
+        self
+    }
+    
+    pub fn define(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.defines.insert(name.into(), value.into());
+        self
+    }
+    
+    pub fn blocklist(mut self, pattern: impl Into<String>) -> Self {
+        self.blocklist.push(pattern.into());
+        self
+    }
+    
+    pub fn allowlist(mut self, pattern: impl Into<String>) -> Self {
+        self.allowlist.push(pattern.into());
+        self
+    }
+    
+    /// Generate bindings from a header file
+    pub fn generate_from_header(&self, header: &Path) -> Result<Binding, String> {
+        // In a real implementation, this would:
+        // 1. Invoke libclang to parse the header
+        // 2. Extract type definitions, function declarations, etc.
+        // 3. Apply allowlist/blocklist filters
+        // 4. Generate Binding structure
+        
+        let name = header.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("bindings")
+            .to_string();
+        
+        Ok(Binding::new(name, "c"))
+    }
+    
+    /// Generate bindings from header content string
+    pub fn generate_from_source(&self, source: &str, name: &str) -> Result<Binding, String> {
+        // Parse source and generate bindings
+        Ok(Binding::new(name, "c"))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIBRARY REGISTRY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Global registry of loaded libraries
+pub struct LibraryRegistry {
+    libraries: RwLock<BTreeMap<String, Arc<Library>>>,
+}
+
+impl LibraryRegistry {
+    pub fn new() -> Self {
+        LibraryRegistry {
+            libraries: RwLock::new(BTreeMap::new()),
+        }
+    }
+    
+    /// Get or load a library
+    pub fn get_or_load(&self, name: &str) -> Result<Arc<Library>, LibraryError> {
+        // Check cache
+        {
+            let libs = self.libraries.read().unwrap();
+            if let Some(lib) = libs.get(name) {
+                return Ok(Arc::clone(lib));
+            }
+        }
+        
+        // Load and cache
+        let lib = Arc::new(Library::load(name)?);
+        
+        {
+            let mut libs = self.libraries.write().unwrap();
+            libs.insert(name.to_string(), Arc::clone(&lib));
+        }
+        
+        Ok(lib)
+    }
+    
+    /// Unload a library
+    pub fn unload(&self, name: &str) -> bool {
+        let mut libs = self.libraries.write().unwrap();
+        libs.remove(name).is_some()
+    }
+    
+    /// List loaded libraries
+    pub fn list(&self) -> Vec<String> {
+        let libs = self.libraries.read().unwrap();
+        libs.keys().cloned().collect()
+    }
+}
+
+impl Default for LibraryRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Global registry instance
+lazy_static! {
+    pub static ref LIBRARIES: LibraryRegistry = LibraryRegistry::new();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_generate_library_names_linux() {
+        let target = TargetInfo::from_triple("x86_64-unknown-linux-gnu");
+        let names = generate_library_names("foo", &target);
+        
+        assert!(names.contains(&"libfoo.so".to_string()));
+        assert!(names.contains(&"foo.so".to_string()));
+    }
+    
+    #[test]
+    fn test_generate_library_names_macos() {
+        let target = TargetInfo::from_triple("x86_64-apple-darwin");
+        let names = generate_library_names("foo", &target);
+        
+        assert!(names.contains(&"libfoo.dylib".to_string()));
+    }
+    
+    #[test]
+    fn test_generate_library_names_windows() {
+        let target = TargetInfo::from_triple("x86_64-pc-windows-msvc");
+        let names = generate_library_names("foo", &target);
+        
+        assert!(names.contains(&"foo.dll".to_string()));
+        assert!(names.contains(&"libfoo.dll".to_string()));
+    }
+    
+    #[test]
+    fn test_extract_version() {
+        assert_eq!(extract_version("libfoo.so.1.2.3"), Some("1.2.3".to_string()));
+        assert_eq!(extract_version("libfoo.so.6"), Some("6".to_string()));
+        assert_eq!(extract_version("libfoo.so"), None);
+    }
+    
+    #[test]
+    fn test_mangling_none() {
+        let m = Mangling::None;
+        assert_eq!(m.mangle("foo"), "foo");
+        assert_eq!(m.demangle("foo"), "foo");
+    }
+    
+    #[test]
+    fn test_mangling_underscore() {
+        let m = Mangling::LeadingUnderscore;
+        assert_eq!(m.mangle("foo"), "_foo");
+        assert_eq!(m.demangle("_foo"), "foo");
+    }
+    
+    #[test]
+    fn test_binding_generation() {
+        let binding = Binding::new("test", "testlib")
+            .function(FunctionBinding {
+                name: "test_func".to_string(),
+                symbol: "test_func".to_string(),
+                signature: FunctionSignature::new("test_func")
+                    .param("x", ForeignType::Int)
+                    .returns(ForeignType::Int),
+                safety: Safety::Unsafe,
+                doc: Some("Test function".to_string()),
+            })
+            .constant(ConstantBinding {
+                name: "TEST_CONST".to_string(),
+                ty: ForeignType::Int,
+                value: ConstantValue::Integer(42),
+            });
+        
+        let code = binding.generate_quanta();
+        assert!(code.contains("test_func"));
+        assert!(code.contains("TEST_CONST"));
+        assert!(code.contains("42"));
+    }
+    
+    #[test]
+    fn test_library_registry() {
+        let registry = LibraryRegistry::new();
+        assert!(registry.list().is_empty());
+    }
+}

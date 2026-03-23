@@ -1,0 +1,993 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ INFERENCE — Hindley-Milner Type Inference Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Type inference implementation:
+// - Hindley-Milner Algorithm W with extensions
+// - Bidirectional type checking
+// - Constraint generation and solving
+// - Row polymorphism for records/variants
+// - Rank-N polymorphism support
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::inference::engine
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE VARIABLES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type variable identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TyVar(pub u32);
+
+impl TyVar {
+    /// Generate fresh type variable
+    pub fn fresh() -> Self {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        TyVar(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl std::fmt::Display for TyVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "?{}", self.0)
+    }
+}
+
+/// Type variable kind
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TyVarKind {
+    /// Unknown type (will be unified)
+    Unknown,
+    /// Integer literal (polymorphic)
+    IntLit,
+    /// Float literal (polymorphic)
+    FloatLit,
+    /// Effect variable
+    Effect,
+    /// Row variable (for records/variants)
+    Row,
+    /// Lifetime variable
+    Lifetime,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTERNAL TYPE REPRESENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Internal type representation for inference
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ty {
+    /// Type variable
+    Var(TyVar),
+    
+    /// Unit type
+    Unit,
+    
+    /// Boolean
+    Bool,
+    
+    /// Integer (with optional specific size)
+    Int(Option<IntSize>),
+    
+    /// Unsigned integer
+    UInt(Option<UIntSize>),
+    
+    /// Float (with optional specific size)
+    Float(Option<FloatSize>),
+    
+    /// String
+    String,
+    
+    /// Character
+    Char,
+    
+    /// Never type
+    Never,
+    
+    /// Function type
+    Fun {
+        params: Vec<Ty>,
+        ret: Box<Ty>,
+        effects: EffectRow,
+    },
+    
+    /// Tuple
+    Tuple(Vec<Ty>),
+    
+    /// Array with known size
+    Array(Box<Ty>, usize),
+    
+    /// Slice
+    Slice(Box<Ty>),
+    
+    /// Reference
+    Ref {
+        lifetime: LifetimeVar,
+        mutability: Mutability,
+        ty: Box<Ty>,
+    },
+    
+    /// Named type with type arguments
+    Named {
+        name: TypeName,
+        args: Vec<Ty>,
+    },
+    
+    /// Record type (row polymorphism)
+    Record(Row),
+    
+    /// Variant type (row polymorphism)
+    Variant(Row),
+    
+    /// Forall (polymorphic type)
+    Forall {
+        vars: Vec<TyVar>,
+        body: Box<Ty>,
+    },
+    
+    /// Error (for recovery)
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntSize { I8, I16, I32, I64, I128, ISize }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UIntSize { U8, U16, U32, U64, U128, USize }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatSize { F32, F64 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutability { Shared, Mutable }
+
+/// Type name
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TypeName(pub String);
+
+/// Lifetime variable
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LifetimeVar(pub u32);
+
+impl LifetimeVar {
+    pub fn fresh() -> Self {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        LifetimeVar(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+    
+    pub fn static_lifetime() -> Self {
+        LifetimeVar(u32::MAX)
+    }
+}
+
+/// Row type for record/variant polymorphism
+#[derive(Debug, Clone, PartialEq)]
+pub struct Row {
+    /// Known fields
+    pub fields: BTreeMap<String, Ty>,
+    /// Row tail (None = closed, Some = open/extensible)
+    pub tail: Option<TyVar>,
+}
+
+impl Row {
+    pub fn empty() -> Self {
+        Row {
+            fields: BTreeMap::new(),
+            tail: None,
+        }
+    }
+    
+    pub fn open() -> Self {
+        Row {
+            fields: BTreeMap::new(),
+            tail: Some(TyVar::fresh()),
+        }
+    }
+    
+    pub fn with_field(mut self, name: String, ty: Ty) -> Self {
+        self.fields.insert(name, ty);
+        self
+    }
+}
+
+/// Effect row for effect polymorphism
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectRow {
+    /// Known effects
+    pub effects: BTreeSet<EffectName>,
+    /// Row tail for open effects
+    pub tail: Option<TyVar>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EffectName(pub String);
+
+impl EffectRow {
+    pub fn pure() -> Self {
+        EffectRow {
+            effects: BTreeSet::new(),
+            tail: None,
+        }
+    }
+    
+    pub fn total() -> Self {
+        EffectRow {
+            effects: BTreeSet::new(),
+            tail: Some(TyVar::fresh()),
+        }
+    }
+    
+    pub fn singleton(effect: EffectName) -> Self {
+        let mut effects = BTreeSet::new();
+        effects.insert(effect);
+        EffectRow { effects, tail: None }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE SCHEME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Polymorphic type scheme (forall quantified)
+#[derive(Debug, Clone)]
+pub struct Scheme {
+    /// Quantified type variables
+    pub vars: Vec<TyVar>,
+    /// Quantified lifetime variables
+    pub lifetimes: Vec<LifetimeVar>,
+    /// Constraints on variables
+    pub constraints: Vec<Constraint>,
+    /// The type body
+    pub ty: Ty,
+}
+
+impl Scheme {
+    /// Monomorphic scheme (no quantification)
+    pub fn mono(ty: Ty) -> Self {
+        Scheme {
+            vars: Vec::new(),
+            lifetimes: Vec::new(),
+            constraints: Vec::new(),
+            ty,
+        }
+    }
+    
+    /// Instantiate scheme with fresh variables
+    pub fn instantiate(&self) -> (Ty, Vec<Constraint>) {
+        let mut subst = Substitution::new();
+        
+        // Create fresh variables for each quantified var
+        for &var in &self.vars {
+            subst.insert(var, Ty::Var(TyVar::fresh()));
+        }
+        
+        // Apply substitution
+        let ty = subst.apply(&self.ty);
+        let constraints = self.constraints.iter()
+            .map(|c| subst.apply_constraint(c))
+            .collect();
+        
+        (ty, constraints)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONSTRAINTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type constraint
+#[derive(Debug, Clone)]
+pub enum Constraint {
+    /// Type equality: T1 = T2
+    Eq(Ty, Ty),
+    
+    /// Trait bound: T: Trait
+    Trait {
+        ty: Ty,
+        trait_name: String,
+        args: Vec<Ty>,
+    },
+    
+    /// Effect constraint
+    Effect {
+        actual: EffectRow,
+        expected: EffectRow,
+    },
+    
+    /// Field constraint (for records): T has field f: U
+    HasField {
+        record: Ty,
+        field: String,
+        field_ty: Ty,
+    },
+    
+    /// Lifetime outlives: 'a: 'b
+    Outlives(LifetimeVar, LifetimeVar),
+    
+    /// Integer literal constraint
+    IntLiteral(Ty),
+    
+    /// Float literal constraint
+    FloatLiteral(Ty),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SUBSTITUTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type substitution
+#[derive(Debug, Clone, Default)]
+pub struct Substitution {
+    mapping: BTreeMap<TyVar, Ty>,
+    lifetime_mapping: BTreeMap<LifetimeVar, LifetimeVar>,
+}
+
+impl Substitution {
+    pub fn new() -> Self {
+        Substitution::default()
+    }
+    
+    /// Insert mapping
+    pub fn insert(&mut self, var: TyVar, ty: Ty) {
+        self.mapping.insert(var, ty);
+    }
+    
+    /// Lookup variable
+    pub fn get(&self, var: TyVar) -> Option<&Ty> {
+        self.mapping.get(&var)
+    }
+    
+    /// Apply substitution to type
+    pub fn apply(&self, ty: &Ty) -> Ty {
+        match ty {
+            Ty::Var(var) => {
+                if let Some(t) = self.mapping.get(var) {
+                    // Apply recursively in case of chains
+                    self.apply(t)
+                } else {
+                    ty.clone()
+                }
+            }
+            
+            Ty::Fun { params, ret, effects } => Ty::Fun {
+                params: params.iter().map(|t| self.apply(t)).collect(),
+                ret: Box::new(self.apply(ret)),
+                effects: self.apply_effects(effects),
+            },
+            
+            Ty::Tuple(tys) => {
+                Ty::Tuple(tys.iter().map(|t| self.apply(t)).collect())
+            }
+            
+            Ty::Array(elem, size) => {
+                Ty::Array(Box::new(self.apply(elem)), *size)
+            }
+            
+            Ty::Slice(elem) => {
+                Ty::Slice(Box::new(self.apply(elem)))
+            }
+            
+            Ty::Ref { lifetime, mutability, ty } => Ty::Ref {
+                lifetime: self.apply_lifetime(*lifetime),
+                mutability: *mutability,
+                ty: Box::new(self.apply(ty)),
+            },
+            
+            Ty::Named { name, args } => Ty::Named {
+                name: name.clone(),
+                args: args.iter().map(|t| self.apply(t)).collect(),
+            },
+            
+            Ty::Record(row) => Ty::Record(self.apply_row(row)),
+            
+            Ty::Variant(row) => Ty::Variant(self.apply_row(row)),
+            
+            Ty::Forall { vars, body } => {
+                // Don't substitute bound variables
+                let mut inner_subst = self.clone();
+                for var in vars {
+                    inner_subst.mapping.remove(var);
+                }
+                Ty::Forall {
+                    vars: vars.clone(),
+                    body: Box::new(inner_subst.apply(body)),
+                }
+            }
+            
+            // Primitives
+            Ty::Unit | Ty::Bool | Ty::Char | Ty::String | 
+            Ty::Never | Ty::Error => ty.clone(),
+            
+            Ty::Int(_) | Ty::UInt(_) | Ty::Float(_) => ty.clone(),
+        }
+    }
+    
+    fn apply_row(&self, row: &Row) -> Row {
+        let fields = row.fields.iter()
+            .map(|(k, v)| (k.clone(), self.apply(v)))
+            .collect();
+        
+        let tail = row.tail.and_then(|var| {
+            if let Some(Ty::Var(new_var)) = self.mapping.get(&var) {
+                Some(*new_var)
+            } else {
+                Some(var)
+            }
+        });
+        
+        Row { fields, tail }
+    }
+    
+    fn apply_effects(&self, effects: &EffectRow) -> EffectRow {
+        let tail = effects.tail.and_then(|var| {
+            if let Some(Ty::Var(new_var)) = self.mapping.get(&var) {
+                Some(*new_var)
+            } else {
+                Some(var)
+            }
+        });
+        
+        EffectRow {
+            effects: effects.effects.clone(),
+            tail,
+        }
+    }
+    
+    fn apply_lifetime(&self, lt: LifetimeVar) -> LifetimeVar {
+        self.lifetime_mapping.get(&lt).copied().unwrap_or(lt)
+    }
+    
+    /// Apply to constraint
+    pub fn apply_constraint(&self, constraint: &Constraint) -> Constraint {
+        match constraint {
+            Constraint::Eq(t1, t2) => {
+                Constraint::Eq(self.apply(t1), self.apply(t2))
+            }
+            Constraint::Trait { ty, trait_name, args } => Constraint::Trait {
+                ty: self.apply(ty),
+                trait_name: trait_name.clone(),
+                args: args.iter().map(|t| self.apply(t)).collect(),
+            },
+            Constraint::Effect { actual, expected } => Constraint::Effect {
+                actual: self.apply_effects(actual),
+                expected: self.apply_effects(expected),
+            },
+            Constraint::HasField { record, field, field_ty } => Constraint::HasField {
+                record: self.apply(record),
+                field: field.clone(),
+                field_ty: self.apply(field_ty),
+            },
+            Constraint::Outlives(a, b) => {
+                Constraint::Outlives(
+                    self.apply_lifetime(*a),
+                    self.apply_lifetime(*b),
+                )
+            }
+            Constraint::IntLiteral(ty) => Constraint::IntLiteral(self.apply(ty)),
+            Constraint::FloatLiteral(ty) => Constraint::FloatLiteral(self.apply(ty)),
+        }
+    }
+    
+    /// Compose two substitutions
+    pub fn compose(&self, other: &Substitution) -> Substitution {
+        let mut result = Substitution::new();
+        
+        // Apply self to other's mappings
+        for (&var, ty) in &other.mapping {
+            result.insert(var, self.apply(ty));
+        }
+        
+        // Add self's mappings (if not already present)
+        for (&var, ty) in &self.mapping {
+            result.mapping.entry(var).or_insert_with(|| ty.clone());
+        }
+        
+        result
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UNIFICATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unification engine
+pub struct Unifier {
+    /// Current substitution
+    subst: Substitution,
+    
+    /// Deferred constraints
+    deferred: Vec<Constraint>,
+    
+    /// Error accumulator
+    errors: Vec<TypeError>,
+}
+
+impl Unifier {
+    pub fn new() -> Self {
+        Unifier {
+            subst: Substitution::new(),
+            deferred: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+    
+    /// Unify two types
+    pub fn unify(&mut self, t1: &Ty, t2: &Ty) -> Result<(), TypeError> {
+        let t1 = self.subst.apply(t1);
+        let t2 = self.subst.apply(t2);
+        
+        if t1 == t2 {
+            return Ok(());
+        }
+        
+        match (&t1, &t2) {
+            // Variable unification
+            (Ty::Var(v), t) | (t, Ty::Var(v)) => {
+                self.unify_var(*v, t)
+            }
+            
+            // Function types
+            (Ty::Fun { params: p1, ret: r1, effects: e1 },
+             Ty::Fun { params: p2, ret: r2, effects: e2 }) => {
+                if p1.len() != p2.len() {
+                    return Err(TypeError::ArityMismatch {
+                        expected: p1.len(),
+                        found: p2.len(),
+                    });
+                }
+                
+                for (a, b) in p1.iter().zip(p2.iter()) {
+                    self.unify(a, b)?;
+                }
+                
+                self.unify(r1, r2)?;
+                self.unify_effects(e1, e2)?;
+                
+                Ok(())
+            }
+            
+            // Tuples
+            (Ty::Tuple(ts1), Ty::Tuple(ts2)) => {
+                if ts1.len() != ts2.len() {
+                    return Err(TypeError::TupleLengthMismatch {
+                        expected: ts1.len(),
+                        found: ts2.len(),
+                    });
+                }
+                
+                for (a, b) in ts1.iter().zip(ts2.iter()) {
+                    self.unify(a, b)?;
+                }
+                
+                Ok(())
+            }
+            
+            // Arrays
+            (Ty::Array(e1, n1), Ty::Array(e2, n2)) => {
+                if n1 != n2 {
+                    return Err(TypeError::ArraySizeMismatch {
+                        expected: *n1,
+                        found: *n2,
+                    });
+                }
+                
+                self.unify(e1, e2)
+            }
+            
+            // Slices
+            (Ty::Slice(e1), Ty::Slice(e2)) => {
+                self.unify(e1, e2)
+            }
+            
+            // References
+            (Ty::Ref { mutability: m1, ty: t1, .. },
+             Ty::Ref { mutability: m2, ty: t2, .. }) => {
+                if m1 != m2 {
+                    return Err(TypeError::MutabilityMismatch);
+                }
+                self.unify(t1, t2)
+            }
+            
+            // Named types
+            (Ty::Named { name: n1, args: a1 },
+             Ty::Named { name: n2, args: a2 }) => {
+                if n1 != n2 {
+                    return Err(TypeError::TypeMismatch {
+                        expected: t1.clone(),
+                        found: t2.clone(),
+                    });
+                }
+                
+                if a1.len() != a2.len() {
+                    return Err(TypeError::ArityMismatch {
+                        expected: a1.len(),
+                        found: a2.len(),
+                    });
+                }
+                
+                for (a, b) in a1.iter().zip(a2.iter()) {
+                    self.unify(a, b)?;
+                }
+                
+                Ok(())
+            }
+            
+            // Records (row polymorphism)
+            (Ty::Record(r1), Ty::Record(r2)) => {
+                self.unify_rows(r1, r2)
+            }
+            
+            // Integer literal polymorphism
+            (Ty::Int(None), Ty::Int(_)) | (Ty::Int(_), Ty::Int(None)) => Ok(()),
+            (Ty::UInt(None), Ty::UInt(_)) | (Ty::UInt(_), Ty::UInt(None)) => Ok(()),
+            (Ty::Float(None), Ty::Float(_)) | (Ty::Float(_), Ty::Float(None)) => Ok(()),
+            
+            // Error type unifies with anything
+            (Ty::Error, _) | (_, Ty::Error) => Ok(()),
+            
+            // Never type
+            (Ty::Never, _) => Ok(()), // Never can be any type
+            
+            // Type mismatch
+            _ => Err(TypeError::TypeMismatch {
+                expected: t1.clone(),
+                found: t2.clone(),
+            }),
+        }
+    }
+    
+    /// Unify type variable with type
+    fn unify_var(&mut self, var: TyVar, ty: &Ty) -> Result<(), TypeError> {
+        // Occurs check
+        if self.occurs_in(var, ty) {
+            return Err(TypeError::InfiniteType(var));
+        }
+        
+        self.subst.insert(var, ty.clone());
+        Ok(())
+    }
+    
+    /// Occurs check: does variable occur in type?
+    fn occurs_in(&self, var: TyVar, ty: &Ty) -> bool {
+        match ty {
+            Ty::Var(v) => *v == var,
+            Ty::Fun { params, ret, .. } => {
+                params.iter().any(|t| self.occurs_in(var, t)) ||
+                self.occurs_in(var, ret)
+            }
+            Ty::Tuple(ts) => ts.iter().any(|t| self.occurs_in(var, t)),
+            Ty::Array(e, _) | Ty::Slice(e) => self.occurs_in(var, e),
+            Ty::Ref { ty, .. } => self.occurs_in(var, ty),
+            Ty::Named { args, .. } => args.iter().any(|t| self.occurs_in(var, t)),
+            Ty::Record(row) | Ty::Variant(row) => {
+                row.fields.values().any(|t| self.occurs_in(var, t)) ||
+                row.tail.map_or(false, |v| v == var)
+            }
+            Ty::Forall { body, .. } => self.occurs_in(var, body),
+            _ => false,
+        }
+    }
+    
+    /// Unify effect rows
+    fn unify_effects(&mut self, e1: &EffectRow, e2: &EffectRow) -> Result<(), TypeError> {
+        // Effects must be subset relationship for now
+        // Full effect unification would be more complex
+        
+        match (&e1.tail, &e2.tail) {
+            (Some(v1), Some(v2)) if v1 == v2 => {
+                // Same tail, effects must match
+                if e1.effects != e2.effects {
+                    return Err(TypeError::EffectMismatch);
+                }
+                Ok(())
+            }
+            (Some(v), None) | (None, Some(v)) => {
+                // One is open, one is closed
+                // Unify tail with remaining effects
+                Ok(())
+            }
+            (None, None) => {
+                if e1.effects == e2.effects {
+                    Ok(())
+                } else {
+                    Err(TypeError::EffectMismatch)
+                }
+            }
+            (Some(v1), Some(v2)) => {
+                // Different tails, create fresh tail
+                self.unify(&Ty::Var(*v1), &Ty::Var(*v2))
+            }
+        }
+    }
+    
+    /// Unify rows (for records/variants)
+    fn unify_rows(&mut self, r1: &Row, r2: &Row) -> Result<(), TypeError> {
+        // Check common fields
+        for (name, ty1) in &r1.fields {
+            if let Some(ty2) = r2.fields.get(name) {
+                self.unify(ty1, ty2)?;
+            } else if r2.tail.is_none() {
+                return Err(TypeError::MissingField(name.clone()));
+            }
+        }
+        
+        for (name, _) in &r2.fields {
+            if !r1.fields.contains_key(name) && r1.tail.is_none() {
+                return Err(TypeError::MissingField(name.clone()));
+            }
+        }
+        
+        // Unify tails
+        match (r1.tail, r2.tail) {
+            (Some(v1), Some(v2)) => {
+                if v1 != v2 {
+                    self.unify(&Ty::Var(v1), &Ty::Var(v2))?;
+                }
+            }
+            (Some(v), None) => {
+                // Create row with r2's extra fields
+                let extra: BTreeMap<_, _> = r2.fields.iter()
+                    .filter(|(k, _)| !r1.fields.contains_key(*k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                
+                if extra.is_empty() {
+                    self.subst.insert(v, Ty::Record(Row::empty()));
+                } else {
+                    self.subst.insert(v, Ty::Record(Row {
+                        fields: extra,
+                        tail: None,
+                    }));
+                }
+            }
+            (None, Some(v)) => {
+                let extra: BTreeMap<_, _> = r1.fields.iter()
+                    .filter(|(k, _)| !r2.fields.contains_key(*k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                
+                if extra.is_empty() {
+                    self.subst.insert(v, Ty::Record(Row::empty()));
+                } else {
+                    self.subst.insert(v, Ty::Record(Row {
+                        fields: extra,
+                        tail: None,
+                    }));
+                }
+            }
+            (None, None) => {
+                // Both closed, already checked fields match
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Solve deferred constraints
+    pub fn solve_deferred(&mut self) -> Result<(), Vec<TypeError>> {
+        let mut unsolved = Vec::new();
+        
+        for constraint in std::mem::take(&mut self.deferred) {
+            match &constraint {
+                Constraint::Eq(t1, t2) => {
+                    if let Err(e) = self.unify(t1, t2) {
+                        self.errors.push(e);
+                    }
+                }
+                Constraint::IntLiteral(ty) => {
+                    let ty = self.subst.apply(ty);
+                    match ty {
+                        Ty::Var(_) => {
+                            // Default to i32
+                            if let Err(e) = self.unify(&ty, &Ty::Int(Some(IntSize::I32))) {
+                                self.errors.push(e);
+                            }
+                        }
+                        Ty::Int(_) | Ty::UInt(_) => {}
+                        _ => {
+                            self.errors.push(TypeError::NotIntegral(ty));
+                        }
+                    }
+                }
+                Constraint::FloatLiteral(ty) => {
+                    let ty = self.subst.apply(ty);
+                    match ty {
+                        Ty::Var(_) => {
+                            // Default to f64
+                            if let Err(e) = self.unify(&ty, &Ty::Float(Some(FloatSize::F64))) {
+                                self.errors.push(e);
+                            }
+                        }
+                        Ty::Float(_) => {}
+                        _ => {
+                            self.errors.push(TypeError::NotFloating(ty));
+                        }
+                    }
+                }
+                _ => {
+                    unsolved.push(constraint);
+                }
+            }
+        }
+        
+        self.deferred = unsolved;
+        
+        if self.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(std::mem::take(&mut self.errors))
+        }
+    }
+    
+    /// Get final substitution
+    pub fn substitution(&self) -> &Substitution {
+        &self.subst
+    }
+    
+    /// Add deferred constraint
+    pub fn defer(&mut self, constraint: Constraint) {
+        self.deferred.push(constraint);
+    }
+}
+
+impl Default for Unifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub enum TypeError {
+    TypeMismatch { expected: Ty, found: Ty },
+    ArityMismatch { expected: usize, found: usize },
+    TupleLengthMismatch { expected: usize, found: usize },
+    ArraySizeMismatch { expected: usize, found: usize },
+    MutabilityMismatch,
+    InfiniteType(TyVar),
+    UnboundVariable(String),
+    UnknownType(String),
+    MissingField(String),
+    EffectMismatch,
+    NotIntegral(Ty),
+    NotFloating(Ty),
+    AmbiguousType(TyVar),
+    TraitNotSatisfied { ty: Ty, trait_name: String },
+}
+
+impl std::fmt::Display for TypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TypeMismatch { expected, found } => {
+                write!(f, "type mismatch: expected {:?}, found {:?}", expected, found)
+            }
+            Self::ArityMismatch { expected, found } => {
+                write!(f, "arity mismatch: expected {}, found {}", expected, found)
+            }
+            Self::TupleLengthMismatch { expected, found } => {
+                write!(f, "tuple length mismatch: expected {}, found {}", expected, found)
+            }
+            Self::ArraySizeMismatch { expected, found } => {
+                write!(f, "array size mismatch: expected {}, found {}", expected, found)
+            }
+            Self::MutabilityMismatch => write!(f, "mutability mismatch"),
+            Self::InfiniteType(var) => write!(f, "infinite type: {}", var),
+            Self::UnboundVariable(name) => write!(f, "unbound variable: {}", name),
+            Self::UnknownType(name) => write!(f, "unknown type: {}", name),
+            Self::MissingField(name) => write!(f, "missing field: {}", name),
+            Self::EffectMismatch => write!(f, "effect mismatch"),
+            Self::NotIntegral(ty) => write!(f, "not an integral type: {:?}", ty),
+            Self::NotFloating(ty) => write!(f, "not a floating type: {:?}", ty),
+            Self::AmbiguousType(var) => write!(f, "ambiguous type: {}", var),
+            Self::TraitNotSatisfied { ty, trait_name } => {
+                write!(f, "trait {} not satisfied for {:?}", trait_name, ty)
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_tyvar_fresh() {
+        let v1 = TyVar::fresh();
+        let v2 = TyVar::fresh();
+        assert_ne!(v1, v2);
+    }
+    
+    #[test]
+    fn test_unify_same() {
+        let mut unifier = Unifier::new();
+        assert!(unifier.unify(&Ty::Int(Some(IntSize::I32)), &Ty::Int(Some(IntSize::I32))).is_ok());
+    }
+    
+    #[test]
+    fn test_unify_var() {
+        let mut unifier = Unifier::new();
+        let var = TyVar::fresh();
+        
+        assert!(unifier.unify(&Ty::Var(var), &Ty::Bool).is_ok());
+        
+        let result = unifier.substitution().apply(&Ty::Var(var));
+        assert_eq!(result, Ty::Bool);
+    }
+    
+    #[test]
+    fn test_unify_function() {
+        let mut unifier = Unifier::new();
+        
+        let t1 = Ty::Fun {
+            params: vec![Ty::Int(Some(IntSize::I32))],
+            ret: Box::new(Ty::Bool),
+            effects: EffectRow::pure(),
+        };
+        
+        let var = TyVar::fresh();
+        let t2 = Ty::Fun {
+            params: vec![Ty::Int(Some(IntSize::I32))],
+            ret: Box::new(Ty::Var(var)),
+            effects: EffectRow::pure(),
+        };
+        
+        assert!(unifier.unify(&t1, &t2).is_ok());
+        
+        let result = unifier.substitution().apply(&Ty::Var(var));
+        assert_eq!(result, Ty::Bool);
+    }
+    
+    #[test]
+    fn test_occurs_check() {
+        let mut unifier = Unifier::new();
+        let var = TyVar::fresh();
+        
+        // Try to unify X with List<X> (should fail)
+        let infinite = Ty::Named {
+            name: TypeName("List".to_string()),
+            args: vec![Ty::Var(var)],
+        };
+        
+        let result = unifier.unify(&Ty::Var(var), &infinite);
+        assert!(matches!(result, Err(TypeError::InfiniteType(_))));
+    }
+    
+    #[test]
+    fn test_row_unification() {
+        let mut unifier = Unifier::new();
+        
+        let r1 = Ty::Record(Row {
+            fields: [("x".to_string(), Ty::Int(Some(IntSize::I32)))].into_iter().collect(),
+            tail: Some(TyVar::fresh()),
+        });
+        
+        let r2 = Ty::Record(Row {
+            fields: [
+                ("x".to_string(), Ty::Int(Some(IntSize::I32))),
+                ("y".to_string(), Ty::Bool),
+            ].into_iter().collect(),
+            tail: None,
+        });
+        
+        assert!(unifier.unify(&r1, &r2).is_ok());
+    }
+}

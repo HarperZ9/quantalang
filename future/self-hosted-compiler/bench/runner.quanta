@@ -1,0 +1,716 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ BENCHMARK — Runner & Statistics
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Criterion-style benchmark runner with statistical rigor.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::bench::runner
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use std::time::{Duration, Instant};
+use std::hint::black_box;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Benchmark configuration
+#[derive(Debug, Clone)]
+pub struct BenchConfig {
+    /// Warm-up time before measurement
+    pub warm_up_time: Duration,
+    
+    /// Measurement time per benchmark
+    pub measurement_time: Duration,
+    
+    /// Minimum number of iterations
+    pub min_iterations: u64,
+    
+    /// Maximum number of iterations
+    pub max_iterations: u64,
+    
+    /// Target sample count for statistics
+    pub sample_count: usize,
+    
+    /// Confidence level for intervals (0.95 = 95%)
+    pub confidence_level: f64,
+    
+    /// Outlier threshold (IQR multiplier)
+    pub outlier_threshold: f64,
+    
+    /// Enable noise detection
+    pub noise_detection: bool,
+    
+    /// Baseline directory for comparisons
+    pub baseline_dir: Option<std::path::PathBuf>,
+    
+    /// Save results as new baseline
+    pub save_baseline: bool,
+    
+    /// Output format
+    pub output_format: OutputFormat,
+    
+    /// Significance threshold for regression detection
+    pub significance_threshold: f64,
+}
+
+impl Default for BenchConfig {
+    fn default() -> Self {
+        BenchConfig {
+            warm_up_time: Duration::from_secs(3),
+            measurement_time: Duration::from_secs(5),
+            min_iterations: 10,
+            max_iterations: 10_000_000,
+            sample_count: 100,
+            confidence_level: 0.95,
+            outlier_threshold: 1.5,
+            noise_detection: true,
+            baseline_dir: None,
+            save_baseline: false,
+            output_format: OutputFormat::Pretty,
+            significance_threshold: 0.05,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Pretty,
+    Json,
+    Csv,
+    Minimal,
+    Verbose,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BENCHMARK DEFINITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Benchmark definition
+pub struct Benchmark<T> {
+    pub name: String,
+    pub group: Option<String>,
+    pub function: Box<dyn Fn(&mut Bencher) -> T>,
+    pub setup: Option<Box<dyn Fn() -> ()>>,
+    pub teardown: Option<Box<dyn Fn() -> ()>>,
+    pub inputs: Vec<BenchmarkInput>,
+}
+
+impl<T> Benchmark<T> {
+    pub fn new<S: Into<String>, F: Fn(&mut Bencher) -> T + 'static>(name: S, f: F) -> Self {
+        Benchmark {
+            name: name.into(),
+            group: None,
+            function: Box::new(f),
+            setup: None,
+            teardown: None,
+            inputs: Vec::new(),
+        }
+    }
+    
+    pub fn group<S: Into<String>>(mut self, group: S) -> Self {
+        self.group = Some(group.into());
+        self
+    }
+    
+    pub fn setup<F: Fn() + 'static>(mut self, f: F) -> Self {
+        self.setup = Some(Box::new(f));
+        self
+    }
+    
+    pub fn teardown<F: Fn() + 'static>(mut self, f: F) -> Self {
+        self.teardown = Some(Box::new(f));
+        self
+    }
+    
+    pub fn with_input<S: Into<String>>(mut self, name: S, size: usize) -> Self {
+        self.inputs.push(BenchmarkInput {
+            name: name.into(),
+            size,
+        });
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BenchmarkInput {
+    pub name: String,
+    pub size: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BENCHER (MEASUREMENT INTERFACE)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Measurement interface passed to benchmark functions
+pub struct Bencher {
+    iterations: u64,
+    elapsed: Duration,
+    bytes_processed: u64,
+}
+
+impl Bencher {
+    fn new() -> Self {
+        Bencher {
+            iterations: 0,
+            elapsed: Duration::ZERO,
+            bytes_processed: 0,
+        }
+    }
+    
+    /// Run the benchmark function repeatedly
+    pub fn iter<F, R>(&mut self, mut f: F) where F: FnMut() -> R {
+        let start = Instant::now();
+        
+        for _ in 0..self.iterations {
+            black_box(f());
+        }
+        
+        self.elapsed = start.elapsed();
+    }
+    
+    /// Run with setup for each iteration
+    pub fn iter_with_setup<S, R, SF, F>(&mut self, mut setup: SF, mut routine: F)
+    where
+        SF: FnMut() -> S,
+        F: FnMut(S) -> R,
+    {
+        let start = Instant::now();
+        
+        for _ in 0..self.iterations {
+            let input = black_box(setup());
+            black_box(routine(input));
+        }
+        
+        self.elapsed = start.elapsed();
+    }
+    
+    /// Run batched iterations
+    pub fn iter_batched<S, R, SF, F>(&mut self, mut setup: SF, mut routine: F, batch_size: usize)
+    where
+        SF: FnMut() -> S,
+        F: FnMut(S) -> R,
+    {
+        let batches = (self.iterations as usize + batch_size - 1) / batch_size;
+        let start = Instant::now();
+        
+        for _ in 0..batches {
+            let input = black_box(setup());
+            for _ in 0..batch_size {
+                black_box(routine(black_box(&input)));
+            }
+        }
+        
+        self.elapsed = start.elapsed();
+    }
+    
+    /// Set bytes processed (for throughput calculation)
+    pub fn bytes(&mut self, bytes: u64) {
+        self.bytes_processed = bytes;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BENCHMARK RUNNER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Benchmark runner
+pub struct Runner {
+    config: BenchConfig,
+    results: Vec<BenchmarkResult>,
+    baselines: BTreeMap<String, BenchmarkResult>,
+}
+
+impl Runner {
+    pub fn new(config: BenchConfig) -> Self {
+        let mut runner = Runner {
+            config,
+            results: Vec::new(),
+            baselines: BTreeMap::new(),
+        };
+        
+        // Load baselines if configured
+        if let Some(ref dir) = runner.config.baseline_dir {
+            runner.load_baselines(dir);
+        }
+        
+        runner
+    }
+    
+    /// Run a benchmark
+    pub fn run<T>(&mut self, benchmark: &Benchmark<T>) -> BenchmarkResult {
+        let full_name = match &benchmark.group {
+            Some(g) => format!("{}/{}", g, benchmark.name),
+            None => benchmark.name.clone(),
+        };
+        
+        eprintln!("Benchmarking {}", full_name);
+        
+        // Setup
+        if let Some(ref setup) = benchmark.setup {
+            setup();
+        }
+        
+        // Warm-up phase
+        let iterations_per_sample = self.warm_up(&benchmark.function);
+        
+        // Measurement phase
+        let samples = self.measure(&benchmark.function, iterations_per_sample);
+        
+        // Teardown
+        if let Some(ref teardown) = benchmark.teardown {
+            teardown();
+        }
+        
+        // Analyze
+        let stats = self.analyze(&samples, iterations_per_sample);
+        
+        // Compare with baseline
+        let comparison = self.baselines.get(&full_name)
+            .map(|baseline| self.compare(&stats, &baseline.stats));
+        
+        let result = BenchmarkResult {
+            name: full_name.clone(),
+            group: benchmark.group.clone(),
+            samples,
+            iterations_per_sample,
+            stats,
+            comparison,
+            timestamp: std::time::SystemTime::now(),
+        };
+        
+        // Print result
+        self.print_result(&result);
+        
+        self.results.push(result.clone());
+        result
+    }
+    
+    /// Warm-up phase - determine iterations per sample
+    fn warm_up<T, F: Fn(&mut Bencher) -> T>(&self, f: &F) -> u64 {
+        let deadline = Instant::now() + self.config.warm_up_time;
+        let mut iterations = 1u64;
+        
+        while Instant::now() < deadline {
+            let mut bencher = Bencher::new();
+            bencher.iterations = iterations;
+            
+            let start = Instant::now();
+            f(&mut bencher);
+            let elapsed = start.elapsed();
+            
+            // Adjust iterations to target ~10ms per sample
+            let target = Duration::from_millis(10);
+            if elapsed < target && iterations < self.config.max_iterations {
+                let ratio = target.as_nanos() as f64 / elapsed.as_nanos().max(1) as f64;
+                iterations = ((iterations as f64 * ratio) as u64)
+                    .max(iterations + 1)
+                    .min(self.config.max_iterations);
+            } else {
+                break;
+            }
+        }
+        
+        iterations.max(self.config.min_iterations)
+    }
+    
+    /// Measurement phase - collect samples
+    fn measure<T, F: Fn(&mut Bencher) -> T>(&self, f: &F, iterations: u64) -> Vec<Duration> {
+        let deadline = Instant::now() + self.config.measurement_time;
+        let mut samples = Vec::with_capacity(self.config.sample_count);
+        
+        while samples.len() < self.config.sample_count && Instant::now() < deadline {
+            let mut bencher = Bencher::new();
+            bencher.iterations = iterations;
+            
+            let start = Instant::now();
+            f(&mut bencher);
+            let elapsed = if bencher.elapsed > Duration::ZERO {
+                bencher.elapsed
+            } else {
+                start.elapsed()
+            };
+            
+            // Time per iteration
+            let per_iter = elapsed / iterations as u32;
+            samples.push(per_iter);
+        }
+        
+        samples
+    }
+    
+    /// Analyze samples and compute statistics
+    fn analyze(&self, samples: &[Duration], iterations: u64) -> Statistics {
+        let mut times: Vec<f64> = samples.iter()
+            .map(|d| d.as_nanos() as f64)
+            .collect();
+        
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        
+        let n = times.len();
+        
+        // Central tendency
+        let mean = times.iter().sum::<f64>() / n as f64;
+        let median = if n % 2 == 0 {
+            (times[n/2 - 1] + times[n/2]) / 2.0
+        } else {
+            times[n/2]
+        };
+        
+        // Dispersion
+        let variance = times.iter()
+            .map(|t| (t - mean).powi(2))
+            .sum::<f64>() / (n - 1) as f64;
+        let std_dev = variance.sqrt();
+        
+        // Standard error
+        let std_error = std_dev / (n as f64).sqrt();
+        
+        // Confidence interval
+        let z = z_score(self.config.confidence_level);
+        let ci_lower = mean - z * std_error;
+        let ci_upper = mean + z * std_error;
+        
+        // Quartiles
+        let q1 = times[n / 4];
+        let q3 = times[3 * n / 4];
+        let iqr = q3 - q1;
+        
+        // Outliers
+        let lower_fence = q1 - self.config.outlier_threshold * iqr;
+        let upper_fence = q3 + self.config.outlier_threshold * iqr;
+        
+        let (outliers_low, outliers_high) = if self.config.noise_detection {
+            let low = times.iter().filter(|&&t| t < lower_fence).count();
+            let high = times.iter().filter(|&&t| t > upper_fence).count();
+            (low, high)
+        } else {
+            (0, 0)
+        };
+        
+        // Min/Max
+        let min = *times.first().unwrap();
+        let max = *times.last().unwrap();
+        
+        // Percentiles
+        let p50 = times[n * 50 / 100];
+        let p90 = times[n * 90 / 100];
+        let p95 = times[n * 95 / 100];
+        let p99 = times[n * 99 / 100];
+        
+        Statistics {
+            mean: Duration::from_nanos(mean as u64),
+            median: Duration::from_nanos(median as u64),
+            std_dev: Duration::from_nanos(std_dev as u64),
+            std_error: Duration::from_nanos(std_error as u64),
+            ci_lower: Duration::from_nanos(ci_lower.max(0.0) as u64),
+            ci_upper: Duration::from_nanos(ci_upper as u64),
+            confidence_level: self.config.confidence_level,
+            min: Duration::from_nanos(min as u64),
+            max: Duration::from_nanos(max as u64),
+            p50: Duration::from_nanos(p50 as u64),
+            p90: Duration::from_nanos(p90 as u64),
+            p95: Duration::from_nanos(p95 as u64),
+            p99: Duration::from_nanos(p99 as u64),
+            sample_count: n,
+            iterations_per_sample: iterations,
+            outliers_low,
+            outliers_high,
+        }
+    }
+    
+    /// Compare with baseline
+    fn compare(&self, current: &Statistics, baseline: &Statistics) -> Comparison {
+        let current_mean = current.mean.as_nanos() as f64;
+        let baseline_mean = baseline.mean.as_nanos() as f64;
+        
+        let diff = current_mean - baseline_mean;
+        let diff_percent = (diff / baseline_mean) * 100.0;
+        
+        // Pooled standard error for significance testing
+        let se_current = current.std_error.as_nanos() as f64;
+        let se_baseline = baseline.std_error.as_nanos() as f64;
+        let pooled_se = (se_current.powi(2) + se_baseline.powi(2)).sqrt();
+        
+        // t-statistic
+        let t_stat = diff / pooled_se;
+        
+        // Significance (two-tailed)
+        let significant = t_stat.abs() > z_score(1.0 - self.config.significance_threshold / 2.0);
+        
+        // Determine change type
+        let change = if !significant {
+            ChangeType::NoChange
+        } else if diff_percent < -5.0 {
+            ChangeType::Improvement
+        } else if diff_percent > 5.0 {
+            ChangeType::Regression
+        } else {
+            ChangeType::NoChange
+        };
+        
+        Comparison {
+            baseline_mean: baseline.mean,
+            diff: Duration::from_nanos(diff.abs() as u64),
+            diff_percent,
+            change,
+            significant,
+            t_statistic: t_stat,
+        }
+    }
+    
+    /// Print result to console
+    fn print_result(&self, result: &BenchmarkResult) {
+        match self.config.output_format {
+            OutputFormat::Pretty => self.print_pretty(result),
+            OutputFormat::Minimal => self.print_minimal(result),
+            OutputFormat::Verbose => self.print_verbose(result),
+            _ => self.print_pretty(result),
+        }
+    }
+    
+    fn print_pretty(&self, result: &BenchmarkResult) {
+        let stats = &result.stats;
+        
+        println!("  time:   [{} {} {}]",
+            format_duration(stats.ci_lower),
+            format_duration(stats.mean),
+            format_duration(stats.ci_upper),
+        );
+        
+        if let Some(ref cmp) = result.comparison {
+            let change_str = match cmp.change {
+                ChangeType::Improvement => format!("\x1b[32m{:+.2}%\x1b[0m", cmp.diff_percent),
+                ChangeType::Regression => format!("\x1b[31m{:+.2}%\x1b[0m", cmp.diff_percent),
+                ChangeType::NoChange => format!("{:+.2}%", cmp.diff_percent),
+            };
+            println!("  change: {} (p < {})", change_str, 
+                if cmp.significant { "0.05" } else { "n/s" });
+        }
+        
+        if stats.outliers_low > 0 || stats.outliers_high > 0 {
+            println!("  outliers: {} low, {} high", stats.outliers_low, stats.outliers_high);
+        }
+        
+        println!();
+    }
+    
+    fn print_minimal(&self, result: &BenchmarkResult) {
+        println!("{}: {}", result.name, format_duration(result.stats.mean));
+    }
+    
+    fn print_verbose(&self, result: &BenchmarkResult) {
+        let stats = &result.stats;
+        
+        println!("Benchmark: {}", result.name);
+        println!("  Samples:     {}", stats.sample_count);
+        println!("  Iterations:  {}", stats.iterations_per_sample);
+        println!("  Mean:        {}", format_duration(stats.mean));
+        println!("  Median:      {}", format_duration(stats.median));
+        println!("  Std Dev:     {}", format_duration(stats.std_dev));
+        println!("  Std Error:   {}", format_duration(stats.std_error));
+        println!("  {}% CI:     [{}, {}]", 
+            (stats.confidence_level * 100.0) as u32,
+            format_duration(stats.ci_lower),
+            format_duration(stats.ci_upper));
+        println!("  Min:         {}", format_duration(stats.min));
+        println!("  Max:         {}", format_duration(stats.max));
+        println!("  P50:         {}", format_duration(stats.p50));
+        println!("  P90:         {}", format_duration(stats.p90));
+        println!("  P95:         {}", format_duration(stats.p95));
+        println!("  P99:         {}", format_duration(stats.p99));
+        
+        if let Some(ref cmp) = result.comparison {
+            println!("  Baseline:    {}", format_duration(cmp.baseline_mean));
+            println!("  Change:      {:+.2}%", cmp.diff_percent);
+            println!("  Significant: {}", cmp.significant);
+        }
+        
+        println!();
+    }
+    
+    /// Load baselines from directory
+    fn load_baselines(&mut self, dir: &std::path::Path) {
+        // In real impl, load from JSON files
+        let _ = dir;
+    }
+    
+    /// Save baselines to directory
+    pub fn save_baselines(&self, dir: &std::path::Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("failed to create baseline dir: {}", e))?;
+        
+        for result in &self.results {
+            let filename = format!("{}.json", result.name.replace('/', "_"));
+            let path = dir.join(filename);
+            
+            let json = self.result_to_json(result);
+            std::fs::write(path, json)
+                .map_err(|e| format!("failed to write baseline: {}", e))?;
+        }
+        
+        Ok(())
+    }
+    
+    fn result_to_json(&self, result: &BenchmarkResult) -> String {
+        let stats = &result.stats;
+        format!(
+            r#"{{"name":"{}","mean_ns":{},"std_dev_ns":{},"sample_count":{}}}"#,
+            result.name,
+            stats.mean.as_nanos(),
+            stats.std_dev.as_nanos(),
+            stats.sample_count
+        )
+    }
+    
+    /// Get all results
+    pub fn results(&self) -> &[BenchmarkResult] {
+        &self.results
+    }
+    
+    /// Generate summary report
+    pub fn summary(&self) -> String {
+        let mut report = String::new();
+        
+        report.push_str("═══════════════════════════════════════════════════════════════\n");
+        report.push_str("                    BENCHMARK SUMMARY                           \n");
+        report.push_str("═══════════════════════════════════════════════════════════════\n\n");
+        
+        for result in &self.results {
+            report.push_str(&format!("{:<40} {}\n", 
+                result.name,
+                format_duration(result.stats.mean)));
+            
+            if let Some(ref cmp) = result.comparison {
+                let indicator = match cmp.change {
+                    ChangeType::Improvement => "↓",
+                    ChangeType::Regression => "↑",
+                    ChangeType::NoChange => "=",
+                };
+                report.push_str(&format!("  {} {:+.2}%\n", indicator, cmp.diff_percent));
+            }
+        }
+        
+        report
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RESULTS & STATISTICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Benchmark result
+#[derive(Debug, Clone)]
+pub struct BenchmarkResult {
+    pub name: String,
+    pub group: Option<String>,
+    pub samples: Vec<Duration>,
+    pub iterations_per_sample: u64,
+    pub stats: Statistics,
+    pub comparison: Option<Comparison>,
+    pub timestamp: std::time::SystemTime,
+}
+
+/// Statistical summary
+#[derive(Debug, Clone)]
+pub struct Statistics {
+    pub mean: Duration,
+    pub median: Duration,
+    pub std_dev: Duration,
+    pub std_error: Duration,
+    pub ci_lower: Duration,
+    pub ci_upper: Duration,
+    pub confidence_level: f64,
+    pub min: Duration,
+    pub max: Duration,
+    pub p50: Duration,
+    pub p90: Duration,
+    pub p95: Duration,
+    pub p99: Duration,
+    pub sample_count: usize,
+    pub iterations_per_sample: u64,
+    pub outliers_low: usize,
+    pub outliers_high: usize,
+}
+
+/// Comparison with baseline
+#[derive(Debug, Clone)]
+pub struct Comparison {
+    pub baseline_mean: Duration,
+    pub diff: Duration,
+    pub diff_percent: f64,
+    pub change: ChangeType,
+    pub significant: bool,
+    pub t_statistic: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeType {
+    Improvement,
+    Regression,
+    NoChange,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn z_score(confidence: f64) -> f64 {
+    // Approximate z-score for common confidence levels
+    match (confidence * 100.0) as u32 {
+        90 => 1.645,
+        95 => 1.96,
+        99 => 2.576,
+        _ => 1.96,
+    }
+}
+
+fn format_duration(d: Duration) -> String {
+    let nanos = d.as_nanos();
+    
+    if nanos >= 1_000_000_000 {
+        format!("{:.3} s", d.as_secs_f64())
+    } else if nanos >= 1_000_000 {
+        format!("{:.3} ms", nanos as f64 / 1_000_000.0)
+    } else if nanos >= 1_000 {
+        format!("{:.3} µs", nanos as f64 / 1_000.0)
+    } else {
+        format!("{} ns", nanos)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_bench_config_default() {
+        let config = BenchConfig::default();
+        assert_eq!(config.confidence_level, 0.95);
+        assert_eq!(config.sample_count, 100);
+    }
+    
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(format_duration(Duration::from_nanos(500)), "500 ns");
+        assert_eq!(format_duration(Duration::from_micros(500)), "500.000 µs");
+        assert_eq!(format_duration(Duration::from_millis(500)), "500.000 ms");
+    }
+    
+    #[test]
+    fn test_z_score() {
+        assert!((z_score(0.95) - 1.96).abs() < 0.01);
+        assert!((z_score(0.99) - 2.576).abs() < 0.01);
+    }
+}

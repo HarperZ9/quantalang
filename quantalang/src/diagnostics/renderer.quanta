@@ -1,0 +1,933 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DIAGNOSTICS — Renderer
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Rich diagnostic rendering:
+// - Rust-style terminal output with colors
+// - Source code snippets with highlighting
+// - Multi-line span support
+// - JSON output for IDE integration
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::diagnostics::renderer
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::format;
+use alloc::sync::Arc;
+use std::io::{self, Write, BufWriter};
+use std::collections::BTreeMap;
+
+use super::span::{
+    Span, BytePos, FileId, LineNumber, ColumnNumber,
+    SourceMap, SourceFile, LabeledSpan, SpanStyle,
+};
+use super::diagnostic::{
+    Diagnostic, SubDiagnostic, Severity, ErrorCode, Suggestion,
+    SuggestionReplacement, Applicability, SuggestionStyle,
+    DiagnosticEmitter,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COLORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// ANSI color codes
+pub mod colors {
+    pub const RESET: &str = "\x1b[0m";
+    pub const BOLD: &str = "\x1b[1m";
+    pub const DIM: &str = "\x1b[2m";
+    pub const UNDERLINE: &str = "\x1b[4m";
+    
+    pub const RED: &str = "\x1b[31m";
+    pub const GREEN: &str = "\x1b[32m";
+    pub const YELLOW: &str = "\x1b[33m";
+    pub const BLUE: &str = "\x1b[34m";
+    pub const MAGENTA: &str = "\x1b[35m";
+    pub const CYAN: &str = "\x1b[36m";
+    pub const WHITE: &str = "\x1b[37m";
+    
+    pub const BOLD_RED: &str = "\x1b[1;31m";
+    pub const BOLD_GREEN: &str = "\x1b[1;32m";
+    pub const BOLD_YELLOW: &str = "\x1b[1;33m";
+    pub const BOLD_BLUE: &str = "\x1b[1;34m";
+    pub const BOLD_MAGENTA: &str = "\x1b[1;35m";
+    pub const BOLD_CYAN: &str = "\x1b[1;36m";
+    pub const BOLD_WHITE: &str = "\x1b[1;37m";
+}
+
+/// Color configuration
+#[derive(Debug, Clone)]
+pub struct ColorConfig {
+    pub enabled: bool,
+    pub error: &'static str,
+    pub warning: &'static str,
+    pub note: &'static str,
+    pub help: &'static str,
+    pub line_number: &'static str,
+    pub source: &'static str,
+    pub primary_underline: &'static str,
+    pub secondary_underline: &'static str,
+}
+
+impl ColorConfig {
+    pub fn colored() -> Self {
+        ColorConfig {
+            enabled: true,
+            error: colors::BOLD_RED,
+            warning: colors::BOLD_YELLOW,
+            note: colors::BOLD_CYAN,
+            help: colors::BOLD_GREEN,
+            line_number: colors::BOLD_BLUE,
+            source: colors::RESET,
+            primary_underline: colors::BOLD_RED,
+            secondary_underline: colors::BOLD_BLUE,
+        }
+    }
+    
+    pub fn plain() -> Self {
+        ColorConfig {
+            enabled: false,
+            error: "",
+            warning: "",
+            note: "",
+            help: "",
+            line_number: "",
+            source: "",
+            primary_underline: "",
+            secondary_underline: "",
+        }
+    }
+    
+    pub fn reset(&self) -> &'static str {
+        if self.enabled { colors::RESET } else { "" }
+    }
+    
+    pub fn bold(&self) -> &'static str {
+        if self.enabled { colors::BOLD } else { "" }
+    }
+    
+    pub fn severity_color(&self, severity: Severity) -> &'static str {
+        if !self.enabled {
+            return "";
+        }
+        match severity {
+            Severity::Bug | Severity::Error => self.error,
+            Severity::Warning => self.warning,
+            Severity::Note => self.note,
+            Severity::Help => self.help,
+        }
+    }
+}
+
+impl Default for ColorConfig {
+    fn default() -> Self {
+        Self::colored()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TERMINAL RENDERER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Rust-style terminal diagnostic renderer
+pub struct TerminalRenderer {
+    source_map: Arc<SourceMap>,
+    colors: ColorConfig,
+    show_source: bool,
+    context_lines: u32,
+}
+
+impl TerminalRenderer {
+    /// Create a new terminal renderer
+    pub fn new(source_map: Arc<SourceMap>) -> Self {
+        TerminalRenderer {
+            source_map,
+            colors: ColorConfig::colored(),
+            show_source: true,
+            context_lines: 2,
+        }
+    }
+    
+    /// Set color configuration
+    pub fn with_colors(mut self, colors: ColorConfig) -> Self {
+        self.colors = colors;
+        self
+    }
+    
+    /// Disable colors
+    pub fn no_colors(mut self) -> Self {
+        self.colors = ColorConfig::plain();
+        self
+    }
+    
+    /// Set whether to show source snippets
+    pub fn show_source(mut self, show: bool) -> Self {
+        self.show_source = show;
+        self
+    }
+    
+    /// Set context lines around spans
+    pub fn context_lines(mut self, lines: u32) -> Self {
+        self.context_lines = lines;
+        self
+    }
+    
+    /// Render a diagnostic to a string
+    pub fn render(&self, diagnostic: &Diagnostic) -> String {
+        let mut output = String::new();
+        self.render_to(&mut output, diagnostic);
+        output
+    }
+    
+    /// Render a diagnostic to a writer
+    pub fn render_to(&self, output: &mut String, diagnostic: &Diagnostic) {
+        // Header: error[E0001]: message
+        self.render_header(output, diagnostic);
+        
+        // Source snippets
+        if self.show_source && !diagnostic.spans.is_empty() {
+            self.render_source_snippets(output, diagnostic);
+        }
+        
+        // Notes
+        for note in &diagnostic.notes {
+            output.push_str(&format!(
+                "   {}= note{}: {}\n",
+                self.colors.note,
+                self.colors.reset(),
+                note
+            ));
+        }
+        
+        // Children (help, etc.)
+        for child in &diagnostic.children {
+            self.render_child(output, child);
+        }
+        
+        // Suggestions
+        for suggestion in &diagnostic.suggestions {
+            self.render_suggestion(output, suggestion);
+        }
+        
+        output.push('\n');
+    }
+    
+    /// Render diagnostic header
+    fn render_header(&self, output: &mut String, diagnostic: &Diagnostic) {
+        let color = self.colors.severity_color(diagnostic.severity);
+        
+        output.push_str(color);
+        output.push_str(diagnostic.severity.as_str());
+        
+        if let Some(code) = diagnostic.code {
+            output.push_str(&format!("[{}]", code));
+        }
+        
+        output.push_str(self.colors.reset());
+        output.push_str(self.colors.bold());
+        output.push_str(": ");
+        output.push_str(&diagnostic.message);
+        output.push_str(self.colors.reset());
+        output.push('\n');
+    }
+    
+    /// Render source code snippets with highlighting
+    fn render_source_snippets(&self, output: &mut String, diagnostic: &Diagnostic) {
+        // Group spans by file
+        let mut spans_by_file: BTreeMap<FileId, Vec<&LabeledSpan>> = BTreeMap::new();
+        for span in &diagnostic.spans.spans {
+            spans_by_file.entry(span.file_id)
+                .or_default()
+                .push(span);
+        }
+        
+        for (file_id, spans) in spans_by_file {
+            if let Some(file) = self.source_map.get_file(file_id) {
+                self.render_file_snippet(output, &file, &spans, diagnostic.severity);
+            }
+        }
+    }
+    
+    /// Render snippet for a single file
+    fn render_file_snippet(
+        &self,
+        output: &mut String,
+        file: &SourceFile,
+        spans: &[&LabeledSpan],
+        severity: Severity,
+    ) {
+        if spans.is_empty() {
+            return;
+        }
+        
+        // Get primary span location
+        let primary_span = spans.iter()
+            .find(|s| s.style == SpanStyle::Primary)
+            .or(spans.first())
+            .unwrap();
+        
+        let loc = file.lookup_span(primary_span.span);
+        
+        // Location line: --> src/main.quanta:10:5
+        output.push_str(&format!(
+            "  {}-->{} {}:{}:{}\n",
+            self.colors.line_number,
+            self.colors.reset(),
+            file.path.display(),
+            loc.start_line,
+            loc.start_column
+        ));
+        
+        // Determine lines to show
+        let min_line = spans.iter()
+            .map(|s| file.lookup_line(s.span.lo).0)
+            .min()
+            .unwrap_or(1);
+        let max_line = spans.iter()
+            .map(|s| file.lookup_line(s.span.hi).0)
+            .max()
+            .unwrap_or(1);
+        
+        let first_line = min_line.saturating_sub(self.context_lines).max(1);
+        let last_line = (max_line + self.context_lines).min(file.line_count() as u32);
+        
+        // Calculate line number width
+        let line_width = last_line.to_string().len();
+        
+        // Empty line before source
+        output.push_str(&format!(
+            "   {}{}|{}\n",
+            " ".repeat(line_width),
+            self.colors.line_number,
+            self.colors.reset()
+        ));
+        
+        // Render each line
+        for line_num in first_line..=last_line {
+            let line = LineNumber(line_num);
+            
+            if let Some(content) = file.line_content(line) {
+                // Line number and source
+                output.push_str(&format!(
+                    " {}{:>width$} |{} {}\n",
+                    self.colors.line_number,
+                    line_num,
+                    self.colors.reset(),
+                    content,
+                    width = line_width
+                ));
+                
+                // Underlines for this line
+                let underlines = self.compute_underlines(file, spans, line);
+                if !underlines.is_empty() {
+                    output.push_str(&format!(
+                        " {} {}|{} ",
+                        " ".repeat(line_width),
+                        self.colors.line_number,
+                        self.colors.reset()
+                    ));
+                    
+                    self.render_underlines(output, &underlines, severity);
+                    output.push('\n');
+                }
+            }
+        }
+    }
+    
+    /// Compute underlines for a specific line
+    fn compute_underlines(
+        &self,
+        file: &SourceFile,
+        spans: &[&LabeledSpan],
+        line: LineNumber,
+    ) -> Vec<UnderlineSegment> {
+        let line_start = file.line_start(line).unwrap_or(BytePos(0));
+        let line_end = file.line_start(LineNumber(line.0 + 1))
+            .unwrap_or(BytePos(file.len));
+        
+        let mut segments = Vec::new();
+        
+        for span in spans {
+            // Check if span intersects this line
+            if span.span.hi <= line_start || span.span.lo >= line_end {
+                continue;
+            }
+            
+            // Compute visible portion
+            let start = if span.span.lo < line_start {
+                0
+            } else {
+                // Count characters from line start
+                let prefix = &file.source[line_start.to_usize()..span.span.lo.to_usize()];
+                prefix.chars().count() as u32
+            };
+            
+            let end = if span.span.hi >= line_end {
+                let content = file.line_content(line).unwrap_or("");
+                content.chars().count() as u32
+            } else {
+                let prefix = &file.source[line_start.to_usize()..span.span.hi.to_usize()];
+                prefix.chars().count() as u32
+            };
+            
+            if end > start {
+                segments.push(UnderlineSegment {
+                    start,
+                    end,
+                    style: span.style,
+                    label: span.label.clone(),
+                    is_line_end: span.span.hi >= line_end,
+                });
+            }
+        }
+        
+        // Sort by start position
+        segments.sort_by_key(|s| s.start);
+        segments
+    }
+    
+    /// Render underline segments
+    fn render_underlines(
+        &self,
+        output: &mut String,
+        segments: &[UnderlineSegment],
+        severity: Severity,
+    ) {
+        let mut pos = 0u32;
+        let mut labels = Vec::new();
+        
+        for segment in segments {
+            // Spaces before this segment
+            while pos < segment.start {
+                output.push(' ');
+                pos += 1;
+            }
+            
+            // Underline character
+            let (char, color) = match segment.style {
+                SpanStyle::Primary => ('^', self.colors.severity_color(severity)),
+                SpanStyle::Secondary => ('-', self.colors.secondary_underline),
+                SpanStyle::Note => ('.', self.colors.note),
+            };
+            
+            output.push_str(color);
+            for _ in segment.start..segment.end {
+                output.push(char);
+                pos += 1;
+            }
+            output.push_str(self.colors.reset());
+            
+            // Collect label for later
+            if let Some(label) = &segment.label {
+                if segment.is_line_end {
+                    // Inline label
+                    output.push(' ');
+                    output.push_str(color);
+                    output.push_str(label);
+                    output.push_str(self.colors.reset());
+                } else {
+                    labels.push((segment.end, label.clone(), segment.style));
+                }
+            }
+        }
+        
+        // TODO: Multi-line label rendering
+    }
+    
+    /// Render child diagnostic
+    fn render_child(&self, output: &mut String, child: &SubDiagnostic) {
+        let color = self.colors.severity_color(child.severity);
+        output.push_str(&format!(
+            "   {}= {}{}: {}\n",
+            color,
+            child.severity.as_str(),
+            self.colors.reset(),
+            child.message
+        ));
+    }
+    
+    /// Render suggestion
+    fn render_suggestion(&self, output: &mut String, suggestion: &Suggestion) {
+        if matches!(suggestion.style, SuggestionStyle::CompletelyHidden) {
+            return;
+        }
+        
+        output.push_str(&format!(
+            "   {}= help{}: {}\n",
+            self.colors.help,
+            self.colors.reset(),
+            suggestion.message
+        ));
+        
+        if matches!(suggestion.style, SuggestionStyle::ShowCode) {
+            // Show the suggested code
+            if let Some(file) = self.source_map.get_file(suggestion.replacement.file_id) {
+                let loc = file.lookup_span(suggestion.replacement.span);
+                
+                // Show replacement in context
+                if !suggestion.replacement.replacement.is_empty() {
+                    output.push_str(&format!(
+                        "   {}|{}\n",
+                        self.colors.line_number,
+                        self.colors.reset(),
+                    ));
+                    output.push_str(&format!(
+                        "   {}|{} {}{}{}\n",
+                        self.colors.line_number,
+                        self.colors.reset(),
+                        self.colors.help,
+                        suggestion.replacement.replacement,
+                        self.colors.reset(),
+                    ));
+                }
+            }
+        }
+        
+        // Show applicability hint
+        match suggestion.applicability {
+            Applicability::MachineApplicable => {
+                output.push_str("   = note: this fix can be automatically applied with `quantac --fix`\n");
+            }
+            Applicability::HasPlaceholders => {
+                output.push_str("   = note: fill in the placeholder(s)\n");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Underline segment for a single line
+struct UnderlineSegment {
+    start: u32,
+    end: u32,
+    style: SpanStyle,
+    label: Option<String>,
+    is_line_end: bool,
+}
+
+impl DiagnosticEmitter for TerminalRenderer {
+    fn emit(&self, diagnostic: &Diagnostic) {
+        let output = self.render(diagnostic);
+        eprint!("{}", output);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JSON RENDERER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// JSON diagnostic renderer for IDE integration
+pub struct JsonRenderer {
+    source_map: Arc<SourceMap>,
+    pretty: bool,
+}
+
+impl JsonRenderer {
+    pub fn new(source_map: Arc<SourceMap>) -> Self {
+        JsonRenderer {
+            source_map,
+            pretty: false,
+        }
+    }
+    
+    pub fn pretty(mut self, pretty: bool) -> Self {
+        self.pretty = pretty;
+        self
+    }
+    
+    /// Render diagnostic as JSON
+    pub fn render(&self, diagnostic: &Diagnostic) -> String {
+        let mut output = String::new();
+        self.render_to(&mut output, diagnostic);
+        output
+    }
+    
+    /// Render to string
+    pub fn render_to(&self, output: &mut String, diagnostic: &Diagnostic) {
+        output.push('{');
+        
+        // Severity
+        self.write_field(output, "severity", &format!("\"{}\"", diagnostic.severity.as_str()), true);
+        
+        // Code
+        if let Some(code) = diagnostic.code {
+            output.push_str(",");
+            self.write_field(output, "code", &format!("\"{}\"", code), false);
+        }
+        
+        // Message
+        output.push_str(",");
+        self.write_field(output, "message", &self.escape_string(&diagnostic.message), false);
+        
+        // Spans
+        if !diagnostic.spans.is_empty() {
+            output.push_str(",");
+            self.write_field(output, "spans", &self.render_spans(&diagnostic.spans.spans), false);
+        }
+        
+        // Notes
+        if !diagnostic.notes.is_empty() {
+            output.push_str(",");
+            let notes: Vec<String> = diagnostic.notes.iter()
+                .map(|n| self.escape_string(n))
+                .collect();
+            self.write_field(output, "notes", &format!("[{}]", notes.join(",")), false);
+        }
+        
+        // Children
+        if !diagnostic.children.is_empty() {
+            output.push_str(",");
+            let children: Vec<String> = diagnostic.children.iter()
+                .map(|c| self.render_child(c))
+                .collect();
+            self.write_field(output, "children", &format!("[{}]", children.join(",")), false);
+        }
+        
+        // Suggestions
+        if !diagnostic.suggestions.is_empty() {
+            output.push_str(",");
+            let suggestions: Vec<String> = diagnostic.suggestions.iter()
+                .map(|s| self.render_suggestion(s))
+                .collect();
+            self.write_field(output, "suggestions", &format!("[{}]", suggestions.join(",")), false);
+        }
+        
+        output.push('}');
+        
+        if self.pretty {
+            output.push('\n');
+        }
+    }
+    
+    fn write_field(&self, output: &mut String, name: &str, value: &str, first: bool) {
+        if self.pretty {
+            output.push_str("\n  ");
+        }
+        output.push_str(&format!("\"{}\":{}{}", 
+            name,
+            if self.pretty { " " } else { "" },
+            value
+        ));
+    }
+    
+    fn render_spans(&self, spans: &[LabeledSpan]) -> String {
+        let rendered: Vec<String> = spans.iter()
+            .map(|span| {
+                let mut obj = format!(
+                    "{{\"start\":{},\"end\":{},\"file_id\":{},\"style\":\"{}\"",
+                    span.span.lo.0,
+                    span.span.hi.0,
+                    span.file_id.to_u32(),
+                    match span.style {
+                        SpanStyle::Primary => "primary",
+                        SpanStyle::Secondary => "secondary",
+                        SpanStyle::Note => "note",
+                    }
+                );
+                
+                // Add location info if available
+                if let Some(file) = self.source_map.get_file(span.file_id) {
+                    let loc = file.lookup_span(span.span);
+                    obj.push_str(&format!(
+                        ",\"file_name\":{},\"line_start\":{},\"line_end\":{},\"column_start\":{},\"column_end\":{}",
+                        self.escape_string(&file.path.to_string_lossy()),
+                        loc.start_line.0,
+                        loc.end_line.0,
+                        loc.start_column.0,
+                        loc.end_column.0
+                    ));
+                }
+                
+                if let Some(label) = &span.label {
+                    obj.push_str(&format!(",\"label\":{}", self.escape_string(label)));
+                }
+                
+                obj.push('}');
+                obj
+            })
+            .collect();
+        
+        format!("[{}]", rendered.join(","))
+    }
+    
+    fn render_child(&self, child: &SubDiagnostic) -> String {
+        format!(
+            "{{\"severity\":\"{}\",\"message\":{}}}",
+            child.severity.as_str(),
+            self.escape_string(&child.message)
+        )
+    }
+    
+    fn render_suggestion(&self, suggestion: &Suggestion) -> String {
+        format!(
+            "{{\"message\":{},\"replacement\":{},\"applicability\":\"{}\"}}",
+            self.escape_string(&suggestion.message),
+            self.escape_string(&suggestion.replacement.replacement),
+            match suggestion.applicability {
+                Applicability::MachineApplicable => "machine_applicable",
+                Applicability::MaybeIncorrect => "maybe_incorrect",
+                Applicability::HasPlaceholders => "has_placeholders",
+                Applicability::Unspecified => "unspecified",
+            }
+        )
+    }
+    
+    fn escape_string(&self, s: &str) -> String {
+        let mut result = String::with_capacity(s.len() + 2);
+        result.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => result.push_str("\\\""),
+                '\\' => result.push_str("\\\\"),
+                '\n' => result.push_str("\\n"),
+                '\r' => result.push_str("\\r"),
+                '\t' => result.push_str("\\t"),
+                c if c.is_control() => {
+                    result.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => result.push(c),
+            }
+        }
+        result.push('"');
+        result
+    }
+}
+
+impl DiagnosticEmitter for JsonRenderer {
+    fn emit(&self, diagnostic: &Diagnostic) {
+        let output = self.render(diagnostic);
+        eprintln!("{}", output);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SHORT RENDERER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Minimal one-line renderer (GCC-style)
+pub struct ShortRenderer {
+    source_map: Arc<SourceMap>,
+    colors: ColorConfig,
+}
+
+impl ShortRenderer {
+    pub fn new(source_map: Arc<SourceMap>) -> Self {
+        ShortRenderer {
+            source_map,
+            colors: ColorConfig::colored(),
+        }
+    }
+    
+    pub fn no_colors(mut self) -> Self {
+        self.colors = ColorConfig::plain();
+        self
+    }
+    
+    pub fn render(&self, diagnostic: &Diagnostic) -> String {
+        let mut output = String::new();
+        
+        // Get primary span location
+        if let Some(span) = diagnostic.spans.primary_spans().next() {
+            if let Some(file) = self.source_map.get_file(span.file_id) {
+                let loc = file.lookup_location(span.span.lo);
+                output.push_str(&format!(
+                    "{}:{}:{}: ",
+                    loc.file.display(),
+                    loc.line,
+                    loc.column
+                ));
+            }
+        }
+        
+        // Severity and message
+        let color = self.colors.severity_color(diagnostic.severity);
+        output.push_str(&format!(
+            "{}{}{}:",
+            color,
+            diagnostic.severity.as_str(),
+            self.colors.reset()
+        ));
+        
+        if let Some(code) = diagnostic.code {
+            output.push_str(&format!(" [{}]", code));
+        }
+        
+        output.push_str(&format!(" {}", diagnostic.message));
+        output.push('\n');
+        
+        output
+    }
+}
+
+impl DiagnosticEmitter for ShortRenderer {
+    fn emit(&self, diagnostic: &Diagnostic) {
+        let output = self.render(diagnostic);
+        eprint!("{}", output);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SARIF RENDERER (Static Analysis Results Interchange Format)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SARIF output for CI/CD integration
+pub struct SarifRenderer {
+    source_map: Arc<SourceMap>,
+    tool_name: String,
+    tool_version: String,
+}
+
+impl SarifRenderer {
+    pub fn new(source_map: Arc<SourceMap>) -> Self {
+        SarifRenderer {
+            source_map,
+            tool_name: "quantac".to_string(),
+            tool_version: "1.0.0".to_string(),
+        }
+    }
+    
+    pub fn with_tool(mut self, name: impl Into<String>, version: impl Into<String>) -> Self {
+        self.tool_name = name.into();
+        self.tool_version = version.into();
+        self
+    }
+    
+    /// Render multiple diagnostics as SARIF
+    pub fn render_all(&self, diagnostics: &[Diagnostic]) -> String {
+        let mut output = String::new();
+        
+        output.push_str("{\n");
+        output.push_str("  \"$schema\": \"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json\",\n");
+        output.push_str("  \"version\": \"2.1.0\",\n");
+        output.push_str("  \"runs\": [{\n");
+        
+        // Tool info
+        output.push_str(&format!(
+            "    \"tool\": {{\n      \"driver\": {{\n        \"name\": \"{}\",\n        \"version\": \"{}\",\n        \"informationUri\": \"https://quantalang.dev\"\n      }}\n    }},\n",
+            self.tool_name,
+            self.tool_version
+        ));
+        
+        // Results
+        output.push_str("    \"results\": [\n");
+        
+        let results: Vec<String> = diagnostics.iter()
+            .map(|d| self.render_result(d))
+            .collect();
+        output.push_str(&results.join(",\n"));
+        
+        output.push_str("\n    ]\n");
+        output.push_str("  }]\n");
+        output.push_str("}\n");
+        
+        output
+    }
+    
+    fn render_result(&self, diagnostic: &Diagnostic) -> String {
+        let level = match diagnostic.severity {
+            Severity::Bug | Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Note | Severity::Help => "note",
+        };
+        
+        let mut result = format!(
+            "      {{\n        \"level\": \"{}\",\n        \"message\": {{ \"text\": \"{}\" }}",
+            level,
+            diagnostic.message.replace('"', "\\\"")
+        );
+        
+        if let Some(code) = diagnostic.code {
+            result.push_str(&format!(",\n        \"ruleId\": \"{}\"", code));
+        }
+        
+        // Locations
+        if let Some(span) = diagnostic.spans.primary_spans().next() {
+            if let Some(file) = self.source_map.get_file(span.file_id) {
+                let loc = file.lookup_span(span.span);
+                result.push_str(&format!(
+                    ",\n        \"locations\": [{{\n          \"physicalLocation\": {{\n            \"artifactLocation\": {{ \"uri\": \"{}\" }},\n            \"region\": {{\n              \"startLine\": {},\n              \"startColumn\": {},\n              \"endLine\": {},\n              \"endColumn\": {}\n            }}\n          }}\n        }}]",
+                    file.path.display(),
+                    loc.start_line.0,
+                    loc.start_column.0,
+                    loc.end_line.0,
+                    loc.end_column.0
+                ));
+            }
+        }
+        
+        result.push_str("\n      }");
+        result
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::diagnostic::{DiagnosticBuilder, types};
+    use std::path::PathBuf;
+    
+    fn test_source_map() -> Arc<SourceMap> {
+        let map = SourceMap::new();
+        map.add_file(
+            PathBuf::from("test.quanta"),
+            "fn main() {\n    let x = 42;\n    println(x);\n}\n".to_string(),
+        );
+        map
+    }
+    
+    #[test]
+    fn test_terminal_render() {
+        let map = test_source_map();
+        let renderer = TerminalRenderer::new(map.clone()).no_colors();
+        
+        let diag = DiagnosticBuilder::error("type mismatch")
+            .code(types::TYPE_MISMATCH)
+            .span(Span::new(BytePos(16), BytePos(22)), FileId(0))
+            .note("expected `String`, found `i32`")
+            .build();
+        
+        let output = renderer.render(&diag);
+        assert!(output.contains("error[E0100]"));
+        assert!(output.contains("type mismatch"));
+    }
+    
+    #[test]
+    fn test_json_render() {
+        let map = test_source_map();
+        let renderer = JsonRenderer::new(map.clone());
+        
+        let diag = DiagnosticBuilder::error("undefined variable")
+            .code(resolution::UNDEFINED_VARIABLE)
+            .span(Span::new(BytePos(40), BytePos(41)), FileId(0))
+            .build();
+        
+        let output = renderer.render(&diag);
+        assert!(output.contains("\"severity\":\"error\""));
+        assert!(output.contains("\"code\":\"E0201\""));
+    }
+    
+    #[test]
+    fn test_short_render() {
+        let map = test_source_map();
+        let renderer = ShortRenderer::new(map.clone()).no_colors();
+        
+        let diag = DiagnosticBuilder::warning("unused variable")
+            .span(Span::new(BytePos(20), BytePos(21)), FileId(0))
+            .build();
+        
+        let output = renderer.render(&diag);
+        assert!(output.contains("test.quanta:"));
+        assert!(output.contains("warning:"));
+    }
+    
+    use super::super::diagnostic::resolution;
+}

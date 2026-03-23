@@ -1,0 +1,895 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ MLIR — Passes & Transformations
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// MLIR Pass Infrastructure:
+//   - Pass manager
+//   - Dialect conversion patterns
+//   - Optimization passes
+//   - Lowering passes (Quanta → Standard → LLVM)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::mlir::passes
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use super::dialect::{MlirContext, MlirType, MlirTypeKind, TypeId};
+use super::ir::{
+    Module, Operation, Block, Region, Value, TypedValue, Location, BlockId,
+    IrBuilder, IrPrinter,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PASS INFRASTRUCTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Pass result
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassResult {
+    Success,
+    Failure,
+}
+
+/// Pass trait
+pub trait Pass: Send + Sync {
+    /// Pass name
+    fn name(&self) -> &str;
+    
+    /// Pass description
+    fn description(&self) -> &str { "" }
+    
+    /// Run the pass on a module
+    fn run_on_module(&self, module: &mut Module, ctx: &mut MlirContext) -> PassResult;
+    
+    /// Run the pass on a single operation
+    fn run_on_operation(&self, op: &mut Operation, ctx: &mut MlirContext) -> PassResult {
+        PassResult::Success
+    }
+    
+    /// Clone the pass
+    fn clone_pass(&self) -> Box<dyn Pass>;
+}
+
+/// Pass manager
+pub struct PassManager {
+    passes: Vec<Box<dyn Pass>>,
+    options: PassManagerOptions,
+}
+
+#[derive(Debug, Clone)]
+pub struct PassManagerOptions {
+    /// Print IR after each pass
+    pub print_after_all: bool,
+    /// Print IR before and after passes that modify it
+    pub print_before_after: bool,
+    /// Verify IR after each pass
+    pub verify_after_all: bool,
+    /// Enable timing
+    pub enable_timing: bool,
+    /// Enable statistics
+    pub enable_statistics: bool,
+}
+
+impl Default for PassManagerOptions {
+    fn default() -> Self {
+        PassManagerOptions {
+            print_after_all: false,
+            print_before_after: false,
+            verify_after_all: true,
+            enable_timing: false,
+            enable_statistics: false,
+        }
+    }
+}
+
+impl PassManager {
+    pub fn new() -> Self {
+        PassManager {
+            passes: Vec::new(),
+            options: PassManagerOptions::default(),
+        }
+    }
+    
+    pub fn with_options(options: PassManagerOptions) -> Self {
+        PassManager {
+            passes: Vec::new(),
+            options,
+        }
+    }
+    
+    /// Add a pass to the pipeline
+    pub fn add_pass(&mut self, pass: Box<dyn Pass>) {
+        self.passes.push(pass);
+    }
+    
+    /// Run all passes on the module
+    pub fn run(&self, module: &mut Module, ctx: &mut MlirContext) -> PassResult {
+        let mut printer = IrPrinter::new();
+        
+        for pass in &self.passes {
+            if self.options.print_before_after {
+                println!("// ===== Before {} =====", pass.name());
+                println!("{}", printer.print_module(module));
+            }
+            
+            let start = std::time::Instant::now();
+            let result = pass.run_on_module(module, ctx);
+            let duration = start.elapsed();
+            
+            if self.options.enable_timing {
+                println!("// Pass {}: {:?}", pass.name(), duration);
+            }
+            
+            if result == PassResult::Failure {
+                eprintln!("Pass {} failed", pass.name());
+                return PassResult::Failure;
+            }
+            
+            if self.options.print_after_all || self.options.print_before_after {
+                println!("// ===== After {} =====", pass.name());
+                println!("{}", printer.print_module(module));
+            }
+            
+            if self.options.verify_after_all {
+                // TODO: Run verifier
+            }
+        }
+        
+        PassResult::Success
+    }
+    
+    /// Create a standard lowering pipeline
+    pub fn create_lowering_pipeline() -> Self {
+        let mut pm = PassManager::new();
+        
+        // Canonicalization
+        pm.add_pass(Box::new(CanonicalizationPass::new()));
+        
+        // CSE
+        pm.add_pass(Box::new(CommonSubexpressionElimination::new()));
+        
+        // Lower Quanta dialect to standard dialects
+        pm.add_pass(Box::new(LowerQuantaToStandard::new()));
+        
+        // Lower SCF to CF
+        pm.add_pass(Box::new(LowerScfToCf::new()));
+        
+        // Convert to LLVM dialect
+        pm.add_pass(Box::new(ConvertToLlvm::new()));
+        
+        // Reconcile unrealized casts
+        pm.add_pass(Box::new(ReconcileUnrealizedCasts::new()));
+        
+        pm
+    }
+    
+    /// Create an optimization pipeline
+    pub fn create_optimization_pipeline(opt_level: OptLevel) -> Self {
+        let mut pm = PassManager::new();
+        
+        // Always run canonicalization
+        pm.add_pass(Box::new(CanonicalizationPass::new()));
+        
+        if opt_level >= OptLevel::O1 {
+            pm.add_pass(Box::new(CommonSubexpressionElimination::new()));
+            pm.add_pass(Box::new(DeadCodeElimination::new()));
+        }
+        
+        if opt_level >= OptLevel::O2 {
+            pm.add_pass(Box::new(LoopInvariantCodeMotion::new()));
+            pm.add_pass(Box::new(InliningPass::new(InliningConfig::default())));
+            pm.add_pass(Box::new(CanonicalizationPass::new()));
+        }
+        
+        if opt_level >= OptLevel::O3 {
+            pm.add_pass(Box::new(LoopUnrolling::new(LoopUnrollingConfig::default())));
+            pm.add_pass(Box::new(Vectorization::new()));
+        }
+        
+        pm
+    }
+}
+
+impl Default for PassManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OptLevel {
+    O0,
+    O1,
+    O2,
+    O3,
+    Os,
+    Oz,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CANONICALIZATION PASS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Canonicalization pass - applies algebraic simplifications
+pub struct CanonicalizationPass {
+    max_iterations: usize,
+}
+
+impl CanonicalizationPass {
+    pub fn new() -> Self {
+        CanonicalizationPass { max_iterations: 10 }
+    }
+}
+
+impl Pass for CanonicalizationPass {
+    fn name(&self) -> &str { "canonicalize" }
+    
+    fn description(&self) -> &str {
+        "Apply canonicalization patterns to simplify operations"
+    }
+    
+    fn run_on_module(&self, module: &mut Module, ctx: &mut MlirContext) -> PassResult {
+        let mut changed = true;
+        let mut iterations = 0;
+        
+        while changed && iterations < self.max_iterations {
+            changed = false;
+            iterations += 1;
+            
+            for block in &mut module.body.blocks {
+                let mut i = 0;
+                while i < block.operations.len() {
+                    if self.canonicalize_operation(&mut block.operations[i]) {
+                        changed = true;
+                    }
+                    i += 1;
+                }
+            }
+        }
+        
+        PassResult::Success
+    }
+    
+    fn clone_pass(&self) -> Box<dyn Pass> {
+        Box::new(CanonicalizationPass {
+            max_iterations: self.max_iterations,
+        })
+    }
+}
+
+impl CanonicalizationPass {
+    fn canonicalize_operation(&self, op: &mut Operation) -> bool {
+        let mut changed = false;
+        
+        // Constant folding for arithmetic
+        if op.name == "arith.addi" {
+            // Add 0 → identity
+            // TODO: Check if operand is constant 0
+        }
+        
+        if op.name == "arith.muli" {
+            // Multiply by 1 → identity
+            // Multiply by 0 → 0
+        }
+        
+        if op.name == "arith.subi" {
+            // Subtract 0 → identity
+            // x - x → 0
+        }
+        
+        changed
+    }
+}
+
+impl Default for CanonicalizationPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMMON SUBEXPRESSION ELIMINATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct CommonSubexpressionElimination;
+
+impl CommonSubexpressionElimination {
+    pub fn new() -> Self { CommonSubexpressionElimination }
+}
+
+impl Pass for CommonSubexpressionElimination {
+    fn name(&self) -> &str { "cse" }
+    
+    fn description(&self) -> &str {
+        "Eliminate common subexpressions"
+    }
+    
+    fn run_on_module(&self, module: &mut Module, ctx: &mut MlirContext) -> PassResult {
+        // Map expression signature to value
+        let mut expressions: BTreeMap<String, Value> = BTreeMap::new();
+        
+        for block in &mut module.body.blocks {
+            let mut to_remove = Vec::new();
+            
+            for (i, op) in block.operations.iter().enumerate() {
+                // Only CSE pure operations
+                if !op.has_side_effects() {
+                    let sig = self.compute_signature(op);
+                    
+                    if let Some(existing_value) = expressions.get(&sig) {
+                        // Found duplicate - mark for removal
+                        to_remove.push(i);
+                        // TODO: Replace uses of op's result with existing_value
+                    } else if let Some(result) = op.get_result(0) {
+                        expressions.insert(sig, result);
+                    }
+                }
+            }
+            
+            // Remove duplicates in reverse order
+            for i in to_remove.into_iter().rev() {
+                block.operations.remove(i);
+            }
+        }
+        
+        PassResult::Success
+    }
+    
+    fn clone_pass(&self) -> Box<dyn Pass> {
+        Box::new(CommonSubexpressionElimination)
+    }
+}
+
+impl CommonSubexpressionElimination {
+    fn compute_signature(&self, op: &Operation) -> String {
+        let operands: Vec<String> = op.operands.iter()
+            .map(|v| format!("{}", v.id.0))
+            .collect();
+        
+        format!("{}({})", op.name, operands.join(","))
+    }
+}
+
+impl Default for CommonSubexpressionElimination {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEAD CODE ELIMINATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct DeadCodeElimination;
+
+impl DeadCodeElimination {
+    pub fn new() -> Self { DeadCodeElimination }
+}
+
+impl Pass for DeadCodeElimination {
+    fn name(&self) -> &str { "dce" }
+    
+    fn description(&self) -> &str {
+        "Eliminate dead code"
+    }
+    
+    fn run_on_module(&self, module: &mut Module, ctx: &mut MlirContext) -> PassResult {
+        // Collect all used values
+        let mut used_values: BTreeSet<u64> = BTreeSet::new();
+        
+        for block in &module.body.blocks {
+            for op in &block.operations {
+                for operand in &op.operands {
+                    used_values.insert(operand.id.0);
+                }
+            }
+        }
+        
+        // Remove operations whose results are not used
+        for block in &mut module.body.blocks {
+            block.operations.retain(|op| {
+                // Keep operations with side effects
+                if op.has_side_effects() {
+                    return true;
+                }
+                
+                // Keep if any result is used
+                op.results.iter().any(|r| used_values.contains(&r.value.id.0))
+            });
+        }
+        
+        PassResult::Success
+    }
+    
+    fn clone_pass(&self) -> Box<dyn Pass> {
+        Box::new(DeadCodeElimination)
+    }
+}
+
+impl Default for DeadCodeElimination {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP INVARIANT CODE MOTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct LoopInvariantCodeMotion;
+
+impl LoopInvariantCodeMotion {
+    pub fn new() -> Self { LoopInvariantCodeMotion }
+}
+
+impl Pass for LoopInvariantCodeMotion {
+    fn name(&self) -> &str { "licm" }
+    
+    fn description(&self) -> &str {
+        "Hoist loop-invariant code out of loops"
+    }
+    
+    fn run_on_module(&self, module: &mut Module, ctx: &mut MlirContext) -> PassResult {
+        // Find loops and hoist invariant code
+        // This is a simplified version - full implementation would use dominator trees
+        
+        for block in &mut module.body.blocks {
+            for op in &mut block.operations {
+                if op.name == "scf.for" || op.name == "scf.while" {
+                    self.process_loop(op);
+                }
+            }
+        }
+        
+        PassResult::Success
+    }
+    
+    fn clone_pass(&self) -> Box<dyn Pass> {
+        Box::new(LoopInvariantCodeMotion)
+    }
+}
+
+impl LoopInvariantCodeMotion {
+    fn process_loop(&self, loop_op: &mut Operation) {
+        // Identify values defined outside the loop
+        let mut external_defs: BTreeSet<u64> = BTreeSet::new();
+        for operand in &loop_op.operands {
+            external_defs.insert(operand.id.0);
+        }
+        
+        // Check each operation in the loop body
+        for region in &mut loop_op.regions {
+            for block in &mut region.blocks {
+                let mut to_hoist = Vec::new();
+                
+                for (i, op) in block.operations.iter().enumerate() {
+                    if self.is_loop_invariant(op, &external_defs) {
+                        to_hoist.push(i);
+                    }
+                }
+                
+                // Would need to actually move operations to preheader
+                // This is just the detection phase
+            }
+        }
+    }
+    
+    fn is_loop_invariant(&self, op: &Operation, external_defs: &BTreeSet<u64>) -> bool {
+        // Operation is loop invariant if:
+        // 1. It has no side effects
+        // 2. All operands are defined outside the loop
+        
+        if op.has_side_effects() {
+            return false;
+        }
+        
+        op.operands.iter().all(|v| external_defs.contains(&v.id.0))
+    }
+}
+
+impl Default for LoopInvariantCodeMotion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INLINING PASS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct InliningConfig {
+    pub max_function_size: usize,
+    pub inline_threshold: usize,
+    pub always_inline_small: bool,
+}
+
+impl Default for InliningConfig {
+    fn default() -> Self {
+        InliningConfig {
+            max_function_size: 100,
+            inline_threshold: 50,
+            always_inline_small: true,
+        }
+    }
+}
+
+pub struct InliningPass {
+    config: InliningConfig,
+}
+
+impl InliningPass {
+    pub fn new(config: InliningConfig) -> Self {
+        InliningPass { config }
+    }
+}
+
+impl Pass for InliningPass {
+    fn name(&self) -> &str { "inline" }
+    
+    fn description(&self) -> &str {
+        "Inline function calls"
+    }
+    
+    fn run_on_module(&self, module: &mut Module, ctx: &mut MlirContext) -> PassResult {
+        // Build call graph and inline profitable calls
+        // This is a simplified version
+        
+        PassResult::Success
+    }
+    
+    fn clone_pass(&self) -> Box<dyn Pass> {
+        Box::new(InliningPass {
+            config: self.config.clone(),
+        })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP UNROLLING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct LoopUnrollingConfig {
+    pub unroll_factor: usize,
+    pub max_iterations: usize,
+    pub full_unroll_threshold: usize,
+}
+
+impl Default for LoopUnrollingConfig {
+    fn default() -> Self {
+        LoopUnrollingConfig {
+            unroll_factor: 4,
+            max_iterations: 16,
+            full_unroll_threshold: 8,
+        }
+    }
+}
+
+pub struct LoopUnrolling {
+    config: LoopUnrollingConfig,
+}
+
+impl LoopUnrolling {
+    pub fn new(config: LoopUnrollingConfig) -> Self {
+        LoopUnrolling { config }
+    }
+}
+
+impl Pass for LoopUnrolling {
+    fn name(&self) -> &str { "loop-unroll" }
+    
+    fn description(&self) -> &str {
+        "Unroll loops"
+    }
+    
+    fn run_on_module(&self, module: &mut Module, ctx: &mut MlirContext) -> PassResult {
+        // Find loops and unroll them
+        PassResult::Success
+    }
+    
+    fn clone_pass(&self) -> Box<dyn Pass> {
+        Box::new(LoopUnrolling {
+            config: self.config.clone(),
+        })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VECTORIZATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct Vectorization {
+    vector_width: usize,
+}
+
+impl Vectorization {
+    pub fn new() -> Self {
+        Vectorization { vector_width: 4 }
+    }
+    
+    pub fn with_width(width: usize) -> Self {
+        Vectorization { vector_width: width }
+    }
+}
+
+impl Pass for Vectorization {
+    fn name(&self) -> &str { "vectorize" }
+    
+    fn description(&self) -> &str {
+        "Vectorize operations"
+    }
+    
+    fn run_on_module(&self, module: &mut Module, ctx: &mut MlirContext) -> PassResult {
+        // Auto-vectorize loops
+        PassResult::Success
+    }
+    
+    fn clone_pass(&self) -> Box<dyn Pass> {
+        Box::new(Vectorization {
+            vector_width: self.vector_width,
+        })
+    }
+}
+
+impl Default for Vectorization {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOWERING PASSES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Lower Quanta dialect to standard dialects
+pub struct LowerQuantaToStandard;
+
+impl LowerQuantaToStandard {
+    pub fn new() -> Self { LowerQuantaToStandard }
+}
+
+impl Pass for LowerQuantaToStandard {
+    fn name(&self) -> &str { "lower-quanta-to-std" }
+    
+    fn description(&self) -> &str {
+        "Lower Quanta dialect operations to standard dialects"
+    }
+    
+    fn run_on_module(&self, module: &mut Module, ctx: &mut MlirContext) -> PassResult {
+        for block in &mut module.body.blocks {
+            for op in &mut block.operations {
+                self.lower_operation(op);
+            }
+        }
+        
+        PassResult::Success
+    }
+    
+    fn clone_pass(&self) -> Box<dyn Pass> {
+        Box::new(LowerQuantaToStandard)
+    }
+}
+
+impl LowerQuantaToStandard {
+    fn lower_operation(&self, op: &mut Operation) {
+        match op.name.as_str() {
+            "quanta.box.alloc" => {
+                // Lower to memref.alloc
+                op.name = "memref.alloc".to_string();
+            }
+            
+            "quanta.box.dealloc" => {
+                op.name = "memref.dealloc".to_string();
+            }
+            
+            "quanta.struct.get" => {
+                // Lower to llvm.extractvalue
+                op.name = "llvm.extractvalue".to_string();
+            }
+            
+            "quanta.match" => {
+                // Lower to scf.if / switch
+                // This would be a complex lowering
+            }
+            
+            _ => {}
+        }
+    }
+}
+
+/// Lower SCF dialect to CF dialect
+pub struct LowerScfToCf;
+
+impl LowerScfToCf {
+    pub fn new() -> Self { LowerScfToCf }
+}
+
+impl Pass for LowerScfToCf {
+    fn name(&self) -> &str { "lower-scf-to-cf" }
+    
+    fn description(&self) -> &str {
+        "Lower structured control flow to unstructured control flow"
+    }
+    
+    fn run_on_module(&self, module: &mut Module, ctx: &mut MlirContext) -> PassResult {
+        // Convert scf.if, scf.for, scf.while to cf.br, cf.cond_br
+        PassResult::Success
+    }
+    
+    fn clone_pass(&self) -> Box<dyn Pass> {
+        Box::new(LowerScfToCf)
+    }
+}
+
+/// Convert to LLVM dialect
+pub struct ConvertToLlvm;
+
+impl ConvertToLlvm {
+    pub fn new() -> Self { ConvertToLlvm }
+}
+
+impl Pass for ConvertToLlvm {
+    fn name(&self) -> &str { "convert-to-llvm" }
+    
+    fn description(&self) -> &str {
+        "Convert all operations to LLVM dialect"
+    }
+    
+    fn run_on_module(&self, module: &mut Module, ctx: &mut MlirContext) -> PassResult {
+        for block in &mut module.body.blocks {
+            for op in &mut block.operations {
+                self.convert_operation(op);
+            }
+        }
+        
+        PassResult::Success
+    }
+    
+    fn clone_pass(&self) -> Box<dyn Pass> {
+        Box::new(ConvertToLlvm)
+    }
+}
+
+impl ConvertToLlvm {
+    fn convert_operation(&self, op: &mut Operation) {
+        match op.name.as_str() {
+            "func.func" => {
+                op.name = "llvm.func".to_string();
+            }
+            
+            "func.return" => {
+                op.name = "llvm.return".to_string();
+            }
+            
+            "func.call" => {
+                op.name = "llvm.call".to_string();
+            }
+            
+            "memref.alloc" => {
+                op.name = "llvm.alloca".to_string();
+            }
+            
+            "memref.load" => {
+                op.name = "llvm.load".to_string();
+            }
+            
+            "memref.store" => {
+                op.name = "llvm.store".to_string();
+            }
+            
+            "arith.addi" => {
+                op.name = "llvm.add".to_string();
+            }
+            
+            "arith.subi" => {
+                op.name = "llvm.sub".to_string();
+            }
+            
+            "arith.muli" => {
+                op.name = "llvm.mul".to_string();
+            }
+            
+            "arith.divsi" => {
+                op.name = "llvm.sdiv".to_string();
+            }
+            
+            "arith.cmpi" => {
+                op.name = "llvm.icmp".to_string();
+            }
+            
+            "cf.br" => {
+                op.name = "llvm.br".to_string();
+            }
+            
+            "cf.cond_br" => {
+                op.name = "llvm.cond_br".to_string();
+            }
+            
+            _ => {}
+        }
+    }
+}
+
+/// Reconcile unrealized casts
+pub struct ReconcileUnrealizedCasts;
+
+impl ReconcileUnrealizedCasts {
+    pub fn new() -> Self { ReconcileUnrealizedCasts }
+}
+
+impl Pass for ReconcileUnrealizedCasts {
+    fn name(&self) -> &str { "reconcile-unrealized-casts" }
+    
+    fn description(&self) -> &str {
+        "Remove unrealized conversion casts"
+    }
+    
+    fn run_on_module(&self, module: &mut Module, ctx: &mut MlirContext) -> PassResult {
+        for block in &mut module.body.blocks {
+            block.operations.retain(|op| {
+                op.name != "builtin.unrealized_conversion_cast"
+            });
+        }
+        
+        PassResult::Success
+    }
+    
+    fn clone_pass(&self) -> Box<dyn Pass> {
+        Box::new(ReconcileUnrealizedCasts)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_pass_manager() {
+        let mut pm = PassManager::new();
+        pm.add_pass(Box::new(CanonicalizationPass::new()));
+        pm.add_pass(Box::new(DeadCodeElimination::new()));
+        
+        assert_eq!(pm.passes.len(), 2);
+    }
+    
+    #[test]
+    fn test_lowering_pipeline() {
+        let pm = PassManager::create_lowering_pipeline();
+        
+        // Should have multiple passes
+        assert!(pm.passes.len() >= 4);
+    }
+    
+    #[test]
+    fn test_optimization_pipeline() {
+        let pm = PassManager::create_optimization_pipeline(OptLevel::O2);
+        
+        // O2 should have several passes
+        assert!(pm.passes.len() >= 3);
+    }
+    
+    #[test]
+    fn test_canonicalization() {
+        let pass = CanonicalizationPass::new();
+        assert_eq!(pass.name(), "canonicalize");
+    }
+    
+    #[test]
+    fn test_dce() {
+        let pass = DeadCodeElimination::new();
+        assert_eq!(pass.name(), "dce");
+    }
+}

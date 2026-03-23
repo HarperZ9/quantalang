@@ -1,0 +1,863 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ STANDARD LIBRARY — Path Module
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Cross-platform path manipulation:
+// - Path (borrowed path slice)
+// - PathBuf (owned path buffer)
+// - Path components and iteration
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module std::path
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::borrow::{Cow, ToOwned};
+use core::cmp;
+use core::fmt;
+use core::hash::{Hash, Hasher};
+use core::iter::FusedIterator;
+use core::ops::Deref;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PATH SEPARATORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The main path separator for the current platform
+#[cfg(windows)]
+pub const MAIN_SEPARATOR: char = '\\';
+
+#[cfg(not(windows))]
+pub const MAIN_SEPARATOR: char = '/';
+
+/// The main path separator as a string
+#[cfg(windows)]
+pub const MAIN_SEPARATOR_STR: &str = "\\";
+
+#[cfg(not(windows))]
+pub const MAIN_SEPARATOR_STR: &str = "/";
+
+/// Check if a character is a path separator
+pub fn is_separator(c: char) -> bool {
+    c == '/' || (cfg!(windows) && c == '\\')
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PATH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A borrowed path slice (similar to &str)
+#[repr(transparent)]
+pub struct Path {
+    inner: str,
+}
+
+impl Path {
+    /// Create a Path from a string slice
+    pub fn new<S: AsRef<str> + ?Sized>(s: &S) -> &Path {
+        unsafe { &*(s.as_ref() as *const str as *const Path) }
+    }
+    
+    /// Get the underlying string
+    pub fn as_str(&self) -> &str {
+        &self.inner
+    }
+    
+    /// Get the underlying OS string representation
+    pub fn as_os_str(&self) -> &str {
+        &self.inner
+    }
+    
+    /// Convert to an owned PathBuf
+    pub fn to_path_buf(&self) -> PathBuf {
+        PathBuf::from(self.inner.to_string())
+    }
+    
+    /// Check if the path is absolute
+    pub fn is_absolute(&self) -> bool {
+        #[cfg(windows)]
+        {
+            // Windows: starts with drive letter or UNC path
+            let bytes = self.inner.as_bytes();
+            if bytes.len() >= 3 {
+                let b0 = bytes[0];
+                let b1 = bytes[1];
+                let b2 = bytes[2];
+                
+                // C:\ or C:/
+                if b0.is_ascii_alphabetic() && b1 == b':' && is_separator(b2 as char) {
+                    return true;
+                }
+                
+                // \\server or //server
+                if bytes.len() >= 2 && is_separator(bytes[0] as char) && is_separator(bytes[1] as char) {
+                    return true;
+                }
+            }
+            false
+        }
+        
+        #[cfg(not(windows))]
+        {
+            self.inner.starts_with('/')
+        }
+    }
+    
+    /// Check if the path is relative
+    pub fn is_relative(&self) -> bool {
+        !self.is_absolute()
+    }
+    
+    /// Check if the path has a root
+    pub fn has_root(&self) -> bool {
+        self.components().next().map(|c| matches!(c, Component::RootDir | Component::Prefix(_))).unwrap_or(false)
+    }
+    
+    /// Get the parent directory
+    pub fn parent(&self) -> Option<&Path> {
+        let mut comps = self.components();
+        let comp = comps.next_back();
+        comp.and_then(|p| {
+            match p {
+                Component::Normal(_) | Component::CurDir | Component::ParentDir => {
+                    Some(comps.as_path())
+                }
+                _ => None,
+            }
+        })
+    }
+    
+    /// Get the ancestors (parent, grandparent, etc.)
+    pub fn ancestors(&self) -> Ancestors<'_> {
+        Ancestors { next: Some(self) }
+    }
+    
+    /// Get the file name
+    pub fn file_name(&self) -> Option<&str> {
+        self.components().next_back().and_then(|c| {
+            match c {
+                Component::Normal(s) => Some(s),
+                _ => None,
+            }
+        })
+    }
+    
+    /// Get the file stem (name without extension)
+    pub fn file_stem(&self) -> Option<&str> {
+        self.file_name().map(|name| {
+            if let Some(pos) = name.rfind('.') {
+                if pos > 0 {
+                    return &name[..pos];
+                }
+            }
+            name
+        })
+    }
+    
+    /// Get the file extension
+    pub fn extension(&self) -> Option<&str> {
+        self.file_name().and_then(|name| {
+            if let Some(pos) = name.rfind('.') {
+                if pos > 0 && pos < name.len() - 1 {
+                    return Some(&name[pos + 1..]);
+                }
+            }
+            None
+        })
+    }
+    
+    /// Join with another path
+    pub fn join<P: AsRef<Path>>(&self, path: P) -> PathBuf {
+        let mut buf = self.to_path_buf();
+        buf.push(path);
+        buf
+    }
+    
+    /// Create a path with a different file name
+    pub fn with_file_name<S: AsRef<str>>(&self, file_name: S) -> PathBuf {
+        let mut buf = self.to_path_buf();
+        buf.set_file_name(file_name);
+        buf
+    }
+    
+    /// Create a path with a different extension
+    pub fn with_extension<S: AsRef<str>>(&self, extension: S) -> PathBuf {
+        let mut buf = self.to_path_buf();
+        buf.set_extension(extension);
+        buf
+    }
+    
+    /// Get path components
+    pub fn components(&self) -> Components<'_> {
+        Components {
+            path: &self.inner,
+            front: State::StartDir,
+            back: State::Body,
+        }
+    }
+    
+    /// Iterate over path components
+    pub fn iter(&self) -> Iter<'_> {
+        Iter {
+            inner: self.components(),
+        }
+    }
+    
+    /// Check if path starts with another path
+    pub fn starts_with<P: AsRef<Path>>(&self, base: P) -> bool {
+        iter_starts_with(self.components(), base.as_ref().components())
+    }
+    
+    /// Check if path ends with another path
+    pub fn ends_with<P: AsRef<Path>>(&self, child: P) -> bool {
+        iter_ends_with(self.components(), child.as_ref().components())
+    }
+    
+    /// Strip a prefix from the path
+    pub fn strip_prefix<P: AsRef<Path>>(&self, base: P) -> Result<&Path, StripPrefixError> {
+        iter_strip_prefix(self.components(), base.as_ref().components())
+            .map(|c| c.as_path())
+            .ok_or(StripPrefixError(()))
+    }
+    
+    /// Convert to a lossy string
+    pub fn to_string_lossy(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.inner)
+    }
+    
+    /// Check if path is a directory (via metadata)
+    pub fn is_dir(&self) -> bool {
+        crate::fs::metadata(self).map(|m| m.is_dir()).unwrap_or(false)
+    }
+    
+    /// Check if path is a file (via metadata)
+    pub fn is_file(&self) -> bool {
+        crate::fs::metadata(self).map(|m| m.is_file()).unwrap_or(false)
+    }
+    
+    /// Check if path is a symlink (via symlink metadata)
+    pub fn is_symlink(&self) -> bool {
+        crate::fs::symlink_metadata(self).map(|m| m.is_symlink()).unwrap_or(false)
+    }
+    
+    /// Check if path exists
+    pub fn exists(&self) -> bool {
+        crate::fs::metadata(self).is_ok()
+    }
+    
+    /// Try to check if path exists
+    pub fn try_exists(&self) -> crate::io::Result<bool> {
+        crate::fs::try_exists(self)
+    }
+    
+    /// Get metadata for the path
+    pub fn metadata(&self) -> crate::io::Result<crate::fs::Metadata> {
+        crate::fs::metadata(self)
+    }
+    
+    /// Get symlink metadata
+    pub fn symlink_metadata(&self) -> crate::io::Result<crate::fs::Metadata> {
+        crate::fs::symlink_metadata(self)
+    }
+    
+    /// Read a directory
+    pub fn read_dir(&self) -> crate::io::Result<crate::fs::ReadDir> {
+        crate::fs::read_dir(self)
+    }
+    
+    /// Get the canonical (absolute) path
+    pub fn canonicalize(&self) -> crate::io::Result<PathBuf> {
+        crate::fs::canonicalize(self)
+    }
+    
+    /// Read a symbolic link
+    pub fn read_link(&self) -> crate::io::Result<PathBuf> {
+        crate::fs::read_link(self)
+    }
+}
+
+impl fmt::Debug for Path {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", &self.inner)
+    }
+}
+
+impl fmt::Display for Path {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", &self.inner)
+    }
+}
+
+impl AsRef<Path> for Path {
+    fn as_ref(&self) -> &Path {
+        self
+    }
+}
+
+impl AsRef<str> for Path {
+    fn as_ref(&self) -> &str {
+        &self.inner
+    }
+}
+
+impl AsRef<Path> for str {
+    fn as_ref(&self) -> &Path {
+        Path::new(self)
+    }
+}
+
+impl AsRef<Path> for String {
+    fn as_ref(&self) -> &Path {
+        Path::new(self)
+    }
+}
+
+impl ToOwned for Path {
+    type Owned = PathBuf;
+    
+    fn to_owned(&self) -> PathBuf {
+        self.to_path_buf()
+    }
+}
+
+impl PartialEq for Path {
+    fn eq(&self, other: &Path) -> bool {
+        self.components().eq(other.components())
+    }
+}
+
+impl Eq for Path {}
+
+impl Hash for Path {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for comp in self.components() {
+            comp.hash(state);
+        }
+    }
+}
+
+impl PartialOrd for Path {
+    fn partial_cmp(&self, other: &Path) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Path {
+    fn cmp(&self, other: &Path) -> cmp::Ordering {
+        self.components().cmp(other.components())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PATHBUF
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// An owned, mutable path (similar to String)
+#[derive(Clone, Default)]
+pub struct PathBuf {
+    inner: String,
+}
+
+impl PathBuf {
+    /// Create a new empty PathBuf
+    pub fn new() -> Self {
+        PathBuf { inner: String::new() }
+    }
+    
+    /// Create a PathBuf with the given capacity
+    pub fn with_capacity(capacity: usize) -> Self {
+        PathBuf { inner: String::with_capacity(capacity) }
+    }
+    
+    /// Get the path as a Path slice
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.inner)
+    }
+    
+    /// Push a path component
+    pub fn push<P: AsRef<Path>>(&mut self, path: P) {
+        let path = path.as_ref();
+        
+        // If the argument is absolute, replace self
+        if path.is_absolute() || (cfg!(windows) && path.has_root()) {
+            self.inner = path.inner.to_string();
+            return;
+        }
+        
+        // Add separator if needed
+        if !self.inner.is_empty() && !self.inner.ends_with(MAIN_SEPARATOR) {
+            self.inner.push(MAIN_SEPARATOR);
+        }
+        
+        self.inner.push_str(&path.inner);
+    }
+    
+    /// Pop the last component
+    pub fn pop(&mut self) -> bool {
+        match self.parent().map(|p| p.inner.len()) {
+            Some(len) => {
+                self.inner.truncate(len);
+                true
+            }
+            None => false,
+        }
+    }
+    
+    /// Set the file name
+    pub fn set_file_name<S: AsRef<str>>(&mut self, file_name: S) {
+        if self.file_name().is_some() {
+            self.pop();
+        }
+        self.push(file_name.as_ref());
+    }
+    
+    /// Set the extension
+    pub fn set_extension<S: AsRef<str>>(&mut self, extension: S) -> bool {
+        let ext = extension.as_ref();
+        
+        if let Some(stem) = self.file_stem().map(|s| s.to_string()) {
+            self.pop();
+            
+            if ext.is_empty() {
+                self.push(&stem);
+            } else {
+                let new_name = format!("{}.{}", stem, ext);
+                self.push(&new_name);
+            }
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Convert into a String
+    pub fn into_string(self) -> Result<String, PathBuf> {
+        Ok(self.inner)
+    }
+    
+    /// Convert into an OsString
+    pub fn into_os_string(self) -> String {
+        self.inner
+    }
+    
+    /// Get the capacity
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+    
+    /// Clear the path
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+    
+    /// Reserve capacity
+    pub fn reserve(&mut self, additional: usize) {
+        self.inner.reserve(additional);
+    }
+    
+    /// Reserve exact capacity
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.inner.reserve_exact(additional);
+    }
+    
+    /// Shrink to fit
+    pub fn shrink_to_fit(&mut self) {
+        self.inner.shrink_to_fit();
+    }
+}
+
+impl Deref for PathBuf {
+    type Target = Path;
+    
+    fn deref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+impl fmt::Debug for PathBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", &self.inner)
+    }
+}
+
+impl fmt::Display for PathBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", &self.inner)
+    }
+}
+
+impl From<String> for PathBuf {
+    fn from(s: String) -> Self {
+        PathBuf { inner: s }
+    }
+}
+
+impl From<&str> for PathBuf {
+    fn from(s: &str) -> Self {
+        PathBuf { inner: s.to_string() }
+    }
+}
+
+impl From<&Path> for PathBuf {
+    fn from(p: &Path) -> Self {
+        p.to_path_buf()
+    }
+}
+
+impl AsRef<Path> for PathBuf {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+impl AsRef<str> for PathBuf {
+    fn as_ref(&self) -> &str {
+        &self.inner
+    }
+}
+
+impl PartialEq for PathBuf {
+    fn eq(&self, other: &PathBuf) -> bool {
+        self.as_path() == other.as_path()
+    }
+}
+
+impl Eq for PathBuf {}
+
+impl Hash for PathBuf {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_path().hash(state);
+    }
+}
+
+impl PartialOrd for PathBuf {
+    fn partial_cmp(&self, other: &PathBuf) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PathBuf {
+    fn cmp(&self, other: &PathBuf) -> cmp::Ordering {
+        self.as_path().cmp(other.as_path())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPONENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A path component
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Component<'a> {
+    /// Windows prefix (e.g., C:)
+    Prefix(&'a str),
+    /// Root directory (/)
+    RootDir,
+    /// Current directory (.)
+    CurDir,
+    /// Parent directory (..)
+    ParentDir,
+    /// Normal component
+    Normal(&'a str),
+}
+
+impl<'a> Component<'a> {
+    /// Get as a Path
+    pub fn as_os_str(&self) -> &'a str {
+        match self {
+            Component::Prefix(s) => s,
+            Component::RootDir => MAIN_SEPARATOR_STR,
+            Component::CurDir => ".",
+            Component::ParentDir => "..",
+            Component::Normal(s) => s,
+        }
+    }
+}
+
+impl AsRef<Path> for Component<'_> {
+    fn as_ref(&self) -> &Path {
+        Path::new(self.as_os_str())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
+enum State {
+    StartDir,
+    Body,
+    Done,
+}
+
+/// Iterator over path components
+#[derive(Clone)]
+pub struct Components<'a> {
+    path: &'a str,
+    front: State,
+    back: State,
+}
+
+impl<'a> Components<'a> {
+    /// Get remaining path as Path
+    pub fn as_path(&self) -> &'a Path {
+        Path::new(self.path)
+    }
+}
+
+impl<'a> Iterator for Components<'a> {
+    type Item = Component<'a>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.path.is_empty() {
+            // Skip leading separators
+            let trimmed = self.path.trim_start_matches(is_separator);
+            
+            // Handle root
+            if self.front == State::StartDir && trimmed.len() < self.path.len() {
+                self.path = trimmed;
+                self.front = State::Body;
+                
+                #[cfg(windows)]
+                {
+                    // Check for Windows prefix (C:)
+                    let bytes = self.path.as_bytes();
+                    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                        let prefix = &self.path[..2];
+                        self.path = &self.path[2..];
+                        return Some(Component::Prefix(prefix));
+                    }
+                }
+                
+                return Some(Component::RootDir);
+            }
+            
+            self.front = State::Body;
+            self.path = trimmed;
+            
+            if self.path.is_empty() {
+                break;
+            }
+            
+            // Find next component
+            let end = self.path.find(is_separator).unwrap_or(self.path.len());
+            let comp = &self.path[..end];
+            self.path = &self.path[end..];
+            
+            match comp {
+                "." => return Some(Component::CurDir),
+                ".." => return Some(Component::ParentDir),
+                "" => continue,
+                _ => return Some(Component::Normal(comp)),
+            }
+        }
+        
+        None
+    }
+}
+
+impl<'a> DoubleEndedIterator for Components<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        while !self.path.is_empty() {
+            // Trim trailing separators
+            let trimmed = self.path.trim_end_matches(is_separator);
+            
+            if trimmed.is_empty() {
+                self.path = trimmed;
+                if self.front == State::StartDir {
+                    self.front = State::Body;
+                    return Some(Component::RootDir);
+                }
+                break;
+            }
+            
+            self.path = trimmed;
+            
+            // Find last component
+            let start = self.path.rfind(is_separator).map(|i| i + 1).unwrap_or(0);
+            let comp = &self.path[start..];
+            self.path = &self.path[..start];
+            
+            match comp {
+                "." => return Some(Component::CurDir),
+                ".." => return Some(Component::ParentDir),
+                "" => continue,
+                _ => return Some(Component::Normal(comp)),
+            }
+        }
+        
+        None
+    }
+}
+
+impl FusedIterator for Components<'_> {}
+
+/// Iterator over path components as &str
+#[derive(Clone)]
+pub struct Iter<'a> {
+    inner: Components<'a>,
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = &'a str;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|c| c.as_os_str())
+    }
+}
+
+impl<'a> DoubleEndedIterator for Iter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(|c| c.as_os_str())
+    }
+}
+
+impl FusedIterator for Iter<'_> {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ANCESTORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Iterator over ancestors of a path
+pub struct Ancestors<'a> {
+    next: Option<&'a Path>,
+}
+
+impl<'a> Iterator for Ancestors<'a> {
+    type Item = &'a Path;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        let next = self.next?;
+        self.next = next.parent();
+        Some(next)
+    }
+}
+
+impl FusedIterator for Ancestors<'_> {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Error returned when strip_prefix fails
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripPrefixError(());
+
+impl fmt::Display for StripPrefixError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "prefix not found")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn iter_starts_with<'a>(mut a: Components<'a>, mut b: Components<'a>) -> bool {
+    loop {
+        match (a.next(), b.next()) {
+            (Some(x), Some(y)) if x == y => continue,
+            (_, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn iter_ends_with<'a>(mut a: Components<'a>, mut b: Components<'a>) -> bool {
+    loop {
+        match (a.next_back(), b.next_back()) {
+            (Some(x), Some(y)) if x == y => continue,
+            (_, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn iter_strip_prefix<'a>(mut a: Components<'a>, mut b: Components<'a>) -> Option<Components<'a>> {
+    loop {
+        match (a.next(), b.next()) {
+            (Some(x), Some(y)) if x == y => continue,
+            (_, None) => return Some(a),
+            _ => return None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_path_new() {
+        let path = Path::new("/foo/bar");
+        assert_eq!(path.as_str(), "/foo/bar");
+    }
+    
+    #[test]
+    fn test_pathbuf_push() {
+        let mut buf = PathBuf::from("/foo");
+        buf.push("bar");
+        buf.push("baz.txt");
+        assert_eq!(buf.as_str(), "/foo/bar/baz.txt");
+    }
+    
+    #[test]
+    fn test_file_name() {
+        assert_eq!(Path::new("/foo/bar.txt").file_name(), Some("bar.txt"));
+        assert_eq!(Path::new("/foo/bar").file_name(), Some("bar"));
+        assert_eq!(Path::new("/").file_name(), None);
+    }
+    
+    #[test]
+    fn test_file_stem() {
+        assert_eq!(Path::new("foo.txt").file_stem(), Some("foo"));
+        assert_eq!(Path::new("foo.tar.gz").file_stem(), Some("foo.tar"));
+        assert_eq!(Path::new(".hidden").file_stem(), Some(".hidden"));
+    }
+    
+    #[test]
+    fn test_extension() {
+        assert_eq!(Path::new("foo.txt").extension(), Some("txt"));
+        assert_eq!(Path::new("foo.tar.gz").extension(), Some("gz"));
+        assert_eq!(Path::new("foo").extension(), None);
+        assert_eq!(Path::new(".hidden").extension(), None);
+    }
+    
+    #[test]
+    fn test_parent() {
+        let path = Path::new("/foo/bar/baz.txt");
+        assert_eq!(path.parent().map(|p| p.as_str()), Some("/foo/bar"));
+        assert_eq!(path.parent().unwrap().parent().map(|p| p.as_str()), Some("/foo"));
+    }
+    
+    #[test]
+    fn test_join() {
+        let path = Path::new("/foo");
+        assert_eq!(path.join("bar").as_str(), "/foo/bar");
+        assert_eq!(path.join("/bar").as_str(), "/bar"); // Absolute path replaces
+    }
+    
+    #[test]
+    fn test_is_absolute() {
+        assert!(Path::new("/foo").is_absolute());
+        assert!(!Path::new("foo").is_absolute());
+        assert!(!Path::new("./foo").is_absolute());
+    }
+    
+    #[test]
+    fn test_components() {
+        let path = Path::new("/foo/bar/baz");
+        let comps: Vec<_> = path.components().collect();
+        assert_eq!(comps, vec![
+            Component::RootDir,
+            Component::Normal("foo"),
+            Component::Normal("bar"),
+            Component::Normal("baz"),
+        ]);
+    }
+}

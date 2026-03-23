@@ -1,0 +1,615 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ CORE — Memory Operations
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Low-level memory manipulation primitives. These are the building blocks
+// for safe abstractions like Vec, Box, and RefCell.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#![no_std]
+
+module core::mem
+
+use crate::intrinsics;
+use crate::marker::{Copy, Sized};
+use crate::cmp::Ordering;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIZE AND ALIGNMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Returns the size of a type in bytes.
+/// 
+/// # Examples
+/// ```
+/// assert_eq!(size_of::<u8>(), 1);
+/// assert_eq!(size_of::<u32>(), 4);
+/// assert_eq!(size_of::<(u32, u32)>(), 8);
+/// ```
+#[inline]
+#[must_use]
+pub const fn size_of<T>() -> usize {
+    intrinsics::size_of::<T>()
+}
+
+/// Returns the size of the pointed-to value in bytes.
+/// 
+/// For sized types, this is the same as `size_of::<T>()`.
+/// For dynamically sized types (DSTs), this computes the size at runtime.
+#[inline]
+#[must_use]
+pub fn size_of_val<T: ?Sized>(val: &T) -> usize {
+    intrinsics::size_of_val(val as *const T)
+}
+
+/// Returns the minimum alignment of a type in bytes.
+/// 
+/// # Examples
+/// ```
+/// assert_eq!(align_of::<u8>(), 1);
+/// assert_eq!(align_of::<u32>(), 4);
+/// assert_eq!(align_of::<u64>(), 8);
+/// ```
+#[inline]
+#[must_use]
+pub const fn align_of<T>() -> usize {
+    intrinsics::align_of::<T>()
+}
+
+/// Returns the alignment of the pointed-to value.
+#[inline]
+#[must_use]
+pub fn align_of_val<T: ?Sized>(val: &T) -> usize {
+    intrinsics::align_of_val(val as *const T)
+}
+
+/// Returns the offset of a field within a struct.
+/// 
+/// # Examples
+/// ```
+/// struct Foo { a: u8, b: u32 }
+/// assert_eq!(offset_of!(Foo, a), 0);
+/// assert_eq!(offset_of!(Foo, b), 4);  // Padded for alignment
+/// ```
+#[macro_export]
+macro_rules! offset_of {
+    ($ty:ty, $field:ident) => {{
+        // Create null pointer and compute field offset
+        let uninit = core::mem::MaybeUninit::<$ty>::uninit();
+        let base = uninit.as_ptr();
+        let field = unsafe { core::ptr::addr_of!((*base).$field) };
+        (field as usize) - (base as usize)
+    }};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRANSMUTATION AND REINTERPRETATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Reinterprets the bits of one type as another type.
+/// 
+/// # Safety
+/// - Both types must have the same size
+/// - The bit pattern must be valid for the destination type
+/// 
+/// # Examples
+/// ```
+/// let bytes: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
+/// let n: u32 = unsafe { transmute(bytes) };
+/// // n = 0x78563412 on little-endian
+/// ```
+#[inline]
+pub const unsafe fn transmute<Src, Dst>(src: Src) -> Dst {
+    // Compile-time size check
+    const { assert!(size_of::<Src>() == size_of::<Dst>()) };
+    intrinsics::transmute(src)
+}
+
+/// Reinterprets the bits of a value as another type without compile-time checks.
+/// 
+/// # Safety
+/// Same as `transmute`, but bypasses the compile-time size check.
+/// Only use when types are genuinely the same size at runtime (e.g., `usize`/`*const T`).
+#[inline]
+pub const unsafe fn transmute_unchecked<Src, Dst>(src: Src) -> Dst {
+    intrinsics::transmute(src)
+}
+
+/// Reinterprets a reference as a reference to another type.
+/// 
+/// # Safety
+/// - Alignment of `Dst` must not exceed alignment of `Src`
+/// - Both types must have valid representations at the same bit patterns
+#[inline]
+pub const unsafe fn transmute_ref<Src, Dst>(src: &Src) -> &Dst {
+    &*(src as *const Src as *const Dst)
+}
+
+/// Reinterprets a mutable reference as a mutable reference to another type.
+#[inline]
+pub unsafe fn transmute_mut<Src, Dst>(src: &mut Src) -> &mut Dst {
+    &mut *(src as *mut Src as *mut Dst)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ZEROING AND INITIALIZATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Creates a value where all bytes are zero.
+/// 
+/// # Safety
+/// Zero bytes must be a valid representation for `T`.
+/// 
+/// Valid for:
+/// - Integer types
+/// - Floating-point (represents 0.0)
+/// - Raw pointers (null)
+/// - Option<NonNull<T>> (None)
+/// 
+/// NOT valid for:
+/// - References (null references are UB)
+/// - bool (only 0 and 1 are valid)
+/// - char (not all bit patterns are valid)
+/// - Function pointers (null is UB)
+#[inline]
+pub const unsafe fn zeroed<T>() -> T {
+    MaybeUninit::zeroed().assume_init()
+}
+
+/// Creates an uninitialized value.
+/// 
+/// # Safety
+/// Reading the result is undefined behavior until it is properly initialized.
+/// 
+/// # Use Cases
+/// - Allocating memory to be filled later
+/// - Interfacing with C APIs that initialize output parameters
+/// 
+/// # Prefer
+/// Use `MaybeUninit<T>` instead for safer handling of uninitialized memory.
+#[inline]
+pub const unsafe fn uninit<T>() -> T {
+    MaybeUninit::uninit().assume_init()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAYBE UNINIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A wrapper type to represent possibly-uninitialized data.
+/// 
+/// This type provides a safe interface to work with uninitialized memory.
+/// Unlike `uninit()`, the value is not "assumed" to be initialized until
+/// you explicitly call `assume_init()`.
+/// 
+/// # Memory Layout
+/// `MaybeUninit<T>` has the same size and alignment as `T`.
+#[repr(transparent)]
+pub union MaybeUninit<T> {
+    uninit: (),
+    value: ManuallyDrop<T>,
+}
+
+impl<T> MaybeUninit<T> {
+    /// Creates a new `MaybeUninit<T>` initialized with the given value.
+    #[inline]
+    pub const fn new(val: T) -> MaybeUninit<T> {
+        MaybeUninit { value: ManuallyDrop::new(val) }
+    }
+    
+    /// Creates a new `MaybeUninit<T>` in an uninitialized state.
+    #[inline]
+    pub const fn uninit() -> MaybeUninit<T> {
+        MaybeUninit { uninit: () }
+    }
+    
+    /// Creates a new `MaybeUninit<T>` with all bytes set to zero.
+    #[inline]
+    pub const fn zeroed() -> MaybeUninit<T> {
+        let mut u = MaybeUninit::uninit();
+        unsafe {
+            let ptr = u.as_mut_ptr() as *mut u8;
+            intrinsics::write_bytes(ptr, 0, size_of::<T>());
+        }
+        u
+    }
+    
+    /// Creates an uninitialized array.
+    #[inline]
+    pub const fn uninit_array<const N: usize>() -> [MaybeUninit<T>; N] {
+        unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() }
+    }
+    
+    /// Sets the value.
+    #[inline]
+    pub fn write(&mut self, val: T) -> &mut T {
+        *self = MaybeUninit::new(val);
+        unsafe { self.assume_init_mut() }
+    }
+    
+    /// Gets a pointer to the contained value.
+    #[inline]
+    pub const fn as_ptr(&self) -> *const T {
+        self as *const _ as *const T
+    }
+    
+    /// Gets a mutable pointer to the contained value.
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self as *mut _ as *mut T
+    }
+    
+    /// Extracts the value, assuming it is initialized.
+    /// 
+    /// # Safety
+    /// The value must be initialized.
+    #[inline]
+    pub const unsafe fn assume_init(self) -> T {
+        ManuallyDrop::into_inner(self.value)
+    }
+    
+    /// Gets a reference to the value, assuming it is initialized.
+    /// 
+    /// # Safety
+    /// The value must be initialized.
+    #[inline]
+    pub const unsafe fn assume_init_ref(&self) -> &T {
+        &*self.as_ptr()
+    }
+    
+    /// Gets a mutable reference to the value, assuming it is initialized.
+    /// 
+    /// # Safety
+    /// The value must be initialized.
+    #[inline]
+    pub unsafe fn assume_init_mut(&mut self) -> &mut T {
+        &mut *self.as_mut_ptr()
+    }
+    
+    /// Reads the value without moving it.
+    /// 
+    /// # Safety
+    /// The value must be initialized.
+    #[inline]
+    pub unsafe fn assume_init_read(&self) -> T {
+        intrinsics::read(self.as_ptr())
+    }
+    
+    /// Drops the contained value in place.
+    /// 
+    /// # Safety
+    /// The value must be initialized.
+    #[inline]
+    pub unsafe fn assume_init_drop(&mut self) {
+        intrinsics::drop_in_place(self.as_mut_ptr())
+    }
+}
+
+impl<T: Copy> Clone for MaybeUninit<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: Copy> Copy for MaybeUninit<T> {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MANUALLY DROP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A wrapper that inhibits compiler from automatically calling `T`'s destructor.
+/// 
+/// # Use Cases
+/// - Building unsafe data structures
+/// - Moving out of a `Drop` type
+/// - Ensuring precise control over destruction order
+#[repr(transparent)]
+pub struct ManuallyDrop<T: ?Sized> {
+    value: T,
+}
+
+impl<T> ManuallyDrop<T> {
+    /// Wraps a value to prevent automatic destruction.
+    #[inline]
+    pub const fn new(value: T) -> ManuallyDrop<T> {
+        ManuallyDrop { value }
+    }
+    
+    /// Extracts the inner value, consuming the wrapper.
+    #[inline]
+    pub const fn into_inner(slot: ManuallyDrop<T>) -> T {
+        slot.value
+    }
+    
+    /// Takes the value out, leaving an uninitialized slot.
+    /// 
+    /// # Safety
+    /// - The slot must not be used after this call
+    /// - The caller is responsible for dropping the returned value
+    #[inline]
+    pub unsafe fn take(slot: &mut ManuallyDrop<T>) -> T {
+        intrinsics::read(&slot.value)
+    }
+}
+
+impl<T: ?Sized> ManuallyDrop<T> {
+    /// Manually drops the contained value.
+    /// 
+    /// # Safety
+    /// - The value must be initialized
+    /// - The value must not be accessed after this call
+    #[inline]
+    pub unsafe fn drop(slot: &mut ManuallyDrop<T>) {
+        intrinsics::drop_in_place(&mut slot.value)
+    }
+}
+
+impl<T: ?Sized> core::ops::Deref for ManuallyDrop<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T: ?Sized> core::ops::DerefMut for ManuallyDrop<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
+
+impl<T: Copy> Copy for ManuallyDrop<T> {}
+
+impl<T: Clone> Clone for ManuallyDrop<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        ManuallyDrop::new(self.value.clone())
+    }
+}
+
+impl<T: Default> Default for ManuallyDrop<T> {
+    #[inline]
+    fn default() -> Self {
+        ManuallyDrop::new(T::default())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SWAP AND REPLACE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Swaps the values at two mutable locations.
+/// 
+/// # Examples
+/// ```
+/// let mut a = 1;
+/// let mut b = 2;
+/// swap(&mut a, &mut b);
+/// assert_eq!(a, 2);
+/// assert_eq!(b, 1);
+/// ```
+#[inline]
+pub fn swap<T>(x: &mut T, y: &mut T) {
+    unsafe {
+        let mut tmp = MaybeUninit::<T>::uninit();
+        intrinsics::copy_nonoverlapping(x, tmp.as_mut_ptr(), 1);
+        intrinsics::copy_nonoverlapping(y, x, 1);
+        intrinsics::copy_nonoverlapping(tmp.as_ptr(), y, 1);
+    }
+}
+
+/// Moves `src` into the referenced `dst`, returning the previous value.
+/// 
+/// # Examples
+/// ```
+/// let mut s = "hello".to_string();
+/// let old = replace(&mut s, "world".to_string());
+/// assert_eq!(old, "hello");
+/// assert_eq!(s, "world");
+/// ```
+#[inline]
+pub fn replace<T>(dst: &mut T, src: T) -> T {
+    unsafe {
+        let result = intrinsics::read(dst);
+        intrinsics::write(dst, src);
+        result
+    }
+}
+
+/// Replaces the value with its default, returning the old value.
+/// 
+/// # Examples
+/// ```
+/// let mut v = vec![1, 2, 3];
+/// let old = take(&mut v);
+/// assert!(v.is_empty());
+/// assert_eq!(old, vec![1, 2, 3]);
+/// ```
+#[inline]
+pub fn take<T: Default>(dst: &mut T) -> T {
+    replace(dst, T::default())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DROP AND FORGET
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Disposes of a value without running its destructor.
+/// 
+/// # Safety
+/// - For most types, this is perfectly safe
+/// - For linear types, this is a compile error (they MUST be consumed)
+/// - Memory leaks are possible but not UB
+/// 
+/// # Use Cases
+/// - Preventing double-free in unsafe code
+/// - Moving ownership to C code that will manage the memory
+#[inline]
+pub const fn forget<T>(t: T) {
+    let _ = ManuallyDrop::new(t);
+}
+
+/// Calls the destructor on a value without running `drop`.
+/// 
+/// This is equivalent to calling `ptr::drop_in_place(&mut value)`.
+#[inline]
+pub fn drop<T>(_x: T) {
+    // Value is moved into this function and dropped at end
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE QUERIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Returns `true` if dropping values of type `T` has no effect.
+/// 
+/// This is the case when:
+/// - `T` does not implement `Drop`
+/// - `T` has no fields that need dropping
+#[inline]
+#[must_use]
+pub const fn needs_drop<T>() -> bool {
+    intrinsics::needs_drop::<T>()
+}
+
+/// Returns the type name as a string slice.
+#[inline]
+#[must_use]
+pub const fn type_name<T: ?Sized>() -> &'static str {
+    intrinsics::type_name::<T>()
+}
+
+/// Returns a unique identifier for the type.
+#[inline]
+#[must_use]
+pub const fn type_id<T: 'static>() -> u64 {
+    intrinsics::type_id::<T>()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DISCRIMINANT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Opaque type representing the discriminant of an enum.
+pub struct Discriminant<T> {
+    value: u128,
+    _marker: core::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for Discriminant<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Discriminant<T> {}
+
+impl<T> core::cmp::PartialEq for Discriminant<T> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl<T> core::cmp::Eq for Discriminant<T> {}
+
+impl<T> core::hash::Hash for Discriminant<T> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
+}
+
+/// Returns the discriminant of an enum variant.
+/// 
+/// # Examples
+/// ```
+/// enum Foo { A, B, C }
+/// let x = Foo::B;
+/// assert_eq!(discriminant(&Foo::A), discriminant(&Foo::A));
+/// assert_ne!(discriminant(&Foo::A), discriminant(&Foo::B));
+/// ```
+#[inline]
+pub fn discriminant<T>(v: &T) -> Discriminant<T> {
+    Discriminant {
+        value: intrinsics::discriminant_value(v),
+        _marker: core::marker::PhantomData,
+    }
+}
+
+/// Returns the number of variants in an enum.
+#[inline]
+pub const fn variant_count<T>() -> usize {
+    intrinsics::variant_count::<T>()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COPY OPERATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Bitwise-copies a value.
+/// 
+/// Unlike `Clone`, this is a simple memcpy that works for any `Copy` type.
+#[inline]
+pub fn copy<T: Copy>(x: &T) -> T {
+    *x
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIN ALIGN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Helper type for computing minimum alignment.
+#[repr(C)]
+pub struct Aligned<T, A: Alignment> {
+    _align: A,
+    pub value: T,
+}
+
+/// Marker trait for alignment values.
+pub trait Alignment: Sized {}
+
+/// 1-byte alignment.
+#[repr(C, align(1))]
+pub struct Align1;
+impl Alignment for Align1 {}
+
+/// 2-byte alignment.
+#[repr(C, align(2))]
+pub struct Align2;
+impl Alignment for Align2 {}
+
+/// 4-byte alignment.
+#[repr(C, align(4))]
+pub struct Align4;
+impl Alignment for Align4 {}
+
+/// 8-byte alignment.
+#[repr(C, align(8))]
+pub struct Align8;
+impl Alignment for Align8 {}
+
+/// 16-byte alignment.
+#[repr(C, align(16))]
+pub struct Align16;
+impl Alignment for Align16 {}
+
+/// 32-byte alignment (AVX).
+#[repr(C, align(32))]
+pub struct Align32;
+impl Alignment for Align32 {}
+
+/// 64-byte alignment (cache line).
+#[repr(C, align(64))]
+pub struct Align64;
+impl Alignment for Align64 {}
+
+/// 4096-byte alignment (page).
+#[repr(C, align(4096))]
+pub struct AlignPage;
+impl Alignment for AlignPage {}

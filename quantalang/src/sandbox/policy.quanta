@@ -1,0 +1,1391 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ SANDBOX — Security Policy & Permissions
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Capability-based security model with:
+// - Fine-grained permissions
+// - Resource quotas
+// - Syscall filtering
+// - Path-based access control
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::sandbox::policy
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::collections::{BTreeMap, BTreeSet};
+use core::time::Duration;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECURITY POLICY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Complete security policy for a sandbox
+#[derive(Debug, Clone)]
+pub struct SecurityPolicy {
+    /// Unique policy identifier
+    pub id: String,
+    
+    /// Human-readable name
+    pub name: String,
+    
+    /// Policy version
+    pub version: u32,
+    
+    /// Filesystem permissions
+    pub filesystem: FilesystemPolicy,
+    
+    /// Network permissions
+    pub network: NetworkPolicy,
+    
+    /// Process permissions
+    pub process: ProcessPolicy,
+    
+    /// Resource limits
+    pub resources: ResourceLimits,
+    
+    /// Syscall filter
+    pub syscalls: SyscallPolicy,
+    
+    /// IPC permissions
+    pub ipc: IpcPolicy,
+    
+    /// Capability set
+    pub capabilities: CapabilitySet,
+    
+    /// Audit settings
+    pub audit: AuditPolicy,
+}
+
+impl SecurityPolicy {
+    /// Create a minimal restrictive policy
+    pub fn minimal() -> Self {
+        SecurityPolicy {
+            id: "minimal".into(),
+            name: "Minimal Policy".into(),
+            version: 1,
+            filesystem: FilesystemPolicy::deny_all(),
+            network: NetworkPolicy::deny_all(),
+            process: ProcessPolicy::single_thread(),
+            resources: ResourceLimits::restrictive(),
+            syscalls: SyscallPolicy::minimal(),
+            ipc: IpcPolicy::deny_all(),
+            capabilities: CapabilitySet::empty(),
+            audit: AuditPolicy::default(),
+        }
+    }
+    
+    /// Create a standard policy with common permissions
+    pub fn standard() -> Self {
+        SecurityPolicy {
+            id: "standard".into(),
+            name: "Standard Policy".into(),
+            version: 1,
+            filesystem: FilesystemPolicy::standard(),
+            network: NetworkPolicy::outbound_only(),
+            process: ProcessPolicy::standard(),
+            resources: ResourceLimits::standard(),
+            syscalls: SyscallPolicy::standard(),
+            ipc: IpcPolicy::standard(),
+            capabilities: CapabilitySet::standard(),
+            audit: AuditPolicy::default(),
+        }
+    }
+    
+    /// Create a permissive policy (for trusted code)
+    pub fn permissive() -> Self {
+        SecurityPolicy {
+            id: "permissive".into(),
+            name: "Permissive Policy".into(),
+            version: 1,
+            filesystem: FilesystemPolicy::permissive(),
+            network: NetworkPolicy::allow_all(),
+            process: ProcessPolicy::permissive(),
+            resources: ResourceLimits::permissive(),
+            syscalls: SyscallPolicy::permissive(),
+            ipc: IpcPolicy::allow_all(),
+            capabilities: CapabilitySet::all(),
+            audit: AuditPolicy::minimal(),
+        }
+    }
+    
+    /// Builder for custom policies
+    pub fn builder() -> PolicyBuilder {
+        PolicyBuilder::new()
+    }
+    
+    /// Validate policy consistency
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        // Check for conflicting rules
+        self.filesystem.validate()?;
+        self.network.validate()?;
+        self.syscalls.validate()?;
+        Ok(())
+    }
+    
+    /// Merge with another policy (most restrictive wins)
+    pub fn merge(&self, other: &SecurityPolicy) -> SecurityPolicy {
+        SecurityPolicy {
+            id: format!("{}+{}", self.id, other.id),
+            name: format!("{} + {}", self.name, other.name),
+            version: 1,
+            filesystem: self.filesystem.merge(&other.filesystem),
+            network: self.network.merge(&other.network),
+            process: self.process.merge(&other.process),
+            resources: self.resources.merge(&other.resources),
+            syscalls: self.syscalls.merge(&other.syscalls),
+            ipc: self.ipc.merge(&other.ipc),
+            capabilities: self.capabilities.intersect(&other.capabilities),
+            audit: self.audit.merge(&other.audit),
+        }
+    }
+}
+
+impl Default for SecurityPolicy {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POLICY BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Builder for creating custom security policies
+pub struct PolicyBuilder {
+    policy: SecurityPolicy,
+}
+
+impl PolicyBuilder {
+    pub fn new() -> Self {
+        PolicyBuilder {
+            policy: SecurityPolicy::minimal(),
+        }
+    }
+    
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.policy.id = id.into();
+        self
+    }
+    
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.policy.name = name.into();
+        self
+    }
+    
+    pub fn filesystem(mut self, policy: FilesystemPolicy) -> Self {
+        self.policy.filesystem = policy;
+        self
+    }
+    
+    pub fn network(mut self, policy: NetworkPolicy) -> Self {
+        self.policy.network = policy;
+        self
+    }
+    
+    pub fn process(mut self, policy: ProcessPolicy) -> Self {
+        self.policy.process = policy;
+        self
+    }
+    
+    pub fn resources(mut self, limits: ResourceLimits) -> Self {
+        self.policy.resources = limits;
+        self
+    }
+    
+    pub fn syscalls(mut self, policy: SyscallPolicy) -> Self {
+        self.policy.syscalls = policy;
+        self
+    }
+    
+    pub fn capabilities(mut self, caps: CapabilitySet) -> Self {
+        self.policy.capabilities = caps;
+        self
+    }
+    
+    pub fn allow_read(mut self, path: impl Into<String>) -> Self {
+        self.policy.filesystem.add_rule(PathRule::allow_read(path));
+        self
+    }
+    
+    pub fn allow_write(mut self, path: impl Into<String>) -> Self {
+        self.policy.filesystem.add_rule(PathRule::allow_write(path));
+        self
+    }
+    
+    pub fn allow_network(mut self, host: impl Into<String>, port: u16) -> Self {
+        self.policy.network.add_rule(NetworkRule::allow_connect(host, port));
+        self
+    }
+    
+    pub fn max_memory(mut self, bytes: usize) -> Self {
+        self.policy.resources.max_memory = bytes;
+        self
+    }
+    
+    pub fn max_cpu_time(mut self, duration: Duration) -> Self {
+        self.policy.resources.max_cpu_time = Some(duration);
+        self
+    }
+    
+    pub fn build(self) -> Result<SecurityPolicy, PolicyError> {
+        self.policy.validate()?;
+        Ok(self.policy)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FILESYSTEM POLICY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Filesystem access policy
+#[derive(Debug, Clone)]
+pub struct FilesystemPolicy {
+    /// Default action for unlisted paths
+    pub default_action: PathAction,
+    
+    /// Path-specific rules
+    pub rules: Vec<PathRule>,
+    
+    /// Allowed file extensions
+    pub allowed_extensions: Option<BTreeSet<String>>,
+    
+    /// Maximum file size for read/write
+    pub max_file_size: Option<usize>,
+    
+    /// Allow symbolic link following
+    pub follow_symlinks: bool,
+    
+    /// Allow creation of hard links
+    pub allow_hardlinks: bool,
+}
+
+impl FilesystemPolicy {
+    pub fn deny_all() -> Self {
+        FilesystemPolicy {
+            default_action: PathAction::Deny,
+            rules: Vec::new(),
+            allowed_extensions: None,
+            max_file_size: None,
+            follow_symlinks: false,
+            allow_hardlinks: false,
+        }
+    }
+    
+    pub fn standard() -> Self {
+        let mut policy = Self::deny_all();
+        policy.rules = vec![
+            PathRule::allow_read("/usr/share"),
+            PathRule::allow_read("/etc/localtime"),
+            PathRule::allow_read("/etc/timezone"),
+            PathRule::allow_read_write("/tmp"),
+        ];
+        policy.follow_symlinks = true;
+        policy
+    }
+    
+    pub fn permissive() -> Self {
+        FilesystemPolicy {
+            default_action: PathAction::Allow,
+            rules: vec![
+                PathRule::deny("/etc/shadow"),
+                PathRule::deny("/etc/passwd"),
+                PathRule::deny("/proc"),
+                PathRule::deny("/sys"),
+            ],
+            allowed_extensions: None,
+            max_file_size: None,
+            follow_symlinks: true,
+            allow_hardlinks: true,
+        }
+    }
+    
+    pub fn add_rule(&mut self, rule: PathRule) {
+        self.rules.push(rule);
+    }
+    
+    pub fn check_access(&self, path: &str, access: FileAccess) -> Decision {
+        // Check specific rules first (most specific wins)
+        let mut best_match: Option<&PathRule> = None;
+        let mut best_specificity = 0;
+        
+        for rule in &self.rules {
+            if rule.matches(path) {
+                let specificity = rule.path.len();
+                if specificity > best_specificity {
+                    best_specificity = specificity;
+                    best_match = Some(rule);
+                }
+            }
+        }
+        
+        if let Some(rule) = best_match {
+            if rule.allows(access) {
+                return Decision::Allow;
+            } else {
+                return Decision::Deny(format!("path rule denies {:?} access to {}", access, path));
+            }
+        }
+        
+        // Check default action
+        match self.default_action {
+            PathAction::Allow => Decision::Allow,
+            PathAction::Deny => Decision::Deny(format!("default policy denies access to {}", path)),
+            PathAction::Audit => Decision::Audit,
+        }
+    }
+    
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        // Check for conflicting rules
+        for (i, rule1) in self.rules.iter().enumerate() {
+            for rule2 in self.rules.iter().skip(i + 1) {
+                if rule1.path == rule2.path && rule1.action != rule2.action {
+                    return Err(PolicyError::ConflictingRules(format!(
+                        "conflicting rules for path: {}",
+                        rule1.path
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    pub fn merge(&self, other: &FilesystemPolicy) -> FilesystemPolicy {
+        let mut merged = self.clone();
+        
+        // Most restrictive default
+        merged.default_action = match (&self.default_action, &other.default_action) {
+            (PathAction::Deny, _) | (_, PathAction::Deny) => PathAction::Deny,
+            (PathAction::Audit, _) | (_, PathAction::Audit) => PathAction::Audit,
+            _ => PathAction::Allow,
+        };
+        
+        // Combine rules
+        merged.rules.extend(other.rules.clone());
+        
+        // Most restrictive settings
+        merged.follow_symlinks = self.follow_symlinks && other.follow_symlinks;
+        merged.allow_hardlinks = self.allow_hardlinks && other.allow_hardlinks;
+        
+        merged
+    }
+}
+
+/// Path-based access rule
+#[derive(Debug, Clone)]
+pub struct PathRule {
+    /// Path pattern (supports glob)
+    pub path: String,
+    
+    /// Allowed operations
+    pub permissions: FilePermissions,
+    
+    /// Rule action
+    pub action: PathAction,
+}
+
+impl PathRule {
+    pub fn allow_read(path: impl Into<String>) -> Self {
+        PathRule {
+            path: path.into(),
+            permissions: FilePermissions::READ,
+            action: PathAction::Allow,
+        }
+    }
+    
+    pub fn allow_write(path: impl Into<String>) -> Self {
+        PathRule {
+            path: path.into(),
+            permissions: FilePermissions::WRITE,
+            action: PathAction::Allow,
+        }
+    }
+    
+    pub fn allow_read_write(path: impl Into<String>) -> Self {
+        PathRule {
+            path: path.into(),
+            permissions: FilePermissions::READ | FilePermissions::WRITE,
+            action: PathAction::Allow,
+        }
+    }
+    
+    pub fn allow_execute(path: impl Into<String>) -> Self {
+        PathRule {
+            path: path.into(),
+            permissions: FilePermissions::EXECUTE,
+            action: PathAction::Allow,
+        }
+    }
+    
+    pub fn deny(path: impl Into<String>) -> Self {
+        PathRule {
+            path: path.into(),
+            permissions: FilePermissions::all(),
+            action: PathAction::Deny,
+        }
+    }
+    
+    pub fn matches(&self, path: &str) -> bool {
+        // Simple prefix matching (would use glob in full implementation)
+        path.starts_with(&self.path) || glob_match(&self.path, path)
+    }
+    
+    pub fn allows(&self, access: FileAccess) -> bool {
+        if self.action != PathAction::Allow {
+            return false;
+        }
+        
+        match access {
+            FileAccess::Read => self.permissions.contains(FilePermissions::READ),
+            FileAccess::Write => self.permissions.contains(FilePermissions::WRITE),
+            FileAccess::Execute => self.permissions.contains(FilePermissions::EXECUTE),
+            FileAccess::Delete => self.permissions.contains(FilePermissions::DELETE),
+            FileAccess::Create => self.permissions.contains(FilePermissions::CREATE),
+        }
+    }
+}
+
+/// Path action
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathAction {
+    Allow,
+    Deny,
+    Audit,
+}
+
+/// File access type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAccess {
+    Read,
+    Write,
+    Execute,
+    Delete,
+    Create,
+}
+
+bitflags::bitflags! {
+    /// File permission flags
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FilePermissions: u32 {
+        const READ = 0b00001;
+        const WRITE = 0b00010;
+        const EXECUTE = 0b00100;
+        const DELETE = 0b01000;
+        const CREATE = 0b10000;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NETWORK POLICY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Network access policy
+#[derive(Debug, Clone)]
+pub struct NetworkPolicy {
+    /// Allow outbound connections
+    pub allow_outbound: bool,
+    
+    /// Allow inbound connections (listening)
+    pub allow_inbound: bool,
+    
+    /// Allowed protocols
+    pub allowed_protocols: ProtocolSet,
+    
+    /// Network rules
+    pub rules: Vec<NetworkRule>,
+    
+    /// DNS resolution allowed
+    pub allow_dns: bool,
+    
+    /// Maximum connections
+    pub max_connections: Option<usize>,
+    
+    /// Rate limiting
+    pub rate_limit: Option<RateLimit>,
+}
+
+impl NetworkPolicy {
+    pub fn deny_all() -> Self {
+        NetworkPolicy {
+            allow_outbound: false,
+            allow_inbound: false,
+            allowed_protocols: ProtocolSet::empty(),
+            rules: Vec::new(),
+            allow_dns: false,
+            max_connections: Some(0),
+            rate_limit: None,
+        }
+    }
+    
+    pub fn outbound_only() -> Self {
+        NetworkPolicy {
+            allow_outbound: true,
+            allow_inbound: false,
+            allowed_protocols: ProtocolSet::TCP | ProtocolSet::UDP,
+            rules: Vec::new(),
+            allow_dns: true,
+            max_connections: Some(100),
+            rate_limit: None,
+        }
+    }
+    
+    pub fn allow_all() -> Self {
+        NetworkPolicy {
+            allow_outbound: true,
+            allow_inbound: true,
+            allowed_protocols: ProtocolSet::all(),
+            rules: Vec::new(),
+            allow_dns: true,
+            max_connections: None,
+            rate_limit: None,
+        }
+    }
+    
+    pub fn add_rule(&mut self, rule: NetworkRule) {
+        self.rules.push(rule);
+    }
+    
+    pub fn check_connect(&self, host: &str, port: u16, protocol: Protocol) -> Decision {
+        if !self.allow_outbound {
+            return Decision::Deny("outbound connections not allowed".into());
+        }
+        
+        if !self.allowed_protocols.contains(protocol.into()) {
+            return Decision::Deny(format!("protocol {:?} not allowed", protocol));
+        }
+        
+        // Check specific rules
+        for rule in &self.rules {
+            if rule.matches(host, port) {
+                return match rule.action {
+                    NetworkAction::Allow => Decision::Allow,
+                    NetworkAction::Deny => Decision::Deny(format!("rule denies connection to {}:{}", host, port)),
+                };
+            }
+        }
+        
+        Decision::Allow
+    }
+    
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        Ok(())
+    }
+    
+    pub fn merge(&self, other: &NetworkPolicy) -> NetworkPolicy {
+        NetworkPolicy {
+            allow_outbound: self.allow_outbound && other.allow_outbound,
+            allow_inbound: self.allow_inbound && other.allow_inbound,
+            allowed_protocols: self.allowed_protocols & other.allowed_protocols,
+            rules: [self.rules.clone(), other.rules.clone()].concat(),
+            allow_dns: self.allow_dns && other.allow_dns,
+            max_connections: match (self.max_connections, other.max_connections) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            },
+            rate_limit: self.rate_limit.clone().or(other.rate_limit.clone()),
+        }
+    }
+}
+
+/// Network rule
+#[derive(Debug, Clone)]
+pub struct NetworkRule {
+    /// Host pattern (supports glob)
+    pub host: String,
+    
+    /// Port or port range
+    pub port: PortSpec,
+    
+    /// Rule action
+    pub action: NetworkAction,
+}
+
+impl NetworkRule {
+    pub fn allow_connect(host: impl Into<String>, port: u16) -> Self {
+        NetworkRule {
+            host: host.into(),
+            port: PortSpec::Single(port),
+            action: NetworkAction::Allow,
+        }
+    }
+    
+    pub fn allow_range(host: impl Into<String>, start: u16, end: u16) -> Self {
+        NetworkRule {
+            host: host.into(),
+            port: PortSpec::Range(start, end),
+            action: NetworkAction::Allow,
+        }
+    }
+    
+    pub fn deny(host: impl Into<String>) -> Self {
+        NetworkRule {
+            host: host.into(),
+            port: PortSpec::Any,
+            action: NetworkAction::Deny,
+        }
+    }
+    
+    pub fn matches(&self, host: &str, port: u16) -> bool {
+        let host_matches = glob_match(&self.host, host);
+        let port_matches = match &self.port {
+            PortSpec::Single(p) => *p == port,
+            PortSpec::Range(start, end) => port >= *start && port <= *end,
+            PortSpec::Any => true,
+        };
+        host_matches && port_matches
+    }
+}
+
+/// Port specification
+#[derive(Debug, Clone)]
+pub enum PortSpec {
+    Single(u16),
+    Range(u16, u16),
+    Any,
+}
+
+/// Network action
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkAction {
+    Allow,
+    Deny,
+}
+
+/// Network protocol
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+    Unix,
+    Raw,
+}
+
+bitflags::bitflags! {
+    /// Protocol set
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ProtocolSet: u32 {
+        const TCP = 0b0001;
+        const UDP = 0b0010;
+        const UNIX = 0b0100;
+        const RAW = 0b1000;
+    }
+}
+
+impl From<Protocol> for ProtocolSet {
+    fn from(p: Protocol) -> Self {
+        match p {
+            Protocol::Tcp => ProtocolSet::TCP,
+            Protocol::Udp => ProtocolSet::UDP,
+            Protocol::Unix => ProtocolSet::UNIX,
+            Protocol::Raw => ProtocolSet::RAW,
+        }
+    }
+}
+
+/// Rate limiting configuration
+#[derive(Debug, Clone)]
+pub struct RateLimit {
+    /// Bytes per second
+    pub bytes_per_second: usize,
+    
+    /// Connections per minute
+    pub connections_per_minute: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROCESS POLICY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Process execution policy
+#[derive(Debug, Clone)]
+pub struct ProcessPolicy {
+    /// Allow spawning child processes
+    pub allow_spawn: bool,
+    
+    /// Allowed executables
+    pub allowed_executables: Vec<String>,
+    
+    /// Maximum threads
+    pub max_threads: Option<usize>,
+    
+    /// Allow fork
+    pub allow_fork: bool,
+    
+    /// Allow exec
+    pub allow_exec: bool,
+    
+    /// Allow ptrace
+    pub allow_ptrace: bool,
+    
+    /// Allow signal sending
+    pub allow_signals: bool,
+}
+
+impl ProcessPolicy {
+    pub fn single_thread() -> Self {
+        ProcessPolicy {
+            allow_spawn: false,
+            allowed_executables: Vec::new(),
+            max_threads: Some(1),
+            allow_fork: false,
+            allow_exec: false,
+            allow_ptrace: false,
+            allow_signals: false,
+        }
+    }
+    
+    pub fn standard() -> Self {
+        ProcessPolicy {
+            allow_spawn: false,
+            allowed_executables: Vec::new(),
+            max_threads: Some(64),
+            allow_fork: false,
+            allow_exec: false,
+            allow_ptrace: false,
+            allow_signals: true,
+        }
+    }
+    
+    pub fn permissive() -> Self {
+        ProcessPolicy {
+            allow_spawn: true,
+            allowed_executables: Vec::new(),
+            max_threads: None,
+            allow_fork: true,
+            allow_exec: true,
+            allow_ptrace: false,
+            allow_signals: true,
+        }
+    }
+    
+    pub fn merge(&self, other: &ProcessPolicy) -> ProcessPolicy {
+        ProcessPolicy {
+            allow_spawn: self.allow_spawn && other.allow_spawn,
+            allowed_executables: self.allowed_executables.iter()
+                .filter(|e| other.allowed_executables.contains(e))
+                .cloned()
+                .collect(),
+            max_threads: match (self.max_threads, other.max_threads) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            },
+            allow_fork: self.allow_fork && other.allow_fork,
+            allow_exec: self.allow_exec && other.allow_exec,
+            allow_ptrace: self.allow_ptrace && other.allow_ptrace,
+            allow_signals: self.allow_signals && other.allow_signals,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RESOURCE LIMITS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Resource usage limits
+#[derive(Debug, Clone)]
+pub struct ResourceLimits {
+    /// Maximum memory (bytes)
+    pub max_memory: usize,
+    
+    /// Maximum CPU time
+    pub max_cpu_time: Option<Duration>,
+    
+    /// Maximum wall clock time
+    pub max_wall_time: Option<Duration>,
+    
+    /// Maximum open files
+    pub max_open_files: usize,
+    
+    /// Maximum file size (bytes)
+    pub max_file_size: usize,
+    
+    /// Maximum stack size (bytes)
+    pub max_stack_size: usize,
+    
+    /// Maximum address space (bytes)
+    pub max_address_space: Option<usize>,
+    
+    /// CPU quota (percentage, 100 = 1 core)
+    pub cpu_quota: Option<u32>,
+}
+
+impl ResourceLimits {
+    pub fn restrictive() -> Self {
+        ResourceLimits {
+            max_memory: 64 * 1024 * 1024, // 64MB
+            max_cpu_time: Some(Duration::from_secs(10)),
+            max_wall_time: Some(Duration::from_secs(30)),
+            max_open_files: 16,
+            max_file_size: 1024 * 1024, // 1MB
+            max_stack_size: 1024 * 1024, // 1MB
+            max_address_space: Some(256 * 1024 * 1024), // 256MB
+            cpu_quota: Some(50), // 50%
+        }
+    }
+    
+    pub fn standard() -> Self {
+        ResourceLimits {
+            max_memory: 512 * 1024 * 1024, // 512MB
+            max_cpu_time: Some(Duration::from_secs(300)),
+            max_wall_time: Some(Duration::from_secs(600)),
+            max_open_files: 256,
+            max_file_size: 100 * 1024 * 1024, // 100MB
+            max_stack_size: 8 * 1024 * 1024, // 8MB
+            max_address_space: Some(2 * 1024 * 1024 * 1024), // 2GB
+            cpu_quota: None,
+        }
+    }
+    
+    pub fn permissive() -> Self {
+        ResourceLimits {
+            max_memory: usize::MAX,
+            max_cpu_time: None,
+            max_wall_time: None,
+            max_open_files: 65536,
+            max_file_size: usize::MAX,
+            max_stack_size: usize::MAX,
+            max_address_space: None,
+            cpu_quota: None,
+        }
+    }
+    
+    pub fn merge(&self, other: &ResourceLimits) -> ResourceLimits {
+        ResourceLimits {
+            max_memory: self.max_memory.min(other.max_memory),
+            max_cpu_time: match (self.max_cpu_time, other.max_cpu_time) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            },
+            max_wall_time: match (self.max_wall_time, other.max_wall_time) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            },
+            max_open_files: self.max_open_files.min(other.max_open_files),
+            max_file_size: self.max_file_size.min(other.max_file_size),
+            max_stack_size: self.max_stack_size.min(other.max_stack_size),
+            max_address_space: match (self.max_address_space, other.max_address_space) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            },
+            cpu_quota: match (self.cpu_quota, other.cpu_quota) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            },
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SYSCALL POLICY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Syscall filtering policy (seccomp-bpf style)
+#[derive(Debug, Clone)]
+pub struct SyscallPolicy {
+    /// Default action
+    pub default_action: SyscallAction,
+    
+    /// Per-syscall rules
+    pub rules: BTreeMap<u32, SyscallRule>,
+}
+
+impl SyscallPolicy {
+    pub fn minimal() -> Self {
+        let mut rules = BTreeMap::new();
+        
+        // Allow basic syscalls
+        for syscall in MINIMAL_SYSCALLS.iter() {
+            rules.insert(*syscall, SyscallRule::allow());
+        }
+        
+        SyscallPolicy {
+            default_action: SyscallAction::Kill,
+            rules,
+        }
+    }
+    
+    pub fn standard() -> Self {
+        let mut rules = BTreeMap::new();
+        
+        for syscall in STANDARD_SYSCALLS.iter() {
+            rules.insert(*syscall, SyscallRule::allow());
+        }
+        
+        SyscallPolicy {
+            default_action: SyscallAction::Errno(1), // EPERM
+            rules,
+        }
+    }
+    
+    pub fn permissive() -> Self {
+        let mut rules = BTreeMap::new();
+        
+        // Block dangerous syscalls
+        for syscall in BLOCKED_SYSCALLS.iter() {
+            rules.insert(*syscall, SyscallRule::deny());
+        }
+        
+        SyscallPolicy {
+            default_action: SyscallAction::Allow,
+            rules,
+        }
+    }
+    
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        Ok(())
+    }
+    
+    pub fn merge(&self, other: &SyscallPolicy) -> SyscallPolicy {
+        let mut merged = self.clone();
+        
+        // Most restrictive default
+        merged.default_action = match (&self.default_action, &other.default_action) {
+            (SyscallAction::Kill, _) | (_, SyscallAction::Kill) => SyscallAction::Kill,
+            (SyscallAction::Trap, _) | (_, SyscallAction::Trap) => SyscallAction::Trap,
+            (SyscallAction::Errno(e), _) | (_, SyscallAction::Errno(e)) => SyscallAction::Errno(*e),
+            _ => SyscallAction::Allow,
+        };
+        
+        // Merge rules (most restrictive wins)
+        for (syscall, rule) in &other.rules {
+            merged.rules.entry(*syscall)
+                .and_modify(|r| *r = r.merge(rule))
+                .or_insert(rule.clone());
+        }
+        
+        merged
+    }
+}
+
+/// Syscall rule
+#[derive(Debug, Clone)]
+pub struct SyscallRule {
+    pub action: SyscallAction,
+    pub arg_filters: Vec<ArgFilter>,
+}
+
+impl SyscallRule {
+    pub fn allow() -> Self {
+        SyscallRule {
+            action: SyscallAction::Allow,
+            arg_filters: Vec::new(),
+        }
+    }
+    
+    pub fn deny() -> Self {
+        SyscallRule {
+            action: SyscallAction::Errno(1),
+            arg_filters: Vec::new(),
+        }
+    }
+    
+    pub fn merge(&self, other: &SyscallRule) -> SyscallRule {
+        // Most restrictive wins
+        let action = match (&self.action, &other.action) {
+            (SyscallAction::Kill, _) | (_, SyscallAction::Kill) => SyscallAction::Kill,
+            (SyscallAction::Trap, _) | (_, SyscallAction::Trap) => SyscallAction::Trap,
+            (SyscallAction::Errno(e), _) => SyscallAction::Errno(*e),
+            (_, SyscallAction::Errno(e)) => SyscallAction::Errno(*e),
+            _ => SyscallAction::Allow,
+        };
+        
+        SyscallRule {
+            action,
+            arg_filters: [self.arg_filters.clone(), other.arg_filters.clone()].concat(),
+        }
+    }
+}
+
+/// Syscall action
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyscallAction {
+    Allow,
+    Kill,
+    Trap,
+    Errno(i32),
+    Log,
+}
+
+/// Argument filter
+#[derive(Debug, Clone)]
+pub struct ArgFilter {
+    pub arg_index: usize,
+    pub op: FilterOp,
+    pub value: u64,
+}
+
+/// Filter operation
+#[derive(Debug, Clone, Copy)]
+pub enum FilterOp {
+    Equal,
+    NotEqual,
+    LessThan,
+    LessEqual,
+    GreaterThan,
+    GreaterEqual,
+    MaskedEqual(u64),
+}
+
+// Syscall number sets (Linux x86_64)
+const MINIMAL_SYSCALLS: &[u32] = &[
+    0,   // read
+    1,   // write
+    3,   // close
+    9,   // mmap
+    11,  // munmap
+    12,  // brk
+    60,  // exit
+    231, // exit_group
+];
+
+const STANDARD_SYSCALLS: &[u32] = &[
+    0, 1, 2, 3, 5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    21, 22, 23, 24, 25, 28, 32, 33, 35, 39, 41, 42, 44, 45, 46, 47,
+    49, 50, 51, 52, 53, 54, 56, 57, 58, 59, 60, 63, 72, 73, 74, 75,
+    79, 89, 96, 97, 98, 99, 102, 104, 107, 108, 110, 111, 158, 186,
+    202, 217, 218, 228, 230, 231, 257, 262, 273, 281, 302, 318, 334,
+];
+
+const BLOCKED_SYSCALLS: &[u32] = &[
+    101, // ptrace
+    134, // uselib
+    156, // _sysctl
+    177, // get_kernel_syms
+    178, // query_module
+    180, // nfsservctl
+    182, // security
+    183, // getpmsg
+    184, // putpmsg
+    185, // afs_syscall
+    214, // epoll_ctl_old
+    215, // epoll_wait_old
+    236, // vserver
+];
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// IPC POLICY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Inter-process communication policy
+#[derive(Debug, Clone)]
+pub struct IpcPolicy {
+    /// Allow shared memory
+    pub allow_shm: bool,
+    
+    /// Allow semaphores
+    pub allow_sem: bool,
+    
+    /// Allow message queues
+    pub allow_mq: bool,
+    
+    /// Allow Unix domain sockets
+    pub allow_unix_sockets: bool,
+    
+    /// Allow pipes
+    pub allow_pipes: bool,
+}
+
+impl IpcPolicy {
+    pub fn deny_all() -> Self {
+        IpcPolicy {
+            allow_shm: false,
+            allow_sem: false,
+            allow_mq: false,
+            allow_unix_sockets: false,
+            allow_pipes: false,
+        }
+    }
+    
+    pub fn standard() -> Self {
+        IpcPolicy {
+            allow_shm: false,
+            allow_sem: false,
+            allow_mq: false,
+            allow_unix_sockets: true,
+            allow_pipes: true,
+        }
+    }
+    
+    pub fn allow_all() -> Self {
+        IpcPolicy {
+            allow_shm: true,
+            allow_sem: true,
+            allow_mq: true,
+            allow_unix_sockets: true,
+            allow_pipes: true,
+        }
+    }
+    
+    pub fn merge(&self, other: &IpcPolicy) -> IpcPolicy {
+        IpcPolicy {
+            allow_shm: self.allow_shm && other.allow_shm,
+            allow_sem: self.allow_sem && other.allow_sem,
+            allow_mq: self.allow_mq && other.allow_mq,
+            allow_unix_sockets: self.allow_unix_sockets && other.allow_unix_sockets,
+            allow_pipes: self.allow_pipes && other.allow_pipes,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CAPABILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bitflags::bitflags! {
+    /// Linux capabilities
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CapabilitySet: u64 {
+        const CAP_CHOWN = 1 << 0;
+        const CAP_DAC_OVERRIDE = 1 << 1;
+        const CAP_DAC_READ_SEARCH = 1 << 2;
+        const CAP_FOWNER = 1 << 3;
+        const CAP_FSETID = 1 << 4;
+        const CAP_KILL = 1 << 5;
+        const CAP_SETGID = 1 << 6;
+        const CAP_SETUID = 1 << 7;
+        const CAP_SETPCAP = 1 << 8;
+        const CAP_LINUX_IMMUTABLE = 1 << 9;
+        const CAP_NET_BIND_SERVICE = 1 << 10;
+        const CAP_NET_BROADCAST = 1 << 11;
+        const CAP_NET_ADMIN = 1 << 12;
+        const CAP_NET_RAW = 1 << 13;
+        const CAP_IPC_LOCK = 1 << 14;
+        const CAP_IPC_OWNER = 1 << 15;
+        const CAP_SYS_MODULE = 1 << 16;
+        const CAP_SYS_RAWIO = 1 << 17;
+        const CAP_SYS_CHROOT = 1 << 18;
+        const CAP_SYS_PTRACE = 1 << 19;
+        const CAP_SYS_PACCT = 1 << 20;
+        const CAP_SYS_ADMIN = 1 << 21;
+        const CAP_SYS_BOOT = 1 << 22;
+        const CAP_SYS_NICE = 1 << 23;
+        const CAP_SYS_RESOURCE = 1 << 24;
+        const CAP_SYS_TIME = 1 << 25;
+        const CAP_SYS_TTY_CONFIG = 1 << 26;
+        const CAP_MKNOD = 1 << 27;
+        const CAP_LEASE = 1 << 28;
+        const CAP_AUDIT_WRITE = 1 << 29;
+        const CAP_AUDIT_CONTROL = 1 << 30;
+        const CAP_SETFCAP = 1 << 31;
+    }
+}
+
+impl CapabilitySet {
+    pub fn standard() -> Self {
+        Self::empty()
+    }
+    
+    pub fn intersect(&self, other: &CapabilitySet) -> CapabilitySet {
+        *self & *other
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUDIT POLICY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Audit logging policy
+#[derive(Debug, Clone)]
+pub struct AuditPolicy {
+    /// Log all syscalls
+    pub log_syscalls: bool,
+    
+    /// Log file access
+    pub log_file_access: bool,
+    
+    /// Log network access
+    pub log_network_access: bool,
+    
+    /// Log policy violations
+    pub log_violations: bool,
+    
+    /// Audit log destination
+    pub log_destination: AuditDestination,
+}
+
+impl Default for AuditPolicy {
+    fn default() -> Self {
+        AuditPolicy {
+            log_syscalls: false,
+            log_file_access: false,
+            log_network_access: false,
+            log_violations: true,
+            log_destination: AuditDestination::Syslog,
+        }
+    }
+}
+
+impl AuditPolicy {
+    pub fn minimal() -> Self {
+        AuditPolicy {
+            log_syscalls: false,
+            log_file_access: false,
+            log_network_access: false,
+            log_violations: false,
+            log_destination: AuditDestination::None,
+        }
+    }
+    
+    pub fn merge(&self, other: &AuditPolicy) -> AuditPolicy {
+        AuditPolicy {
+            log_syscalls: self.log_syscalls || other.log_syscalls,
+            log_file_access: self.log_file_access || other.log_file_access,
+            log_network_access: self.log_network_access || other.log_network_access,
+            log_violations: self.log_violations || other.log_violations,
+            log_destination: self.log_destination.clone(),
+        }
+    }
+}
+
+/// Audit log destination
+#[derive(Debug, Clone)]
+pub enum AuditDestination {
+    None,
+    Syslog,
+    File(String),
+    Callback,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DECISION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Policy decision result
+#[derive(Debug, Clone)]
+pub enum Decision {
+    Allow,
+    Deny(String),
+    Audit,
+}
+
+impl Decision {
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Decision::Allow | Decision::Audit)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Policy error
+#[derive(Debug, Clone)]
+pub enum PolicyError {
+    ConflictingRules(String),
+    InvalidRule(String),
+    ValidationFailed(String),
+}
+
+impl std::fmt::Display for PolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConflictingRules(msg) => write!(f, "conflicting rules: {}", msg),
+            Self::InvalidRule(msg) => write!(f, "invalid rule: {}", msg),
+            Self::ValidationFailed(msg) => write!(f, "validation failed: {}", msg),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Simple glob matching
+fn glob_match(pattern: &str, text: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    
+    if pattern.ends_with("*") {
+        let prefix = &pattern[..pattern.len() - 1];
+        return text.starts_with(prefix);
+    }
+    
+    if pattern.starts_with("*") {
+        let suffix = &pattern[1..];
+        return text.ends_with(suffix);
+    }
+    
+    pattern == text
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_minimal_policy() {
+        let policy = SecurityPolicy::minimal();
+        assert!(matches!(policy.filesystem.default_action, PathAction::Deny));
+        assert!(!policy.network.allow_outbound);
+    }
+    
+    #[test]
+    fn test_path_rule_matching() {
+        let rule = PathRule::allow_read("/tmp");
+        assert!(rule.matches("/tmp/file.txt"));
+        assert!(rule.matches("/tmp"));
+        assert!(!rule.matches("/var/tmp"));
+    }
+    
+    #[test]
+    fn test_filesystem_check() {
+        let mut policy = FilesystemPolicy::deny_all();
+        policy.add_rule(PathRule::allow_read("/tmp"));
+        
+        assert!(policy.check_access("/tmp/file.txt", FileAccess::Read).is_allowed());
+        assert!(!policy.check_access("/etc/passwd", FileAccess::Read).is_allowed());
+    }
+    
+    #[test]
+    fn test_policy_builder() {
+        let policy = SecurityPolicy::builder()
+            .id("test")
+            .allow_read("/tmp")
+            .max_memory(64 * 1024 * 1024)
+            .build()
+            .unwrap();
+        
+        assert_eq!(policy.id, "test");
+        assert_eq!(policy.resources.max_memory, 64 * 1024 * 1024);
+    }
+    
+    #[test]
+    fn test_policy_merge() {
+        let p1 = SecurityPolicy::standard();
+        let p2 = SecurityPolicy::minimal();
+        
+        let merged = p1.merge(&p2);
+        
+        // Should be most restrictive
+        assert!(!merged.network.allow_outbound);
+    }
+    
+    #[test]
+    fn test_glob_match() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("/tmp/*", "/tmp/file"));
+        assert!(glob_match("*.txt", "file.txt"));
+        assert!(!glob_match("*.txt", "file.log"));
+    }
+}

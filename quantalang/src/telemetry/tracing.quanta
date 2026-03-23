@@ -1,0 +1,1412 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ TELEMETRY — Distributed Tracing
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// OpenTelemetry-compatible distributed tracing:
+// - W3C Trace Context propagation
+// - Span creation and management
+// - Context propagation
+// - Multiple exporter backends
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::telemetry::tracing
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use core::time::Duration;
+use std::sync::{Mutex, RwLock};
+use std::time::{SystemTime, Instant};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRACE AND SPAN IDENTIFIERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 128-bit trace identifier (W3C Trace Context)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TraceId([u8; 16]);
+
+impl TraceId {
+    /// Create a new random trace ID
+    pub fn new() -> Self {
+        let mut bytes = [0u8; 16];
+        getrandom(&mut bytes);
+        TraceId(bytes)
+    }
+    
+    /// Create from bytes
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        TraceId(bytes)
+    }
+    
+    /// Create from hex string
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        if hex.len() != 32 {
+            return None;
+        }
+        let mut bytes = [0u8; 16];
+        for i in 0..16 {
+            bytes[i] = u8::from_str_radix(&hex[i*2..i*2+2], 16).ok()?;
+        }
+        Some(TraceId(bytes))
+    }
+    
+    /// Convert to hex string
+    pub fn to_hex(&self) -> String {
+        self.0.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+    
+    /// Check if valid (non-zero)
+    pub fn is_valid(&self) -> bool {
+        self.0.iter().any(|&b| b != 0)
+    }
+    
+    /// Get as bytes
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl Default for TraceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 64-bit span identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SpanId([u8; 8]);
+
+impl SpanId {
+    /// Create a new random span ID
+    pub fn new() -> Self {
+        let mut bytes = [0u8; 8];
+        getrandom(&mut bytes);
+        SpanId(bytes)
+    }
+    
+    /// Create from bytes
+    pub fn from_bytes(bytes: [u8; 8]) -> Self {
+        SpanId(bytes)
+    }
+    
+    /// Create from hex string
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        if hex.len() != 16 {
+            return None;
+        }
+        let mut bytes = [0u8; 8];
+        for i in 0..8 {
+            bytes[i] = u8::from_str_radix(&hex[i*2..i*2+2], 16).ok()?;
+        }
+        Some(SpanId(bytes))
+    }
+    
+    /// Convert to hex string
+    pub fn to_hex(&self) -> String {
+        self.0.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+    
+    /// Check if valid (non-zero)
+    pub fn is_valid(&self) -> bool {
+        self.0.iter().any(|&b| b != 0)
+    }
+    
+    /// Get as bytes
+    pub fn as_bytes(&self) -> &[u8; 8] {
+        &self.0
+    }
+}
+
+impl Default for SpanId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRACE FLAGS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bitflags::bitflags! {
+    /// Trace flags (W3C Trace Context)
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TraceFlags: u8 {
+        /// Trace is sampled
+        const SAMPLED = 0b00000001;
+    }
+}
+
+impl Default for TraceFlags {
+    fn default() -> Self {
+        TraceFlags::SAMPLED
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPAN CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Immutable span context for propagation
+#[derive(Debug, Clone)]
+pub struct SpanContext {
+    /// Trace identifier
+    pub trace_id: TraceId,
+    
+    /// Span identifier
+    pub span_id: SpanId,
+    
+    /// Trace flags
+    pub trace_flags: TraceFlags,
+    
+    /// Trace state (vendor-specific)
+    pub trace_state: TraceState,
+    
+    /// Whether this is a remote context
+    pub is_remote: bool,
+}
+
+impl SpanContext {
+    /// Create a new span context
+    pub fn new(trace_id: TraceId, span_id: SpanId, trace_flags: TraceFlags) -> Self {
+        SpanContext {
+            trace_id,
+            span_id,
+            trace_flags,
+            trace_state: TraceState::default(),
+            is_remote: false,
+        }
+    }
+    
+    /// Create an invalid/empty context
+    pub fn invalid() -> Self {
+        SpanContext {
+            trace_id: TraceId([0; 16]),
+            span_id: SpanId([0; 8]),
+            trace_flags: TraceFlags::empty(),
+            trace_state: TraceState::default(),
+            is_remote: false,
+        }
+    }
+    
+    /// Check if context is valid
+    pub fn is_valid(&self) -> bool {
+        self.trace_id.is_valid() && self.span_id.is_valid()
+    }
+    
+    /// Check if sampled
+    pub fn is_sampled(&self) -> bool {
+        self.trace_flags.contains(TraceFlags::SAMPLED)
+    }
+    
+    /// Parse from W3C traceparent header
+    pub fn from_traceparent(header: &str) -> Option<Self> {
+        let parts: Vec<&str> = header.split('-').collect();
+        if parts.len() < 4 {
+            return None;
+        }
+        
+        // Version check
+        if parts[0] != "00" {
+            return None;
+        }
+        
+        let trace_id = TraceId::from_hex(parts[1])?;
+        let span_id = SpanId::from_hex(parts[2])?;
+        let flags = u8::from_str_radix(parts[3], 16).ok()?;
+        
+        Some(SpanContext {
+            trace_id,
+            span_id,
+            trace_flags: TraceFlags::from_bits_truncate(flags),
+            trace_state: TraceState::default(),
+            is_remote: true,
+        })
+    }
+    
+    /// Convert to W3C traceparent header
+    pub fn to_traceparent(&self) -> String {
+        format!(
+            "00-{}-{}-{:02x}",
+            self.trace_id.to_hex(),
+            self.span_id.to_hex(),
+            self.trace_flags.bits()
+        )
+    }
+}
+
+/// Vendor-specific trace state
+#[derive(Debug, Clone, Default)]
+pub struct TraceState {
+    entries: Vec<(String, String)>,
+}
+
+impl TraceState {
+    /// Create empty trace state
+    pub fn new() -> Self {
+        TraceState { entries: Vec::new() }
+    }
+    
+    /// Get a value
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+    
+    /// Insert a value (returns new TraceState)
+    pub fn insert(&self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        let mut entries = self.entries.clone();
+        let key = key.into();
+        
+        // Remove existing entry with same key
+        entries.retain(|(k, _)| k != &key);
+        
+        // Add new entry at front
+        entries.insert(0, (key, value.into()));
+        
+        // Limit to 32 entries
+        entries.truncate(32);
+        
+        TraceState { entries }
+    }
+    
+    /// Parse from tracestate header
+    pub fn from_header(header: &str) -> Self {
+        let entries: Vec<_> = header
+            .split(',')
+            .filter_map(|pair| {
+                let mut parts = pair.trim().splitn(2, '=');
+                let key = parts.next()?.trim().to_string();
+                let value = parts.next()?.trim().to_string();
+                Some((key, value))
+            })
+            .take(32)
+            .collect();
+        
+        TraceState { entries }
+    }
+    
+    /// Convert to tracestate header
+    pub fn to_header(&self) -> String {
+        self.entries
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPAN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Span kind
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanKind {
+    /// Internal operation
+    Internal,
+    /// Server-side of RPC
+    Server,
+    /// Client-side of RPC
+    Client,
+    /// Producer of async message
+    Producer,
+    /// Consumer of async message
+    Consumer,
+}
+
+impl Default for SpanKind {
+    fn default() -> Self {
+        SpanKind::Internal
+    }
+}
+
+/// Span status code
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusCode {
+    /// Unset
+    Unset,
+    /// Operation completed successfully
+    Ok,
+    /// Operation failed
+    Error,
+}
+
+impl Default for StatusCode {
+    fn default() -> Self {
+        StatusCode::Unset
+    }
+}
+
+/// Span status
+#[derive(Debug, Clone, Default)]
+pub struct Status {
+    pub code: StatusCode,
+    pub message: String,
+}
+
+impl Status {
+    pub fn ok() -> Self {
+        Status { code: StatusCode::Ok, message: String::new() }
+    }
+    
+    pub fn error(message: impl Into<String>) -> Self {
+        Status { code: StatusCode::Error, message: message.into() }
+    }
+}
+
+/// Attribute value
+#[derive(Debug, Clone)]
+pub enum AttributeValue {
+    String(String),
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    StringArray(Vec<String>),
+    BoolArray(Vec<bool>),
+    I64Array(Vec<i64>),
+    F64Array(Vec<f64>),
+}
+
+impl From<&str> for AttributeValue {
+    fn from(s: &str) -> Self { AttributeValue::String(s.to_string()) }
+}
+impl From<String> for AttributeValue {
+    fn from(s: String) -> Self { AttributeValue::String(s) }
+}
+impl From<bool> for AttributeValue {
+    fn from(b: bool) -> Self { AttributeValue::Bool(b) }
+}
+impl From<i64> for AttributeValue {
+    fn from(i: i64) -> Self { AttributeValue::I64(i) }
+}
+impl From<f64> for AttributeValue {
+    fn from(f: f64) -> Self { AttributeValue::F64(f) }
+}
+
+/// Span event
+#[derive(Debug, Clone)]
+pub struct Event {
+    pub name: String,
+    pub timestamp: SystemTime,
+    pub attributes: Vec<(String, AttributeValue)>,
+}
+
+/// Span link
+#[derive(Debug, Clone)]
+pub struct Link {
+    pub context: SpanContext,
+    pub attributes: Vec<(String, AttributeValue)>,
+}
+
+/// A span representing an operation
+pub struct Span {
+    inner: Arc<SpanInner>,
+}
+
+struct SpanInner {
+    /// Span context
+    context: SpanContext,
+    
+    /// Parent span context
+    parent: Option<SpanContext>,
+    
+    /// Span name
+    name: RwLock<String>,
+    
+    /// Span kind
+    kind: SpanKind,
+    
+    /// Start time
+    start_time: SystemTime,
+    
+    /// Start instant (for duration)
+    start_instant: Instant,
+    
+    /// End time
+    end_time: RwLock<Option<SystemTime>>,
+    
+    /// Status
+    status: RwLock<Status>,
+    
+    /// Attributes
+    attributes: RwLock<Vec<(String, AttributeValue)>>,
+    
+    /// Events
+    events: RwLock<Vec<Event>>,
+    
+    /// Links
+    links: RwLock<Vec<Link>>,
+    
+    /// Recording flag
+    is_recording: AtomicBool,
+    
+    /// Tracer reference for export
+    tracer: Arc<TracerInner>,
+}
+
+impl Span {
+    /// Get span context
+    pub fn context(&self) -> &SpanContext {
+        &self.inner.context
+    }
+    
+    /// Check if recording
+    pub fn is_recording(&self) -> bool {
+        self.inner.is_recording.load(Ordering::Acquire)
+    }
+    
+    /// Set span name
+    pub fn set_name(&self, name: impl Into<String>) {
+        if self.is_recording() {
+            *self.inner.name.write().unwrap() = name.into();
+        }
+    }
+    
+    /// Set attribute
+    pub fn set_attribute(&self, key: impl Into<String>, value: impl Into<AttributeValue>) {
+        if self.is_recording() {
+            let key = key.into();
+            let value = value.into();
+            let mut attrs = self.inner.attributes.write().unwrap();
+            
+            // Update existing or add new
+            if let Some(existing) = attrs.iter_mut().find(|(k, _)| k == &key) {
+                existing.1 = value;
+            } else {
+                attrs.push((key, value));
+            }
+        }
+    }
+    
+    /// Add event
+    pub fn add_event(&self, name: impl Into<String>) {
+        self.add_event_with_attrs(name, vec![]);
+    }
+    
+    /// Add event with attributes
+    pub fn add_event_with_attrs(
+        &self,
+        name: impl Into<String>,
+        attributes: Vec<(String, AttributeValue)>,
+    ) {
+        if self.is_recording() {
+            self.inner.events.write().unwrap().push(Event {
+                name: name.into(),
+                timestamp: SystemTime::now(),
+                attributes,
+            });
+        }
+    }
+    
+    /// Add link
+    pub fn add_link(&self, context: SpanContext, attributes: Vec<(String, AttributeValue)>) {
+        if self.is_recording() {
+            self.inner.links.write().unwrap().push(Link {
+                context,
+                attributes,
+            });
+        }
+    }
+    
+    /// Set status
+    pub fn set_status(&self, status: Status) {
+        if self.is_recording() {
+            *self.inner.status.write().unwrap() = status;
+        }
+    }
+    
+    /// Record exception
+    pub fn record_exception(&self, exception: &dyn std::error::Error) {
+        if self.is_recording() {
+            let mut attrs = vec![
+                ("exception.type".to_string(), AttributeValue::String(std::any::type_name_of_val(exception).to_string())),
+                ("exception.message".to_string(), AttributeValue::String(exception.to_string())),
+            ];
+            
+            // Add backtrace if available
+            if let Some(backtrace) = std::error::request_ref::<std::backtrace::Backtrace>(exception) {
+                attrs.push((
+                    "exception.stacktrace".to_string(),
+                    AttributeValue::String(backtrace.to_string()),
+                ));
+            }
+            
+            self.add_event_with_attrs("exception", attrs);
+            self.set_status(Status::error(exception.to_string()));
+        }
+    }
+    
+    /// End the span
+    pub fn end(&self) {
+        self.end_with_time(SystemTime::now());
+    }
+    
+    /// End the span with specific timestamp
+    pub fn end_with_time(&self, timestamp: SystemTime) {
+        if self.inner.is_recording.swap(false, Ordering::AcqRel) {
+            *self.inner.end_time.write().unwrap() = Some(timestamp);
+            
+            // Export span data
+            let data = self.to_span_data();
+            self.inner.tracer.export_span(data);
+        }
+    }
+    
+    /// Convert to exportable span data
+    fn to_span_data(&self) -> SpanData {
+        SpanData {
+            context: self.inner.context.clone(),
+            parent: self.inner.parent.clone(),
+            name: self.inner.name.read().unwrap().clone(),
+            kind: self.inner.kind,
+            start_time: self.inner.start_time,
+            end_time: self.inner.end_time.read().unwrap().unwrap_or_else(SystemTime::now),
+            status: self.inner.status.read().unwrap().clone(),
+            attributes: self.inner.attributes.read().unwrap().clone(),
+            events: self.inner.events.read().unwrap().clone(),
+            links: self.inner.links.read().unwrap().clone(),
+        }
+    }
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// Exportable span data
+#[derive(Debug, Clone)]
+pub struct SpanData {
+    pub context: SpanContext,
+    pub parent: Option<SpanContext>,
+    pub name: String,
+    pub kind: SpanKind,
+    pub start_time: SystemTime,
+    pub end_time: SystemTime,
+    pub status: Status,
+    pub attributes: Vec<(String, AttributeValue)>,
+    pub events: Vec<Event>,
+    pub links: Vec<Link>,
+}
+
+impl SpanData {
+    /// Get duration
+    pub fn duration(&self) -> Duration {
+        self.end_time
+            .duration_since(self.start_time)
+            .unwrap_or(Duration::ZERO)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPAN BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Builder for creating spans
+pub struct SpanBuilder {
+    name: String,
+    kind: SpanKind,
+    parent: Option<SpanContext>,
+    links: Vec<Link>,
+    attributes: Vec<(String, AttributeValue)>,
+    start_time: Option<SystemTime>,
+    tracer: Arc<TracerInner>,
+}
+
+impl SpanBuilder {
+    fn new(name: impl Into<String>, tracer: Arc<TracerInner>) -> Self {
+        SpanBuilder {
+            name: name.into(),
+            kind: SpanKind::Internal,
+            parent: None,
+            links: Vec::new(),
+            attributes: Vec::new(),
+            start_time: None,
+            tracer,
+        }
+    }
+    
+    /// Set span kind
+    pub fn with_kind(mut self, kind: SpanKind) -> Self {
+        self.kind = kind;
+        self
+    }
+    
+    /// Set parent context
+    pub fn with_parent(mut self, parent: SpanContext) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+    
+    /// Add link
+    pub fn with_link(mut self, context: SpanContext) -> Self {
+        self.links.push(Link { context, attributes: Vec::new() });
+        self
+    }
+    
+    /// Add attribute
+    pub fn with_attribute(mut self, key: impl Into<String>, value: impl Into<AttributeValue>) -> Self {
+        self.attributes.push((key.into(), value.into()));
+        self
+    }
+    
+    /// Set start time
+    pub fn with_start_time(mut self, time: SystemTime) -> Self {
+        self.start_time = Some(time);
+        self
+    }
+    
+    /// Start the span
+    pub fn start(self) -> Span {
+        let trace_id = self.parent
+            .as_ref()
+            .map(|p| p.trace_id)
+            .unwrap_or_else(TraceId::new);
+        
+        let span_id = SpanId::new();
+        
+        let context = SpanContext::new(
+            trace_id,
+            span_id,
+            TraceFlags::SAMPLED,
+        );
+        
+        let start_time = self.start_time.unwrap_or_else(SystemTime::now);
+        
+        Span {
+            inner: Arc::new(SpanInner {
+                context,
+                parent: self.parent,
+                name: RwLock::new(self.name),
+                kind: self.kind,
+                start_time,
+                start_instant: Instant::now(),
+                end_time: RwLock::new(None),
+                status: RwLock::new(Status::default()),
+                attributes: RwLock::new(self.attributes),
+                events: RwLock::new(Vec::new()),
+                links: RwLock::new(self.links),
+                is_recording: AtomicBool::new(true),
+                tracer: self.tracer,
+            }),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRACER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Tracer for creating spans
+#[derive(Clone)]
+pub struct Tracer {
+    inner: Arc<TracerInner>,
+}
+
+struct TracerInner {
+    /// Tracer name
+    name: String,
+    
+    /// Tracer version
+    version: String,
+    
+    /// Span processor
+    processor: Box<dyn SpanProcessor>,
+    
+    /// Sampler
+    sampler: Box<dyn Sampler>,
+}
+
+impl Tracer {
+    /// Create a span builder
+    pub fn span_builder(&self, name: impl Into<String>) -> SpanBuilder {
+        SpanBuilder::new(name, self.inner.clone())
+    }
+    
+    /// Start a new span
+    pub fn start_span(&self, name: impl Into<String>) -> Span {
+        self.span_builder(name).start()
+    }
+    
+    /// Start a span with parent
+    pub fn start_span_with_parent(&self, name: impl Into<String>, parent: &SpanContext) -> Span {
+        self.span_builder(name)
+            .with_parent(parent.clone())
+            .start()
+    }
+    
+    /// Get tracer name
+    pub fn name(&self) -> &str {
+        &self.inner.name
+    }
+    
+    /// Get tracer version
+    pub fn version(&self) -> &str {
+        &self.inner.version
+    }
+}
+
+impl TracerInner {
+    fn export_span(&self, data: SpanData) {
+        self.processor.on_end(data);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRACER PROVIDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Provider for creating tracers
+pub struct TracerProvider {
+    inner: Arc<TracerProviderInner>,
+}
+
+struct TracerProviderInner {
+    /// Registered span processors
+    processors: RwLock<Vec<Box<dyn SpanProcessor>>>,
+    
+    /// Sampler
+    sampler: Box<dyn Sampler>,
+    
+    /// Resource attributes
+    resource: Resource,
+    
+    /// Shutdown flag
+    shutdown: AtomicBool,
+}
+
+impl TracerProvider {
+    /// Create a new provider builder
+    pub fn builder() -> TracerProviderBuilder {
+        TracerProviderBuilder::default()
+    }
+    
+    /// Get a tracer
+    pub fn tracer(&self, name: impl Into<String>) -> Tracer {
+        self.tracer_with_version(name, "")
+    }
+    
+    /// Get a tracer with version
+    pub fn tracer_with_version(&self, name: impl Into<String>, version: impl Into<String>) -> Tracer {
+        let processor = CompositeProcessor {
+            processors: self.inner.processors.read().unwrap().iter()
+                .map(|p| p.clone_box())
+                .collect(),
+        };
+        
+        Tracer {
+            inner: Arc::new(TracerInner {
+                name: name.into(),
+                version: version.into(),
+                processor: Box::new(processor),
+                sampler: self.inner.sampler.clone_box(),
+            }),
+        }
+    }
+    
+    /// Shutdown the provider
+    pub fn shutdown(&self) {
+        if !self.inner.shutdown.swap(true, Ordering::AcqRel) {
+            for processor in self.inner.processors.read().unwrap().iter() {
+                processor.shutdown();
+            }
+        }
+    }
+    
+    /// Force flush all processors
+    pub fn force_flush(&self) {
+        for processor in self.inner.processors.read().unwrap().iter() {
+            processor.force_flush();
+        }
+    }
+}
+
+impl Drop for TracerProvider {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Builder for tracer provider
+#[derive(Default)]
+pub struct TracerProviderBuilder {
+    processors: Vec<Box<dyn SpanProcessor>>,
+    sampler: Option<Box<dyn Sampler>>,
+    resource: Option<Resource>,
+}
+
+impl TracerProviderBuilder {
+    /// Add a span processor
+    pub fn with_processor<P: SpanProcessor + 'static>(mut self, processor: P) -> Self {
+        self.processors.push(Box::new(processor));
+        self
+    }
+    
+    /// Set sampler
+    pub fn with_sampler<S: Sampler + 'static>(mut self, sampler: S) -> Self {
+        self.sampler = Some(Box::new(sampler));
+        self
+    }
+    
+    /// Set resource
+    pub fn with_resource(mut self, resource: Resource) -> Self {
+        self.resource = Some(resource);
+        self
+    }
+    
+    /// Build the provider
+    pub fn build(self) -> TracerProvider {
+        TracerProvider {
+            inner: Arc::new(TracerProviderInner {
+                processors: RwLock::new(self.processors),
+                sampler: self.sampler.unwrap_or_else(|| Box::new(AlwaysOnSampler)),
+                resource: self.resource.unwrap_or_default(),
+                shutdown: AtomicBool::new(false),
+            }),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPAN PROCESSOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Span processor trait
+pub trait SpanProcessor: Send + Sync {
+    /// Called when span starts
+    fn on_start(&self, span: &Span);
+    
+    /// Called when span ends
+    fn on_end(&self, span: SpanData);
+    
+    /// Shutdown processor
+    fn shutdown(&self);
+    
+    /// Force flush
+    fn force_flush(&self);
+    
+    /// Clone to boxed trait object
+    fn clone_box(&self) -> Box<dyn SpanProcessor>;
+}
+
+/// Simple span processor (synchronous export)
+pub struct SimpleSpanProcessor {
+    exporter: Arc<dyn SpanExporter>,
+}
+
+impl SimpleSpanProcessor {
+    pub fn new<E: SpanExporter + 'static>(exporter: E) -> Self {
+        SimpleSpanProcessor {
+            exporter: Arc::new(exporter),
+        }
+    }
+}
+
+impl SpanProcessor for SimpleSpanProcessor {
+    fn on_start(&self, _span: &Span) {}
+    
+    fn on_end(&self, span: SpanData) {
+        let _ = self.exporter.export(vec![span]);
+    }
+    
+    fn shutdown(&self) {
+        self.exporter.shutdown();
+    }
+    
+    fn force_flush(&self) {}
+    
+    fn clone_box(&self) -> Box<dyn SpanProcessor> {
+        Box::new(SimpleSpanProcessor {
+            exporter: self.exporter.clone(),
+        })
+    }
+}
+
+/// Batching span processor
+pub struct BatchSpanProcessor {
+    exporter: Arc<dyn SpanExporter>,
+    batch: Mutex<Vec<SpanData>>,
+    batch_size: usize,
+    shutdown: AtomicBool,
+}
+
+impl BatchSpanProcessor {
+    pub fn new<E: SpanExporter + 'static>(exporter: E, batch_size: usize) -> Self {
+        BatchSpanProcessor {
+            exporter: Arc::new(exporter),
+            batch: Mutex::new(Vec::with_capacity(batch_size)),
+            batch_size,
+            shutdown: AtomicBool::new(false),
+        }
+    }
+    
+    fn export_batch(&self) {
+        let spans: Vec<_> = {
+            let mut batch = self.batch.lock().unwrap();
+            std::mem::take(&mut *batch)
+        };
+        
+        if !spans.is_empty() {
+            let _ = self.exporter.export(spans);
+        }
+    }
+}
+
+impl SpanProcessor for BatchSpanProcessor {
+    fn on_start(&self, _span: &Span) {}
+    
+    fn on_end(&self, span: SpanData) {
+        if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        
+        let should_export = {
+            let mut batch = self.batch.lock().unwrap();
+            batch.push(span);
+            batch.len() >= self.batch_size
+        };
+        
+        if should_export {
+            self.export_batch();
+        }
+    }
+    
+    fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.export_batch();
+        self.exporter.shutdown();
+    }
+    
+    fn force_flush(&self) {
+        self.export_batch();
+    }
+    
+    fn clone_box(&self) -> Box<dyn SpanProcessor> {
+        Box::new(BatchSpanProcessor {
+            exporter: self.exporter.clone(),
+            batch: Mutex::new(Vec::with_capacity(self.batch_size)),
+            batch_size: self.batch_size,
+            shutdown: AtomicBool::new(false),
+        })
+    }
+}
+
+/// Composite processor
+struct CompositeProcessor {
+    processors: Vec<Box<dyn SpanProcessor>>,
+}
+
+impl SpanProcessor for CompositeProcessor {
+    fn on_start(&self, span: &Span) {
+        for p in &self.processors {
+            p.on_start(span);
+        }
+    }
+    
+    fn on_end(&self, span: SpanData) {
+        for p in &self.processors {
+            p.on_end(span.clone());
+        }
+    }
+    
+    fn shutdown(&self) {
+        for p in &self.processors {
+            p.shutdown();
+        }
+    }
+    
+    fn force_flush(&self) {
+        for p in &self.processors {
+            p.force_flush();
+        }
+    }
+    
+    fn clone_box(&self) -> Box<dyn SpanProcessor> {
+        Box::new(CompositeProcessor {
+            processors: self.processors.iter().map(|p| p.clone_box()).collect(),
+        })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPAN EXPORTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Span exporter trait
+pub trait SpanExporter: Send + Sync {
+    /// Export spans
+    fn export(&self, spans: Vec<SpanData>) -> Result<(), ExportError>;
+    
+    /// Shutdown exporter
+    fn shutdown(&self);
+}
+
+/// Console exporter (for debugging)
+pub struct ConsoleExporter;
+
+impl SpanExporter for ConsoleExporter {
+    fn export(&self, spans: Vec<SpanData>) -> Result<(), ExportError> {
+        for span in spans {
+            println!(
+                "[TRACE] {} {} ({}ms) status={:?}",
+                span.context.trace_id.to_hex(),
+                span.name,
+                span.duration().as_millis(),
+                span.status.code,
+            );
+            
+            for (key, value) in &span.attributes {
+                println!("  {}: {:?}", key, value);
+            }
+            
+            for event in &span.events {
+                println!("  EVENT: {} at {:?}", event.name, event.timestamp);
+            }
+        }
+        Ok(())
+    }
+    
+    fn shutdown(&self) {}
+}
+
+/// In-memory exporter (for testing)
+pub struct InMemoryExporter {
+    spans: Mutex<Vec<SpanData>>,
+}
+
+impl InMemoryExporter {
+    pub fn new() -> Self {
+        InMemoryExporter {
+            spans: Mutex::new(Vec::new()),
+        }
+    }
+    
+    pub fn spans(&self) -> Vec<SpanData> {
+        self.spans.lock().unwrap().clone()
+    }
+    
+    pub fn clear(&self) {
+        self.spans.lock().unwrap().clear();
+    }
+}
+
+impl SpanExporter for InMemoryExporter {
+    fn export(&self, spans: Vec<SpanData>) -> Result<(), ExportError> {
+        self.spans.lock().unwrap().extend(spans);
+        Ok(())
+    }
+    
+    fn shutdown(&self) {}
+}
+
+impl Default for InMemoryExporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Export error
+#[derive(Debug)]
+pub enum ExportError {
+    Shutdown,
+    Transport(String),
+    Encoding(String),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SAMPLER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Sampling decision
+#[derive(Debug, Clone)]
+pub enum SamplingDecision {
+    /// Don't record or sample
+    Drop,
+    /// Record but don't sample
+    RecordOnly,
+    /// Record and sample
+    RecordAndSample,
+}
+
+/// Sampling result
+#[derive(Debug, Clone)]
+pub struct SamplingResult {
+    pub decision: SamplingDecision,
+    pub attributes: Vec<(String, AttributeValue)>,
+    pub trace_state: TraceState,
+}
+
+/// Sampler trait
+pub trait Sampler: Send + Sync {
+    fn should_sample(&self, context: &SamplerContext) -> SamplingResult;
+    fn clone_box(&self) -> Box<dyn Sampler>;
+}
+
+/// Context for sampling decision
+pub struct SamplerContext<'a> {
+    pub trace_id: &'a TraceId,
+    pub name: &'a str,
+    pub kind: SpanKind,
+    pub parent: Option<&'a SpanContext>,
+}
+
+/// Always-on sampler
+pub struct AlwaysOnSampler;
+
+impl Sampler for AlwaysOnSampler {
+    fn should_sample(&self, _context: &SamplerContext) -> SamplingResult {
+        SamplingResult {
+            decision: SamplingDecision::RecordAndSample,
+            attributes: Vec::new(),
+            trace_state: TraceState::default(),
+        }
+    }
+    
+    fn clone_box(&self) -> Box<dyn Sampler> {
+        Box::new(AlwaysOnSampler)
+    }
+}
+
+/// Always-off sampler
+pub struct AlwaysOffSampler;
+
+impl Sampler for AlwaysOffSampler {
+    fn should_sample(&self, _context: &SamplerContext) -> SamplingResult {
+        SamplingResult {
+            decision: SamplingDecision::Drop,
+            attributes: Vec::new(),
+            trace_state: TraceState::default(),
+        }
+    }
+    
+    fn clone_box(&self) -> Box<dyn Sampler> {
+        Box::new(AlwaysOffSampler)
+    }
+}
+
+/// Probability-based sampler
+pub struct TraceIdRatioSampler {
+    ratio: f64,
+    threshold: u64,
+}
+
+impl TraceIdRatioSampler {
+    pub fn new(ratio: f64) -> Self {
+        let ratio = ratio.clamp(0.0, 1.0);
+        let threshold = (ratio * u64::MAX as f64) as u64;
+        TraceIdRatioSampler { ratio, threshold }
+    }
+}
+
+impl Sampler for TraceIdRatioSampler {
+    fn should_sample(&self, context: &SamplerContext) -> SamplingResult {
+        let bytes = context.trace_id.as_bytes();
+        let value = u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        
+        let decision = if value <= self.threshold {
+            SamplingDecision::RecordAndSample
+        } else {
+            SamplingDecision::Drop
+        };
+        
+        SamplingResult {
+            decision,
+            attributes: Vec::new(),
+            trace_state: TraceState::default(),
+        }
+    }
+    
+    fn clone_box(&self) -> Box<dyn Sampler> {
+        Box::new(TraceIdRatioSampler {
+            ratio: self.ratio,
+            threshold: self.threshold,
+        })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RESOURCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Resource describing the entity producing telemetry
+#[derive(Debug, Clone, Default)]
+pub struct Resource {
+    attributes: Vec<(String, AttributeValue)>,
+}
+
+impl Resource {
+    /// Create empty resource
+    pub fn empty() -> Self {
+        Resource { attributes: Vec::new() }
+    }
+    
+    /// Create resource with attributes
+    pub fn new(attributes: Vec<(String, AttributeValue)>) -> Self {
+        Resource { attributes }
+    }
+    
+    /// Get attribute value
+    pub fn get(&self, key: &str) -> Option<&AttributeValue> {
+        self.attributes.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+    
+    /// Merge with another resource
+    pub fn merge(&self, other: &Resource) -> Resource {
+        let mut attrs = self.attributes.clone();
+        for (k, v) in &other.attributes {
+            if !attrs.iter().any(|(key, _)| key == k) {
+                attrs.push((k.clone(), v.clone()));
+            }
+        }
+        Resource { attributes: attrs }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONTEXT PROPAGATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+thread_local! {
+    static CURRENT_SPAN: std::cell::RefCell<Option<SpanContext>> = std::cell::RefCell::new(None);
+}
+
+/// Get current span context
+pub fn current_span_context() -> Option<SpanContext> {
+    CURRENT_SPAN.with(|s| s.borrow().clone())
+}
+
+/// Set current span context
+pub fn set_current_span_context(ctx: SpanContext) -> SpanContextGuard {
+    let previous = CURRENT_SPAN.with(|s| s.borrow_mut().replace(ctx));
+    SpanContextGuard { previous }
+}
+
+/// Guard that restores previous context on drop
+pub struct SpanContextGuard {
+    previous: Option<SpanContext>,
+}
+
+impl Drop for SpanContextGuard {
+    fn drop(&mut self) {
+        CURRENT_SPAN.with(|s| *s.borrow_mut() = self.previous.take());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn getrandom(buf: &mut [u8]) {
+    #[cfg(unix)]
+    {
+        use std::fs::File;
+        use std::io::Read;
+        if let Ok(mut f) = File::open("/dev/urandom") {
+            let _ = f.read_exact(buf);
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Would use BCryptGenRandom
+        for b in buf.iter_mut() {
+            *b = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos() & 0xFF) as u8;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_trace_id() {
+        let id = TraceId::new();
+        assert!(id.is_valid());
+        
+        let hex = id.to_hex();
+        assert_eq!(hex.len(), 32);
+        
+        let parsed = TraceId::from_hex(&hex).unwrap();
+        assert_eq!(id, parsed);
+    }
+    
+    #[test]
+    fn test_span_id() {
+        let id = SpanId::new();
+        assert!(id.is_valid());
+        
+        let hex = id.to_hex();
+        assert_eq!(hex.len(), 16);
+    }
+    
+    #[test]
+    fn test_traceparent() {
+        let ctx = SpanContext::new(
+            TraceId::new(),
+            SpanId::new(),
+            TraceFlags::SAMPLED,
+        );
+        
+        let header = ctx.to_traceparent();
+        let parsed = SpanContext::from_traceparent(&header).unwrap();
+        
+        assert_eq!(ctx.trace_id, parsed.trace_id);
+        assert_eq!(ctx.span_id, parsed.span_id);
+    }
+    
+    #[test]
+    fn test_tracer_provider() {
+        let exporter = InMemoryExporter::new();
+        let processor = SimpleSpanProcessor::new(exporter);
+        
+        let provider = TracerProvider::builder()
+            .with_processor(processor)
+            .build();
+        
+        let tracer = provider.tracer("test");
+        let span = tracer.start_span("test-span");
+        span.set_attribute("key", "value");
+        span.end();
+        
+        provider.shutdown();
+    }
+    
+    #[test]
+    fn test_sampler() {
+        let sampler = TraceIdRatioSampler::new(0.5);
+        let trace_id = TraceId::new();
+        
+        let ctx = SamplerContext {
+            trace_id: &trace_id,
+            name: "test",
+            kind: SpanKind::Internal,
+            parent: None,
+        };
+        
+        let result = sampler.should_sample(&ctx);
+        // Just ensure it doesn't panic
+        let _ = result.decision;
+    }
+}

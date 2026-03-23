@@ -1,0 +1,2371 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — AArch64 Code Generation Backend
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Target: AArch64 (ARM64) — ARMv8-A and later
+// ABI: AAPCS64 (ARM Architecture Procedure Call Standard for 64-bit)
+// 
+// Supported targets:
+//   - aarch64-unknown-linux-gnu   (Linux userspace)
+//   - aarch64-apple-darwin        (macOS Apple Silicon)
+//   - aarch64-unknown-none        (Bare metal / Quanta OS kernel)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::codegen_aarch64
+
+use crate::mir::{MirBody, MirBasicBlock, MirStatement, MirTerminator, MirRvalue};
+use crate::mir::{MirOperand, MirPlace, MirConstant, BinOp, UnOp, CastKind};
+use crate::types::{Type, TypeKind};
+use crate::driver::CompilerOptions;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTER DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// AArch64 general-purpose registers (64-bit: Xn, 32-bit: Wn)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Reg {
+    // General-purpose registers X0-X30
+    X0 = 0,   X1,  X2,  X3,  X4,  X5,  X6,  X7,
+    X8,  X9,  X10, X11, X12, X13, X14, X15,
+    X16, X17, X18, X19, X20, X21, X22, X23,
+    X24, X25, X26, X27, X28, X29, X30,
+    
+    // Special registers
+    SP,       // Stack pointer (X31 context-dependent)
+    XZR,      // Zero register (X31 context-dependent)
+    PC,       // Program counter (not directly addressable)
+    
+    // SIMD/FP registers V0-V31 (128-bit, aliases: D0-D31, S0-S31, H0-H31, B0-B31)
+    V0 = 64,  V1,  V2,  V3,  V4,  V5,  V6,  V7,
+    V8,  V9,  V10, V11, V12, V13, V14, V15,
+    V16, V17, V18, V19, V20, V21, V22, V23,
+    V24, V25, V26, V27, V28, V29, V30, V31,
+    
+    // Condition flags (NZCV)
+    NZCV = 128,
+}
+
+impl Reg {
+    /// Returns the register encoding (0-30 for X0-X30, 31 for SP/XZR)
+    pub const fn encoding(self) -> u32 {
+        match self {
+            Reg::X0..=Reg::X30 => self as u32,
+            Reg::SP | Reg::XZR => 31,
+            Reg::V0..=Reg::V31 => (self as u32) - 64,
+            _ => 0,
+        }
+    }
+    
+    /// Returns 32-bit alias (Wn)
+    pub const fn w(self) -> Self {
+        self  // Same register, different view
+    }
+    
+    /// Returns true if this is a general-purpose register
+    pub const fn is_gp(self) -> bool {
+        matches!(self, Reg::X0..=Reg::X30)
+    }
+    
+    /// Returns true if this is a SIMD/FP register
+    pub const fn is_fp(self) -> bool {
+        matches!(self, Reg::V0..=Reg::V31)
+    }
+    
+    /// Returns true if this is a callee-saved register
+    pub const fn is_callee_saved(self) -> bool {
+        matches!(self, 
+            Reg::X19 | Reg::X20 | Reg::X21 | Reg::X22 | Reg::X23 |
+            Reg::X24 | Reg::X25 | Reg::X26 | Reg::X27 | Reg::X28 |
+            Reg::X29 | Reg::X30 |  // FP and LR
+            Reg::V8..=Reg::V15     // Lower 64 bits only
+        )
+    }
+}
+
+/// AAPCS64 calling convention registers
+pub mod abi {
+    use super::Reg;
+    
+    /// Integer argument registers (X0-X7)
+    pub const ARG_REGS: [Reg; 8] = [
+        Reg::X0, Reg::X1, Reg::X2, Reg::X3,
+        Reg::X4, Reg::X5, Reg::X6, Reg::X7,
+    ];
+    
+    /// FP/SIMD argument registers (V0-V7)
+    pub const FP_ARG_REGS: [Reg; 8] = [
+        Reg::V0, Reg::V1, Reg::V2, Reg::V3,
+        Reg::V4, Reg::V5, Reg::V6, Reg::V7,
+    ];
+    
+    /// Return value registers
+    pub const RET_REGS: [Reg; 2] = [Reg::X0, Reg::X1];
+    pub const FP_RET_REGS: [Reg; 4] = [Reg::V0, Reg::V1, Reg::V2, Reg::V3];
+    
+    /// Callee-saved registers (must be preserved across calls)
+    pub const CALLEE_SAVED: [Reg; 10] = [
+        Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23,
+        Reg::X24, Reg::X25, Reg::X26, Reg::X27, Reg::X28,
+    ];
+    
+    /// Caller-saved (scratch) registers
+    pub const CALLER_SAVED: [Reg; 18] = [
+        Reg::X0,  Reg::X1,  Reg::X2,  Reg::X3,  Reg::X4,
+        Reg::X5,  Reg::X6,  Reg::X7,  Reg::X8,  Reg::X9,
+        Reg::X10, Reg::X11, Reg::X12, Reg::X13, Reg::X14,
+        Reg::X15, Reg::X16, Reg::X17,
+    ];
+    
+    /// Frame pointer (X29)
+    pub const FP: Reg = Reg::X29;
+    
+    /// Link register (X30) — return address
+    pub const LR: Reg = Reg::X30;
+    
+    /// Intra-procedure scratch registers (X16, X17)
+    pub const IP0: Reg = Reg::X16;
+    pub const IP1: Reg = Reg::X17;
+    
+    /// Platform register (X18) — reserved on some platforms
+    pub const PR: Reg = Reg::X18;
+    
+    /// Indirect result location register (X8)
+    pub const XR: Reg = Reg::X8;
+    
+    /// Allocatable GP registers (excludes SP, FP, LR, platform reg)
+    pub const ALLOCATABLE_GP: [Reg; 25] = [
+        Reg::X0,  Reg::X1,  Reg::X2,  Reg::X3,  Reg::X4,
+        Reg::X5,  Reg::X6,  Reg::X7,  Reg::X8,  Reg::X9,
+        Reg::X10, Reg::X11, Reg::X12, Reg::X13, Reg::X14,
+        Reg::X15, Reg::X16, Reg::X17,
+        Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23,
+        Reg::X24, Reg::X25,
+    ];
+}
+
+/// Register size specifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegSize {
+    W,    // 32-bit (Wn)
+    X,    // 64-bit (Xn)
+    B,    // 8-bit SIMD element
+    H,    // 16-bit SIMD element (half)
+    S,    // 32-bit SIMD element (single)
+    D,    // 64-bit SIMD element (double)
+    Q,    // 128-bit SIMD element (quad)
+}
+
+impl RegSize {
+    pub const fn bits(self) -> u32 {
+        match self {
+            RegSize::B => 8,
+            RegSize::H => 16,
+            RegSize::W | RegSize::S => 32,
+            RegSize::X | RegSize::D => 64,
+            RegSize::Q => 128,
+        }
+    }
+    
+    pub const fn sf_bit(self) -> u32 {
+        match self {
+            RegSize::W | RegSize::S => 0,
+            RegSize::X | RegSize::D => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// Virtual register (before allocation)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VReg(pub u32);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY OPERANDS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// AArch64 addressing modes
+#[derive(Debug, Clone)]
+pub enum MemOperand {
+    /// Base register: [Xn]
+    Base(Reg),
+    
+    /// Base + immediate offset: [Xn, #imm]
+    BaseOffset(Reg, i64),
+    
+    /// Base + register offset: [Xn, Xm]
+    BaseReg(Reg, Reg),
+    
+    /// Base + scaled register: [Xn, Xm, LSL #shift]
+    BaseRegShift(Reg, Reg, ShiftType, u8),
+    
+    /// Base + extended register: [Xn, Wm, SXTW #shift]
+    BaseRegExt(Reg, Reg, ExtendType, u8),
+    
+    /// Pre-indexed: [Xn, #imm]!
+    PreIndex(Reg, i64),
+    
+    /// Post-indexed: [Xn], #imm
+    PostIndex(Reg, i64),
+    
+    /// PC-relative: label
+    PcRelative(i64),
+    
+    /// Literal pool reference
+    Literal(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftType {
+    LSL,  // Logical shift left
+    LSR,  // Logical shift right
+    ASR,  // Arithmetic shift right
+    ROR,  // Rotate right
+}
+
+impl ShiftType {
+    pub const fn encoding(self) -> u32 {
+        match self {
+            ShiftType::LSL => 0b00,
+            ShiftType::LSR => 0b01,
+            ShiftType::ASR => 0b10,
+            ShiftType::ROR => 0b11,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtendType {
+    UXTB,  // Unsigned extend byte
+    UXTH,  // Unsigned extend halfword
+    UXTW,  // Unsigned extend word
+    UXTX,  // Unsigned extend doubleword (alias for LSL)
+    SXTB,  // Signed extend byte
+    SXTH,  // Signed extend halfword
+    SXTW,  // Signed extend word
+    SXTX,  // Signed extend doubleword
+}
+
+impl ExtendType {
+    pub const fn encoding(self) -> u32 {
+        match self {
+            ExtendType::UXTB => 0b000,
+            ExtendType::UXTH => 0b001,
+            ExtendType::UXTW => 0b010,
+            ExtendType::UXTX => 0b011,
+            ExtendType::SXTB => 0b100,
+            ExtendType::SXTH => 0b101,
+            ExtendType::SXTW => 0b110,
+            ExtendType::SXTX => 0b111,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONDITION CODES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// AArch64 condition codes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cond {
+    EQ = 0b0000,  // Equal (Z=1)
+    NE = 0b0001,  // Not equal (Z=0)
+    CS = 0b0010,  // Carry set / unsigned higher or same (C=1)
+    CC = 0b0011,  // Carry clear / unsigned lower (C=0)
+    MI = 0b0100,  // Minus / negative (N=1)
+    PL = 0b0101,  // Plus / positive or zero (N=0)
+    VS = 0b0110,  // Overflow (V=1)
+    VC = 0b0111,  // No overflow (V=0)
+    HI = 0b1000,  // Unsigned higher (C=1 && Z=0)
+    LS = 0b1001,  // Unsigned lower or same (C=0 || Z=1)
+    GE = 0b1010,  // Signed greater or equal (N==V)
+    LT = 0b1011,  // Signed less than (N!=V)
+    GT = 0b1100,  // Signed greater than (Z=0 && N==V)
+    LE = 0b1101,  // Signed less or equal (Z=1 || N!=V)
+    AL = 0b1110,  // Always
+    NV = 0b1111,  // Never (reserved)
+}
+
+impl Cond {
+    pub const fn encoding(self) -> u32 {
+        self as u32
+    }
+    
+    pub const fn invert(self) -> Self {
+        match self {
+            Cond::EQ => Cond::NE,
+            Cond::NE => Cond::EQ,
+            Cond::CS => Cond::CC,
+            Cond::CC => Cond::CS,
+            Cond::MI => Cond::PL,
+            Cond::PL => Cond::MI,
+            Cond::VS => Cond::VC,
+            Cond::VC => Cond::VS,
+            Cond::HI => Cond::LS,
+            Cond::LS => Cond::HI,
+            Cond::GE => Cond::LT,
+            Cond::LT => Cond::GE,
+            Cond::GT => Cond::LE,
+            Cond::LE => Cond::GT,
+            Cond::AL => Cond::NV,
+            Cond::NV => Cond::AL,
+        }
+    }
+    
+    pub fn from_binop(op: BinOp, signed: bool) -> Self {
+        match (op, signed) {
+            (BinOp::Eq, _) => Cond::EQ,
+            (BinOp::Ne, _) => Cond::NE,
+            (BinOp::Lt, true) => Cond::LT,
+            (BinOp::Lt, false) => Cond::CC,
+            (BinOp::Le, true) => Cond::LE,
+            (BinOp::Le, false) => Cond::LS,
+            (BinOp::Gt, true) => Cond::GT,
+            (BinOp::Gt, false) => Cond::HI,
+            (BinOp::Ge, true) => Cond::GE,
+            (BinOp::Ge, false) => Cond::CS,
+            _ => Cond::AL,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOW-LEVEL IR (LIR) INSTRUCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Label in the LIR
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LirLabel(pub u32);
+
+/// LIR operand
+#[derive(Debug, Clone)]
+pub enum LirOperand {
+    Reg(VReg),
+    PhysReg(Reg),
+    Imm(i64),
+    Mem(MemOperand),
+    Label(LirLabel),
+}
+
+/// LIR instruction
+#[derive(Debug, Clone)]
+pub enum LirInst {
+    // ─────────────────────────────────────────────────────────────────────────
+    // Data Movement
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// MOV Rd, Rn (register to register)
+    Mov { dst: LirOperand, src: LirOperand, size: RegSize },
+    
+    /// MOVZ Rd, #imm{, LSL #shift} (move wide with zero)
+    MovZ { dst: LirOperand, imm: u16, shift: u8, size: RegSize },
+    
+    /// MOVK Rd, #imm{, LSL #shift} (move wide with keep)
+    MovK { dst: LirOperand, imm: u16, shift: u8, size: RegSize },
+    
+    /// MOVN Rd, #imm{, LSL #shift} (move wide with NOT)
+    MovN { dst: LirOperand, imm: u16, shift: u8, size: RegSize },
+    
+    /// LDR Rt, [addr] (load register)
+    Ldr { dst: LirOperand, addr: MemOperand, size: RegSize },
+    
+    /// LDRSW Rt, [addr] (load signed word, extend to 64-bit)
+    LdrSW { dst: LirOperand, addr: MemOperand },
+    
+    /// LDRB/LDRH (load byte/halfword)
+    LdrBH { dst: LirOperand, addr: MemOperand, size: RegSize, signed: bool },
+    
+    /// LDP Rt1, Rt2, [addr] (load pair)
+    Ldp { dst1: LirOperand, dst2: LirOperand, addr: MemOperand, size: RegSize },
+    
+    /// STR Rt, [addr] (store register)
+    Str { src: LirOperand, addr: MemOperand, size: RegSize },
+    
+    /// STRB/STRH (store byte/halfword)
+    StrBH { src: LirOperand, addr: MemOperand, size: RegSize },
+    
+    /// STP Rt1, Rt2, [addr] (store pair)
+    Stp { src1: LirOperand, src2: LirOperand, addr: MemOperand, size: RegSize },
+    
+    /// ADR/ADRP Rd, label (PC-relative address)
+    Adr { dst: LirOperand, label: LirLabel, page: bool },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Arithmetic
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// ADD Rd, Rn, Op2
+    Add { dst: LirOperand, src1: LirOperand, src2: LirOperand, size: RegSize, set_flags: bool },
+    
+    /// SUB Rd, Rn, Op2
+    Sub { dst: LirOperand, src1: LirOperand, src2: LirOperand, size: RegSize, set_flags: bool },
+    
+    /// MUL Rd, Rn, Rm
+    Mul { dst: LirOperand, src1: LirOperand, src2: LirOperand, size: RegSize },
+    
+    /// SMULL/UMULL Xd, Wn, Wm (signed/unsigned multiply long)
+    MulL { dst: LirOperand, src1: LirOperand, src2: LirOperand, signed: bool },
+    
+    /// SDIV/UDIV Rd, Rn, Rm
+    Div { dst: LirOperand, src1: LirOperand, src2: LirOperand, size: RegSize, signed: bool },
+    
+    /// MADD Rd, Rn, Rm, Ra (Rd = Ra + Rn * Rm)
+    Madd { dst: LirOperand, src1: LirOperand, src2: LirOperand, acc: LirOperand, size: RegSize },
+    
+    /// MSUB Rd, Rn, Rm, Ra (Rd = Ra - Rn * Rm)
+    Msub { dst: LirOperand, src1: LirOperand, src2: LirOperand, acc: LirOperand, size: RegSize },
+    
+    /// NEG Rd, Rm (negate)
+    Neg { dst: LirOperand, src: LirOperand, size: RegSize, set_flags: bool },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Logical
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// AND Rd, Rn, Op2
+    And { dst: LirOperand, src1: LirOperand, src2: LirOperand, size: RegSize, set_flags: bool },
+    
+    /// ORR Rd, Rn, Op2
+    Orr { dst: LirOperand, src1: LirOperand, src2: LirOperand, size: RegSize },
+    
+    /// EOR Rd, Rn, Op2 (XOR)
+    Eor { dst: LirOperand, src1: LirOperand, src2: LirOperand, size: RegSize },
+    
+    /// BIC Rd, Rn, Op2 (bit clear: AND NOT)
+    Bic { dst: LirOperand, src1: LirOperand, src2: LirOperand, size: RegSize },
+    
+    /// ORN Rd, Rn, Op2 (OR NOT)
+    Orn { dst: LirOperand, src1: LirOperand, src2: LirOperand, size: RegSize },
+    
+    /// MVN Rd, Op2 (bitwise NOT)
+    Mvn { dst: LirOperand, src: LirOperand, size: RegSize },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Shift and Rotate
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// LSL Rd, Rn, #imm / Rm
+    Lsl { dst: LirOperand, src: LirOperand, amount: LirOperand, size: RegSize },
+    
+    /// LSR Rd, Rn, #imm / Rm
+    Lsr { dst: LirOperand, src: LirOperand, amount: LirOperand, size: RegSize },
+    
+    /// ASR Rd, Rn, #imm / Rm
+    Asr { dst: LirOperand, src: LirOperand, amount: LirOperand, size: RegSize },
+    
+    /// ROR Rd, Rn, #imm / Rm
+    Ror { dst: LirOperand, src: LirOperand, amount: LirOperand, size: RegSize },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Compare and Test
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// CMP Rn, Op2 (compare: SUBS with discarded result)
+    Cmp { src1: LirOperand, src2: LirOperand, size: RegSize },
+    
+    /// CMN Rn, Op2 (compare negative: ADDS with discarded result)
+    Cmn { src1: LirOperand, src2: LirOperand, size: RegSize },
+    
+    /// TST Rn, Op2 (test: ANDS with discarded result)
+    Tst { src1: LirOperand, src2: LirOperand, size: RegSize },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Conditional
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// CSEL Rd, Rn, Rm, cond (conditional select)
+    Csel { dst: LirOperand, src1: LirOperand, src2: LirOperand, cond: Cond, size: RegSize },
+    
+    /// CSET Rd, cond (conditional set)
+    Cset { dst: LirOperand, cond: Cond, size: RegSize },
+    
+    /// CSINC Rd, Rn, Rm, cond (conditional select increment)
+    Csinc { dst: LirOperand, src1: LirOperand, src2: LirOperand, cond: Cond, size: RegSize },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Bit Manipulation
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// CLZ Rd, Rn (count leading zeros)
+    Clz { dst: LirOperand, src: LirOperand, size: RegSize },
+    
+    /// CLS Rd, Rn (count leading sign bits)
+    Cls { dst: LirOperand, src: LirOperand, size: RegSize },
+    
+    /// RBIT Rd, Rn (reverse bits)
+    Rbit { dst: LirOperand, src: LirOperand, size: RegSize },
+    
+    /// REV Rd, Rn (reverse bytes)
+    Rev { dst: LirOperand, src: LirOperand, size: RegSize },
+    
+    /// REV16 Rd, Rn (reverse bytes in halfwords)
+    Rev16 { dst: LirOperand, src: LirOperand, size: RegSize },
+    
+    /// REV32 Rd, Rn (reverse bytes in words)
+    Rev32 { dst: LirOperand, src: LirOperand },
+    
+    /// UBFX/SBFX Rd, Rn, #lsb, #width (unsigned/signed bitfield extract)
+    Bfx { dst: LirOperand, src: LirOperand, lsb: u8, width: u8, size: RegSize, signed: bool },
+    
+    /// BFI Rd, Rn, #lsb, #width (bitfield insert)
+    Bfi { dst: LirOperand, src: LirOperand, lsb: u8, width: u8, size: RegSize },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Extension
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// SXTB/SXTH/SXTW (sign extend)
+    Sxt { dst: LirOperand, src: LirOperand, src_size: RegSize, dst_size: RegSize },
+    
+    /// UXTB/UXTH (zero extend)
+    Uxt { dst: LirOperand, src: LirOperand, src_size: RegSize, dst_size: RegSize },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Branch
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// B label (unconditional branch)
+    B { label: LirLabel },
+    
+    /// B.cond label (conditional branch)
+    BCond { label: LirLabel, cond: Cond },
+    
+    /// BL label (branch with link: call)
+    Bl { label: LirLabel },
+    
+    /// BLR Rn (branch with link to register)
+    Blr { target: LirOperand },
+    
+    /// BR Rn (branch to register)
+    Br { target: LirOperand },
+    
+    /// RET {Rn} (return: BR X30)
+    Ret { target: Option<LirOperand> },
+    
+    /// CBZ/CBNZ Rt, label (compare and branch if zero/nonzero)
+    Cbz { src: LirOperand, label: LirLabel, nonzero: bool, size: RegSize },
+    
+    /// TBZ/TBNZ Rt, #bit, label (test bit and branch)
+    Tbz { src: LirOperand, bit: u8, label: LirLabel, nonzero: bool },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Floating-Point
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// FMOV (FP move)
+    Fmov { dst: LirOperand, src: LirOperand, size: RegSize },
+    
+    /// FADD
+    Fadd { dst: LirOperand, src1: LirOperand, src2: LirOperand, size: RegSize },
+    
+    /// FSUB
+    Fsub { dst: LirOperand, src1: LirOperand, src2: LirOperand, size: RegSize },
+    
+    /// FMUL
+    Fmul { dst: LirOperand, src1: LirOperand, src2: LirOperand, size: RegSize },
+    
+    /// FDIV
+    Fdiv { dst: LirOperand, src1: LirOperand, src2: LirOperand, size: RegSize },
+    
+    /// FNEG
+    Fneg { dst: LirOperand, src: LirOperand, size: RegSize },
+    
+    /// FABS
+    Fabs { dst: LirOperand, src: LirOperand, size: RegSize },
+    
+    /// FSQRT
+    Fsqrt { dst: LirOperand, src: LirOperand, size: RegSize },
+    
+    /// FCMP
+    Fcmp { src1: LirOperand, src2: LirOperand, size: RegSize },
+    
+    /// FCVT (FP convert between sizes)
+    Fcvt { dst: LirOperand, src: LirOperand, dst_size: RegSize, src_size: RegSize },
+    
+    /// SCVTF/UCVTF (integer to FP)
+    CvtIntToFp { dst: LirOperand, src: LirOperand, dst_size: RegSize, src_size: RegSize, signed: bool },
+    
+    /// FCVTZS/FCVTZU (FP to integer, round toward zero)
+    CvtFpToInt { dst: LirOperand, src: LirOperand, dst_size: RegSize, src_size: RegSize, signed: bool },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // System
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// NOP
+    Nop,
+    
+    /// BRK #imm (breakpoint)
+    Brk { imm: u16 },
+    
+    /// SVC #imm (supervisor call / syscall)
+    Svc { imm: u16 },
+    
+    /// HLT #imm (halt)
+    Hlt { imm: u16 },
+    
+    /// MSR (move to system register)
+    Msr { sysreg: SystemReg, src: LirOperand },
+    
+    /// MRS (move from system register)
+    Mrs { dst: LirOperand, sysreg: SystemReg },
+    
+    /// DMB/DSB/ISB (barriers)
+    Barrier { kind: BarrierKind, option: BarrierOption },
+    
+    /// WFI/WFE (wait for interrupt/event)
+    Wait { for_event: bool },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Atomic (ARMv8.1+)
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// LDADD/LDSET/LDCLR/LDEOR (atomic load and op)
+    LdAtomic { dst: LirOperand, src: LirOperand, addr: MemOperand, op: AtomicOp, 
+               size: RegSize, acquire: bool, release: bool },
+    
+    /// CAS (compare and swap)
+    Cas { expected: LirOperand, new: LirOperand, addr: MemOperand, 
+          size: RegSize, acquire: bool, release: bool },
+    
+    /// LDXR/STXR (load/store exclusive)
+    LdExclusive { dst: LirOperand, addr: MemOperand, size: RegSize, acquire: bool },
+    StExclusive { status: LirOperand, src: LirOperand, addr: MemOperand, size: RegSize, release: bool },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Pseudo-instructions
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    /// Label marker
+    Label(LirLabel),
+    
+    /// Comment
+    Comment(String),
+    
+    /// Frame setup (prologue)
+    FrameSetup { frame_size: u32, saved_regs: Vec<Reg> },
+    
+    /// Frame destroy (epilogue)
+    FrameDestroy { frame_size: u32, saved_regs: Vec<Reg> },
+    
+    /// Spill virtual register to stack
+    Spill { vreg: VReg, slot: u32 },
+    
+    /// Reload virtual register from stack
+    Reload { vreg: VReg, slot: u32 },
+    
+    /// Call with ABI handling
+    Call { target: CallTarget, args: Vec<LirOperand>, defs: Vec<Reg> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemReg {
+    // Exception level control
+    SCTLR_EL1,
+    TTBR0_EL1,
+    TTBR1_EL1,
+    TCR_EL1,
+    MAIR_EL1,
+    VBAR_EL1,
+    
+    // Exception handling
+    ESR_EL1,
+    FAR_EL1,
+    ELR_EL1,
+    SPSR_EL1,
+    
+    // Timer
+    CNTFRQ_EL0,
+    CNTVCT_EL0,
+    CNTV_TVAL_EL0,
+    CNTV_CTL_EL0,
+    
+    // Performance monitors
+    PMCCNTR_EL0,
+    PMCR_EL0,
+    
+    // Thread ID
+    TPIDR_EL0,
+    TPIDR_EL1,
+    
+    // Current exception level
+    CurrentEL,
+    
+    // NZCV flags
+    NZCV,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierKind {
+    DMB,  // Data memory barrier
+    DSB,  // Data synchronization barrier
+    ISB,  // Instruction synchronization barrier
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierOption {
+    OSHLD = 0b0001,  // Outer shareable, loads
+    OSHST = 0b0010,  // Outer shareable, stores
+    OSH   = 0b0011,  // Outer shareable, all
+    NSHLD = 0b0101,  // Non-shareable, loads
+    NSHST = 0b0110,  // Non-shareable, stores
+    NSH   = 0b0111,  // Non-shareable, all
+    ISHLD = 0b1001,  // Inner shareable, loads
+    ISHST = 0b1010,  // Inner shareable, stores
+    ISH   = 0b1011,  // Inner shareable, all
+    LD    = 0b1101,  // Full system, loads
+    ST    = 0b1110,  // Full system, stores
+    SY    = 0b1111,  // Full system, all
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicOp {
+    Add,
+    Set,   // OR
+    Clr,   // AND NOT
+    Eor,   // XOR
+    Smax,  // Signed max
+    Smin,  // Signed min
+    Umax,  // Unsigned max
+    Umin,  // Unsigned min
+    Swap,
+}
+
+#[derive(Debug, Clone)]
+pub enum CallTarget {
+    Direct(String),
+    Indirect(VReg),
+    Symbol(String),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIR FUNCTION AND BLOCK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct LirFunction {
+    pub name: String,
+    pub blocks: Vec<LirBlock>,
+    pub stack_size: u32,
+    pub saved_regs: Vec<Reg>,
+    pub vreg_count: u32,
+}
+
+#[derive(Debug)]
+pub struct LirBlock {
+    pub label: LirLabel,
+    pub instructions: Vec<LirInst>,
+    pub successors: Vec<LirLabel>,
+    pub predecessors: Vec<LirLabel>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSTRUCTION SELECTOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct InstructionSelector {
+    next_vreg: u32,
+    next_label: u32,
+    local_to_vreg: Vec<VReg>,
+    block_labels: Vec<LirLabel>,
+    stack_size: u32,
+    stack_slots: Vec<u32>,
+}
+
+impl InstructionSelector {
+    pub fn new() -> Self {
+        InstructionSelector {
+            next_vreg: 0,
+            next_label: 0,
+            local_to_vreg: Vec::new(),
+            block_labels: Vec::new(),
+            stack_size: 0,
+            stack_slots: Vec::new(),
+        }
+    }
+    
+    fn alloc_vreg(&mut self) -> VReg {
+        let vreg = VReg(self.next_vreg);
+        self.next_vreg += 1;
+        vreg
+    }
+    
+    fn alloc_label(&mut self) -> LirLabel {
+        let label = LirLabel(self.next_label);
+        self.next_label += 1;
+        label
+    }
+    
+    fn alloc_stack_slot(&mut self, size: u32, align: u32) -> u32 {
+        self.stack_size = (self.stack_size + align - 1) & !(align - 1);
+        let slot = self.stack_size;
+        self.stack_size += size;
+        slot
+    }
+    
+    pub fn select(&mut self, body: &MirBody, name: &str) -> LirFunction {
+        // Allocate labels for basic blocks
+        self.block_labels = body.basic_blocks.iter()
+            .map(|_| self.alloc_label())
+            .collect();
+        
+        // Allocate vregs for locals
+        self.local_to_vreg = body.local_decls.iter()
+            .map(|_| self.alloc_vreg())
+            .collect();
+        
+        // Allocate stack slots for large/aggregate types
+        self.stack_slots = body.local_decls.iter()
+            .map(|local| {
+                if self.needs_stack_slot(&local.ty) {
+                    self.alloc_stack_slot(self.type_size(&local.ty), self.type_align(&local.ty))
+                } else {
+                    0
+                }
+            })
+            .collect();
+        
+        // Lower each basic block
+        let blocks: Vec<LirBlock> = body.basic_blocks.iter().enumerate()
+            .map(|(i, bb)| self.lower_block(bb, i))
+            .collect();
+        
+        // Compute predecessors
+        let blocks = self.compute_predecessors(blocks);
+        
+        LirFunction {
+            name: name.to_string(),
+            blocks,
+            stack_size: self.stack_size,
+            saved_regs: Vec::new(),
+            vreg_count: self.next_vreg,
+        }
+    }
+    
+    fn lower_block(&mut self, bb: &MirBasicBlock, idx: usize) -> LirBlock {
+        let mut insts = Vec::new();
+        
+        // Block label
+        insts.push(LirInst::Label(self.block_labels[idx]));
+        
+        // Statements
+        for stmt in &bb.statements {
+            self.lower_statement(stmt, &mut insts);
+        }
+        
+        // Terminator
+        let successors = self.lower_terminator(&bb.terminator, &mut insts);
+        
+        LirBlock {
+            label: self.block_labels[idx],
+            instructions: insts,
+            successors,
+            predecessors: Vec::new(),
+        }
+    }
+    
+    fn lower_statement(&mut self, stmt: &MirStatement, insts: &mut Vec<LirInst>) {
+        match stmt {
+            MirStatement::Assign(place, rvalue) => {
+                let dst = self.place_to_vreg(place);
+                self.lower_rvalue(rvalue, dst, insts);
+            }
+            MirStatement::StorageLive(_) | MirStatement::StorageDead(_) => {
+                // No-op for now
+            }
+            MirStatement::Nop => {}
+        }
+    }
+    
+    fn lower_rvalue(&mut self, rvalue: &MirRvalue, dst: VReg, insts: &mut Vec<LirInst>) {
+        match rvalue {
+            MirRvalue::Use(operand) => {
+                let src = self.lower_operand(operand);
+                insts.push(LirInst::Mov {
+                    dst: LirOperand::Reg(dst),
+                    src,
+                    size: RegSize::X,
+                });
+            }
+            
+            MirRvalue::BinaryOp(op, lhs, rhs) => {
+                self.lower_binop(*op, lhs, rhs, dst, insts);
+            }
+            
+            MirRvalue::UnaryOp(op, operand) => {
+                self.lower_unop(*op, operand, dst, insts);
+            }
+            
+            MirRvalue::Ref(_, place) | MirRvalue::AddressOf(_, place) => {
+                // LEA equivalent: compute address
+                let base = self.place_to_vreg(place);
+                let offset = self.stack_slots[place.local.0 as usize];
+                insts.push(LirInst::Add {
+                    dst: LirOperand::Reg(dst),
+                    src1: LirOperand::PhysReg(Reg::SP),
+                    src2: LirOperand::Imm(offset as i64),
+                    size: RegSize::X,
+                    set_flags: false,
+                });
+            }
+            
+            MirRvalue::Cast(kind, operand, ty) => {
+                self.lower_cast(*kind, operand, ty, dst, insts);
+            }
+            
+            MirRvalue::Aggregate(_, fields) => {
+                // Store each field at the appropriate offset
+                let base_slot = self.stack_slots[dst.0 as usize];
+                let mut offset = 0u32;
+                for field in fields {
+                    let src = self.lower_operand(field);
+                    let field_size = 8u32; // Simplified
+                    insts.push(LirInst::Str {
+                        src,
+                        addr: MemOperand::BaseOffset(Reg::SP, (base_slot + offset) as i64),
+                        size: RegSize::X,
+                    });
+                    offset += field_size;
+                }
+            }
+            
+            _ => {
+                insts.push(LirInst::Comment(format!("TODO: {:?}", rvalue)));
+            }
+        }
+    }
+    
+    fn lower_binop(&mut self, op: BinOp, lhs: &MirOperand, rhs: &MirOperand, 
+                   dst: VReg, insts: &mut Vec<LirInst>) {
+        let lhs_op = self.lower_operand(lhs);
+        let rhs_op = self.lower_operand(rhs);
+        let dst_op = LirOperand::Reg(dst);
+        
+        match op {
+            BinOp::Add => {
+                insts.push(LirInst::Add {
+                    dst: dst_op, src1: lhs_op, src2: rhs_op,
+                    size: RegSize::X, set_flags: false,
+                });
+            }
+            BinOp::Sub => {
+                insts.push(LirInst::Sub {
+                    dst: dst_op, src1: lhs_op, src2: rhs_op,
+                    size: RegSize::X, set_flags: false,
+                });
+            }
+            BinOp::Mul => {
+                insts.push(LirInst::Mul {
+                    dst: dst_op, src1: lhs_op, src2: rhs_op,
+                    size: RegSize::X,
+                });
+            }
+            BinOp::Div => {
+                insts.push(LirInst::Div {
+                    dst: dst_op, src1: lhs_op, src2: rhs_op,
+                    size: RegSize::X, signed: true,
+                });
+            }
+            BinOp::Rem => {
+                // AArch64 doesn't have remainder instruction
+                // r = a - (a / b) * b
+                let tmp = self.alloc_vreg();
+                insts.push(LirInst::Div {
+                    dst: LirOperand::Reg(tmp),
+                    src1: lhs_op.clone(),
+                    src2: rhs_op.clone(),
+                    size: RegSize::X, signed: true,
+                });
+                insts.push(LirInst::Msub {
+                    dst: dst_op,
+                    src1: LirOperand::Reg(tmp),
+                    src2: rhs_op,
+                    acc: lhs_op,
+                    size: RegSize::X,
+                });
+            }
+            BinOp::BitAnd => {
+                insts.push(LirInst::And {
+                    dst: dst_op, src1: lhs_op, src2: rhs_op,
+                    size: RegSize::X, set_flags: false,
+                });
+            }
+            BinOp::BitOr => {
+                insts.push(LirInst::Orr {
+                    dst: dst_op, src1: lhs_op, src2: rhs_op,
+                    size: RegSize::X,
+                });
+            }
+            BinOp::BitXor => {
+                insts.push(LirInst::Eor {
+                    dst: dst_op, src1: lhs_op, src2: rhs_op,
+                    size: RegSize::X,
+                });
+            }
+            BinOp::Shl => {
+                insts.push(LirInst::Lsl {
+                    dst: dst_op, src: lhs_op, amount: rhs_op,
+                    size: RegSize::X,
+                });
+            }
+            BinOp::Shr => {
+                insts.push(LirInst::Lsr {
+                    dst: dst_op, src: lhs_op, amount: rhs_op,
+                    size: RegSize::X,
+                });
+            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                // Compare and set
+                insts.push(LirInst::Cmp {
+                    src1: lhs_op, src2: rhs_op,
+                    size: RegSize::X,
+                });
+                let cond = Cond::from_binop(op, true);
+                insts.push(LirInst::Cset {
+                    dst: dst_op,
+                    cond,
+                    size: RegSize::X,
+                });
+            }
+            _ => {
+                insts.push(LirInst::Comment(format!("TODO binop: {:?}", op)));
+            }
+        }
+    }
+    
+    fn lower_unop(&mut self, op: UnOp, operand: &MirOperand, dst: VReg, insts: &mut Vec<LirInst>) {
+        let src = self.lower_operand(operand);
+        let dst_op = LirOperand::Reg(dst);
+        
+        match op {
+            UnOp::Not => {
+                insts.push(LirInst::Mvn {
+                    dst: dst_op, src,
+                    size: RegSize::X,
+                });
+            }
+            UnOp::Neg => {
+                insts.push(LirInst::Neg {
+                    dst: dst_op, src,
+                    size: RegSize::X, set_flags: false,
+                });
+            }
+        }
+    }
+    
+    fn lower_cast(&mut self, kind: CastKind, operand: &MirOperand, ty: &Type,
+                  dst: VReg, insts: &mut Vec<LirInst>) {
+        let src = self.lower_operand(operand);
+        let dst_op = LirOperand::Reg(dst);
+        
+        match kind {
+            CastKind::IntToInt => {
+                // Sign or zero extend
+                let (src_size, dst_size, signed) = self.cast_sizes(operand, ty);
+                if signed {
+                    insts.push(LirInst::Sxt {
+                        dst: dst_op, src,
+                        src_size, dst_size,
+                    });
+                } else {
+                    insts.push(LirInst::Uxt {
+                        dst: dst_op, src,
+                        src_size, dst_size,
+                    });
+                }
+            }
+            CastKind::IntToFloat => {
+                let (src_size, dst_size, signed) = self.cast_sizes(operand, ty);
+                insts.push(LirInst::CvtIntToFp {
+                    dst: dst_op, src,
+                    src_size, dst_size, signed,
+                });
+            }
+            CastKind::FloatToInt => {
+                let (src_size, dst_size, signed) = self.cast_sizes(operand, ty);
+                insts.push(LirInst::CvtFpToInt {
+                    dst: dst_op, src,
+                    src_size, dst_size, signed,
+                });
+            }
+            CastKind::FloatToFloat => {
+                let (src_size, dst_size, _) = self.cast_sizes(operand, ty);
+                insts.push(LirInst::Fcvt {
+                    dst: dst_op, src,
+                    src_size, dst_size,
+                });
+            }
+            CastKind::PtrToPtr | CastKind::Transmute => {
+                insts.push(LirInst::Mov {
+                    dst: dst_op, src,
+                    size: RegSize::X,
+                });
+            }
+        }
+    }
+    
+    fn lower_terminator(&mut self, term: &MirTerminator, insts: &mut Vec<LirInst>) -> Vec<LirLabel> {
+        match term {
+            MirTerminator::Goto(target) => {
+                let label = self.block_labels[target.0 as usize];
+                insts.push(LirInst::B { label });
+                vec![label]
+            }
+            
+            MirTerminator::Return => {
+                insts.push(LirInst::Ret { target: None });
+                vec![]
+            }
+            
+            MirTerminator::SwitchInt { discr, targets, otherwise } => {
+                let src = self.lower_operand(discr);
+                let mut succs = Vec::new();
+                
+                for (val, target) in targets {
+                    let label = self.block_labels[target.0 as usize];
+                    insts.push(LirInst::Cmp {
+                        src1: src.clone(),
+                        src2: LirOperand::Imm(*val as i64),
+                        size: RegSize::X,
+                    });
+                    insts.push(LirInst::BCond { label, cond: Cond::EQ });
+                    succs.push(label);
+                }
+                
+                let otherwise_label = self.block_labels[otherwise.0 as usize];
+                insts.push(LirInst::B { label: otherwise_label });
+                succs.push(otherwise_label);
+                
+                succs
+            }
+            
+            MirTerminator::Call { func, args, destination, target } => {
+                // Move arguments to argument registers
+                let mut arg_ops = Vec::new();
+                for (i, arg) in args.iter().enumerate() {
+                    let src = self.lower_operand(arg);
+                    if i < 8 {
+                        insts.push(LirInst::Mov {
+                            dst: LirOperand::PhysReg(abi::ARG_REGS[i]),
+                            src: src.clone(),
+                            size: RegSize::X,
+                        });
+                    }
+                    arg_ops.push(src);
+                }
+                
+                // Call
+                let call_target = match func {
+                    MirOperand::Constant(MirConstant::Function(def_id)) => {
+                        CallTarget::Symbol(format!("func_{}", def_id.0))
+                    }
+                    _ => {
+                        let target_vreg = self.alloc_vreg();
+                        CallTarget::Indirect(target_vreg)
+                    }
+                };
+                
+                insts.push(LirInst::Call {
+                    target: call_target,
+                    args: arg_ops,
+                    defs: abi::CALLER_SAVED.to_vec(),
+                });
+                
+                // Move result
+                if let Some((place, _)) = destination {
+                    let dst = self.place_to_vreg(place);
+                    insts.push(LirInst::Mov {
+                        dst: LirOperand::Reg(dst),
+                        src: LirOperand::PhysReg(Reg::X0),
+                        size: RegSize::X,
+                    });
+                }
+                
+                // Continue to target block
+                if let Some(target_block) = target {
+                    let label = self.block_labels[target_block.0 as usize];
+                    insts.push(LirInst::B { label });
+                    vec![label]
+                } else {
+                    vec![]
+                }
+            }
+            
+            MirTerminator::Unreachable => {
+                insts.push(LirInst::Brk { imm: 0xFFFF });
+                vec![]
+            }
+            
+            _ => {
+                insts.push(LirInst::Comment(format!("TODO terminator: {:?}", term)));
+                vec![]
+            }
+        }
+    }
+    
+    fn lower_operand(&mut self, operand: &MirOperand) -> LirOperand {
+        match operand {
+            MirOperand::Copy(place) | MirOperand::Move(place) => {
+                LirOperand::Reg(self.place_to_vreg(place))
+            }
+            MirOperand::Constant(c) => {
+                match c {
+                    MirConstant::Int(v) => LirOperand::Imm(*v as i64),
+                    MirConstant::Bool(b) => LirOperand::Imm(if *b { 1 } else { 0 }),
+                    MirConstant::Float(f) => LirOperand::Imm(f.to_bits() as i64),
+                    _ => LirOperand::Imm(0),
+                }
+            }
+        }
+    }
+    
+    fn place_to_vreg(&self, place: &MirPlace) -> VReg {
+        self.local_to_vreg[place.local.0 as usize]
+    }
+    
+    fn compute_predecessors(&self, mut blocks: Vec<LirBlock>) -> Vec<LirBlock> {
+        let mut preds: Vec<Vec<LirLabel>> = vec![Vec::new(); blocks.len()];
+        
+        for block in &blocks {
+            for &succ in &block.successors {
+                preds[succ.0 as usize].push(block.label);
+            }
+        }
+        
+        for (i, block) in blocks.iter_mut().enumerate() {
+            block.predecessors = preds[i].clone();
+        }
+        
+        blocks
+    }
+    
+    fn needs_stack_slot(&self, ty: &Type) -> bool {
+        self.type_size(ty) > 16
+    }
+    
+    fn type_size(&self, ty: &Type) -> u32 {
+        match &ty.kind {
+            TypeKind::Bool | TypeKind::I8 | TypeKind::U8 => 1,
+            TypeKind::I16 | TypeKind::U16 => 2,
+            TypeKind::I32 | TypeKind::U32 | TypeKind::F32 => 4,
+            TypeKind::I64 | TypeKind::U64 | TypeKind::F64 => 8,
+            TypeKind::I128 | TypeKind::U128 => 16,
+            TypeKind::Ptr(_) | TypeKind::Ref(_, _) => 8,
+            _ => 8,
+        }
+    }
+    
+    fn type_align(&self, ty: &Type) -> u32 {
+        self.type_size(ty).min(16)
+    }
+    
+    fn cast_sizes(&self, operand: &MirOperand, ty: &Type) -> (RegSize, RegSize, bool) {
+        // Simplified - would need type info from operand
+        let dst_size = match self.type_size(ty) {
+            1..=4 => RegSize::W,
+            _ => RegSize::X,
+        };
+        (RegSize::X, dst_size, true)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTER ALLOCATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct RegisterAllocator {
+    intervals: Vec<LiveInterval>,
+    active: Vec<usize>,
+    free_regs: Vec<Reg>,
+    allocation: Vec<Option<Reg>>,
+    spilled: Vec<bool>,
+    spill_slots: Vec<u32>,
+    next_spill_slot: u32,
+}
+
+#[derive(Debug)]
+struct LiveInterval {
+    vreg: VReg,
+    start: u32,
+    end: u32,
+    uses: Vec<u32>,
+    defs: Vec<u32>,
+    is_fp: bool,
+}
+
+impl RegisterAllocator {
+    pub fn new() -> Self {
+        RegisterAllocator {
+            intervals: Vec::new(),
+            active: Vec::new(),
+            free_regs: abi::ALLOCATABLE_GP.to_vec(),
+            allocation: Vec::new(),
+            spilled: Vec::new(),
+            spill_slots: Vec::new(),
+            next_spill_slot: 0,
+        }
+    }
+    
+    pub fn allocate(&mut self, func: &mut LirFunction) {
+        self.compute_intervals(func);
+        
+        // Initialize allocation vectors
+        self.allocation = vec![None; func.vreg_count as usize];
+        self.spilled = vec![false; func.vreg_count as usize];
+        self.spill_slots = vec![0; func.vreg_count as usize];
+        
+        // Sort intervals by start position
+        let mut sorted: Vec<usize> = (0..self.intervals.len()).collect();
+        sorted.sort_by_key(|&i| self.intervals[i].start);
+        
+        for idx in sorted {
+            let interval = &self.intervals[idx];
+            let vreg = interval.vreg;
+            
+            // Expire old intervals
+            self.expire_old_intervals(interval.start);
+            
+            // Try to allocate
+            if let Some(reg) = self.free_regs.pop() {
+                self.allocation[vreg.0 as usize] = Some(reg);
+                self.active.push(idx);
+                self.active.sort_by_key(|&i| self.intervals[i].end);
+            } else {
+                self.spill_at_interval(idx);
+            }
+        }
+        
+        // Update function with spill slots
+        func.stack_size += self.next_spill_slot * 8;
+    }
+    
+    fn compute_intervals(&mut self, func: &LirFunction) {
+        self.intervals = vec![LiveInterval {
+            vreg: VReg(0),
+            start: u32::MAX,
+            end: 0,
+            uses: Vec::new(),
+            defs: Vec::new(),
+            is_fp: false,
+        }; func.vreg_count as usize];
+        
+        for (i, interval) in self.intervals.iter_mut().enumerate() {
+            interval.vreg = VReg(i as u32);
+        }
+        
+        let mut pos = 0u32;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                self.scan_instruction(inst, pos);
+                pos += 1;
+            }
+        }
+    }
+    
+    fn scan_instruction(&mut self, inst: &LirInst, pos: u32) {
+        // Simplified: just scan for Reg operands
+        match inst {
+            LirInst::Mov { dst, src, .. } => {
+                if let LirOperand::Reg(vreg) = dst {
+                    self.record_def(*vreg, pos);
+                }
+                if let LirOperand::Reg(vreg) = src {
+                    self.record_use(*vreg, pos);
+                }
+            }
+            LirInst::Add { dst, src1, src2, .. } |
+            LirInst::Sub { dst, src1, src2, .. } |
+            LirInst::Mul { dst, src1, src2, .. } |
+            LirInst::And { dst, src1, src2, .. } |
+            LirInst::Orr { dst, src1, src2, .. } |
+            LirInst::Eor { dst, src1, src2, .. } => {
+                if let LirOperand::Reg(vreg) = dst {
+                    self.record_def(*vreg, pos);
+                }
+                if let LirOperand::Reg(vreg) = src1 {
+                    self.record_use(*vreg, pos);
+                }
+                if let LirOperand::Reg(vreg) = src2 {
+                    self.record_use(*vreg, pos);
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    fn record_def(&mut self, vreg: VReg, pos: u32) {
+        let interval = &mut self.intervals[vreg.0 as usize];
+        interval.start = interval.start.min(pos);
+        interval.end = interval.end.max(pos);
+        interval.defs.push(pos);
+    }
+    
+    fn record_use(&mut self, vreg: VReg, pos: u32) {
+        let interval = &mut self.intervals[vreg.0 as usize];
+        interval.start = interval.start.min(pos);
+        interval.end = interval.end.max(pos);
+        interval.uses.push(pos);
+    }
+    
+    fn expire_old_intervals(&mut self, current: u32) {
+        self.active.retain(|&idx| {
+            let interval = &self.intervals[idx];
+            if interval.end < current {
+                if let Some(reg) = self.allocation[interval.vreg.0 as usize] {
+                    self.free_regs.push(reg);
+                }
+                false
+            } else {
+                true
+            }
+        });
+    }
+    
+    fn spill_at_interval(&mut self, idx: usize) {
+        let interval = &self.intervals[idx];
+        
+        if let Some(&last_idx) = self.active.last() {
+            let last_interval = &self.intervals[last_idx];
+            if last_interval.end > interval.end {
+                // Spill the interval that ends later
+                let reg = self.allocation[last_interval.vreg.0 as usize].unwrap();
+                self.allocation[interval.vreg.0 as usize] = Some(reg);
+                self.allocation[last_interval.vreg.0 as usize] = None;
+                self.spilled[last_interval.vreg.0 as usize] = true;
+                self.spill_slots[last_interval.vreg.0 as usize] = self.next_spill_slot;
+                self.next_spill_slot += 1;
+                
+                self.active.pop();
+                self.active.push(idx);
+                self.active.sort_by_key(|&i| self.intervals[i].end);
+            } else {
+                // Spill the current interval
+                self.spilled[interval.vreg.0 as usize] = true;
+                self.spill_slots[interval.vreg.0 as usize] = self.next_spill_slot;
+                self.next_spill_slot += 1;
+            }
+        } else {
+            self.spilled[interval.vreg.0 as usize] = true;
+            self.spill_slots[interval.vreg.0 as usize] = self.next_spill_slot;
+            self.next_spill_slot += 1;
+        }
+    }
+    
+    pub fn get_allocation(&self, vreg: VReg) -> Option<Reg> {
+        self.allocation.get(vreg.0 as usize).copied().flatten()
+    }
+    
+    pub fn is_spilled(&self, vreg: VReg) -> bool {
+        self.spilled.get(vreg.0 as usize).copied().unwrap_or(false)
+    }
+    
+    pub fn get_spill_slot(&self, vreg: VReg) -> u32 {
+        self.spill_slots.get(vreg.0 as usize).copied().unwrap_or(0)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CODE EMITTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct CodeEmitter {
+    code: Vec<u32>,  // AArch64 uses 32-bit instructions
+    labels: Vec<Option<u32>>,
+    fixups: Vec<Fixup>,
+    regalloc: RegisterAllocator,
+}
+
+struct Fixup {
+    offset: u32,
+    label: LirLabel,
+    kind: FixupKind,
+}
+
+#[derive(Clone, Copy)]
+enum FixupKind {
+    Branch26,    // B, BL (26-bit offset)
+    Branch19,    // B.cond, CBZ, CBNZ (19-bit offset)
+    Branch14,    // TBZ, TBNZ (14-bit offset)
+    Adr21,       // ADR (21-bit offset)
+    AdrpPage21,  // ADRP (21-bit page offset)
+}
+
+impl CodeEmitter {
+    pub fn new(regalloc: RegisterAllocator) -> Self {
+        CodeEmitter {
+            code: Vec::new(),
+            labels: Vec::new(),
+            fixups: Vec::new(),
+            regalloc,
+        }
+    }
+    
+    pub fn emit_function(&mut self, func: &LirFunction) -> Vec<u8> {
+        self.labels = vec![None; func.blocks.len()];
+        
+        // Emit prologue
+        self.emit_prologue(func);
+        
+        // Emit blocks
+        for block in &func.blocks {
+            self.emit_block(block);
+        }
+        
+        // Apply fixups
+        self.apply_fixups();
+        
+        // Convert to bytes
+        self.code.iter()
+            .flat_map(|&inst| inst.to_le_bytes())
+            .collect()
+    }
+    
+    fn emit_prologue(&mut self, func: &LirFunction) {
+        // STP X29, X30, [SP, #-frame_size]!
+        let frame_size = (func.stack_size + 15) & !15;  // 16-byte aligned
+        if frame_size > 0 {
+            self.emit_stp_pre(Reg::X29, Reg::X30, Reg::SP, -(frame_size as i64));
+        }
+        
+        // MOV X29, SP
+        self.emit_mov_rr(Reg::X29, Reg::SP, RegSize::X);
+        
+        // Save callee-saved registers
+        let mut offset = 16i64;
+        for &reg in &func.saved_regs {
+            self.emit_str_offset(reg, Reg::SP, offset, RegSize::X);
+            offset += 8;
+        }
+    }
+    
+    fn emit_epilogue(&mut self, func: &LirFunction) {
+        // Restore callee-saved registers
+        let frame_size = (func.stack_size + 15) & !15;
+        let mut offset = 16i64;
+        for &reg in &func.saved_regs {
+            self.emit_ldr_offset(reg, Reg::SP, offset, RegSize::X);
+            offset += 8;
+        }
+        
+        // LDP X29, X30, [SP], #frame_size
+        if frame_size > 0 {
+            self.emit_ldp_post(Reg::X29, Reg::X30, Reg::SP, frame_size as i64);
+        }
+        
+        // RET
+        self.emit_ret();
+    }
+    
+    fn emit_block(&mut self, block: &LirBlock) {
+        self.labels[block.label.0 as usize] = Some(self.code.len() as u32 * 4);
+        
+        for inst in &block.instructions {
+            self.emit_instruction(inst);
+        }
+    }
+    
+    fn emit_instruction(&mut self, inst: &LirInst) {
+        match inst {
+            LirInst::Label(_) => {}
+            LirInst::Comment(_) => {}
+            
+            LirInst::Mov { dst, src, size } => {
+                let dst_reg = self.resolve_operand_reg(dst);
+                match src {
+                    LirOperand::PhysReg(r) => self.emit_mov_rr(dst_reg, *r, *size),
+                    LirOperand::Reg(v) => {
+                        let src_reg = self.regalloc.get_allocation(*v).unwrap_or(Reg::XZR);
+                        self.emit_mov_rr(dst_reg, src_reg, *size);
+                    }
+                    LirOperand::Imm(imm) => self.emit_mov_imm(dst_reg, *imm, *size),
+                    _ => {}
+                }
+            }
+            
+            LirInst::Add { dst, src1, src2, size, set_flags } => {
+                let rd = self.resolve_operand_reg(dst);
+                let rn = self.resolve_operand_reg(src1);
+                match src2 {
+                    LirOperand::Imm(imm) if *imm >= 0 && *imm < 4096 => {
+                        self.emit_add_imm(rd, rn, *imm as u32, *size, *set_flags);
+                    }
+                    _ => {
+                        let rm = self.resolve_operand_reg(src2);
+                        self.emit_add_reg(rd, rn, rm, *size, *set_flags);
+                    }
+                }
+            }
+            
+            LirInst::Sub { dst, src1, src2, size, set_flags } => {
+                let rd = self.resolve_operand_reg(dst);
+                let rn = self.resolve_operand_reg(src1);
+                match src2 {
+                    LirOperand::Imm(imm) if *imm >= 0 && *imm < 4096 => {
+                        self.emit_sub_imm(rd, rn, *imm as u32, *size, *set_flags);
+                    }
+                    _ => {
+                        let rm = self.resolve_operand_reg(src2);
+                        self.emit_sub_reg(rd, rn, rm, *size, *set_flags);
+                    }
+                }
+            }
+            
+            LirInst::Mul { dst, src1, src2, size } => {
+                let rd = self.resolve_operand_reg(dst);
+                let rn = self.resolve_operand_reg(src1);
+                let rm = self.resolve_operand_reg(src2);
+                self.emit_mul(rd, rn, rm, *size);
+            }
+            
+            LirInst::Div { dst, src1, src2, size, signed } => {
+                let rd = self.resolve_operand_reg(dst);
+                let rn = self.resolve_operand_reg(src1);
+                let rm = self.resolve_operand_reg(src2);
+                self.emit_div(rd, rn, rm, *size, *signed);
+            }
+            
+            LirInst::And { dst, src1, src2, size, .. } => {
+                let rd = self.resolve_operand_reg(dst);
+                let rn = self.resolve_operand_reg(src1);
+                let rm = self.resolve_operand_reg(src2);
+                self.emit_and_reg(rd, rn, rm, *size);
+            }
+            
+            LirInst::Orr { dst, src1, src2, size } => {
+                let rd = self.resolve_operand_reg(dst);
+                let rn = self.resolve_operand_reg(src1);
+                let rm = self.resolve_operand_reg(src2);
+                self.emit_orr_reg(rd, rn, rm, *size);
+            }
+            
+            LirInst::Eor { dst, src1, src2, size } => {
+                let rd = self.resolve_operand_reg(dst);
+                let rn = self.resolve_operand_reg(src1);
+                let rm = self.resolve_operand_reg(src2);
+                self.emit_eor_reg(rd, rn, rm, *size);
+            }
+            
+            LirInst::Lsl { dst, src, amount, size } => {
+                let rd = self.resolve_operand_reg(dst);
+                let rn = self.resolve_operand_reg(src);
+                match amount {
+                    LirOperand::Imm(shift) => self.emit_lsl_imm(rd, rn, *shift as u32, *size),
+                    _ => {
+                        let rm = self.resolve_operand_reg(amount);
+                        self.emit_lsl_reg(rd, rn, rm, *size);
+                    }
+                }
+            }
+            
+            LirInst::Lsr { dst, src, amount, size } => {
+                let rd = self.resolve_operand_reg(dst);
+                let rn = self.resolve_operand_reg(src);
+                match amount {
+                    LirOperand::Imm(shift) => self.emit_lsr_imm(rd, rn, *shift as u32, *size),
+                    _ => {
+                        let rm = self.resolve_operand_reg(amount);
+                        self.emit_lsr_reg(rd, rn, rm, *size);
+                    }
+                }
+            }
+            
+            LirInst::Cmp { src1, src2, size } => {
+                let rn = self.resolve_operand_reg(src1);
+                match src2 {
+                    LirOperand::Imm(imm) if *imm >= 0 && *imm < 4096 => {
+                        self.emit_cmp_imm(rn, *imm as u32, *size);
+                    }
+                    _ => {
+                        let rm = self.resolve_operand_reg(src2);
+                        self.emit_cmp_reg(rn, rm, *size);
+                    }
+                }
+            }
+            
+            LirInst::Cset { dst, cond, size } => {
+                let rd = self.resolve_operand_reg(dst);
+                self.emit_cset(rd, *cond, *size);
+            }
+            
+            LirInst::Ldr { dst, addr, size } => {
+                let rt = self.resolve_operand_reg(dst);
+                self.emit_ldr(rt, addr, *size);
+            }
+            
+            LirInst::Str { src, addr, size } => {
+                let rt = self.resolve_operand_reg(src);
+                self.emit_str(rt, addr, *size);
+            }
+            
+            LirInst::B { label } => {
+                self.emit_b(*label);
+            }
+            
+            LirInst::BCond { label, cond } => {
+                self.emit_bcond(*label, *cond);
+            }
+            
+            LirInst::Bl { label } => {
+                self.emit_bl(*label);
+            }
+            
+            LirInst::Ret { .. } => {
+                self.emit_ret();
+            }
+            
+            LirInst::Nop => {
+                self.emit_nop();
+            }
+            
+            LirInst::Brk { imm } => {
+                self.emit_brk(*imm);
+            }
+            
+            LirInst::Svc { imm } => {
+                self.emit_svc(*imm);
+            }
+            
+            _ => {
+                // Emit NOP for unimplemented instructions
+                self.emit_nop();
+            }
+        }
+    }
+    
+    fn resolve_operand_reg(&self, op: &LirOperand) -> Reg {
+        match op {
+            LirOperand::PhysReg(r) => *r,
+            LirOperand::Reg(v) => self.regalloc.get_allocation(*v).unwrap_or(Reg::XZR),
+            _ => Reg::XZR,
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Instruction Encoding Helpers
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn emit(&mut self, inst: u32) {
+        self.code.push(inst);
+    }
+    
+    fn emit_mov_rr(&mut self, rd: Reg, rn: Reg, size: RegSize) {
+        // ORR Rd, XZR, Rn
+        let sf = size.sf_bit();
+        let inst = (sf << 31) | (0b0101010 << 24) | (rn.encoding() << 16) | 
+                   (0b11111 << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_mov_imm(&mut self, rd: Reg, imm: i64, size: RegSize) {
+        // MOVZ for small positive, MOVN for small negative
+        let sf = size.sf_bit();
+        if imm >= 0 && imm < 65536 {
+            // MOVZ Rd, #imm
+            let inst = (sf << 31) | (0b10100101 << 23) | ((imm as u32 & 0xFFFF) << 5) | rd.encoding();
+            self.emit(inst);
+        } else if imm < 0 && imm >= -65536 {
+            // MOVN Rd, #~imm
+            let inv = (!imm) as u32 & 0xFFFF;
+            let inst = (sf << 31) | (0b00100101 << 23) | (inv << 5) | rd.encoding();
+            self.emit(inst);
+        } else {
+            // Multi-instruction sequence for large immediates
+            let u = imm as u64;
+            self.emit_movz(rd, (u & 0xFFFF) as u16, 0, size);
+            if (u >> 16) & 0xFFFF != 0 {
+                self.emit_movk(rd, ((u >> 16) & 0xFFFF) as u16, 16, size);
+            }
+            if (u >> 32) & 0xFFFF != 0 {
+                self.emit_movk(rd, ((u >> 32) & 0xFFFF) as u16, 32, size);
+            }
+            if (u >> 48) & 0xFFFF != 0 {
+                self.emit_movk(rd, ((u >> 48) & 0xFFFF) as u16, 48, size);
+            }
+        }
+    }
+    
+    fn emit_movz(&mut self, rd: Reg, imm: u16, shift: u8, size: RegSize) {
+        let sf = size.sf_bit();
+        let hw = (shift / 16) as u32;
+        let inst = (sf << 31) | (0b10100101 << 23) | (hw << 21) | 
+                   ((imm as u32) << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_movk(&mut self, rd: Reg, imm: u16, shift: u8, size: RegSize) {
+        let sf = size.sf_bit();
+        let hw = (shift / 16) as u32;
+        let inst = (sf << 31) | (0b11100101 << 23) | (hw << 21) | 
+                   ((imm as u32) << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_add_imm(&mut self, rd: Reg, rn: Reg, imm: u32, size: RegSize, set_flags: bool) {
+        let sf = size.sf_bit();
+        let s = if set_flags { 1 } else { 0 };
+        let inst = (sf << 31) | (s << 29) | (0b10001 << 24) | 
+                   ((imm & 0xFFF) << 10) | (rn.encoding() << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_add_reg(&mut self, rd: Reg, rn: Reg, rm: Reg, size: RegSize, set_flags: bool) {
+        let sf = size.sf_bit();
+        let s = if set_flags { 1 } else { 0 };
+        let inst = (sf << 31) | (s << 29) | (0b01011 << 24) | 
+                   (rm.encoding() << 16) | (rn.encoding() << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_sub_imm(&mut self, rd: Reg, rn: Reg, imm: u32, size: RegSize, set_flags: bool) {
+        let sf = size.sf_bit();
+        let s = if set_flags { 1 } else { 0 };
+        let inst = (sf << 31) | (1 << 30) | (s << 29) | (0b10001 << 24) | 
+                   ((imm & 0xFFF) << 10) | (rn.encoding() << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_sub_reg(&mut self, rd: Reg, rn: Reg, rm: Reg, size: RegSize, set_flags: bool) {
+        let sf = size.sf_bit();
+        let s = if set_flags { 1 } else { 0 };
+        let inst = (sf << 31) | (1 << 30) | (s << 29) | (0b01011 << 24) | 
+                   (rm.encoding() << 16) | (rn.encoding() << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_mul(&mut self, rd: Reg, rn: Reg, rm: Reg, size: RegSize) {
+        // MADD Rd, Rn, Rm, XZR
+        let sf = size.sf_bit();
+        let inst = (sf << 31) | (0b0011011000 << 21) | (rm.encoding() << 16) | 
+                   (0b11111 << 10) | (rn.encoding() << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_div(&mut self, rd: Reg, rn: Reg, rm: Reg, size: RegSize, signed: bool) {
+        let sf = size.sf_bit();
+        let o1 = if signed { 1 } else { 0 };
+        let inst = (sf << 31) | (0b0011010110 << 21) | (rm.encoding() << 16) | 
+                   (0b00001 << 11) | (o1 << 10) | (rn.encoding() << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_and_reg(&mut self, rd: Reg, rn: Reg, rm: Reg, size: RegSize) {
+        let sf = size.sf_bit();
+        let inst = (sf << 31) | (0b0001010 << 24) | (rm.encoding() << 16) | 
+                   (rn.encoding() << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_orr_reg(&mut self, rd: Reg, rn: Reg, rm: Reg, size: RegSize) {
+        let sf = size.sf_bit();
+        let inst = (sf << 31) | (0b0101010 << 24) | (rm.encoding() << 16) | 
+                   (rn.encoding() << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_eor_reg(&mut self, rd: Reg, rn: Reg, rm: Reg, size: RegSize) {
+        let sf = size.sf_bit();
+        let inst = (sf << 31) | (0b1001010 << 24) | (rm.encoding() << 16) | 
+                   (rn.encoding() << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_lsl_imm(&mut self, rd: Reg, rn: Reg, shift: u32, size: RegSize) {
+        // UBFM Rd, Rn, #(-shift mod 64), #(63-shift) for X
+        let sf = size.sf_bit();
+        let width = if sf == 1 { 64 } else { 32 };
+        let immr = (width - shift) % width;
+        let imms = width - 1 - shift;
+        let n = sf;
+        let inst = (sf << 31) | (0b10100110 << 23) | (n << 22) | 
+                   (immr << 16) | (imms << 10) | (rn.encoding() << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_lsl_reg(&mut self, rd: Reg, rn: Reg, rm: Reg, size: RegSize) {
+        // LSLV Rd, Rn, Rm
+        let sf = size.sf_bit();
+        let inst = (sf << 31) | (0b0011010110 << 21) | (rm.encoding() << 16) | 
+                   (0b001000 << 10) | (rn.encoding() << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_lsr_imm(&mut self, rd: Reg, rn: Reg, shift: u32, size: RegSize) {
+        let sf = size.sf_bit();
+        let width = if sf == 1 { 63u32 } else { 31 };
+        let n = sf;
+        let inst = (sf << 31) | (0b10100110 << 23) | (n << 22) | 
+                   (shift << 16) | (width << 10) | (rn.encoding() << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_lsr_reg(&mut self, rd: Reg, rn: Reg, rm: Reg, size: RegSize) {
+        let sf = size.sf_bit();
+        let inst = (sf << 31) | (0b0011010110 << 21) | (rm.encoding() << 16) | 
+                   (0b001001 << 10) | (rn.encoding() << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_cmp_imm(&mut self, rn: Reg, imm: u32, size: RegSize) {
+        // SUBS XZR, Rn, #imm
+        self.emit_sub_imm(Reg::XZR, rn, imm, size, true);
+    }
+    
+    fn emit_cmp_reg(&mut self, rn: Reg, rm: Reg, size: RegSize) {
+        // SUBS XZR, Rn, Rm
+        self.emit_sub_reg(Reg::XZR, rn, rm, size, true);
+    }
+    
+    fn emit_cset(&mut self, rd: Reg, cond: Cond, size: RegSize) {
+        // CSINC Rd, XZR, XZR, invert(cond)
+        let sf = size.sf_bit();
+        let inv_cond = cond.invert();
+        let inst = (sf << 31) | (0b0011010100 << 21) | (0b11111 << 16) | 
+                   (inv_cond.encoding() << 12) | (0b01 << 10) | (0b11111 << 5) | rd.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_ldr(&mut self, rt: Reg, addr: &MemOperand, size: RegSize) {
+        match addr {
+            MemOperand::BaseOffset(base, offset) => {
+                self.emit_ldr_offset(rt, *base, *offset, size);
+            }
+            _ => {
+                // Simplified: just handle base+offset
+                self.emit_nop();
+            }
+        }
+    }
+    
+    fn emit_ldr_offset(&mut self, rt: Reg, base: Reg, offset: i64, size: RegSize) {
+        let sf = size.sf_bit();
+        let scaled_offset = (offset / (if sf == 1 { 8 } else { 4 })) as u32;
+        let inst = (1 << 31) | (sf << 30) | (0b11100101 << 22) | 
+                   ((scaled_offset & 0xFFF) << 10) | (base.encoding() << 5) | rt.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_str(&mut self, rt: Reg, addr: &MemOperand, size: RegSize) {
+        match addr {
+            MemOperand::BaseOffset(base, offset) => {
+                self.emit_str_offset(rt, *base, *offset, size);
+            }
+            _ => {
+                self.emit_nop();
+            }
+        }
+    }
+    
+    fn emit_str_offset(&mut self, rt: Reg, base: Reg, offset: i64, size: RegSize) {
+        let sf = size.sf_bit();
+        let scaled_offset = (offset / (if sf == 1 { 8 } else { 4 })) as u32;
+        let inst = (1 << 31) | (sf << 30) | (0b11100100 << 22) | 
+                   ((scaled_offset & 0xFFF) << 10) | (base.encoding() << 5) | rt.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_stp_pre(&mut self, rt1: Reg, rt2: Reg, base: Reg, offset: i64) {
+        // STP Rt1, Rt2, [Rn, #offset]!
+        let imm7 = ((offset / 8) as u32) & 0x7F;
+        let inst = (0b1010100110 << 22) | (imm7 << 15) | (rt2.encoding() << 10) | 
+                   (base.encoding() << 5) | rt1.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_ldp_post(&mut self, rt1: Reg, rt2: Reg, base: Reg, offset: i64) {
+        // LDP Rt1, Rt2, [Rn], #offset
+        let imm7 = ((offset / 8) as u32) & 0x7F;
+        let inst = (0b1010100011 << 22) | (imm7 << 15) | (rt2.encoding() << 10) | 
+                   (base.encoding() << 5) | rt1.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_b(&mut self, label: LirLabel) {
+        self.fixups.push(Fixup {
+            offset: self.code.len() as u32 * 4,
+            label,
+            kind: FixupKind::Branch26,
+        });
+        // B (placeholder)
+        let inst = 0b000101 << 26;
+        self.emit(inst);
+    }
+    
+    fn emit_bcond(&mut self, label: LirLabel, cond: Cond) {
+        self.fixups.push(Fixup {
+            offset: self.code.len() as u32 * 4,
+            label,
+            kind: FixupKind::Branch19,
+        });
+        // B.cond (placeholder)
+        let inst = (0b01010100 << 24) | cond.encoding();
+        self.emit(inst);
+    }
+    
+    fn emit_bl(&mut self, label: LirLabel) {
+        self.fixups.push(Fixup {
+            offset: self.code.len() as u32 * 4,
+            label,
+            kind: FixupKind::Branch26,
+        });
+        // BL (placeholder)
+        let inst = 0b100101 << 26;
+        self.emit(inst);
+    }
+    
+    fn emit_ret(&mut self) {
+        // RET (BR X30)
+        let inst = (0b1101011001011111 << 16) | (Reg::X30.encoding() << 5);
+        self.emit(inst);
+    }
+    
+    fn emit_nop(&mut self) {
+        // NOP = HINT #0
+        self.emit(0xD503201F);
+    }
+    
+    fn emit_brk(&mut self, imm: u16) {
+        let inst = (0b11010100001 << 21) | ((imm as u32) << 5);
+        self.emit(inst);
+    }
+    
+    fn emit_svc(&mut self, imm: u16) {
+        let inst = (0b11010100000 << 21) | ((imm as u32) << 5) | 0b00001;
+        self.emit(inst);
+    }
+    
+    fn apply_fixups(&mut self) {
+        for fixup in &self.fixups {
+            let target = self.labels[fixup.label.0 as usize].unwrap_or(0);
+            let offset = (target as i64 - fixup.offset as i64) / 4;
+            
+            let inst_idx = (fixup.offset / 4) as usize;
+            let inst = self.code[inst_idx];
+            
+            let patched = match fixup.kind {
+                FixupKind::Branch26 => {
+                    let imm26 = (offset as u32) & 0x3FFFFFF;
+                    (inst & !0x3FFFFFF) | imm26
+                }
+                FixupKind::Branch19 => {
+                    let imm19 = ((offset as u32) & 0x7FFFF) << 5;
+                    (inst & !(0x7FFFF << 5)) | imm19
+                }
+                FixupKind::Branch14 => {
+                    let imm14 = ((offset as u32) & 0x3FFF) << 5;
+                    (inst & !(0x3FFF << 5)) | imm14
+                }
+                _ => inst,
+            };
+            
+            self.code[inst_idx] = patched;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ELF WRITER (AArch64)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct Aarch64ElfWriter {
+    output: Vec<u8>,
+    symbols: Vec<ElfSymbol>,
+    sections: Vec<ElfSection>,
+    strtab: Vec<u8>,
+    shstrtab: Vec<u8>,
+}
+
+struct ElfSymbol {
+    name: String,
+    value: u64,
+    size: u64,
+    info: u8,
+    other: u8,
+    shndx: u16,
+}
+
+struct ElfSection {
+    name: String,
+    sh_type: u32,
+    sh_flags: u64,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_info: u32,
+    sh_addralign: u64,
+    sh_entsize: u64,
+    data: Vec<u8>,
+}
+
+impl Aarch64ElfWriter {
+    pub fn new() -> Self {
+        Aarch64ElfWriter {
+            output: Vec::new(),
+            symbols: Vec::new(),
+            sections: Vec::new(),
+            strtab: vec![0],
+            shstrtab: vec![0],
+        }
+    }
+    
+    pub fn add_text_section(&mut self, code: &[u8]) {
+        self.sections.push(ElfSection {
+            name: ".text".to_string(),
+            sh_type: 1,  // SHT_PROGBITS
+            sh_flags: 0x6,  // SHF_ALLOC | SHF_EXECINSTR
+            sh_addr: 0,
+            sh_offset: 0,
+            sh_size: code.len() as u64,
+            sh_link: 0,
+            sh_info: 0,
+            sh_addralign: 4,
+            sh_entsize: 0,
+            data: code.to_vec(),
+        });
+    }
+    
+    pub fn add_symbol(&mut self, name: &str, offset: u64, size: u64, is_func: bool) {
+        self.symbols.push(ElfSymbol {
+            name: name.to_string(),
+            value: offset,
+            size,
+            info: if is_func { 0x12 } else { 0x11 },
+            other: 0,
+            shndx: 1,
+        });
+    }
+    
+    pub fn write(&mut self) -> Vec<u8> {
+        self.output.clear();
+        
+        // ELF header (64 bytes)
+        self.write_elf_header();
+        
+        // Pad to section data
+        while self.output.len() < 64 {
+            self.output.push(0);
+        }
+        
+        // Write section data
+        for section in &mut self.sections {
+            section.sh_offset = self.output.len() as u64;
+            self.output.extend(&section.data);
+            // Align to 8 bytes
+            while self.output.len() % 8 != 0 {
+                self.output.push(0);
+            }
+        }
+        
+        // Section headers offset
+        let shoff = self.output.len() as u64;
+        
+        // Write section headers
+        self.write_section_headers();
+        
+        // Patch header with section header offset
+        let shoff_bytes = shoff.to_le_bytes();
+        self.output[40..48].copy_from_slice(&shoff_bytes);
+        
+        self.output.clone()
+    }
+    
+    fn write_elf_header(&mut self) {
+        // e_ident
+        self.output.extend(&[0x7F, b'E', b'L', b'F']);  // Magic
+        self.output.push(2);  // ELFCLASS64
+        self.output.push(1);  // ELFDATA2LSB
+        self.output.push(1);  // EV_CURRENT
+        self.output.push(0);  // ELFOSABI_NONE
+        self.output.extend(&[0; 8]);  // Padding
+        
+        // e_type
+        self.output.extend(&1u16.to_le_bytes());  // ET_REL
+        
+        // e_machine
+        self.output.extend(&183u16.to_le_bytes());  // EM_AARCH64
+        
+        // e_version
+        self.output.extend(&1u32.to_le_bytes());
+        
+        // e_entry
+        self.output.extend(&0u64.to_le_bytes());
+        
+        // e_phoff
+        self.output.extend(&0u64.to_le_bytes());
+        
+        // e_shoff (placeholder)
+        self.output.extend(&0u64.to_le_bytes());
+        
+        // e_flags
+        self.output.extend(&0u32.to_le_bytes());
+        
+        // e_ehsize
+        self.output.extend(&64u16.to_le_bytes());
+        
+        // e_phentsize
+        self.output.extend(&0u16.to_le_bytes());
+        
+        // e_phnum
+        self.output.extend(&0u16.to_le_bytes());
+        
+        // e_shentsize
+        self.output.extend(&64u16.to_le_bytes());
+        
+        // e_shnum
+        self.output.extend(&((self.sections.len() + 1) as u16).to_le_bytes());
+        
+        // e_shstrndx
+        self.output.extend(&0u16.to_le_bytes());
+    }
+    
+    fn write_section_headers(&mut self) {
+        // Null section
+        self.output.extend(&[0u8; 64]);
+        
+        // Other sections
+        for section in &self.sections {
+            // sh_name
+            self.output.extend(&0u32.to_le_bytes());
+            // sh_type
+            self.output.extend(&section.sh_type.to_le_bytes());
+            // sh_flags
+            self.output.extend(&section.sh_flags.to_le_bytes());
+            // sh_addr
+            self.output.extend(&section.sh_addr.to_le_bytes());
+            // sh_offset
+            self.output.extend(&section.sh_offset.to_le_bytes());
+            // sh_size
+            self.output.extend(&section.sh_size.to_le_bytes());
+            // sh_link
+            self.output.extend(&section.sh_link.to_le_bytes());
+            // sh_info
+            self.output.extend(&section.sh_info.to_le_bytes());
+            // sh_addralign
+            self.output.extend(&section.sh_addralign.to_le_bytes());
+            // sh_entsize
+            self.output.extend(&section.sh_entsize.to_le_bytes());
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BACKEND INTERFACE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct Aarch64Backend {
+    opts: CompilerOptions,
+}
+
+impl Aarch64Backend {
+    pub fn new(opts: &CompilerOptions) -> Self {
+        Aarch64Backend { opts: opts.clone() }
+    }
+    
+    pub fn compile(&mut self, mir: &crate::mir::MirModule) -> Result<CompiledObject, String> {
+        let mut code = Vec::new();
+        let mut symbols = Vec::new();
+        
+        for func in &mir.functions {
+            let func_start = code.len() as u64;
+            
+            // Instruction selection
+            let mut selector = InstructionSelector::new();
+            let mut lir_func = selector.select(&func.body, &func.name);
+            
+            // Register allocation
+            let mut regalloc = RegisterAllocator::new();
+            regalloc.allocate(&mut lir_func);
+            
+            // Code emission
+            let mut emitter = CodeEmitter::new(regalloc);
+            let func_code = emitter.emit_function(&lir_func);
+            
+            symbols.push(Symbol {
+                name: func.name.clone(),
+                offset: func_start,
+                size: func_code.len() as u64,
+                is_func: true,
+            });
+            
+            code.extend(func_code);
+        }
+        
+        Ok(CompiledObject {
+            code,
+            data: Vec::new(),
+            symbols,
+            relocations: Vec::new(),
+        })
+    }
+}
+
+use crate::driver::{CompiledObject, Symbol};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_reg_encoding() {
+        assert_eq!(Reg::X0.encoding(), 0);
+        assert_eq!(Reg::X15.encoding(), 15);
+        assert_eq!(Reg::X30.encoding(), 30);
+        assert_eq!(Reg::SP.encoding(), 31);
+        assert_eq!(Reg::XZR.encoding(), 31);
+    }
+    
+    #[test]
+    fn test_cond_encoding() {
+        assert_eq!(Cond::EQ.encoding(), 0b0000);
+        assert_eq!(Cond::NE.encoding(), 0b0001);
+        assert_eq!(Cond::GE.encoding(), 0b1010);
+        assert_eq!(Cond::LT.encoding(), 0b1011);
+    }
+    
+    #[test]
+    fn test_cond_invert() {
+        assert_eq!(Cond::EQ.invert(), Cond::NE);
+        assert_eq!(Cond::LT.invert(), Cond::GE);
+        assert_eq!(Cond::GT.invert(), Cond::LE);
+    }
+    
+    #[test]
+    fn test_nop_encoding() {
+        let mut regalloc = RegisterAllocator::new();
+        let mut emitter = CodeEmitter::new(regalloc);
+        emitter.emit_nop();
+        assert_eq!(emitter.code[0], 0xD503201F);
+    }
+    
+    #[test]
+    fn test_ret_encoding() {
+        let mut regalloc = RegisterAllocator::new();
+        let mut emitter = CodeEmitter::new(regalloc);
+        emitter.emit_ret();
+        // RET = BR X30 = 0xD65F03C0
+        assert_eq!(emitter.code[0], 0xD65F03C0);
+    }
+    
+    #[test]
+    fn test_elf_header() {
+        let mut writer = Aarch64ElfWriter::new();
+        writer.add_text_section(&[0xD503201F_u32.to_le_bytes()].concat());  // NOP
+        let elf = writer.write();
+        
+        // Check magic
+        assert_eq!(&elf[0..4], &[0x7F, b'E', b'L', b'F']);
+        // Check class (64-bit)
+        assert_eq!(elf[4], 2);
+        // Check machine (AArch64 = 183)
+        assert_eq!(u16::from_le_bytes([elf[18], elf[19]]), 183);
+    }
+}

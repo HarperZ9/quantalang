@@ -1,0 +1,1047 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ HIR — High-level Intermediate Representation
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending (P083-P088)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// HIR is the first IR after parsing. It performs:
+// 1. Name resolution (all identifiers resolved to definitions)
+// 2. Desugaring (for loops → loop + iterators, ? → match, etc.)
+// 3. Type annotation propagation
+// 4. Lifetime elision resolution
+// 5. Method resolution (UFCS normalization)
+//
+// HIR preserves high-level structure for:
+// - Type inference
+// - Trait resolution
+// - Macro hygiene verification
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::hir
+
+use std::collections::HashMap
+use crate::ast::{Span, Mutability, BinaryOp, UnaryOp}
+use crate::types::{Ty, TypeVar, AdtId, TraitId, Lifetime, EffectSet, FnSig, IntTy, FloatTy}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEFINITION IDS (Unique identifiers for all definitions)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unique ID for any definition in the program
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DefId {
+    pub crate_id: u32,
+    pub local_id: u32,
+}
+
+impl DefId {
+    pub fn new(crate_id: u32, local_id: u32) -> Self {
+        DefId { crate_id, local_id }
+    }
+    
+    pub fn local(id: u32) -> Self {
+        DefId { crate_id: 0, local_id: id }
+    }
+}
+
+/// Local variable ID (unique within a function body)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LocalId(pub u32);
+
+/// Body ID (unique identifier for a function/closure body)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BodyId(pub DefId);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIR CRATE (Top-level compilation unit)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct HirCrate {
+    pub name: String,
+    pub items: HashMap<DefId, HirItem>,
+    pub bodies: HashMap<BodyId, HirBody>,
+    pub trait_impls: Vec<HirImplDef>,
+    pub exported_items: Vec<DefId>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIR ITEMS (Top-level definitions)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct HirItem {
+    pub def_id: DefId,
+    pub name: String,
+    pub kind: HirItemKind,
+    pub vis: HirVisibility,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirItemKind {
+    Function(HirFnDef),
+    Struct(HirStructDef),
+    Enum(HirEnumDef),
+    Union(HirUnionDef),
+    Trait(HirTraitDef),
+    TypeAlias(HirTypeAlias),
+    Const(HirConstDef),
+    Static(HirStaticDef),
+    Mod(HirModDef),
+    
+    // QuantaLang extensions
+    Bitfield(HirBitfieldDef),
+    StateMachine(HirStateMachineDef),
+    Effect(HirEffectDef),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HirVisibility {
+    Public,
+    Crate,
+    Restricted(DefId),  // pub(in path)
+    Private,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUNCTION DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct HirFnDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub generics: HirGenerics,
+    pub sig: HirFnSig,
+    pub body_id: Option<BodyId>,
+    pub qualifiers: HirFnQualifiers,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirFnSig {
+    pub inputs: Vec<(LocalId, Ty)>,
+    pub output: Ty,
+    pub c_variadic: bool,
+    pub effects: EffectSet,
+}
+
+#[derive(Debug, Default)]
+pub struct HirFnQualifiers {
+    pub is_async: bool,
+    pub is_unsafe: bool,
+    pub is_const: bool,
+    pub is_extern: bool,
+    pub abi: HirAbi,
+    // QuantaLang extensions
+    pub is_kernel: bool,
+    pub is_pure: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HirAbi {
+    #[default]
+    Quanta,
+    C,
+    System,
+    Stdcall,
+    Fastcall,
+    Vectorcall,
+    SysV64,
+    Win64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GENERICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Default)]
+pub struct HirGenerics {
+    pub params: Vec<HirGenericParam>,
+    pub where_clause: Vec<HirWherePredicate>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirGenericParam {
+    pub def_id: DefId,
+    pub name: String,
+    pub kind: HirGenericParamKind,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirGenericParamKind {
+    Lifetime { bounds: Vec<Lifetime> },
+    Type { default: Option<Ty>, bounds: Vec<HirTraitBound> },
+    Const { ty: Ty, default: Option<HirConstArg> },
+}
+
+#[derive(Debug)]
+pub struct HirTraitBound {
+    pub trait_ref: HirTraitRef,
+    pub modifier: HirBoundModifier,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HirBoundModifier {
+    None,
+    Maybe,    // ?Trait
+    Negative, // !Trait
+}
+
+#[derive(Debug)]
+pub struct HirTraitRef {
+    pub trait_def: DefId,
+    pub generic_args: Vec<HirGenericArg>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirGenericArg {
+    Lifetime(Lifetime),
+    Type(Ty),
+    Const(HirConstArg),
+}
+
+#[derive(Debug)]
+pub struct HirConstArg {
+    pub value: HirConstValue,
+    pub ty: Ty,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirConstValue {
+    Scalar(u128),
+    Bool(bool),
+    Char(char),
+    // ... other const values
+}
+
+#[derive(Debug)]
+pub struct HirWherePredicate {
+    pub kind: HirWherePredicateKind,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirWherePredicateKind {
+    BoundPredicate { ty: Ty, bounds: Vec<HirTraitBound> },
+    RegionPredicate { lifetime: Lifetime, bounds: Vec<Lifetime> },
+    EqPredicate { lhs: Ty, rhs: Ty },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct HirStructDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub generics: HirGenerics,
+    pub kind: HirStructKind,
+    pub is_linear: bool,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirStructKind {
+    Struct(Vec<HirFieldDef>),
+    Tuple(Vec<HirFieldDef>),
+    Unit,
+}
+
+#[derive(Debug)]
+pub struct HirFieldDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub ty: Ty,
+    pub vis: HirVisibility,
+    pub is_volatile: bool,
+    pub volatile_access: Option<crate::types::VolatileAccess>,
+    pub offset: Option<u64>,  // For @offset attribute
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirEnumDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub generics: HirGenerics,
+    pub variants: Vec<HirVariantDef>,
+    pub repr: Option<HirRepr>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirVariantDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub fields: Vec<HirFieldDef>,
+    pub discriminant: Option<i128>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirUnionDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub generics: HirGenerics,
+    pub fields: Vec<HirFieldDef>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirRepr {
+    C,
+    Transparent,
+    Int(IntTy),
+    Align(u64),
+    Packed,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG EXTENSIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct HirBitfieldDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub backing_ty: IntTy,
+    pub fields: Vec<HirBitfieldField>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirBitfieldField {
+    pub name: String,
+    pub start_bit: u8,
+    pub end_bit: u8,  // Inclusive
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirStateMachineDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub generics: HirGenerics,
+    pub states: Vec<HirStateDef>,
+    pub transitions: Vec<HirTransition>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirStateDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub data: Vec<HirFieldDef>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirTransition {
+    pub from_state: DefId,
+    pub to_state: DefId,
+    pub trigger: String,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirEffectDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub operations: Vec<HirEffectOp>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirEffectOp {
+    pub name: String,
+    pub sig: HirFnSig,
+    pub span: Span,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRAITS AND IMPLS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct HirTraitDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub generics: HirGenerics,
+    pub supertraits: Vec<HirTraitRef>,
+    pub items: Vec<HirTraitItem>,
+    pub is_auto: bool,
+    pub is_unsafe: bool,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirTraitItem {
+    pub def_id: DefId,
+    pub name: String,
+    pub kind: HirTraitItemKind,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirTraitItemKind {
+    Const { ty: Ty, default: Option<BodyId> },
+    Type { bounds: Vec<HirTraitBound>, default: Option<Ty> },
+    Fn { sig: HirFnSig, default: Option<BodyId> },
+}
+
+#[derive(Debug)]
+pub struct HirImplDef {
+    pub def_id: DefId,
+    pub generics: HirGenerics,
+    pub trait_ref: Option<HirTraitRef>,
+    pub self_ty: Ty,
+    pub items: Vec<HirImplItem>,
+    pub is_unsafe: bool,
+    pub is_negative: bool,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirImplItem {
+    pub def_id: DefId,
+    pub name: String,
+    pub kind: HirImplItemKind,
+    pub vis: HirVisibility,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirImplItemKind {
+    Const { ty: Ty, body: BodyId },
+    Type { ty: Ty },
+    Fn { sig: HirFnSig, body: BodyId },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OTHER ITEMS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct HirTypeAlias {
+    pub def_id: DefId,
+    pub name: String,
+    pub generics: HirGenerics,
+    pub ty: Ty,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirConstDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub ty: Ty,
+    pub body: BodyId,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirStaticDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub ty: Ty,
+    pub mutability: Mutability,
+    pub body: BodyId,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirModDef {
+    pub def_id: DefId,
+    pub name: String,
+    pub items: Vec<DefId>,
+    pub span: Span,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIR BODY (Function/closure bodies)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct HirBody {
+    pub id: BodyId,
+    pub params: Vec<HirParam>,
+    pub locals: Vec<HirLocal>,
+    pub expr: HirExpr,
+    pub generator_kind: Option<HirGeneratorKind>,
+}
+
+#[derive(Debug)]
+pub struct HirParam {
+    pub local_id: LocalId,
+    pub pat: HirPat,
+    pub ty: Ty,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirLocal {
+    pub id: LocalId,
+    pub name: String,
+    pub ty: Ty,
+    pub mutability: Mutability,
+    pub init: Option<Box<HirExpr>>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HirGeneratorKind {
+    Gen,    // Generator (yield)
+    Async,  // Async block/fn
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIR EXPRESSIONS (Desugared, resolved)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct HirExpr {
+    pub id: HirExprId,
+    pub kind: HirExprKind,
+    pub ty: Ty,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HirExprId(pub u32);
+
+#[derive(Debug)]
+pub enum HirExprKind {
+    // ─────────────────────────────────────────────────────────────────────────
+    // Literals
+    // ─────────────────────────────────────────────────────────────────────────
+    Literal(HirLiteral),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Paths (fully resolved)
+    // ─────────────────────────────────────────────────────────────────────────
+    Path(HirPath),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Operations
+    // ─────────────────────────────────────────────────────────────────────────
+    Unary(UnaryOp, Box<HirExpr>),
+    Binary(BinaryOp, Box<HirExpr>, Box<HirExpr>),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Compound literals
+    // ─────────────────────────────────────────────────────────────────────────
+    Tuple(Vec<HirExpr>),
+    Array(Vec<HirExpr>),
+    Repeat(Box<HirExpr>, HirConstArg),  // [expr; N]
+    Struct {
+        path: HirPath,
+        fields: Vec<HirFieldExpr>,
+        base: Option<Box<HirExpr>>,
+    },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Access
+    // ─────────────────────────────────────────────────────────────────────────
+    Field(Box<HirExpr>, String),
+    TupleField(Box<HirExpr>, u32),
+    Index(Box<HirExpr>, Box<HirExpr>),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Calls (UFCS normalized: all method calls become function calls)
+    // ─────────────────────────────────────────────────────────────────────────
+    Call {
+        func: Box<HirExpr>,
+        args: Vec<HirExpr>,
+    },
+    MethodCall {
+        receiver: Box<HirExpr>,
+        method: DefId,
+        generic_args: Vec<HirGenericArg>,
+        args: Vec<HirExpr>,
+    },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Control flow (desugared)
+    // ─────────────────────────────────────────────────────────────────────────
+    If {
+        condition: Box<HirExpr>,
+        then_branch: Box<HirExpr>,
+        else_branch: Option<Box<HirExpr>>,
+    },
+    Match {
+        scrutinee: Box<HirExpr>,
+        arms: Vec<HirMatchArm>,
+    },
+    Loop {
+        body: Box<HirExpr>,
+        label: Option<String>,
+    },
+    // Note: for, while desugared to Loop + Match
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Jumps
+    // ─────────────────────────────────────────────────────────────────────────
+    Break { label: Option<String>, value: Option<Box<HirExpr>> },
+    Continue { label: Option<String> },
+    Return(Option<Box<HirExpr>>),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Blocks
+    // ─────────────────────────────────────────────────────────────────────────
+    Block(HirBlock),
+    Unsafe(Box<HirExpr>),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // References
+    // ─────────────────────────────────────────────────────────────────────────
+    Ref(Mutability, Box<HirExpr>),
+    Deref(Box<HirExpr>),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Type operations
+    // ─────────────────────────────────────────────────────────────────────────
+    Cast(Box<HirExpr>, Ty),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Closures
+    // ─────────────────────────────────────────────────────────────────────────
+    Closure {
+        capture: HirCaptureMode,
+        body: BodyId,
+        captures: Vec<HirCapture>,
+    },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Async/Await
+    // ─────────────────────────────────────────────────────────────────────────
+    Await(Box<HirExpr>),
+    Yield(Option<Box<HirExpr>>),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Assignment
+    // ─────────────────────────────────────────────────────────────────────────
+    Assign(Box<HirExpr>, Box<HirExpr>),
+    AssignOp(BinaryOp, Box<HirExpr>, Box<HirExpr>),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Let (in expression position)
+    // ─────────────────────────────────────────────────────────────────────────
+    Let { pat: HirPat, init: Box<HirExpr> },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // QuantaLang extensions
+    // ─────────────────────────────────────────────────────────────────────────
+    Asm(HirAsmExpr),
+    Consume(Box<HirExpr>),  // Explicit linear resource consumption
+    StateTransition {
+        expr: Box<HirExpr>,
+        from_state: DefId,
+        to_state: DefId,
+        trigger: String,
+    },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Error recovery
+    // ─────────────────────────────────────────────────────────────────────────
+    Err,
+}
+
+#[derive(Debug)]
+pub struct HirLiteral {
+    pub kind: HirLiteralKind,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirLiteralKind {
+    Bool(bool),
+    Char(char),
+    Byte(u8),
+    Int(u128, IntTy),
+    Float(f64, FloatTy),
+    Str(String),
+    ByteStr(Vec<u8>),
+}
+
+#[derive(Debug)]
+pub struct HirPath {
+    pub res: HirRes,
+    pub segments: Vec<HirPathSegment>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirRes {
+    Def(DefKind, DefId),
+    Local(LocalId),
+    PrimTy(HirPrimTy),
+    SelfTy(Option<DefId>, Option<DefId>),  // trait def, impl def
+    Err,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefKind {
+    Mod,
+    Struct,
+    Union,
+    Enum,
+    Variant,
+    Trait,
+    TypeAlias,
+    Fn,
+    Const,
+    Static,
+    Ctor,
+    AssocFn,
+    AssocTy,
+    AssocConst,
+    Field,
+    // QuantaLang
+    Bitfield,
+    StateMachine,
+    State,
+    Effect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HirPrimTy {
+    Bool,
+    Char,
+    Int(IntTy),
+    Float(FloatTy),
+    Str,
+    Never,
+}
+
+#[derive(Debug)]
+pub struct HirPathSegment {
+    pub name: String,
+    pub args: Option<Vec<HirGenericArg>>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirFieldExpr {
+    pub name: String,
+    pub expr: HirExpr,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirMatchArm {
+    pub pat: HirPat,
+    pub guard: Option<Box<HirExpr>>,
+    pub body: Box<HirExpr>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirBlock {
+    pub stmts: Vec<HirStmt>,
+    pub expr: Option<Box<HirExpr>>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct HirStmt {
+    pub kind: HirStmtKind,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirStmtKind {
+    Local(HirLocal),
+    Expr(HirExpr),
+    Semi(HirExpr),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HirCaptureMode {
+    ByRef,
+    ByValue,
+}
+
+#[derive(Debug)]
+pub struct HirCapture {
+    pub local: LocalId,
+    pub mode: HirCaptureMode,
+    pub mutability: Mutability,
+}
+
+#[derive(Debug)]
+pub struct HirAsmExpr {
+    pub template: Vec<HirAsmTemplatePiece>,
+    pub operands: Vec<HirAsmOperand>,
+    pub options: HirAsmOptions,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirAsmTemplatePiece {
+    String(String),
+    Placeholder { idx: usize, modifier: Option<char> },
+}
+
+#[derive(Debug)]
+pub struct HirAsmOperand {
+    pub kind: HirAsmOperandKind,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum HirAsmOperandKind {
+    In { reg: String, expr: HirExpr },
+    Out { reg: String, expr: Option<HirExpr>, late: bool },
+    InOut { reg: String, in_expr: HirExpr, out_expr: Option<HirExpr> },
+    Const(HirConstArg),
+    Sym(HirPath),
+}
+
+#[derive(Debug, Default)]
+pub struct HirAsmOptions {
+    pub pure_: bool,
+    pub nomem: bool,
+    pub readonly: bool,
+    pub preserves_flags: bool,
+    pub noreturn: bool,
+    pub nostack: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIR PATTERNS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct HirPat {
+    pub id: HirPatId,
+    pub kind: HirPatKind,
+    pub ty: Ty,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HirPatId(pub u32);
+
+#[derive(Debug)]
+pub enum HirPatKind {
+    Wild,
+    Binding {
+        name: String,
+        local_id: LocalId,
+        mutability: Mutability,
+        subpat: Option<Box<HirPat>>,
+    },
+    Struct {
+        path: HirPath,
+        fields: Vec<HirPatField>,
+        rest: bool,
+    },
+    TupleStruct {
+        path: HirPath,
+        pats: Vec<HirPat>,
+    },
+    Path(HirPath),
+    Tuple(Vec<HirPat>),
+    Ref {
+        mutability: Mutability,
+        pat: Box<HirPat>,
+    },
+    Lit(HirLiteral),
+    Range {
+        start: Option<Box<HirPat>>,
+        end: Option<Box<HirPat>>,
+        inclusive: bool,
+    },
+    Slice {
+        before: Vec<HirPat>,
+        middle: Option<Box<HirPat>>,
+        after: Vec<HirPat>,
+    },
+    Or(Vec<HirPat>),
+}
+
+#[derive(Debug)]
+pub struct HirPatField {
+    pub name: String,
+    pub pat: HirPat,
+    pub shorthand: bool,
+    pub span: Span,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIR LOWERING CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct HirLowering {
+    next_def_id: u32,
+    next_local_id: u32,
+    next_expr_id: u32,
+    next_pat_id: u32,
+    
+    /// Definition table
+    defs: HashMap<DefId, DefInfo>,
+    
+    /// Current scope for name resolution
+    scopes: Vec<Scope>,
+    
+    /// Errors collected during lowering
+    errors: Vec<HirError>,
+}
+
+#[derive(Debug)]
+struct DefInfo {
+    name: String,
+    kind: DefKind,
+    parent: Option<DefId>,
+}
+
+#[derive(Debug, Default)]
+struct Scope {
+    bindings: HashMap<String, HirRes>,
+    kind: ScopeKind,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    #[default]
+    Block,
+    Function,
+    Module,
+    Loop(Option<String>),  // Label
+}
+
+#[derive(Debug)]
+pub enum HirError {
+    UnresolvedName { name: String, span: Span },
+    DuplicateDefinition { name: String, span: Span },
+    InvalidBreak { span: Span },
+    InvalidContinue { span: Span },
+    MismatchedTypes { expected: Ty, found: Ty, span: Span },
+}
+
+impl HirLowering {
+    pub fn new() -> Self {
+        HirLowering {
+            next_def_id: 0,
+            next_local_id: 0,
+            next_expr_id: 0,
+            next_pat_id: 0,
+            defs: HashMap::new(),
+            scopes: vec![Scope::default()],
+            errors: Vec::new(),
+        }
+    }
+    
+    pub fn fresh_def_id(&mut self) -> DefId {
+        let id = DefId::local(self.next_def_id);
+        self.next_def_id += 1;
+        id
+    }
+    
+    pub fn fresh_local_id(&mut self) -> LocalId {
+        let id = LocalId(self.next_local_id);
+        self.next_local_id += 1;
+        id
+    }
+    
+    pub fn fresh_expr_id(&mut self) -> HirExprId {
+        let id = HirExprId(self.next_expr_id);
+        self.next_expr_id += 1;
+        id
+    }
+    
+    pub fn fresh_pat_id(&mut self) -> HirPatId {
+        let id = HirPatId(self.next_pat_id);
+        self.next_pat_id += 1;
+        id
+    }
+    
+    pub fn push_scope(&mut self, kind: ScopeKind) {
+        self.scopes.push(Scope { bindings: HashMap::new(), kind });
+    }
+    
+    pub fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+    
+    pub fn define(&mut self, name: String, res: HirRes) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.bindings.insert(name, res);
+        }
+    }
+    
+    pub fn resolve(&self, name: &str) -> Option<HirRes> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(res) = scope.bindings.get(name) {
+                return Some(res.clone());
+            }
+        }
+        None
+    }
+    
+    pub fn current_loop_label(&self) -> Option<String> {
+        for scope in self.scopes.iter().rev() {
+            if let ScopeKind::Loop(label) = &scope.kind {
+                return label.clone();
+            }
+        }
+        None
+    }
+    
+    pub fn errors(&self) -> &[HirError] {
+        &self.errors
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_def_id() {
+        let id = DefId::local(42);
+        assert_eq!(id.crate_id, 0);
+        assert_eq!(id.local_id, 42);
+    }
+    
+    #[test]
+    fn test_scope_resolution() {
+        let mut ctx = HirLowering::new();
+        
+        let local = LocalId(0);
+        ctx.define("x".to_string(), HirRes::Local(local));
+        
+        assert!(matches!(ctx.resolve("x"), Some(HirRes::Local(_))));
+        assert!(ctx.resolve("y").is_none());
+        
+        ctx.push_scope(ScopeKind::Block);
+        let local2 = LocalId(1);
+        ctx.define("x".to_string(), HirRes::Local(local2));
+        
+        // Inner scope shadows outer
+        if let Some(HirRes::Local(l)) = ctx.resolve("x") {
+            assert_eq!(l.0, 1);
+        }
+        
+        ctx.pop_scope();
+        
+        // Outer scope restored
+        if let Some(HirRes::Local(l)) = ctx.resolve("x") {
+            assert_eq!(l.0, 0);
+        }
+    }
+}

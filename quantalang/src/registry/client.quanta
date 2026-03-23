@@ -1,0 +1,967 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ REGISTRY — Client
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Registry client implementation:
+// - Package publishing
+// - Package fetching and caching
+// - Authentication
+// - Index synchronization
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::registry::client
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::format;
+use alloc::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::fs::{self, File};
+use std::io::{Read, Write, BufReader, BufWriter};
+use std::time::{SystemTime, Duration};
+use std::collections::HashMap;
+
+use super::index::{
+    PackageName, Version, VersionReq, PackageMetadata, PackageIndex,
+    IndexEntry, Dependency,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTRY CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Default registry URL
+pub const DEFAULT_REGISTRY: &str = "https://registry.quantalang.dev";
+
+/// Registry configuration
+#[derive(Debug, Clone)]
+pub struct RegistryConfig {
+    /// Registry URL
+    pub url: String,
+    
+    /// API endpoint
+    pub api_url: String,
+    
+    /// Index URL (sparse index)
+    pub index_url: String,
+    
+    /// Download URL template
+    pub download_url: String,
+    
+    /// Local cache directory
+    pub cache_dir: PathBuf,
+    
+    /// Index cache directory
+    pub index_cache_dir: PathBuf,
+    
+    /// Authentication token
+    pub token: Option<String>,
+    
+    /// Request timeout
+    pub timeout: Duration,
+    
+    /// Maximum retries
+    pub max_retries: u32,
+    
+    /// Retry delay
+    pub retry_delay: Duration,
+    
+    /// Allow insecure HTTP
+    pub allow_insecure: bool,
+}
+
+impl RegistryConfig {
+    /// Create default configuration
+    pub fn default_registry() -> Self {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let cache_base = home.join(".quanta").join("registry");
+        
+        RegistryConfig {
+            url: DEFAULT_REGISTRY.to_string(),
+            api_url: format!("{}/api/v1", DEFAULT_REGISTRY),
+            index_url: format!("{}/index", DEFAULT_REGISTRY),
+            download_url: format!("{}/dl/{{name}}/{{version}}", DEFAULT_REGISTRY),
+            cache_dir: cache_base.join("cache"),
+            index_cache_dir: cache_base.join("index"),
+            token: None,
+            timeout: Duration::from_secs(30),
+            max_retries: 3,
+            retry_delay: Duration::from_secs(1),
+            allow_insecure: false,
+        }
+    }
+    
+    /// Create from URL
+    pub fn from_url(url: impl Into<String>) -> Self {
+        let url = url.into();
+        let mut config = Self::default_registry();
+        config.api_url = format!("{}/api/v1", url);
+        config.index_url = format!("{}/index", url);
+        config.download_url = format!("{}/dl/{{name}}/{{version}}", url);
+        config.url = url;
+        config
+    }
+    
+    /// Set authentication token
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+    
+    /// Set cache directory
+    pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = dir.into();
+        self
+    }
+    
+    /// Get download URL for package
+    pub fn download_url_for(&self, name: &str, version: &Version) -> String {
+        self.download_url
+            .replace("{name}", name)
+            .replace("{version}", &version.to_string())
+    }
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self::default_registry()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTHENTICATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Authentication credentials
+#[derive(Debug, Clone)]
+pub struct Credentials {
+    /// API token
+    pub token: String,
+    
+    /// Token expiry
+    pub expires_at: Option<SystemTime>,
+}
+
+impl Credentials {
+    /// Create from token
+    pub fn from_token(token: impl Into<String>) -> Self {
+        Credentials {
+            token: token.into(),
+            expires_at: None,
+        }
+    }
+    
+    /// Check if expired
+    pub fn is_expired(&self) -> bool {
+        if let Some(expires) = self.expires_at {
+            SystemTime::now() > expires
+        } else {
+            false
+        }
+    }
+    
+    /// Load from credentials file
+    pub fn load() -> Result<Self, RegistryError> {
+        let path = Self::credentials_path();
+        
+        if !path.exists() {
+            return Err(RegistryError::NotAuthenticated);
+        }
+        
+        let content = fs::read_to_string(&path)
+            .map_err(|e| RegistryError::Io(e.to_string()))?;
+        
+        // Simple format: token on first line
+        let token = content.lines().next()
+            .ok_or(RegistryError::NotAuthenticated)?
+            .trim()
+            .to_string();
+        
+        Ok(Credentials::from_token(token))
+    }
+    
+    /// Save to credentials file
+    pub fn save(&self) -> Result<(), RegistryError> {
+        let path = Self::credentials_path();
+        
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| RegistryError::Io(e.to_string()))?;
+        }
+        
+        fs::write(&path, &self.token)
+            .map_err(|e| RegistryError::Io(e.to_string()))?;
+        
+        // Set restrictive permissions on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&path)
+                .map_err(|e| RegistryError::Io(e.to_string()))?
+                .permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(&path, perms)
+                .map_err(|e| RegistryError::Io(e.to_string()))?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Delete credentials
+    pub fn delete() -> Result<(), RegistryError> {
+        let path = Self::credentials_path();
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|e| RegistryError::Io(e.to_string()))?;
+        }
+        Ok(())
+    }
+    
+    fn credentials_path() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".quanta")
+            .join("credentials")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HTTP CLIENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// HTTP request method
+#[derive(Debug, Clone, Copy)]
+pub enum Method {
+    Get,
+    Post,
+    Put,
+    Delete,
+}
+
+/// HTTP response
+#[derive(Debug)]
+pub struct Response {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub body: Vec<u8>,
+}
+
+impl Response {
+    /// Check if success status
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+    
+    /// Get body as string
+    pub fn text(&self) -> Result<String, RegistryError> {
+        String::from_utf8(self.body.clone())
+            .map_err(|_| RegistryError::InvalidResponse("invalid UTF-8".to_string()))
+    }
+    
+    /// Parse body as JSON
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, RegistryError> {
+        serde_json::from_slice(&self.body)
+            .map_err(|e| RegistryError::InvalidResponse(e.to_string()))
+    }
+}
+
+/// Simple HTTP client (abstracts over actual HTTP implementation)
+pub struct HttpClient {
+    config: RegistryConfig,
+    user_agent: String,
+}
+
+impl HttpClient {
+    /// Create new client
+    pub fn new(config: RegistryConfig) -> Self {
+        HttpClient {
+            config,
+            user_agent: format!("quanta-registry/{}", env!("CARGO_PKG_VERSION")),
+        }
+    }
+    
+    /// Make GET request
+    pub fn get(&self, url: &str) -> Result<Response, RegistryError> {
+        self.request(Method::Get, url, None)
+    }
+    
+    /// Make POST request with body
+    pub fn post(&self, url: &str, body: &[u8]) -> Result<Response, RegistryError> {
+        self.request(Method::Post, url, Some(body))
+    }
+    
+    /// Make PUT request with body
+    pub fn put(&self, url: &str, body: &[u8]) -> Result<Response, RegistryError> {
+        self.request(Method::Put, url, Some(body))
+    }
+    
+    /// Make DELETE request
+    pub fn delete(&self, url: &str) -> Result<Response, RegistryError> {
+        self.request(Method::Delete, url, None)
+    }
+    
+    /// Make HTTP request with retries
+    fn request(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<&[u8]>,
+    ) -> Result<Response, RegistryError> {
+        let mut last_error = None;
+        
+        for attempt in 0..=self.config.max_retries {
+            if attempt > 0 {
+                std::thread::sleep(self.config.retry_delay * attempt);
+            }
+            
+            match self.do_request(method, url, body) {
+                Ok(response) => {
+                    if response.is_success() {
+                        return Ok(response);
+                    }
+                    
+                    // Don't retry client errors
+                    if response.status >= 400 && response.status < 500 {
+                        return self.handle_error_response(response);
+                    }
+                    
+                    last_error = Some(RegistryError::Http {
+                        status: response.status,
+                        message: response.text().unwrap_or_default(),
+                    });
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
+        }
+        
+        Err(last_error.unwrap_or(RegistryError::Network("request failed".to_string())))
+    }
+    
+    /// Perform single HTTP request (implementation placeholder)
+    fn do_request(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<&[u8]>,
+    ) -> Result<Response, RegistryError> {
+        // This would use a real HTTP client like reqwest or ureq
+        // For now, provide a stub implementation
+        
+        #[cfg(feature = "http")]
+        {
+            use ureq;
+            
+            let mut request = match method {
+                Method::Get => ureq::get(url),
+                Method::Post => ureq::post(url),
+                Method::Put => ureq::put(url),
+                Method::Delete => ureq::delete(url),
+            };
+            
+            request = request
+                .set("User-Agent", &self.user_agent)
+                .timeout(self.config.timeout);
+            
+            if let Some(ref token) = self.config.token {
+                request = request.set("Authorization", &format!("Bearer {}", token));
+            }
+            
+            let response = if let Some(body) = body {
+                request
+                    .set("Content-Type", "application/octet-stream")
+                    .send_bytes(body)
+            } else {
+                request.call()
+            };
+            
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let mut body = Vec::new();
+                    resp.into_reader().read_to_end(&mut body)
+                        .map_err(|e| RegistryError::Network(e.to_string()))?;
+                    
+                    Ok(Response {
+                        status,
+                        headers: HashMap::new(),
+                        body,
+                    })
+                }
+                Err(ureq::Error::Status(status, resp)) => {
+                    let mut body = Vec::new();
+                    resp.into_reader().read_to_end(&mut body).ok();
+                    
+                    Ok(Response {
+                        status,
+                        headers: HashMap::new(),
+                        body,
+                    })
+                }
+                Err(e) => Err(RegistryError::Network(e.to_string())),
+            }
+        }
+        
+        #[cfg(not(feature = "http"))]
+        {
+            // Stub for when HTTP is not available
+            Err(RegistryError::Network("HTTP client not available".to_string()))
+        }
+    }
+    
+    /// Handle error response
+    fn handle_error_response(&self, response: Response) -> Result<Response, RegistryError> {
+        let message = response.text().unwrap_or_default();
+        
+        match response.status {
+            401 => Err(RegistryError::Unauthorized),
+            403 => Err(RegistryError::Forbidden(message)),
+            404 => Err(RegistryError::NotFound(message)),
+            409 => Err(RegistryError::Conflict(message)),
+            422 => Err(RegistryError::InvalidPackage(message)),
+            429 => Err(RegistryError::RateLimited),
+            _ => Err(RegistryError::Http {
+                status: response.status,
+                message,
+            }),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTRY CLIENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Registry client
+pub struct RegistryClient {
+    config: RegistryConfig,
+    http: HttpClient,
+    index: PackageIndex,
+    cache: PackageCache,
+}
+
+impl RegistryClient {
+    /// Create new client
+    pub fn new(config: RegistryConfig) -> Self {
+        let http = HttpClient::new(config.clone());
+        let cache = PackageCache::new(config.cache_dir.clone());
+        
+        RegistryClient {
+            config,
+            http,
+            index: PackageIndex::new(),
+            cache,
+        }
+    }
+    
+    /// Create with default configuration
+    pub fn default_registry() -> Self {
+        Self::new(RegistryConfig::default())
+    }
+    
+    /// Login with token
+    pub fn login(&mut self, token: impl Into<String>) -> Result<(), RegistryError> {
+        let token = token.into();
+        
+        // Verify token by making API call
+        let old_token = self.config.token.take();
+        self.config.token = Some(token.clone());
+        
+        match self.whoami() {
+            Ok(_) => {
+                // Save credentials
+                Credentials::from_token(&token).save()?;
+                Ok(())
+            }
+            Err(e) => {
+                self.config.token = old_token;
+                Err(e)
+            }
+        }
+    }
+    
+    /// Logout
+    pub fn logout(&mut self) -> Result<(), RegistryError> {
+        self.config.token = None;
+        Credentials::delete()
+    }
+    
+    /// Get current user info
+    pub fn whoami(&self) -> Result<UserInfo, RegistryError> {
+        let url = format!("{}/me", self.config.api_url);
+        let response = self.http.get(&url)?;
+        response.json()
+    }
+    
+    /// Publish package
+    pub fn publish(&self, tarball: &[u8], metadata: &PackageMetadata) -> Result<(), RegistryError> {
+        if self.config.token.is_none() {
+            return Err(RegistryError::NotAuthenticated);
+        }
+        
+        // Validate package
+        self.validate_package(metadata)?;
+        
+        // Check if version already exists
+        if let Ok(Some(_)) = self.get_version(&metadata.name, &metadata.version) {
+            return Err(RegistryError::Conflict(format!(
+                "version {} already exists",
+                metadata.version
+            )));
+        }
+        
+        // Upload tarball
+        let url = format!(
+            "{}/crates/{}/{}",
+            self.config.api_url,
+            metadata.name,
+            metadata.version
+        );
+        
+        self.http.put(&url, tarball)?;
+        
+        Ok(())
+    }
+    
+    /// Yank version
+    pub fn yank(&self, name: &PackageName, version: &Version) -> Result<(), RegistryError> {
+        if self.config.token.is_none() {
+            return Err(RegistryError::NotAuthenticated);
+        }
+        
+        let url = format!(
+            "{}/crates/{}/{}/yank",
+            self.config.api_url,
+            name,
+            version
+        );
+        
+        self.http.delete(&url)?;
+        Ok(())
+    }
+    
+    /// Unyank version
+    pub fn unyank(&self, name: &PackageName, version: &Version) -> Result<(), RegistryError> {
+        if self.config.token.is_none() {
+            return Err(RegistryError::NotAuthenticated);
+        }
+        
+        let url = format!(
+            "{}/crates/{}/{}/unyank",
+            self.config.api_url,
+            name,
+            version
+        );
+        
+        self.http.put(&url, &[])?;
+        Ok(())
+    }
+    
+    /// Get package metadata
+    pub fn get_package(&self, name: &str) -> Result<Option<IndexEntry>, RegistryError> {
+        // Try cache first
+        if let Some(entry) = self.index.get(name) {
+            return Ok(Some(entry));
+        }
+        
+        // Fetch from registry
+        let url = format!("{}/{}", self.config.index_url, Self::index_path(name));
+        
+        match self.http.get(&url) {
+            Ok(response) => {
+                let entry: IndexEntry = response.json()?;
+                Ok(Some(entry))
+            }
+            Err(RegistryError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+    
+    /// Get specific version
+    pub fn get_version(
+        &self,
+        name: &PackageName,
+        version: &Version,
+    ) -> Result<Option<PackageMetadata>, RegistryError> {
+        let entry = self.get_package(name.as_str())?;
+        Ok(entry.and_then(|e| e.get_version(version).cloned()))
+    }
+    
+    /// Download package tarball
+    pub fn download(
+        &self,
+        name: &PackageName,
+        version: &Version,
+    ) -> Result<Vec<u8>, RegistryError> {
+        // Check cache
+        if let Some(data) = self.cache.get(name, version)? {
+            return Ok(data);
+        }
+        
+        // Download from registry
+        let url = self.config.download_url_for(name.as_str(), version);
+        let response = self.http.get(&url)?;
+        
+        // Verify checksum if available
+        if let Some(metadata) = self.get_version(name, version)? {
+            if let Some(ref expected) = metadata.checksum {
+                let actual = Self::compute_checksum(&response.body);
+                if &actual != expected {
+                    return Err(RegistryError::ChecksumMismatch {
+                        expected: expected.clone(),
+                        actual,
+                    });
+                }
+            }
+        }
+        
+        // Cache the download
+        self.cache.put(name, version, &response.body)?;
+        
+        Ok(response.body)
+    }
+    
+    /// Search packages
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, RegistryError> {
+        let url = format!(
+            "{}/search?q={}&limit={}",
+            self.config.api_url,
+            urlencoding::encode(query),
+            limit
+        );
+        
+        let response = self.http.get(&url)?;
+        response.json()
+    }
+    
+    /// Sync index
+    pub fn sync_index(&mut self) -> Result<(), RegistryError> {
+        // For sparse index, we don't need full sync
+        // Just update the last sync time
+        self.index.set_synced();
+        Ok(())
+    }
+    
+    /// Validate package before publish
+    fn validate_package(&self, metadata: &PackageMetadata) -> Result<(), RegistryError> {
+        // Check name
+        if metadata.name.as_str().len() > 64 {
+            return Err(RegistryError::InvalidPackage("name too long".to_string()));
+        }
+        
+        // Check description
+        if let Some(ref desc) = metadata.description {
+            if desc.len() > 1000 {
+                return Err(RegistryError::InvalidPackage("description too long".to_string()));
+            }
+        }
+        
+        // Check keywords count
+        if metadata.keywords.len() > 5 {
+            return Err(RegistryError::InvalidPackage("too many keywords (max 5)".to_string()));
+        }
+        
+        Ok(())
+    }
+    
+    /// Compute SHA256 checksum
+    fn compute_checksum(data: &[u8]) -> String {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        format!("{:x}", hasher.finalize())
+    }
+    
+    /// Get index path for package name (sparse index format)
+    fn index_path(name: &str) -> String {
+        match name.len() {
+            1 => format!("1/{}", name),
+            2 => format!("2/{}", name),
+            3 => format!("3/{}/{}", &name[..1], name),
+            _ => format!("{}/{}/{}", &name[..2], &name[2..4], name),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PACKAGE CACHE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Local package cache
+pub struct PackageCache {
+    cache_dir: PathBuf,
+}
+
+impl PackageCache {
+    /// Create new cache
+    pub fn new(cache_dir: PathBuf) -> Self {
+        PackageCache { cache_dir }
+    }
+    
+    /// Get cached package
+    pub fn get(&self, name: &PackageName, version: &Version) -> Result<Option<Vec<u8>>, RegistryError> {
+        let path = self.cache_path(name, version);
+        
+        if path.exists() {
+            let data = fs::read(&path)
+                .map_err(|e| RegistryError::Io(e.to_string()))?;
+            Ok(Some(data))
+        } else {
+            Ok(None)
+        }
+    }
+    
+    /// Cache package
+    pub fn put(&self, name: &PackageName, version: &Version, data: &[u8]) -> Result<(), RegistryError> {
+        let path = self.cache_path(name, version);
+        
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| RegistryError::Io(e.to_string()))?;
+        }
+        
+        fs::write(&path, data)
+            .map_err(|e| RegistryError::Io(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    /// Clear cache
+    pub fn clear(&self) -> Result<(), RegistryError> {
+        if self.cache_dir.exists() {
+            fs::remove_dir_all(&self.cache_dir)
+                .map_err(|e| RegistryError::Io(e.to_string()))?;
+        }
+        Ok(())
+    }
+    
+    /// Get cache size
+    pub fn size(&self) -> Result<u64, RegistryError> {
+        let mut total = 0;
+        
+        if self.cache_dir.exists() {
+            for entry in walkdir::WalkDir::new(&self.cache_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+            {
+                if let Ok(metadata) = entry.metadata() {
+                    total += metadata.len();
+                }
+            }
+        }
+        
+        Ok(total)
+    }
+    
+    fn cache_path(&self, name: &PackageName, version: &Version) -> PathBuf {
+        self.cache_dir
+            .join(name.as_str())
+            .join(format!("{}.crate", version))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// API TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// User info from API
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct UserInfo {
+    pub id: u64,
+    pub login: String,
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub avatar: Option<String>,
+}
+
+/// Search result
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SearchResult {
+    pub name: String,
+    pub max_version: String,
+    pub description: Option<String>,
+    pub downloads: u64,
+    pub recent_downloads: u64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Registry error
+#[derive(Debug)]
+pub enum RegistryError {
+    Network(String),
+    Http { status: u16, message: String },
+    Io(String),
+    NotAuthenticated,
+    Unauthorized,
+    Forbidden(String),
+    NotFound(String),
+    Conflict(String),
+    InvalidPackage(String),
+    InvalidResponse(String),
+    RateLimited,
+    ChecksumMismatch { expected: String, actual: String },
+}
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(msg) => write!(f, "network error: {}", msg),
+            Self::Http { status, message } => write!(f, "HTTP {}: {}", status, message),
+            Self::Io(msg) => write!(f, "I/O error: {}", msg),
+            Self::NotAuthenticated => write!(f, "not authenticated, run `quanta login`"),
+            Self::Unauthorized => write!(f, "unauthorized, invalid token"),
+            Self::Forbidden(msg) => write!(f, "forbidden: {}", msg),
+            Self::NotFound(msg) => write!(f, "not found: {}", msg),
+            Self::Conflict(msg) => write!(f, "conflict: {}", msg),
+            Self::InvalidPackage(msg) => write!(f, "invalid package: {}", msg),
+            Self::InvalidResponse(msg) => write!(f, "invalid response: {}", msg),
+            Self::RateLimited => write!(f, "rate limited, try again later"),
+            Self::ChecksumMismatch { expected, actual } => {
+                write!(f, "checksum mismatch: expected {}, got {}", expected, actual)
+            }
+        }
+    }
+}
+
+impl std::error::Error for RegistryError {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+mod dirs {
+    use std::path::PathBuf;
+    use std::env;
+    
+    pub fn home_dir() -> Option<PathBuf> {
+        env::var("HOME")
+            .or_else(|_| env::var("USERPROFILE"))
+            .map(PathBuf::from)
+            .ok()
+    }
+}
+
+mod urlencoding {
+    pub fn encode(s: &str) -> String {
+        let mut result = String::new();
+        for c in s.chars() {
+            match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => {
+                    result.push(c);
+                }
+                _ => {
+                    for byte in c.to_string().as_bytes() {
+                        result.push_str(&format!("%{:02X}", byte));
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
+mod walkdir {
+    use std::path::{Path, PathBuf};
+    use std::fs;
+    
+    pub struct WalkDir {
+        stack: Vec<PathBuf>,
+    }
+    
+    impl WalkDir {
+        pub fn new(path: impl AsRef<Path>) -> Self {
+            WalkDir {
+                stack: vec![path.as_ref().to_path_buf()],
+            }
+        }
+    }
+    
+    impl Iterator for WalkDir {
+        type Item = Result<DirEntry, std::io::Error>;
+        
+        fn next(&mut self) -> Option<Self::Item> {
+            while let Some(path) = self.stack.pop() {
+                if path.is_dir() {
+                    if let Ok(entries) = fs::read_dir(&path) {
+                        for entry in entries.flatten() {
+                            self.stack.push(entry.path());
+                        }
+                    }
+                }
+                return Some(Ok(DirEntry { path }));
+            }
+            None
+        }
+    }
+    
+    pub struct DirEntry {
+        path: PathBuf,
+    }
+    
+    impl DirEntry {
+        pub fn file_type(&self) -> FileType {
+            FileType { is_file: self.path.is_file() }
+        }
+        
+        pub fn metadata(&self) -> Result<fs::Metadata, std::io::Error> {
+            fs::metadata(&self.path)
+        }
+    }
+    
+    pub struct FileType {
+        is_file: bool,
+    }
+    
+    impl FileType {
+        pub fn is_file(&self) -> bool {
+            self.is_file
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_config_default() {
+        let config = RegistryConfig::default();
+        assert_eq!(config.url, DEFAULT_REGISTRY);
+        assert!(config.token.is_none());
+    }
+    
+    #[test]
+    fn test_config_from_url() {
+        let config = RegistryConfig::from_url("https://custom.registry.io");
+        assert_eq!(config.url, "https://custom.registry.io");
+        assert!(config.api_url.contains("custom.registry.io"));
+    }
+    
+    #[test]
+    fn test_index_path() {
+        assert_eq!(RegistryClient::index_path("a"), "1/a");
+        assert_eq!(RegistryClient::index_path("ab"), "2/ab");
+        assert_eq!(RegistryClient::index_path("abc"), "3/a/abc");
+        assert_eq!(RegistryClient::index_path("abcd"), "ab/cd/abcd");
+        assert_eq!(RegistryClient::index_path("serde"), "se/rd/serde");
+    }
+    
+    #[test]
+    fn test_url_encoding() {
+        assert_eq!(urlencoding::encode("hello world"), "hello%20world");
+        assert_eq!(urlencoding::encode("a+b=c"), "a%2Bb%3Dc");
+    }
+}

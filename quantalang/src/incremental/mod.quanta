@@ -1,0 +1,462 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ INCREMENTAL — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+//! # Incremental Compilation
+//!
+//! High-performance incremental compilation system:
+//!
+//! - **Content-Addressable Cache**: Artifacts indexed by cryptographic hash
+//! - **Fine-Grained Dependencies**: Function/type level tracking
+//! - **Minimal Rebuilds**: Only recompile what's affected by changes
+//! - **Parallel Safe**: Lock-free concurrent cache access
+//!
+//! ## How It Works
+//!
+//! ```text
+//! Source Files → Change Detection → Dependency Analysis → Selective Recompilation
+//!      │                │                  │                     │
+//!      ▼                ▼                  ▼                     ▼
+//!  File Hash        Compare          Build Graph          Compile Only
+//!  Fingerprint      Signatures       Traversal            Changed Units
+//! ```
+//!
+//! ## Cache Structure
+//!
+//! ```text
+//! ~/.quanta/cache/
+//! ├── artifacts/           # Compiled artifacts by hash
+//! │   ├── a1b2c3d4...     # Object files, MIR, metadata
+//! │   └── ...
+//! ├── deps/                # Dependency graphs
+//! │   ├── project.deps    # Project-wide dependencies
+//! │   └── ...
+//! └── index.db            # Cache index database
+//! ```
+
+module quantalang::incremental
+
+pub mod cache;
+pub mod deps;
+
+pub use cache::{
+    // Hashing
+    ContentHash,
+    
+    // Fingerprints
+    FileFingerprint,
+    
+    // Units
+    UnitId, CompilationUnit,
+    Symbol, SymbolKind, SymbolRef, Visibility,
+    Artifact, ArtifactKind,
+    
+    // Cache
+    ArtifactCache, CacheConfig, CacheStats,
+    
+    // Dependency tracking
+    DependencyTracker,
+};
+
+pub use deps::{
+    // Dependency graph
+    DepGraph, DepNode, DepEdge, DepKind,
+    
+    // Query system
+    QueryContext, QueryKey, QueryResult,
+    
+    // Session
+    IncrementalSession, SessionConfig,
+    CompilationPlan, RecompileReason,
+};
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Instant, Duration};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INCREMENTAL COMPILER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Incremental compilation orchestrator
+pub struct IncrementalCompiler {
+    /// Artifact cache
+    cache: Arc<ArtifactCache>,
+    
+    /// Dependency tracker
+    deps: Arc<DependencyTracker>,
+    
+    /// Current session
+    session: Option<IncrementalSession>,
+    
+    /// Configuration
+    config: IncrementalConfig,
+    
+    /// Statistics
+    stats: CompilationStats,
+}
+
+/// Incremental compilation configuration
+#[derive(Debug, Clone)]
+pub struct IncrementalConfig {
+    /// Cache directory
+    pub cache_dir: PathBuf,
+    
+    /// Maximum cache size
+    pub max_cache_size: u64,
+    
+    /// Enable parallel compilation
+    pub parallel: bool,
+    
+    /// Number of worker threads
+    pub threads: usize,
+    
+    /// Enable fine-grained dependencies
+    pub fine_grained: bool,
+    
+    /// Verify cache integrity
+    pub verify_cache: bool,
+    
+    /// Cache compression
+    pub compression: bool,
+}
+
+impl Default for IncrementalConfig {
+    fn default() -> Self {
+        IncrementalConfig {
+            cache_dir: PathBuf::from(".quanta/cache"),
+            max_cache_size: 10 * 1024 * 1024 * 1024, // 10 GB
+            parallel: true,
+            threads: num_cpus(),
+            fine_grained: true,
+            verify_cache: true,
+            compression: true,
+        }
+    }
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+}
+
+/// Compilation statistics
+#[derive(Debug, Clone, Default)]
+pub struct CompilationStats {
+    /// Total files in project
+    pub total_files: usize,
+    
+    /// Files recompiled
+    pub recompiled: usize,
+    
+    /// Files skipped (cached)
+    pub cached: usize,
+    
+    /// Cache hits
+    pub cache_hits: u64,
+    
+    /// Cache misses
+    pub cache_misses: u64,
+    
+    /// Total compilation time
+    pub total_time: Duration,
+    
+    /// Time saved by caching
+    pub time_saved: Duration,
+}
+
+impl CompilationStats {
+    /// Cache hit rate
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.cache_hits + self.cache_misses;
+        if total > 0 {
+            self.cache_hits as f64 / total as f64
+        } else {
+            0.0
+        }
+    }
+    
+    /// Recompilation rate
+    pub fn recompile_rate(&self) -> f64 {
+        if self.total_files > 0 {
+            self.recompiled as f64 / self.total_files as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+impl IncrementalCompiler {
+    /// Create new incremental compiler
+    pub fn new(config: IncrementalConfig) -> std::io::Result<Self> {
+        let cache = ArtifactCache::new(
+            config.cache_dir.join("artifacts"),
+            CacheConfig {
+                max_size: config.max_cache_size,
+                compression: config.compression,
+                verify_reads: config.verify_cache,
+                ..Default::default()
+            },
+        )?;
+        
+        Ok(IncrementalCompiler {
+            cache: Arc::new(cache),
+            deps: Arc::new(DependencyTracker::new()),
+            session: None,
+            config,
+            stats: CompilationStats::default(),
+        })
+    }
+    
+    /// Start new compilation session
+    pub fn begin_session(&mut self, root: &Path) -> std::io::Result<()> {
+        let session = IncrementalSession::new(
+            root.to_path_buf(),
+            SessionConfig {
+                fine_grained: self.config.fine_grained,
+                parallel: self.config.parallel,
+                threads: self.config.threads,
+            },
+        );
+        
+        self.session = Some(session);
+        self.stats = CompilationStats::default();
+        
+        Ok(())
+    }
+    
+    /// Analyze what needs recompilation
+    pub fn analyze_changes(&mut self, files: &[PathBuf]) -> std::io::Result<CompilationPlan> {
+        let session = self.session.as_mut()
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "no active session"
+            ))?;
+        
+        self.stats.total_files = files.len();
+        
+        // Get current fingerprints
+        let current_fingerprints: Vec<_> = files.iter()
+            .filter_map(|f| FileFingerprint::from_file(f).ok())
+            .collect();
+        
+        // Determine what changed
+        let mut changed = BTreeSet::new();
+        let mut unchanged = BTreeSet::new();
+        
+        for fp in &current_fingerprints {
+            let unit_id = UnitId::from_path(&fp.path);
+            
+            if session.is_changed(&unit_id, fp) {
+                changed.insert(unit_id);
+            } else {
+                unchanged.insert(unit_id);
+            }
+        }
+        
+        // Compute transitive closure
+        let mut to_recompile = changed.clone();
+        
+        for unit in &changed {
+            let affected = self.deps.transitive_dependents(unit);
+            to_recompile.extend(affected);
+        }
+        
+        // Update stats
+        self.stats.recompiled = to_recompile.len();
+        self.stats.cached = unchanged.len().saturating_sub(to_recompile.len());
+        
+        Ok(CompilationPlan {
+            to_compile: to_recompile.into_iter().collect(),
+            to_skip: unchanged.difference(&changed).cloned().collect(),
+            order: self.deps.topological_sort(&files.iter()
+                .map(|p| UnitId::from_path(p))
+                .collect::<Vec<_>>()),
+        })
+    }
+    
+    /// Compile single unit
+    pub fn compile_unit(&mut self, unit: &UnitId) -> Result<CompilationResult, CompileError> {
+        let start = Instant::now();
+        
+        // Check cache first
+        let cache_key = self.compute_cache_key(unit)?;
+        
+        if let Some(cached) = self.cache.get(&cache_key) {
+            self.stats.cache_hits += 1;
+            return Ok(CompilationResult {
+                unit: unit.clone(),
+                from_cache: true,
+                artifacts: vec![],
+                time: start.elapsed(),
+            });
+        }
+        
+        self.stats.cache_misses += 1;
+        
+        // Actually compile
+        let result = self.do_compile(unit)?;
+        
+        // Store in cache
+        let serialized = self.serialize_result(&result)?;
+        let _ = self.cache.put(cache_key, &serialized);
+        
+        Ok(result)
+    }
+    
+    fn compute_cache_key(&self, unit: &UnitId) -> Result<ContentHash, CompileError> {
+        // Combine: source hash + dependency hashes + compiler version + flags
+        let mut hashes = Vec::new();
+        
+        // Source hash (would come from session)
+        hashes.push(ContentHash::compute(unit.as_str().as_bytes()));
+        
+        // Dependency hashes
+        for dep in self.deps.dependencies(unit) {
+            hashes.push(ContentHash::compute(dep.as_str().as_bytes()));
+        }
+        
+        // Compiler version
+        hashes.push(ContentHash::compute(env!("CARGO_PKG_VERSION").as_bytes()));
+        
+        Ok(ContentHash::combine(&hashes))
+    }
+    
+    fn do_compile(&self, unit: &UnitId) -> Result<CompilationResult, CompileError> {
+        // Placeholder - real implementation would invoke compiler
+        Ok(CompilationResult {
+            unit: unit.clone(),
+            from_cache: false,
+            artifacts: vec![],
+            time: Duration::ZERO,
+        })
+    }
+    
+    fn serialize_result(&self, _result: &CompilationResult) -> Result<Vec<u8>, CompileError> {
+        Ok(Vec::new())
+    }
+    
+    /// End session
+    pub fn end_session(&mut self) -> CompilationStats {
+        self.session = None;
+        std::mem::take(&mut self.stats)
+    }
+    
+    /// Get cache statistics
+    pub fn cache_stats(&self) -> CacheStats {
+        self.cache.stats()
+    }
+    
+    /// Clear cache
+    pub fn clear_cache(&self) -> std::io::Result<()> {
+        self.cache.clear()
+    }
+    
+    /// Get compilation statistics
+    pub fn stats(&self) -> &CompilationStats {
+        &self.stats
+    }
+}
+
+/// Compilation result
+#[derive(Debug)]
+pub struct CompilationResult {
+    pub unit: UnitId,
+    pub from_cache: bool,
+    pub artifacts: Vec<PathBuf>,
+    pub time: Duration,
+}
+
+/// Compilation error
+#[derive(Debug)]
+pub enum CompileError {
+    IoError(std::io::Error),
+    ParseError(String),
+    TypeError(String),
+    InternalError(String),
+}
+
+impl std::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IoError(e) => write!(f, "I/O error: {}", e),
+            Self::ParseError(m) => write!(f, "parse error: {}", m),
+            Self::TypeError(m) => write!(f, "type error: {}", m),
+            Self::InternalError(m) => write!(f, "internal error: {}", m),
+        }
+    }
+}
+
+impl From<std::io::Error> for CompileError {
+    fn from(e: std::io::Error) -> Self {
+        CompileError::IoError(e)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub mod prelude {
+    pub use super::{
+        // Hashing
+        ContentHash,
+        
+        // Fingerprints
+        FileFingerprint,
+        
+        // Units
+        UnitId, CompilationUnit,
+        
+        // Cache
+        ArtifactCache, CacheConfig, CacheStats,
+        
+        // Dependencies
+        DependencyTracker,
+        
+        // Compiler
+        IncrementalCompiler, IncrementalConfig,
+        CompilationStats, CompilationResult, CompileError,
+        
+        // Session
+        IncrementalSession, CompilationPlan,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_compilation_stats() {
+        let stats = CompilationStats {
+            total_files: 100,
+            recompiled: 10,
+            cached: 90,
+            cache_hits: 90,
+            cache_misses: 10,
+            ..Default::default()
+        };
+        
+        assert!((stats.hit_rate() - 0.9).abs() < 0.001);
+        assert!((stats.recompile_rate() - 0.1).abs() < 0.001);
+    }
+    
+    #[test]
+    fn test_incremental_config() {
+        let config = IncrementalConfig::default();
+        assert!(config.parallel);
+        assert!(config.fine_grained);
+    }
+}

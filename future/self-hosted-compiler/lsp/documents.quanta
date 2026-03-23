@@ -1,0 +1,590 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ LANGUAGE SERVER PROTOCOL — Document Manager
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Manages open documents, text synchronization, and document state.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::lsp::documents
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use crate::lsp::types::*;
+use crate::lsp::protocol::JsonValue;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINE INDEX
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Fast line-based indexing for a document
+#[derive(Debug, Clone)]
+pub struct LineIndex {
+    /// Byte offset of each line start
+    line_starts: Vec<usize>,
+    /// Total length in bytes
+    len: usize,
+}
+
+impl LineIndex {
+    pub fn new(text: &str) -> Self {
+        let mut line_starts = vec![0];
+        
+        for (i, c) in text.char_indices() {
+            if c == '\n' {
+                line_starts.push(i + 1);
+            }
+        }
+        
+        LineIndex {
+            line_starts,
+            len: text.len(),
+        }
+    }
+    
+    /// Number of lines
+    pub fn line_count(&self) -> usize {
+        self.line_starts.len()
+    }
+    
+    /// Get byte offset for a position
+    pub fn offset(&self, pos: Position) -> Option<usize> {
+        let line = pos.line as usize;
+        if line >= self.line_starts.len() {
+            return None;
+        }
+        
+        let line_start = self.line_starts[line];
+        let char_offset = pos.character as usize;
+        
+        Some(line_start + char_offset)
+    }
+    
+    /// Get position for a byte offset
+    pub fn position(&self, offset: usize) -> Position {
+        // Binary search for the line
+        let line = match self.line_starts.binary_search(&offset) {
+            Ok(line) => line,
+            Err(line) => line.saturating_sub(1),
+        };
+        
+        let line_start = self.line_starts[line];
+        let character = offset - line_start;
+        
+        Position {
+            line: line as u32,
+            character: character as u32,
+        }
+    }
+    
+    /// Get the byte range for a line
+    pub fn line_range(&self, line: usize) -> Option<(usize, usize)> {
+        if line >= self.line_starts.len() {
+            return None;
+        }
+        
+        let start = self.line_starts[line];
+        let end = self.line_starts.get(line + 1).copied().unwrap_or(self.len);
+        
+        Some((start, end))
+    }
+    
+    /// Convert LSP Range to byte range
+    pub fn range_to_bytes(&self, range: Range) -> Option<(usize, usize)> {
+        let start = self.offset(range.start)?;
+        let end = self.offset(range.end)?;
+        Some((start, end))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOCUMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A text document
+#[derive(Debug, Clone)]
+pub struct Document {
+    /// Document URI
+    pub uri: DocumentUri,
+    /// Language ID
+    pub language_id: String,
+    /// Version number
+    pub version: i32,
+    /// Document text
+    pub text: String,
+    /// Line index
+    pub line_index: LineIndex,
+}
+
+impl Document {
+    pub fn new(uri: DocumentUri, language_id: String, version: i32, text: String) -> Self {
+        let line_index = LineIndex::new(&text);
+        Document {
+            uri,
+            language_id,
+            version,
+            text,
+            line_index,
+        }
+    }
+    
+    /// Get text at a range
+    pub fn text_at(&self, range: Range) -> Option<&str> {
+        let (start, end) = self.line_index.range_to_bytes(range)?;
+        self.text.get(start..end)
+    }
+    
+    /// Get a line's text
+    pub fn line(&self, line: usize) -> Option<&str> {
+        let (start, end) = self.line_index.line_range(line)?;
+        let text = &self.text[start..end];
+        // Remove trailing newline
+        Some(text.trim_end_matches('\n').trim_end_matches('\r'))
+    }
+    
+    /// Get word at position
+    pub fn word_at(&self, pos: Position) -> Option<(&str, Range)> {
+        let line_text = self.line(pos.line as usize)?;
+        let char_idx = pos.character as usize;
+        
+        if char_idx > line_text.len() {
+            return None;
+        }
+        
+        // Find word boundaries
+        let start = line_text[..char_idx]
+            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        
+        let end = line_text[char_idx..]
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| char_idx + i)
+            .unwrap_or(line_text.len());
+        
+        if start >= end {
+            return None;
+        }
+        
+        let word = &line_text[start..end];
+        let range = Range {
+            start: Position::new(pos.line, start as u32),
+            end: Position::new(pos.line, end as u32),
+        };
+        
+        Some((word, range))
+    }
+    
+    /// Apply incremental changes
+    pub fn apply_changes(&mut self, changes: Vec<TextDocumentContentChange>) {
+        for change in changes {
+            if let Some(range) = change.range {
+                // Incremental update
+                if let Some((start, end)) = self.line_index.range_to_bytes(range) {
+                    self.text.replace_range(start..end, &change.text);
+                }
+            } else {
+                // Full replacement
+                self.text = change.text;
+            }
+        }
+        
+        // Rebuild line index
+        self.line_index = LineIndex::new(&self.text);
+    }
+    
+    /// Get position at end of document
+    pub fn end_position(&self) -> Position {
+        self.line_index.position(self.text.len())
+    }
+}
+
+/// Text document content change
+#[derive(Debug, Clone)]
+pub struct TextDocumentContentChange {
+    /// Range to replace (None = full document)
+    pub range: Option<Range>,
+    /// New text
+    pub text: String,
+}
+
+impl TextDocumentContentChange {
+    pub fn from_json(json: &JsonValue) -> Option<Self> {
+        let text = json.get_str("text")?.to_string();
+        let range = json.get("range").and_then(Range::from_json);
+        Some(TextDocumentContentChange { range, text })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOCUMENT MANAGER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Manages all open documents
+pub struct DocumentManager {
+    /// Open documents by URI
+    documents: RwLock<HashMap<DocumentUri, Document>>,
+}
+
+impl DocumentManager {
+    pub fn new() -> Self {
+        DocumentManager {
+            documents: RwLock::new(HashMap::new()),
+        }
+    }
+    
+    /// Open a document
+    pub fn open(&self, uri: DocumentUri, language_id: String, version: i32, text: String) {
+        let doc = Document::new(uri.clone(), language_id, version, text);
+        self.documents.write().unwrap().insert(uri, doc);
+    }
+    
+    /// Close a document
+    pub fn close(&self, uri: &str) {
+        self.documents.write().unwrap().remove(uri);
+    }
+    
+    /// Update a document
+    pub fn update(&self, uri: &str, version: i32, changes: Vec<TextDocumentContentChange>) {
+        let mut docs = self.documents.write().unwrap();
+        if let Some(doc) = docs.get_mut(uri) {
+            doc.version = version;
+            doc.apply_changes(changes);
+        }
+    }
+    
+    /// Get a document
+    pub fn get(&self, uri: &str) -> Option<Document> {
+        self.documents.read().unwrap().get(uri).cloned()
+    }
+    
+    /// Get all open URIs
+    pub fn uris(&self) -> Vec<DocumentUri> {
+        self.documents.read().unwrap().keys().cloned().collect()
+    }
+    
+    /// Check if a document is open
+    pub fn is_open(&self, uri: &str) -> bool {
+        self.documents.read().unwrap().contains_key(uri)
+    }
+}
+
+impl Default for DocumentManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOCUMENT CACHE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cached analysis results for a document
+#[derive(Debug, Clone)]
+pub struct DocumentCache {
+    /// Document version this cache is for
+    pub version: i32,
+    /// Parsed AST (if any)
+    pub ast: Option<Arc<ParsedAst>>,
+    /// Type information
+    pub types: Option<Arc<TypeInfo>>,
+    /// Diagnostics
+    pub diagnostics: Vec<Diagnostic>,
+    /// Symbols
+    pub symbols: Vec<DocumentSymbol>,
+    /// Semantic tokens
+    pub semantic_tokens: Option<SemanticTokens>,
+}
+
+impl DocumentCache {
+    pub fn new(version: i32) -> Self {
+        DocumentCache {
+            version,
+            ast: None,
+            types: None,
+            diagnostics: Vec::new(),
+            symbols: Vec::new(),
+            semantic_tokens: None,
+        }
+    }
+}
+
+/// Placeholder for parsed AST
+#[derive(Debug, Clone)]
+pub struct ParsedAst {
+    // Would contain actual AST nodes
+    pub root: AstNode,
+}
+
+/// Placeholder AST node
+#[derive(Debug, Clone)]
+pub enum AstNode {
+    Module {
+        items: Vec<AstNode>,
+    },
+    Function {
+        name: String,
+        params: Vec<(String, String)>,
+        return_type: Option<String>,
+        body: Box<AstNode>,
+        range: Range,
+    },
+    Struct {
+        name: String,
+        fields: Vec<(String, String)>,
+        range: Range,
+    },
+    Enum {
+        name: String,
+        variants: Vec<String>,
+        range: Range,
+    },
+    Impl {
+        target: String,
+        methods: Vec<AstNode>,
+        range: Range,
+    },
+    Trait {
+        name: String,
+        methods: Vec<AstNode>,
+        range: Range,
+    },
+    Use {
+        path: String,
+        range: Range,
+    },
+    Block {
+        statements: Vec<AstNode>,
+    },
+    Let {
+        name: String,
+        ty: Option<String>,
+        value: Option<Box<AstNode>>,
+        range: Range,
+    },
+    Expr {
+        kind: ExprKind,
+        range: Range,
+    },
+    Error {
+        message: String,
+        range: Range,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ExprKind {
+    Identifier(String),
+    Literal(String),
+    Call { func: String, args: Vec<AstNode> },
+    MethodCall { receiver: Box<AstNode>, method: String, args: Vec<AstNode> },
+    FieldAccess { receiver: Box<AstNode>, field: String },
+    Binary { op: String, left: Box<AstNode>, right: Box<AstNode> },
+    Unary { op: String, operand: Box<AstNode> },
+    If { condition: Box<AstNode>, then_branch: Box<AstNode>, else_branch: Option<Box<AstNode>> },
+    Match { scrutinee: Box<AstNode>, arms: Vec<(AstNode, AstNode)> },
+    Block(Vec<AstNode>),
+    Return(Option<Box<AstNode>>),
+    Other,
+}
+
+/// Placeholder for type information
+#[derive(Debug, Clone)]
+pub struct TypeInfo {
+    /// Variable types at each position
+    pub variables: HashMap<String, TypeEntry>,
+    /// Function signatures
+    pub functions: HashMap<String, FunctionSig>,
+    /// Struct definitions
+    pub structs: HashMap<String, StructDef>,
+    /// Enum definitions
+    pub enums: HashMap<String, EnumDef>,
+    /// Trait definitions
+    pub traits: HashMap<String, TraitDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeEntry {
+    pub name: String,
+    pub ty: String,
+    pub range: Range,
+    pub mutable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionSig {
+    pub name: String,
+    pub params: Vec<(String, String)>,
+    pub return_type: String,
+    pub doc: Option<String>,
+    pub range: Range,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<(String, String)>,
+    pub methods: Vec<FunctionSig>,
+    pub doc: Option<String>,
+    pub range: Range,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<EnumVariant>,
+    pub methods: Vec<FunctionSig>,
+    pub doc: Option<String>,
+    pub range: Range,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumVariant {
+    pub name: String,
+    pub fields: Option<Vec<(String, String)>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraitDef {
+    pub name: String,
+    pub methods: Vec<FunctionSig>,
+    pub doc: Option<String>,
+    pub range: Range,
+}
+
+impl TypeInfo {
+    pub fn new() -> Self {
+        TypeInfo {
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+            structs: HashMap::new(),
+            enums: HashMap::new(),
+            traits: HashMap::new(),
+        }
+    }
+}
+
+impl Default for TypeInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ANALYSIS CACHE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cache for document analysis results
+pub struct AnalysisCache {
+    caches: RwLock<HashMap<DocumentUri, DocumentCache>>,
+}
+
+impl AnalysisCache {
+    pub fn new() -> Self {
+        AnalysisCache {
+            caches: RwLock::new(HashMap::new()),
+        }
+    }
+    
+    /// Get or create cache for a document
+    pub fn get_or_create(&self, uri: &str, version: i32) -> DocumentCache {
+        let mut caches = self.caches.write().unwrap();
+        
+        if let Some(cache) = caches.get(uri) {
+            if cache.version == version {
+                return cache.clone();
+            }
+        }
+        
+        let cache = DocumentCache::new(version);
+        caches.insert(uri.to_string(), cache.clone());
+        cache
+    }
+    
+    /// Update cache
+    pub fn update(&self, uri: &str, cache: DocumentCache) {
+        self.caches.write().unwrap().insert(uri.to_string(), cache);
+    }
+    
+    /// Get cache if version matches
+    pub fn get(&self, uri: &str, version: i32) -> Option<DocumentCache> {
+        let caches = self.caches.read().unwrap();
+        caches.get(uri).filter(|c| c.version == version).cloned()
+    }
+    
+    /// Invalidate cache for a document
+    pub fn invalidate(&self, uri: &str) {
+        self.caches.write().unwrap().remove(uri);
+    }
+    
+    /// Clear all caches
+    pub fn clear(&self) {
+        self.caches.write().unwrap().clear();
+    }
+}
+
+impl Default for AnalysisCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_line_index() {
+        let text = "line 1\nline 2\nline 3";
+        let index = LineIndex::new(text);
+        
+        assert_eq!(index.line_count(), 3);
+        assert_eq!(index.offset(Position::new(0, 0)), Some(0));
+        assert_eq!(index.offset(Position::new(1, 0)), Some(7));
+        assert_eq!(index.offset(Position::new(2, 0)), Some(14));
+        
+        assert_eq!(index.position(0), Position::new(0, 0));
+        assert_eq!(index.position(7), Position::new(1, 0));
+        assert_eq!(index.position(10), Position::new(1, 3));
+    }
+    
+    #[test]
+    fn test_document_word_at() {
+        let doc = Document::new(
+            "file:///test.quanta".to_string(),
+            "quanta".to_string(),
+            1,
+            "fn hello_world() {}".to_string(),
+        );
+        
+        let (word, _range) = doc.word_at(Position::new(0, 5)).unwrap();
+        assert_eq!(word, "hello_world");
+    }
+    
+    #[test]
+    fn test_document_manager() {
+        let manager = DocumentManager::new();
+        
+        manager.open(
+            "file:///test.quanta".to_string(),
+            "quanta".to_string(),
+            1,
+            "fn main() {}".to_string(),
+        );
+        
+        assert!(manager.is_open("file:///test.quanta"));
+        
+        let doc = manager.get("file:///test.quanta").unwrap();
+        assert_eq!(doc.version, 1);
+        
+        manager.close("file:///test.quanta");
+        assert!(!manager.is_open("file:///test.quanta"));
+    }
+}

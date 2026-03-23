@@ -1,0 +1,1142 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DEBUGGER — Debug Adapter Server
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// DAP server implementation for IDE integration.
+// Communicates via stdin/stdout using JSON-RPC framing.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::debug::server
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use std::io::{self, Read, Write, BufRead, BufReader, BufWriter};
+use std::sync::{Mutex, RwLock};
+use std::thread;
+use crate::debug::protocol::*;
+use crate::debug::state::{DebugSession, SessionState};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEBUG ADAPTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Debug Adapter Protocol server
+pub struct DebugAdapter {
+    /// Debug session
+    session: Arc<DebugSession>,
+    
+    /// Server state
+    state: RwLock<AdapterState>,
+    
+    /// Capabilities
+    capabilities: Capabilities,
+    
+    /// Output writer (mutex for thread safety)
+    output: Mutex<Box<dyn Write + Send>>,
+    
+    /// Running flag
+    running: std::sync::atomic::AtomicBool,
+}
+
+impl DebugAdapter {
+    pub fn new() -> Self {
+        DebugAdapter {
+            session: Arc::new(DebugSession::new(1)),
+            state: RwLock::new(AdapterState::NotStarted),
+            capabilities: Self::default_capabilities(),
+            output: Mutex::new(Box::new(io::stdout())),
+            running: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    
+    pub fn with_output<W: Write + Send + 'static>(mut self, output: W) -> Self {
+        self.output = Mutex::new(Box::new(output));
+        self
+    }
+    
+    fn default_capabilities() -> Capabilities {
+        Capabilities {
+            supports_configuration_done_request: true,
+            supports_function_breakpoints: true,
+            supports_conditional_breakpoints: true,
+            supports_hit_conditional_breakpoints: true,
+            supports_evaluate_for_hovers: true,
+            exception_breakpoint_filters: vec![
+                ExceptionBreakpointsFilter {
+                    filter: "all".to_string(),
+                    label: "All Exceptions".to_string(),
+                    description: Some("Break on all exceptions".to_string()),
+                    default: false,
+                    supports_condition: false,
+                    condition_description: None,
+                },
+                ExceptionBreakpointsFilter {
+                    filter: "uncaught".to_string(),
+                    label: "Uncaught Exceptions".to_string(),
+                    description: Some("Break on uncaught exceptions".to_string()),
+                    default: true,
+                    supports_condition: false,
+                    condition_description: None,
+                },
+            ],
+            supports_step_back: false,
+            supports_set_variable: true,
+            supports_restart_frame: false,
+            supports_goto_targets_request: false,
+            supports_step_in_targets_request: true,
+            supports_completions_request: true,
+            completion_trigger_characters: vec![".".to_string(), ":".to_string()],
+            supports_modules_request: true,
+            additional_module_columns: Vec::new(),
+            supported_checksum_algorithms: vec![ChecksumAlgorithm::Sha256],
+            supports_restart_request: true,
+            supports_exception_options: false,
+            supports_value_formatting_options: true,
+            supports_exception_info_request: true,
+            support_terminate_debuggee: true,
+            support_suspend_debuggee: true,
+            supports_delayed_stack_trace_loading: true,
+            supports_loaded_sources_request: true,
+            supports_log_points: true,
+            supports_terminate_threads_request: false,
+            supports_set_expression: false,
+            supports_terminate_request: true,
+            supports_data_breakpoints: false,
+            supports_read_memory_request: true,
+            supports_write_memory_request: true,
+            supports_disassemble_request: true,
+            supports_cancel_request: false,
+            supports_breakpoint_locations_request: true,
+            supports_clipboard_context: true,
+            supports_stepping_granularity: true,
+            supports_instruction_breakpoints: false,
+            supports_exception_filter_options: false,
+            supports_single_thread_execution_requests: true,
+        }
+    }
+    
+    /// Run the adapter (blocking)
+    pub fn run(&self) -> Result<(), String> {
+        self.running.store(true, std::sync::atomic::Ordering::SeqCst);
+        
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        
+        // Start event sender thread
+        let session = Arc::clone(&self.session);
+        let running = &self.running;
+        
+        while running.load(std::sync::atomic::Ordering::SeqCst) {
+            // Read message
+            match self.read_message(&mut reader) {
+                Ok(Some(msg)) => {
+                    self.handle_message(msg)?;
+                }
+                Ok(None) => {
+                    // EOF
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("Error reading message: {}", e);
+                    break;
+                }
+            }
+            
+            // Send pending events
+            for event in self.session.take_events() {
+                self.send_event(&event)?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Stop the adapter
+    pub fn stop(&self) {
+        self.running.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MESSAGE I/O
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn read_message<R: BufRead>(&self, reader: &mut R) -> Result<Option<Message>, String> {
+        // Read Content-Length header
+        let mut content_length: Option<usize> = None;
+        
+        loop {
+            let mut line = String::new();
+            let bytes_read = reader.read_line(&mut line)
+                .map_err(|e| format!("read error: {}", e))?;
+            
+            if bytes_read == 0 {
+                return Ok(None);
+            }
+            
+            let line = line.trim();
+            
+            if line.is_empty() {
+                break;
+            }
+            
+            if line.starts_with("Content-Length:") {
+                let len_str = line[15..].trim();
+                content_length = Some(len_str.parse()
+                    .map_err(|_| "invalid Content-Length")?);
+            }
+        }
+        
+        let length = content_length
+            .ok_or("missing Content-Length header")?;
+        
+        // Read body
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body)
+            .map_err(|e| format!("read error: {}", e))?;
+        
+        let body_str = String::from_utf8(body)
+            .map_err(|_| "invalid UTF-8")?;
+        
+        // Parse JSON
+        self.parse_message(&body_str)
+    }
+    
+    fn parse_message(&self, json: &str) -> Result<Option<Message>, String> {
+        // Simple JSON parsing (in production, use serde_json)
+        let json = json.trim();
+        
+        // Extract type field
+        let type_val = extract_json_string(json, "type")
+            .ok_or("missing type field")?;
+        
+        match type_val.as_str() {
+            "request" => {
+                let seq = extract_json_i64(json, "seq").unwrap_or(0);
+                let command = extract_json_string(json, "command")
+                    .ok_or("missing command field")?;
+                
+                let arguments = self.parse_arguments(&command, json)?;
+                
+                Ok(Some(Message::Request(Request {
+                    seq,
+                    command,
+                    arguments,
+                })))
+            }
+            _ => Ok(None),
+        }
+    }
+    
+    fn parse_arguments(&self, command: &str, json: &str) -> Result<Option<RequestArguments>, String> {
+        let args_json = extract_json_object(json, "arguments");
+        
+        match command {
+            "initialize" => {
+                let args = InitializeRequestArguments {
+                    client_id: args_json.as_ref().and_then(|j| extract_json_string(j, "clientID")),
+                    client_name: args_json.as_ref().and_then(|j| extract_json_string(j, "clientName")),
+                    adapter_id: args_json.as_ref()
+                        .and_then(|j| extract_json_string(j, "adapterID"))
+                        .unwrap_or_else(|| "quantalang".to_string()),
+                    locale: args_json.as_ref().and_then(|j| extract_json_string(j, "locale")),
+                    lines_start_at_1: args_json.as_ref()
+                        .and_then(|j| extract_json_bool(j, "linesStartAt1"))
+                        .unwrap_or(true),
+                    columns_start_at_1: args_json.as_ref()
+                        .and_then(|j| extract_json_bool(j, "columnsStartAt1"))
+                        .unwrap_or(true),
+                    ..Default::default()
+                };
+                Ok(Some(RequestArguments::Initialize(args)))
+            }
+            
+            "launch" => {
+                let args_json = args_json.ok_or("missing arguments")?;
+                let args = LaunchRequestArguments {
+                    no_debug: extract_json_bool(&args_json, "noDebug").unwrap_or(false),
+                    restart: extract_json_bool(&args_json, "__restart").unwrap_or(false),
+                    program: extract_json_string(&args_json, "program")
+                        .ok_or("missing program")?,
+                    args: extract_json_string_array(&args_json, "args").unwrap_or_default(),
+                    cwd: extract_json_string(&args_json, "cwd"),
+                    env: BTreeMap::new(),
+                    stop_on_entry: extract_json_bool(&args_json, "stopOnEntry").unwrap_or(false),
+                    console: None,
+                };
+                Ok(Some(RequestArguments::Launch(args)))
+            }
+            
+            "attach" => {
+                let args_json = args_json.ok_or("missing arguments")?;
+                let args = AttachRequestArguments {
+                    restart: extract_json_bool(&args_json, "__restart").unwrap_or(false),
+                    process_id: extract_json_i64(&args_json, "processId"),
+                    port: extract_json_i64(&args_json, "port").map(|p| p as u16),
+                    host: extract_json_string(&args_json, "host"),
+                };
+                Ok(Some(RequestArguments::Attach(args)))
+            }
+            
+            "setBreakpoints" => {
+                let args_json = args_json.ok_or("missing arguments")?;
+                let source = parse_source(extract_json_object(&args_json, "source").as_deref())?;
+                let breakpoints = parse_source_breakpoints(&args_json)?;
+                
+                Ok(Some(RequestArguments::SetBreakpoints(SetBreakpointsArguments {
+                    source,
+                    breakpoints,
+                    source_modified: extract_json_bool(&args_json, "sourceModified").unwrap_or(false),
+                })))
+            }
+            
+            "configurationDone" => Ok(Some(RequestArguments::ConfigurationDone)),
+            
+            "continue" => {
+                let args_json = args_json.ok_or("missing arguments")?;
+                Ok(Some(RequestArguments::Continue(ContinueArguments {
+                    thread_id: extract_json_i64(&args_json, "threadId").unwrap_or(1),
+                    single_thread: extract_json_bool(&args_json, "singleThread").unwrap_or(false),
+                })))
+            }
+            
+            "next" => {
+                let args_json = args_json.ok_or("missing arguments")?;
+                Ok(Some(RequestArguments::Next(NextArguments {
+                    thread_id: extract_json_i64(&args_json, "threadId").unwrap_or(1),
+                    single_thread: extract_json_bool(&args_json, "singleThread").unwrap_or(false),
+                    granularity: None,
+                })))
+            }
+            
+            "stepIn" => {
+                let args_json = args_json.ok_or("missing arguments")?;
+                Ok(Some(RequestArguments::StepIn(StepInArguments {
+                    thread_id: extract_json_i64(&args_json, "threadId").unwrap_or(1),
+                    single_thread: extract_json_bool(&args_json, "singleThread").unwrap_or(false),
+                    target_id: None,
+                    granularity: None,
+                })))
+            }
+            
+            "stepOut" => {
+                let args_json = args_json.ok_or("missing arguments")?;
+                Ok(Some(RequestArguments::StepOut(StepOutArguments {
+                    thread_id: extract_json_i64(&args_json, "threadId").unwrap_or(1),
+                    single_thread: extract_json_bool(&args_json, "singleThread").unwrap_or(false),
+                    granularity: None,
+                })))
+            }
+            
+            "pause" => {
+                let args_json = args_json.ok_or("missing arguments")?;
+                Ok(Some(RequestArguments::Pause(PauseArguments {
+                    thread_id: extract_json_i64(&args_json, "threadId").unwrap_or(1),
+                })))
+            }
+            
+            "threads" => Ok(Some(RequestArguments::Threads)),
+            
+            "stackTrace" => {
+                let args_json = args_json.ok_or("missing arguments")?;
+                Ok(Some(RequestArguments::StackTrace(StackTraceArguments {
+                    thread_id: extract_json_i64(&args_json, "threadId").unwrap_or(1),
+                    start_frame: extract_json_i64(&args_json, "startFrame"),
+                    levels: extract_json_i64(&args_json, "levels"),
+                    format: None,
+                })))
+            }
+            
+            "scopes" => {
+                let args_json = args_json.ok_or("missing arguments")?;
+                Ok(Some(RequestArguments::Scopes(ScopesArguments {
+                    frame_id: extract_json_i64(&args_json, "frameId").unwrap_or(1),
+                })))
+            }
+            
+            "variables" => {
+                let args_json = args_json.ok_or("missing arguments")?;
+                Ok(Some(RequestArguments::Variables(VariablesArguments {
+                    variables_reference: extract_json_i64(&args_json, "variablesReference").unwrap_or(0),
+                    filter: None,
+                    start: extract_json_i64(&args_json, "start"),
+                    count: extract_json_i64(&args_json, "count"),
+                    format: None,
+                })))
+            }
+            
+            "evaluate" => {
+                let args_json = args_json.ok_or("missing arguments")?;
+                Ok(Some(RequestArguments::Evaluate(EvaluateArguments {
+                    expression: extract_json_string(&args_json, "expression").unwrap_or_default(),
+                    frame_id: extract_json_i64(&args_json, "frameId"),
+                    context: extract_json_string(&args_json, "context")
+                        .and_then(|s| match s.as_str() {
+                            "watch" => Some(EvaluateContext::Watch),
+                            "repl" => Some(EvaluateContext::Repl),
+                            "hover" => Some(EvaluateContext::Hover),
+                            _ => None,
+                        }),
+                    format: None,
+                })))
+            }
+            
+            "disconnect" => {
+                let restart = args_json.as_ref()
+                    .and_then(|j| extract_json_bool(j, "restart"))
+                    .unwrap_or(false);
+                let terminate = args_json.as_ref()
+                    .and_then(|j| extract_json_bool(j, "terminateDebuggee"))
+                    .unwrap_or(true);
+                Ok(Some(RequestArguments::Disconnect(DisconnectArguments {
+                    restart,
+                    terminate_debuggee: terminate,
+                    suspend_debuggee: false,
+                })))
+            }
+            
+            "terminate" => {
+                let restart = args_json.as_ref()
+                    .and_then(|j| extract_json_bool(j, "restart"))
+                    .unwrap_or(false);
+                Ok(Some(RequestArguments::Terminate(TerminateArguments { restart })))
+            }
+            
+            _ => Ok(None),
+        }
+    }
+    
+    fn send_response(&self, response: &Response) -> Result<(), String> {
+        let json = self.response_to_json(response);
+        self.send_raw(&json)
+    }
+    
+    fn send_event(&self, event: &Event) -> Result<(), String> {
+        let json = self.event_to_json(event);
+        self.send_raw(&json)
+    }
+    
+    fn send_raw(&self, json: &str) -> Result<(), String> {
+        let mut output = self.output.lock().unwrap();
+        
+        let msg = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
+        
+        output.write_all(msg.as_bytes())
+            .map_err(|e| format!("write error: {}", e))?;
+        output.flush()
+            .map_err(|e| format!("flush error: {}", e))?;
+        
+        Ok(())
+    }
+    
+    fn response_to_json(&self, r: &Response) -> String {
+        let mut json = String::from("{");
+        json.push_str(&format!("\"seq\":{},", r.seq));
+        json.push_str("\"type\":\"response\",");
+        json.push_str(&format!("\"request_seq\":{},", r.request_seq));
+        json.push_str(&format!("\"success\":{},", r.success));
+        json.push_str(&format!("\"command\":\"{}\"", r.command));
+        
+        if let Some(ref msg) = r.message {
+            json.push_str(&format!(",\"message\":\"{}\"", escape_json_string(msg)));
+        }
+        
+        if let Some(ref body) = r.body {
+            json.push_str(",\"body\":");
+            json.push_str(&self.response_body_to_json(body));
+        }
+        
+        json.push('}');
+        json
+    }
+    
+    fn response_body_to_json(&self, body: &ResponseBody) -> String {
+        match body {
+            ResponseBody::Initialize(caps) => self.capabilities_to_json(caps),
+            ResponseBody::SetBreakpoints(b) => {
+                let bps: Vec<String> = b.breakpoints.iter()
+                    .map(|bp| self.breakpoint_to_json(bp))
+                    .collect();
+                format!("{{\"breakpoints\":[{}]}}", bps.join(","))
+            }
+            ResponseBody::Continue(b) => {
+                format!("{{\"allThreadsContinued\":{}}}", b.all_threads_continued)
+            }
+            ResponseBody::Threads(b) => {
+                let threads: Vec<String> = b.threads.iter()
+                    .map(|t| format!("{{\"id\":{},\"name\":\"{}\"}}", t.id, escape_json_string(&t.name)))
+                    .collect();
+                format!("{{\"threads\":[{}]}}", threads.join(","))
+            }
+            ResponseBody::StackTrace(b) => {
+                let frames: Vec<String> = b.stack_frames.iter()
+                    .map(|f| self.stack_frame_to_json(f))
+                    .collect();
+                let mut json = format!("{{\"stackFrames\":[{}]", frames.join(","));
+                if let Some(total) = b.total_frames {
+                    json.push_str(&format!(",\"totalFrames\":{}", total));
+                }
+                json.push('}');
+                json
+            }
+            ResponseBody::Scopes(b) => {
+                let scopes: Vec<String> = b.scopes.iter()
+                    .map(|s| self.scope_to_json(s))
+                    .collect();
+                format!("{{\"scopes\":[{}]}}", scopes.join(","))
+            }
+            ResponseBody::Variables(b) => {
+                let vars: Vec<String> = b.variables.iter()
+                    .map(|v| self.variable_to_json(v))
+                    .collect();
+                format!("{{\"variables\":[{}]}}", vars.join(","))
+            }
+            ResponseBody::Evaluate(b) => {
+                let mut json = format!("{{\"result\":\"{}\",\"variablesReference\":{}",
+                    escape_json_string(&b.result), b.variables_reference);
+                if let Some(ref ty) = b.ty {
+                    json.push_str(&format!(",\"type\":\"{}\"", escape_json_string(ty)));
+                }
+                json.push('}');
+                json
+            }
+            _ => "{}".to_string(),
+        }
+    }
+    
+    fn capabilities_to_json(&self, caps: &Capabilities) -> String {
+        let mut json = String::from("{");
+        
+        json.push_str(&format!("\"supportsConfigurationDoneRequest\":{},", caps.supports_configuration_done_request));
+        json.push_str(&format!("\"supportsFunctionBreakpoints\":{},", caps.supports_function_breakpoints));
+        json.push_str(&format!("\"supportsConditionalBreakpoints\":{},", caps.supports_conditional_breakpoints));
+        json.push_str(&format!("\"supportsEvaluateForHovers\":{},", caps.supports_evaluate_for_hovers));
+        json.push_str(&format!("\"supportsSetVariable\":{},", caps.supports_set_variable));
+        json.push_str(&format!("\"supportsCompletionsRequest\":{},", caps.supports_completions_request));
+        json.push_str(&format!("\"supportsRestartRequest\":{},", caps.supports_restart_request));
+        json.push_str(&format!("\"supportsTerminateRequest\":{},", caps.supports_terminate_request));
+        json.push_str(&format!("\"supportsDelayedStackTraceLoading\":{},", caps.supports_delayed_stack_trace_loading));
+        json.push_str(&format!("\"supportsLoadedSourcesRequest\":{},", caps.supports_loaded_sources_request));
+        json.push_str(&format!("\"supportsLogPoints\":{},", caps.supports_log_points));
+        json.push_str(&format!("\"supportsSteppingGranularity\":{},", caps.supports_stepping_granularity));
+        json.push_str(&format!("\"supportTerminateDebuggee\":{},", caps.support_terminate_debuggee));
+        json.push_str(&format!("\"supportSuspendDebuggee\":{}", caps.support_suspend_debuggee));
+        
+        if !caps.exception_breakpoint_filters.is_empty() {
+            json.push_str(",\"exceptionBreakpointFilters\":[");
+            let filters: Vec<String> = caps.exception_breakpoint_filters.iter()
+                .map(|f| format!(
+                    "{{\"filter\":\"{}\",\"label\":\"{}\",\"default\":{}}}",
+                    f.filter, f.label, f.default
+                ))
+                .collect();
+            json.push_str(&filters.join(","));
+            json.push(']');
+        }
+        
+        json.push('}');
+        json
+    }
+    
+    fn breakpoint_to_json(&self, bp: &Breakpoint) -> String {
+        let mut json = String::from("{");
+        
+        if let Some(id) = bp.id {
+            json.push_str(&format!("\"id\":{},", id));
+        }
+        json.push_str(&format!("\"verified\":{}", bp.verified));
+        if let Some(line) = bp.line {
+            json.push_str(&format!(",\"line\":{}", line));
+        }
+        if let Some(col) = bp.column {
+            json.push_str(&format!(",\"column\":{}", col));
+        }
+        
+        json.push('}');
+        json
+    }
+    
+    fn stack_frame_to_json(&self, frame: &StackFrame) -> String {
+        let mut json = format!(
+            "{{\"id\":{},\"name\":\"{}\",\"line\":{},\"column\":{}",
+            frame.id, escape_json_string(&frame.name), frame.line, frame.column
+        );
+        
+        if let Some(ref source) = frame.source {
+            json.push_str(",\"source\":");
+            json.push_str(&self.source_to_json(source));
+        }
+        
+        json.push('}');
+        json
+    }
+    
+    fn source_to_json(&self, source: &Source) -> String {
+        let mut json = String::from("{");
+        
+        if let Some(ref name) = source.name {
+            json.push_str(&format!("\"name\":\"{}\"", escape_json_string(name)));
+        }
+        if let Some(ref path) = source.path {
+            if source.name.is_some() { json.push(','); }
+            json.push_str(&format!("\"path\":\"{}\"", escape_json_string(path)));
+        }
+        
+        json.push('}');
+        json
+    }
+    
+    fn scope_to_json(&self, scope: &Scope) -> String {
+        let mut json = format!(
+            "{{\"name\":\"{}\",\"variablesReference\":{},\"expensive\":{}",
+            escape_json_string(&scope.name), scope.variables_reference, scope.expensive
+        );
+        
+        if let Some(hint) = &scope.presentation_hint {
+            let hint_str = match hint {
+                ScopePresentationHint::Arguments => "arguments",
+                ScopePresentationHint::Locals => "locals",
+                ScopePresentationHint::Registers => "registers",
+            };
+            json.push_str(&format!(",\"presentationHint\":\"{}\"", hint_str));
+        }
+        
+        json.push('}');
+        json
+    }
+    
+    fn variable_to_json(&self, var: &Variable) -> String {
+        let mut json = format!(
+            "{{\"name\":\"{}\",\"value\":\"{}\",\"variablesReference\":{}",
+            escape_json_string(&var.name),
+            escape_json_string(&var.value),
+            var.variables_reference
+        );
+        
+        if let Some(ref ty) = var.ty {
+            json.push_str(&format!(",\"type\":\"{}\"", escape_json_string(ty)));
+        }
+        if let Some(ref eval_name) = var.evaluate_name {
+            json.push_str(&format!(",\"evaluateName\":\"{}\"", escape_json_string(eval_name)));
+        }
+        
+        json.push('}');
+        json
+    }
+    
+    fn event_to_json(&self, event: &Event) -> String {
+        let mut json = format!(
+            "{{\"seq\":{},\"type\":\"event\",\"event\":\"{}\"",
+            event.seq, event.event
+        );
+        
+        if let Some(ref body) = event.body {
+            json.push_str(",\"body\":");
+            json.push_str(&self.event_body_to_json(body));
+        }
+        
+        json.push('}');
+        json
+    }
+    
+    fn event_body_to_json(&self, body: &EventBody) -> String {
+        match body {
+            EventBody::Initialized => "{}".to_string(),
+            EventBody::Stopped(b) => {
+                let reason = match b.reason {
+                    StopReason::Step => "step",
+                    StopReason::Breakpoint => "breakpoint",
+                    StopReason::Exception => "exception",
+                    StopReason::Pause => "pause",
+                    StopReason::Entry => "entry",
+                    _ => "unknown",
+                };
+                let mut json = format!("{{\"reason\":\"{}\"", reason);
+                if let Some(tid) = b.thread_id {
+                    json.push_str(&format!(",\"threadId\":{}", tid));
+                }
+                json.push_str(&format!(",\"allThreadsStopped\":{}", b.all_threads_stopped));
+                json.push('}');
+                json
+            }
+            EventBody::Continued(b) => {
+                format!("{{\"threadId\":{},\"allThreadsContinued\":{}}}", 
+                    b.thread_id, b.all_threads_continued)
+            }
+            EventBody::Exited(b) => {
+                format!("{{\"exitCode\":{}}}", b.exit_code)
+            }
+            EventBody::Terminated(_) => "{}".to_string(),
+            EventBody::Thread(b) => {
+                let reason = match b.reason {
+                    ThreadReason::Started => "started",
+                    ThreadReason::Exited => "exited",
+                };
+                format!("{{\"reason\":\"{}\",\"threadId\":{}}}", reason, b.thread_id)
+            }
+            EventBody::Output(b) => {
+                let mut json = format!("{{\"output\":\"{}\"", escape_json_string(&b.output));
+                if let Some(cat) = &b.category {
+                    let cat_str = match cat {
+                        OutputCategory::Console => "console",
+                        OutputCategory::Stdout => "stdout",
+                        OutputCategory::Stderr => "stderr",
+                        _ => "console",
+                    };
+                    json.push_str(&format!(",\"category\":\"{}\"", cat_str));
+                }
+                json.push('}');
+                json
+            }
+            _ => "{}".to_string(),
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REQUEST HANDLING
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn handle_message(&self, msg: Message) -> Result<(), String> {
+        match msg {
+            Message::Request(req) => self.handle_request(req),
+            _ => Ok(()),
+        }
+    }
+    
+    fn handle_request(&self, req: Request) -> Result<(), String> {
+        let result = match &req.arguments {
+            Some(RequestArguments::Initialize(args)) => self.handle_initialize(&req, args),
+            Some(RequestArguments::Launch(args)) => self.handle_launch(&req, args),
+            Some(RequestArguments::Attach(args)) => self.handle_attach(&req, args),
+            Some(RequestArguments::SetBreakpoints(args)) => self.handle_set_breakpoints(&req, args),
+            Some(RequestArguments::ConfigurationDone) => self.handle_configuration_done(&req),
+            Some(RequestArguments::Continue(args)) => self.handle_continue(&req, args),
+            Some(RequestArguments::Next(args)) => self.handle_next(&req, args),
+            Some(RequestArguments::StepIn(args)) => self.handle_step_in(&req, args),
+            Some(RequestArguments::StepOut(args)) => self.handle_step_out(&req, args),
+            Some(RequestArguments::Pause(args)) => self.handle_pause(&req, args),
+            Some(RequestArguments::Threads) => self.handle_threads(&req),
+            Some(RequestArguments::StackTrace(args)) => self.handle_stack_trace(&req, args),
+            Some(RequestArguments::Scopes(args)) => self.handle_scopes(&req, args),
+            Some(RequestArguments::Variables(args)) => self.handle_variables(&req, args),
+            Some(RequestArguments::Evaluate(args)) => self.handle_evaluate(&req, args),
+            Some(RequestArguments::Disconnect(args)) => self.handle_disconnect(&req, args),
+            Some(RequestArguments::Terminate(args)) => self.handle_terminate(&req, args),
+            _ => self.send_error_response(&req, &format!("unknown command: {}", req.command)),
+        };
+        
+        result
+    }
+    
+    fn handle_initialize(&self, req: &Request, args: &InitializeRequestArguments) -> Result<(), String> {
+        // Update config
+        self.session.update_config(|config| {
+            config.lines_start_at_1 = args.lines_start_at_1;
+            config.columns_start_at_1 = args.columns_start_at_1;
+        });
+        
+        self.session.set_state(SessionState::Initialized);
+        
+        // Send capabilities
+        self.send_response(&Response {
+            seq: self.session.next_seq(),
+            request_seq: req.seq,
+            success: true,
+            command: req.command.clone(),
+            message: None,
+            body: Some(ResponseBody::Initialize(self.capabilities.clone())),
+        })?;
+        
+        // Send initialized event
+        self.send_event(&Event {
+            seq: self.session.next_seq(),
+            event: "initialized".to_string(),
+            body: Some(EventBody::Initialized),
+        })
+    }
+    
+    fn handle_launch(&self, req: &Request, args: &LaunchRequestArguments) -> Result<(), String> {
+        match self.session.launch(args) {
+            Ok(()) => self.send_success_response(req),
+            Err(e) => self.send_error_response(req, &e),
+        }
+    }
+    
+    fn handle_attach(&self, req: &Request, args: &AttachRequestArguments) -> Result<(), String> {
+        match self.session.attach(args) {
+            Ok(()) => self.send_success_response(req),
+            Err(e) => self.send_error_response(req, &e),
+        }
+    }
+    
+    fn handle_set_breakpoints(&self, req: &Request, args: &SetBreakpointsArguments) -> Result<(), String> {
+        let breakpoints = self.session.set_breakpoints(&args.source, &args.breakpoints);
+        
+        self.send_response(&Response {
+            seq: self.session.next_seq(),
+            request_seq: req.seq,
+            success: true,
+            command: req.command.clone(),
+            message: None,
+            body: Some(ResponseBody::SetBreakpoints(SetBreakpointsResponseBody {
+                breakpoints,
+            })),
+        })
+    }
+    
+    fn handle_configuration_done(&self, req: &Request) -> Result<(), String> {
+        self.send_success_response(req)
+    }
+    
+    fn handle_continue(&self, req: &Request, args: &ContinueArguments) -> Result<(), String> {
+        match self.session.continue_execution(args.thread_id, args.single_thread) {
+            Ok(all_continued) => {
+                self.send_response(&Response {
+                    seq: self.session.next_seq(),
+                    request_seq: req.seq,
+                    success: true,
+                    command: req.command.clone(),
+                    message: None,
+                    body: Some(ResponseBody::Continue(ContinueResponseBody {
+                        all_threads_continued: all_continued,
+                    })),
+                })
+            }
+            Err(e) => self.send_error_response(req, &e),
+        }
+    }
+    
+    fn handle_next(&self, req: &Request, args: &NextArguments) -> Result<(), String> {
+        let granularity = args.granularity.unwrap_or(SteppingGranularity::Line);
+        match self.session.step_next(args.thread_id, granularity) {
+            Ok(()) => self.send_success_response(req),
+            Err(e) => self.send_error_response(req, &e),
+        }
+    }
+    
+    fn handle_step_in(&self, req: &Request, args: &StepInArguments) -> Result<(), String> {
+        let granularity = args.granularity.unwrap_or(SteppingGranularity::Line);
+        match self.session.step_in(args.thread_id, granularity) {
+            Ok(()) => self.send_success_response(req),
+            Err(e) => self.send_error_response(req, &e),
+        }
+    }
+    
+    fn handle_step_out(&self, req: &Request, args: &StepOutArguments) -> Result<(), String> {
+        let granularity = args.granularity.unwrap_or(SteppingGranularity::Line);
+        match self.session.step_out(args.thread_id, granularity) {
+            Ok(()) => self.send_success_response(req),
+            Err(e) => self.send_error_response(req, &e),
+        }
+    }
+    
+    fn handle_pause(&self, req: &Request, args: &PauseArguments) -> Result<(), String> {
+        match self.session.pause_thread(args.thread_id) {
+            Ok(()) => self.send_success_response(req),
+            Err(e) => self.send_error_response(req, &e),
+        }
+    }
+    
+    fn handle_threads(&self, req: &Request) -> Result<(), String> {
+        let threads = self.session.get_threads();
+        
+        self.send_response(&Response {
+            seq: self.session.next_seq(),
+            request_seq: req.seq,
+            success: true,
+            command: req.command.clone(),
+            message: None,
+            body: Some(ResponseBody::Threads(ThreadsResponseBody { threads })),
+        })
+    }
+    
+    fn handle_stack_trace(&self, req: &Request, args: &StackTraceArguments) -> Result<(), String> {
+        match self.session.get_stack_trace(args.thread_id, args.start_frame.unwrap_or(0), args.levels.unwrap_or(20)) {
+            Ok((frames, total)) => {
+                self.send_response(&Response {
+                    seq: self.session.next_seq(),
+                    request_seq: req.seq,
+                    success: true,
+                    command: req.command.clone(),
+                    message: None,
+                    body: Some(ResponseBody::StackTrace(StackTraceResponseBody {
+                        stack_frames: frames,
+                        total_frames: Some(total),
+                    })),
+                })
+            }
+            Err(e) => self.send_error_response(req, &e),
+        }
+    }
+    
+    fn handle_scopes(&self, req: &Request, args: &ScopesArguments) -> Result<(), String> {
+        let scopes = self.session.get_scopes(args.frame_id);
+        
+        self.send_response(&Response {
+            seq: self.session.next_seq(),
+            request_seq: req.seq,
+            success: true,
+            command: req.command.clone(),
+            message: None,
+            body: Some(ResponseBody::Scopes(ScopesResponseBody { scopes })),
+        })
+    }
+    
+    fn handle_variables(&self, req: &Request, args: &VariablesArguments) -> Result<(), String> {
+        let variables = self.session.get_variables(args.variables_reference);
+        
+        self.send_response(&Response {
+            seq: self.session.next_seq(),
+            request_seq: req.seq,
+            success: true,
+            command: req.command.clone(),
+            message: None,
+            body: Some(ResponseBody::Variables(VariablesResponseBody { variables })),
+        })
+    }
+    
+    fn handle_evaluate(&self, req: &Request, args: &EvaluateArguments) -> Result<(), String> {
+        let context = args.context.unwrap_or(EvaluateContext::Repl);
+        
+        match self.session.evaluate(&args.expression, args.frame_id, context) {
+            Ok(result) => {
+                self.send_response(&Response {
+                    seq: self.session.next_seq(),
+                    request_seq: req.seq,
+                    success: true,
+                    command: req.command.clone(),
+                    message: None,
+                    body: Some(ResponseBody::Evaluate(result)),
+                })
+            }
+            Err(e) => self.send_error_response(req, &e),
+        }
+    }
+    
+    fn handle_disconnect(&self, req: &Request, args: &DisconnectArguments) -> Result<(), String> {
+        let _ = self.session.disconnect(args.terminate_debuggee);
+        self.send_success_response(req)?;
+        self.stop();
+        Ok(())
+    }
+    
+    fn handle_terminate(&self, req: &Request, args: &TerminateArguments) -> Result<(), String> {
+        let _ = self.session.terminate();
+        self.send_success_response(req)
+    }
+    
+    fn send_success_response(&self, req: &Request) -> Result<(), String> {
+        self.send_response(&Response {
+            seq: self.session.next_seq(),
+            request_seq: req.seq,
+            success: true,
+            command: req.command.clone(),
+            message: None,
+            body: None,
+        })
+    }
+    
+    fn send_error_response(&self, req: &Request, error: &str) -> Result<(), String> {
+        self.send_response(&Response {
+            seq: self.session.next_seq(),
+            request_seq: req.seq,
+            success: false,
+            command: req.command.clone(),
+            message: Some(error.to_string()),
+            body: None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdapterState {
+    NotStarted,
+    Running,
+    Terminated,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JSON HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\":", key);
+    let start = json.find(&pattern)? + pattern.len();
+    let rest = json[start..].trim_start();
+    
+    if !rest.starts_with('"') {
+        return None;
+    }
+    
+    let rest = &rest[1..];
+    let end = rest.find('"')?;
+    
+    Some(rest[..end].to_string())
+}
+
+fn extract_json_i64(json: &str, key: &str) -> Option<i64> {
+    let pattern = format!("\"{}\":", key);
+    let start = json.find(&pattern)? + pattern.len();
+    let rest = json[start..].trim_start();
+    
+    let end = rest.find(|c: char| !c.is_ascii_digit() && c != '-')?;
+    rest[..end].parse().ok()
+}
+
+fn extract_json_bool(json: &str, key: &str) -> Option<bool> {
+    let pattern = format!("\"{}\":", key);
+    let start = json.find(&pattern)? + pattern.len();
+    let rest = json[start..].trim_start();
+    
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn extract_json_object(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\":", key);
+    let start = json.find(&pattern)? + pattern.len();
+    let rest = json[start..].trim_start();
+    
+    if !rest.starts_with('{') {
+        return None;
+    }
+    
+    let mut depth = 0;
+    let mut end = 0;
+    
+    for (i, c) in rest.chars().enumerate() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    Some(rest[..end].to_string())
+}
+
+fn extract_json_string_array(json: &str, key: &str) -> Option<Vec<String>> {
+    let pattern = format!("\"{}\":", key);
+    let start = json.find(&pattern)? + pattern.len();
+    let rest = json[start..].trim_start();
+    
+    if !rest.starts_with('[') {
+        return None;
+    }
+    
+    let end = rest.find(']')? + 1;
+    let array = &rest[1..end-1];
+    
+    let items: Vec<String> = array
+        .split(',')
+        .filter_map(|s| {
+            let s = s.trim();
+            if s.starts_with('"') && s.ends_with('"') {
+                Some(s[1..s.len()-1].to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    
+    Some(items)
+}
+
+fn escape_json_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn parse_source(json: Option<&str>) -> Result<Source, String> {
+    let json = json.ok_or("missing source")?;
+    
+    Ok(Source {
+        name: extract_json_string(json, "name"),
+        path: extract_json_string(json, "path"),
+        source_reference: extract_json_i64(json, "sourceReference"),
+        presentation_hint: None,
+        origin: None,
+        sources: Vec::new(),
+        adapter_data: None,
+        checksums: Vec::new(),
+    })
+}
+
+fn parse_source_breakpoints(json: &str) -> Result<Vec<SourceBreakpoint>, String> {
+    // Simplified - in production use proper JSON parser
+    let mut breakpoints = Vec::new();
+    
+    // Find breakpoints array
+    if let Some(start) = json.find("\"breakpoints\"") {
+        let rest = &json[start..];
+        if let Some(arr_start) = rest.find('[') {
+            if let Some(arr_end) = rest.find(']') {
+                let arr = &rest[arr_start+1..arr_end];
+                
+                for bp in arr.split("},") {
+                    let bp = bp.trim().trim_start_matches('{').trim_end_matches('}');
+                    
+                    if let Some(line) = extract_json_i64(bp, "line") {
+                        breakpoints.push(SourceBreakpoint {
+                            line,
+                            column: extract_json_i64(bp, "column"),
+                            condition: extract_json_string(bp, "condition"),
+                            hit_condition: extract_json_string(bp, "hitCondition"),
+                            log_message: extract_json_string(bp, "logMessage"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(breakpoints)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_extract_json_string() {
+        let json = r#"{"type":"request","command":"initialize"}"#;
+        assert_eq!(extract_json_string(json, "type"), Some("request".to_string()));
+        assert_eq!(extract_json_string(json, "command"), Some("initialize".to_string()));
+    }
+    
+    #[test]
+    fn test_extract_json_i64() {
+        let json = r#"{"seq":42,"threadId":1}"#;
+        assert_eq!(extract_json_i64(json, "seq"), Some(42));
+        assert_eq!(extract_json_i64(json, "threadId"), Some(1));
+    }
+    
+    #[test]
+    fn test_escape_json_string() {
+        assert_eq!(escape_json_string("hello\nworld"), "hello\\nworld");
+        assert_eq!(escape_json_string("say \"hi\""), "say \\\"hi\\\"");
+    }
+}

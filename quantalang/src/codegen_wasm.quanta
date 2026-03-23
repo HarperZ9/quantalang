@@ -1,0 +1,1152 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ WASM BACKEND — WebAssembly Code Generation
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Generates WebAssembly binary format (.wasm) from QuantaLang MIR.
+// Targets wasm32-unknown-wasi for WASI runtime support.
+//
+// WebAssembly Binary Format:
+//   - Magic: 0x00 0x61 0x73 0x6D ("\0asm")
+//   - Version: 0x01 0x00 0x00 0x00 (version 1)
+//   - Sections: Type, Import, Function, Table, Memory, Global, Export, 
+//               Start, Element, Code, Data, DataCount, Custom
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::codegen::wasm
+
+use std::collections::HashMap;
+use std::io::{self, Write};
+use crate::mir::*;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WASM CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Magic number and version
+pub const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D]; // "\0asm"
+pub const WASM_VERSION: [u8; 4] = [0x01, 0x00, 0x00, 0x00]; // version 1
+
+// Section IDs
+pub const SECTION_CUSTOM: u8 = 0;
+pub const SECTION_TYPE: u8 = 1;
+pub const SECTION_IMPORT: u8 = 2;
+pub const SECTION_FUNCTION: u8 = 3;
+pub const SECTION_TABLE: u8 = 4;
+pub const SECTION_MEMORY: u8 = 5;
+pub const SECTION_GLOBAL: u8 = 6;
+pub const SECTION_EXPORT: u8 = 7;
+pub const SECTION_START: u8 = 8;
+pub const SECTION_ELEMENT: u8 = 9;
+pub const SECTION_CODE: u8 = 10;
+pub const SECTION_DATA: u8 = 11;
+pub const SECTION_DATA_COUNT: u8 = 12;
+
+// Value types
+pub const TYPE_I32: u8 = 0x7F;
+pub const TYPE_I64: u8 = 0x7E;
+pub const TYPE_F32: u8 = 0x7D;
+pub const TYPE_F64: u8 = 0x7C;
+pub const TYPE_V128: u8 = 0x7B;
+pub const TYPE_FUNCREF: u8 = 0x70;
+pub const TYPE_EXTERNREF: u8 = 0x6F;
+
+// Function type marker
+pub const TYPE_FUNC: u8 = 0x60;
+
+// Block types
+pub const BLOCK_VOID: u8 = 0x40;
+
+// Export kinds
+pub const EXPORT_FUNC: u8 = 0x00;
+pub const EXPORT_TABLE: u8 = 0x01;
+pub const EXPORT_MEMORY: u8 = 0x02;
+pub const EXPORT_GLOBAL: u8 = 0x03;
+
+// Import kinds
+pub const IMPORT_FUNC: u8 = 0x00;
+pub const IMPORT_TABLE: u8 = 0x01;
+pub const IMPORT_MEMORY: u8 = 0x02;
+pub const IMPORT_GLOBAL: u8 = 0x03;
+
+// Limits flags
+pub const LIMITS_MIN_ONLY: u8 = 0x00;
+pub const LIMITS_MIN_MAX: u8 = 0x01;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WASM OPCODES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WasmOp {
+    // Control flow
+    Unreachable = 0x00,
+    Nop = 0x01,
+    Block = 0x02,
+    Loop = 0x03,
+    If = 0x04,
+    Else = 0x05,
+    End = 0x0B,
+    Br = 0x0C,
+    BrIf = 0x0D,
+    BrTable = 0x0E,
+    Return = 0x0F,
+    Call = 0x10,
+    CallIndirect = 0x11,
+    
+    // Reference types
+    RefNull = 0xD0,
+    RefIsNull = 0xD1,
+    RefFunc = 0xD2,
+    
+    // Parametric
+    Drop = 0x1A,
+    Select = 0x1B,
+    SelectTyped = 0x1C,
+    
+    // Variable access
+    LocalGet = 0x20,
+    LocalSet = 0x21,
+    LocalTee = 0x22,
+    GlobalGet = 0x23,
+    GlobalSet = 0x24,
+    
+    // Table operations
+    TableGet = 0x25,
+    TableSet = 0x26,
+    
+    // Memory operations
+    I32Load = 0x28,
+    I64Load = 0x29,
+    F32Load = 0x2A,
+    F64Load = 0x2B,
+    I32Load8S = 0x2C,
+    I32Load8U = 0x2D,
+    I32Load16S = 0x2E,
+    I32Load16U = 0x2F,
+    I64Load8S = 0x30,
+    I64Load8U = 0x31,
+    I64Load16S = 0x32,
+    I64Load16U = 0x33,
+    I64Load32S = 0x34,
+    I64Load32U = 0x35,
+    I32Store = 0x36,
+    I64Store = 0x37,
+    F32Store = 0x38,
+    F64Store = 0x39,
+    I32Store8 = 0x3A,
+    I32Store16 = 0x3B,
+    I64Store8 = 0x3C,
+    I64Store16 = 0x3D,
+    I64Store32 = 0x3E,
+    MemorySize = 0x3F,
+    MemoryGrow = 0x40,
+    
+    // Constants
+    I32Const = 0x41,
+    I64Const = 0x42,
+    F32Const = 0x43,
+    F64Const = 0x44,
+    
+    // Comparison (i32)
+    I32Eqz = 0x45,
+    I32Eq = 0x46,
+    I32Ne = 0x47,
+    I32LtS = 0x48,
+    I32LtU = 0x49,
+    I32GtS = 0x4A,
+    I32GtU = 0x4B,
+    I32LeS = 0x4C,
+    I32LeU = 0x4D,
+    I32GeS = 0x4E,
+    I32GeU = 0x4F,
+    
+    // Comparison (i64)
+    I64Eqz = 0x50,
+    I64Eq = 0x51,
+    I64Ne = 0x52,
+    I64LtS = 0x53,
+    I64LtU = 0x54,
+    I64GtS = 0x55,
+    I64GtU = 0x56,
+    I64LeS = 0x57,
+    I64LeU = 0x58,
+    I64GeS = 0x59,
+    I64GeU = 0x5A,
+    
+    // Comparison (f32)
+    F32Eq = 0x5B,
+    F32Ne = 0x5C,
+    F32Lt = 0x5D,
+    F32Gt = 0x5E,
+    F32Le = 0x5F,
+    F32Ge = 0x60,
+    
+    // Comparison (f64)
+    F64Eq = 0x61,
+    F64Ne = 0x62,
+    F64Lt = 0x63,
+    F64Gt = 0x64,
+    F64Le = 0x65,
+    F64Ge = 0x66,
+    
+    // Arithmetic (i32)
+    I32Clz = 0x67,
+    I32Ctz = 0x68,
+    I32Popcnt = 0x69,
+    I32Add = 0x6A,
+    I32Sub = 0x6B,
+    I32Mul = 0x6C,
+    I32DivS = 0x6D,
+    I32DivU = 0x6E,
+    I32RemS = 0x6F,
+    I32RemU = 0x70,
+    I32And = 0x71,
+    I32Or = 0x72,
+    I32Xor = 0x73,
+    I32Shl = 0x74,
+    I32ShrS = 0x75,
+    I32ShrU = 0x76,
+    I32Rotl = 0x77,
+    I32Rotr = 0x78,
+    
+    // Arithmetic (i64)
+    I64Clz = 0x79,
+    I64Ctz = 0x7A,
+    I64Popcnt = 0x7B,
+    I64Add = 0x7C,
+    I64Sub = 0x7D,
+    I64Mul = 0x7E,
+    I64DivS = 0x7F,
+    I64DivU = 0x80,
+    I64RemS = 0x81,
+    I64RemU = 0x82,
+    I64And = 0x83,
+    I64Or = 0x84,
+    I64Xor = 0x85,
+    I64Shl = 0x86,
+    I64ShrS = 0x87,
+    I64ShrU = 0x88,
+    I64Rotl = 0x89,
+    I64Rotr = 0x8A,
+    
+    // Arithmetic (f32)
+    F32Abs = 0x8B,
+    F32Neg = 0x8C,
+    F32Ceil = 0x8D,
+    F32Floor = 0x8E,
+    F32Trunc = 0x8F,
+    F32Nearest = 0x90,
+    F32Sqrt = 0x91,
+    F32Add = 0x92,
+    F32Sub = 0x93,
+    F32Mul = 0x94,
+    F32Div = 0x95,
+    F32Min = 0x96,
+    F32Max = 0x97,
+    F32Copysign = 0x98,
+    
+    // Arithmetic (f64)
+    F64Abs = 0x99,
+    F64Neg = 0x9A,
+    F64Ceil = 0x9B,
+    F64Floor = 0x9C,
+    F64Trunc = 0x9D,
+    F64Nearest = 0x9E,
+    F64Sqrt = 0x9F,
+    F64Add = 0xA0,
+    F64Sub = 0xA1,
+    F64Mul = 0xA2,
+    F64Div = 0xA3,
+    F64Min = 0xA4,
+    F64Max = 0xA5,
+    F64Copysign = 0xA6,
+    
+    // Conversions
+    I32WrapI64 = 0xA7,
+    I32TruncF32S = 0xA8,
+    I32TruncF32U = 0xA9,
+    I32TruncF64S = 0xAA,
+    I32TruncF64U = 0xAB,
+    I64ExtendI32S = 0xAC,
+    I64ExtendI32U = 0xAD,
+    I64TruncF32S = 0xAE,
+    I64TruncF32U = 0xAF,
+    I64TruncF64S = 0xB0,
+    I64TruncF64U = 0xB1,
+    F32ConvertI32S = 0xB2,
+    F32ConvertI32U = 0xB3,
+    F32ConvertI64S = 0xB4,
+    F32ConvertI64U = 0xB5,
+    F32DemoteF64 = 0xB6,
+    F64ConvertI32S = 0xB7,
+    F64ConvertI32U = 0xB8,
+    F64ConvertI64S = 0xB9,
+    F64ConvertI64U = 0xBA,
+    F64PromoteF32 = 0xBB,
+    I32ReinterpretF32 = 0xBC,
+    I64ReinterpretF64 = 0xBD,
+    F32ReinterpretI32 = 0xBE,
+    F64ReinterpretI64 = 0xBF,
+    
+    // Sign extension
+    I32Extend8S = 0xC0,
+    I32Extend16S = 0xC1,
+    I64Extend8S = 0xC2,
+    I64Extend16S = 0xC3,
+    I64Extend32S = 0xC4,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WASM TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// WebAssembly value type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmType {
+    I32,
+    I64,
+    F32,
+    F64,
+    V128,
+    FuncRef,
+    ExternRef,
+}
+
+impl WasmType {
+    pub fn to_byte(&self) -> u8 {
+        match self {
+            WasmType::I32 => TYPE_I32,
+            WasmType::I64 => TYPE_I64,
+            WasmType::F32 => TYPE_F32,
+            WasmType::F64 => TYPE_F64,
+            WasmType::V128 => TYPE_V128,
+            WasmType::FuncRef => TYPE_FUNCREF,
+            WasmType::ExternRef => TYPE_EXTERNREF,
+        }
+    }
+    
+    pub fn size(&self) -> u32 {
+        match self {
+            WasmType::I32 | WasmType::F32 => 4,
+            WasmType::I64 | WasmType::F64 => 8,
+            WasmType::V128 => 16,
+            WasmType::FuncRef | WasmType::ExternRef => 4, // Reference
+        }
+    }
+}
+
+/// Function type signature
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FuncType {
+    pub params: Vec<WasmType>,
+    pub results: Vec<WasmType>,
+}
+
+impl FuncType {
+    pub fn new(params: Vec<WasmType>, results: Vec<WasmType>) -> Self {
+        FuncType { params, results }
+    }
+    
+    pub fn void() -> Self {
+        FuncType { params: Vec::new(), results: Vec::new() }
+    }
+}
+
+/// Import descriptor
+#[derive(Debug, Clone)]
+pub struct WasmImport {
+    pub module: String,
+    pub name: String,
+    pub kind: ImportKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum ImportKind {
+    Func(u32),      // Type index
+    Table(TableType),
+    Memory(MemoryType),
+    Global(GlobalType),
+}
+
+/// Export descriptor
+#[derive(Debug, Clone)]
+pub struct WasmExport {
+    pub name: String,
+    pub kind: ExportKind,
+    pub index: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ExportKind {
+    Func,
+    Table,
+    Memory,
+    Global,
+}
+
+impl ExportKind {
+    pub fn to_byte(&self) -> u8 {
+        match self {
+            ExportKind::Func => EXPORT_FUNC,
+            ExportKind::Table => EXPORT_TABLE,
+            ExportKind::Memory => EXPORT_MEMORY,
+            ExportKind::Global => EXPORT_GLOBAL,
+        }
+    }
+}
+
+/// Table type
+#[derive(Debug, Clone)]
+pub struct TableType {
+    pub elem_type: WasmType,
+    pub limits: Limits,
+}
+
+/// Memory type
+#[derive(Debug, Clone)]
+pub struct MemoryType {
+    pub limits: Limits,
+}
+
+/// Global type
+#[derive(Debug, Clone)]
+pub struct GlobalType {
+    pub value_type: WasmType,
+    pub mutable: bool,
+}
+
+/// Limits (min/max)
+#[derive(Debug, Clone)]
+pub struct Limits {
+    pub min: u32,
+    pub max: Option<u32>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WASM FUNCTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A WASM function body
+#[derive(Debug, Clone)]
+pub struct WasmFunction {
+    /// Local variables (excluding parameters)
+    pub locals: Vec<WasmType>,
+    /// Function body instructions
+    pub code: Vec<u8>,
+}
+
+impl WasmFunction {
+    pub fn new() -> Self {
+        WasmFunction {
+            locals: Vec::new(),
+            code: Vec::new(),
+        }
+    }
+    
+    /// Add a local variable, returns its index
+    pub fn add_local(&mut self, ty: WasmType) -> u32 {
+        let idx = self.locals.len() as u32;
+        self.locals.push(ty);
+        idx
+    }
+    
+    /// Emit an opcode
+    pub fn emit(&mut self, op: WasmOp) {
+        self.code.push(op as u8);
+    }
+    
+    /// Emit an opcode with a u32 immediate (LEB128)
+    pub fn emit_u32(&mut self, op: WasmOp, val: u32) {
+        self.code.push(op as u8);
+        write_leb128_u32(&mut self.code, val);
+    }
+    
+    /// Emit an opcode with an i32 immediate (LEB128)
+    pub fn emit_i32(&mut self, op: WasmOp, val: i32) {
+        self.code.push(op as u8);
+        write_leb128_i32(&mut self.code, val);
+    }
+    
+    /// Emit an opcode with an i64 immediate (LEB128)
+    pub fn emit_i64(&mut self, op: WasmOp, val: i64) {
+        self.code.push(op as u8);
+        write_leb128_i64(&mut self.code, val);
+    }
+    
+    /// Emit an opcode with an f32 immediate
+    pub fn emit_f32(&mut self, op: WasmOp, val: f32) {
+        self.code.push(op as u8);
+        self.code.extend_from_slice(&val.to_le_bytes());
+    }
+    
+    /// Emit an opcode with an f64 immediate
+    pub fn emit_f64(&mut self, op: WasmOp, val: f64) {
+        self.code.push(op as u8);
+        self.code.extend_from_slice(&val.to_le_bytes());
+    }
+    
+    /// Emit a memory operation with alignment and offset
+    pub fn emit_memarg(&mut self, op: WasmOp, align: u32, offset: u32) {
+        self.code.push(op as u8);
+        write_leb128_u32(&mut self.code, align);
+        write_leb128_u32(&mut self.code, offset);
+    }
+    
+    /// Emit block type
+    pub fn emit_block(&mut self, op: WasmOp, block_type: Option<WasmType>) {
+        self.code.push(op as u8);
+        match block_type {
+            None => self.code.push(BLOCK_VOID),
+            Some(ty) => self.code.push(ty.to_byte()),
+        }
+    }
+    
+    /// Emit raw bytes
+    pub fn emit_bytes(&mut self, bytes: &[u8]) {
+        self.code.extend_from_slice(bytes);
+    }
+}
+
+impl Default for WasmFunction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WASM MODULE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A complete WASM module
+pub struct WasmModule {
+    /// Function type signatures
+    pub types: Vec<FuncType>,
+    /// Type index deduplication
+    type_map: HashMap<FuncType, u32>,
+    /// Imports
+    pub imports: Vec<WasmImport>,
+    /// Function type indices (for non-imported functions)
+    pub func_types: Vec<u32>,
+    /// Tables
+    pub tables: Vec<TableType>,
+    /// Memories
+    pub memories: Vec<MemoryType>,
+    /// Globals
+    pub globals: Vec<(GlobalType, Vec<u8>)>,
+    /// Exports
+    pub exports: Vec<WasmExport>,
+    /// Start function index
+    pub start: Option<u32>,
+    /// Element segments
+    pub elements: Vec<ElementSegment>,
+    /// Function bodies
+    pub functions: Vec<WasmFunction>,
+    /// Data segments
+    pub data: Vec<DataSegment>,
+    /// Custom sections
+    pub custom: Vec<(String, Vec<u8>)>,
+    
+    /// Number of imported functions
+    num_imported_funcs: u32,
+}
+
+/// Element segment
+#[derive(Debug, Clone)]
+pub struct ElementSegment {
+    pub table_idx: u32,
+    pub offset: Vec<u8>,  // Constant expression
+    pub func_indices: Vec<u32>,
+}
+
+/// Data segment
+#[derive(Debug, Clone)]
+pub struct DataSegment {
+    pub memory_idx: u32,
+    pub offset: Vec<u8>,  // Constant expression
+    pub data: Vec<u8>,
+}
+
+impl WasmModule {
+    pub fn new() -> Self {
+        WasmModule {
+            types: Vec::new(),
+            type_map: HashMap::new(),
+            imports: Vec::new(),
+            func_types: Vec::new(),
+            tables: Vec::new(),
+            memories: Vec::new(),
+            globals: Vec::new(),
+            exports: Vec::new(),
+            start: None,
+            elements: Vec::new(),
+            functions: Vec::new(),
+            data: Vec::new(),
+            custom: Vec::new(),
+            num_imported_funcs: 0,
+        }
+    }
+    
+    /// Add or get a function type, returns type index
+    pub fn add_type(&mut self, func_type: FuncType) -> u32 {
+        if let Some(&idx) = self.type_map.get(&func_type) {
+            return idx;
+        }
+        
+        let idx = self.types.len() as u32;
+        self.type_map.insert(func_type.clone(), idx);
+        self.types.push(func_type);
+        idx
+    }
+    
+    /// Add an import
+    pub fn add_import(&mut self, import: WasmImport) -> u32 {
+        let idx = match &import.kind {
+            ImportKind::Func(_) => {
+                let idx = self.num_imported_funcs;
+                self.num_imported_funcs += 1;
+                idx
+            }
+            _ => 0, // TODO: Track other import counts
+        };
+        self.imports.push(import);
+        idx
+    }
+    
+    /// Add a function, returns function index
+    pub fn add_function(&mut self, type_idx: u32, body: WasmFunction) -> u32 {
+        let idx = self.num_imported_funcs + self.functions.len() as u32;
+        self.func_types.push(type_idx);
+        self.functions.push(body);
+        idx
+    }
+    
+    /// Add a memory
+    pub fn add_memory(&mut self, min_pages: u32, max_pages: Option<u32>) -> u32 {
+        let idx = self.memories.len() as u32;
+        self.memories.push(MemoryType {
+            limits: Limits {
+                min: min_pages,
+                max: max_pages,
+            },
+        });
+        idx
+    }
+    
+    /// Add a global
+    pub fn add_global(&mut self, ty: GlobalType, init: Vec<u8>) -> u32 {
+        let idx = self.globals.len() as u32;
+        self.globals.push((ty, init));
+        idx
+    }
+    
+    /// Add an export
+    pub fn add_export(&mut self, name: String, kind: ExportKind, index: u32) {
+        self.exports.push(WasmExport { name, kind, index });
+    }
+    
+    /// Add a data segment
+    pub fn add_data(&mut self, memory_idx: u32, offset: u32, data: Vec<u8>) {
+        // Create offset expression: i32.const <offset>; end
+        let mut offset_expr = Vec::new();
+        offset_expr.push(WasmOp::I32Const as u8);
+        write_leb128_i32(&mut offset_expr, offset as i32);
+        offset_expr.push(WasmOp::End as u8);
+        
+        self.data.push(DataSegment {
+            memory_idx,
+            offset: offset_expr,
+            data,
+        });
+    }
+    
+    /// Encode the module to binary format
+    pub fn encode(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        
+        // Magic and version
+        output.extend_from_slice(&WASM_MAGIC);
+        output.extend_from_slice(&WASM_VERSION);
+        
+        // Type section
+        if !self.types.is_empty() {
+            self.encode_type_section(&mut output);
+        }
+        
+        // Import section
+        if !self.imports.is_empty() {
+            self.encode_import_section(&mut output);
+        }
+        
+        // Function section
+        if !self.func_types.is_empty() {
+            self.encode_function_section(&mut output);
+        }
+        
+        // Table section
+        if !self.tables.is_empty() {
+            self.encode_table_section(&mut output);
+        }
+        
+        // Memory section
+        if !self.memories.is_empty() {
+            self.encode_memory_section(&mut output);
+        }
+        
+        // Global section
+        if !self.globals.is_empty() {
+            self.encode_global_section(&mut output);
+        }
+        
+        // Export section
+        if !self.exports.is_empty() {
+            self.encode_export_section(&mut output);
+        }
+        
+        // Start section
+        if let Some(start_idx) = self.start {
+            self.encode_start_section(&mut output, start_idx);
+        }
+        
+        // Element section
+        if !self.elements.is_empty() {
+            self.encode_element_section(&mut output);
+        }
+        
+        // Data count section (for bulk memory operations)
+        if !self.data.is_empty() {
+            self.encode_data_count_section(&mut output);
+        }
+        
+        // Code section
+        if !self.functions.is_empty() {
+            self.encode_code_section(&mut output);
+        }
+        
+        // Data section
+        if !self.data.is_empty() {
+            self.encode_data_section(&mut output);
+        }
+        
+        // Custom sections
+        for (name, data) in &self.custom {
+            self.encode_custom_section(&mut output, name, data);
+        }
+        
+        output
+    }
+    
+    fn encode_type_section(&self, output: &mut Vec<u8>) {
+        let mut section = Vec::new();
+        
+        write_leb128_u32(&mut section, self.types.len() as u32);
+        
+        for func_type in &self.types {
+            section.push(TYPE_FUNC);
+            
+            // Params
+            write_leb128_u32(&mut section, func_type.params.len() as u32);
+            for ty in &func_type.params {
+                section.push(ty.to_byte());
+            }
+            
+            // Results
+            write_leb128_u32(&mut section, func_type.results.len() as u32);
+            for ty in &func_type.results {
+                section.push(ty.to_byte());
+            }
+        }
+        
+        output.push(SECTION_TYPE);
+        write_leb128_u32(output, section.len() as u32);
+        output.extend_from_slice(&section);
+    }
+    
+    fn encode_import_section(&self, output: &mut Vec<u8>) {
+        let mut section = Vec::new();
+        
+        write_leb128_u32(&mut section, self.imports.len() as u32);
+        
+        for import in &self.imports {
+            // Module name
+            write_leb128_u32(&mut section, import.module.len() as u32);
+            section.extend_from_slice(import.module.as_bytes());
+            
+            // Field name
+            write_leb128_u32(&mut section, import.name.len() as u32);
+            section.extend_from_slice(import.name.as_bytes());
+            
+            // Import kind
+            match &import.kind {
+                ImportKind::Func(type_idx) => {
+                    section.push(IMPORT_FUNC);
+                    write_leb128_u32(&mut section, *type_idx);
+                }
+                ImportKind::Table(table_type) => {
+                    section.push(IMPORT_TABLE);
+                    section.push(table_type.elem_type.to_byte());
+                    self.encode_limits(&mut section, &table_type.limits);
+                }
+                ImportKind::Memory(mem_type) => {
+                    section.push(IMPORT_MEMORY);
+                    self.encode_limits(&mut section, &mem_type.limits);
+                }
+                ImportKind::Global(global_type) => {
+                    section.push(IMPORT_GLOBAL);
+                    section.push(global_type.value_type.to_byte());
+                    section.push(if global_type.mutable { 1 } else { 0 });
+                }
+            }
+        }
+        
+        output.push(SECTION_IMPORT);
+        write_leb128_u32(output, section.len() as u32);
+        output.extend_from_slice(&section);
+    }
+    
+    fn encode_function_section(&self, output: &mut Vec<u8>) {
+        let mut section = Vec::new();
+        
+        write_leb128_u32(&mut section, self.func_types.len() as u32);
+        for type_idx in &self.func_types {
+            write_leb128_u32(&mut section, *type_idx);
+        }
+        
+        output.push(SECTION_FUNCTION);
+        write_leb128_u32(output, section.len() as u32);
+        output.extend_from_slice(&section);
+    }
+    
+    fn encode_table_section(&self, output: &mut Vec<u8>) {
+        let mut section = Vec::new();
+        
+        write_leb128_u32(&mut section, self.tables.len() as u32);
+        for table in &self.tables {
+            section.push(table.elem_type.to_byte());
+            self.encode_limits(&mut section, &table.limits);
+        }
+        
+        output.push(SECTION_TABLE);
+        write_leb128_u32(output, section.len() as u32);
+        output.extend_from_slice(&section);
+    }
+    
+    fn encode_memory_section(&self, output: &mut Vec<u8>) {
+        let mut section = Vec::new();
+        
+        write_leb128_u32(&mut section, self.memories.len() as u32);
+        for memory in &self.memories {
+            self.encode_limits(&mut section, &memory.limits);
+        }
+        
+        output.push(SECTION_MEMORY);
+        write_leb128_u32(output, section.len() as u32);
+        output.extend_from_slice(&section);
+    }
+    
+    fn encode_global_section(&self, output: &mut Vec<u8>) {
+        let mut section = Vec::new();
+        
+        write_leb128_u32(&mut section, self.globals.len() as u32);
+        for (global_type, init) in &self.globals {
+            section.push(global_type.value_type.to_byte());
+            section.push(if global_type.mutable { 1 } else { 0 });
+            section.extend_from_slice(init);
+        }
+        
+        output.push(SECTION_GLOBAL);
+        write_leb128_u32(output, section.len() as u32);
+        output.extend_from_slice(&section);
+    }
+    
+    fn encode_export_section(&self, output: &mut Vec<u8>) {
+        let mut section = Vec::new();
+        
+        write_leb128_u32(&mut section, self.exports.len() as u32);
+        for export in &self.exports {
+            write_leb128_u32(&mut section, export.name.len() as u32);
+            section.extend_from_slice(export.name.as_bytes());
+            section.push(export.kind.to_byte());
+            write_leb128_u32(&mut section, export.index);
+        }
+        
+        output.push(SECTION_EXPORT);
+        write_leb128_u32(output, section.len() as u32);
+        output.extend_from_slice(&section);
+    }
+    
+    fn encode_start_section(&self, output: &mut Vec<u8>, start_idx: u32) {
+        let mut section = Vec::new();
+        write_leb128_u32(&mut section, start_idx);
+        
+        output.push(SECTION_START);
+        write_leb128_u32(output, section.len() as u32);
+        output.extend_from_slice(&section);
+    }
+    
+    fn encode_element_section(&self, output: &mut Vec<u8>) {
+        let mut section = Vec::new();
+        
+        write_leb128_u32(&mut section, self.elements.len() as u32);
+        for elem in &self.elements {
+            write_leb128_u32(&mut section, elem.table_idx);
+            section.extend_from_slice(&elem.offset);
+            
+            write_leb128_u32(&mut section, elem.func_indices.len() as u32);
+            for idx in &elem.func_indices {
+                write_leb128_u32(&mut section, *idx);
+            }
+        }
+        
+        output.push(SECTION_ELEMENT);
+        write_leb128_u32(output, section.len() as u32);
+        output.extend_from_slice(&section);
+    }
+    
+    fn encode_data_count_section(&self, output: &mut Vec<u8>) {
+        let mut section = Vec::new();
+        write_leb128_u32(&mut section, self.data.len() as u32);
+        
+        output.push(SECTION_DATA_COUNT);
+        write_leb128_u32(output, section.len() as u32);
+        output.extend_from_slice(&section);
+    }
+    
+    fn encode_code_section(&self, output: &mut Vec<u8>) {
+        let mut section = Vec::new();
+        
+        write_leb128_u32(&mut section, self.functions.len() as u32);
+        
+        for func in &self.functions {
+            let mut func_body = Vec::new();
+            
+            // Encode locals (compressed by type)
+            let mut local_groups: Vec<(u32, WasmType)> = Vec::new();
+            for &ty in &func.locals {
+                if let Some(last) = local_groups.last_mut() {
+                    if last.1 == ty {
+                        last.0 += 1;
+                        continue;
+                    }
+                }
+                local_groups.push((1, ty));
+            }
+            
+            write_leb128_u32(&mut func_body, local_groups.len() as u32);
+            for (count, ty) in local_groups {
+                write_leb128_u32(&mut func_body, count);
+                func_body.push(ty.to_byte());
+            }
+            
+            // Function code
+            func_body.extend_from_slice(&func.code);
+            
+            // Write function body size
+            write_leb128_u32(&mut section, func_body.len() as u32);
+            section.extend_from_slice(&func_body);
+        }
+        
+        output.push(SECTION_CODE);
+        write_leb128_u32(output, section.len() as u32);
+        output.extend_from_slice(&section);
+    }
+    
+    fn encode_data_section(&self, output: &mut Vec<u8>) {
+        let mut section = Vec::new();
+        
+        write_leb128_u32(&mut section, self.data.len() as u32);
+        for data in &self.data {
+            // Memory index (0 = active segment)
+            write_leb128_u32(&mut section, 0);
+            // Offset expression
+            section.extend_from_slice(&data.offset);
+            // Data
+            write_leb128_u32(&mut section, data.data.len() as u32);
+            section.extend_from_slice(&data.data);
+        }
+        
+        output.push(SECTION_DATA);
+        write_leb128_u32(output, section.len() as u32);
+        output.extend_from_slice(&section);
+    }
+    
+    fn encode_custom_section(&self, output: &mut Vec<u8>, name: &str, data: &[u8]) {
+        let mut section = Vec::new();
+        
+        // Name
+        write_leb128_u32(&mut section, name.len() as u32);
+        section.extend_from_slice(name.as_bytes());
+        
+        // Data
+        section.extend_from_slice(data);
+        
+        output.push(SECTION_CUSTOM);
+        write_leb128_u32(output, section.len() as u32);
+        output.extend_from_slice(&section);
+    }
+    
+    fn encode_limits(&self, output: &mut Vec<u8>, limits: &Limits) {
+        if let Some(max) = limits.max {
+            output.push(LIMITS_MIN_MAX);
+            write_leb128_u32(output, limits.min);
+            write_leb128_u32(output, max);
+        } else {
+            output.push(LIMITS_MIN_ONLY);
+            write_leb128_u32(output, limits.min);
+        }
+    }
+}
+
+impl Default for WasmModule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LEB128 ENCODING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Write unsigned LEB128
+pub fn write_leb128_u32(output: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        output.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+/// Write signed LEB128 (i32)
+pub fn write_leb128_i32(output: &mut Vec<u8>, mut value: i32) {
+    let mut more = true;
+    while more {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        
+        // Check if we need more bytes
+        let sign_bit = (byte & 0x40) != 0;
+        if (value == 0 && !sign_bit) || (value == -1 && sign_bit) {
+            more = false;
+        } else {
+            byte |= 0x80;
+        }
+        output.push(byte);
+    }
+}
+
+/// Write signed LEB128 (i64)
+pub fn write_leb128_i64(output: &mut Vec<u8>, mut value: i64) {
+    let mut more = true;
+    while more {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        
+        let sign_bit = (byte & 0x40) != 0;
+        if (value == 0 && !sign_bit) || (value == -1 && sign_bit) {
+            more = false;
+        } else {
+            byte |= 0x80;
+        }
+        output.push(byte);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_leb128_u32() {
+        let mut buf = Vec::new();
+        write_leb128_u32(&mut buf, 0);
+        assert_eq!(buf, vec![0x00]);
+        
+        buf.clear();
+        write_leb128_u32(&mut buf, 127);
+        assert_eq!(buf, vec![0x7F]);
+        
+        buf.clear();
+        write_leb128_u32(&mut buf, 128);
+        assert_eq!(buf, vec![0x80, 0x01]);
+        
+        buf.clear();
+        write_leb128_u32(&mut buf, 624485);
+        assert_eq!(buf, vec![0xE5, 0x8E, 0x26]);
+    }
+    
+    #[test]
+    fn test_leb128_i32() {
+        let mut buf = Vec::new();
+        write_leb128_i32(&mut buf, 0);
+        assert_eq!(buf, vec![0x00]);
+        
+        buf.clear();
+        write_leb128_i32(&mut buf, -1);
+        assert_eq!(buf, vec![0x7F]);
+        
+        buf.clear();
+        write_leb128_i32(&mut buf, -123456);
+        assert_eq!(buf, vec![0xC0, 0xBB, 0x78]);
+    }
+    
+    #[test]
+    fn test_empty_module() {
+        let module = WasmModule::new();
+        let binary = module.encode();
+        
+        // Should have magic and version
+        assert_eq!(&binary[0..4], &WASM_MAGIC);
+        assert_eq!(&binary[4..8], &WASM_VERSION);
+    }
+    
+    #[test]
+    fn test_simple_function() {
+        let mut module = WasmModule::new();
+        
+        // Add type: () -> i32
+        let type_idx = module.add_type(FuncType::new(vec![], vec![WasmType::I32]));
+        
+        // Add function that returns 42
+        let mut func = WasmFunction::new();
+        func.emit_i32(WasmOp::I32Const, 42);
+        func.emit(WasmOp::End);
+        
+        let func_idx = module.add_function(type_idx, func);
+        
+        // Export as "main"
+        module.add_export("main".to_string(), ExportKind::Func, func_idx);
+        
+        let binary = module.encode();
+        
+        // Should have type, function, export, and code sections
+        assert!(binary.len() > 8);
+    }
+    
+    #[test]
+    fn test_memory() {
+        let mut module = WasmModule::new();
+        
+        // Add memory with 1 page minimum
+        module.add_memory(1, Some(16));
+        
+        // Export memory
+        module.add_export("memory".to_string(), ExportKind::Memory, 0);
+        
+        let binary = module.encode();
+        assert!(binary.contains(&SECTION_MEMORY));
+    }
+}

@@ -1,0 +1,1347 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ FFI — Code Generation
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Generates native code for FFI interop:
+// - Thunks for calling foreign functions
+// - Trampolines for callbacks from foreign code
+// - Wrapper functions with safety checks
+// - ABI conversion sequences
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::ffi::codegen
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+
+use super::types::{
+    Abi, ForeignType, FunctionSignature, Parameter, TargetInfo, Architecture,
+    StructType, StructLayout, MarshalStrategy, TypeMarshaler,
+};
+use super::bindings::{Binding, FunctionBinding, Safety};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CODE GENERATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// FFI code generator
+pub struct FfiCodegen {
+    target: TargetInfo,
+    options: CodegenOptions,
+    thunks: Vec<ThunkDef>,
+    trampolines: Vec<TrampolineDef>,
+    wrappers: Vec<WrapperDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodegenOptions {
+    /// Generate debug information
+    pub debug_info: bool,
+    
+    /// Generate safety checks
+    pub safety_checks: bool,
+    
+    /// Generate null pointer checks
+    pub null_checks: bool,
+    
+    /// Generate bounds checks for arrays
+    pub bounds_checks: bool,
+    
+    /// Use stack probes for large allocations
+    pub stack_probes: bool,
+    
+    /// Optimization level (0-3)
+    pub opt_level: u8,
+    
+    /// Generate position-independent code
+    pub pic: bool,
+    
+    /// Enable CFI (Control Flow Integrity)
+    pub cfi: bool,
+    
+    /// Generate unwind tables
+    pub unwind_tables: bool,
+}
+
+impl Default for CodegenOptions {
+    fn default() -> Self {
+        CodegenOptions {
+            debug_info: true,
+            safety_checks: true,
+            null_checks: true,
+            bounds_checks: true,
+            stack_probes: true,
+            opt_level: 2,
+            pic: true,
+            cfi: true,
+            unwind_tables: true,
+        }
+    }
+}
+
+impl FfiCodegen {
+    pub fn new(target: TargetInfo) -> Self {
+        FfiCodegen {
+            target,
+            options: CodegenOptions::default(),
+            thunks: Vec::new(),
+            trampolines: Vec::new(),
+            wrappers: Vec::new(),
+        }
+    }
+    
+    pub fn with_options(mut self, options: CodegenOptions) -> Self {
+        self.options = options;
+        self
+    }
+    
+    /// Generate a thunk for calling a foreign function
+    pub fn generate_thunk(&mut self, binding: &FunctionBinding) -> Result<ThunkDef, CodegenError> {
+        let signature = &binding.signature;
+        let thunk_name = format!("__ffi_thunk_{}", binding.name);
+        
+        // Determine calling convention
+        let calling_conv = self.resolve_calling_convention(&signature.abi);
+        
+        // Generate argument marshaling
+        let arg_marshaling = self.generate_arg_marshaling(&signature.params)?;
+        
+        // Generate return value marshaling
+        let ret_marshaling = self.generate_return_marshaling(&signature.return_type)?;
+        
+        // Generate the thunk body
+        let mut instructions = Vec::new();
+        
+        // Prologue
+        instructions.extend(self.generate_prologue(&signature));
+        
+        // Safety checks if enabled
+        if self.options.safety_checks {
+            instructions.extend(self.generate_safety_checks(&signature)?);
+        }
+        
+        // Marshal arguments
+        for marshal in &arg_marshaling {
+            instructions.extend(marshal.instructions.clone());
+        }
+        
+        // Call the foreign function
+        instructions.push(Instruction::Call {
+            target: CallTarget::Symbol(binding.symbol.clone()),
+            convention: calling_conv,
+        });
+        
+        // Marshal return value
+        instructions.extend(ret_marshaling.instructions.clone());
+        
+        // Epilogue
+        instructions.extend(self.generate_epilogue(&signature));
+        
+        let thunk = ThunkDef {
+            name: thunk_name,
+            foreign_symbol: binding.symbol.clone(),
+            signature: signature.clone(),
+            calling_conv,
+            instructions,
+            frame_size: self.calculate_frame_size(&signature),
+            safety: binding.safety,
+        };
+        
+        self.thunks.push(thunk.clone());
+        Ok(thunk)
+    }
+    
+    /// Generate a trampoline for callbacks from foreign code
+    pub fn generate_trampoline(
+        &mut self,
+        name: &str,
+        signature: &FunctionSignature,
+        callback_id: u64,
+    ) -> Result<TrampolineDef, CodegenError> {
+        let tramp_name = format!("__ffi_tramp_{}", name);
+        
+        let calling_conv = self.resolve_calling_convention(&signature.abi);
+        
+        let mut instructions = Vec::new();
+        
+        // Trampoline prologue (must match foreign ABI exactly)
+        instructions.extend(self.generate_trampoline_prologue(&signature));
+        
+        // Save callback context
+        instructions.push(Instruction::LoadImm {
+            dest: Register::R10,
+            value: callback_id,
+        });
+        
+        // Convert from foreign ABI to QuantaLang calling convention
+        let arg_conversion = self.generate_abi_conversion(
+            &signature.params,
+            &calling_conv,
+            CallingConvention::QuantaLang,
+        )?;
+        instructions.extend(arg_conversion);
+        
+        // Call the QuantaLang callback dispatcher
+        instructions.push(Instruction::Call {
+            target: CallTarget::Symbol("__quanta_callback_dispatch".to_string()),
+            convention: CallingConvention::QuantaLang,
+        });
+        
+        // Convert return value back to foreign ABI
+        let ret_conversion = self.generate_return_abi_conversion(
+            &signature.return_type,
+            CallingConvention::QuantaLang,
+            &calling_conv,
+        )?;
+        instructions.extend(ret_conversion);
+        
+        // Trampoline epilogue
+        instructions.extend(self.generate_trampoline_epilogue(&signature));
+        
+        let trampoline = TrampolineDef {
+            name: tramp_name,
+            callback_id,
+            signature: signature.clone(),
+            calling_conv,
+            instructions,
+        };
+        
+        self.trampolines.push(trampoline.clone());
+        Ok(trampoline)
+    }
+    
+    /// Generate a safe wrapper function
+    pub fn generate_wrapper(
+        &mut self,
+        binding: &FunctionBinding,
+    ) -> Result<WrapperDef, CodegenError> {
+        let wrapper_name = format!("{}", binding.name);
+        let thunk_name = format!("__ffi_thunk_{}", binding.name);
+        
+        let mut instructions = Vec::new();
+        
+        // Generate panic boundary (catch foreign exceptions)
+        instructions.push(Instruction::PushPanicBoundary);
+        
+        // Validate all pointer arguments
+        if self.options.null_checks {
+            for (i, param) in binding.signature.params.iter().enumerate() {
+                if param.ty.is_pointer() {
+                    instructions.push(Instruction::NullCheck {
+                        reg: self.arg_register(i),
+                        error_msg: format!("null pointer in argument {}", param.name),
+                    });
+                }
+            }
+        }
+        
+        // Call the thunk
+        instructions.push(Instruction::Call {
+            target: CallTarget::Symbol(thunk_name),
+            convention: CallingConvention::QuantaLang,
+        });
+        
+        // Check for errors from foreign code
+        instructions.push(Instruction::CheckForeignError);
+        
+        // Pop panic boundary
+        instructions.push(Instruction::PopPanicBoundary);
+        
+        let wrapper = WrapperDef {
+            name: wrapper_name,
+            binding: binding.clone(),
+            instructions,
+            is_unsafe: binding.safety == Safety::Unsafe,
+        };
+        
+        self.wrappers.push(wrapper.clone());
+        Ok(wrapper)
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Calling Convention Handling
+    // ─────────────────────────────────────────────────────────────────────────────
+    
+    fn resolve_calling_convention(&self, abi: &Abi) -> CallingConvention {
+        match (abi, &self.target.arch) {
+            (Abi::C, Architecture::X86_64) => {
+                if self.target.os.is_windows() {
+                    CallingConvention::Win64
+                } else {
+                    CallingConvention::SysV64
+                }
+            }
+            (Abi::C, Architecture::Aarch64) => CallingConvention::Aarch64,
+            (Abi::C, Architecture::X86) => CallingConvention::Cdecl,
+            (Abi::Stdcall, _) => CallingConvention::Stdcall,
+            (Abi::Fastcall, _) => CallingConvention::Fastcall,
+            (Abi::Win64, _) => CallingConvention::Win64,
+            (Abi::SysV, _) => CallingConvention::SysV64,
+            (Abi::Aapcs, _) => CallingConvention::Aarch64,
+            (Abi::Vectorcall, _) => CallingConvention::Vectorcall,
+            _ => CallingConvention::SysV64, // Default
+        }
+    }
+    
+    fn arg_register(&self, index: usize) -> Register {
+        match &self.target.arch {
+            Architecture::X86_64 => {
+                if self.target.os.is_windows() {
+                    // Windows x64: rcx, rdx, r8, r9
+                    match index {
+                        0 => Register::Rcx,
+                        1 => Register::Rdx,
+                        2 => Register::R8,
+                        3 => Register::R9,
+                        _ => Register::Stack(index - 4),
+                    }
+                } else {
+                    // System V: rdi, rsi, rdx, rcx, r8, r9
+                    match index {
+                        0 => Register::Rdi,
+                        1 => Register::Rsi,
+                        2 => Register::Rdx,
+                        3 => Register::Rcx,
+                        4 => Register::R8,
+                        5 => Register::R9,
+                        _ => Register::Stack(index - 6),
+                    }
+                }
+            }
+            Architecture::Aarch64 => {
+                // ARM64: x0-x7 for arguments
+                if index < 8 {
+                    Register::Arm64(index as u8)
+                } else {
+                    Register::Stack(index - 8)
+                }
+            }
+            _ => Register::Stack(index),
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Argument Marshaling
+    // ─────────────────────────────────────────────────────────────────────────────
+    
+    fn generate_arg_marshaling(
+        &self,
+        params: &[Parameter],
+    ) -> Result<Vec<MarshalSequence>, CodegenError> {
+        let mut sequences = Vec::new();
+        
+        for (i, param) in params.iter().enumerate() {
+            let marshaler = TypeMarshaler::for_type(&param.ty, &self.target);
+            let strategy = marshaler.strategy();
+            
+            let instructions = match strategy {
+                MarshalStrategy::Direct => {
+                    // Pass directly in register
+                    vec![Instruction::Move {
+                        src: self.arg_register(i),
+                        dest: self.foreign_arg_register(i),
+                    }]
+                }
+                MarshalStrategy::Indirect => {
+                    // Pass by pointer
+                    vec![
+                        Instruction::AddressOf {
+                            src: self.arg_register(i),
+                            dest: Register::Temp(0),
+                        },
+                        Instruction::Move {
+                            src: Register::Temp(0),
+                            dest: self.foreign_arg_register(i),
+                        },
+                    ]
+                }
+                MarshalStrategy::Expand => {
+                    // Expand small struct into registers
+                    self.generate_struct_expansion(&param.ty, i)?
+                }
+                MarshalStrategy::Stack => {
+                    // Pass on stack
+                    let offset = self.calculate_stack_offset(i, params);
+                    vec![Instruction::StoreStack {
+                        src: self.arg_register(i),
+                        offset,
+                        size: marshaler.size(),
+                    }]
+                }
+                MarshalStrategy::Convert => {
+                    // Type conversion required
+                    self.generate_type_conversion(&param.ty, i)?
+                }
+            };
+            
+            sequences.push(MarshalSequence {
+                param_index: i,
+                strategy,
+                instructions,
+            });
+        }
+        
+        Ok(sequences)
+    }
+    
+    fn generate_return_marshaling(
+        &self,
+        return_type: &ForeignType,
+    ) -> Result<MarshalSequence, CodegenError> {
+        if return_type.is_void() {
+            return Ok(MarshalSequence {
+                param_index: usize::MAX,
+                strategy: MarshalStrategy::Direct,
+                instructions: vec![],
+            });
+        }
+        
+        let marshaler = TypeMarshaler::for_type(return_type, &self.target);
+        let strategy = marshaler.strategy();
+        
+        let instructions = match strategy {
+            MarshalStrategy::Direct => {
+                // Return value is already in return register
+                vec![Instruction::Move {
+                    src: Register::Rax,
+                    dest: Register::Rax,
+                }]
+            }
+            MarshalStrategy::Indirect => {
+                // Return value is via hidden pointer
+                vec![
+                    Instruction::Load {
+                        src: Register::Rax,
+                        dest: Register::Temp(0),
+                        size: marshaler.size(),
+                    },
+                ]
+            }
+            MarshalStrategy::Expand => {
+                // Return value split across registers (e.g., rax:rdx)
+                self.generate_return_collection(return_type)?
+            }
+            _ => vec![],
+        };
+        
+        Ok(MarshalSequence {
+            param_index: usize::MAX,
+            strategy,
+            instructions,
+        })
+    }
+    
+    fn foreign_arg_register(&self, index: usize) -> Register {
+        // Same as arg_register for now, but could differ for cross-ABI calls
+        self.arg_register(index)
+    }
+    
+    fn generate_struct_expansion(
+        &self,
+        ty: &ForeignType,
+        param_index: usize,
+    ) -> Result<Vec<Instruction>, CodegenError> {
+        let mut instructions = Vec::new();
+        
+        // Load struct fields into separate registers
+        if let ForeignType::Struct(ref s) = ty {
+            let layout = s.layout(&self.target);
+            let base_reg = self.arg_register(param_index);
+            
+            for (i, field) in layout.fields.iter().enumerate() {
+                if i < 2 {
+                    // First two fields go in registers
+                    instructions.push(Instruction::LoadOffset {
+                        base: base_reg.clone(),
+                        offset: field.offset,
+                        dest: self.foreign_arg_register(param_index + i),
+                        size: field.size,
+                    });
+                }
+            }
+        }
+        
+        Ok(instructions)
+    }
+    
+    fn generate_return_collection(
+        &self,
+        ty: &ForeignType,
+    ) -> Result<Vec<Instruction>, CodegenError> {
+        let mut instructions = Vec::new();
+        
+        // Collect return value from multiple registers into struct
+        if let ForeignType::Struct(ref s) = ty {
+            let layout = s.layout(&self.target);
+            
+            // Allocate space for return value
+            instructions.push(Instruction::AllocStack {
+                size: layout.size,
+                align: layout.alignment,
+            });
+            
+            // Store rax to first field
+            if !layout.fields.is_empty() {
+                instructions.push(Instruction::StoreOffset {
+                    src: Register::Rax,
+                    base: Register::Rsp,
+                    offset: 0,
+                    size: layout.fields[0].size.min(8),
+                });
+            }
+            
+            // Store rdx to second field if present
+            if layout.fields.len() > 1 && layout.size > 8 {
+                instructions.push(Instruction::StoreOffset {
+                    src: Register::Rdx,
+                    base: Register::Rsp,
+                    offset: 8,
+                    size: (layout.size - 8).min(8),
+                });
+            }
+        }
+        
+        Ok(instructions)
+    }
+    
+    fn generate_type_conversion(
+        &self,
+        ty: &ForeignType,
+        param_index: usize,
+    ) -> Result<Vec<Instruction>, CodegenError> {
+        let mut instructions = Vec::new();
+        let src = self.arg_register(param_index);
+        let dest = self.foreign_arg_register(param_index);
+        
+        match ty {
+            ForeignType::Bool => {
+                // QuantaLang bool to C bool (may differ in size)
+                instructions.push(Instruction::ZeroExtend {
+                    src,
+                    dest,
+                    from_bits: 8,
+                    to_bits: 32, // C bool is often int-sized
+                });
+            }
+            ForeignType::Char => {
+                // Unicode char to C char (truncate to byte)
+                instructions.push(Instruction::Truncate {
+                    src,
+                    dest,
+                    to_bits: 8,
+                });
+            }
+            ForeignType::WChar => {
+                // Unicode char to wchar_t
+                let wchar_bits = if self.target.os.is_windows() { 16 } else { 32 };
+                instructions.push(Instruction::ZeroExtend {
+                    src,
+                    dest,
+                    from_bits: 32,
+                    to_bits: wchar_bits,
+                });
+            }
+            _ => {
+                // Default: direct move
+                instructions.push(Instruction::Move { src, dest });
+            }
+        }
+        
+        Ok(instructions)
+    }
+    
+    fn calculate_stack_offset(&self, param_index: usize, params: &[Parameter]) -> usize {
+        let mut offset = 0;
+        let reg_count = match &self.target.arch {
+            Architecture::X86_64 => {
+                if self.target.os.is_windows() { 4 } else { 6 }
+            }
+            Architecture::Aarch64 => 8,
+            _ => 0,
+        };
+        
+        for (i, param) in params.iter().enumerate() {
+            if i < reg_count {
+                continue;
+            }
+            if i == param_index {
+                return offset;
+            }
+            let marshaler = TypeMarshaler::for_type(&param.ty, &self.target);
+            offset += marshaler.size().max(8); // Stack slots are 8-byte aligned
+        }
+        
+        offset
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // ABI Conversion
+    // ─────────────────────────────────────────────────────────────────────────────
+    
+    fn generate_abi_conversion(
+        &self,
+        params: &[Parameter],
+        from: &CallingConvention,
+        to: CallingConvention,
+    ) -> Result<Vec<Instruction>, CodegenError> {
+        let mut instructions = Vec::new();
+        
+        if from == &to {
+            return Ok(instructions);
+        }
+        
+        // Save caller-saved registers if needed
+        let caller_saved = self.caller_saved_registers(from);
+        for reg in &caller_saved {
+            instructions.push(Instruction::Push { reg: reg.clone() });
+        }
+        
+        // Move arguments to correct positions
+        for (i, param) in params.iter().enumerate() {
+            let src = self.conv_arg_register(from, i);
+            let dest = self.conv_arg_register(&to, i);
+            
+            if src != dest {
+                instructions.push(Instruction::Move { src, dest });
+            }
+        }
+        
+        Ok(instructions)
+    }
+    
+    fn generate_return_abi_conversion(
+        &self,
+        return_type: &ForeignType,
+        from: CallingConvention,
+        to: &CallingConvention,
+    ) -> Result<Vec<Instruction>, CodegenError> {
+        let mut instructions = Vec::new();
+        
+        if from == *to || return_type.is_void() {
+            return Ok(instructions);
+        }
+        
+        // Return values are usually in rax/x0, but size may differ
+        let marshaler = TypeMarshaler::for_type(return_type, &self.target);
+        
+        if marshaler.size() <= 8 {
+            // Single register return - usually compatible
+        } else if marshaler.size() <= 16 {
+            // Two-register return - may need shuffling
+            match (from, to) {
+                (CallingConvention::SysV64, CallingConvention::Win64) => {
+                    // SysV returns in rax:rdx, Win64 uses hidden pointer
+                    // Need to store to memory
+                }
+                _ => {}
+            }
+        }
+        
+        Ok(instructions)
+    }
+    
+    fn conv_arg_register(&self, conv: &CallingConvention, index: usize) -> Register {
+        match conv {
+            CallingConvention::SysV64 => {
+                match index {
+                    0 => Register::Rdi,
+                    1 => Register::Rsi,
+                    2 => Register::Rdx,
+                    3 => Register::Rcx,
+                    4 => Register::R8,
+                    5 => Register::R9,
+                    _ => Register::Stack(index - 6),
+                }
+            }
+            CallingConvention::Win64 => {
+                match index {
+                    0 => Register::Rcx,
+                    1 => Register::Rdx,
+                    2 => Register::R8,
+                    3 => Register::R9,
+                    _ => Register::Stack(index - 4),
+                }
+            }
+            CallingConvention::Aarch64 => {
+                if index < 8 {
+                    Register::Arm64(index as u8)
+                } else {
+                    Register::Stack(index - 8)
+                }
+            }
+            CallingConvention::QuantaLang => self.arg_register(index),
+            _ => Register::Stack(index),
+        }
+    }
+    
+    fn caller_saved_registers(&self, conv: &CallingConvention) -> Vec<Register> {
+        match conv {
+            CallingConvention::SysV64 => vec![
+                Register::Rax, Register::Rcx, Register::Rdx,
+                Register::Rsi, Register::Rdi, Register::R8,
+                Register::R9, Register::R10, Register::R11,
+            ],
+            CallingConvention::Win64 => vec![
+                Register::Rax, Register::Rcx, Register::Rdx,
+                Register::R8, Register::R9, Register::R10, Register::R11,
+            ],
+            _ => vec![],
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Prologue/Epilogue Generation
+    // ─────────────────────────────────────────────────────────────────────────────
+    
+    fn generate_prologue(&self, sig: &FunctionSignature) -> Vec<Instruction> {
+        let mut instructions = Vec::new();
+        let frame_size = self.calculate_frame_size(sig);
+        
+        // Push frame pointer
+        instructions.push(Instruction::Push { reg: Register::Rbp });
+        instructions.push(Instruction::Move {
+            src: Register::Rsp,
+            dest: Register::Rbp,
+        });
+        
+        // Allocate stack frame
+        if frame_size > 0 {
+            if self.options.stack_probes && frame_size > 4096 {
+                // Use stack probes for large frames
+                instructions.push(Instruction::StackProbe { size: frame_size });
+            } else {
+                instructions.push(Instruction::SubImm {
+                    reg: Register::Rsp,
+                    value: frame_size as u64,
+                });
+            }
+        }
+        
+        // Save callee-saved registers
+        let callee_saved = self.callee_saved_registers();
+        for reg in &callee_saved {
+            instructions.push(Instruction::Push { reg: reg.clone() });
+        }
+        
+        // Generate CFI directives if enabled
+        if self.options.cfi {
+            instructions.push(Instruction::CfiStartProc);
+            instructions.push(Instruction::CfiDefCfa {
+                reg: Register::Rbp,
+                offset: 16,
+            });
+        }
+        
+        instructions
+    }
+    
+    fn generate_epilogue(&self, sig: &FunctionSignature) -> Vec<Instruction> {
+        let mut instructions = Vec::new();
+        
+        // Restore callee-saved registers
+        let callee_saved = self.callee_saved_registers();
+        for reg in callee_saved.iter().rev() {
+            instructions.push(Instruction::Pop { reg: reg.clone() });
+        }
+        
+        // Restore frame pointer
+        instructions.push(Instruction::Move {
+            src: Register::Rbp,
+            dest: Register::Rsp,
+        });
+        instructions.push(Instruction::Pop { reg: Register::Rbp });
+        
+        // CFI end
+        if self.options.cfi {
+            instructions.push(Instruction::CfiEndProc);
+        }
+        
+        // Return
+        instructions.push(Instruction::Ret);
+        
+        instructions
+    }
+    
+    fn generate_trampoline_prologue(&self, sig: &FunctionSignature) -> Vec<Instruction> {
+        // Trampolines need minimal prologue to match foreign ABI exactly
+        vec![
+            Instruction::Push { reg: Register::Rbp },
+            Instruction::Move {
+                src: Register::Rsp,
+                dest: Register::Rbp,
+            },
+        ]
+    }
+    
+    fn generate_trampoline_epilogue(&self, sig: &FunctionSignature) -> Vec<Instruction> {
+        vec![
+            Instruction::Pop { reg: Register::Rbp },
+            Instruction::Ret,
+        ]
+    }
+    
+    fn callee_saved_registers(&self) -> Vec<Register> {
+        match &self.target.arch {
+            Architecture::X86_64 => {
+                vec![
+                    Register::Rbx, Register::R12, Register::R13,
+                    Register::R14, Register::R15,
+                ]
+            }
+            Architecture::Aarch64 => {
+                vec![
+                    Register::Arm64(19), Register::Arm64(20),
+                    Register::Arm64(21), Register::Arm64(22),
+                    Register::Arm64(23), Register::Arm64(24),
+                    Register::Arm64(25), Register::Arm64(26),
+                    Register::Arm64(27), Register::Arm64(28),
+                ]
+            }
+            _ => vec![],
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Safety Checks
+    // ─────────────────────────────────────────────────────────────────────────────
+    
+    fn generate_safety_checks(
+        &self,
+        sig: &FunctionSignature,
+    ) -> Result<Vec<Instruction>, CodegenError> {
+        let mut instructions = Vec::new();
+        
+        for (i, param) in sig.params.iter().enumerate() {
+            // Null pointer checks
+            if self.options.null_checks && param.ty.is_pointer() && !param.nullable {
+                instructions.push(Instruction::NullCheck {
+                    reg: self.arg_register(i),
+                    error_msg: format!("null pointer in parameter '{}'", param.name),
+                });
+            }
+            
+            // Bounds checks for sized arrays
+            if self.options.bounds_checks {
+                if let ForeignType::Array { len: Some(len), .. } = &param.ty {
+                    instructions.push(Instruction::BoundsCheck {
+                        ptr_reg: self.arg_register(i),
+                        len_reg: Register::Temp(0),
+                        expected: *len,
+                    });
+                }
+            }
+        }
+        
+        Ok(instructions)
+    }
+    
+    fn calculate_frame_size(&self, sig: &FunctionSignature) -> usize {
+        let mut size = 0;
+        
+        // Space for spilled arguments
+        let reg_count = match &self.target.arch {
+            Architecture::X86_64 => {
+                if self.target.os.is_windows() { 4 } else { 6 }
+            }
+            Architecture::Aarch64 => 8,
+            _ => 0,
+        };
+        
+        for (i, param) in sig.params.iter().enumerate() {
+            if i >= reg_count {
+                let marshaler = TypeMarshaler::for_type(&param.ty, &self.target);
+                size += marshaler.size().max(8);
+            }
+        }
+        
+        // Shadow space (Windows x64)
+        if self.target.os.is_windows() && matches!(self.target.arch, Architecture::X86_64) {
+            size = size.max(32); // 32 bytes shadow space
+        }
+        
+        // Align to 16 bytes
+        (size + 15) & !15
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Code Emission
+    // ─────────────────────────────────────────────────────────────────────────────
+    
+    /// Emit all generated code as assembly
+    pub fn emit_assembly(&self) -> String {
+        let mut asm = String::new();
+        
+        // Header
+        asm.push_str("; QuantaLang FFI Generated Code\n");
+        asm.push_str(&format!("; Target: {}-{}\n\n", 
+            self.target.arch.as_str(), 
+            self.target.os.as_str()
+        ));
+        
+        asm.push_str("section .text\n\n");
+        
+        // Emit thunks
+        for thunk in &self.thunks {
+            asm.push_str(&self.emit_thunk_asm(thunk));
+            asm.push('\n');
+        }
+        
+        // Emit trampolines
+        for tramp in &self.trampolines {
+            asm.push_str(&self.emit_trampoline_asm(tramp));
+            asm.push('\n');
+        }
+        
+        // Emit wrappers
+        for wrapper in &self.wrappers {
+            asm.push_str(&self.emit_wrapper_asm(wrapper));
+            asm.push('\n');
+        }
+        
+        asm
+    }
+    
+    fn emit_thunk_asm(&self, thunk: &ThunkDef) -> String {
+        let mut asm = String::new();
+        
+        asm.push_str(&format!("global {}\n", thunk.name));
+        asm.push_str(&format!("{}:\n", thunk.name));
+        
+        for instr in &thunk.instructions {
+            asm.push_str(&format!("    {}\n", self.emit_instruction(instr)));
+        }
+        
+        asm
+    }
+    
+    fn emit_trampoline_asm(&self, tramp: &TrampolineDef) -> String {
+        let mut asm = String::new();
+        
+        asm.push_str(&format!("global {}\n", tramp.name));
+        asm.push_str(&format!("{}:\n", tramp.name));
+        
+        for instr in &tramp.instructions {
+            asm.push_str(&format!("    {}\n", self.emit_instruction(instr)));
+        }
+        
+        asm
+    }
+    
+    fn emit_wrapper_asm(&self, wrapper: &WrapperDef) -> String {
+        let mut asm = String::new();
+        
+        asm.push_str(&format!("; Wrapper for {}\n", wrapper.binding.name));
+        asm.push_str(&format!("global {}\n", wrapper.name));
+        asm.push_str(&format!("{}:\n", wrapper.name));
+        
+        for instr in &wrapper.instructions {
+            asm.push_str(&format!("    {}\n", self.emit_instruction(instr)));
+        }
+        
+        asm
+    }
+    
+    fn emit_instruction(&self, instr: &Instruction) -> String {
+        match instr {
+            Instruction::Move { src, dest } => {
+                format!("mov {}, {}", self.reg_name(dest), self.reg_name(src))
+            }
+            Instruction::Push { reg } => {
+                format!("push {}", self.reg_name(reg))
+            }
+            Instruction::Pop { reg } => {
+                format!("pop {}", self.reg_name(reg))
+            }
+            Instruction::Call { target, .. } => {
+                match target {
+                    CallTarget::Symbol(s) => format!("call {}", s),
+                    CallTarget::Register(r) => format!("call {}", self.reg_name(r)),
+                    CallTarget::Indirect(addr) => format!("call qword [{}]", addr),
+                }
+            }
+            Instruction::Ret => "ret".to_string(),
+            Instruction::SubImm { reg, value } => {
+                format!("sub {}, {}", self.reg_name(reg), value)
+            }
+            Instruction::LoadImm { dest, value } => {
+                format!("mov {}, {}", self.reg_name(dest), value)
+            }
+            Instruction::Load { src, dest, size } => {
+                let size_spec = match size {
+                    1 => "byte",
+                    2 => "word",
+                    4 => "dword",
+                    8 => "qword",
+                    _ => "qword",
+                };
+                format!("mov {}, {} [{}]", self.reg_name(dest), size_spec, self.reg_name(src))
+            }
+            Instruction::Store { src, dest, size } => {
+                let size_spec = match size {
+                    1 => "byte",
+                    2 => "word",
+                    4 => "dword",
+                    8 => "qword",
+                    _ => "qword",
+                };
+                format!("mov {} [{}], {}", size_spec, self.reg_name(dest), self.reg_name(src))
+            }
+            Instruction::LoadOffset { base, offset, dest, size } => {
+                let size_spec = match size {
+                    1 => "byte",
+                    2 => "word",
+                    4 => "dword",
+                    8 => "qword",
+                    _ => "qword",
+                };
+                format!("mov {}, {} [{}+{}]", self.reg_name(dest), size_spec, self.reg_name(base), offset)
+            }
+            Instruction::StoreOffset { src, base, offset, size } => {
+                let size_spec = match size {
+                    1 => "byte",
+                    2 => "word",
+                    4 => "dword",
+                    8 => "qword",
+                    _ => "qword",
+                };
+                format!("mov {} [{}+{}], {}", size_spec, self.reg_name(base), offset, self.reg_name(src))
+            }
+            Instruction::StoreStack { src, offset, size } => {
+                format!("mov qword [rsp+{}], {}", offset, self.reg_name(src))
+            }
+            Instruction::NullCheck { reg, error_msg } => {
+                format!("test {}, {} ; null check: {}\n    jz __ffi_null_error", 
+                    self.reg_name(reg), self.reg_name(reg), error_msg)
+            }
+            Instruction::BoundsCheck { ptr_reg, len_reg, expected } => {
+                format!("; bounds check for array[{}]", expected)
+            }
+            Instruction::ZeroExtend { src, dest, from_bits, to_bits } => {
+                if *from_bits == 8 && *to_bits <= 64 {
+                    format!("movzx {}, {}", self.reg_name(dest), self.reg_name_sized(src, 8))
+                } else {
+                    format!("mov {}, {}", self.reg_name(dest), self.reg_name(src))
+                }
+            }
+            Instruction::Truncate { src, dest, to_bits } => {
+                format!("mov {}, {}", self.reg_name_sized(dest, *to_bits), self.reg_name(src))
+            }
+            Instruction::AddressOf { src, dest } => {
+                format!("lea {}, [{}]", self.reg_name(dest), self.reg_name(src))
+            }
+            Instruction::AllocStack { size, align } => {
+                format!("sub rsp, {}", (size + 15) & !15)
+            }
+            Instruction::StackProbe { size } => {
+                format!("call __chkstk ; probe {} bytes", size)
+            }
+            Instruction::CfiStartProc => ".cfi_startproc".to_string(),
+            Instruction::CfiEndProc => ".cfi_endproc".to_string(),
+            Instruction::CfiDefCfa { reg, offset } => {
+                format!(".cfi_def_cfa {}, {}", self.reg_name(reg), offset)
+            }
+            Instruction::PushPanicBoundary => {
+                "call __quanta_push_panic_boundary".to_string()
+            }
+            Instruction::PopPanicBoundary => {
+                "call __quanta_pop_panic_boundary".to_string()
+            }
+            Instruction::CheckForeignError => {
+                "call __quanta_check_foreign_error".to_string()
+            }
+        }
+    }
+    
+    fn reg_name(&self, reg: &Register) -> &'static str {
+        match reg {
+            Register::Rax => "rax",
+            Register::Rbx => "rbx",
+            Register::Rcx => "rcx",
+            Register::Rdx => "rdx",
+            Register::Rsi => "rsi",
+            Register::Rdi => "rdi",
+            Register::Rbp => "rbp",
+            Register::Rsp => "rsp",
+            Register::R8 => "r8",
+            Register::R9 => "r9",
+            Register::R10 => "r10",
+            Register::R11 => "r11",
+            Register::R12 => "r12",
+            Register::R13 => "r13",
+            Register::R14 => "r14",
+            Register::R15 => "r15",
+            Register::Temp(n) => match n {
+                0 => "r10",
+                1 => "r11",
+                _ => "rax",
+            },
+            Register::Stack(_) => "[rsp+?]",
+            Register::Arm64(n) => match n {
+                0 => "x0",
+                1 => "x1",
+                _ => "x0",
+            },
+        }
+    }
+    
+    fn reg_name_sized(&self, reg: &Register, bits: usize) -> &'static str {
+        match (reg, bits) {
+            (Register::Rax, 8) => "al",
+            (Register::Rax, 16) => "ax",
+            (Register::Rax, 32) => "eax",
+            (Register::Rbx, 8) => "bl",
+            (Register::Rcx, 8) => "cl",
+            (Register::Rdx, 8) => "dl",
+            _ => self.reg_name(reg),
+        }
+    }
+    
+    /// Get generated thunks
+    pub fn thunks(&self) -> &[ThunkDef] {
+        &self.thunks
+    }
+    
+    /// Get generated trampolines
+    pub fn trampolines(&self) -> &[TrampolineDef] {
+        &self.trampolines
+    }
+    
+    /// Get generated wrappers
+    pub fn wrappers(&self) -> &[WrapperDef] {
+        &self.wrappers
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Thunk definition (calls foreign function)
+#[derive(Debug, Clone)]
+pub struct ThunkDef {
+    pub name: String,
+    pub foreign_symbol: String,
+    pub signature: FunctionSignature,
+    pub calling_conv: CallingConvention,
+    pub instructions: Vec<Instruction>,
+    pub frame_size: usize,
+    pub safety: Safety,
+}
+
+/// Trampoline definition (callback from foreign code)
+#[derive(Debug, Clone)]
+pub struct TrampolineDef {
+    pub name: String,
+    pub callback_id: u64,
+    pub signature: FunctionSignature,
+    pub calling_conv: CallingConvention,
+    pub instructions: Vec<Instruction>,
+}
+
+/// Wrapper definition (safe interface)
+#[derive(Debug, Clone)]
+pub struct WrapperDef {
+    pub name: String,
+    pub binding: FunctionBinding,
+    pub instructions: Vec<Instruction>,
+    pub is_unsafe: bool,
+}
+
+/// Marshaling sequence for a parameter
+#[derive(Debug, Clone)]
+pub struct MarshalSequence {
+    pub param_index: usize,
+    pub strategy: MarshalStrategy,
+    pub instructions: Vec<Instruction>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CALLING CONVENTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallingConvention {
+    /// System V AMD64 ABI (Linux, macOS, BSD)
+    SysV64,
+    /// Windows x64 ABI
+    Win64,
+    /// ARM64 AAPCS
+    Aarch64,
+    /// x86 cdecl
+    Cdecl,
+    /// x86 stdcall
+    Stdcall,
+    /// x86 fastcall
+    Fastcall,
+    /// MSVC vectorcall
+    Vectorcall,
+    /// QuantaLang native
+    QuantaLang,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Register {
+    // x86-64 general purpose
+    Rax, Rbx, Rcx, Rdx,
+    Rsi, Rdi, Rbp, Rsp,
+    R8, R9, R10, R11,
+    R12, R13, R14, R15,
+    
+    // Temporary registers
+    Temp(usize),
+    
+    // Stack slot
+    Stack(usize),
+    
+    // ARM64
+    Arm64(u8),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSTRUCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub enum Instruction {
+    Move { src: Register, dest: Register },
+    Push { reg: Register },
+    Pop { reg: Register },
+    Call { target: CallTarget, convention: CallingConvention },
+    Ret,
+    SubImm { reg: Register, value: u64 },
+    LoadImm { dest: Register, value: u64 },
+    Load { src: Register, dest: Register, size: usize },
+    Store { src: Register, dest: Register, size: usize },
+    LoadOffset { base: Register, offset: usize, dest: Register, size: usize },
+    StoreOffset { src: Register, base: Register, offset: usize, size: usize },
+    StoreStack { src: Register, offset: usize, size: usize },
+    NullCheck { reg: Register, error_msg: String },
+    BoundsCheck { ptr_reg: Register, len_reg: Register, expected: usize },
+    ZeroExtend { src: Register, dest: Register, from_bits: usize, to_bits: usize },
+    Truncate { src: Register, dest: Register, to_bits: usize },
+    AddressOf { src: Register, dest: Register },
+    AllocStack { size: usize, align: usize },
+    StackProbe { size: usize },
+    CfiStartProc,
+    CfiEndProc,
+    CfiDefCfa { reg: Register, offset: usize },
+    PushPanicBoundary,
+    PopPanicBoundary,
+    CheckForeignError,
+}
+
+#[derive(Debug, Clone)]
+pub enum CallTarget {
+    Symbol(String),
+    Register(Register),
+    Indirect(String),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub enum CodegenError {
+    UnsupportedType(String),
+    UnsupportedAbi(String),
+    InvalidSignature(String),
+    TargetNotSupported(String),
+}
+
+impl std::fmt::Display for CodegenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedType(t) => write!(f, "unsupported type: {}", t),
+            Self::UnsupportedAbi(a) => write!(f, "unsupported ABI: {}", a),
+            Self::InvalidSignature(s) => write!(f, "invalid signature: {}", s),
+            Self::TargetNotSupported(t) => write!(f, "target not supported: {}", t),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn test_target() -> TargetInfo {
+        TargetInfo::host()
+    }
+    
+    #[test]
+    fn test_codegen_new() {
+        let codegen = FfiCodegen::new(test_target());
+        assert!(codegen.thunks.is_empty());
+        assert!(codegen.trampolines.is_empty());
+    }
+    
+    #[test]
+    fn test_codegen_options_default() {
+        let opts = CodegenOptions::default();
+        assert!(opts.safety_checks);
+        assert!(opts.null_checks);
+        assert_eq!(opts.opt_level, 2);
+    }
+    
+    #[test]
+    fn test_calling_convention_resolution() {
+        let codegen = FfiCodegen::new(test_target());
+        
+        let conv = codegen.resolve_calling_convention(&Abi::C);
+        // Should match host platform
+        assert!(matches!(conv, CallingConvention::SysV64 | CallingConvention::Win64));
+    }
+    
+    #[test]
+    fn test_frame_size_calculation() {
+        let codegen = FfiCodegen::new(test_target());
+        
+        let sig = FunctionSignature {
+            name: "test".to_string(),
+            abi: Abi::C,
+            params: vec![],
+            return_type: ForeignType::Void,
+            variadic: false,
+        };
+        
+        let size = codegen.calculate_frame_size(&sig);
+        assert!(size % 16 == 0); // Must be aligned
+    }
+    
+    #[test]
+    fn test_emit_instruction() {
+        let codegen = FfiCodegen::new(test_target());
+        
+        let instr = Instruction::Move {
+            src: Register::Rax,
+            dest: Register::Rbx,
+        };
+        
+        let asm = codegen.emit_instruction(&instr);
+        assert_eq!(asm, "mov rbx, rax");
+    }
+    
+    #[test]
+    fn test_arg_register_sysv() {
+        let mut target = test_target();
+        target.arch = Architecture::X86_64;
+        
+        let codegen = FfiCodegen::new(target);
+        
+        assert_eq!(codegen.arg_register(0), Register::Rdi);
+        assert_eq!(codegen.arg_register(1), Register::Rsi);
+    }
+}

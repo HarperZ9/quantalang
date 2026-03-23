@@ -1,0 +1,1144 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ REPL — Evaluator
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Expression evaluator and interpreter for the REPL environment.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::repl::eval
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
+use core::cell::RefCell;
+use std::time::{Duration, Instant};
+use crate::repl::config::{Value, TypeInfo, TypeKind, ReplConfig};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENVIRONMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Variable binding environment
+#[derive(Debug, Clone)]
+pub struct Environment {
+    /// Variable bindings
+    bindings: BTreeMap<String, Binding>,
+    
+    /// Parent environment (for scoping)
+    parent: Option<Rc<RefCell<Environment>>>,
+    
+    /// Type definitions
+    types: BTreeMap<String, TypeInfo>,
+    
+    /// Function definitions
+    functions: BTreeMap<String, FunctionDef>,
+    
+    /// Imported modules
+    imports: Vec<String>,
+}
+
+impl Environment {
+    pub fn new() -> Self {
+        let mut env = Environment {
+            bindings: BTreeMap::new(),
+            parent: None,
+            types: BTreeMap::new(),
+            functions: BTreeMap::new(),
+            imports: Vec::new(),
+        };
+        
+        // Register built-in functions
+        env.register_builtins();
+        
+        env
+    }
+    
+    pub fn with_parent(parent: Rc<RefCell<Environment>>) -> Self {
+        Environment {
+            bindings: BTreeMap::new(),
+            parent: Some(parent),
+            types: BTreeMap::new(),
+            functions: BTreeMap::new(),
+            imports: Vec::new(),
+        }
+    }
+    
+    /// Define a variable
+    pub fn define(&mut self, name: &str, value: Value, mutable: bool) {
+        self.bindings.insert(name.to_string(), Binding {
+            value,
+            mutable,
+            defined_at: None,
+        });
+    }
+    
+    /// Get a variable
+    pub fn get(&self, name: &str) -> Option<Value> {
+        if let Some(binding) = self.bindings.get(name) {
+            return Some(binding.value.clone());
+        }
+        
+        if let Some(ref parent) = self.parent {
+            return parent.borrow().get(name);
+        }
+        
+        None
+    }
+    
+    /// Set a variable (must exist and be mutable)
+    pub fn set(&mut self, name: &str, value: Value) -> Result<(), String> {
+        if let Some(binding) = self.bindings.get_mut(name) {
+            if !binding.mutable {
+                return Err(format!("cannot assign to immutable variable `{}`", name));
+            }
+            binding.value = value;
+            return Ok(());
+        }
+        
+        if let Some(ref parent) = self.parent {
+            return parent.borrow_mut().set(name, value);
+        }
+        
+        Err(format!("undefined variable `{}`", name))
+    }
+    
+    /// Check if variable exists
+    pub fn contains(&self, name: &str) -> bool {
+        if self.bindings.contains_key(name) {
+            return true;
+        }
+        
+        if let Some(ref parent) = self.parent {
+            return parent.borrow().contains(name);
+        }
+        
+        false
+    }
+    
+    /// List all bindings
+    pub fn list_bindings(&self) -> Vec<(String, String)> {
+        let mut result: Vec<(String, String)> = self.bindings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.value.type_name().to_string()))
+            .collect();
+        
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
+    
+    /// Define a function
+    pub fn define_function(&mut self, name: &str, func: FunctionDef) {
+        self.functions.insert(name.to_string(), func);
+    }
+    
+    /// Get a function
+    pub fn get_function(&self, name: &str) -> Option<&FunctionDef> {
+        if let Some(func) = self.functions.get(name) {
+            return Some(func);
+        }
+        
+        if let Some(ref parent) = self.parent {
+            return parent.borrow().get_function(name).cloned().as_ref().map(|_| {
+                // This is a workaround - in real code we'd handle this better
+                self.functions.get(name).unwrap()
+            });
+        }
+        
+        None
+    }
+    
+    /// Register built-in functions
+    fn register_builtins(&mut self) {
+        // print
+        self.functions.insert("print".to_string(), FunctionDef {
+            name: "print".to_string(),
+            params: vec![("value".to_string(), "any".to_string())],
+            return_type: "()".to_string(),
+            body: FunctionBody::Builtin(builtin_print),
+        });
+        
+        // println
+        self.functions.insert("println".to_string(), FunctionDef {
+            name: "println".to_string(),
+            params: vec![("value".to_string(), "any".to_string())],
+            return_type: "()".to_string(),
+            body: FunctionBody::Builtin(builtin_println),
+        });
+        
+        // type_of
+        self.functions.insert("type_of".to_string(), FunctionDef {
+            name: "type_of".to_string(),
+            params: vec![("value".to_string(), "any".to_string())],
+            return_type: "String".to_string(),
+            body: FunctionBody::Builtin(builtin_type_of),
+        });
+        
+        // len
+        self.functions.insert("len".to_string(), FunctionDef {
+            name: "len".to_string(),
+            params: vec![("value".to_string(), "any".to_string())],
+            return_type: "usize".to_string(),
+            body: FunctionBody::Builtin(builtin_len),
+        });
+        
+        // dbg
+        self.functions.insert("dbg".to_string(), FunctionDef {
+            name: "dbg".to_string(),
+            params: vec![("value".to_string(), "any".to_string())],
+            return_type: "any".to_string(),
+            body: FunctionBody::Builtin(builtin_dbg),
+        });
+        
+        // assert
+        self.functions.insert("assert".to_string(), FunctionDef {
+            name: "assert".to_string(),
+            params: vec![("cond".to_string(), "bool".to_string())],
+            return_type: "()".to_string(),
+            body: FunctionBody::Builtin(builtin_assert),
+        });
+        
+        // panic
+        self.functions.insert("panic".to_string(), FunctionDef {
+            name: "panic".to_string(),
+            params: vec![("msg".to_string(), "String".to_string())],
+            return_type: "!".to_string(),
+            body: FunctionBody::Builtin(builtin_panic),
+        });
+        
+        // Math functions
+        self.functions.insert("abs".to_string(), FunctionDef {
+            name: "abs".to_string(),
+            params: vec![("x".to_string(), "number".to_string())],
+            return_type: "number".to_string(),
+            body: FunctionBody::Builtin(builtin_abs),
+        });
+        
+        self.functions.insert("sqrt".to_string(), FunctionDef {
+            name: "sqrt".to_string(),
+            params: vec![("x".to_string(), "f64".to_string())],
+            return_type: "f64".to_string(),
+            body: FunctionBody::Builtin(builtin_sqrt),
+        });
+        
+        self.functions.insert("pow".to_string(), FunctionDef {
+            name: "pow".to_string(),
+            params: vec![("base".to_string(), "f64".to_string()), ("exp".to_string(), "f64".to_string())],
+            return_type: "f64".to_string(),
+            body: FunctionBody::Builtin(builtin_pow),
+        });
+    }
+    
+    /// Clear all user bindings
+    pub fn clear(&mut self) {
+        self.bindings.clear();
+        // Keep built-in functions
+    }
+}
+
+impl Default for Environment {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Binding {
+    pub value: Value,
+    pub mutable: bool,
+    pub defined_at: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionDef {
+    pub name: String,
+    pub params: Vec<(String, String)>,
+    pub return_type: String,
+    pub body: FunctionBody,
+}
+
+#[derive(Clone)]
+pub enum FunctionBody {
+    Builtin(fn(&[Value]) -> Result<Value, String>),
+    UserDefined(String),
+}
+
+impl std::fmt::Debug for FunctionBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FunctionBody::Builtin(_) => write!(f, "Builtin(...)"),
+            FunctionBody::UserDefined(s) => write!(f, "UserDefined({})", s),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUILT-IN FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn builtin_print(args: &[Value]) -> Result<Value, String> {
+    for arg in args {
+        print!("{}", arg);
+    }
+    Ok(Value::Unit)
+}
+
+fn builtin_println(args: &[Value]) -> Result<Value, String> {
+    for arg in args {
+        print!("{}", arg);
+    }
+    println!();
+    Ok(Value::Unit)
+}
+
+fn builtin_type_of(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("type_of requires an argument".to_string());
+    }
+    Ok(Value::String(args[0].type_name().to_string()))
+}
+
+fn builtin_len(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("len requires an argument".to_string());
+    }
+    
+    let len = match &args[0] {
+        Value::String(s) => s.len(),
+        Value::Array(a) => a.len(),
+        Value::Tuple(t) => t.len(),
+        Value::Bytes(b) => b.len(),
+        _ => return Err(format!("len not supported for type {}", args[0].type_name())),
+    };
+    
+    Ok(Value::Usize(len))
+}
+
+fn builtin_dbg(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("dbg requires an argument".to_string());
+    }
+    
+    eprintln!("[dbg] {} = {:?}", args[0].type_name(), args[0]);
+    Ok(args[0].clone())
+}
+
+fn builtin_assert(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("assert requires an argument".to_string());
+    }
+    
+    match &args[0] {
+        Value::Bool(true) => Ok(Value::Unit),
+        Value::Bool(false) => Err("assertion failed".to_string()),
+        _ => Err("assert requires a boolean argument".to_string()),
+    }
+}
+
+fn builtin_panic(args: &[Value]) -> Result<Value, String> {
+    let msg = args.first()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "explicit panic".to_string());
+    Err(format!("panic: {}", msg))
+}
+
+fn builtin_abs(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("abs requires an argument".to_string());
+    }
+    
+    match &args[0] {
+        Value::I32(n) => Ok(Value::I32(n.abs())),
+        Value::I64(n) => Ok(Value::I64(n.abs())),
+        Value::F32(n) => Ok(Value::F32(n.abs())),
+        Value::F64(n) => Ok(Value::F64(n.abs())),
+        _ => Err(format!("abs not supported for type {}", args[0].type_name())),
+    }
+}
+
+fn builtin_sqrt(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("sqrt requires an argument".to_string());
+    }
+    
+    let x = args[0].to_f64()
+        .ok_or_else(|| "sqrt requires a numeric argument".to_string())?;
+    
+    Ok(Value::F64(x.sqrt()))
+}
+
+fn builtin_pow(args: &[Value]) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err("pow requires two arguments".to_string());
+    }
+    
+    let base = args[0].to_f64()
+        .ok_or_else(|| "pow requires numeric arguments".to_string())?;
+    let exp = args[1].to_f64()
+        .ok_or_else(|| "pow requires numeric arguments".to_string())?;
+    
+    Ok(Value::F64(base.powf(exp)))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EVALUATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Expression evaluator
+pub struct Evaluator {
+    env: Rc<RefCell<Environment>>,
+    config: ReplConfig,
+}
+
+impl Evaluator {
+    pub fn new(config: ReplConfig) -> Self {
+        Evaluator {
+            env: Rc::new(RefCell::new(Environment::new())),
+            config,
+        }
+    }
+    
+    /// Get environment reference
+    pub fn env(&self) -> Rc<RefCell<Environment>> {
+        Rc::clone(&self.env)
+    }
+    
+    /// Evaluate source code
+    pub fn eval(&mut self, source: &str) -> EvalResult {
+        let start = Instant::now();
+        
+        // Parse and evaluate
+        let result = self.eval_source(source);
+        
+        let duration = start.elapsed();
+        
+        EvalResult {
+            value: result,
+            duration,
+            warnings: Vec::new(),
+        }
+    }
+    
+    fn eval_source(&mut self, source: &str) -> Result<Value, String> {
+        let source = source.trim();
+        
+        if source.is_empty() {
+            return Ok(Value::Unit);
+        }
+        
+        // Handle let bindings
+        if source.starts_with("let ") {
+            return self.eval_let(source);
+        }
+        
+        // Handle function definitions
+        if source.starts_with("fn ") {
+            return self.eval_fn_def(source);
+        }
+        
+        // Handle assignments
+        if let Some(idx) = source.find('=') {
+            if !source[..idx].contains('(') && !source[..idx].contains("==") && !source[..idx].contains("!=") {
+                let before_eq = source[..idx].trim();
+                if is_identifier(before_eq) {
+                    return self.eval_assignment(before_eq, &source[idx+1..]);
+                }
+            }
+        }
+        
+        // Evaluate expression
+        self.eval_expr(source)
+    }
+    
+    fn eval_let(&mut self, source: &str) -> Result<Value, String> {
+        // let [mut] name [: type] = expr
+        let source = &source[4..]; // Skip "let "
+        
+        let mutable = source.starts_with("mut ");
+        let source = if mutable { &source[4..] } else { source };
+        
+        let eq_pos = source.find('=')
+            .ok_or("let binding requires '='")?;
+        
+        let name_part = source[..eq_pos].trim();
+        let expr_part = source[eq_pos+1..].trim();
+        
+        // Handle optional type annotation
+        let name = if let Some(colon) = name_part.find(':') {
+            name_part[..colon].trim()
+        } else {
+            name_part
+        };
+        
+        if !is_identifier(name) {
+            return Err(format!("invalid identifier: {}", name));
+        }
+        
+        let value = self.eval_expr(expr_part)?;
+        self.env.borrow_mut().define(name, value.clone(), mutable);
+        
+        Ok(value)
+    }
+    
+    fn eval_fn_def(&mut self, source: &str) -> Result<Value, String> {
+        // fn name(params) [-> type] { body }
+        let source = &source[3..]; // Skip "fn "
+        
+        let paren_start = source.find('(')
+            .ok_or("function definition requires '('")?;
+        
+        let name = source[..paren_start].trim();
+        
+        if !is_identifier(name) {
+            return Err(format!("invalid function name: {}", name));
+        }
+        
+        let paren_end = source.find(')')
+            .ok_or("function definition requires ')'")?;
+        
+        let params_str = &source[paren_start+1..paren_end];
+        let params: Vec<(String, String)> = params_str
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                let s = s.trim();
+                if let Some(colon) = s.find(':') {
+                    (s[..colon].trim().to_string(), s[colon+1..].trim().to_string())
+                } else {
+                    (s.to_string(), "any".to_string())
+                }
+            })
+            .collect();
+        
+        let rest = &source[paren_end+1..].trim();
+        
+        // Find return type
+        let (return_type, body_start) = if rest.starts_with("->") {
+            let rest = rest[2..].trim();
+            if let Some(brace) = rest.find('{') {
+                (rest[..brace].trim().to_string(), brace)
+            } else {
+                return Err("function body must start with '{'".to_string());
+            }
+        } else if rest.starts_with('{') {
+            ("()".to_string(), 0)
+        } else {
+            return Err("function body must start with '{'".to_string());
+        };
+        
+        let body = &rest[body_start..];
+        
+        // Remove braces
+        let body = body.trim_start_matches('{').trim_end_matches('}').trim();
+        
+        self.env.borrow_mut().define_function(name, FunctionDef {
+            name: name.to_string(),
+            params,
+            return_type,
+            body: FunctionBody::UserDefined(body.to_string()),
+        });
+        
+        Ok(Value::Unit)
+    }
+    
+    fn eval_assignment(&mut self, name: &str, expr: &str) -> Result<Value, String> {
+        let value = self.eval_expr(expr.trim())?;
+        self.env.borrow_mut().set(name, value.clone())?;
+        Ok(value)
+    }
+    
+    fn eval_expr(&mut self, expr: &str) -> Result<Value, String> {
+        let expr = expr.trim();
+        
+        if expr.is_empty() {
+            return Ok(Value::Unit);
+        }
+        
+        // Literals
+        if expr == "true" {
+            return Ok(Value::Bool(true));
+        }
+        if expr == "false" {
+            return Ok(Value::Bool(false));
+        }
+        if expr == "()" {
+            return Ok(Value::Unit);
+        }
+        
+        // String literal
+        if expr.starts_with('"') && expr.ends_with('"') {
+            let s = &expr[1..expr.len()-1];
+            return Ok(Value::String(unescape_string(s)));
+        }
+        
+        // Char literal
+        if expr.starts_with('\'') && expr.ends_with('\'') && expr.len() >= 3 {
+            let c = &expr[1..expr.len()-1];
+            let ch = unescape_char(c)?;
+            return Ok(Value::Char(ch));
+        }
+        
+        // Number literal
+        if let Some(value) = parse_number(expr) {
+            return Ok(value);
+        }
+        
+        // Array literal
+        if expr.starts_with('[') && expr.ends_with(']') {
+            return self.eval_array(&expr[1..expr.len()-1]);
+        }
+        
+        // Tuple literal
+        if expr.starts_with('(') && expr.ends_with(')') && expr.contains(',') {
+            return self.eval_tuple(&expr[1..expr.len()-1]);
+        }
+        
+        // Parenthesized expression
+        if expr.starts_with('(') && expr.ends_with(')') {
+            return self.eval_expr(&expr[1..expr.len()-1]);
+        }
+        
+        // Function call
+        if let Some(paren_pos) = expr.find('(') {
+            if expr.ends_with(')') {
+                let name = &expr[..paren_pos];
+                let args = &expr[paren_pos+1..expr.len()-1];
+                return self.eval_call(name, args);
+            }
+        }
+        
+        // Binary operators (in order of precedence)
+        for (op, eval_fn) in [
+            ("||", Self::eval_or as fn(&mut Self, &str, &str) -> Result<Value, String>),
+            ("&&", Self::eval_and),
+            ("==", Self::eval_eq),
+            ("!=", Self::eval_ne),
+            ("<=", Self::eval_le),
+            (">=", Self::eval_ge),
+            ("<", Self::eval_lt),
+            (">", Self::eval_gt),
+            ("+", Self::eval_add),
+            ("-", Self::eval_sub),
+            ("*", Self::eval_mul),
+            ("/", Self::eval_div),
+            ("%", Self::eval_mod),
+        ] {
+            if let Some(idx) = find_operator(expr, op) {
+                let left = &expr[..idx];
+                let right = &expr[idx + op.len()..];
+                return eval_fn(self, left, right);
+            }
+        }
+        
+        // Unary operators
+        if expr.starts_with('!') {
+            let inner = self.eval_expr(&expr[1..])?;
+            return match inner {
+                Value::Bool(b) => Ok(Value::Bool(!b)),
+                _ => Err("! operator requires boolean".to_string()),
+            };
+        }
+        
+        if expr.starts_with('-') && !expr[1..].starts_with(|c: char| c.is_ascii_digit()) {
+            let inner = self.eval_expr(&expr[1..])?;
+            return self.negate(inner);
+        }
+        
+        // Variable reference
+        if is_identifier(expr) {
+            return self.env.borrow().get(expr)
+                .ok_or_else(|| format!("undefined variable: {}", expr));
+        }
+        
+        Err(format!("cannot evaluate: {}", expr))
+    }
+    
+    fn eval_array(&mut self, content: &str) -> Result<Value, String> {
+        if content.trim().is_empty() {
+            return Ok(Value::Array(Vec::new()));
+        }
+        
+        let elements: Result<Vec<Value>, String> = split_args(content)
+            .iter()
+            .map(|e| self.eval_expr(e))
+            .collect();
+        
+        Ok(Value::Array(elements?))
+    }
+    
+    fn eval_tuple(&mut self, content: &str) -> Result<Value, String> {
+        let elements: Result<Vec<Value>, String> = split_args(content)
+            .iter()
+            .map(|e| self.eval_expr(e))
+            .collect();
+        
+        Ok(Value::Tuple(elements?))
+    }
+    
+    fn eval_call(&mut self, name: &str, args_str: &str) -> Result<Value, String> {
+        let args: Result<Vec<Value>, String> = if args_str.trim().is_empty() {
+            Ok(Vec::new())
+        } else {
+            split_args(args_str)
+                .iter()
+                .map(|a| self.eval_expr(a))
+                .collect()
+        };
+        let args = args?;
+        
+        // Check built-in functions first
+        let func = self.env.borrow().functions.get(name).cloned();
+        
+        if let Some(func) = func {
+            match func.body {
+                FunctionBody::Builtin(f) => return f(&args),
+                FunctionBody::UserDefined(body) => {
+                    // Create new scope
+                    let child_env = Rc::new(RefCell::new(
+                        Environment::with_parent(Rc::clone(&self.env))
+                    ));
+                    
+                    // Bind parameters
+                    for ((param_name, _), arg) in func.params.iter().zip(args.iter()) {
+                        child_env.borrow_mut().define(param_name, arg.clone(), false);
+                    }
+                    
+                    // Evaluate body
+                    let old_env = std::mem::replace(&mut self.env, child_env);
+                    let result = self.eval_expr(&body);
+                    self.env = old_env;
+                    
+                    return result;
+                }
+            }
+        }
+        
+        Err(format!("undefined function: {}", name))
+    }
+    
+    // Binary operator evaluations
+    fn eval_or(&mut self, left: &str, right: &str) -> Result<Value, String> {
+        let l = self.eval_expr(left)?;
+        if l.is_truthy() {
+            return Ok(l);
+        }
+        self.eval_expr(right)
+    }
+    
+    fn eval_and(&mut self, left: &str, right: &str) -> Result<Value, String> {
+        let l = self.eval_expr(left)?;
+        if !l.is_truthy() {
+            return Ok(l);
+        }
+        self.eval_expr(right)
+    }
+    
+    fn eval_eq(&mut self, left: &str, right: &str) -> Result<Value, String> {
+        let l = self.eval_expr(left)?;
+        let r = self.eval_expr(right)?;
+        Ok(Value::Bool(values_equal(&l, &r)))
+    }
+    
+    fn eval_ne(&mut self, left: &str, right: &str) -> Result<Value, String> {
+        let l = self.eval_expr(left)?;
+        let r = self.eval_expr(right)?;
+        Ok(Value::Bool(!values_equal(&l, &r)))
+    }
+    
+    fn eval_lt(&mut self, left: &str, right: &str) -> Result<Value, String> {
+        let l = self.eval_expr(left)?;
+        let r = self.eval_expr(right)?;
+        compare_values(&l, &r).map(|ord| Value::Bool(ord == std::cmp::Ordering::Less))
+    }
+    
+    fn eval_le(&mut self, left: &str, right: &str) -> Result<Value, String> {
+        let l = self.eval_expr(left)?;
+        let r = self.eval_expr(right)?;
+        compare_values(&l, &r).map(|ord| Value::Bool(ord != std::cmp::Ordering::Greater))
+    }
+    
+    fn eval_gt(&mut self, left: &str, right: &str) -> Result<Value, String> {
+        let l = self.eval_expr(left)?;
+        let r = self.eval_expr(right)?;
+        compare_values(&l, &r).map(|ord| Value::Bool(ord == std::cmp::Ordering::Greater))
+    }
+    
+    fn eval_ge(&mut self, left: &str, right: &str) -> Result<Value, String> {
+        let l = self.eval_expr(left)?;
+        let r = self.eval_expr(right)?;
+        compare_values(&l, &r).map(|ord| Value::Bool(ord != std::cmp::Ordering::Less))
+    }
+    
+    fn eval_add(&mut self, left: &str, right: &str) -> Result<Value, String> {
+        let l = self.eval_expr(left)?;
+        let r = self.eval_expr(right)?;
+        
+        match (&l, &r) {
+            (Value::I32(a), Value::I32(b)) => Ok(Value::I32(a + b)),
+            (Value::I64(a), Value::I64(b)) => Ok(Value::I64(a + b)),
+            (Value::F32(a), Value::F32(b)) => Ok(Value::F32(a + b)),
+            (Value::F64(a), Value::F64(b)) => Ok(Value::F64(a + b)),
+            (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
+            _ => {
+                // Try numeric coercion
+                if let (Some(a), Some(b)) = (l.to_f64(), r.to_f64()) {
+                    return Ok(Value::F64(a + b));
+                }
+                Err(format!("cannot add {} and {}", l.type_name(), r.type_name()))
+            }
+        }
+    }
+    
+    fn eval_sub(&mut self, left: &str, right: &str) -> Result<Value, String> {
+        let l = self.eval_expr(left)?;
+        let r = self.eval_expr(right)?;
+        
+        match (&l, &r) {
+            (Value::I32(a), Value::I32(b)) => Ok(Value::I32(a - b)),
+            (Value::I64(a), Value::I64(b)) => Ok(Value::I64(a - b)),
+            (Value::F32(a), Value::F32(b)) => Ok(Value::F32(a - b)),
+            (Value::F64(a), Value::F64(b)) => Ok(Value::F64(a - b)),
+            _ => {
+                if let (Some(a), Some(b)) = (l.to_f64(), r.to_f64()) {
+                    return Ok(Value::F64(a - b));
+                }
+                Err(format!("cannot subtract {} from {}", r.type_name(), l.type_name()))
+            }
+        }
+    }
+    
+    fn eval_mul(&mut self, left: &str, right: &str) -> Result<Value, String> {
+        let l = self.eval_expr(left)?;
+        let r = self.eval_expr(right)?;
+        
+        match (&l, &r) {
+            (Value::I32(a), Value::I32(b)) => Ok(Value::I32(a * b)),
+            (Value::I64(a), Value::I64(b)) => Ok(Value::I64(a * b)),
+            (Value::F32(a), Value::F32(b)) => Ok(Value::F32(a * b)),
+            (Value::F64(a), Value::F64(b)) => Ok(Value::F64(a * b)),
+            _ => {
+                if let (Some(a), Some(b)) = (l.to_f64(), r.to_f64()) {
+                    return Ok(Value::F64(a * b));
+                }
+                Err(format!("cannot multiply {} and {}", l.type_name(), r.type_name()))
+            }
+        }
+    }
+    
+    fn eval_div(&mut self, left: &str, right: &str) -> Result<Value, String> {
+        let l = self.eval_expr(left)?;
+        let r = self.eval_expr(right)?;
+        
+        match (&l, &r) {
+            (Value::I32(a), Value::I32(b)) => {
+                if *b == 0 { return Err("division by zero".to_string()); }
+                Ok(Value::I32(a / b))
+            }
+            (Value::I64(a), Value::I64(b)) => {
+                if *b == 0 { return Err("division by zero".to_string()); }
+                Ok(Value::I64(a / b))
+            }
+            (Value::F32(a), Value::F32(b)) => Ok(Value::F32(a / b)),
+            (Value::F64(a), Value::F64(b)) => Ok(Value::F64(a / b)),
+            _ => {
+                if let (Some(a), Some(b)) = (l.to_f64(), r.to_f64()) {
+                    return Ok(Value::F64(a / b));
+                }
+                Err(format!("cannot divide {} by {}", l.type_name(), r.type_name()))
+            }
+        }
+    }
+    
+    fn eval_mod(&mut self, left: &str, right: &str) -> Result<Value, String> {
+        let l = self.eval_expr(left)?;
+        let r = self.eval_expr(right)?;
+        
+        match (&l, &r) {
+            (Value::I32(a), Value::I32(b)) => {
+                if *b == 0 { return Err("division by zero".to_string()); }
+                Ok(Value::I32(a % b))
+            }
+            (Value::I64(a), Value::I64(b)) => {
+                if *b == 0 { return Err("division by zero".to_string()); }
+                Ok(Value::I64(a % b))
+            }
+            _ => Err(format!("cannot compute modulo of {} and {}", l.type_name(), r.type_name())),
+        }
+    }
+    
+    fn negate(&self, value: Value) -> Result<Value, String> {
+        match value {
+            Value::I32(n) => Ok(Value::I32(-n)),
+            Value::I64(n) => Ok(Value::I64(-n)),
+            Value::F32(n) => Ok(Value::F32(-n)),
+            Value::F64(n) => Ok(Value::F64(-n)),
+            _ => Err(format!("cannot negate {}", value.type_name())),
+        }
+    }
+}
+
+/// Evaluation result
+#[derive(Debug)]
+pub struct EvalResult {
+    pub value: Result<Value, String>,
+    pub duration: Duration,
+    pub warnings: Vec<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn parse_number(s: &str) -> Option<Value> {
+    // Integer with suffix
+    if let Some(val) = s.strip_suffix("i8") {
+        return val.parse::<i8>().ok().map(Value::I8);
+    }
+    if let Some(val) = s.strip_suffix("i16") {
+        return val.parse::<i16>().ok().map(Value::I16);
+    }
+    if let Some(val) = s.strip_suffix("i32") {
+        return val.parse::<i32>().ok().map(Value::I32);
+    }
+    if let Some(val) = s.strip_suffix("i64") {
+        return val.parse::<i64>().ok().map(Value::I64);
+    }
+    if let Some(val) = s.strip_suffix("u8") {
+        return val.parse::<u8>().ok().map(Value::U8);
+    }
+    if let Some(val) = s.strip_suffix("u16") {
+        return val.parse::<u16>().ok().map(Value::U16);
+    }
+    if let Some(val) = s.strip_suffix("u32") {
+        return val.parse::<u32>().ok().map(Value::U32);
+    }
+    if let Some(val) = s.strip_suffix("u64") {
+        return val.parse::<u64>().ok().map(Value::U64);
+    }
+    if let Some(val) = s.strip_suffix("usize") {
+        return val.parse::<usize>().ok().map(Value::Usize);
+    }
+    if let Some(val) = s.strip_suffix("isize") {
+        return val.parse::<isize>().ok().map(Value::Isize);
+    }
+    if let Some(val) = s.strip_suffix("f32") {
+        return val.parse::<f32>().ok().map(Value::F32);
+    }
+    if let Some(val) = s.strip_suffix("f64") {
+        return val.parse::<f64>().ok().map(Value::F64);
+    }
+    
+    // Float
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        return s.parse::<f64>().ok().map(Value::F64);
+    }
+    
+    // Integer (default to i32)
+    s.parse::<i32>().ok().map(Value::I32)
+}
+
+fn unescape_string(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars();
+    
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('t') => result.push('\t'),
+                Some('\\') => result.push('\\'),
+                Some('"') => result.push('"'),
+                Some('0') => result.push('\0'),
+                Some(c) => {
+                    result.push('\\');
+                    result.push(c);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    
+    result
+}
+
+fn unescape_char(s: &str) -> Result<char, String> {
+    if s.len() == 1 {
+        return Ok(s.chars().next().unwrap());
+    }
+    
+    if s.starts_with('\\') {
+        match s.chars().nth(1) {
+            Some('n') => return Ok('\n'),
+            Some('r') => return Ok('\r'),
+            Some('t') => return Ok('\t'),
+            Some('\\') => return Ok('\\'),
+            Some('\'') => return Ok('\''),
+            Some('0') => return Ok('\0'),
+            _ => {}
+        }
+    }
+    
+    Err(format!("invalid character literal: '{}'", s))
+}
+
+fn split_args(s: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+    let mut in_string = false;
+    
+    for c in s.chars() {
+        match c {
+            '"' => {
+                in_string = !in_string;
+                current.push(c);
+            }
+            '(' | '[' | '{' if !in_string => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' | ']' | '}' if !in_string => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if depth == 0 && !in_string => {
+                args.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    
+    if !current.trim().is_empty() {
+        args.push(current.trim().to_string());
+    }
+    
+    args
+}
+
+fn find_operator(expr: &str, op: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut in_string = false;
+    let bytes = expr.as_bytes();
+    let op_bytes = op.as_bytes();
+    
+    // Search from right to left for left-associativity
+    let mut i = expr.len();
+    while i > 0 {
+        i -= 1;
+        
+        let c = bytes[i];
+        
+        if c == b'"' {
+            in_string = !in_string;
+            continue;
+        }
+        
+        if in_string {
+            continue;
+        }
+        
+        match c {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' => depth -= 1,
+            _ if depth == 0 => {
+                if i + op.len() <= expr.len() && &bytes[i..i + op.len()] == op_bytes {
+                    // Check it's not part of a larger operator
+                    let valid = if op == "<" || op == ">" {
+                        i + 1 >= expr.len() || (bytes[i + 1] != b'=' && bytes[i + 1] != op_bytes[0])
+                    } else {
+                        true
+                    };
+                    
+                    if valid {
+                        return Some(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    None
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Unit, Value::Unit) => true,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::String(a), Value::String(b)) => a == b,
+        _ => {
+            if let (Some(a), Some(b)) = (a.to_f64(), b.to_f64()) {
+                (a - b).abs() < f64::EPSILON
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
+    if let (Some(a), Some(b)) = (a.to_f64(), b.to_f64()) {
+        return Ok(a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    
+    match (a, b) {
+        (Value::String(a), Value::String(b)) => Ok(a.cmp(b)),
+        (Value::Char(a), Value::Char(b)) => Ok(a.cmp(b)),
+        _ => Err(format!("cannot compare {} and {}", a.type_name(), b.type_name())),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_eval_literals() {
+        let mut eval = Evaluator::new(ReplConfig::default());
+        
+        assert_eq!(eval.eval("42").value.unwrap(), Value::I32(42));
+        assert_eq!(eval.eval("true").value.unwrap(), Value::Bool(true));
+        assert_eq!(eval.eval("\"hello\"").value.unwrap(), Value::String("hello".to_string()));
+    }
+    
+    #[test]
+    fn test_eval_arithmetic() {
+        let mut eval = Evaluator::new(ReplConfig::default());
+        
+        assert_eq!(eval.eval("2 + 3").value.unwrap(), Value::I32(5));
+        assert_eq!(eval.eval("10 - 4").value.unwrap(), Value::I32(6));
+        assert_eq!(eval.eval("3 * 4").value.unwrap(), Value::I32(12));
+        assert_eq!(eval.eval("15 / 3").value.unwrap(), Value::I32(5));
+    }
+    
+    #[test]
+    fn test_eval_variables() {
+        let mut eval = Evaluator::new(ReplConfig::default());
+        
+        eval.eval("let x = 10").value.unwrap();
+        assert_eq!(eval.eval("x").value.unwrap(), Value::I32(10));
+        assert_eq!(eval.eval("x + 5").value.unwrap(), Value::I32(15));
+    }
+}

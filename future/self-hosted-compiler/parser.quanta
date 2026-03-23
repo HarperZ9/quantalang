@@ -1,0 +1,2592 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ PARSER — Recursive Descent with Pratt Precedence
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::parser
+
+use crate::lexer::{Token, TokenKind, Span, Lexer, IntSuffix, FloatSuffix}
+use crate::ast::*
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PARSER STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct Parser<'src> {
+    tokens: Vec<Token>,
+    pos: usize,
+    errors: Vec<ParseError>,
+    file_id: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParseError {
+    pub message: String,
+    pub span: Span,
+    pub kind: ParseErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    UnexpectedToken,
+    ExpectedToken,
+    ExpectedExpression,
+    ExpectedType,
+    ExpectedPattern,
+    ExpectedItem,
+    InvalidAttribute,
+    InvalidLiteral,
+    Overflow,
+}
+
+pub type ParseResult<T> = Result<T, ParseError>;
+
+impl<'src> Parser<'src> {
+    pub fn new(source: &'src str, file_id: u16) -> Self {
+        let mut lexer = Lexer::new(source, file_id);
+        let tokens = lexer.tokenize();
+        
+        Parser {
+            tokens,
+            pos: 0,
+            errors: Vec::new(),
+            file_id,
+        }
+    }
+    
+    pub fn parse_module(&mut self) -> ParseResult<Module> {
+        let start = self.current_span();
+        
+        // Optional module declaration: module foo::bar
+        let name = if self.check(TokenKind::Mod) {
+            self.advance();
+            let path = self.parse_path()?;
+            self.expect(TokenKind::Semi)?;
+            Identifier { name: path.segments.iter().map(|s| s.ident.name.clone()).collect::<Vec<_>>().join("::"), span: path.span }
+        } else {
+            Identifier { name: "main".to_string(), span: start }
+        };
+        
+        let mut items = Vec::new();
+        while !self.at_end() {
+            match self.parse_item() {
+                Ok(item) => items.push(item),
+                Err(e) => {
+                    self.errors.push(e);
+                    self.synchronize();
+                }
+            }
+        }
+        
+        Ok(Module {
+            name,
+            items,
+            span: start.merge(self.previous_span()),
+        })
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // ITEMS
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_item(&mut self) -> ParseResult<Item> {
+        let start = self.current_span();
+        let attrs = self.parse_attributes()?;
+        let vis = self.parse_visibility()?;
+        
+        let kind = if self.check(TokenKind::Fn) {
+            ItemKind::Function(self.parse_function()?)
+        } else if self.check(TokenKind::Struct) {
+            self.advance();
+            if self.check(TokenKind::Bitfield) {
+                // Actually: bitfield struct
+                self.pos -= 1; // backtrack
+                ItemKind::BitfieldStruct(self.parse_bitfield()?)
+            } else {
+                ItemKind::Struct(self.parse_struct_def()?)
+            }
+        } else if self.check(TokenKind::Bitfield) {
+            ItemKind::BitfieldStruct(self.parse_bitfield()?)
+        } else if self.check(TokenKind::Enum) {
+            ItemKind::Enum(self.parse_enum_def()?)
+        } else if self.check(TokenKind::Union) {
+            ItemKind::Union(self.parse_union_def()?)
+        } else if self.check(TokenKind::Trait) {
+            ItemKind::Trait(self.parse_trait_def()?)
+        } else if self.check(TokenKind::Impl) {
+            ItemKind::Impl(self.parse_impl_block()?)
+        } else if self.check(TokenKind::Type) {
+            ItemKind::TypeAlias(self.parse_type_alias()?)
+        } else if self.check(TokenKind::Const) {
+            ItemKind::Const(self.parse_const_item()?)
+        } else if self.check(TokenKind::Static) {
+            ItemKind::Static(self.parse_static_item()?)
+        } else if self.check(TokenKind::Mod) {
+            ItemKind::Module(self.parse_module_item()?)
+        } else if self.check(TokenKind::Use) {
+            ItemKind::Use(self.parse_use_tree()?)
+        } else if self.check(TokenKind::Extern) {
+            ItemKind::ExternBlock(self.parse_extern_block()?)
+        } else if self.check(TokenKind::State) {
+            ItemKind::StateMachine(self.parse_state_machine()?)
+        } else if self.check(TokenKind::Effect) {
+            ItemKind::Effect(self.parse_effect_def()?)
+        } else if self.check(TokenKind::Linear) {
+            // linear struct Foo { ... }
+            self.advance();
+            self.expect(TokenKind::Struct)?;
+            let mut def = self.parse_struct_def()?;
+            def.is_linear = true;
+            ItemKind::Struct(def)
+        } else {
+            return Err(self.error(ParseErrorKind::ExpectedItem, "expected item"));
+        };
+        
+        Ok(Item {
+            attrs,
+            vis,
+            kind,
+            span: start.merge(self.previous_span()),
+        })
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // FUNCTIONS
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_function(&mut self) -> ParseResult<Function> {
+        let start = self.current_span();
+        let mut qualifiers = FnQualifiers::default();
+        
+        // Parse qualifiers before `fn`
+        loop {
+            if self.check(TokenKind::Async) {
+                self.advance();
+                qualifiers.is_async = true;
+            } else if self.check(TokenKind::Unsafe) {
+                self.advance();
+                qualifiers.is_unsafe = true;
+            } else if self.check(TokenKind::Const) {
+                self.advance();
+                qualifiers.is_const = true;
+            } else if self.check(TokenKind::Kernel) {
+                self.advance();
+                qualifiers.is_kernel = true;
+            } else if self.check(TokenKind::Pure) {
+                self.advance();
+                qualifiers.is_pure = true;
+            } else if self.check(TokenKind::Extern) {
+                self.advance();
+                qualifiers.is_extern = Some(self.parse_abi()?);
+            } else {
+                break;
+            }
+        }
+        
+        self.expect(TokenKind::Fn)?;
+        let name = self.parse_identifier()?;
+        let generics = self.parse_generics()?;
+        
+        // Parameters
+        self.expect(TokenKind::LParen)?;
+        let params = self.parse_fn_params()?;
+        self.expect(TokenKind::RParen)?;
+        
+        // Return type
+        let return_type = if self.check(TokenKind::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        
+        // Where clause
+        let where_clause = if self.check(TokenKind::Where) {
+            Some(self.parse_where_clause()?)
+        } else {
+            None
+        };
+        
+        // Body (optional for trait methods and extern)
+        let body = if self.check(TokenKind::LBrace) {
+            Some(self.parse_block()?)
+        } else {
+            self.expect(TokenKind::Semi)?;
+            None
+        };
+        
+        Ok(Function {
+            name,
+            generics,
+            params,
+            return_type,
+            where_clause,
+            body,
+            qualifiers,
+            span: start.merge(self.previous_span()),
+        })
+    }
+    
+    fn parse_fn_params(&mut self) -> ParseResult<Vec<FnParam>> {
+        let mut params = Vec::new();
+        
+        while !self.check(TokenKind::RParen) && !self.at_end() {
+            // self, &self, &mut self
+            if self.check(TokenKind::Self_) || 
+               (self.check(TokenKind::Ampersand) && self.peek_next_is(TokenKind::Self_)) ||
+               (self.check(TokenKind::Ampersand) && self.peek_next_is(TokenKind::Mut)) {
+                // Handle self parameter
+                let start = self.current_span();
+                let is_ref = self.check(TokenKind::Ampersand);
+                if is_ref { self.advance(); }
+                let is_mut = self.check(TokenKind::Mut);
+                if is_mut { self.advance(); }
+                self.expect(TokenKind::Self_)?;
+                
+                params.push(FnParam {
+                    pattern: Pattern {
+                        kind: PatternKind::Ident {
+                            mutability: if is_mut { Mutability::Mutable } else { Mutability::Immutable },
+                            name: Identifier { name: "self".to_string(), span: start },
+                            subpattern: None,
+                        },
+                        span: start,
+                    },
+                    ty: Type {
+                        kind: if is_ref {
+                            TypeKind::Ref {
+                                lifetime: None,
+                                mutability: if is_mut { Mutability::Mutable } else { Mutability::Immutable },
+                                inner: Box::new(Type { kind: TypeKind::Path(Path {
+                                    segments: vec![PathSegment {
+                                        ident: Identifier { name: "Self".to_string(), span: start },
+                                        generics: None,
+                                        span: start,
+                                    }],
+                                    span: start,
+                                }), span: start }),
+                            }
+                        } else {
+                            TypeKind::Path(Path {
+                                segments: vec![PathSegment {
+                                    ident: Identifier { name: "Self".to_string(), span: start },
+                                    generics: None,
+                                    span: start,
+                                }],
+                                span: start,
+                            })
+                        },
+                        span: start,
+                    },
+                    is_mut,
+                    span: start.merge(self.previous_span()),
+                });
+            } else {
+                // Regular parameter
+                let start = self.current_span();
+                let is_mut = if self.check(TokenKind::Mut) { self.advance(); true } else { false };
+                let pattern = self.parse_pattern()?;
+                self.expect(TokenKind::Colon)?;
+                let ty = self.parse_type()?;
+                
+                params.push(FnParam {
+                    pattern,
+                    ty,
+                    is_mut,
+                    span: start.merge(self.previous_span()),
+                });
+            }
+            
+            if !self.check(TokenKind::RParen) {
+                self.expect(TokenKind::Comma)?;
+            }
+        }
+        
+        Ok(params)
+    }
+    
+    fn parse_abi(&mut self) -> ParseResult<Abi> {
+        if self.check_string() {
+            let s = self.parse_string_literal()?;
+            match s.as_str() {
+                "Rust" => Ok(Abi::Rust),
+                "C" => Ok(Abi::C),
+                "system" => Ok(Abi::System),
+                "stdcall" => Ok(Abi::Stdcall),
+                "fastcall" => Ok(Abi::Fastcall),
+                "vectorcall" => Ok(Abi::Vectorcall),
+                "aapcs" => Ok(Abi::Aapcs),
+                "win64" => Ok(Abi::Win64),
+                "sysv64" => Ok(Abi::SysV64),
+                "ptx-kernel" => Ok(Abi::PtxKernel),
+                _ => Ok(Abi::Custom(s)),
+            }
+        } else {
+            Ok(Abi::C)
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // STRUCTS
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_struct_def(&mut self) -> ParseResult<StructDef> {
+        let start = self.current_span();
+        let name = self.parse_identifier()?;
+        let generics = self.parse_generics()?;
+        
+        let (kind, where_clause) = if self.check(TokenKind::Where) {
+            let wc = self.parse_where_clause()?;
+            if self.check(TokenKind::LBrace) {
+                (StructKind::Named(self.parse_struct_fields()?), Some(wc))
+            } else if self.check(TokenKind::Semi) {
+                self.advance();
+                (StructKind::Unit, Some(wc))
+            } else {
+                return Err(self.error(ParseErrorKind::ExpectedToken, "expected '{' or ';'"));
+            }
+        } else if self.check(TokenKind::LBrace) {
+            (StructKind::Named(self.parse_struct_fields()?), None)
+        } else if self.check(TokenKind::LParen) {
+            (StructKind::Tuple(self.parse_tuple_fields()?), None)
+        } else if self.check(TokenKind::Semi) {
+            self.advance();
+            (StructKind::Unit, None)
+        } else {
+            return Err(self.error(ParseErrorKind::ExpectedToken, "expected '{', '(', or ';'"));
+        };
+        
+        Ok(StructDef {
+            name,
+            generics,
+            kind,
+            where_clause,
+            is_linear: false,
+            span: start.merge(self.previous_span()),
+        })
+    }
+    
+    fn parse_struct_fields(&mut self) -> ParseResult<Vec<StructField>> {
+        self.expect(TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            let start = self.current_span();
+            let attrs = self.parse_attributes()?;
+            let vis = self.parse_visibility()?;
+            
+            // Check for volatility
+            let volatility = if self.check(TokenKind::Volatile) {
+                self.advance();
+                if self.check(TokenKind::Readonly) {
+                    self.advance();
+                    Volatility::VolatileReadonly
+                } else if self.check(TokenKind::Writeonly) {
+                    self.advance();
+                    Volatility::VolatileWriteonly
+                } else {
+                    Volatility::Volatile
+                }
+            } else {
+                Volatility::None
+            };
+            
+            let name = self.parse_identifier()?;
+            self.expect(TokenKind::Colon)?;
+            let ty = self.parse_type()?;
+            
+            fields.push(StructField {
+                attrs,
+                vis,
+                name,
+                ty,
+                volatility,
+                span: start.merge(self.previous_span()),
+            });
+            
+            if !self.check(TokenKind::RBrace) {
+                self.expect(TokenKind::Comma)?;
+            }
+        }
+        
+        self.expect(TokenKind::RBrace)?;
+        Ok(fields)
+    }
+    
+    fn parse_tuple_fields(&mut self) -> ParseResult<Vec<TupleField>> {
+        self.expect(TokenKind::LParen)?;
+        let mut fields = Vec::new();
+        
+        while !self.check(TokenKind::RParen) && !self.at_end() {
+            let start = self.current_span();
+            let attrs = self.parse_attributes()?;
+            let vis = self.parse_visibility()?;
+            let ty = self.parse_type()?;
+            
+            fields.push(TupleField { attrs, vis, ty, span: start.merge(self.previous_span()) });
+            
+            if !self.check(TokenKind::RParen) {
+                self.expect(TokenKind::Comma)?;
+            }
+        }
+        
+        self.expect(TokenKind::RParen)?;
+        self.expect(TokenKind::Semi)?;
+        Ok(fields)
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // BITFIELDS
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_bitfield(&mut self) -> ParseResult<BitfieldDef> {
+        let start = self.current_span();
+        self.expect(TokenKind::Bitfield)?;
+        self.expect(TokenKind::Struct)?;
+        
+        let name = self.parse_identifier()?;
+        self.expect(TokenKind::Colon)?;
+        let backing_type = self.parse_type()?;
+        
+        self.expect(TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            let field_start = self.current_span();
+            let field_name = self.parse_identifier()?;
+            self.expect(TokenKind::Colon)?;
+            
+            let bits = if self.check_int() {
+                let start_bit = self.parse_int_literal()? as u8;
+                if self.check(TokenKind::DotDot) {
+                    self.advance();
+                    let end_bit = self.parse_int_literal()? as u8;
+                    BitRange::Range { start: start_bit, end: end_bit }
+                } else {
+                    BitRange::Single(start_bit)
+                }
+            } else {
+                return Err(self.error(ParseErrorKind::ExpectedToken, "expected bit index"));
+            };
+            
+            fields.push(BitfieldField {
+                name: field_name,
+                bits,
+                ty: None,
+                span: field_start.merge(self.previous_span()),
+            });
+            
+            if !self.check(TokenKind::RBrace) {
+                self.expect(TokenKind::Comma)?;
+            }
+        }
+        
+        self.expect(TokenKind::RBrace)?;
+        
+        Ok(BitfieldDef {
+            name,
+            backing_type,
+            fields,
+            span: start.merge(self.previous_span()),
+        })
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // STATE MACHINES
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_state_machine(&mut self) -> ParseResult<StateMachineDef> {
+        let start = self.current_span();
+        self.expect(TokenKind::State)?;
+        
+        let name = self.parse_identifier()?;
+        let generics = self.parse_generics()?;
+        
+        self.expect(TokenKind::LBrace)?;
+        
+        let mut states = Vec::new();
+        let mut transitions = Vec::new();
+        
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            let item_start = self.current_span();
+            
+            // State declaration or transition
+            let first_ident = self.parse_identifier()?;
+            
+            if self.check(TokenKind::Arrow) {
+                // Transition: State -> OtherState: method()
+                self.advance();
+                let to_state = self.parse_identifier()?;
+                self.expect(TokenKind::Colon)?;
+                let trigger = self.parse_identifier()?;
+                self.expect(TokenKind::LParen)?;
+                self.expect(TokenKind::RParen)?;
+                
+                transitions.push(StateTransition {
+                    from: TransitionSource::State(first_ident),
+                    to: to_state,
+                    trigger,
+                    span: item_start.merge(self.previous_span()),
+                });
+            } else if self.check(TokenKind::LBrace) {
+                // State with data
+                let data = Some(self.parse_struct_fields()?);
+                states.push(StateDecl {
+                    name: first_ident,
+                    data,
+                    span: item_start.merge(self.previous_span()),
+                });
+            } else {
+                // Simple state
+                states.push(StateDecl {
+                    name: first_ident,
+                    data: None,
+                    span: item_start.merge(self.previous_span()),
+                });
+            }
+            
+            if !self.check(TokenKind::RBrace) {
+                self.expect(TokenKind::Comma)?;
+            }
+        }
+        
+        self.expect(TokenKind::RBrace)?;
+        
+        Ok(StateMachineDef {
+            name,
+            generics,
+            states,
+            transitions,
+            span: start.merge(self.previous_span()),
+        })
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // ENUMS
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_enum_def(&mut self) -> ParseResult<EnumDef> {
+        let start = self.current_span();
+        self.expect(TokenKind::Enum)?;
+        
+        let name = self.parse_identifier()?;
+        let generics = self.parse_generics()?;
+        let where_clause = if self.check(TokenKind::Where) {
+            Some(self.parse_where_clause()?)
+        } else {
+            None
+        };
+        
+        self.expect(TokenKind::LBrace)?;
+        let mut variants = Vec::new();
+        
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            let var_start = self.current_span();
+            let attrs = self.parse_attributes()?;
+            let var_name = self.parse_identifier()?;
+            
+            let kind = if self.check(TokenKind::LBrace) {
+                VariantKind::Struct(self.parse_struct_fields()?)
+            } else if self.check(TokenKind::LParen) {
+                self.advance();
+                let mut types = Vec::new();
+                while !self.check(TokenKind::RParen) && !self.at_end() {
+                    types.push(self.parse_type()?);
+                    if !self.check(TokenKind::RParen) {
+                        self.expect(TokenKind::Comma)?;
+                    }
+                }
+                self.expect(TokenKind::RParen)?;
+                VariantKind::Tuple(types)
+            } else {
+                VariantKind::Unit
+            };
+            
+            let discriminant = if self.check(TokenKind::Eq) {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            
+            variants.push(EnumVariant {
+                attrs,
+                name: var_name,
+                kind,
+                discriminant,
+                span: var_start.merge(self.previous_span()),
+            });
+            
+            if !self.check(TokenKind::RBrace) {
+                self.expect(TokenKind::Comma)?;
+            }
+        }
+        
+        self.expect(TokenKind::RBrace)?;
+        
+        Ok(EnumDef {
+            name,
+            generics,
+            variants,
+            where_clause,
+            span: start.merge(self.previous_span()),
+        })
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // TYPES
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_type(&mut self) -> ParseResult<Type> {
+        let start = self.current_span();
+        
+        let kind = match &self.current().kind {
+            // Primitives
+            TokenKind::U8 => { self.advance(); TypeKind::Int(IntType::U8) }
+            TokenKind::U16 => { self.advance(); TypeKind::Int(IntType::U16) }
+            TokenKind::U32 => { self.advance(); TypeKind::Int(IntType::U32) }
+            TokenKind::U64 => { self.advance(); TypeKind::Int(IntType::U64) }
+            TokenKind::U128 => { self.advance(); TypeKind::Int(IntType::U128) }
+            TokenKind::Usize => { self.advance(); TypeKind::Int(IntType::Usize) }
+            TokenKind::I8 => { self.advance(); TypeKind::Int(IntType::I8) }
+            TokenKind::I16 => { self.advance(); TypeKind::Int(IntType::I16) }
+            TokenKind::I32 => { self.advance(); TypeKind::Int(IntType::I32) }
+            TokenKind::I64 => { self.advance(); TypeKind::Int(IntType::I64) }
+            TokenKind::I128 => { self.advance(); TypeKind::Int(IntType::I128) }
+            TokenKind::Isize => { self.advance(); TypeKind::Int(IntType::Isize) }
+            TokenKind::F32 => { self.advance(); TypeKind::Float(FloatType::F32) }
+            TokenKind::F64 => { self.advance(); TypeKind::Float(FloatType::F64) }
+            TokenKind::Bool => { self.advance(); TypeKind::Bool }
+            TokenKind::Char => { self.advance(); TypeKind::Char }
+            TokenKind::Str => { self.advance(); TypeKind::Str }
+            
+            // Physical types
+            TokenKind::PhysAddr => { self.advance(); TypeKind::PhysAddr }
+            TokenKind::VirtAddr => { self.advance(); TypeKind::VirtAddr }
+            TokenKind::Bytes => { self.advance(); TypeKind::Bytes }
+            TokenKind::Pages => { self.advance(); TypeKind::Pages }
+            TokenKind::Microseconds => { self.advance(); TypeKind::Microseconds }
+            TokenKind::Nanoseconds => { self.advance(); TypeKind::Nanoseconds }
+            TokenKind::Hertz => { self.advance(); TypeKind::Hertz }
+            
+            // Never type
+            TokenKind::Bang => { self.advance(); TypeKind::Never }
+            
+            // Unit / tuple
+            TokenKind::LParen => {
+                self.advance();
+                if self.check(TokenKind::RParen) {
+                    self.advance();
+                    TypeKind::Unit
+                } else {
+                    let mut types = vec![self.parse_type()?];
+                    while self.check(TokenKind::Comma) {
+                        self.advance();
+                        if !self.check(TokenKind::RParen) {
+                            types.push(self.parse_type()?);
+                        }
+                    }
+                    self.expect(TokenKind::RParen)?;
+                    if types.len() == 1 {
+                        return Ok(types.pop().unwrap());
+                    }
+                    TypeKind::Tuple(types)
+                }
+            }
+            
+            // Array / slice
+            TokenKind::LBracket => {
+                self.advance();
+                let elem = self.parse_type()?;
+                if self.check(TokenKind::Semi) {
+                    self.advance();
+                    let len = self.parse_expr()?;
+                    self.expect(TokenKind::RBracket)?;
+                    TypeKind::Array { elem: Box::new(elem), len: Box::new(len) }
+                } else {
+                    self.expect(TokenKind::RBracket)?;
+                    TypeKind::Slice(Box::new(elem))
+                }
+            }
+            
+            // Reference
+            TokenKind::Ampersand => {
+                self.advance();
+                let lifetime = if self.check_lifetime() {
+                    Some(self.parse_lifetime()?)
+                } else {
+                    None
+                };
+                let mutability = if self.check(TokenKind::Mut) {
+                    self.advance();
+                    Mutability::Mutable
+                } else {
+                    Mutability::Immutable
+                };
+                let inner = self.parse_type()?;
+                TypeKind::Ref { lifetime, mutability, inner: Box::new(inner) }
+            }
+            
+            // Pointer
+            TokenKind::Star => {
+                self.advance();
+                let mutability = if self.check(TokenKind::Mut) {
+                    self.advance();
+                    Mutability::Mutable
+                } else if self.check(TokenKind::Const) {
+                    self.advance();
+                    Mutability::Immutable
+                } else {
+                    Mutability::Immutable
+                };
+                let inner = self.parse_type()?;
+                TypeKind::Ptr { mutability, inner: Box::new(inner) }
+            }
+            
+            // Linear type
+            TokenKind::Linear => {
+                self.advance();
+                let inner = self.parse_type()?;
+                TypeKind::Linear(Box::new(inner))
+            }
+            
+            // Volatile type
+            TokenKind::Volatile => {
+                self.advance();
+                let access = if self.check(TokenKind::Readonly) {
+                    self.advance();
+                    VolatileAccess::ReadOnly
+                } else if self.check(TokenKind::Writeonly) {
+                    self.advance();
+                    VolatileAccess::WriteOnly
+                } else {
+                    VolatileAccess::ReadWrite
+                };
+                let inner = self.parse_type()?;
+                TypeKind::Volatile { inner: Box::new(inner), access }
+            }
+            
+            // dyn Trait
+            TokenKind::Dyn => {
+                self.advance();
+                let bounds = self.parse_type_bounds()?;
+                TypeKind::TraitObject { bounds, dyn_token: true }
+            }
+            
+            // impl Trait
+            TokenKind::Impl => {
+                self.advance();
+                let bounds = self.parse_type_bounds()?;
+                TypeKind::ImplTrait(bounds)
+            }
+            
+            // Underscore (infer)
+            TokenKind::Underscore => {
+                self.advance();
+                TypeKind::Infer
+            }
+            
+            // Path
+            TokenKind::Identifier(_) | TokenKind::ColonColon | TokenKind::SelfType | TokenKind::Super | TokenKind::Crate => {
+                TypeKind::Path(self.parse_path()?)
+            }
+            
+            _ => {
+                return Err(self.error(ParseErrorKind::ExpectedType, "expected type"));
+            }
+        };
+        
+        Ok(Type { kind, span: start.merge(self.previous_span()) })
+    }
+    
+    fn parse_type_bounds(&mut self) -> ParseResult<Vec<TypeBound>> {
+        let mut bounds = vec![self.parse_type_bound()?];
+        
+        while self.check(TokenKind::Plus) {
+            self.advance();
+            bounds.push(self.parse_type_bound()?);
+        }
+        
+        Ok(bounds)
+    }
+    
+    fn parse_type_bound(&mut self) -> ParseResult<TypeBound> {
+        let start = self.current_span();
+        
+        if self.check_lifetime() {
+            Ok(TypeBound {
+                kind: TypeBoundKind::Lifetime(self.parse_lifetime()?),
+                span: start.merge(self.previous_span()),
+            })
+        } else {
+            let modifier = if self.check(TokenKind::Question) {
+                self.advance();
+                TraitBoundModifier::Maybe
+            } else if self.check(TokenKind::Bang) {
+                self.advance();
+                TraitBoundModifier::Negative
+            } else {
+                TraitBoundModifier::None
+            };
+            
+            let path = self.parse_path()?;
+            
+            Ok(TypeBound {
+                kind: TypeBoundKind::Trait { path, modifier },
+                span: start.merge(self.previous_span()),
+            })
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // EXPRESSIONS (Pratt parser)
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_expr(&mut self) -> ParseResult<Expr> {
+        self.parse_expr_bp(0)
+    }
+    
+    fn parse_expr_bp(&mut self, min_bp: u8) -> ParseResult<Expr> {
+        let start = self.current_span();
+        
+        // Prefix / atom
+        let mut lhs = self.parse_prefix_or_atom()?;
+        
+        // Infix
+        loop {
+            let op = match self.current().kind {
+                // Assignment (right-associative)
+                TokenKind::Eq => BinaryOp::Assign,
+                TokenKind::PlusEq => BinaryOp::AddAssign,
+                TokenKind::MinusEq => BinaryOp::SubAssign,
+                TokenKind::StarEq => BinaryOp::MulAssign,
+                TokenKind::SlashEq => BinaryOp::DivAssign,
+                TokenKind::PercentEq => BinaryOp::RemAssign,
+                TokenKind::AmpersandEq => BinaryOp::BitAndAssign,
+                TokenKind::PipeEq => BinaryOp::BitOrAssign,
+                TokenKind::CaretEq => BinaryOp::BitXorAssign,
+                TokenKind::ShlEq => BinaryOp::ShlAssign,
+                TokenKind::ShrEq => BinaryOp::ShrAssign,
+                
+                // Logical
+                TokenKind::PipePipe => BinaryOp::Or,
+                TokenKind::AndAnd => BinaryOp::And,
+                
+                // Comparison
+                TokenKind::EqEq => BinaryOp::Eq,
+                TokenKind::Ne => BinaryOp::Ne,
+                TokenKind::Lt => BinaryOp::Lt,
+                TokenKind::Le => BinaryOp::Le,
+                TokenKind::Gt => BinaryOp::Gt,
+                TokenKind::Ge => BinaryOp::Ge,
+                
+                // Bitwise
+                TokenKind::Pipe => BinaryOp::BitOr,
+                TokenKind::Caret => BinaryOp::BitXor,
+                TokenKind::Ampersand => BinaryOp::BitAnd,
+                TokenKind::Shl => BinaryOp::Shl,
+                TokenKind::Shr => BinaryOp::Shr,
+                
+                // Arithmetic
+                TokenKind::Plus => BinaryOp::Add,
+                TokenKind::Minus => BinaryOp::Sub,
+                TokenKind::Star => BinaryOp::Mul,
+                TokenKind::Slash => BinaryOp::Div,
+                TokenKind::Percent => BinaryOp::Rem,
+                
+                // Postfix operations (handled differently)
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::Dot | TokenKind::Question => {
+                    lhs = self.parse_postfix(lhs)?;
+                    continue;
+                }
+                
+                _ => break,
+            };
+            
+            let (l_bp, r_bp) = Self::infix_binding_power(op);
+            if l_bp < min_bp {
+                break;
+            }
+            
+            self.advance();
+            let rhs = self.parse_expr_bp(r_bp)?;
+            
+            lhs = Expr {
+                kind: ExprKind::Binary { left: Box::new(lhs), op, right: Box::new(rhs) },
+                span: start.merge(self.previous_span()),
+            };
+        }
+        
+        Ok(lhs)
+    }
+    
+    fn parse_prefix_or_atom(&mut self) -> ParseResult<Expr> {
+        let start = self.current_span();
+        
+        // Prefix operators
+        if let Some(op) = self.try_prefix_op() {
+            self.advance();
+            let ((), r_bp) = Self::prefix_binding_power(op);
+            let operand = self.parse_expr_bp(r_bp)?;
+            return Ok(Expr {
+                kind: ExprKind::Unary { op, expr: Box::new(operand) },
+                span: start.merge(self.previous_span()),
+            });
+        }
+        
+        // Reference
+        if self.check(TokenKind::Ampersand) {
+            self.advance();
+            let mutability = if self.check(TokenKind::Mut) {
+                self.advance();
+                Mutability::Mutable
+            } else {
+                Mutability::Immutable
+            };
+            let expr = self.parse_expr_bp(14)?; // High precedence
+            return Ok(Expr {
+                kind: ExprKind::Ref { mutability, expr: Box::new(expr) },
+                span: start.merge(self.previous_span()),
+            });
+        }
+        
+        // Dereference
+        if self.check(TokenKind::Star) {
+            self.advance();
+            let expr = self.parse_expr_bp(14)?;
+            return Ok(Expr {
+                kind: ExprKind::Deref(Box::new(expr)),
+                span: start.merge(self.previous_span()),
+            });
+        }
+        
+        self.parse_atom()
+    }
+    
+    fn parse_atom(&mut self) -> ParseResult<Expr> {
+        let start = self.current_span();
+        
+        let kind = match &self.current().kind.clone() {
+            // Literals
+            TokenKind::IntegerLiteral { value, suffix } => {
+                let v = *value;
+                let s = *suffix;
+                self.advance();
+                ExprKind::Literal(Literal {
+                    kind: LiteralKind::Int { value: v, suffix: s },
+                    span: start,
+                })
+            }
+            
+            TokenKind::FloatLiteral { value, suffix } => {
+                let v = *value;
+                let s = *suffix;
+                self.advance();
+                ExprKind::Literal(Literal {
+                    kind: LiteralKind::Float { value: v, suffix: s },
+                    span: start,
+                })
+            }
+            
+            TokenKind::StringLiteral(s) => {
+                let s = s.clone();
+                self.advance();
+                ExprKind::Literal(Literal {
+                    kind: LiteralKind::Str(s),
+                    span: start,
+                })
+            }
+            
+            TokenKind::CharLiteral(c) => {
+                let c = *c;
+                self.advance();
+                ExprKind::Literal(Literal {
+                    kind: LiteralKind::Char(c),
+                    span: start,
+                })
+            }
+            
+            TokenKind::ByteLiteral(b) => {
+                let b = *b;
+                self.advance();
+                ExprKind::Literal(Literal {
+                    kind: LiteralKind::Byte(b),
+                    span: start,
+                })
+            }
+            
+            TokenKind::True => {
+                self.advance();
+                ExprKind::Literal(Literal { kind: LiteralKind::Bool(true), span: start })
+            }
+            
+            TokenKind::False => {
+                self.advance();
+                ExprKind::Literal(Literal { kind: LiteralKind::Bool(false), span: start })
+            }
+            
+            // Blocks and control flow
+            TokenKind::LBrace => ExprKind::Block(self.parse_block()?),
+            TokenKind::If => self.parse_if_expr()?,
+            TokenKind::Match => self.parse_match_expr()?,
+            TokenKind::Loop => self.parse_loop_expr()?,
+            TokenKind::While => self.parse_while_expr()?,
+            TokenKind::For => self.parse_for_expr()?,
+            TokenKind::Return => self.parse_return_expr()?,
+            TokenKind::Break => self.parse_break_expr()?,
+            TokenKind::Continue => self.parse_continue_expr()?,
+            TokenKind::Unsafe => {
+                self.advance();
+                ExprKind::Unsafe(Box::new(self.parse_block()?))
+            }
+            
+            // Closures
+            TokenKind::Pipe | TokenKind::PipePipe => self.parse_closure()?,
+            TokenKind::Move => self.parse_closure()?,
+            
+            // Inline assembly
+            TokenKind::Asm => self.parse_asm_expr()?,
+            
+            // Consume (linear types)
+            TokenKind::Consume => {
+                self.advance();
+                ExprKind::Consume(Box::new(self.parse_expr()?))
+            }
+            
+            // Tuple / parenthesized
+            TokenKind::LParen => {
+                self.advance();
+                if self.check(TokenKind::RParen) {
+                    self.advance();
+                    ExprKind::Tuple(Vec::new())
+                } else {
+                    let first = self.parse_expr()?;
+                    if self.check(TokenKind::Comma) {
+                        let mut exprs = vec![first];
+                        while self.check(TokenKind::Comma) {
+                            self.advance();
+                            if !self.check(TokenKind::RParen) {
+                                exprs.push(self.parse_expr()?);
+                            }
+                        }
+                        self.expect(TokenKind::RParen)?;
+                        ExprKind::Tuple(exprs)
+                    } else {
+                        self.expect(TokenKind::RParen)?;
+                        return Ok(first);
+                    }
+                }
+            }
+            
+            // Array
+            TokenKind::LBracket => {
+                self.advance();
+                if self.check(TokenKind::RBracket) {
+                    self.advance();
+                    ExprKind::Array(Vec::new())
+                } else {
+                    let first = self.parse_expr()?;
+                    if self.check(TokenKind::Semi) {
+                        // [expr; count]
+                        self.advance();
+                        let count = self.parse_expr()?;
+                        self.expect(TokenKind::RBracket)?;
+                        ExprKind::ArrayRepeat { value: Box::new(first), count: Box::new(count) }
+                    } else {
+                        // [expr, expr, ...]
+                        let mut exprs = vec![first];
+                        while self.check(TokenKind::Comma) {
+                            self.advance();
+                            if !self.check(TokenKind::RBracket) {
+                                exprs.push(self.parse_expr()?);
+                            }
+                        }
+                        self.expect(TokenKind::RBracket)?;
+                        ExprKind::Array(exprs)
+                    }
+                }
+            }
+            
+            // Path / struct literal
+            TokenKind::Identifier(_) | TokenKind::ColonColon | TokenKind::SelfType | TokenKind::Self_ | TokenKind::Super | TokenKind::Crate => {
+                let path = self.parse_path()?;
+                
+                // Check for struct literal
+                if self.check(TokenKind::LBrace) && !self.at_stmt_boundary() {
+                    self.advance();
+                    let mut fields = Vec::new();
+                    let mut rest = None;
+                    
+                    while !self.check(TokenKind::RBrace) && !self.at_end() {
+                        if self.check(TokenKind::DotDot) {
+                            self.advance();
+                            rest = Some(Box::new(self.parse_expr()?));
+                            break;
+                        }
+                        
+                        let field_start = self.current_span();
+                        let name = self.parse_identifier()?;
+                        
+                        let (value, shorthand) = if self.check(TokenKind::Colon) {
+                            self.advance();
+                            (self.parse_expr()?, false)
+                        } else {
+                            // Shorthand: Foo { x } means Foo { x: x }
+                            (Expr {
+                                kind: ExprKind::Path(Path {
+                                    segments: vec![PathSegment {
+                                        ident: name.clone(),
+                                        generics: None,
+                                        span: name.span,
+                                    }],
+                                    span: name.span,
+                                }),
+                                span: name.span,
+                            }, true)
+                        };
+                        
+                        fields.push(StructExprField {
+                            name,
+                            value,
+                            shorthand,
+                            span: field_start.merge(self.previous_span()),
+                        });
+                        
+                        if !self.check(TokenKind::RBrace) {
+                            self.expect(TokenKind::Comma)?;
+                        }
+                    }
+                    
+                    self.expect(TokenKind::RBrace)?;
+                    ExprKind::Struct { path, fields, rest }
+                } else {
+                    ExprKind::Path(path)
+                }
+            }
+            
+            _ => {
+                return Err(self.error(ParseErrorKind::ExpectedExpression, "expected expression"));
+            }
+        };
+        
+        Ok(Expr { kind, span: start.merge(self.previous_span()) })
+    }
+    
+    fn parse_postfix(&mut self, lhs: Expr) -> ParseResult<Expr> {
+        let start = lhs.span;
+        
+        let kind = match self.current().kind {
+            // Function call
+            TokenKind::LParen => {
+                self.advance();
+                let mut args = Vec::new();
+                while !self.check(TokenKind::RParen) && !self.at_end() {
+                    args.push(self.parse_expr()?);
+                    if !self.check(TokenKind::RParen) {
+                        self.expect(TokenKind::Comma)?;
+                    }
+                }
+                self.expect(TokenKind::RParen)?;
+                ExprKind::Call { func: Box::new(lhs), args }
+            }
+            
+            // Index
+            TokenKind::LBracket => {
+                self.advance();
+                let index = self.parse_expr()?;
+                self.expect(TokenKind::RBracket)?;
+                ExprKind::Index { expr: Box::new(lhs), index: Box::new(index) }
+            }
+            
+            // Field access / method call
+            TokenKind::Dot => {
+                self.advance();
+                
+                // Tuple index
+                if self.check_int() {
+                    let index = self.parse_int_literal()? as u32;
+                    ExprKind::TupleIndex { expr: Box::new(lhs), index }
+                } else {
+                    let name = self.parse_identifier()?;
+                    
+                    // Method call
+                    if self.check(TokenKind::LParen) {
+                        self.advance();
+                        let mut args = Vec::new();
+                        while !self.check(TokenKind::RParen) && !self.at_end() {
+                            args.push(self.parse_expr()?);
+                            if !self.check(TokenKind::RParen) {
+                                self.expect(TokenKind::Comma)?;
+                            }
+                        }
+                        self.expect(TokenKind::RParen)?;
+                        ExprKind::MethodCall {
+                            receiver: Box::new(lhs),
+                            method: name,
+                            generics: None,
+                            args,
+                        }
+                    } else {
+                        ExprKind::Field { expr: Box::new(lhs), field: name }
+                    }
+                }
+            }
+            
+            // Try operator
+            TokenKind::Question => {
+                self.advance();
+                ExprKind::Try(Box::new(lhs))
+            }
+            
+            _ => return Ok(lhs),
+        };
+        
+        Ok(Expr { kind, span: start.merge(self.previous_span()) })
+    }
+    
+    // Binding power for operators
+    fn prefix_binding_power(op: UnaryOp) -> ((), u8) {
+        match op {
+            UnaryOp::Neg | UnaryOp::Not | UnaryOp::BitNot => ((), 15),
+        }
+    }
+    
+    fn infix_binding_power(op: BinaryOp) -> (u8, u8) {
+        match op {
+            // Assignment (right-associative)
+            BinaryOp::Assign | BinaryOp::AddAssign | BinaryOp::SubAssign |
+            BinaryOp::MulAssign | BinaryOp::DivAssign | BinaryOp::RemAssign |
+            BinaryOp::BitAndAssign | BinaryOp::BitOrAssign | BinaryOp::BitXorAssign |
+            BinaryOp::ShlAssign | BinaryOp::ShrAssign => (2, 1),
+            
+            // Logical or
+            BinaryOp::Or => (3, 4),
+            
+            // Logical and
+            BinaryOp::And => (5, 6),
+            
+            // Comparison
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | 
+            BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => (7, 8),
+            
+            // Bitwise or
+            BinaryOp::BitOr => (9, 10),
+            
+            // Bitwise xor
+            BinaryOp::BitXor => (11, 12),
+            
+            // Bitwise and
+            BinaryOp::BitAnd => (13, 14),
+            
+            // Shifts
+            BinaryOp::Shl | BinaryOp::Shr => (15, 16),
+            
+            // Add/sub
+            BinaryOp::Add | BinaryOp::Sub => (17, 18),
+            
+            // Mul/div/rem
+            BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => (19, 20),
+        }
+    }
+    
+    fn try_prefix_op(&self) -> Option<UnaryOp> {
+        match self.current().kind {
+            TokenKind::Minus => Some(UnaryOp::Neg),
+            TokenKind::Bang => Some(UnaryOp::Not),
+            TokenKind::Tilde => Some(UnaryOp::BitNot),
+            _ => None,
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // CONTROL FLOW EXPRESSIONS
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_if_expr(&mut self) -> ParseResult<ExprKind> {
+        self.expect(TokenKind::If)?;
+        let condition = self.parse_expr()?;
+        let then_branch = self.parse_block()?;
+        
+        let else_branch = if self.check(TokenKind::Else) {
+            self.advance();
+            if self.check(TokenKind::If) {
+                Some(Box::new(Expr {
+                    kind: self.parse_if_expr()?,
+                    span: self.current_span(),
+                }))
+            } else {
+                Some(Box::new(Expr {
+                    kind: ExprKind::Block(self.parse_block()?),
+                    span: self.current_span(),
+                }))
+            }
+        } else {
+            None
+        };
+        
+        Ok(ExprKind::If {
+            condition: Box::new(condition),
+            then_branch: Box::new(then_branch),
+            else_branch,
+        })
+    }
+    
+    fn parse_match_expr(&mut self) -> ParseResult<ExprKind> {
+        self.expect(TokenKind::Match)?;
+        let scrutinee = self.parse_expr()?;
+        self.expect(TokenKind::LBrace)?;
+        
+        let mut arms = Vec::new();
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            let arm_start = self.current_span();
+            let attrs = self.parse_attributes()?;
+            let pattern = self.parse_pattern()?;
+            
+            let guard = if self.check(TokenKind::If) {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            
+            self.expect(TokenKind::FatArrow)?;
+            let body = self.parse_expr()?;
+            
+            arms.push(MatchArm {
+                attrs,
+                pattern,
+                guard,
+                body,
+                span: arm_start.merge(self.previous_span()),
+            });
+            
+            if !self.check(TokenKind::RBrace) {
+                self.expect(TokenKind::Comma)?;
+            }
+        }
+        
+        self.expect(TokenKind::RBrace)?;
+        
+        Ok(ExprKind::Match { scrutinee: Box::new(scrutinee), arms })
+    }
+    
+    fn parse_loop_expr(&mut self) -> ParseResult<ExprKind> {
+        let label = self.try_parse_label();
+        self.expect(TokenKind::Loop)?;
+        let body = self.parse_block()?;
+        Ok(ExprKind::Loop { label, body: Box::new(body) })
+    }
+    
+    fn parse_while_expr(&mut self) -> ParseResult<ExprKind> {
+        let label = self.try_parse_label();
+        self.expect(TokenKind::While)?;
+        let condition = self.parse_expr()?;
+        let body = self.parse_block()?;
+        Ok(ExprKind::While { label, condition: Box::new(condition), body: Box::new(body) })
+    }
+    
+    fn parse_for_expr(&mut self) -> ParseResult<ExprKind> {
+        let label = self.try_parse_label();
+        self.expect(TokenKind::For)?;
+        let pattern = self.parse_pattern()?;
+        self.expect(TokenKind::In)?;
+        let iter = self.parse_expr()?;
+        let body = self.parse_block()?;
+        Ok(ExprKind::For { label, pattern, iter: Box::new(iter), body: Box::new(body) })
+    }
+    
+    fn parse_return_expr(&mut self) -> ParseResult<ExprKind> {
+        self.expect(TokenKind::Return)?;
+        let value = if self.at_expr_start() {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        Ok(ExprKind::Return(value))
+    }
+    
+    fn parse_break_expr(&mut self) -> ParseResult<ExprKind> {
+        self.expect(TokenKind::Break)?;
+        let label = self.try_parse_label();
+        let value = if self.at_expr_start() && !self.check(TokenKind::Semi) {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        Ok(ExprKind::Break { label, value })
+    }
+    
+    fn parse_continue_expr(&mut self) -> ParseResult<ExprKind> {
+        self.expect(TokenKind::Continue)?;
+        let label = self.try_parse_label();
+        Ok(ExprKind::Continue { label })
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // INLINE ASSEMBLY
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_asm_expr(&mut self) -> ParseResult<ExprKind> {
+        let start = self.current_span();
+        self.expect(TokenKind::Asm)?;
+        
+        // Architecture
+        let arch = if let TokenKind::Identifier(name) = &self.current().kind {
+            let a = match name.as_str() {
+                "x86_64" => AsmArch::X86_64,
+                "aarch64" | "arm64" => AsmArch::Aarch64,
+                "riscv64" => AsmArch::Riscv64,
+                _ => AsmArch::Any,
+            };
+            self.advance();
+            a
+        } else {
+            AsmArch::Any
+        };
+        
+        self.expect(TokenKind::LBrace)?;
+        
+        // Parse assembly template (simplified - just collect as string for now)
+        let mut template = Vec::new();
+        let mut operands = Vec::new();
+        
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            if let TokenKind::StringLiteral(s) = &self.current().kind.clone() {
+                template.push(AsmTemplatePiece::String(s.clone()));
+                self.advance();
+            } else {
+                self.advance(); // Skip unknown tokens in asm block
+            }
+            
+            if self.check(TokenKind::Comma) {
+                self.advance();
+            }
+        }
+        
+        self.expect(TokenKind::RBrace)?;
+        
+        Ok(ExprKind::Asm(AsmExpr {
+            arch,
+            template,
+            operands,
+            options: AsmOptions::default(),
+            span: start.merge(self.previous_span()),
+        }))
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // CLOSURES
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_closure(&mut self) -> ParseResult<ExprKind> {
+        let capture = if self.check(TokenKind::Move) {
+            self.advance();
+            CaptureMode::ByMove
+        } else {
+            CaptureMode::ByRef
+        };
+        
+        // |params| or ||
+        let params = if self.check(TokenKind::PipePipe) {
+            self.advance();
+            Vec::new()
+        } else {
+            self.expect(TokenKind::Pipe)?;
+            let mut params = Vec::new();
+            while !self.check(TokenKind::Pipe) && !self.at_end() {
+                let pat = self.parse_pattern()?;
+                let ty = if self.check(TokenKind::Colon) {
+                    self.advance();
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                params.push(ClosureParam { pattern: pat, ty, span: self.previous_span() });
+                if !self.check(TokenKind::Pipe) {
+                    self.expect(TokenKind::Comma)?;
+                }
+            }
+            self.expect(TokenKind::Pipe)?;
+            params
+        };
+        
+        let ret = if self.check(TokenKind::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        
+        let body = self.parse_expr()?;
+        
+        Ok(ExprKind::Closure { capture, params, ret, body: Box::new(body) })
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // PATTERNS
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_pattern(&mut self) -> ParseResult<Pattern> {
+        let start = self.current_span();
+        
+        let kind = match &self.current().kind.clone() {
+            TokenKind::Underscore => {
+                self.advance();
+                PatternKind::Wildcard
+            }
+            
+            TokenKind::Mut => {
+                self.advance();
+                let name = self.parse_identifier()?;
+                PatternKind::Ident { mutability: Mutability::Mutable, name, subpattern: None }
+            }
+            
+            TokenKind::Ampersand => {
+                self.advance();
+                let mutability = if self.check(TokenKind::Mut) {
+                    self.advance();
+                    Mutability::Mutable
+                } else {
+                    Mutability::Immutable
+                };
+                let inner = self.parse_pattern()?;
+                PatternKind::Ref { mutability, pattern: Box::new(inner) }
+            }
+            
+            TokenKind::LParen => {
+                self.advance();
+                if self.check(TokenKind::RParen) {
+                    self.advance();
+                    PatternKind::Tuple(Vec::new())
+                } else {
+                    let mut pats = vec![self.parse_pattern()?];
+                    while self.check(TokenKind::Comma) {
+                        self.advance();
+                        if !self.check(TokenKind::RParen) {
+                            pats.push(self.parse_pattern()?);
+                        }
+                    }
+                    self.expect(TokenKind::RParen)?;
+                    if pats.len() == 1 {
+                        return Ok(pats.pop().unwrap());
+                    }
+                    PatternKind::Tuple(pats)
+                }
+            }
+            
+            TokenKind::LBracket => {
+                self.advance();
+                let mut before = Vec::new();
+                let mut rest = None;
+                let mut after = Vec::new();
+                
+                while !self.check(TokenKind::RBracket) && !self.at_end() {
+                    if self.check(TokenKind::DotDot) {
+                        self.advance();
+                        if self.check(TokenKind::Identifier(_)) {
+                            rest = Some(Box::new(self.parse_pattern()?));
+                        }
+                        // Collect patterns after ..
+                        while !self.check(TokenKind::RBracket) && !self.at_end() {
+                            if self.check(TokenKind::Comma) { self.advance(); }
+                            after.push(self.parse_pattern()?);
+                        }
+                        break;
+                    }
+                    before.push(self.parse_pattern()?);
+                    if !self.check(TokenKind::RBracket) && !self.check(TokenKind::DotDot) {
+                        self.expect(TokenKind::Comma)?;
+                    }
+                }
+                self.expect(TokenKind::RBracket)?;
+                PatternKind::Slice { before, rest, after }
+            }
+            
+            TokenKind::True => {
+                self.advance();
+                PatternKind::Literal(Literal { kind: LiteralKind::Bool(true), span: start })
+            }
+            
+            TokenKind::False => {
+                self.advance();
+                PatternKind::Literal(Literal { kind: LiteralKind::Bool(false), span: start })
+            }
+            
+            TokenKind::IntegerLiteral { value, suffix } => {
+                let v = *value;
+                let s = *suffix;
+                self.advance();
+                PatternKind::Literal(Literal { kind: LiteralKind::Int { value: v, suffix: s }, span: start })
+            }
+            
+            TokenKind::CharLiteral(c) => {
+                let c = *c;
+                self.advance();
+                PatternKind::Literal(Literal { kind: LiteralKind::Char(c), span: start })
+            }
+            
+            TokenKind::StringLiteral(s) => {
+                let s = s.clone();
+                self.advance();
+                PatternKind::Literal(Literal { kind: LiteralKind::Str(s), span: start })
+            }
+            
+            TokenKind::Identifier(_) | TokenKind::ColonColon | TokenKind::SelfType | TokenKind::Super | TokenKind::Crate => {
+                let path = self.parse_path()?;
+                
+                if path.segments.len() == 1 && !self.check(TokenKind::LBrace) && !self.check(TokenKind::LParen) {
+                    // Simple identifier binding
+                    PatternKind::Ident {
+                        mutability: Mutability::Immutable,
+                        name: path.segments[0].ident.clone(),
+                        subpattern: None,
+                    }
+                } else if self.check(TokenKind::LBrace) {
+                    // Struct pattern
+                    self.advance();
+                    let mut fields = Vec::new();
+                    let mut rest = false;
+                    
+                    while !self.check(TokenKind::RBrace) && !self.at_end() {
+                        if self.check(TokenKind::DotDot) {
+                            self.advance();
+                            rest = true;
+                            break;
+                        }
+                        
+                        let field_start = self.current_span();
+                        let name = self.parse_identifier()?;
+                        
+                        let (pattern, shorthand) = if self.check(TokenKind::Colon) {
+                            self.advance();
+                            (self.parse_pattern()?, false)
+                        } else {
+                            (Pattern {
+                                kind: PatternKind::Ident {
+                                    mutability: Mutability::Immutable,
+                                    name: name.clone(),
+                                    subpattern: None,
+                                },
+                                span: name.span,
+                            }, true)
+                        };
+                        
+                        fields.push(PatternField {
+                            name,
+                            pattern,
+                            shorthand,
+                            span: field_start.merge(self.previous_span()),
+                        });
+                        
+                        if !self.check(TokenKind::RBrace) {
+                            self.expect(TokenKind::Comma)?;
+                        }
+                    }
+                    
+                    self.expect(TokenKind::RBrace)?;
+                    PatternKind::Struct { path, fields, rest }
+                } else if self.check(TokenKind::LParen) {
+                    // Tuple struct pattern
+                    self.advance();
+                    let mut fields = Vec::new();
+                    while !self.check(TokenKind::RParen) && !self.at_end() {
+                        fields.push(self.parse_pattern()?);
+                        if !self.check(TokenKind::RParen) {
+                            self.expect(TokenKind::Comma)?;
+                        }
+                    }
+                    self.expect(TokenKind::RParen)?;
+                    PatternKind::TupleStruct { path, fields }
+                } else {
+                    PatternKind::Path(path)
+                }
+            }
+            
+            _ => {
+                return Err(self.error(ParseErrorKind::ExpectedPattern, "expected pattern"));
+            }
+        };
+        
+        // Check for | (or pattern)
+        if self.check(TokenKind::Pipe) {
+            let mut patterns = vec![Pattern { kind, span: start.merge(self.previous_span()) }];
+            while self.check(TokenKind::Pipe) {
+                self.advance();
+                patterns.push(self.parse_pattern()?);
+            }
+            return Ok(Pattern {
+                kind: PatternKind::Or(patterns),
+                span: start.merge(self.previous_span()),
+            });
+        }
+        
+        Ok(Pattern { kind, span: start.merge(self.previous_span()) })
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // BLOCKS AND STATEMENTS
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_block(&mut self) -> ParseResult<Block> {
+        let start = self.current_span();
+        self.expect(TokenKind::LBrace)?;
+        
+        let mut stmts = Vec::new();
+        let mut expr = None;
+        
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            let stmt = self.parse_stmt()?;
+            
+            // Check if this is the trailing expression
+            if let StmtKind::Expr { expr: e, has_semi: false } = stmt.kind {
+                if self.check(TokenKind::RBrace) {
+                    expr = Some(Box::new(e));
+                    break;
+                } else {
+                    stmts.push(Stmt {
+                        kind: StmtKind::Expr { expr: e, has_semi: false },
+                        span: stmt.span,
+                    });
+                }
+            } else {
+                stmts.push(stmt);
+            }
+        }
+        
+        self.expect(TokenKind::RBrace)?;
+        
+        Ok(Block { stmts, expr, span: start.merge(self.previous_span()) })
+    }
+    
+    fn parse_stmt(&mut self) -> ParseResult<Stmt> {
+        let start = self.current_span();
+        
+        // Let statement
+        if self.check(TokenKind::Let) {
+            self.advance();
+            let pattern = self.parse_pattern()?;
+            let ty = if self.check(TokenKind::Colon) {
+                self.advance();
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            let init = if self.check(TokenKind::Eq) {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            self.expect(TokenKind::Semi)?;
+            
+            return Ok(Stmt {
+                kind: StmtKind::Let { pattern, ty, init },
+                span: start.merge(self.previous_span()),
+            });
+        }
+        
+        // Item
+        if self.at_item_start() {
+            let item = self.parse_item()?;
+            return Ok(Stmt {
+                kind: StmtKind::Item(item),
+                span: start.merge(self.previous_span()),
+            });
+        }
+        
+        // Expression statement
+        let expr = self.parse_expr()?;
+        let has_semi = if self.check(TokenKind::Semi) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        
+        Ok(Stmt {
+            kind: StmtKind::Expr { expr, has_semi },
+            span: start.merge(self.previous_span()),
+        })
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // HELPERS
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn parse_identifier(&mut self) -> ParseResult<Identifier> {
+        let span = self.current_span();
+        match &self.current().kind {
+            TokenKind::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(Identifier { name, span })
+            }
+            _ => Err(self.error(ParseErrorKind::ExpectedToken, "expected identifier")),
+        }
+    }
+    
+    fn parse_path(&mut self) -> ParseResult<Path> {
+        let start = self.current_span();
+        let mut segments = Vec::new();
+        
+        // Leading ::
+        let has_leading = self.check(TokenKind::ColonColon);
+        if has_leading {
+            self.advance();
+        }
+        
+        loop {
+            let seg_start = self.current_span();
+            let ident = match &self.current().kind {
+                TokenKind::Identifier(name) => {
+                    let name = name.clone();
+                    self.advance();
+                    Identifier { name, span: seg_start }
+                }
+                TokenKind::SelfType => {
+                    self.advance();
+                    Identifier { name: "Self".to_string(), span: seg_start }
+                }
+                TokenKind::Self_ => {
+                    self.advance();
+                    Identifier { name: "self".to_string(), span: seg_start }
+                }
+                TokenKind::Super => {
+                    self.advance();
+                    Identifier { name: "super".to_string(), span: seg_start }
+                }
+                TokenKind::Crate => {
+                    self.advance();
+                    Identifier { name: "crate".to_string(), span: seg_start }
+                }
+                _ => break,
+            };
+            
+            // Generic arguments
+            let generics = if self.check(TokenKind::ColonColon) && self.peek_next_is(TokenKind::Lt) {
+                self.advance(); // ::
+                Some(self.parse_generic_args()?)
+            } else if self.check(TokenKind::Lt) && self.can_start_generics() {
+                Some(self.parse_generic_args()?)
+            } else {
+                None
+            };
+            
+            segments.push(PathSegment {
+                ident,
+                generics,
+                span: seg_start.merge(self.previous_span()),
+            });
+            
+            if self.check(TokenKind::ColonColon) && !self.peek_next_is(TokenKind::Lt) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        
+        if segments.is_empty() {
+            return Err(self.error(ParseErrorKind::ExpectedToken, "expected path"));
+        }
+        
+        Ok(Path { segments, span: start.merge(self.previous_span()) })
+    }
+    
+    fn parse_generics(&mut self) -> ParseResult<Generics> {
+        if !self.check(TokenKind::Lt) {
+            return Ok(Generics::default());
+        }
+        
+        let start = self.current_span();
+        self.advance();
+        
+        let mut params = Vec::new();
+        
+        while !self.check(TokenKind::Gt) && !self.at_end() {
+            let param = self.parse_generic_param()?;
+            params.push(param);
+            
+            if !self.check(TokenKind::Gt) {
+                self.expect(TokenKind::Comma)?;
+            }
+        }
+        
+        self.expect(TokenKind::Gt)?;
+        
+        Ok(Generics { params, span: start.merge(self.previous_span()) })
+    }
+    
+    fn parse_generic_param(&mut self) -> ParseResult<GenericParam> {
+        let start = self.current_span();
+        
+        // Lifetime
+        if self.check_lifetime() {
+            let lifetime = self.parse_lifetime()?;
+            let mut bounds = Vec::new();
+            if self.check(TokenKind::Colon) {
+                self.advance();
+                while self.check_lifetime() {
+                    bounds.push(self.parse_lifetime()?);
+                    if !self.check(TokenKind::Plus) {
+                        break;
+                    }
+                    self.advance();
+                }
+            }
+            return Ok(GenericParam {
+                kind: GenericParamKind::Lifetime { name: lifetime, bounds },
+                span: start.merge(self.previous_span()),
+            });
+        }
+        
+        // Const
+        if self.check(TokenKind::Const) {
+            self.advance();
+            let name = self.parse_identifier()?;
+            self.expect(TokenKind::Colon)?;
+            let ty = self.parse_type()?;
+            let default = if self.check(TokenKind::Eq) {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            return Ok(GenericParam {
+                kind: GenericParamKind::Const { name, ty, default },
+                span: start.merge(self.previous_span()),
+            });
+        }
+        
+        // Type
+        let name = self.parse_identifier()?;
+        let bounds = if self.check(TokenKind::Colon) {
+            self.advance();
+            self.parse_type_bounds()?
+        } else {
+            Vec::new()
+        };
+        let default = if self.check(TokenKind::Eq) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        
+        Ok(GenericParam {
+            kind: GenericParamKind::Type { name, bounds, default },
+            span: start.merge(self.previous_span()),
+        })
+    }
+    
+    fn parse_generic_args(&mut self) -> ParseResult<GenericArgs> {
+        let start = self.current_span();
+        self.expect(TokenKind::Lt)?;
+        
+        let mut args = Vec::new();
+        
+        while !self.check(TokenKind::Gt) && !self.at_end() {
+            if self.check_lifetime() {
+                args.push(GenericArg::Lifetime(self.parse_lifetime()?));
+            } else {
+                // Could be type or const
+                args.push(GenericArg::Type(self.parse_type()?));
+            }
+            
+            if !self.check(TokenKind::Gt) {
+                self.expect(TokenKind::Comma)?;
+            }
+        }
+        
+        self.expect(TokenKind::Gt)?;
+        
+        Ok(GenericArgs { args, span: start.merge(self.previous_span()) })
+    }
+    
+    fn parse_lifetime(&mut self) -> ParseResult<Lifetime> {
+        let span = self.current_span();
+        match &self.current().kind {
+            TokenKind::Lifetime(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(Lifetime { name, span })
+            }
+            _ => Err(self.error(ParseErrorKind::ExpectedToken, "expected lifetime")),
+        }
+    }
+    
+    fn parse_where_clause(&mut self) -> ParseResult<WhereClause> {
+        let start = self.current_span();
+        self.expect(TokenKind::Where)?;
+        
+        let mut predicates = Vec::new();
+        
+        loop {
+            let pred = self.parse_where_predicate()?;
+            predicates.push(pred);
+            
+            if !self.check(TokenKind::Comma) {
+                break;
+            }
+            self.advance();
+            
+            // Stop before { or ;
+            if self.check(TokenKind::LBrace) || self.check(TokenKind::Semi) {
+                break;
+            }
+        }
+        
+        Ok(WhereClause { predicates, span: start.merge(self.previous_span()) })
+    }
+    
+    fn parse_where_predicate(&mut self) -> ParseResult<WherePredicate> {
+        let start = self.current_span();
+        
+        if self.check_lifetime() {
+            let lifetime = self.parse_lifetime()?;
+            self.expect(TokenKind::Colon)?;
+            let mut bounds = Vec::new();
+            loop {
+                bounds.push(self.parse_lifetime()?);
+                if !self.check(TokenKind::Plus) { break; }
+                self.advance();
+            }
+            Ok(WherePredicate {
+                kind: WherePredicateKind::Lifetime { lifetime, bounds },
+                span: start.merge(self.previous_span()),
+            })
+        } else {
+            let ty = self.parse_type()?;
+            self.expect(TokenKind::Colon)?;
+            let bounds = self.parse_type_bounds()?;
+            Ok(WherePredicate {
+                kind: WherePredicateKind::Type { ty, bounds },
+                span: start.merge(self.previous_span()),
+            })
+        }
+    }
+    
+    fn parse_attributes(&mut self) -> ParseResult<Vec<Attribute>> {
+        let mut attrs = Vec::new();
+        
+        while self.check(TokenKind::At) || self.check(TokenKind::Hash) {
+            if self.check(TokenKind::Hash) {
+                self.advance();
+                self.expect(TokenKind::LBracket)?;
+                attrs.push(self.parse_attribute_inner()?);
+                self.expect(TokenKind::RBracket)?;
+            } else {
+                self.advance(); // @
+                attrs.push(self.parse_attribute_inner()?);
+            }
+        }
+        
+        Ok(attrs)
+    }
+    
+    fn parse_attribute_inner(&mut self) -> ParseResult<Attribute> {
+        let start = self.current_span();
+        let name = self.parse_identifier()?;
+        
+        let kind = match name.name.as_str() {
+            "packed" => AttrKind::Packed,
+            "align" => {
+                self.expect(TokenKind::LParen)?;
+                let n = self.parse_int_literal()?;
+                self.expect(TokenKind::RParen)?;
+                AttrKind::Align(n)
+            }
+            "mmio" => {
+                self.expect(TokenKind::LParen)?;
+                let addr = self.parse_int_literal()?;
+                self.expect(TokenKind::RParen)?;
+                AttrKind::Mmio { base_addr: addr }
+            }
+            "offset" => {
+                self.expect(TokenKind::LParen)?;
+                let off = self.parse_int_literal()?;
+                self.expect(TokenKind::RParen)?;
+                AttrKind::Offset(off)
+            }
+            "interrupt" => {
+                self.expect(TokenKind::LParen)?;
+                // Parse vector: N
+                self.parse_identifier()?; // "vector"
+                self.expect(TokenKind::Colon)?;
+                let vector = self.parse_int_literal()? as u8;
+                let ist = if self.check(TokenKind::Comma) {
+                    self.advance();
+                    self.parse_identifier()?; // "ist"
+                    self.expect(TokenKind::Colon)?;
+                    Some(self.parse_int_literal()? as u8)
+                } else {
+                    None
+                };
+                self.expect(TokenKind::RParen)?;
+                AttrKind::Interrupt { vector, ist }
+            }
+            "no_alloc" => AttrKind::NoAlloc,
+            "no_panic" => AttrKind::NoPanic,
+            "no_block" => AttrKind::NoBlock,
+            "pure" => AttrKind::Pure,
+            "inline" => {
+                if self.check(TokenKind::LParen) {
+                    self.advance();
+                    let mode = self.parse_identifier()?;
+                    self.expect(TokenKind::RParen)?;
+                    match mode.name.as_str() {
+                        "always" => AttrKind::InlineAlways,
+                        "never" => AttrKind::InlineNever,
+                        _ => AttrKind::Inline,
+                    }
+                } else {
+                    AttrKind::Inline
+                }
+            }
+            "cold" => AttrKind::Cold,
+            "hot" => AttrKind::Hot,
+            "export" => AttrKind::Export,
+            "no_mangle" => AttrKind::NoMangle,
+            "test" => AttrKind::Test,
+            "doc" => {
+                self.expect(TokenKind::Eq)?;
+                let s = self.parse_string_literal()?;
+                AttrKind::Doc(s)
+            }
+            "repr" => {
+                self.expect(TokenKind::LParen)?;
+                let repr_name = self.parse_identifier()?;
+                let repr = match repr_name.name.as_str() {
+                    "C" => ReprKind::C,
+                    "transparent" => ReprKind::Transparent,
+                    "packed" => ReprKind::Packed,
+                    "align" => {
+                        self.expect(TokenKind::LParen)?;
+                        let n = self.parse_int_literal()?;
+                        self.expect(TokenKind::RParen)?;
+                        ReprKind::Align(n)
+                    }
+                    _ => ReprKind::C,
+                };
+                self.expect(TokenKind::RParen)?;
+                AttrKind::Repr(repr)
+            }
+            _ => AttrKind::Custom { name: name.name, args: Vec::new() },
+        };
+        
+        Ok(Attribute { kind, span: start.merge(self.previous_span()) })
+    }
+    
+    fn parse_visibility(&mut self) -> ParseResult<Visibility> {
+        if self.check(TokenKind::Pub) {
+            self.advance();
+            if self.check(TokenKind::LParen) {
+                self.advance();
+                let vis = if self.check(TokenKind::Crate) {
+                    self.advance();
+                    Visibility::Crate
+                } else if self.check(TokenKind::Super) {
+                    self.advance();
+                    Visibility::Super
+                } else {
+                    Visibility::Public
+                };
+                self.expect(TokenKind::RParen)?;
+                Ok(vis)
+            } else {
+                Ok(Visibility::Public)
+            }
+        } else {
+            Ok(Visibility::Private)
+        }
+    }
+    
+    fn try_parse_label(&mut self) -> Option<Label> {
+        if self.check_lifetime() {
+            if let TokenKind::Lifetime(name) = &self.current().kind {
+                let span = self.current_span();
+                let name = name.clone();
+                self.advance();
+                if self.check(TokenKind::Colon) {
+                    self.advance();
+                    return Some(Label { name, span });
+                }
+                // Backtrack
+                self.pos -= 1;
+            }
+        }
+        None
+    }
+    
+    fn parse_int_literal(&mut self) -> ParseResult<u64> {
+        match &self.current().kind {
+            TokenKind::IntegerLiteral { value, .. } => {
+                let v = *value as u64;
+                self.advance();
+                Ok(v)
+            }
+            _ => Err(self.error(ParseErrorKind::ExpectedToken, "expected integer")),
+        }
+    }
+    
+    fn parse_string_literal(&mut self) -> ParseResult<String> {
+        match &self.current().kind {
+            TokenKind::StringLiteral(s) => {
+                let s = s.clone();
+                self.advance();
+                Ok(s)
+            }
+            _ => Err(self.error(ParseErrorKind::ExpectedToken, "expected string")),
+        }
+    }
+    
+    // Stub implementations for missing item parsers
+    fn parse_union_def(&mut self) -> ParseResult<UnionDef> {
+        self.expect(TokenKind::Union)?;
+        let name = self.parse_identifier()?;
+        let generics = self.parse_generics()?;
+        let fields = self.parse_struct_fields()?;
+        Ok(UnionDef {
+            name,
+            generics,
+            fields,
+            where_clause: None,
+            span: self.previous_span(),
+        })
+    }
+    
+    fn parse_trait_def(&mut self) -> ParseResult<TraitDef> {
+        self.expect(TokenKind::Trait)?;
+        let name = self.parse_identifier()?;
+        let generics = self.parse_generics()?;
+        self.expect(TokenKind::LBrace)?;
+        // Simplified: skip items
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            self.advance();
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(TraitDef {
+            name,
+            generics,
+            supertraits: Vec::new(),
+            items: Vec::new(),
+            where_clause: None,
+            is_unsafe: false,
+            is_auto: false,
+            span: self.previous_span(),
+        })
+    }
+    
+    fn parse_impl_block(&mut self) -> ParseResult<ImplBlock> {
+        self.expect(TokenKind::Impl)?;
+        let generics = self.parse_generics()?;
+        let self_ty = self.parse_type()?;
+        self.expect(TokenKind::LBrace)?;
+        // Simplified: skip items
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            self.advance();
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(ImplBlock {
+            generics,
+            trait_: None,
+            self_ty,
+            items: Vec::new(),
+            where_clause: None,
+            is_unsafe: false,
+            span: self.previous_span(),
+        })
+    }
+    
+    fn parse_type_alias(&mut self) -> ParseResult<TypeAlias> {
+        self.expect(TokenKind::Type)?;
+        let name = self.parse_identifier()?;
+        let generics = self.parse_generics()?;
+        self.expect(TokenKind::Eq)?;
+        let ty = self.parse_type()?;
+        self.expect(TokenKind::Semi)?;
+        Ok(TypeAlias { name, generics, ty, where_clause: None, span: self.previous_span() })
+    }
+    
+    fn parse_const_item(&mut self) -> ParseResult<ConstItem> {
+        self.expect(TokenKind::Const)?;
+        let name = self.parse_identifier()?;
+        self.expect(TokenKind::Colon)?;
+        let ty = self.parse_type()?;
+        self.expect(TokenKind::Eq)?;
+        let value = self.parse_expr()?;
+        self.expect(TokenKind::Semi)?;
+        Ok(ConstItem { name, ty, value, span: self.previous_span() })
+    }
+    
+    fn parse_static_item(&mut self) -> ParseResult<StaticItem> {
+        self.expect(TokenKind::Static)?;
+        let mutability = if self.check(TokenKind::Mut) { self.advance(); Mutability::Mutable } else { Mutability::Immutable };
+        let name = self.parse_identifier()?;
+        self.expect(TokenKind::Colon)?;
+        let ty = self.parse_type()?;
+        self.expect(TokenKind::Eq)?;
+        let value = self.parse_expr()?;
+        self.expect(TokenKind::Semi)?;
+        Ok(StaticItem { name, ty, mutability, value, span: self.previous_span() })
+    }
+    
+    fn parse_module_item(&mut self) -> ParseResult<ModuleItem> {
+        self.expect(TokenKind::Mod)?;
+        let name = self.parse_identifier()?;
+        let content = if self.check(TokenKind::LBrace) {
+            self.advance();
+            let mut items = Vec::new();
+            while !self.check(TokenKind::RBrace) && !self.at_end() {
+                items.push(self.parse_item()?);
+            }
+            self.expect(TokenKind::RBrace)?;
+            Some(items)
+        } else {
+            self.expect(TokenKind::Semi)?;
+            None
+        };
+        Ok(ModuleItem { name, content, span: self.previous_span() })
+    }
+    
+    fn parse_use_tree(&mut self) -> ParseResult<UseTree> {
+        self.expect(TokenKind::Use)?;
+        let tree = self.parse_use_tree_inner()?;
+        self.expect(TokenKind::Semi)?;
+        Ok(tree)
+    }
+    
+    fn parse_use_tree_inner(&mut self) -> ParseResult<UseTree> {
+        let start = self.current_span();
+        let path = self.parse_path()?;
+        
+        let kind = if self.check(TokenKind::ColonColon) && self.peek_next_is(TokenKind::Star) {
+            self.advance();
+            self.advance();
+            UseTreeKind::Glob(path)
+        } else if self.check(TokenKind::As) {
+            self.advance();
+            let alias = self.parse_identifier()?;
+            UseTreeKind::Simple { path, alias: Some(alias) }
+        } else {
+            UseTreeKind::Simple { path, alias: None }
+        };
+        
+        Ok(UseTree { kind, span: start.merge(self.previous_span()) })
+    }
+    
+    fn parse_extern_block(&mut self) -> ParseResult<ExternBlock> {
+        self.expect(TokenKind::Extern)?;
+        let abi = if self.check_string() {
+            Some(self.parse_abi()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::LBrace)?;
+        // Simplified
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            self.advance();
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(ExternBlock { abi, items: Vec::new(), span: self.previous_span() })
+    }
+    
+    fn parse_effect_def(&mut self) -> ParseResult<EffectDef> {
+        self.expect(TokenKind::Effect)?;
+        let name = self.parse_identifier()?;
+        self.expect(TokenKind::LBrace)?;
+        while !self.check(TokenKind::RBrace) && !self.at_end() {
+            self.advance();
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(EffectDef { name, operations: Vec::new(), span: self.previous_span() })
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // TOKEN HELPERS
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    fn current(&self) -> &Token {
+        &self.tokens[self.pos]
+    }
+    
+    fn current_span(&self) -> Span {
+        self.current().span
+    }
+    
+    fn previous_span(&self) -> Span {
+        if self.pos > 0 {
+            self.tokens[self.pos - 1].span
+        } else {
+            self.current().span
+        }
+    }
+    
+    fn at_end(&self) -> bool {
+        self.current().kind == TokenKind::Eof
+    }
+    
+    fn check(&self, kind: TokenKind) -> bool {
+        std::mem::discriminant(&self.current().kind) == std::mem::discriminant(&kind)
+    }
+    
+    fn check_lifetime(&self) -> bool {
+        matches!(self.current().kind, TokenKind::Lifetime(_))
+    }
+    
+    fn check_int(&self) -> bool {
+        matches!(self.current().kind, TokenKind::IntegerLiteral { .. })
+    }
+    
+    fn check_string(&self) -> bool {
+        matches!(self.current().kind, TokenKind::StringLiteral(_))
+    }
+    
+    fn peek_next_is(&self, kind: TokenKind) -> bool {
+        if self.pos + 1 >= self.tokens.len() { return false; }
+        std::mem::discriminant(&self.tokens[self.pos + 1].kind) == std::mem::discriminant(&kind)
+    }
+    
+    fn advance(&mut self) -> &Token {
+        if !self.at_end() {
+            self.pos += 1;
+        }
+        &self.tokens[self.pos - 1]
+    }
+    
+    fn expect(&mut self, kind: TokenKind) -> ParseResult<&Token> {
+        if self.check(kind) {
+            Ok(self.advance())
+        } else {
+            Err(self.error(ParseErrorKind::ExpectedToken, &format!("expected {:?}", kind)))
+        }
+    }
+    
+    fn error(&self, kind: ParseErrorKind, message: &str) -> ParseError {
+        ParseError {
+            message: message.to_string(),
+            span: self.current_span(),
+            kind,
+        }
+    }
+    
+    fn synchronize(&mut self) {
+        while !self.at_end() {
+            if matches!(self.current().kind, TokenKind::Semi) {
+                self.advance();
+                return;
+            }
+            
+            match self.current().kind {
+                TokenKind::Fn | TokenKind::Struct | TokenKind::Enum | 
+                TokenKind::Trait | TokenKind::Impl | TokenKind::Mod |
+                TokenKind::Use | TokenKind::Const | TokenKind::Static |
+                TokenKind::Type => return,
+                _ => { self.advance(); }
+            }
+        }
+    }
+    
+    fn at_item_start(&self) -> bool {
+        matches!(self.current().kind,
+            TokenKind::Fn | TokenKind::Struct | TokenKind::Enum |
+            TokenKind::Trait | TokenKind::Impl | TokenKind::Mod |
+            TokenKind::Use | TokenKind::Const | TokenKind::Static |
+            TokenKind::Type | TokenKind::Extern | TokenKind::Pub |
+            TokenKind::Unsafe | TokenKind::Async | TokenKind::Linear |
+            TokenKind::Bitfield | TokenKind::State | TokenKind::Effect
+        )
+    }
+    
+    fn at_expr_start(&self) -> bool {
+        matches!(self.current().kind,
+            TokenKind::IntegerLiteral { .. } | TokenKind::FloatLiteral { .. } |
+            TokenKind::StringLiteral(_) | TokenKind::CharLiteral(_) |
+            TokenKind::True | TokenKind::False |
+            TokenKind::Identifier(_) | TokenKind::LParen | TokenKind::LBrace |
+            TokenKind::LBracket | TokenKind::If | TokenKind::Match |
+            TokenKind::Loop | TokenKind::While | TokenKind::For |
+            TokenKind::Return | TokenKind::Break | TokenKind::Continue |
+            TokenKind::Pipe | TokenKind::PipePipe | TokenKind::Move |
+            TokenKind::Ampersand | TokenKind::Star | TokenKind::Minus |
+            TokenKind::Bang | TokenKind::Unsafe | TokenKind::Asm |
+            TokenKind::Consume
+        )
+    }
+    
+    fn at_stmt_boundary(&self) -> bool {
+        // Check if we're at a point where a { would be ambiguous
+        self.previous_span().end < self.current_span().start - 1
+    }
+    
+    fn can_start_generics(&self) -> bool {
+        // Heuristic: < is generics if followed by type-like things
+        if self.pos + 1 >= self.tokens.len() { return false; }
+        matches!(self.tokens[self.pos + 1].kind,
+            TokenKind::Identifier(_) | TokenKind::Lifetime(_) |
+            TokenKind::U8 | TokenKind::U16 | TokenKind::U32 | TokenKind::U64 |
+            TokenKind::I8 | TokenKind::I16 | TokenKind::I32 | TokenKind::I64 |
+            TokenKind::Ampersand | TokenKind::Star | TokenKind::LParen |
+            TokenKind::LBracket | TokenKind::Gt
+        )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn parse(src: &str) -> Module {
+        Parser::new(src, 0).parse_module().unwrap()
+    }
+    
+    #[test]
+    fn test_function() {
+        let module = parse("fn foo(x: u32) -> u32 { x }");
+        assert_eq!(module.items.len(), 1);
+    }
+    
+    #[test]
+    fn test_bitfield() {
+        let module = parse(r#"
+            bitfield struct PageTableEntry : u64 {
+                present: 0,
+                writable: 1,
+                user: 2,
+                physical_addr: 12..51,
+            }
+        "#);
+        assert_eq!(module.items.len(), 1);
+    }
+    
+    #[test]
+    fn test_linear_struct() {
+        let module = parse("linear struct DmaBuffer { ptr: *mut u8, len: usize }");
+        assert_eq!(module.items.len(), 1);
+    }
+    
+    #[test]
+    fn test_kernel_fn() {
+        let module = parse("kernel fn switch_context(old: *mut Context, new: *Context) { }");
+        assert_eq!(module.items.len(), 1);
+    }
+    
+    #[test]
+    fn test_state_machine() {
+        let module = parse(r#"
+            state Process {
+                Ready,
+                Running,
+                Blocked,
+                Ready -> Running: schedule(),
+                Running -> Blocked: wait(),
+            }
+        "#);
+        assert_eq!(module.items.len(), 1);
+    }
+}

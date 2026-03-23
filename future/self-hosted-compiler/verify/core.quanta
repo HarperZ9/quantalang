@@ -1,0 +1,955 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ VERIFICATION — Formal Verification Framework
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Formal verification infrastructure for QuantaLang:
+//   - Hoare logic-based verification
+//   - Preconditions, postconditions, invariants
+//   - SMT solver integration
+//   - Proof obligations generation
+//   - Refinement types
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::verify::core
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOGICAL FORMULAS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Logical formula (first-order logic with theories)
+#[derive(Debug, Clone, PartialEq)]
+pub enum Formula {
+    // Atomic formulas
+    True,
+    False,
+    Var(String),
+    
+    // Comparisons
+    Eq(Box<Term>, Box<Term>),
+    Ne(Box<Term>, Box<Term>),
+    Lt(Box<Term>, Box<Term>),
+    Le(Box<Term>, Box<Term>),
+    Gt(Box<Term>, Box<Term>),
+    Ge(Box<Term>, Box<Term>),
+    
+    // Logical connectives
+    Not(Box<Formula>),
+    And(Box<Formula>, Box<Formula>),
+    Or(Box<Formula>, Box<Formula>),
+    Implies(Box<Formula>, Box<Formula>),
+    Iff(Box<Formula>, Box<Formula>),
+    
+    // Quantifiers
+    Forall(String, Sort, Box<Formula>),
+    Exists(String, Sort, Box<Formula>),
+    
+    // Theory-specific
+    ArraySelect(Box<Term>, Box<Term>),  // arr[idx]
+    InRange(Box<Term>, Box<Term>, Box<Term>),  // lo <= x < hi
+    Divisible(Box<Term>, Box<Term>),  // x % y == 0
+    BitAnd(Box<Term>, Box<Term>, Box<Term>),  // (x & y) == z
+    
+    // Function application (for UF theory)
+    App(String, Vec<Term>),
+}
+
+impl Formula {
+    pub fn and(self, other: Formula) -> Formula {
+        match (&self, &other) {
+            (Formula::True, _) => other,
+            (_, Formula::True) => self,
+            (Formula::False, _) => Formula::False,
+            (_, Formula::False) => Formula::False,
+            _ => Formula::And(Box::new(self), Box::new(other)),
+        }
+    }
+    
+    pub fn or(self, other: Formula) -> Formula {
+        match (&self, &other) {
+            (Formula::True, _) => Formula::True,
+            (_, Formula::True) => Formula::True,
+            (Formula::False, _) => other,
+            (_, Formula::False) => self,
+            _ => Formula::Or(Box::new(self), Box::new(other)),
+        }
+    }
+    
+    pub fn implies(self, other: Formula) -> Formula {
+        Formula::Implies(Box::new(self), Box::new(other))
+    }
+    
+    pub fn not(self) -> Formula {
+        match self {
+            Formula::True => Formula::False,
+            Formula::False => Formula::True,
+            Formula::Not(inner) => *inner,
+            _ => Formula::Not(Box::new(self)),
+        }
+    }
+    
+    pub fn forall(var: impl Into<String>, sort: Sort, body: Formula) -> Formula {
+        Formula::Forall(var.into(), sort, Box::new(body))
+    }
+    
+    pub fn exists(var: impl Into<String>, sort: Sort, body: Formula) -> Formula {
+        Formula::Exists(var.into(), sort, Box::new(body))
+    }
+    
+    /// Substitute variable with term
+    pub fn substitute(&self, var: &str, term: &Term) -> Formula {
+        match self {
+            Formula::True => Formula::True,
+            Formula::False => Formula::False,
+            Formula::Var(v) => {
+                if v == var {
+                    if let Term::BoolConst(b) = term {
+                        if *b { Formula::True } else { Formula::False }
+                    } else {
+                        Formula::Var(v.clone())
+                    }
+                } else {
+                    Formula::Var(v.clone())
+                }
+            }
+            Formula::Eq(l, r) => Formula::Eq(
+                Box::new(l.substitute(var, term)),
+                Box::new(r.substitute(var, term)),
+            ),
+            Formula::Ne(l, r) => Formula::Ne(
+                Box::new(l.substitute(var, term)),
+                Box::new(r.substitute(var, term)),
+            ),
+            Formula::Lt(l, r) => Formula::Lt(
+                Box::new(l.substitute(var, term)),
+                Box::new(r.substitute(var, term)),
+            ),
+            Formula::Le(l, r) => Formula::Le(
+                Box::new(l.substitute(var, term)),
+                Box::new(r.substitute(var, term)),
+            ),
+            Formula::Gt(l, r) => Formula::Gt(
+                Box::new(l.substitute(var, term)),
+                Box::new(r.substitute(var, term)),
+            ),
+            Formula::Ge(l, r) => Formula::Ge(
+                Box::new(l.substitute(var, term)),
+                Box::new(r.substitute(var, term)),
+            ),
+            Formula::Not(f) => Formula::Not(Box::new(f.substitute(var, term))),
+            Formula::And(l, r) => Formula::And(
+                Box::new(l.substitute(var, term)),
+                Box::new(r.substitute(var, term)),
+            ),
+            Formula::Or(l, r) => Formula::Or(
+                Box::new(l.substitute(var, term)),
+                Box::new(r.substitute(var, term)),
+            ),
+            Formula::Implies(l, r) => Formula::Implies(
+                Box::new(l.substitute(var, term)),
+                Box::new(r.substitute(var, term)),
+            ),
+            Formula::Iff(l, r) => Formula::Iff(
+                Box::new(l.substitute(var, term)),
+                Box::new(r.substitute(var, term)),
+            ),
+            Formula::Forall(v, s, body) if v != var => {
+                Formula::Forall(v.clone(), s.clone(), Box::new(body.substitute(var, term)))
+            }
+            Formula::Exists(v, s, body) if v != var => {
+                Formula::Exists(v.clone(), s.clone(), Box::new(body.substitute(var, term)))
+            }
+            Formula::Forall(v, s, body) => Formula::Forall(v.clone(), s.clone(), body.clone()),
+            Formula::Exists(v, s, body) => Formula::Exists(v.clone(), s.clone(), body.clone()),
+            Formula::ArraySelect(arr, idx) => Formula::ArraySelect(
+                Box::new(arr.substitute(var, term)),
+                Box::new(idx.substitute(var, term)),
+            ),
+            Formula::InRange(x, lo, hi) => Formula::InRange(
+                Box::new(x.substitute(var, term)),
+                Box::new(lo.substitute(var, term)),
+                Box::new(hi.substitute(var, term)),
+            ),
+            Formula::Divisible(x, y) => Formula::Divisible(
+                Box::new(x.substitute(var, term)),
+                Box::new(y.substitute(var, term)),
+            ),
+            Formula::BitAnd(x, y, z) => Formula::BitAnd(
+                Box::new(x.substitute(var, term)),
+                Box::new(y.substitute(var, term)),
+                Box::new(z.substitute(var, term)),
+            ),
+            Formula::App(name, args) => Formula::App(
+                name.clone(),
+                args.iter().map(|a| a.substitute(var, term)).collect(),
+            ),
+        }
+    }
+    
+    /// Free variables in formula
+    pub fn free_vars(&self) -> BTreeSet<String> {
+        let mut vars = BTreeSet::new();
+        self.collect_free_vars(&mut vars, &BTreeSet::new());
+        vars
+    }
+    
+    fn collect_free_vars(&self, free: &mut BTreeSet<String>, bound: &BTreeSet<String>) {
+        match self {
+            Formula::True | Formula::False => {}
+            Formula::Var(v) => {
+                if !bound.contains(v) {
+                    free.insert(v.clone());
+                }
+            }
+            Formula::Eq(l, r) | Formula::Ne(l, r) | Formula::Lt(l, r) |
+            Formula::Le(l, r) | Formula::Gt(l, r) | Formula::Ge(l, r) => {
+                l.collect_free_vars(free, bound);
+                r.collect_free_vars(free, bound);
+            }
+            Formula::Not(f) => f.collect_free_vars(free, bound),
+            Formula::And(l, r) | Formula::Or(l, r) | Formula::Implies(l, r) | Formula::Iff(l, r) => {
+                l.collect_free_vars(free, bound);
+                r.collect_free_vars(free, bound);
+            }
+            Formula::Forall(v, _, body) | Formula::Exists(v, _, body) => {
+                let mut new_bound = bound.clone();
+                new_bound.insert(v.clone());
+                body.collect_free_vars(free, &new_bound);
+            }
+            Formula::ArraySelect(arr, idx) => {
+                arr.collect_free_vars(free, bound);
+                idx.collect_free_vars(free, bound);
+            }
+            Formula::InRange(x, lo, hi) => {
+                x.collect_free_vars(free, bound);
+                lo.collect_free_vars(free, bound);
+                hi.collect_free_vars(free, bound);
+            }
+            Formula::Divisible(x, y) => {
+                x.collect_free_vars(free, bound);
+                y.collect_free_vars(free, bound);
+            }
+            Formula::BitAnd(x, y, z) => {
+                x.collect_free_vars(free, bound);
+                y.collect_free_vars(free, bound);
+                z.collect_free_vars(free, bound);
+            }
+            Formula::App(_, args) => {
+                for arg in args {
+                    arg.collect_free_vars(free, bound);
+                }
+            }
+        }
+    }
+}
+
+/// Term (expression)
+#[derive(Debug, Clone, PartialEq)]
+pub enum Term {
+    // Variables
+    Var(String),
+    
+    // Constants
+    IntConst(i128),
+    BoolConst(bool),
+    RealConst(f64),
+    
+    // Arithmetic
+    Add(Box<Term>, Box<Term>),
+    Sub(Box<Term>, Box<Term>),
+    Mul(Box<Term>, Box<Term>),
+    Div(Box<Term>, Box<Term>),
+    Mod(Box<Term>, Box<Term>),
+    Neg(Box<Term>),
+    
+    // Bitwise
+    BitAnd(Box<Term>, Box<Term>),
+    BitOr(Box<Term>, Box<Term>),
+    BitXor(Box<Term>, Box<Term>),
+    BitNot(Box<Term>),
+    Shl(Box<Term>, Box<Term>),
+    Shr(Box<Term>, Box<Term>),
+    
+    // Conditional
+    Ite(Box<Formula>, Box<Term>, Box<Term>),
+    
+    // Array operations
+    Select(Box<Term>, Box<Term>),
+    Store(Box<Term>, Box<Term>, Box<Term>),
+    
+    // Function application
+    App(String, Vec<Term>),
+    
+    // Old value (for postconditions)
+    Old(Box<Term>),
+    
+    // Result (for postconditions)
+    Result,
+}
+
+impl Term {
+    pub fn var(name: impl Into<String>) -> Term {
+        Term::Var(name.into())
+    }
+    
+    pub fn int(n: i128) -> Term {
+        Term::IntConst(n)
+    }
+    
+    pub fn add(self, other: Term) -> Term {
+        Term::Add(Box::new(self), Box::new(other))
+    }
+    
+    pub fn sub(self, other: Term) -> Term {
+        Term::Sub(Box::new(self), Box::new(other))
+    }
+    
+    pub fn mul(self, other: Term) -> Term {
+        Term::Mul(Box::new(self), Box::new(other))
+    }
+    
+    pub fn substitute(&self, var: &str, replacement: &Term) -> Term {
+        match self {
+            Term::Var(v) if v == var => replacement.clone(),
+            Term::Var(v) => Term::Var(v.clone()),
+            Term::IntConst(n) => Term::IntConst(*n),
+            Term::BoolConst(b) => Term::BoolConst(*b),
+            Term::RealConst(r) => Term::RealConst(*r),
+            Term::Add(l, r) => Term::Add(
+                Box::new(l.substitute(var, replacement)),
+                Box::new(r.substitute(var, replacement)),
+            ),
+            Term::Sub(l, r) => Term::Sub(
+                Box::new(l.substitute(var, replacement)),
+                Box::new(r.substitute(var, replacement)),
+            ),
+            Term::Mul(l, r) => Term::Mul(
+                Box::new(l.substitute(var, replacement)),
+                Box::new(r.substitute(var, replacement)),
+            ),
+            Term::Div(l, r) => Term::Div(
+                Box::new(l.substitute(var, replacement)),
+                Box::new(r.substitute(var, replacement)),
+            ),
+            Term::Mod(l, r) => Term::Mod(
+                Box::new(l.substitute(var, replacement)),
+                Box::new(r.substitute(var, replacement)),
+            ),
+            Term::Neg(t) => Term::Neg(Box::new(t.substitute(var, replacement))),
+            Term::BitAnd(l, r) => Term::BitAnd(
+                Box::new(l.substitute(var, replacement)),
+                Box::new(r.substitute(var, replacement)),
+            ),
+            Term::BitOr(l, r) => Term::BitOr(
+                Box::new(l.substitute(var, replacement)),
+                Box::new(r.substitute(var, replacement)),
+            ),
+            Term::BitXor(l, r) => Term::BitXor(
+                Box::new(l.substitute(var, replacement)),
+                Box::new(r.substitute(var, replacement)),
+            ),
+            Term::BitNot(t) => Term::BitNot(Box::new(t.substitute(var, replacement))),
+            Term::Shl(l, r) => Term::Shl(
+                Box::new(l.substitute(var, replacement)),
+                Box::new(r.substitute(var, replacement)),
+            ),
+            Term::Shr(l, r) => Term::Shr(
+                Box::new(l.substitute(var, replacement)),
+                Box::new(r.substitute(var, replacement)),
+            ),
+            Term::Ite(c, t, e) => Term::Ite(
+                Box::new(c.substitute(var, replacement)),
+                Box::new(t.substitute(var, replacement)),
+                Box::new(e.substitute(var, replacement)),
+            ),
+            Term::Select(arr, idx) => Term::Select(
+                Box::new(arr.substitute(var, replacement)),
+                Box::new(idx.substitute(var, replacement)),
+            ),
+            Term::Store(arr, idx, val) => Term::Store(
+                Box::new(arr.substitute(var, replacement)),
+                Box::new(idx.substitute(var, replacement)),
+                Box::new(val.substitute(var, replacement)),
+            ),
+            Term::App(name, args) => Term::App(
+                name.clone(),
+                args.iter().map(|a| a.substitute(var, replacement)).collect(),
+            ),
+            Term::Old(t) => Term::Old(Box::new(t.substitute(var, replacement))),
+            Term::Result => Term::Result,
+        }
+    }
+    
+    pub fn collect_free_vars(&self, free: &mut BTreeSet<String>, bound: &BTreeSet<String>) {
+        match self {
+            Term::Var(v) => {
+                if !bound.contains(v) {
+                    free.insert(v.clone());
+                }
+            }
+            Term::IntConst(_) | Term::BoolConst(_) | Term::RealConst(_) | Term::Result => {}
+            Term::Add(l, r) | Term::Sub(l, r) | Term::Mul(l, r) | Term::Div(l, r) | Term::Mod(l, r) |
+            Term::BitAnd(l, r) | Term::BitOr(l, r) | Term::BitXor(l, r) | Term::Shl(l, r) | Term::Shr(l, r) => {
+                l.collect_free_vars(free, bound);
+                r.collect_free_vars(free, bound);
+            }
+            Term::Neg(t) | Term::BitNot(t) | Term::Old(t) => {
+                t.collect_free_vars(free, bound);
+            }
+            Term::Ite(c, t, e) => {
+                c.collect_free_vars(free, bound);
+                t.collect_free_vars(free, bound);
+                e.collect_free_vars(free, bound);
+            }
+            Term::Select(arr, idx) => {
+                arr.collect_free_vars(free, bound);
+                idx.collect_free_vars(free, bound);
+            }
+            Term::Store(arr, idx, val) => {
+                arr.collect_free_vars(free, bound);
+                idx.collect_free_vars(free, bound);
+                val.collect_free_vars(free, bound);
+            }
+            Term::App(_, args) => {
+                for arg in args {
+                    arg.collect_free_vars(free, bound);
+                }
+            }
+        }
+    }
+}
+
+/// Sort (type in SMT)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sort {
+    Bool,
+    Int,
+    Real,
+    BitVec(u32),
+    Array(Box<Sort>, Box<Sort>),
+    Uninterpreted(String),
+}
+
+impl Sort {
+    pub fn to_smt2(&self) -> String {
+        match self {
+            Sort::Bool => "Bool".to_string(),
+            Sort::Int => "Int".to_string(),
+            Sort::Real => "Real".to_string(),
+            Sort::BitVec(w) => format!("(_ BitVec {})", w),
+            Sort::Array(k, v) => format!("(Array {} {})", k.to_smt2(), v.to_smt2()),
+            Sort::Uninterpreted(name) => name.clone(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONTRACTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Function contract
+#[derive(Debug, Clone)]
+pub struct Contract {
+    /// Function name
+    pub function: String,
+    /// Preconditions
+    pub requires: Vec<Formula>,
+    /// Postconditions
+    pub ensures: Vec<Formula>,
+    /// Modifies clause
+    pub modifies: Vec<String>,
+    /// Decreases clause (for termination)
+    pub decreases: Option<Term>,
+    /// Pure annotation (no side effects)
+    pub pure: bool,
+}
+
+impl Contract {
+    pub fn new(function: impl Into<String>) -> Self {
+        Contract {
+            function: function.into(),
+            requires: Vec::new(),
+            ensures: Vec::new(),
+            modifies: Vec::new(),
+            decreases: None,
+            pure: false,
+        }
+    }
+    
+    pub fn requires(mut self, condition: Formula) -> Self {
+        self.requires.push(condition);
+        self
+    }
+    
+    pub fn ensures(mut self, condition: Formula) -> Self {
+        self.ensures.push(condition);
+        self
+    }
+    
+    pub fn modifies(mut self, var: impl Into<String>) -> Self {
+        self.modifies.push(var.into());
+        self
+    }
+    
+    pub fn decreases(mut self, term: Term) -> Self {
+        self.decreases = Some(term);
+        self
+    }
+    
+    pub fn pure(mut self) -> Self {
+        self.pure = true;
+        self
+    }
+    
+    /// Combined precondition
+    pub fn combined_precondition(&self) -> Formula {
+        self.requires.iter().cloned().fold(Formula::True, Formula::and)
+    }
+    
+    /// Combined postcondition
+    pub fn combined_postcondition(&self) -> Formula {
+        self.ensures.iter().cloned().fold(Formula::True, Formula::and)
+    }
+}
+
+/// Loop invariant
+#[derive(Debug, Clone)]
+pub struct LoopInvariant {
+    /// Invariant condition
+    pub invariant: Formula,
+    /// Loop variant (for termination)
+    pub variant: Option<Term>,
+    /// Location in source
+    pub location: SourceLocation,
+}
+
+/// Source location
+#[derive(Debug, Clone)]
+pub struct SourceLocation {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+impl Default for SourceLocation {
+    fn default() -> Self {
+        SourceLocation {
+            file: "<unknown>".to_string(),
+            line: 0,
+            column: 0,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERIFICATION CONDITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Verification condition (proof obligation)
+#[derive(Debug, Clone)]
+pub struct VerificationCondition {
+    /// Unique identifier
+    pub id: u64,
+    /// Description
+    pub description: String,
+    /// Kind of VC
+    pub kind: VcKind,
+    /// Assumptions (hypotheses)
+    pub assumptions: Vec<Formula>,
+    /// Goal to prove
+    pub goal: Formula,
+    /// Source location
+    pub location: SourceLocation,
+    /// Status
+    pub status: VcStatus,
+}
+
+impl VerificationCondition {
+    pub fn new(
+        id: u64,
+        description: impl Into<String>,
+        kind: VcKind,
+        goal: Formula,
+        location: SourceLocation,
+    ) -> Self {
+        VerificationCondition {
+            id,
+            description: description.into(),
+            kind,
+            assumptions: Vec::new(),
+            goal,
+            location,
+            status: VcStatus::Pending,
+        }
+    }
+    
+    pub fn with_assumption(mut self, assumption: Formula) -> Self {
+        self.assumptions.push(assumption);
+        self
+    }
+    
+    /// Convert to SMT-LIB2 format
+    pub fn to_smt2(&self) -> String {
+        let mut output = String::new();
+        
+        output.push_str("; VC: ");
+        output.push_str(&self.description);
+        output.push('\n');
+        
+        // Declarations would go here
+        output.push_str("(set-logic ALL)\n");
+        
+        // Assert assumptions
+        for (i, assumption) in self.assumptions.iter().enumerate() {
+            output.push_str(&format!("(assert ; assumption {}\n  ", i));
+            output.push_str(&formula_to_smt2(assumption));
+            output.push_str(")\n");
+        }
+        
+        // Assert negation of goal
+        output.push_str("(assert ; negation of goal\n  (not ");
+        output.push_str(&formula_to_smt2(&self.goal));
+        output.push_str("))\n");
+        
+        output.push_str("(check-sat)\n");
+        output.push_str("(get-model)\n");
+        
+        output
+    }
+    
+    /// The VC is valid if assumptions => goal
+    pub fn as_formula(&self) -> Formula {
+        let assumptions = self.assumptions.iter().cloned().fold(Formula::True, Formula::and);
+        assumptions.implies(self.goal.clone())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcKind {
+    /// Precondition at call site
+    Precondition,
+    /// Postcondition at function exit
+    Postcondition,
+    /// Loop invariant preservation
+    LoopInvariant,
+    /// Loop invariant establishment
+    LoopInvariantInit,
+    /// Assert statement
+    Assert,
+    /// Array bounds check
+    ArrayBounds,
+    /// Division by zero check
+    DivisionByZero,
+    /// Overflow check
+    Overflow,
+    /// Null pointer check
+    NullPointer,
+    /// Termination (variant decrease)
+    Termination,
+    /// Type refinement
+    Refinement,
+    /// Custom
+    Custom(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcStatus {
+    Pending,
+    Valid,
+    Invalid,
+    Unknown,
+    Timeout,
+    Error,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMT-LIB2 CONVERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn formula_to_smt2(formula: &Formula) -> String {
+    match formula {
+        Formula::True => "true".to_string(),
+        Formula::False => "false".to_string(),
+        Formula::Var(v) => v.clone(),
+        Formula::Eq(l, r) => format!("(= {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Formula::Ne(l, r) => format!("(distinct {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Formula::Lt(l, r) => format!("(< {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Formula::Le(l, r) => format!("(<= {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Formula::Gt(l, r) => format!("(> {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Formula::Ge(l, r) => format!("(>= {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Formula::Not(f) => format!("(not {})", formula_to_smt2(f)),
+        Formula::And(l, r) => format!("(and {} {})", formula_to_smt2(l), formula_to_smt2(r)),
+        Formula::Or(l, r) => format!("(or {} {})", formula_to_smt2(l), formula_to_smt2(r)),
+        Formula::Implies(l, r) => format!("(=> {} {})", formula_to_smt2(l), formula_to_smt2(r)),
+        Formula::Iff(l, r) => format!("(= {} {})", formula_to_smt2(l), formula_to_smt2(r)),
+        Formula::Forall(v, s, body) => {
+            format!("(forall (({} {})) {})", v, s.to_smt2(), formula_to_smt2(body))
+        }
+        Formula::Exists(v, s, body) => {
+            format!("(exists (({} {})) {})", v, s.to_smt2(), formula_to_smt2(body))
+        }
+        Formula::ArraySelect(arr, idx) => {
+            format!("(select {} {})", term_to_smt2(arr), term_to_smt2(idx))
+        }
+        Formula::InRange(x, lo, hi) => {
+            format!("(and (>= {} {}) (< {} {}))",
+                term_to_smt2(x), term_to_smt2(lo),
+                term_to_smt2(x), term_to_smt2(hi))
+        }
+        Formula::Divisible(x, y) => {
+            format!("(= (mod {} {}) 0)", term_to_smt2(x), term_to_smt2(y))
+        }
+        Formula::BitAnd(x, y, z) => {
+            format!("(= (bvand {} {}) {})",
+                term_to_smt2(x), term_to_smt2(y), term_to_smt2(z))
+        }
+        Formula::App(name, args) => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                let args_str: Vec<String> = args.iter().map(|a| term_to_smt2(a)).collect();
+                format!("({} {})", name, args_str.join(" "))
+            }
+        }
+    }
+}
+
+fn term_to_smt2(term: &Term) -> String {
+    match term {
+        Term::Var(v) => v.clone(),
+        Term::IntConst(n) => {
+            if *n >= 0 {
+                n.to_string()
+            } else {
+                format!("(- {})", -n)
+            }
+        }
+        Term::BoolConst(b) => if *b { "true" } else { "false" }.to_string(),
+        Term::RealConst(r) => format!("{:.15}", r),
+        Term::Add(l, r) => format!("(+ {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Term::Sub(l, r) => format!("(- {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Term::Mul(l, r) => format!("(* {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Term::Div(l, r) => format!("(div {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Term::Mod(l, r) => format!("(mod {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Term::Neg(t) => format!("(- {})", term_to_smt2(t)),
+        Term::BitAnd(l, r) => format!("(bvand {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Term::BitOr(l, r) => format!("(bvor {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Term::BitXor(l, r) => format!("(bvxor {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Term::BitNot(t) => format!("(bvnot {})", term_to_smt2(t)),
+        Term::Shl(l, r) => format!("(bvshl {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Term::Shr(l, r) => format!("(bvlshr {} {})", term_to_smt2(l), term_to_smt2(r)),
+        Term::Ite(c, t, e) => {
+            format!("(ite {} {} {})", formula_to_smt2(c), term_to_smt2(t), term_to_smt2(e))
+        }
+        Term::Select(arr, idx) => format!("(select {} {})", term_to_smt2(arr), term_to_smt2(idx)),
+        Term::Store(arr, idx, val) => {
+            format!("(store {} {} {})", term_to_smt2(arr), term_to_smt2(idx), term_to_smt2(val))
+        }
+        Term::App(name, args) => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                let args_str: Vec<String> = args.iter().map(|a| term_to_smt2(a)).collect();
+                format!("({} {})", name, args_str.join(" "))
+            }
+        }
+        Term::Old(t) => format!("old_{}", term_to_smt2(t)),
+        Term::Result => "result".to_string(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERIFICATION CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Verification context
+pub struct VerificationContext {
+    /// Function contracts
+    pub contracts: BTreeMap<String, Contract>,
+    /// Type declarations
+    pub types: BTreeMap<String, TypeDecl>,
+    /// Function declarations
+    pub functions: BTreeMap<String, FunctionDecl>,
+    /// Global invariants
+    pub invariants: Vec<Formula>,
+    /// Generated VCs
+    pub vcs: Vec<VerificationCondition>,
+    /// Next VC ID
+    next_vc_id: u64,
+}
+
+impl VerificationContext {
+    pub fn new() -> Self {
+        VerificationContext {
+            contracts: BTreeMap::new(),
+            types: BTreeMap::new(),
+            functions: BTreeMap::new(),
+            invariants: Vec::new(),
+            vcs: Vec::new(),
+            next_vc_id: 0,
+        }
+    }
+    
+    pub fn add_contract(&mut self, contract: Contract) {
+        self.contracts.insert(contract.function.clone(), contract);
+    }
+    
+    pub fn add_type(&mut self, decl: TypeDecl) {
+        self.types.insert(decl.name.clone(), decl);
+    }
+    
+    pub fn add_function(&mut self, decl: FunctionDecl) {
+        self.functions.insert(decl.name.clone(), decl);
+    }
+    
+    pub fn add_invariant(&mut self, invariant: Formula) {
+        self.invariants.push(invariant);
+    }
+    
+    pub fn generate_vc(
+        &mut self,
+        description: impl Into<String>,
+        kind: VcKind,
+        goal: Formula,
+        location: SourceLocation,
+    ) -> u64 {
+        let id = self.next_vc_id;
+        self.next_vc_id += 1;
+        
+        let vc = VerificationCondition::new(id, description, kind, goal, location);
+        self.vcs.push(vc);
+        
+        id
+    }
+    
+    pub fn get_vc(&self, id: u64) -> Option<&VerificationCondition> {
+        self.vcs.iter().find(|vc| vc.id == id)
+    }
+    
+    pub fn get_vc_mut(&mut self, id: u64) -> Option<&mut VerificationCondition> {
+        self.vcs.iter_mut().find(|vc| vc.id == id)
+    }
+}
+
+impl Default for VerificationContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Type declaration
+#[derive(Debug, Clone)]
+pub struct TypeDecl {
+    pub name: String,
+    pub sort: Sort,
+    pub invariant: Option<Formula>,
+}
+
+/// Function declaration (for SMT)
+#[derive(Debug, Clone)]
+pub struct FunctionDecl {
+    pub name: String,
+    pub params: Vec<(String, Sort)>,
+    pub return_sort: Sort,
+    pub definition: Option<Term>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_formula_and() {
+        let a = Formula::Var("a".to_string());
+        let b = Formula::Var("b".to_string());
+        let result = a.and(b);
+        
+        match result {
+            Formula::And(_, _) => {}
+            _ => panic!("Expected And"),
+        }
+    }
+    
+    #[test]
+    fn test_formula_simplify_true() {
+        let a = Formula::Var("a".to_string());
+        let result = Formula::True.and(a.clone());
+        
+        assert_eq!(result, a);
+    }
+    
+    #[test]
+    fn test_term_substitute() {
+        let term = Term::Add(
+            Box::new(Term::Var("x".to_string())),
+            Box::new(Term::IntConst(1)),
+        );
+        
+        let substituted = term.substitute("x", &Term::IntConst(5));
+        
+        match substituted {
+            Term::Add(l, r) => {
+                assert_eq!(*l, Term::IntConst(5));
+                assert_eq!(*r, Term::IntConst(1));
+            }
+            _ => panic!("Expected Add"),
+        }
+    }
+    
+    #[test]
+    fn test_smt2_output() {
+        let formula = Formula::Lt(
+            Box::new(Term::Var("x".to_string())),
+            Box::new(Term::IntConst(10)),
+        );
+        
+        let smt2 = formula_to_smt2(&formula);
+        assert_eq!(smt2, "(< x 10)");
+    }
+    
+    #[test]
+    fn test_contract() {
+        let contract = Contract::new("abs")
+            .requires(Formula::Ge(
+                Box::new(Term::Var("x".to_string())),
+                Box::new(Term::IntConst(i128::MIN)),
+            ))
+            .ensures(Formula::Ge(
+                Box::new(Term::Result),
+                Box::new(Term::IntConst(0)),
+            ))
+            .pure();
+        
+        assert!(contract.pure);
+        assert_eq!(contract.requires.len(), 1);
+        assert_eq!(contract.ensures.len(), 1);
+    }
+    
+    #[test]
+    fn test_vc_generation() {
+        let mut ctx = VerificationContext::new();
+        
+        let id = ctx.generate_vc(
+            "x > 0",
+            VcKind::Assert,
+            Formula::Gt(Box::new(Term::Var("x".to_string())), Box::new(Term::IntConst(0))),
+            SourceLocation::default(),
+        );
+        
+        assert_eq!(id, 0);
+        assert_eq!(ctx.vcs.len(), 1);
+    }
+}

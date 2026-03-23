@@ -1,0 +1,582 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Memory SSA
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Memory SSA representation:
+//   - Memory access versioning
+//   - Use-def chains for memory
+//   - May-alias handling
+//   - Clobbering analysis
+//   - Walk optimization
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::memssa
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY ACCESS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Memory access identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MemoryAccess(pub u32);
+
+impl MemoryAccess {
+    pub const LIVE_ON_ENTRY: MemoryAccess = MemoryAccess(0);
+}
+
+/// Type of memory access
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryAccessKind {
+    /// Definition (store)
+    Def,
+    /// Use (load)
+    Use,
+    /// Phi (merge point)
+    Phi,
+}
+
+/// Memory location abstraction
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MemoryLocation {
+    /// Specific variable
+    Variable(String),
+    /// Pointer dereference
+    Pointer(String),
+    /// Field access
+    Field(String, String),
+    /// Array element
+    Array(String, Option<i64>),
+    /// Unknown/any location
+    Any,
+}
+
+impl MemoryLocation {
+    /// Check if two locations may alias
+    pub fn may_alias(&self, other: &MemoryLocation) -> bool {
+        match (self, other) {
+            (MemoryLocation::Any, _) | (_, MemoryLocation::Any) => true,
+            (MemoryLocation::Variable(a), MemoryLocation::Variable(b)) => a == b,
+            (MemoryLocation::Pointer(_), _) | (_, MemoryLocation::Pointer(_)) => true,
+            (MemoryLocation::Field(a, fa), MemoryLocation::Field(b, fb)) => a == b && fa == fb,
+            (MemoryLocation::Array(a, Some(ia)), MemoryLocation::Array(b, Some(ib))) => {
+                a == b && ia == ib
+            }
+            (MemoryLocation::Array(a, _), MemoryLocation::Array(b, _)) => a == b,
+            _ => false,
+        }
+    }
+    
+    /// Check if two locations must alias
+    pub fn must_alias(&self, other: &MemoryLocation) -> bool {
+        match (self, other) {
+            (MemoryLocation::Variable(a), MemoryLocation::Variable(b)) => a == b,
+            (MemoryLocation::Field(a, fa), MemoryLocation::Field(b, fb)) => a == b && fa == fb,
+            (MemoryLocation::Array(a, Some(ia)), MemoryLocation::Array(b, Some(ib))) => {
+                a == b && ia == ib
+            }
+            _ => false,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY SSA NODE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Memory SSA node
+#[derive(Debug, Clone)]
+pub struct MemoryNode {
+    /// Unique ID
+    pub id: MemoryAccess,
+    /// Kind of access
+    pub kind: MemoryAccessKind,
+    /// Block containing this access
+    pub block: u32,
+    /// Instruction index (for def/use)
+    pub inst_index: Option<usize>,
+    /// Memory location (for def/use)
+    pub location: Option<MemoryLocation>,
+    /// Defining access (for use)
+    pub defining_access: Option<MemoryAccess>,
+    /// Incoming values (for phi)
+    pub phi_incoming: Vec<(u32, MemoryAccess)>,
+}
+
+impl MemoryNode {
+    pub fn new_def(id: MemoryAccess, block: u32, index: usize, loc: MemoryLocation) -> Self {
+        MemoryNode {
+            id,
+            kind: MemoryAccessKind::Def,
+            block,
+            inst_index: Some(index),
+            location: Some(loc),
+            defining_access: None,
+            phi_incoming: Vec::new(),
+        }
+    }
+    
+    pub fn new_use(id: MemoryAccess, block: u32, index: usize, loc: MemoryLocation, def: MemoryAccess) -> Self {
+        MemoryNode {
+            id,
+            kind: MemoryAccessKind::Use,
+            block,
+            inst_index: Some(index),
+            location: Some(loc),
+            defining_access: Some(def),
+            phi_incoming: Vec::new(),
+        }
+    }
+    
+    pub fn new_phi(id: MemoryAccess, block: u32) -> Self {
+        MemoryNode {
+            id,
+            kind: MemoryAccessKind::Phi,
+            block,
+            inst_index: None,
+            location: None,
+            defining_access: None,
+            phi_incoming: Vec::new(),
+        }
+    }
+    
+    /// Check if this is a clobber for a location
+    pub fn clobbers(&self, loc: &MemoryLocation) -> bool {
+        if self.kind != MemoryAccessKind::Def {
+            return false;
+        }
+        
+        self.location.as_ref()
+            .map(|my_loc| my_loc.may_alias(loc))
+            .unwrap_or(false)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY SSA
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Memory SSA representation
+pub struct MemorySSA {
+    /// All memory nodes
+    nodes: BTreeMap<MemoryAccess, MemoryNode>,
+    /// Block to phi mapping
+    block_phis: BTreeMap<u32, MemoryAccess>,
+    /// Instruction to access mapping
+    inst_to_access: BTreeMap<(u32, usize), MemoryAccess>,
+    /// Next ID
+    next_id: u32,
+    /// Dominator tree
+    dom_tree: BTreeMap<u32, u32>,
+}
+
+impl MemorySSA {
+    pub fn new() -> Self {
+        let mut memssa = MemorySSA {
+            nodes: BTreeMap::new(),
+            block_phis: BTreeMap::new(),
+            inst_to_access: BTreeMap::new(),
+            next_id: 1, // 0 reserved for LIVE_ON_ENTRY
+            dom_tree: BTreeMap::new(),
+        };
+        
+        // Create LIVE_ON_ENTRY
+        memssa.nodes.insert(
+            MemoryAccess::LIVE_ON_ENTRY,
+            MemoryNode {
+                id: MemoryAccess::LIVE_ON_ENTRY,
+                kind: MemoryAccessKind::Def,
+                block: 0,
+                inst_index: None,
+                location: Some(MemoryLocation::Any),
+                defining_access: None,
+                phi_incoming: Vec::new(),
+            },
+        );
+        
+        memssa
+    }
+    
+    /// Build Memory SSA for a function
+    pub fn build(&mut self, func: &MirFunction) {
+        // Compute dominators
+        self.compute_dominators(func);
+        
+        // First pass: create defs
+        for block in &func.blocks {
+            for (idx, stmt) in block.statements.iter().enumerate() {
+                if let Some(loc) = self.get_store_location(stmt) {
+                    let id = self.new_access();
+                    let node = MemoryNode::new_def(id, block.id, idx, loc);
+                    self.nodes.insert(id, node);
+                    self.inst_to_access.insert((block.id, idx), id);
+                }
+            }
+        }
+        
+        // Insert phis
+        self.insert_phis(func);
+        
+        // Second pass: link uses to defs
+        for block in &func.blocks {
+            for (idx, stmt) in block.statements.iter().enumerate() {
+                if let Some(loc) = self.get_load_location(stmt) {
+                    let def = self.find_defining_access(block.id, idx, &loc, func);
+                    let id = self.new_access();
+                    let node = MemoryNode::new_use(id, block.id, idx, loc, def);
+                    self.nodes.insert(id, node);
+                    self.inst_to_access.insert((block.id, idx), id);
+                }
+            }
+        }
+    }
+    
+    fn new_access(&mut self) -> MemoryAccess {
+        let id = MemoryAccess(self.next_id);
+        self.next_id += 1;
+        id
+    }
+    
+    fn compute_dominators(&mut self, func: &MirFunction) {
+        // Simplified dominator computation
+        self.dom_tree.clear();
+        
+        if let Some(entry) = func.blocks.first() {
+            self.dom_tree.insert(entry.id, entry.id); // Entry dominates itself
+            
+            for block in func.blocks.iter().skip(1) {
+                // Find immediate dominator (simplified - assume linear CFG)
+                let preds = self.get_predecessors(func, block.id);
+                if let Some(pred) = preds.first() {
+                    self.dom_tree.insert(block.id, *pred);
+                }
+            }
+        }
+    }
+    
+    fn get_predecessors(&self, func: &MirFunction, block_id: u32) -> Vec<u32> {
+        let mut preds = Vec::new();
+        
+        for block in &func.blocks {
+            let succs = match &block.terminator {
+                MirTerminator::Goto(t) => vec![*t],
+                MirTerminator::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+                _ => vec![],
+            };
+            
+            if succs.contains(&block_id) {
+                preds.push(block.id);
+            }
+        }
+        
+        preds
+    }
+    
+    fn insert_phis(&mut self, func: &MirFunction) {
+        // Find join points (blocks with multiple predecessors)
+        for block in &func.blocks {
+            let preds = self.get_predecessors(func, block.id);
+            if preds.len() > 1 {
+                let id = self.new_access();
+                let node = MemoryNode::new_phi(id, block.id);
+                self.nodes.insert(id, node);
+                self.block_phis.insert(block.id, id);
+            }
+        }
+    }
+    
+    fn get_store_location(&self, stmt: &MirStatement) -> Option<MemoryLocation> {
+        match stmt {
+            MirStatement::Store { ptr, .. } => {
+                if let MirOperand::Variable(v) = ptr {
+                    Some(MemoryLocation::Pointer(v.clone()))
+                } else {
+                    Some(MemoryLocation::Any)
+                }
+            }
+            MirStatement::StoreField { base, field, .. } => {
+                if let MirOperand::Variable(v) = base {
+                    Some(MemoryLocation::Field(v.clone(), field.clone()))
+                } else {
+                    Some(MemoryLocation::Any)
+                }
+            }
+            MirStatement::StoreArray { base, index, .. } => {
+                if let MirOperand::Variable(v) = base {
+                    let idx = if let MirOperand::Constant(c) = index {
+                        Some(*c)
+                    } else {
+                        None
+                    };
+                    Some(MemoryLocation::Array(v.clone(), idx))
+                } else {
+                    Some(MemoryLocation::Any)
+                }
+            }
+            MirStatement::Call { .. } => {
+                // Calls may clobber memory
+                Some(MemoryLocation::Any)
+            }
+            _ => None,
+        }
+    }
+    
+    fn get_load_location(&self, stmt: &MirStatement) -> Option<MemoryLocation> {
+        match stmt {
+            MirStatement::Load { ptr, .. } => {
+                if let MirOperand::Variable(v) = ptr {
+                    Some(MemoryLocation::Pointer(v.clone()))
+                } else {
+                    Some(MemoryLocation::Any)
+                }
+            }
+            MirStatement::LoadField { base, field, .. } => {
+                if let MirOperand::Variable(v) = base {
+                    Some(MemoryLocation::Field(v.clone(), field.clone()))
+                } else {
+                    Some(MemoryLocation::Any)
+                }
+            }
+            MirStatement::LoadArray { base, index, .. } => {
+                if let MirOperand::Variable(v) = base {
+                    let idx = if let MirOperand::Constant(c) = index {
+                        Some(*c)
+                    } else {
+                        None
+                    };
+                    Some(MemoryLocation::Array(v.clone(), idx))
+                } else {
+                    Some(MemoryLocation::Any)
+                }
+            }
+            _ => None,
+        }
+    }
+    
+    fn find_defining_access(&self, block: u32, inst: usize, loc: &MemoryLocation, func: &MirFunction) -> MemoryAccess {
+        // Walk backward from instruction to find last clobber
+        
+        // Check earlier instructions in same block
+        for i in (0..inst).rev() {
+            if let Some(&access) = self.inst_to_access.get(&(block, i)) {
+                if let Some(node) = self.nodes.get(&access) {
+                    if node.clobbers(loc) {
+                        return access;
+                    }
+                }
+            }
+        }
+        
+        // Check block phi
+        if let Some(&phi) = self.block_phis.get(&block) {
+            return phi;
+        }
+        
+        // Walk dominator tree
+        let mut current = block;
+        while let Some(&idom) = self.dom_tree.get(&current) {
+            if idom == current {
+                break; // Entry block
+            }
+            
+            // Check all defs in dominator block
+            if let Some(dom_block) = func.blocks.iter().find(|b| b.id == idom) {
+                for i in (0..dom_block.statements.len()).rev() {
+                    if let Some(&access) = self.inst_to_access.get(&(idom, i)) {
+                        if let Some(node) = self.nodes.get(&access) {
+                            if node.clobbers(loc) {
+                                return access;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Check phi at dominator
+            if let Some(&phi) = self.block_phis.get(&idom) {
+                return phi;
+            }
+            
+            current = idom;
+        }
+        
+        MemoryAccess::LIVE_ON_ENTRY
+    }
+    
+    /// Get defining access for a load
+    pub fn get_defining_access(&self, block: u32, inst: usize) -> Option<MemoryAccess> {
+        self.inst_to_access.get(&(block, inst))
+            .and_then(|&id| self.nodes.get(&id))
+            .and_then(|node| node.defining_access)
+    }
+    
+    /// Get memory access for instruction
+    pub fn get_access(&self, block: u32, inst: usize) -> Option<&MemoryNode> {
+        self.inst_to_access.get(&(block, inst))
+            .and_then(|&id| self.nodes.get(&id))
+    }
+    
+    /// Walk to find clobbering access
+    pub fn get_clobbering_access(&self, use_access: MemoryAccess) -> MemoryAccess {
+        let node = match self.nodes.get(&use_access) {
+            Some(n) if n.kind == MemoryAccessKind::Use => n,
+            _ => return MemoryAccess::LIVE_ON_ENTRY,
+        };
+        
+        node.defining_access.unwrap_or(MemoryAccess::LIVE_ON_ENTRY)
+    }
+    
+    /// Check if load can be optimized (no intervening clobber)
+    pub fn is_load_optimizable(&self, load_block: u32, load_inst: usize, def_block: u32, def_inst: usize) -> bool {
+        // Get access for load
+        let load_access = match self.inst_to_access.get(&(load_block, load_inst)) {
+            Some(&a) => a,
+            None => return false,
+        };
+        
+        let load_node = match self.nodes.get(&load_access) {
+            Some(n) => n,
+            None => return false,
+        };
+        
+        // Walk back from load's defining access
+        let mut current = load_node.defining_access.unwrap_or(MemoryAccess::LIVE_ON_ENTRY);
+        
+        while current != MemoryAccess::LIVE_ON_ENTRY {
+            let node = match self.nodes.get(&current) {
+                Some(n) => n,
+                None => break,
+            };
+            
+            if node.block == def_block && node.inst_index == Some(def_inst) {
+                return true;
+            }
+            
+            // Check for clobber
+            if node.kind == MemoryAccessKind::Def {
+                if let (Some(load_loc), Some(node_loc)) = (&load_node.location, &node.location) {
+                    if node_loc.may_alias(load_loc) {
+                        return false;
+                    }
+                }
+            }
+            
+            // Continue walking
+            if node.kind == MemoryAccessKind::Phi {
+                // For phi, check all incoming
+                // Simplified: just stop
+                break;
+            }
+            
+            current = node.defining_access.unwrap_or(MemoryAccess::LIVE_ON_ENTRY);
+        }
+        
+        false
+    }
+}
+
+impl Default for MemorySSA {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    Load { dest: String, ptr: MirOperand },
+    Store { ptr: MirOperand, value: MirOperand },
+    LoadField { dest: String, base: MirOperand, field: String },
+    StoreField { base: MirOperand, field: String, value: MirOperand },
+    LoadArray { dest: String, base: MirOperand, index: MirOperand },
+    StoreArray { base: MirOperand, index: MirOperand, value: MirOperand },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Return { value: Option<MirOperand> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_memory_location_alias() {
+        let loc1 = MemoryLocation::Variable("x".to_string());
+        let loc2 = MemoryLocation::Variable("x".to_string());
+        let loc3 = MemoryLocation::Variable("y".to_string());
+        
+        assert!(loc1.may_alias(&loc2));
+        assert!(loc1.must_alias(&loc2));
+        assert!(!loc1.may_alias(&loc3));
+    }
+    
+    #[test]
+    fn test_pointer_alias() {
+        let ptr = MemoryLocation::Pointer("p".to_string());
+        let var = MemoryLocation::Variable("x".to_string());
+        
+        // Pointers may alias anything
+        assert!(ptr.may_alias(&var));
+        assert!(!ptr.must_alias(&var));
+    }
+    
+    #[test]
+    fn test_field_alias() {
+        let f1 = MemoryLocation::Field("obj".to_string(), "x".to_string());
+        let f2 = MemoryLocation::Field("obj".to_string(), "x".to_string());
+        let f3 = MemoryLocation::Field("obj".to_string(), "y".to_string());
+        
+        assert!(f1.may_alias(&f2));
+        assert!(f1.must_alias(&f2));
+        assert!(!f1.may_alias(&f3));
+    }
+    
+    #[test]
+    fn test_memory_ssa_creation() {
+        let memssa = MemorySSA::new();
+        
+        // Should have LIVE_ON_ENTRY
+        assert!(memssa.nodes.contains_key(&MemoryAccess::LIVE_ON_ENTRY));
+    }
+}

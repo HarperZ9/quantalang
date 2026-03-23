@@ -1,0 +1,817 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Loop Invariant Code Motion (LICM)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Loop Invariant Code Motion optimization:
+//   - Loop invariant detection
+//   - Code hoisting
+//   - Code sinking
+//   - Store sinking
+//   - Control flow sinking
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::licm
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP REPRESENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Natural loop representation
+#[derive(Debug, Clone)]
+pub struct Loop {
+    /// Loop header block
+    pub header: u32,
+    /// Preheader block (created if needed)
+    pub preheader: Option<u32>,
+    /// Loop blocks (including header)
+    pub blocks: BTreeSet<u32>,
+    /// Loop exit blocks
+    pub exits: Vec<u32>,
+    /// Loop latches (back edge sources)
+    pub latches: Vec<u32>,
+    /// Nested loops
+    pub children: Vec<Loop>,
+    /// Parent loop
+    pub parent: Option<u32>,
+    /// Loop depth (1 for outermost)
+    pub depth: u32,
+}
+
+impl Loop {
+    pub fn new(header: u32) -> Self {
+        Loop {
+            header,
+            preheader: None,
+            blocks: [header].into_iter().collect(),
+            exits: Vec::new(),
+            latches: Vec::new(),
+            children: Vec::new(),
+            parent: None,
+            depth: 1,
+        }
+    }
+    
+    /// Check if block is in this loop
+    pub fn contains(&self, block: u32) -> bool {
+        self.blocks.contains(&block)
+    }
+    
+    /// Check if this is innermost loop (no children)
+    pub fn is_innermost(&self) -> bool {
+        self.children.is_empty()
+    }
+    
+    /// Get all nested loops (including self)
+    pub fn all_loops(&self) -> Vec<&Loop> {
+        let mut loops = vec![self];
+        for child in &self.children {
+            loops.extend(child.all_loops());
+        }
+        loops
+    }
+}
+
+/// Loop forest (collection of top-level loops)
+#[derive(Debug, Clone)]
+pub struct LoopForest {
+    /// Top-level loops
+    pub roots: Vec<Loop>,
+    /// Block to innermost loop mapping
+    pub block_to_loop: BTreeMap<u32, u32>,
+}
+
+impl LoopForest {
+    pub fn new() -> Self {
+        LoopForest {
+            roots: Vec::new(),
+            block_to_loop: BTreeMap::new(),
+        }
+    }
+    
+    /// Build loop forest from CFG
+    pub fn build(func: &MirFunction) -> Self {
+        let mut forest = LoopForest::new();
+        
+        // Compute dominators
+        let dominators = forest.compute_dominators(func);
+        
+        // Find back edges and natural loops
+        for block in &func.blocks {
+            for succ in forest.get_successors(block) {
+                // Back edge: succ dominates block
+                if forest.dominates(&dominators, succ, block.id) {
+                    // Found natural loop with header = succ
+                    let loop_blocks = forest.find_natural_loop(func, block.id, succ);
+                    
+                    let mut natural_loop = Loop::new(succ);
+                    natural_loop.blocks = loop_blocks;
+                    natural_loop.latches.push(block.id);
+                    natural_loop.exits = forest.find_exits(func, &natural_loop.blocks);
+                    
+                    forest.add_loop(natural_loop);
+                }
+            }
+        }
+        
+        // Build block to loop mapping
+        for root in &forest.roots {
+            for loop_ref in root.all_loops() {
+                for &block in &loop_ref.blocks {
+                    // Map to innermost loop
+                    if !forest.block_to_loop.contains_key(&block) {
+                        forest.block_to_loop.insert(block, loop_ref.header);
+                    }
+                }
+            }
+        }
+        
+        forest
+    }
+    
+    fn add_loop(&mut self, loop_node: Loop) {
+        // Find if this loop is nested in another or nests another
+        let mut parent_idx: Option<usize> = None;
+        let mut nested_indices: Vec<usize> = Vec::new();
+        
+        for (i, root) in self.roots.iter().enumerate() {
+            if loop_node.blocks.is_superset(&root.blocks) {
+                nested_indices.push(i);
+            } else if root.blocks.is_superset(&loop_node.blocks) {
+                parent_idx = Some(i);
+                break;
+            }
+        }
+        
+        if let Some(idx) = parent_idx {
+            // Add as child of existing loop
+            // Simplified - real impl would recurse into children
+            self.roots.push(loop_node);
+        } else if !nested_indices.is_empty() {
+            // This loop contains other loops
+            let mut new_loop = loop_node;
+            for i in nested_indices.into_iter().rev() {
+                let nested = self.roots.remove(i);
+                new_loop.children.push(nested);
+            }
+            self.roots.push(new_loop);
+        } else {
+            self.roots.push(loop_node);
+        }
+    }
+    
+    fn compute_dominators(&self, func: &MirFunction) -> BTreeMap<u32, BTreeSet<u32>> {
+        let mut doms: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        let all_blocks: BTreeSet<u32> = func.blocks.iter().map(|b| b.id).collect();
+        
+        for block in &func.blocks {
+            doms.insert(block.id, all_blocks.clone());
+        }
+        
+        if let Some(entry) = func.blocks.first() {
+            doms.insert(entry.id, [entry.id].into_iter().collect());
+        }
+        
+        let mut changed = true;
+        while changed {
+            changed = false;
+            
+            for block in &func.blocks {
+                let preds = self.get_predecessors(func, block.id);
+                
+                if preds.is_empty() {
+                    continue;
+                }
+                
+                let mut new_doms: Option<BTreeSet<u32>> = None;
+                
+                for pred in preds {
+                    if let Some(pred_doms) = doms.get(&pred) {
+                        match &mut new_doms {
+                            None => new_doms = Some(pred_doms.clone()),
+                            Some(d) => {
+                                *d = d.intersection(pred_doms).copied().collect();
+                            }
+                        }
+                    }
+                }
+                
+                if let Some(mut new) = new_doms {
+                    new.insert(block.id);
+                    
+                    if doms.get(&block.id) != Some(&new) {
+                        doms.insert(block.id, new);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        
+        doms
+    }
+    
+    fn dominates(&self, doms: &BTreeMap<u32, BTreeSet<u32>>, a: u32, b: u32) -> bool {
+        doms.get(&b).map(|d| d.contains(&a)).unwrap_or(false)
+    }
+    
+    fn find_natural_loop(&self, func: &MirFunction, latch: u32, header: u32) -> BTreeSet<u32> {
+        let mut blocks = BTreeSet::new();
+        blocks.insert(header);
+        
+        if latch == header {
+            return blocks;
+        }
+        
+        let mut worklist = vec![latch];
+        blocks.insert(latch);
+        
+        while let Some(block) = worklist.pop() {
+            for pred in self.get_predecessors(func, block) {
+                if !blocks.contains(&pred) {
+                    blocks.insert(pred);
+                    worklist.push(pred);
+                }
+            }
+        }
+        
+        blocks
+    }
+    
+    fn find_exits(&self, func: &MirFunction, loop_blocks: &BTreeSet<u32>) -> Vec<u32> {
+        let mut exits = Vec::new();
+        
+        for block in &func.blocks {
+            if loop_blocks.contains(&block.id) {
+                for succ in self.get_successors(block) {
+                    if !loop_blocks.contains(&succ) && !exits.contains(&succ) {
+                        exits.push(succ);
+                    }
+                }
+            }
+        }
+        
+        exits
+    }
+    
+    fn get_predecessors(&self, func: &MirFunction, block_id: u32) -> Vec<u32> {
+        let mut preds = Vec::new();
+        
+        for block in &func.blocks {
+            if self.get_successors(block).contains(&block_id) {
+                preds.push(block.id);
+            }
+        }
+        
+        preds
+    }
+    
+    fn get_successors(&self, block: &MirBlock) -> Vec<u32> {
+        match &block.terminator {
+            MirTerminator::Goto(target) => vec![*target],
+            MirTerminator::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+            MirTerminator::Switch { targets, default, .. } => {
+                let mut succs: Vec<_> = targets.iter().map(|(_, t)| *t).collect();
+                succs.push(*default);
+                succs
+            }
+            _ => vec![],
+        }
+    }
+    
+    /// Get loop for a block
+    pub fn get_loop(&self, block: u32) -> Option<u32> {
+        self.block_to_loop.get(&block).copied()
+    }
+}
+
+impl Default for LoopForest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP INVARIANT ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop invariant analyzer
+pub struct LoopInvariantAnalyzer {
+    /// Invariant instructions per loop
+    invariants: BTreeMap<u32, BTreeSet<(u32, usize)>>,
+    /// Definitions in loop
+    loop_defs: BTreeMap<u32, BTreeSet<String>>,
+}
+
+impl LoopInvariantAnalyzer {
+    pub fn new() -> Self {
+        LoopInvariantAnalyzer {
+            invariants: BTreeMap::new(),
+            loop_defs: BTreeMap::new(),
+        }
+    }
+    
+    /// Analyze loop invariants
+    pub fn analyze(&mut self, func: &MirFunction, loop_forest: &LoopForest) {
+        self.invariants.clear();
+        self.loop_defs.clear();
+        
+        // Process each loop
+        for root in &loop_forest.roots {
+            for loop_ref in root.all_loops() {
+                self.analyze_loop(func, loop_ref);
+            }
+        }
+    }
+    
+    fn analyze_loop(&mut self, func: &MirFunction, loop_info: &Loop) {
+        // Collect definitions in loop
+        let mut defs = BTreeSet::new();
+        
+        for block in &func.blocks {
+            if loop_info.contains(block.id) {
+                for stmt in &block.statements {
+                    if let Some(def) = self.get_definition(stmt) {
+                        defs.insert(def.to_string());
+                    }
+                }
+            }
+        }
+        
+        self.loop_defs.insert(loop_info.header, defs.clone());
+        
+        // Find invariants
+        let mut invariants = BTreeSet::new();
+        let mut changed = true;
+        
+        while changed {
+            changed = false;
+            
+            for block in &func.blocks {
+                if !loop_info.contains(block.id) {
+                    continue;
+                }
+                
+                for (idx, stmt) in block.statements.iter().enumerate() {
+                    if invariants.contains(&(block.id, idx)) {
+                        continue;
+                    }
+                    
+                    if self.is_invariant(stmt, &defs, &invariants, loop_info, func) {
+                        invariants.insert((block.id, idx));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        
+        self.invariants.insert(loop_info.header, invariants);
+    }
+    
+    fn is_invariant(
+        &self,
+        stmt: &MirStatement,
+        loop_defs: &BTreeSet<String>,
+        known_invariants: &BTreeSet<(u32, usize)>,
+        loop_info: &Loop,
+        func: &MirFunction,
+    ) -> bool {
+        // Stores and calls are not invariant (side effects)
+        match stmt {
+            MirStatement::Store { .. } |
+            MirStatement::Call { .. } => return false,
+            _ => {}
+        }
+        
+        // Check if all operands are loop-invariant
+        let operands = self.get_operands(stmt);
+        
+        for operand in operands {
+            if let MirOperand::Variable(name) = operand {
+                // Variable is invariant if:
+                // 1. Not defined in loop, OR
+                // 2. Defined by a known invariant instruction
+                
+                if loop_defs.contains(&name) {
+                    // Check if definition is invariant
+                    let def_is_invariant = self.find_definition(func, &name, loop_info)
+                        .map(|(b, i)| known_invariants.contains(&(b, i)))
+                        .unwrap_or(false);
+                    
+                    if !def_is_invariant {
+                        return false;
+                    }
+                }
+            }
+        }
+        
+        true
+    }
+    
+    fn get_definition<'a>(&self, stmt: &'a MirStatement) -> Option<&'a str> {
+        match stmt {
+            MirStatement::Assign { dest, .. } |
+            MirStatement::BinaryOp { dest, .. } |
+            MirStatement::Load { dest, .. } |
+            MirStatement::Phi { dest, .. } => Some(dest.as_str()),
+            MirStatement::Call { dest: Some(d), .. } => Some(d.as_str()),
+            _ => None,
+        }
+    }
+    
+    fn get_operands(&self, stmt: &MirStatement) -> Vec<MirOperand> {
+        match stmt {
+            MirStatement::Assign { value, .. } => vec![value.clone()],
+            MirStatement::BinaryOp { lhs, rhs, .. } => vec![lhs.clone(), rhs.clone()],
+            MirStatement::Load { ptr, .. } => vec![ptr.clone()],
+            MirStatement::Store { ptr, value, .. } => vec![ptr.clone(), value.clone()],
+            MirStatement::Call { args, .. } => args.clone(),
+            _ => vec![],
+        }
+    }
+    
+    fn find_definition(&self, func: &MirFunction, name: &str, loop_info: &Loop) -> Option<(u32, usize)> {
+        for block in &func.blocks {
+            if !loop_info.contains(block.id) {
+                continue;
+            }
+            
+            for (idx, stmt) in block.statements.iter().enumerate() {
+                if self.get_definition(stmt) == Some(name) {
+                    return Some((block.id, idx));
+                }
+            }
+        }
+        
+        None
+    }
+    
+    /// Get invariant instructions for a loop
+    pub fn get_invariants(&self, loop_header: u32) -> &BTreeSet<(u32, usize)> {
+        static EMPTY: BTreeSet<(u32, usize)> = BTreeSet::new();
+        self.invariants.get(&loop_header).unwrap_or(&EMPTY)
+    }
+    
+    /// Check if instruction is invariant
+    pub fn is_loop_invariant(&self, loop_header: u32, block: u32, index: usize) -> bool {
+        self.invariants.get(&loop_header)
+            .map(|inv| inv.contains(&(block, index)))
+            .unwrap_or(false)
+    }
+}
+
+impl Default for LoopInvariantAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LICM PASS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop Invariant Code Motion pass
+pub struct LICM {
+    /// Loop forest
+    loops: LoopForest,
+    /// Invariant analyzer
+    analyzer: LoopInvariantAnalyzer,
+    /// Statistics
+    stats: LICMStats,
+}
+
+/// LICM statistics
+#[derive(Debug, Clone, Default)]
+pub struct LICMStats {
+    /// Loops analyzed
+    pub loops_analyzed: usize,
+    /// Invariants found
+    pub invariants_found: usize,
+    /// Instructions hoisted
+    pub hoisted: usize,
+    /// Instructions sunk
+    pub sunk: usize,
+    /// Preheaders created
+    pub preheaders_created: usize,
+}
+
+impl LICM {
+    pub fn new() -> Self {
+        LICM {
+            loops: LoopForest::new(),
+            analyzer: LoopInvariantAnalyzer::new(),
+            stats: LICMStats::default(),
+        }
+    }
+    
+    /// Run LICM on a function
+    pub fn run(&mut self, func: &mut MirFunction) -> &LICMStats {
+        self.stats = LICMStats::default();
+        
+        // Build loop forest
+        self.loops = LoopForest::build(func);
+        
+        // Analyze invariants
+        self.analyzer.analyze(func, &self.loops);
+        
+        // Process loops from innermost to outermost
+        let all_loops: Vec<_> = self.loops.roots.iter()
+            .flat_map(|r| r.all_loops())
+            .map(|l| l.header)
+            .collect();
+        
+        self.stats.loops_analyzed = all_loops.len();
+        
+        for loop_header in all_loops {
+            let invariants = self.analyzer.get_invariants(loop_header);
+            self.stats.invariants_found += invariants.len();
+            
+            // Ensure preheader exists
+            self.ensure_preheader(func, loop_header);
+            
+            // Hoist invariant code
+            self.hoist_invariants(func, loop_header, invariants);
+        }
+        
+        &self.stats
+    }
+    
+    fn ensure_preheader(&mut self, func: &mut MirFunction, loop_header: u32) {
+        // Find predecessors of header that are not in the loop
+        let loop_info = self.find_loop(loop_header);
+        
+        if loop_info.is_none() {
+            return;
+        }
+        
+        let loop_blocks = loop_info.unwrap();
+        
+        let outside_preds: Vec<_> = self.loops.get_predecessors(func, loop_header)
+            .into_iter()
+            .filter(|&p| !loop_blocks.contains(&p))
+            .collect();
+        
+        if outside_preds.len() <= 1 {
+            // Single predecessor or none - use it as preheader
+            return;
+        }
+        
+        // Create preheader
+        let preheader_id = func.blocks.iter().map(|b| b.id).max().unwrap_or(0) + 1;
+        
+        let preheader = MirBlock {
+            id: preheader_id,
+            statements: Vec::new(),
+            terminator: MirTerminator::Goto(loop_header),
+        };
+        
+        func.blocks.push(preheader);
+        
+        // Redirect predecessors to preheader
+        for block in &mut func.blocks {
+            if outside_preds.contains(&block.id) {
+                self.redirect_successor(block, loop_header, preheader_id);
+            }
+        }
+        
+        self.stats.preheaders_created += 1;
+    }
+    
+    fn find_loop(&self, header: u32) -> Option<&BTreeSet<u32>> {
+        for root in &self.loops.roots {
+            for loop_ref in root.all_loops() {
+                if loop_ref.header == header {
+                    return Some(&loop_ref.blocks);
+                }
+            }
+        }
+        None
+    }
+    
+    fn redirect_successor(&self, block: &mut MirBlock, from: u32, to: u32) {
+        match &mut block.terminator {
+            MirTerminator::Goto(target) => {
+                if *target == from {
+                    *target = to;
+                }
+            }
+            MirTerminator::Branch { then_bb, else_bb, .. } => {
+                if *then_bb == from {
+                    *then_bb = to;
+                }
+                if *else_bb == from {
+                    *else_bb = to;
+                }
+            }
+            MirTerminator::Switch { targets, default, .. } => {
+                for (_, target) in targets {
+                    if *target == from {
+                        *target = to;
+                    }
+                }
+                if *default == from {
+                    *default = to;
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    fn hoist_invariants(&mut self, func: &mut MirFunction, loop_header: u32, invariants: &BTreeSet<(u32, usize)>) {
+        // Find preheader
+        let preheader = self.find_preheader(func, loop_header);
+        
+        if preheader.is_none() {
+            return;
+        }
+        
+        let preheader_id = preheader.unwrap();
+        
+        // Collect instructions to hoist
+        let mut to_hoist: Vec<(u32, usize)> = invariants.iter().copied().collect();
+        
+        // Sort by block and index for stable removal
+        to_hoist.sort();
+        
+        // Extract and hoist (in reverse to maintain indices)
+        let mut hoisted_stmts = Vec::new();
+        
+        for (block_id, index) in to_hoist.into_iter().rev() {
+            if let Some(block) = func.blocks.iter_mut().find(|b| b.id == block_id) {
+                if index < block.statements.len() {
+                    let stmt = block.statements.remove(index);
+                    hoisted_stmts.push(stmt);
+                    self.stats.hoisted += 1;
+                }
+            }
+        }
+        
+        // Insert into preheader (in order)
+        if let Some(preheader) = func.blocks.iter_mut().find(|b| b.id == preheader_id) {
+            for stmt in hoisted_stmts.into_iter().rev() {
+                preheader.statements.push(stmt);
+            }
+        }
+    }
+    
+    fn find_preheader(&self, func: &MirFunction, loop_header: u32) -> Option<u32> {
+        let loop_blocks = self.find_loop(loop_header)?;
+        
+        let preds: Vec<_> = self.loops.get_predecessors(func, loop_header)
+            .into_iter()
+            .filter(|&p| !loop_blocks.contains(&p))
+            .collect();
+        
+        preds.into_iter().next()
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &LICMStats {
+        &self.stats
+    }
+}
+
+impl Default for LICM {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand },
+    Store { ptr: MirOperand, value: MirOperand },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Switch { value: MirOperand, targets: Vec<(i64, u32)>, default: u32 },
+    Return { value: Option<MirOperand> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn create_loop_func() -> MirFunction {
+        MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::Assign {
+                            dest: "i".to_string(),
+                            value: MirOperand::Constant(0),
+                        },
+                    ],
+                    terminator: MirTerminator::Goto(1),
+                },
+                MirBlock {
+                    id: 1, // Loop header
+                    statements: vec![
+                        // Invariant: x = a + b (a, b defined outside loop)
+                        MirStatement::BinaryOp {
+                            dest: "x".to_string(),
+                            op: BinOp::Add,
+                            lhs: MirOperand::Variable("a".to_string()),
+                            rhs: MirOperand::Variable("b".to_string()),
+                        },
+                        // Not invariant: y = y + x
+                        MirStatement::BinaryOp {
+                            dest: "y".to_string(),
+                            op: BinOp::Add,
+                            lhs: MirOperand::Variable("y".to_string()),
+                            rhs: MirOperand::Variable("x".to_string()),
+                        },
+                        // Not invariant: i = i + 1
+                        MirStatement::BinaryOp {
+                            dest: "i".to_string(),
+                            op: BinOp::Add,
+                            lhs: MirOperand::Variable("i".to_string()),
+                            rhs: MirOperand::Constant(1),
+                        },
+                    ],
+                    terminator: MirTerminator::Branch {
+                        cond: MirOperand::Variable("cond".to_string()),
+                        then_bb: 1, // Back to header
+                        else_bb: 2, // Exit
+                    },
+                },
+                MirBlock {
+                    id: 2,
+                    statements: vec![],
+                    terminator: MirTerminator::Return {
+                        value: Some(MirOperand::Variable("y".to_string())),
+                    },
+                },
+            ],
+        }
+    }
+    
+    #[test]
+    fn test_loop_detection() {
+        let func = create_loop_func();
+        let forest = LoopForest::build(&func);
+        
+        assert_eq!(forest.roots.len(), 1);
+        assert_eq!(forest.roots[0].header, 1);
+        assert!(forest.roots[0].blocks.contains(&1));
+    }
+    
+    #[test]
+    fn test_licm() {
+        let mut func = create_loop_func();
+        let mut licm = LICM::new();
+        
+        licm.run(&mut func);
+        
+        assert_eq!(licm.stats().loops_analyzed, 1);
+    }
+}

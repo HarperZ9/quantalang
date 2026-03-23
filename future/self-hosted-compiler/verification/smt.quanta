@@ -1,0 +1,1077 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ VERIFICATION — SMT Solver Integration
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// SMT (Satisfiability Modulo Theories) solver integration for formal verification:
+// - SMT-LIB2 format generation
+// - Z3/CVC5 solver backends
+// - Theory support (bitvectors, arrays, reals, integers)
+// - Model extraction and counterexample generation
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::verification::smt
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::collections::BTreeMap;
+use std::process::{Command, Stdio};
+use std::io::{Write, BufRead, BufReader};
+use std::path::PathBuf;
+use std::time::Duration;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMT SORTS (TYPES)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SMT sort (type)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Sort {
+    /// Boolean
+    Bool,
+    
+    /// Arbitrary-precision integer
+    Int,
+    
+    /// Arbitrary-precision real
+    Real,
+    
+    /// Fixed-width bitvector
+    BitVec(u32),
+    
+    /// Array from index to element
+    Array(Box<Sort>, Box<Sort>),
+    
+    /// Uninterpreted sort
+    Uninterpreted(String),
+    
+    /// Datatype (algebraic)
+    Datatype(String),
+    
+    /// Function sort
+    Function(Vec<Sort>, Box<Sort>),
+}
+
+impl Sort {
+    /// Create bitvector sort
+    pub fn bv(width: u32) -> Self {
+        Sort::BitVec(width)
+    }
+    
+    /// Create array sort
+    pub fn array(index: Sort, element: Sort) -> Self {
+        Sort::Array(Box::new(index), Box::new(element))
+    }
+    
+    /// Create function sort
+    pub fn function(params: Vec<Sort>, ret: Sort) -> Self {
+        Sort::Function(params, Box::new(ret))
+    }
+    
+    /// Convert to SMT-LIB2 string
+    pub fn to_smtlib(&self) -> String {
+        match self {
+            Sort::Bool => "Bool".to_string(),
+            Sort::Int => "Int".to_string(),
+            Sort::Real => "Real".to_string(),
+            Sort::BitVec(w) => format!("(_ BitVec {})", w),
+            Sort::Array(i, e) => format!("(Array {} {})", i.to_smtlib(), e.to_smtlib()),
+            Sort::Uninterpreted(name) => name.clone(),
+            Sort::Datatype(name) => name.clone(),
+            Sort::Function(params, ret) => {
+                let params_str: Vec<String> = params.iter().map(|p| p.to_smtlib()).collect();
+                format!("({}) {}", params_str.join(" "), ret.to_smtlib())
+            }
+        }
+    }
+    
+    /// Check if numeric sort
+    pub fn is_numeric(&self) -> bool {
+        matches!(self, Sort::Int | Sort::Real | Sort::BitVec(_))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMT EXPRESSIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SMT expression
+#[derive(Debug, Clone)]
+pub enum Expr {
+    // ─── Constants ───
+    /// Boolean constant
+    BoolConst(bool),
+    
+    /// Integer constant
+    IntConst(i64),
+    
+    /// Real constant (as string for precision)
+    RealConst(String),
+    
+    /// Bitvector constant
+    BitVecConst(u64, u32),
+    
+    // ─── Variables ───
+    /// Variable reference
+    Var(String, Sort),
+    
+    // ─── Boolean operations ───
+    /// Logical NOT
+    Not(Box<Expr>),
+    
+    /// Logical AND
+    And(Vec<Expr>),
+    
+    /// Logical OR
+    Or(Vec<Expr>),
+    
+    /// Logical XOR
+    Xor(Box<Expr>, Box<Expr>),
+    
+    /// Implication
+    Implies(Box<Expr>, Box<Expr>),
+    
+    /// If-then-else
+    Ite(Box<Expr>, Box<Expr>, Box<Expr>),
+    
+    // ─── Equality ───
+    /// Equality
+    Eq(Box<Expr>, Box<Expr>),
+    
+    /// Distinct (all different)
+    Distinct(Vec<Expr>),
+    
+    // ─── Arithmetic ───
+    /// Negation
+    Neg(Box<Expr>),
+    
+    /// Addition
+    Add(Vec<Expr>),
+    
+    /// Subtraction
+    Sub(Box<Expr>, Box<Expr>),
+    
+    /// Multiplication
+    Mul(Vec<Expr>),
+    
+    /// Division
+    Div(Box<Expr>, Box<Expr>),
+    
+    /// Modulo
+    Mod(Box<Expr>, Box<Expr>),
+    
+    /// Absolute value
+    Abs(Box<Expr>),
+    
+    // ─── Comparisons ───
+    /// Less than
+    Lt(Box<Expr>, Box<Expr>),
+    
+    /// Less than or equal
+    Le(Box<Expr>, Box<Expr>),
+    
+    /// Greater than
+    Gt(Box<Expr>, Box<Expr>),
+    
+    /// Greater than or equal
+    Ge(Box<Expr>, Box<Expr>),
+    
+    // ─── Bitvector operations ───
+    /// Bitvector AND
+    BvAnd(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector OR
+    BvOr(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector XOR
+    BvXor(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector NOT
+    BvNot(Box<Expr>),
+    
+    /// Bitvector addition
+    BvAdd(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector subtraction
+    BvSub(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector multiplication
+    BvMul(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector unsigned division
+    BvUdiv(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector signed division
+    BvSdiv(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector unsigned remainder
+    BvUrem(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector signed remainder
+    BvSrem(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector shift left
+    BvShl(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector logical shift right
+    BvLshr(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector arithmetic shift right
+    BvAshr(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector unsigned less than
+    BvUlt(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector unsigned less than or equal
+    BvUle(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector signed less than
+    BvSlt(Box<Expr>, Box<Expr>),
+    
+    /// Bitvector signed less than or equal
+    BvSle(Box<Expr>, Box<Expr>),
+    
+    /// Extract bits [high:low]
+    Extract(u32, u32, Box<Expr>),
+    
+    /// Concatenate bitvectors
+    Concat(Box<Expr>, Box<Expr>),
+    
+    /// Zero extend
+    ZeroExtend(u32, Box<Expr>),
+    
+    /// Sign extend
+    SignExtend(u32, Box<Expr>),
+    
+    // ─── Array operations ───
+    /// Array select (read)
+    Select(Box<Expr>, Box<Expr>),
+    
+    /// Array store (write)
+    Store(Box<Expr>, Box<Expr>, Box<Expr>),
+    
+    // ─── Quantifiers ───
+    /// Universal quantifier
+    Forall(Vec<(String, Sort)>, Box<Expr>),
+    
+    /// Existential quantifier
+    Exists(Vec<(String, Sort)>, Box<Expr>),
+    
+    // ─── Function application ───
+    /// Function/predicate application
+    Apply(String, Vec<Expr>),
+    
+    // ─── Let binding ───
+    /// Let expression
+    Let(Vec<(String, Expr)>, Box<Expr>),
+}
+
+impl Expr {
+    // ─── Constructors ───
+    
+    pub fn bool_const(b: bool) -> Self {
+        Expr::BoolConst(b)
+    }
+    
+    pub fn int_const(n: i64) -> Self {
+        Expr::IntConst(n)
+    }
+    
+    pub fn bv_const(val: u64, width: u32) -> Self {
+        Expr::BitVecConst(val, width)
+    }
+    
+    pub fn var(name: impl Into<String>, sort: Sort) -> Self {
+        Expr::Var(name.into(), sort)
+    }
+    
+    // ─── Boolean ───
+    
+    pub fn not(e: Expr) -> Self {
+        Expr::Not(Box::new(e))
+    }
+    
+    pub fn and(exprs: Vec<Expr>) -> Self {
+        if exprs.len() == 1 {
+            exprs.into_iter().next().unwrap()
+        } else {
+            Expr::And(exprs)
+        }
+    }
+    
+    pub fn or(exprs: Vec<Expr>) -> Self {
+        if exprs.len() == 1 {
+            exprs.into_iter().next().unwrap()
+        } else {
+            Expr::Or(exprs)
+        }
+    }
+    
+    pub fn implies(lhs: Expr, rhs: Expr) -> Self {
+        Expr::Implies(Box::new(lhs), Box::new(rhs))
+    }
+    
+    pub fn ite(cond: Expr, then_: Expr, else_: Expr) -> Self {
+        Expr::Ite(Box::new(cond), Box::new(then_), Box::new(else_))
+    }
+    
+    // ─── Equality ───
+    
+    pub fn eq(lhs: Expr, rhs: Expr) -> Self {
+        Expr::Eq(Box::new(lhs), Box::new(rhs))
+    }
+    
+    pub fn ne(lhs: Expr, rhs: Expr) -> Self {
+        Expr::Not(Box::new(Expr::Eq(Box::new(lhs), Box::new(rhs))))
+    }
+    
+    // ─── Arithmetic ───
+    
+    pub fn add(exprs: Vec<Expr>) -> Self {
+        if exprs.len() == 1 {
+            exprs.into_iter().next().unwrap()
+        } else {
+            Expr::Add(exprs)
+        }
+    }
+    
+    pub fn sub(lhs: Expr, rhs: Expr) -> Self {
+        Expr::Sub(Box::new(lhs), Box::new(rhs))
+    }
+    
+    pub fn mul(exprs: Vec<Expr>) -> Self {
+        if exprs.len() == 1 {
+            exprs.into_iter().next().unwrap()
+        } else {
+            Expr::Mul(exprs)
+        }
+    }
+    
+    pub fn lt(lhs: Expr, rhs: Expr) -> Self {
+        Expr::Lt(Box::new(lhs), Box::new(rhs))
+    }
+    
+    pub fn le(lhs: Expr, rhs: Expr) -> Self {
+        Expr::Le(Box::new(lhs), Box::new(rhs))
+    }
+    
+    pub fn gt(lhs: Expr, rhs: Expr) -> Self {
+        Expr::Gt(Box::new(lhs), Box::new(rhs))
+    }
+    
+    pub fn ge(lhs: Expr, rhs: Expr) -> Self {
+        Expr::Ge(Box::new(lhs), Box::new(rhs))
+    }
+    
+    // ─── Bitvector ───
+    
+    pub fn bv_and(lhs: Expr, rhs: Expr) -> Self {
+        Expr::BvAnd(Box::new(lhs), Box::new(rhs))
+    }
+    
+    pub fn bv_or(lhs: Expr, rhs: Expr) -> Self {
+        Expr::BvOr(Box::new(lhs), Box::new(rhs))
+    }
+    
+    pub fn bv_add(lhs: Expr, rhs: Expr) -> Self {
+        Expr::BvAdd(Box::new(lhs), Box::new(rhs))
+    }
+    
+    pub fn extract(high: u32, low: u32, e: Expr) -> Self {
+        Expr::Extract(high, low, Box::new(e))
+    }
+    
+    pub fn concat(lhs: Expr, rhs: Expr) -> Self {
+        Expr::Concat(Box::new(lhs), Box::new(rhs))
+    }
+    
+    // ─── Array ───
+    
+    pub fn select(arr: Expr, idx: Expr) -> Self {
+        Expr::Select(Box::new(arr), Box::new(idx))
+    }
+    
+    pub fn store(arr: Expr, idx: Expr, val: Expr) -> Self {
+        Expr::Store(Box::new(arr), Box::new(idx), Box::new(val))
+    }
+    
+    // ─── Quantifiers ───
+    
+    pub fn forall(vars: Vec<(String, Sort)>, body: Expr) -> Self {
+        Expr::Forall(vars, Box::new(body))
+    }
+    
+    pub fn exists(vars: Vec<(String, Sort)>, body: Expr) -> Self {
+        Expr::Exists(vars, Box::new(body))
+    }
+    
+    /// Convert to SMT-LIB2 string
+    pub fn to_smtlib(&self) -> String {
+        match self {
+            Expr::BoolConst(b) => if *b { "true" } else { "false" }.to_string(),
+            Expr::IntConst(n) => {
+                if *n < 0 {
+                    format!("(- {})", -n)
+                } else {
+                    n.to_string()
+                }
+            }
+            Expr::RealConst(s) => s.clone(),
+            Expr::BitVecConst(v, w) => format!("(_ bv{} {})", v, w),
+            
+            Expr::Var(name, _) => name.clone(),
+            
+            Expr::Not(e) => format!("(not {})", e.to_smtlib()),
+            Expr::And(es) => {
+                let args: Vec<String> = es.iter().map(|e| e.to_smtlib()).collect();
+                format!("(and {})", args.join(" "))
+            }
+            Expr::Or(es) => {
+                let args: Vec<String> = es.iter().map(|e| e.to_smtlib()).collect();
+                format!("(or {})", args.join(" "))
+            }
+            Expr::Xor(a, b) => format!("(xor {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::Implies(a, b) => format!("(=> {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::Ite(c, t, e) => format!("(ite {} {} {})", c.to_smtlib(), t.to_smtlib(), e.to_smtlib()),
+            
+            Expr::Eq(a, b) => format!("(= {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::Distinct(es) => {
+                let args: Vec<String> = es.iter().map(|e| e.to_smtlib()).collect();
+                format!("(distinct {})", args.join(" "))
+            }
+            
+            Expr::Neg(e) => format!("(- {})", e.to_smtlib()),
+            Expr::Add(es) => {
+                let args: Vec<String> = es.iter().map(|e| e.to_smtlib()).collect();
+                format!("(+ {})", args.join(" "))
+            }
+            Expr::Sub(a, b) => format!("(- {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::Mul(es) => {
+                let args: Vec<String> = es.iter().map(|e| e.to_smtlib()).collect();
+                format!("(* {})", args.join(" "))
+            }
+            Expr::Div(a, b) => format!("(div {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::Mod(a, b) => format!("(mod {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::Abs(e) => format!("(abs {})", e.to_smtlib()),
+            
+            Expr::Lt(a, b) => format!("(< {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::Le(a, b) => format!("(<= {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::Gt(a, b) => format!("(> {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::Ge(a, b) => format!("(>= {} {})", a.to_smtlib(), b.to_smtlib()),
+            
+            // Bitvector
+            Expr::BvAnd(a, b) => format!("(bvand {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvOr(a, b) => format!("(bvor {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvXor(a, b) => format!("(bvxor {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvNot(e) => format!("(bvnot {})", e.to_smtlib()),
+            Expr::BvAdd(a, b) => format!("(bvadd {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvSub(a, b) => format!("(bvsub {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvMul(a, b) => format!("(bvmul {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvUdiv(a, b) => format!("(bvudiv {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvSdiv(a, b) => format!("(bvsdiv {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvUrem(a, b) => format!("(bvurem {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvSrem(a, b) => format!("(bvsrem {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvShl(a, b) => format!("(bvshl {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvLshr(a, b) => format!("(bvlshr {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvAshr(a, b) => format!("(bvashr {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvUlt(a, b) => format!("(bvult {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvUle(a, b) => format!("(bvule {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvSlt(a, b) => format!("(bvslt {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::BvSle(a, b) => format!("(bvsle {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::Extract(h, l, e) => format!("((_ extract {} {}) {})", h, l, e.to_smtlib()),
+            Expr::Concat(a, b) => format!("(concat {} {})", a.to_smtlib(), b.to_smtlib()),
+            Expr::ZeroExtend(n, e) => format!("((_ zero_extend {}) {})", n, e.to_smtlib()),
+            Expr::SignExtend(n, e) => format!("((_ sign_extend {}) {})", n, e.to_smtlib()),
+            
+            // Array
+            Expr::Select(a, i) => format!("(select {} {})", a.to_smtlib(), i.to_smtlib()),
+            Expr::Store(a, i, v) => format!("(store {} {} {})", a.to_smtlib(), i.to_smtlib(), v.to_smtlib()),
+            
+            // Quantifiers
+            Expr::Forall(vars, body) => {
+                let bindings: Vec<String> = vars.iter()
+                    .map(|(n, s)| format!("({} {})", n, s.to_smtlib()))
+                    .collect();
+                format!("(forall ({}) {})", bindings.join(" "), body.to_smtlib())
+            }
+            Expr::Exists(vars, body) => {
+                let bindings: Vec<String> = vars.iter()
+                    .map(|(n, s)| format!("({} {})", n, s.to_smtlib()))
+                    .collect();
+                format!("(exists ({}) {})", bindings.join(" "), body.to_smtlib())
+            }
+            
+            // Application
+            Expr::Apply(name, args) => {
+                if args.is_empty() {
+                    name.clone()
+                } else {
+                    let arg_strs: Vec<String> = args.iter().map(|e| e.to_smtlib()).collect();
+                    format!("({} {})", name, arg_strs.join(" "))
+                }
+            }
+            
+            // Let
+            Expr::Let(bindings, body) => {
+                let binding_strs: Vec<String> = bindings.iter()
+                    .map(|(n, e)| format!("({} {})", n, e.to_smtlib()))
+                    .collect();
+                format!("(let ({}) {})", binding_strs.join(" "), body.to_smtlib())
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMT CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SMT solver context
+pub struct SmtContext {
+    /// Declared sorts
+    sorts: Vec<(String, u32)>,
+    
+    /// Declared constants
+    constants: Vec<(String, Sort)>,
+    
+    /// Declared functions
+    functions: Vec<(String, Vec<Sort>, Sort)>,
+    
+    /// Assertions
+    assertions: Vec<Expr>,
+    
+    /// Logic setting
+    logic: Option<String>,
+    
+    /// Named assertions for unsat cores
+    named_assertions: Vec<(String, Expr)>,
+}
+
+impl SmtContext {
+    pub fn new() -> Self {
+        SmtContext {
+            sorts: Vec::new(),
+            constants: Vec::new(),
+            functions: Vec::new(),
+            assertions: Vec::new(),
+            logic: None,
+            named_assertions: Vec::new(),
+        }
+    }
+    
+    /// Set logic
+    pub fn set_logic(&mut self, logic: impl Into<String>) {
+        self.logic = Some(logic.into());
+    }
+    
+    /// Declare uninterpreted sort
+    pub fn declare_sort(&mut self, name: impl Into<String>, arity: u32) {
+        self.sorts.push((name.into(), arity));
+    }
+    
+    /// Declare constant
+    pub fn declare_const(&mut self, name: impl Into<String>, sort: Sort) {
+        self.constants.push((name.into(), sort));
+    }
+    
+    /// Declare function
+    pub fn declare_fun(
+        &mut self,
+        name: impl Into<String>,
+        params: Vec<Sort>,
+        ret: Sort,
+    ) {
+        self.functions.push((name.into(), params, ret));
+    }
+    
+    /// Add assertion
+    pub fn assert(&mut self, expr: Expr) {
+        self.assertions.push(expr);
+    }
+    
+    /// Add named assertion (for unsat cores)
+    pub fn assert_named(&mut self, name: impl Into<String>, expr: Expr) {
+        self.named_assertions.push((name.into(), expr));
+    }
+    
+    /// Generate SMT-LIB2 script
+    pub fn to_smtlib(&self) -> String {
+        let mut script = String::new();
+        
+        // Logic
+        if let Some(ref logic) = self.logic {
+            script.push_str(&format!("(set-logic {})\n", logic));
+        }
+        
+        // Sorts
+        for (name, arity) in &self.sorts {
+            script.push_str(&format!("(declare-sort {} {})\n", name, arity));
+        }
+        
+        // Constants
+        for (name, sort) in &self.constants {
+            script.push_str(&format!("(declare-const {} {})\n", name, sort.to_smtlib()));
+        }
+        
+        // Functions
+        for (name, params, ret) in &self.functions {
+            let param_sorts: Vec<String> = params.iter().map(|s| s.to_smtlib()).collect();
+            script.push_str(&format!(
+                "(declare-fun {} ({}) {})\n",
+                name,
+                param_sorts.join(" "),
+                ret.to_smtlib()
+            ));
+        }
+        
+        // Assertions
+        for expr in &self.assertions {
+            script.push_str(&format!("(assert {})\n", expr.to_smtlib()));
+        }
+        
+        // Named assertions
+        for (name, expr) in &self.named_assertions {
+            script.push_str(&format!(
+                "(assert (! {} :named {}))\n",
+                expr.to_smtlib(),
+                name
+            ));
+        }
+        
+        script
+    }
+    
+    /// Reset context
+    pub fn reset(&mut self) {
+        self.sorts.clear();
+        self.constants.clear();
+        self.functions.clear();
+        self.assertions.clear();
+        self.named_assertions.clear();
+    }
+}
+
+impl Default for SmtContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOLVER RESULT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Solver check result
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckResult {
+    /// Satisfiable (model exists)
+    Sat,
+    
+    /// Unsatisfiable (no model)
+    Unsat,
+    
+    /// Unknown (solver could not determine)
+    Unknown,
+}
+
+/// Model value
+#[derive(Debug, Clone)]
+pub enum Value {
+    Bool(bool),
+    Int(i64),
+    Real(String),
+    BitVec(u64, u32),
+    Array(BTreeMap<String, Value>, Box<Value>),
+}
+
+impl Value {
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+    
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+    
+    pub fn as_bv(&self) -> Option<(u64, u32)> {
+        match self {
+            Value::BitVec(v, w) => Some((*v, *w)),
+            _ => None,
+        }
+    }
+}
+
+/// Solver model (satisfying assignment)
+#[derive(Debug, Clone)]
+pub struct Model {
+    pub assignments: BTreeMap<String, Value>,
+}
+
+impl Model {
+    pub fn new() -> Self {
+        Model {
+            assignments: BTreeMap::new(),
+        }
+    }
+    
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.assignments.get(name)
+    }
+    
+    pub fn insert(&mut self, name: impl Into<String>, value: Value) {
+        self.assignments.insert(name.into(), value);
+    }
+}
+
+impl Default for Model {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Unsat core (minimal set of conflicting assertions)
+#[derive(Debug, Clone)]
+pub struct UnsatCore {
+    pub assertions: Vec<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOLVER INTERFACE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SMT solver trait
+pub trait SmtSolver: Send + Sync {
+    /// Check satisfiability
+    fn check(&mut self, ctx: &SmtContext) -> Result<CheckResult, SolverError>;
+    
+    /// Get model (after sat result)
+    fn get_model(&mut self) -> Result<Model, SolverError>;
+    
+    /// Get unsat core (after unsat result)
+    fn get_unsat_core(&mut self) -> Result<UnsatCore, SolverError>;
+    
+    /// Set timeout
+    fn set_timeout(&mut self, timeout: Duration);
+    
+    /// Reset solver
+    fn reset(&mut self);
+    
+    /// Get solver name
+    fn name(&self) -> &str;
+}
+
+/// Solver configuration
+#[derive(Debug, Clone)]
+pub struct SolverConfig {
+    /// Solver path
+    pub path: PathBuf,
+    
+    /// Timeout
+    pub timeout: Duration,
+    
+    /// Produce models
+    pub produce_models: bool,
+    
+    /// Produce unsat cores
+    pub produce_unsat_cores: bool,
+    
+    /// Additional arguments
+    pub args: Vec<String>,
+}
+
+impl Default for SolverConfig {
+    fn default() -> Self {
+        SolverConfig {
+            path: PathBuf::from("z3"),
+            timeout: Duration::from_secs(60),
+            produce_models: true,
+            produce_unsat_cores: false,
+            args: Vec::new(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Z3 SOLVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Z3 solver implementation
+pub struct Z3Solver {
+    config: SolverConfig,
+    last_output: String,
+}
+
+impl Z3Solver {
+    pub fn new(config: SolverConfig) -> Self {
+        Z3Solver {
+            config,
+            last_output: String::new(),
+        }
+    }
+    
+    fn run_z3(&mut self, script: &str) -> Result<String, SolverError> {
+        let mut cmd = Command::new(&self.config.path);
+        cmd.arg("-smt2")
+            .arg("-in")
+            .arg(format!("-T:{}", self.config.timeout.as_secs()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        
+        for arg in &self.config.args {
+            cmd.arg(arg);
+        }
+        
+        let mut child = cmd.spawn()
+            .map_err(|e| SolverError::SpawnFailed(e.to_string()))?;
+        
+        // Write script to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(script.as_bytes())
+                .map_err(|e| SolverError::IoError(e.to_string()))?;
+        }
+        
+        let output = child.wait_with_output()
+            .map_err(|e| SolverError::IoError(e.to_string()))?;
+        
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        
+        if !stderr.is_empty() && !stderr.contains("WARNING") {
+            return Err(SolverError::SolverError(stderr));
+        }
+        
+        self.last_output = stdout.clone();
+        Ok(stdout)
+    }
+    
+    fn parse_check_result(&self, output: &str) -> CheckResult {
+        let first_line = output.lines().next().unwrap_or("");
+        match first_line.trim() {
+            "sat" => CheckResult::Sat,
+            "unsat" => CheckResult::Unsat,
+            _ => CheckResult::Unknown,
+        }
+    }
+    
+    fn parse_model(&self, output: &str) -> Result<Model, SolverError> {
+        let mut model = Model::new();
+        
+        // Simple S-expression parsing for model
+        // Format: (model (define-fun name () Sort value))
+        for line in output.lines() {
+            if line.contains("define-fun") {
+                // Parse function definition
+                // This is simplified; real implementation needs proper S-expr parsing
+                if let Some((name, value)) = self.parse_define_fun(line) {
+                    model.insert(name, value);
+                }
+            }
+        }
+        
+        Ok(model)
+    }
+    
+    fn parse_define_fun(&self, line: &str) -> Option<(String, Value)> {
+        // Very simplified parsing
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 5 {
+            let name = parts[1].trim_matches(|c| c == '(' || c == ')');
+            let value_str = parts.last()?.trim_matches(')');
+            
+            let value = if value_str == "true" {
+                Value::Bool(true)
+            } else if value_str == "false" {
+                Value::Bool(false)
+            } else if let Ok(n) = value_str.parse::<i64>() {
+                Value::Int(n)
+            } else if value_str.starts_with("#x") {
+                let hex = &value_str[2..];
+                if let Ok(v) = u64::from_str_radix(hex, 16) {
+                    Value::BitVec(v, (hex.len() * 4) as u32)
+                } else {
+                    return None;
+                }
+            } else if value_str.starts_with("#b") {
+                let bin = &value_str[2..];
+                if let Ok(v) = u64::from_str_radix(bin, 2) {
+                    Value::BitVec(v, bin.len() as u32)
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            };
+            
+            return Some((name.to_string(), value));
+        }
+        None
+    }
+}
+
+impl SmtSolver for Z3Solver {
+    fn check(&mut self, ctx: &SmtContext) -> Result<CheckResult, SolverError> {
+        let mut script = ctx.to_smtlib();
+        
+        if self.config.produce_models {
+            script = format!("(set-option :produce-models true)\n{}", script);
+        }
+        
+        if self.config.produce_unsat_cores {
+            script = format!("(set-option :produce-unsat-cores true)\n{}", script);
+        }
+        
+        script.push_str("(check-sat)\n");
+        
+        if self.config.produce_models {
+            script.push_str("(get-model)\n");
+        }
+        
+        let output = self.run_z3(&script)?;
+        Ok(self.parse_check_result(&output))
+    }
+    
+    fn get_model(&mut self) -> Result<Model, SolverError> {
+        self.parse_model(&self.last_output)
+    }
+    
+    fn get_unsat_core(&mut self) -> Result<UnsatCore, SolverError> {
+        // Parse unsat core from output
+        let mut core = UnsatCore {
+            assertions: Vec::new(),
+        };
+        
+        for line in self.last_output.lines() {
+            if line.starts_with('(') && !line.contains("error") {
+                let names: Vec<&str> = line.trim_matches(|c| c == '(' || c == ')')
+                    .split_whitespace()
+                    .collect();
+                core.assertions = names.iter().map(|s| s.to_string()).collect();
+            }
+        }
+        
+        Ok(core)
+    }
+    
+    fn set_timeout(&mut self, timeout: Duration) {
+        self.config.timeout = timeout;
+    }
+    
+    fn reset(&mut self) {
+        self.last_output.clear();
+    }
+    
+    fn name(&self) -> &str {
+        "Z3"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum SolverError {
+    SpawnFailed(String),
+    IoError(String),
+    ParseError(String),
+    SolverError(String),
+    Timeout,
+    Unsupported(String),
+}
+
+impl std::fmt::Display for SolverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SpawnFailed(m) => write!(f, "failed to spawn solver: {}", m),
+            Self::IoError(m) => write!(f, "I/O error: {}", m),
+            Self::ParseError(m) => write!(f, "parse error: {}", m),
+            Self::SolverError(m) => write!(f, "solver error: {}", m),
+            Self::Timeout => write!(f, "solver timeout"),
+            Self::Unsupported(m) => write!(f, "unsupported: {}", m),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_sort_smtlib() {
+        assert_eq!(Sort::Bool.to_smtlib(), "Bool");
+        assert_eq!(Sort::Int.to_smtlib(), "Int");
+        assert_eq!(Sort::bv(32).to_smtlib(), "(_ BitVec 32)");
+        assert_eq!(
+            Sort::array(Sort::Int, Sort::Bool).to_smtlib(),
+            "(Array Int Bool)"
+        );
+    }
+    
+    #[test]
+    fn test_expr_smtlib() {
+        let x = Expr::var("x", Sort::Int);
+        let y = Expr::var("y", Sort::Int);
+        
+        let expr = Expr::and(vec![
+            Expr::gt(x.clone(), Expr::int_const(0)),
+            Expr::lt(y.clone(), Expr::int_const(10)),
+        ]);
+        
+        assert_eq!(expr.to_smtlib(), "(and (> x 0) (< y 10))");
+    }
+    
+    #[test]
+    fn test_context_smtlib() {
+        let mut ctx = SmtContext::new();
+        ctx.set_logic("QF_LIA");
+        ctx.declare_const("x", Sort::Int);
+        ctx.declare_const("y", Sort::Int);
+        ctx.assert(Expr::lt(
+            Expr::var("x", Sort::Int),
+            Expr::var("y", Sort::Int),
+        ));
+        
+        let script = ctx.to_smtlib();
+        assert!(script.contains("(set-logic QF_LIA)"));
+        assert!(script.contains("(declare-const x Int)"));
+        assert!(script.contains("(assert (< x y))"));
+    }
+    
+    #[test]
+    fn test_bitvector_expr() {
+        let bv = Expr::bv_const(0xFF, 8);
+        assert_eq!(bv.to_smtlib(), "(_ bv255 8)");
+        
+        let a = Expr::var("a", Sort::bv(32));
+        let b = Expr::var("b", Sort::bv(32));
+        let expr = Expr::bv_add(a, b);
+        assert_eq!(expr.to_smtlib(), "(bvadd a b)");
+    }
+    
+    #[test]
+    fn test_quantifier_expr() {
+        let body = Expr::gt(
+            Expr::var("x", Sort::Int),
+            Expr::int_const(0),
+        );
+        let forall = Expr::forall(vec![("x".to_string(), Sort::Int)], body);
+        
+        assert_eq!(forall.to_smtlib(), "(forall ((x Int)) (> x 0))");
+    }
+}

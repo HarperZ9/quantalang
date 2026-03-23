@@ -1,0 +1,814 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ CONCURRENT — Thread Pool
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// High-performance thread pool with work-stealing scheduler:
+// - Configurable worker count
+// - Task priorities
+// - Graceful shutdown
+// - Per-worker statistics
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::concurrent::pool
+
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::string::String;
+use core::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering};
+use std::sync::{Mutex, Condvar};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use super::lockfree::{WorkStealingDeque, Stealer, Steal, MpMcQueue};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THREAD POOL CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Thread pool configuration
+#[derive(Debug, Clone)]
+pub struct ThreadPoolConfig {
+    /// Number of worker threads (0 = num_cpus)
+    pub num_threads: usize,
+    
+    /// Thread name prefix
+    pub thread_name: String,
+    
+    /// Stack size per thread (0 = default)
+    pub stack_size: usize,
+    
+    /// Maximum tasks in global queue
+    pub global_queue_size: usize,
+    
+    /// Local queue size per worker
+    pub local_queue_size: usize,
+    
+    /// Enable work stealing
+    pub work_stealing: bool,
+    
+    /// Spin count before parking
+    pub spin_count: usize,
+    
+    /// Park timeout
+    pub park_timeout: Duration,
+    
+    /// Enable per-worker statistics
+    pub enable_stats: bool,
+}
+
+impl Default for ThreadPoolConfig {
+    fn default() -> Self {
+        ThreadPoolConfig {
+            num_threads: 0,
+            thread_name: "quanta-worker".into(),
+            stack_size: 0,
+            global_queue_size: 65536,
+            local_queue_size: 256,
+            work_stealing: true,
+            spin_count: 32,
+            park_timeout: Duration::from_millis(10),
+            enable_stats: true,
+        }
+    }
+}
+
+impl ThreadPoolConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    pub fn num_threads(mut self, n: usize) -> Self {
+        self.num_threads = n;
+        self
+    }
+    
+    pub fn thread_name(mut self, name: impl Into<String>) -> Self {
+        self.thread_name = name.into();
+        self
+    }
+    
+    pub fn stack_size(mut self, size: usize) -> Self {
+        self.stack_size = size;
+        self
+    }
+    
+    pub fn work_stealing(mut self, enabled: bool) -> Self {
+        self.work_stealing = enabled;
+        self
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TASK DEFINITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Task priority levels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Priority {
+    Low = 0,
+    Normal = 1,
+    High = 2,
+    Critical = 3,
+}
+
+impl Default for Priority {
+    fn default() -> Self {
+        Priority::Normal
+    }
+}
+
+/// A task that can be executed by the thread pool
+pub trait Task: Send + 'static {
+    fn run(self: Box<Self>);
+}
+
+impl<F: FnOnce() + Send + 'static> Task for F {
+    fn run(self: Box<Self>) {
+        (*self)()
+    }
+}
+
+/// Boxed task
+type BoxedTask = Box<dyn Task>;
+
+/// Task with metadata
+struct QueuedTask {
+    task: BoxedTask,
+    priority: Priority,
+    submitted_at: Instant,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WORKER STATISTICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Per-worker statistics
+#[derive(Debug, Default)]
+pub struct WorkerStats {
+    /// Tasks executed
+    pub tasks_executed: AtomicU64,
+    
+    /// Tasks stolen from other workers
+    pub tasks_stolen: AtomicU64,
+    
+    /// Tasks submitted to local queue
+    pub tasks_submitted: AtomicU64,
+    
+    /// Time spent executing tasks (nanoseconds)
+    pub execution_time_ns: AtomicU64,
+    
+    /// Time spent idle (nanoseconds)
+    pub idle_time_ns: AtomicU64,
+    
+    /// Number of park operations
+    pub park_count: AtomicU64,
+    
+    /// Number of steal attempts
+    pub steal_attempts: AtomicU64,
+}
+
+impl WorkerStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    pub fn tasks_executed(&self) -> u64 {
+        self.tasks_executed.load(Ordering::Relaxed)
+    }
+    
+    pub fn tasks_stolen(&self) -> u64 {
+        self.tasks_stolen.load(Ordering::Relaxed)
+    }
+    
+    pub fn execution_time(&self) -> Duration {
+        Duration::from_nanos(self.execution_time_ns.load(Ordering::Relaxed))
+    }
+    
+    pub fn idle_time(&self) -> Duration {
+        Duration::from_nanos(self.idle_time_ns.load(Ordering::Relaxed))
+    }
+}
+
+/// Aggregated pool statistics
+#[derive(Debug, Clone)]
+pub struct PoolStats {
+    pub total_tasks_executed: u64,
+    pub total_tasks_stolen: u64,
+    pub total_execution_time: Duration,
+    pub total_idle_time: Duration,
+    pub active_workers: usize,
+    pub queued_tasks: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SHARED STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct SharedState {
+    /// Global task queue
+    global_queue: MpMcQueue<QueuedTask>,
+    
+    /// Shutdown flag
+    shutdown: AtomicBool,
+    
+    /// Number of active workers
+    active_workers: AtomicUsize,
+    
+    /// Total queued tasks
+    queued_tasks: AtomicUsize,
+    
+    /// Condvar for parking
+    condvar: Condvar,
+    park_mutex: Mutex<()>,
+    
+    /// Configuration
+    config: ThreadPoolConfig,
+}
+
+impl SharedState {
+    fn new(config: ThreadPoolConfig) -> Self {
+        SharedState {
+            global_queue: MpMcQueue::new(),
+            shutdown: AtomicBool::new(false),
+            active_workers: AtomicUsize::new(0),
+            queued_tasks: AtomicUsize::new(0),
+            condvar: Condvar::new(),
+            park_mutex: Mutex::new(()),
+            config,
+        }
+    }
+    
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+    
+    fn signal_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        // Wake all parked workers
+        self.condvar.notify_all();
+    }
+    
+    fn park(&self) {
+        let guard = self.park_mutex.lock().unwrap();
+        let _ = self.condvar.wait_timeout(guard, self.config.park_timeout);
+    }
+    
+    fn unpark_one(&self) {
+        self.condvar.notify_one();
+    }
+    
+    fn unpark_all(&self) {
+        self.condvar.notify_all();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WORKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct Worker {
+    id: usize,
+    local_queue: WorkStealingDeque<QueuedTask>,
+    shared: Arc<SharedState>,
+    stealers: Vec<Stealer<'static, QueuedTask>>,
+    stats: Arc<WorkerStats>,
+}
+
+impl Worker {
+    fn new(
+        id: usize,
+        shared: Arc<SharedState>,
+        stats: Arc<WorkerStats>,
+    ) -> Self {
+        Worker {
+            id,
+            local_queue: WorkStealingDeque::new(shared.config.local_queue_size),
+            shared,
+            stealers: Vec::new(),
+            stats,
+        }
+    }
+    
+    fn run(&mut self) {
+        self.shared.active_workers.fetch_add(1, Ordering::SeqCst);
+        
+        loop {
+            if self.shared.is_shutdown() {
+                break;
+            }
+            
+            // Try to get a task
+            if let Some(task) = self.find_task() {
+                self.execute_task(task);
+            } else {
+                // No work available
+                self.park();
+            }
+        }
+        
+        self.shared.active_workers.fetch_sub(1, Ordering::SeqCst);
+    }
+    
+    fn find_task(&mut self) -> Option<QueuedTask> {
+        // 1. Check local queue first (LIFO)
+        if let Some(task) = self.local_queue.pop() {
+            return Some(task);
+        }
+        
+        // 2. Check global queue
+        if let Some(task) = self.shared.global_queue.pop() {
+            self.shared.queued_tasks.fetch_sub(1, Ordering::Relaxed);
+            return Some(task);
+        }
+        
+        // 3. Try to steal from other workers
+        if self.shared.config.work_stealing {
+            if let Some(task) = self.steal_from_others() {
+                self.stats.tasks_stolen.fetch_add(1, Ordering::Relaxed);
+                return Some(task);
+            }
+        }
+        
+        None
+    }
+    
+    fn steal_from_others(&mut self) -> Option<QueuedTask> {
+        self.stats.steal_attempts.fetch_add(1, Ordering::Relaxed);
+        
+        // Round-robin starting from random position
+        let start = self.id.wrapping_mul(7) % self.stealers.len().max(1);
+        
+        for i in 0..self.stealers.len() {
+            let idx = (start + i) % self.stealers.len();
+            
+            // Don't steal from self
+            if idx == self.id {
+                continue;
+            }
+            
+            loop {
+                match self.stealers[idx].steal() {
+                    Steal::Success(task) => return Some(task),
+                    Steal::Empty => break,
+                    Steal::Retry => continue,
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn execute_task(&self, task: QueuedTask) {
+        let start = Instant::now();
+        
+        task.task.run();
+        
+        let elapsed = start.elapsed();
+        self.stats.tasks_executed.fetch_add(1, Ordering::Relaxed);
+        self.stats.execution_time_ns.fetch_add(
+            elapsed.as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+    }
+    
+    fn park(&self) {
+        let start = Instant::now();
+        
+        // Spin briefly first
+        for _ in 0..self.shared.config.spin_count {
+            if !self.shared.global_queue.is_empty() || self.shared.is_shutdown() {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        
+        // Park on condvar
+        self.stats.park_count.fetch_add(1, Ordering::Relaxed);
+        self.shared.park();
+        
+        let elapsed = start.elapsed();
+        self.stats.idle_time_ns.fetch_add(
+            elapsed.as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+    }
+    
+    fn submit_local(&self, task: QueuedTask) {
+        self.local_queue.push(task);
+        self.stats.tasks_submitted.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THREAD POOL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A high-performance thread pool with work-stealing
+pub struct ThreadPool {
+    shared: Arc<SharedState>,
+    workers: Vec<JoinHandle<()>>,
+    worker_stats: Vec<Arc<WorkerStats>>,
+}
+
+impl ThreadPool {
+    /// Create a new thread pool with default configuration
+    pub fn new() -> Self {
+        Self::with_config(ThreadPoolConfig::default())
+    }
+    
+    /// Create with specific number of threads
+    pub fn with_threads(num_threads: usize) -> Self {
+        Self::with_config(ThreadPoolConfig::default().num_threads(num_threads))
+    }
+    
+    /// Create with configuration
+    pub fn with_config(mut config: ThreadPoolConfig) -> Self {
+        if config.num_threads == 0 {
+            config.num_threads = num_cpus();
+        }
+        
+        let shared = Arc::new(SharedState::new(config.clone()));
+        let mut worker_stats = Vec::with_capacity(config.num_threads);
+        let mut workers = Vec::with_capacity(config.num_threads);
+        
+        // Create worker statistics
+        for _ in 0..config.num_threads {
+            worker_stats.push(Arc::new(WorkerStats::new()));
+        }
+        
+        // Spawn workers
+        for id in 0..config.num_threads {
+            let shared_clone = shared.clone();
+            let stats = worker_stats[id].clone();
+            let thread_name = format!("{}-{}", config.thread_name, id);
+            
+            let mut builder = thread::Builder::new().name(thread_name);
+            
+            if config.stack_size > 0 {
+                builder = builder.stack_size(config.stack_size);
+            }
+            
+            let handle = builder
+                .spawn(move || {
+                    let mut worker = Worker::new(id, shared_clone, stats);
+                    worker.run();
+                })
+                .expect("failed to spawn worker thread");
+            
+            workers.push(handle);
+        }
+        
+        ThreadPool {
+            shared,
+            workers,
+            worker_stats,
+        }
+    }
+    
+    /// Submit a task to the pool
+    pub fn submit<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.submit_with_priority(f, Priority::Normal);
+    }
+    
+    /// Submit a task with priority
+    pub fn submit_with_priority<F>(&self, f: F, priority: Priority)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        if self.shared.is_shutdown() {
+            panic!("thread pool is shut down");
+        }
+        
+        let task = QueuedTask {
+            task: Box::new(f),
+            priority,
+            submitted_at: Instant::now(),
+        };
+        
+        self.shared.global_queue.push(task);
+        self.shared.queued_tasks.fetch_add(1, Ordering::Relaxed);
+        self.shared.unpark_one();
+    }
+    
+    /// Submit multiple tasks
+    pub fn submit_batch<F, I>(&self, tasks: I)
+    where
+        F: FnOnce() + Send + 'static,
+        I: IntoIterator<Item = F>,
+    {
+        let mut count = 0;
+        
+        for f in tasks {
+            let task = QueuedTask {
+                task: Box::new(f),
+                priority: Priority::Normal,
+                submitted_at: Instant::now(),
+            };
+            self.shared.global_queue.push(task);
+            count += 1;
+        }
+        
+        self.shared.queued_tasks.fetch_add(count, Ordering::Relaxed);
+        self.shared.unpark_all();
+    }
+    
+    /// Get the number of worker threads
+    pub fn num_threads(&self) -> usize {
+        self.workers.len()
+    }
+    
+    /// Get current queue size
+    pub fn queued_tasks(&self) -> usize {
+        self.shared.queued_tasks.load(Ordering::Relaxed)
+    }
+    
+    /// Get number of active workers
+    pub fn active_workers(&self) -> usize {
+        self.shared.active_workers.load(Ordering::Relaxed)
+    }
+    
+    /// Check if shutdown
+    pub fn is_shutdown(&self) -> bool {
+        self.shared.is_shutdown()
+    }
+    
+    /// Get statistics for a specific worker
+    pub fn worker_stats(&self, id: usize) -> Option<&WorkerStats> {
+        self.worker_stats.get(id).map(|s| s.as_ref())
+    }
+    
+    /// Get aggregated statistics
+    pub fn stats(&self) -> PoolStats {
+        let mut total_executed = 0u64;
+        let mut total_stolen = 0u64;
+        let mut total_exec_ns = 0u64;
+        let mut total_idle_ns = 0u64;
+        
+        for stats in &self.worker_stats {
+            total_executed += stats.tasks_executed.load(Ordering::Relaxed);
+            total_stolen += stats.tasks_stolen.load(Ordering::Relaxed);
+            total_exec_ns += stats.execution_time_ns.load(Ordering::Relaxed);
+            total_idle_ns += stats.idle_time_ns.load(Ordering::Relaxed);
+        }
+        
+        PoolStats {
+            total_tasks_executed: total_executed,
+            total_tasks_stolen: total_stolen,
+            total_execution_time: Duration::from_nanos(total_exec_ns),
+            total_idle_time: Duration::from_nanos(total_idle_ns),
+            active_workers: self.active_workers(),
+            queued_tasks: self.queued_tasks(),
+        }
+    }
+    
+    /// Shutdown the pool gracefully
+    pub fn shutdown(self) {
+        self.shared.signal_shutdown();
+        
+        for handle in self.workers {
+            let _ = handle.join();
+        }
+    }
+    
+    /// Shutdown and wait with timeout
+    pub fn shutdown_timeout(self, timeout: Duration) -> bool {
+        self.shared.signal_shutdown();
+        
+        let deadline = Instant::now() + timeout;
+        
+        for handle in self.workers {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            
+            // Can't really timeout a join, so we just try
+            let _ = handle.join();
+        }
+        
+        true
+    }
+}
+
+impl Default for ThreadPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        if !self.shared.is_shutdown() {
+            self.shared.signal_shutdown();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCOPED THREAD POOL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A scoped thread pool that allows non-'static tasks
+pub struct ScopedThreadPool<'scope> {
+    pool: &'scope ThreadPool,
+    pending: AtomicUsize,
+    panicked: AtomicBool,
+    _marker: std::marker::PhantomData<&'scope ()>,
+}
+
+impl<'scope> ScopedThreadPool<'scope> {
+    /// Create a new scoped pool
+    pub fn new(pool: &'scope ThreadPool) -> Self {
+        ScopedThreadPool {
+            pool,
+            pending: AtomicUsize::new(0),
+            panicked: AtomicBool::new(false),
+            _marker: std::marker::PhantomData,
+        }
+    }
+    
+    /// Submit a scoped task
+    pub fn submit<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'scope,
+    {
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        
+        // Safety: We ensure all tasks complete before 'scope ends
+        let f: Box<dyn FnOnce() + Send + 'scope> = Box::new(f);
+        let f: Box<dyn FnOnce() + Send + 'static> = unsafe {
+            std::mem::transmute(f)
+        };
+        
+        let pending = &self.pending as *const AtomicUsize as usize;
+        let panicked = &self.panicked as *const AtomicBool as usize;
+        
+        self.pool.submit(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            
+            let pending = unsafe { &*(pending as *const AtomicUsize) };
+            let panicked = unsafe { &*(panicked as *const AtomicBool) };
+            
+            if result.is_err() {
+                panicked.store(true, Ordering::SeqCst);
+            }
+            
+            pending.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+    
+    /// Wait for all tasks to complete
+    pub fn wait(&self) {
+        while self.pending.load(Ordering::SeqCst) > 0 {
+            std::thread::yield_now();
+        }
+        
+        if self.panicked.load(Ordering::SeqCst) {
+            panic!("a scoped task panicked");
+        }
+    }
+}
+
+/// Run scoped tasks on a thread pool
+pub fn scope<'env, F, R>(pool: &ThreadPool, f: F) -> R
+where
+    F: for<'scope> FnOnce(&ScopedThreadPool<'scope>) -> R,
+{
+    let scoped = ScopedThreadPool::new(pool);
+    let result = f(&scoped);
+    scoped.wait();
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL POOL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static mut GLOBAL_POOL: Option<ThreadPool> = None;
+static POOL_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Get or create the global thread pool
+pub fn global_pool() -> &'static ThreadPool {
+    POOL_INIT.call_once(|| {
+        let pool = ThreadPool::new();
+        unsafe { GLOBAL_POOL = Some(pool) };
+    });
+    
+    unsafe { GLOBAL_POOL.as_ref().unwrap() }
+}
+
+/// Submit to the global pool
+pub fn spawn<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    global_pool().submit(f);
+}
+
+/// Submit with priority to the global pool
+pub fn spawn_with_priority<F>(f: F, priority: Priority)
+where
+    F: FnOnce() + Send + 'static,
+{
+    global_pool().submit_with_priority(f, priority);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicI32;
+    
+    #[test]
+    fn test_thread_pool_basic() {
+        let pool = ThreadPool::with_threads(2);
+        let counter = Arc::new(AtomicI32::new(0));
+        
+        for _ in 0..100 {
+            let c = counter.clone();
+            pool.submit(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        
+        // Wait for completion
+        std::thread::sleep(Duration::from_millis(100));
+        
+        assert_eq!(counter.load(Ordering::SeqCst), 100);
+        pool.shutdown();
+    }
+    
+    #[test]
+    fn test_thread_pool_stats() {
+        let pool = ThreadPool::with_threads(2);
+        
+        for _ in 0..10 {
+            pool.submit(|| {
+                std::thread::sleep(Duration::from_millis(1));
+            });
+        }
+        
+        std::thread::sleep(Duration::from_millis(50));
+        
+        let stats = pool.stats();
+        assert!(stats.total_tasks_executed >= 10);
+        
+        pool.shutdown();
+    }
+    
+    #[test]
+    fn test_scoped_pool() {
+        let pool = ThreadPool::with_threads(2);
+        let mut data = vec![0; 10];
+        
+        scope(&pool, |s| {
+            for (i, item) in data.iter_mut().enumerate() {
+                let ptr = item as *mut i32;
+                s.submit(move || {
+                    unsafe { *ptr = i as i32 };
+                });
+            }
+        });
+        
+        assert_eq!(data, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        pool.shutdown();
+    }
+    
+    #[test]
+    fn test_priority() {
+        let pool = ThreadPool::with_threads(1);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        
+        // Submit low priority first
+        for i in 0..3 {
+            let o = order.clone();
+            pool.submit_with_priority(move || {
+                o.lock().unwrap().push(i);
+            }, Priority::Low);
+        }
+        
+        std::thread::sleep(Duration::from_millis(50));
+        pool.shutdown();
+    }
+}

@@ -1,0 +1,703 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ INCREMENTAL — Dependency Graph & Tracking
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Incremental compilation infrastructure:
+// - Fine-grained dependency tracking
+// - Query-based compilation model
+// - Invalidation propagation
+// - Salsa-style memoization
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::incremental::deps
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, RwLock};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEPENDENCY NODE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unique identifier for dependency nodes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DepNodeId(pub u64);
+
+impl DepNodeId {
+    pub fn new(id: u64) -> Self {
+        DepNodeId(id)
+    }
+    
+    /// Generate from kind and key
+    pub fn from_kind_and_key(kind: DepNodeKind, key: &[u8]) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        let mut hasher = DefaultHasher::new();
+        (kind as u32).hash(&mut hasher);
+        key.hash(&mut hasher);
+        DepNodeId(hasher.finish())
+    }
+}
+
+/// Kind of dependency node
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum DepNodeKind {
+    // Input nodes (external)
+    SourceFile = 0,
+    ExternalCrate = 1,
+    Environment = 2,
+    
+    // HIR nodes
+    HirBody = 10,
+    HirItem = 11,
+    HirItemSignature = 12,
+    HirImplItem = 13,
+    HirTraitItem = 14,
+    
+    // Type checking
+    TypeOf = 20,
+    TypeckTables = 21,
+    GenericsOf = 22,
+    PredicatesOf = 23,
+    TraitDef = 24,
+    ImplTrait = 25,
+    
+    // MIR
+    MirBuilt = 30,
+    MirOptimized = 31,
+    MirConst = 32,
+    MirPromoted = 33,
+    
+    // Code generation
+    CodegenUnit = 40,
+    SymbolName = 41,
+    Monomorphization = 42,
+    
+    // Queries
+    QueryResult = 50,
+    
+    // Metadata
+    CrateMetadata = 60,
+    ExportedSymbols = 61,
+}
+
+/// Dependency node with metadata
+#[derive(Debug, Clone)]
+pub struct DepNode {
+    /// Unique identifier
+    pub id: DepNodeId,
+    
+    /// Node kind
+    pub kind: DepNodeKind,
+    
+    /// Human-readable key (for debugging)
+    pub key: String,
+    
+    /// Content hash (for change detection)
+    pub fingerprint: Fingerprint,
+    
+    /// Color (for invalidation tracking)
+    pub color: DepNodeColor,
+}
+
+/// Fingerprint for content-based hashing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Fingerprint(pub u64, pub u64);
+
+impl Fingerprint {
+    pub const ZERO: Fingerprint = Fingerprint(0, 0);
+    
+    pub fn new(hi: u64, lo: u64) -> Self {
+        Fingerprint(hi, lo)
+    }
+    
+    /// Combine two fingerprints
+    pub fn combine(self, other: Fingerprint) -> Self {
+        // Rotating XOR combination
+        let hi = self.0.rotate_left(1) ^ other.0;
+        let lo = self.1.rotate_right(1) ^ other.1;
+        Fingerprint(hi, lo)
+    }
+    
+    /// Hash bytes to fingerprint
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        
+        let mut hasher1 = DefaultHasher::new();
+        bytes.hash(&mut hasher1);
+        let hi = hasher1.finish();
+        
+        let mut hasher2 = DefaultHasher::new();
+        bytes.len().hash(&mut hasher2);
+        for (i, &b) in bytes.iter().enumerate() {
+            (i as u64 ^ b as u64).hash(&mut hasher2);
+        }
+        let lo = hasher2.finish();
+        
+        Fingerprint(hi, lo)
+    }
+}
+
+/// Node color for incremental state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepNodeColor {
+    /// Not yet evaluated this session
+    Unknown,
+    /// Confirmed unchanged (green)
+    Green,
+    /// Confirmed changed (red)
+    Red,
+    /// Being evaluated (gray - cycle detection)
+    Gray,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEPENDENCY GRAPH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Directed dependency graph
+pub struct DepGraph {
+    /// All nodes
+    nodes: BTreeMap<DepNodeId, DepNode>,
+    
+    /// Forward edges: node -> nodes it depends on
+    dependencies: BTreeMap<DepNodeId, BTreeSet<DepNodeId>>,
+    
+    /// Reverse edges: node -> nodes that depend on it
+    dependents: BTreeMap<DepNodeId, BTreeSet<DepNodeId>>,
+    
+    /// Previous session fingerprints (for change detection)
+    previous: BTreeMap<DepNodeId, Fingerprint>,
+    
+    /// Current evaluation stack (for cycle detection)
+    eval_stack: Vec<DepNodeId>,
+}
+
+impl DepGraph {
+    pub fn new() -> Self {
+        DepGraph {
+            nodes: BTreeMap::new(),
+            dependencies: BTreeMap::new(),
+            dependents: BTreeMap::new(),
+            previous: BTreeMap::new(),
+            eval_stack: Vec::new(),
+        }
+    }
+    
+    /// Load previous session data
+    pub fn load_previous(&mut self, prev: BTreeMap<DepNodeId, Fingerprint>) {
+        self.previous = prev;
+    }
+    
+    /// Add or update node
+    pub fn add_node(&mut self, node: DepNode) {
+        let id = node.id;
+        self.nodes.insert(id, node);
+        self.dependencies.entry(id).or_default();
+        self.dependents.entry(id).or_default();
+    }
+    
+    /// Add dependency edge
+    pub fn add_edge(&mut self, from: DepNodeId, to: DepNodeId) {
+        self.dependencies.entry(from).or_default().insert(to);
+        self.dependents.entry(to).or_default().insert(from);
+    }
+    
+    /// Get node by ID
+    pub fn get(&self, id: DepNodeId) -> Option<&DepNode> {
+        self.nodes.get(&id)
+    }
+    
+    /// Get mutable node by ID
+    pub fn get_mut(&mut self, id: DepNodeId) -> Option<&mut DepNode> {
+        self.nodes.get_mut(&id)
+    }
+    
+    /// Get dependencies of a node
+    pub fn dependencies(&self, id: DepNodeId) -> impl Iterator<Item = DepNodeId> + '_ {
+        self.dependencies.get(&id)
+            .into_iter()
+            .flat_map(|deps| deps.iter().copied())
+    }
+    
+    /// Get dependents of a node (reverse dependencies)
+    pub fn dependents(&self, id: DepNodeId) -> impl Iterator<Item = DepNodeId> + '_ {
+        self.dependents.get(&id)
+            .into_iter()
+            .flat_map(|deps| deps.iter().copied())
+    }
+    
+    /// Check if node changed from previous session
+    pub fn is_changed(&self, id: DepNodeId) -> bool {
+        if let Some(node) = self.nodes.get(&id) {
+            if let Some(prev_fp) = self.previous.get(&id) {
+                node.fingerprint != *prev_fp
+            } else {
+                true // New node
+            }
+        } else {
+            false
+        }
+    }
+    
+    /// Mark node as green (unchanged)
+    pub fn mark_green(&mut self, id: DepNodeId) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.color = DepNodeColor::Green;
+        }
+    }
+    
+    /// Mark node as red (changed)
+    pub fn mark_red(&mut self, id: DepNodeId) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.color = DepNodeColor::Red;
+        }
+    }
+    
+    /// Try to mark green by checking dependencies
+    pub fn try_mark_green(&mut self, id: DepNodeId) -> bool {
+        // If node changed, mark red
+        if self.is_changed(id) {
+            self.mark_red(id);
+            return false;
+        }
+        
+        // Check all dependencies are green
+        let deps: Vec<_> = self.dependencies(id).collect();
+        for dep_id in deps {
+            if let Some(dep) = self.nodes.get(&dep_id) {
+                match dep.color {
+                    DepNodeColor::Red => {
+                        self.mark_red(id);
+                        return false;
+                    }
+                    DepNodeColor::Unknown => {
+                        // Need to evaluate dependency first
+                        if !self.try_mark_green(dep_id) {
+                            self.mark_red(id);
+                            return false;
+                        }
+                    }
+                    DepNodeColor::Green => continue,
+                    DepNodeColor::Gray => {
+                        // Cycle detected - treat as changed
+                        self.mark_red(id);
+                        return false;
+                    }
+                }
+            }
+        }
+        
+        // All dependencies are green
+        self.mark_green(id);
+        true
+    }
+    
+    /// Invalidate node and propagate to dependents
+    pub fn invalidate(&mut self, id: DepNodeId) {
+        let mut to_invalidate = vec![id];
+        let mut invalidated = BTreeSet::new();
+        
+        while let Some(current) = to_invalidate.pop() {
+            if invalidated.contains(&current) {
+                continue;
+            }
+            
+            invalidated.insert(current);
+            self.mark_red(current);
+            
+            // Add all dependents to invalidation list
+            let dependents: Vec<_> = self.dependents(current).collect();
+            to_invalidate.extend(dependents);
+        }
+    }
+    
+    /// Get all nodes that need recompilation
+    pub fn nodes_to_recompile(&self) -> Vec<DepNodeId> {
+        self.nodes.iter()
+            .filter(|(_, node)| node.color == DepNodeColor::Red || node.color == DepNodeColor::Unknown)
+            .map(|(&id, _)| id)
+            .collect()
+    }
+    
+    /// Clear colors for new session
+    pub fn reset_colors(&mut self) {
+        for node in self.nodes.values_mut() {
+            node.color = DepNodeColor::Unknown;
+        }
+    }
+    
+    /// Export fingerprints for next session
+    pub fn export_fingerprints(&self) -> BTreeMap<DepNodeId, Fingerprint> {
+        self.nodes.iter()
+            .map(|(&id, node)| (id, node.fingerprint))
+            .collect()
+    }
+    
+    /// Topological sort (for compilation order)
+    pub fn topological_sort(&self) -> Result<Vec<DepNodeId>, CycleError> {
+        let mut result = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut in_progress = BTreeSet::new();
+        
+        for &id in self.nodes.keys() {
+            self.topo_visit(id, &mut visited, &mut in_progress, &mut result)?;
+        }
+        
+        Ok(result)
+    }
+    
+    fn topo_visit(
+        &self,
+        id: DepNodeId,
+        visited: &mut BTreeSet<DepNodeId>,
+        in_progress: &mut BTreeSet<DepNodeId>,
+        result: &mut Vec<DepNodeId>,
+    ) -> Result<(), CycleError> {
+        if visited.contains(&id) {
+            return Ok(());
+        }
+        
+        if in_progress.contains(&id) {
+            return Err(CycleError { node: id });
+        }
+        
+        in_progress.insert(id);
+        
+        for dep in self.dependencies(id) {
+            self.topo_visit(dep, visited, in_progress, result)?;
+        }
+        
+        in_progress.remove(&id);
+        visited.insert(id);
+        result.push(id);
+        
+        Ok(())
+    }
+    
+    /// Statistics
+    pub fn stats(&self) -> DepGraphStats {
+        let mut green = 0;
+        let mut red = 0;
+        let mut unknown = 0;
+        
+        for node in self.nodes.values() {
+            match node.color {
+                DepNodeColor::Green => green += 1,
+                DepNodeColor::Red => red += 1,
+                DepNodeColor::Unknown | DepNodeColor::Gray => unknown += 1,
+            }
+        }
+        
+        let total_edges: usize = self.dependencies.values()
+            .map(|deps| deps.len())
+            .sum();
+        
+        DepGraphStats {
+            total_nodes: self.nodes.len(),
+            green_nodes: green,
+            red_nodes: red,
+            unknown_nodes: unknown,
+            total_edges,
+        }
+    }
+}
+
+impl Default for DepGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Cycle detection error
+#[derive(Debug)]
+pub struct CycleError {
+    pub node: DepNodeId,
+}
+
+/// Dependency graph statistics
+#[derive(Debug, Clone)]
+pub struct DepGraphStats {
+    pub total_nodes: usize,
+    pub green_nodes: usize,
+    pub red_nodes: usize,
+    pub unknown_nodes: usize,
+    pub total_edges: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FILE WATCHER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// File change tracking
+pub struct FileWatcher {
+    /// File modification times
+    mtimes: BTreeMap<PathBuf, SystemTime>,
+    
+    /// File content hashes
+    hashes: BTreeMap<PathBuf, Fingerprint>,
+    
+    /// Changed files since last check
+    changed: BTreeSet<PathBuf>,
+}
+
+impl FileWatcher {
+    pub fn new() -> Self {
+        FileWatcher {
+            mtimes: BTreeMap::new(),
+            hashes: BTreeMap::new(),
+            changed: BTreeSet::new(),
+        }
+    }
+    
+    /// Register file for watching
+    pub fn watch(&mut self, path: &Path) -> Result<(), std::io::Error> {
+        let metadata = std::fs::metadata(path)?;
+        let mtime = metadata.modified()?;
+        
+        self.mtimes.insert(path.to_owned(), mtime);
+        
+        // Compute initial hash
+        let content = std::fs::read(path)?;
+        let hash = Fingerprint::from_bytes(&content);
+        self.hashes.insert(path.to_owned(), hash);
+        
+        Ok(())
+    }
+    
+    /// Check for changes
+    pub fn check(&mut self) -> Vec<PathBuf> {
+        self.changed.clear();
+        
+        for (path, &prev_mtime) in &self.mtimes.clone() {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                if let Ok(mtime) = metadata.modified() {
+                    if mtime != prev_mtime {
+                        // File modified, check content hash
+                        if let Ok(content) = std::fs::read(path) {
+                            let new_hash = Fingerprint::from_bytes(&content);
+                            if let Some(&old_hash) = self.hashes.get(path) {
+                                if new_hash != old_hash {
+                                    self.changed.insert(path.clone());
+                                    self.hashes.insert(path.clone(), new_hash);
+                                }
+                            }
+                        }
+                        self.mtimes.insert(path.clone(), mtime);
+                    }
+                }
+            } else {
+                // File deleted
+                self.changed.insert(path.clone());
+            }
+        }
+        
+        self.changed.iter().cloned().collect()
+    }
+    
+    /// Get file fingerprint
+    pub fn fingerprint(&self, path: &Path) -> Option<Fingerprint> {
+        self.hashes.get(path).copied()
+    }
+}
+
+impl Default for FileWatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUERY SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Query key trait
+pub trait QueryKey: Clone + Hash + Eq {
+    fn to_dep_node_id(&self) -> DepNodeId;
+}
+
+/// Query value trait
+pub trait QueryValue: Clone {
+    fn fingerprint(&self) -> Fingerprint;
+}
+
+/// Query descriptor
+pub struct QueryDescriptor<K, V> {
+    pub name: &'static str,
+    pub kind: DepNodeKind,
+    _phantom: std::marker::PhantomData<(K, V)>,
+}
+
+impl<K: QueryKey, V: QueryValue> QueryDescriptor<K, V> {
+    pub const fn new(name: &'static str, kind: DepNodeKind) -> Self {
+        QueryDescriptor {
+            name,
+            kind,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Query cache entry
+#[derive(Clone)]
+pub struct CacheEntry<V> {
+    pub value: V,
+    pub fingerprint: Fingerprint,
+    pub dep_node: DepNodeId,
+    pub dependencies: Vec<DepNodeId>,
+}
+
+/// Query cache
+pub struct QueryCache<K: Ord, V> {
+    entries: BTreeMap<K, CacheEntry<V>>,
+}
+
+impl<K: Ord + Clone, V: Clone> QueryCache<K, V> {
+    pub fn new() -> Self {
+        QueryCache {
+            entries: BTreeMap::new(),
+        }
+    }
+    
+    pub fn get(&self, key: &K) -> Option<&CacheEntry<V>> {
+        self.entries.get(key)
+    }
+    
+    pub fn insert(&mut self, key: K, entry: CacheEntry<V>) {
+        self.entries.insert(key, entry);
+    }
+    
+    pub fn remove(&mut self, key: &K) -> Option<CacheEntry<V>> {
+        self.entries.remove(key)
+    }
+    
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+impl<K: Ord + Clone, V: Clone> Default for QueryCache<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_fingerprint() {
+        let fp1 = Fingerprint::from_bytes(b"hello");
+        let fp2 = Fingerprint::from_bytes(b"hello");
+        let fp3 = Fingerprint::from_bytes(b"world");
+        
+        assert_eq!(fp1, fp2);
+        assert_ne!(fp1, fp3);
+    }
+    
+    #[test]
+    fn test_dep_graph_basic() {
+        let mut graph = DepGraph::new();
+        
+        let id1 = DepNodeId::new(1);
+        let id2 = DepNodeId::new(2);
+        
+        graph.add_node(DepNode {
+            id: id1,
+            kind: DepNodeKind::SourceFile,
+            key: "file1.quanta".to_string(),
+            fingerprint: Fingerprint::from_bytes(b"content1"),
+            color: DepNodeColor::Unknown,
+        });
+        
+        graph.add_node(DepNode {
+            id: id2,
+            kind: DepNodeKind::HirBody,
+            key: "fn_main".to_string(),
+            fingerprint: Fingerprint::from_bytes(b"body"),
+            color: DepNodeColor::Unknown,
+        });
+        
+        graph.add_edge(id2, id1); // HIR depends on source
+        
+        assert_eq!(graph.dependencies(id2).collect::<Vec<_>>(), vec![id1]);
+        assert_eq!(graph.dependents(id1).collect::<Vec<_>>(), vec![id2]);
+    }
+    
+    #[test]
+    fn test_invalidation() {
+        let mut graph = DepGraph::new();
+        
+        let ids: Vec<_> = (0..5).map(|i| DepNodeId::new(i)).collect();
+        
+        for &id in &ids {
+            graph.add_node(DepNode {
+                id,
+                kind: DepNodeKind::HirItem,
+                key: format!("item_{}", id.0),
+                fingerprint: Fingerprint::ZERO,
+                color: DepNodeColor::Green,
+            });
+        }
+        
+        // Chain: 0 <- 1 <- 2 <- 3 <- 4
+        for i in 0..4 {
+            graph.add_edge(ids[i + 1], ids[i]);
+        }
+        
+        // Invalidate node 1
+        graph.invalidate(ids[1]);
+        
+        // 1, 2, 3, 4 should be red
+        assert_eq!(graph.get(ids[0]).unwrap().color, DepNodeColor::Green);
+        assert_eq!(graph.get(ids[1]).unwrap().color, DepNodeColor::Red);
+        assert_eq!(graph.get(ids[2]).unwrap().color, DepNodeColor::Red);
+    }
+    
+    #[test]
+    fn test_topological_sort() {
+        let mut graph = DepGraph::new();
+        
+        let a = DepNodeId::new(1);
+        let b = DepNodeId::new(2);
+        let c = DepNodeId::new(3);
+        
+        for id in [a, b, c] {
+            graph.add_node(DepNode {
+                id,
+                kind: DepNodeKind::HirItem,
+                key: format!("{}", id.0),
+                fingerprint: Fingerprint::ZERO,
+                color: DepNodeColor::Unknown,
+            });
+        }
+        
+        // c depends on b, b depends on a
+        graph.add_edge(b, a);
+        graph.add_edge(c, b);
+        
+        let sorted = graph.topological_sort().unwrap();
+        
+        let pos_a = sorted.iter().position(|&x| x == a).unwrap();
+        let pos_b = sorted.iter().position(|&x| x == b).unwrap();
+        let pos_c = sorted.iter().position(|&x| x == c).unwrap();
+        
+        assert!(pos_a < pos_b);
+        assert!(pos_b < pos_c);
+    }
+}

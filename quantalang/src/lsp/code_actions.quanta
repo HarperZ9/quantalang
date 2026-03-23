@@ -1,0 +1,1035 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ LSP — Code Actions Provider
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Comprehensive code actions:
+// - Quick fixes for diagnostics
+// - Refactorings (extract, inline, etc.)
+// - Source actions (organize imports, generate, etc.)
+// - Lazy resolution support
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::lsp::code_actions
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Position
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Position {
+    pub line: u32,
+    pub character: u32,
+}
+
+/// Range
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Range {
+    pub start: Position,
+    pub end: Position,
+}
+
+impl Range {
+    pub fn new(start: Position, end: Position) -> Self {
+        Range { start, end }
+    }
+    
+    pub fn intersects(&self, other: &Range) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
+}
+
+/// Text edit
+#[derive(Debug, Clone)]
+pub struct TextEdit {
+    pub range: Range,
+    pub new_text: String,
+}
+
+/// Workspace edit
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceEdit {
+    pub changes: BTreeMap<String, Vec<TextEdit>>,
+    pub document_changes: Vec<DocumentChange>,
+}
+
+/// Document change
+#[derive(Debug, Clone)]
+pub enum DocumentChange {
+    TextEdit { uri: String, version: Option<i32>, edits: Vec<TextEdit> },
+    CreateFile { uri: String, overwrite: bool },
+    RenameFile { old_uri: String, new_uri: String, overwrite: bool },
+    DeleteFile { uri: String, recursive: bool },
+}
+
+/// Command
+#[derive(Debug, Clone)]
+pub struct Command {
+    pub title: String,
+    pub command: String,
+    pub arguments: Vec<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CODE ACTION TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Code action kind
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CodeActionKind(String);
+
+impl CodeActionKind {
+    pub const EMPTY: &'static str = "";
+    pub const QUICK_FIX: &'static str = "quickfix";
+    pub const REFACTOR: &'static str = "refactor";
+    pub const REFACTOR_EXTRACT: &'static str = "refactor.extract";
+    pub const REFACTOR_INLINE: &'static str = "refactor.inline";
+    pub const REFACTOR_REWRITE: &'static str = "refactor.rewrite";
+    pub const SOURCE: &'static str = "source";
+    pub const SOURCE_ORGANIZE_IMPORTS: &'static str = "source.organizeImports";
+    pub const SOURCE_FIX_ALL: &'static str = "source.fixAll";
+    
+    pub fn new(kind: impl Into<String>) -> Self {
+        CodeActionKind(kind.into())
+    }
+    
+    pub fn quick_fix() -> Self { Self::new(Self::QUICK_FIX) }
+    pub fn refactor() -> Self { Self::new(Self::REFACTOR) }
+    pub fn refactor_extract() -> Self { Self::new(Self::REFACTOR_EXTRACT) }
+    pub fn refactor_inline() -> Self { Self::new(Self::REFACTOR_INLINE) }
+    pub fn refactor_rewrite() -> Self { Self::new(Self::REFACTOR_REWRITE) }
+    pub fn source() -> Self { Self::new(Self::SOURCE) }
+    pub fn organize_imports() -> Self { Self::new(Self::SOURCE_ORGANIZE_IMPORTS) }
+    pub fn fix_all() -> Self { Self::new(Self::SOURCE_FIX_ALL) }
+    
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    
+    pub fn is_preferred_fix(&self) -> bool {
+        self.0.starts_with(Self::QUICK_FIX)
+    }
+    
+    pub fn starts_with(&self, prefix: &str) -> bool {
+        self.0.starts_with(prefix)
+    }
+}
+
+/// Code action
+#[derive(Debug, Clone)]
+pub struct CodeAction {
+    /// Display title
+    pub title: String,
+    
+    /// Kind of action
+    pub kind: Option<CodeActionKind>,
+    
+    /// Associated diagnostics
+    pub diagnostics: Vec<Diagnostic>,
+    
+    /// Is preferred action
+    pub is_preferred: Option<bool>,
+    
+    /// Disabled reason
+    pub disabled: Option<DisabledReason>,
+    
+    /// Workspace edit to apply
+    pub edit: Option<WorkspaceEdit>,
+    
+    /// Command to execute
+    pub command: Option<Command>,
+    
+    /// Data for resolve
+    pub data: Option<CodeActionData>,
+}
+
+impl CodeAction {
+    pub fn new(title: impl Into<String>) -> Self {
+        CodeAction {
+            title: title.into(),
+            kind: None,
+            diagnostics: Vec::new(),
+            is_preferred: None,
+            disabled: None,
+            edit: None,
+            command: None,
+            data: None,
+        }
+    }
+    
+    pub fn quick_fix(title: impl Into<String>) -> Self {
+        Self::new(title).with_kind(CodeActionKind::quick_fix())
+    }
+    
+    pub fn refactor(title: impl Into<String>) -> Self {
+        Self::new(title).with_kind(CodeActionKind::refactor())
+    }
+    
+    pub fn with_kind(mut self, kind: CodeActionKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+    
+    pub fn with_edit(mut self, edit: WorkspaceEdit) -> Self {
+        self.edit = Some(edit);
+        self
+    }
+    
+    pub fn with_command(mut self, command: Command) -> Self {
+        self.command = Some(command);
+        self
+    }
+    
+    pub fn with_diagnostics(mut self, diagnostics: Vec<Diagnostic>) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+    
+    pub fn preferred(mut self) -> Self {
+        self.is_preferred = Some(true);
+        self
+    }
+    
+    pub fn disabled(mut self, reason: impl Into<String>) -> Self {
+        self.disabled = Some(DisabledReason { reason: reason.into() });
+        self
+    }
+    
+    pub fn with_data(mut self, data: CodeActionData) -> Self {
+        self.data = Some(data);
+        self
+    }
+}
+
+/// Disabled reason
+#[derive(Debug, Clone)]
+pub struct DisabledReason {
+    pub reason: String,
+}
+
+/// Code action data for lazy resolution
+#[derive(Debug, Clone)]
+pub struct CodeActionData {
+    pub action_id: String,
+    pub uri: String,
+    pub range: Range,
+    pub context: BTreeMap<String, String>,
+}
+
+/// Diagnostic
+#[derive(Debug, Clone)]
+pub struct Diagnostic {
+    pub range: Range,
+    pub severity: DiagnosticSeverity,
+    pub code: Option<String>,
+    pub source: Option<String>,
+    pub message: String,
+    pub data: Option<DiagnosticData>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error = 1,
+    Warning = 2,
+    Information = 3,
+    Hint = 4,
+}
+
+/// Diagnostic data for quick fixes
+#[derive(Debug, Clone)]
+pub struct DiagnosticData {
+    pub fix_id: String,
+    pub fix_data: BTreeMap<String, String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CODE ACTION CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Code action context
+#[derive(Debug, Clone)]
+pub struct CodeActionContext {
+    /// Diagnostics at the range
+    pub diagnostics: Vec<Diagnostic>,
+    
+    /// Requested kinds (filter)
+    pub only: Option<Vec<CodeActionKind>>,
+    
+    /// Trigger kind
+    pub trigger_kind: CodeActionTriggerKind,
+}
+
+impl CodeActionContext {
+    pub fn new(diagnostics: Vec<Diagnostic>) -> Self {
+        CodeActionContext {
+            diagnostics,
+            only: None,
+            trigger_kind: CodeActionTriggerKind::Invoked,
+        }
+    }
+    
+    pub fn with_filter(mut self, kinds: Vec<CodeActionKind>) -> Self {
+        self.only = Some(kinds);
+        self
+    }
+    
+    pub fn should_include(&self, kind: &CodeActionKind) -> bool {
+        match &self.only {
+            None => true,
+            Some(allowed) => allowed.iter().any(|k| 
+                kind.as_str().starts_with(k.as_str())
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeActionTriggerKind {
+    Invoked = 1,
+    Automatic = 2,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CODE ACTION PROVIDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Code action provider configuration
+#[derive(Debug, Clone)]
+pub struct CodeActionConfig {
+    pub resolve_support: bool,
+    pub quick_fix: bool,
+    pub refactor: bool,
+    pub source_actions: bool,
+    pub max_actions: usize,
+}
+
+impl Default for CodeActionConfig {
+    fn default() -> Self {
+        CodeActionConfig {
+            resolve_support: true,
+            quick_fix: true,
+            refactor: true,
+            source_actions: true,
+            max_actions: 50,
+        }
+    }
+}
+
+/// Code action provider
+pub struct CodeActionProvider {
+    config: CodeActionConfig,
+    /// Quick fix providers
+    quick_fixes: Vec<Arc<dyn QuickFixProvider>>,
+    /// Refactoring providers
+    refactorings: Vec<Arc<dyn RefactoringProvider>>,
+    /// Source action providers
+    source_actions: Vec<Arc<dyn SourceActionProvider>>,
+}
+
+impl CodeActionProvider {
+    pub fn new(config: CodeActionConfig) -> Self {
+        CodeActionProvider {
+            config,
+            quick_fixes: Vec::new(),
+            refactorings: Vec::new(),
+            source_actions: Vec::new(),
+        }
+    }
+    
+    pub fn register_quick_fix(&mut self, provider: Arc<dyn QuickFixProvider>) {
+        self.quick_fixes.push(provider);
+    }
+    
+    pub fn register_refactoring(&mut self, provider: Arc<dyn RefactoringProvider>) {
+        self.refactorings.push(provider);
+    }
+    
+    pub fn register_source_action(&mut self, provider: Arc<dyn SourceActionProvider>) {
+        self.source_actions.push(provider);
+    }
+    
+    /// Get code actions for range
+    pub fn actions(
+        &self,
+        uri: &str,
+        range: Range,
+        context: &CodeActionContext,
+        analysis: &CodeActionAnalysis,
+    ) -> Vec<CodeAction> {
+        let mut actions = Vec::new();
+        
+        // Quick fixes
+        if self.config.quick_fix && context.should_include(&CodeActionKind::quick_fix()) {
+            for provider in &self.quick_fixes {
+                let fixes = provider.fixes(uri, range, &context.diagnostics, analysis);
+                actions.extend(fixes);
+            }
+        }
+        
+        // Refactorings
+        if self.config.refactor && context.should_include(&CodeActionKind::refactor()) {
+            for provider in &self.refactorings {
+                let refactors = provider.refactorings(uri, range, analysis);
+                actions.extend(refactors);
+            }
+        }
+        
+        // Source actions
+        if self.config.source_actions && context.should_include(&CodeActionKind::source()) {
+            for provider in &self.source_actions {
+                let source_acts = provider.actions(uri, analysis);
+                actions.extend(source_acts);
+            }
+        }
+        
+        // Limit results
+        actions.truncate(self.config.max_actions);
+        
+        // Sort: preferred first, then by kind
+        actions.sort_by(|a, b| {
+            let a_pref = a.is_preferred.unwrap_or(false);
+            let b_pref = b.is_preferred.unwrap_or(false);
+            
+            match (a_pref, b_pref) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.kind.as_ref().map(|k| k.as_str())
+                    .cmp(&b.kind.as_ref().map(|k| k.as_str())),
+            }
+        });
+        
+        actions
+    }
+    
+    /// Resolve code action (fill in edit/command)
+    pub fn resolve(&self, action: CodeAction, analysis: &CodeActionAnalysis) -> CodeAction {
+        let data = match &action.data {
+            Some(d) => d,
+            None => return action,
+        };
+        
+        // Find provider that can resolve this action
+        let kind = action.kind.as_ref().map(|k| k.as_str()).unwrap_or("");
+        
+        if kind.starts_with(CodeActionKind::QUICK_FIX) {
+            for provider in &self.quick_fixes {
+                if let Some(resolved) = provider.resolve(&action, analysis) {
+                    return resolved;
+                }
+            }
+        } else if kind.starts_with(CodeActionKind::REFACTOR) {
+            for provider in &self.refactorings {
+                if let Some(resolved) = provider.resolve(&action, analysis) {
+                    return resolved;
+                }
+            }
+        } else if kind.starts_with(CodeActionKind::SOURCE) {
+            for provider in &self.source_actions {
+                if let Some(resolved) = provider.resolve(&action, analysis) {
+                    return resolved;
+                }
+            }
+        }
+        
+        action
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROVIDER TRAITS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Quick fix provider trait
+pub trait QuickFixProvider: Send + Sync {
+    fn fixes(
+        &self,
+        uri: &str,
+        range: Range,
+        diagnostics: &[Diagnostic],
+        analysis: &CodeActionAnalysis,
+    ) -> Vec<CodeAction>;
+    
+    fn resolve(&self, action: &CodeAction, analysis: &CodeActionAnalysis) -> Option<CodeAction>;
+}
+
+/// Refactoring provider trait
+pub trait RefactoringProvider: Send + Sync {
+    fn refactorings(
+        &self,
+        uri: &str,
+        range: Range,
+        analysis: &CodeActionAnalysis,
+    ) -> Vec<CodeAction>;
+    
+    fn resolve(&self, action: &CodeAction, analysis: &CodeActionAnalysis) -> Option<CodeAction>;
+}
+
+/// Source action provider trait
+pub trait SourceActionProvider: Send + Sync {
+    fn actions(
+        &self,
+        uri: &str,
+        analysis: &CodeActionAnalysis,
+    ) -> Vec<CodeAction>;
+    
+    fn resolve(&self, action: &CodeAction, analysis: &CodeActionAnalysis) -> Option<CodeAction>;
+}
+
+/// Analysis context for code actions
+#[derive(Debug, Clone, Default)]
+pub struct CodeActionAnalysis {
+    pub imports: Vec<ImportInfo>,
+    pub symbols: Vec<SymbolInfo>,
+    pub ast_nodes: Vec<AstNodeInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportInfo {
+    pub path: String,
+    pub range: Range,
+    pub is_used: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SymbolInfo {
+    pub name: String,
+    pub kind: String,
+    pub range: Range,
+}
+
+#[derive(Debug, Clone)]
+pub struct AstNodeInfo {
+    pub kind: String,
+    pub range: Range,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUILT-IN QUICK FIXES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Built-in quick fix provider
+pub struct BuiltinQuickFixes;
+
+impl BuiltinQuickFixes {
+    pub fn new() -> Self {
+        BuiltinQuickFixes
+    }
+}
+
+impl QuickFixProvider for BuiltinQuickFixes {
+    fn fixes(
+        &self,
+        uri: &str,
+        range: Range,
+        diagnostics: &[Diagnostic],
+        analysis: &CodeActionAnalysis,
+    ) -> Vec<CodeAction> {
+        let mut actions = Vec::new();
+        
+        for diag in diagnostics {
+            if !diag.range.intersects(&range) {
+                continue;
+            }
+            
+            // Generate fixes based on diagnostic code
+            let code = diag.code.as_deref().unwrap_or("");
+            
+            match code {
+                "E0001" => {
+                    // Unused variable - prefix with underscore
+                    if let Some(fix) = self.fix_unused_variable(uri, diag) {
+                        actions.push(fix);
+                    }
+                }
+                "E0002" => {
+                    // Missing import
+                    if let Some(fix) = self.fix_missing_import(uri, diag, analysis) {
+                        actions.push(fix);
+                    }
+                }
+                "E0003" => {
+                    // Missing semicolon
+                    if let Some(fix) = self.fix_missing_semicolon(uri, diag) {
+                        actions.push(fix);
+                    }
+                }
+                "E0004" => {
+                    // Type mismatch
+                    if let Some(fix) = self.fix_type_mismatch(uri, diag) {
+                        actions.push(fix);
+                    }
+                }
+                "E0005" => {
+                    // Missing return type
+                    if let Some(fix) = self.fix_missing_return_type(uri, diag) {
+                        actions.push(fix);
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        actions
+    }
+    
+    fn resolve(&self, action: &CodeAction, _analysis: &CodeActionAnalysis) -> Option<CodeAction> {
+        // All fixes are computed eagerly
+        None
+    }
+}
+
+impl BuiltinQuickFixes {
+    fn fix_unused_variable(&self, uri: &str, diag: &Diagnostic) -> Option<CodeAction> {
+        let mut edit = WorkspaceEdit::default();
+        
+        // Insert underscore prefix
+        let new_range = Range::new(diag.range.start, diag.range.start);
+        edit.changes.entry(uri.to_string())
+            .or_default()
+            .push(TextEdit {
+                range: new_range,
+                new_text: "_".to_string(),
+            });
+        
+        Some(CodeAction::quick_fix("Prefix with underscore")
+            .with_edit(edit)
+            .with_diagnostics(vec![diag.clone()])
+            .preferred())
+    }
+    
+    fn fix_missing_import(&self, uri: &str, diag: &Diagnostic, analysis: &CodeActionAnalysis) -> Option<CodeAction> {
+        // Extract symbol name from diagnostic
+        let data = diag.data.as_ref()?;
+        let symbol_name = data.fix_data.get("symbol")?;
+        let import_path = data.fix_data.get("import_path")?;
+        
+        // Find import insertion point
+        let insert_pos = analysis.imports.last()
+            .map(|i| Position { line: i.range.end.line + 1, character: 0 })
+            .unwrap_or(Position { line: 0, character: 0 });
+        
+        let mut edit = WorkspaceEdit::default();
+        edit.changes.entry(uri.to_string())
+            .or_default()
+            .push(TextEdit {
+                range: Range::new(insert_pos, insert_pos),
+                new_text: format!("use {};\n", import_path),
+            });
+        
+        Some(CodeAction::quick_fix(format!("Import `{}`", symbol_name))
+            .with_edit(edit)
+            .with_diagnostics(vec![diag.clone()])
+            .preferred())
+    }
+    
+    fn fix_missing_semicolon(&self, uri: &str, diag: &Diagnostic) -> Option<CodeAction> {
+        let mut edit = WorkspaceEdit::default();
+        
+        edit.changes.entry(uri.to_string())
+            .or_default()
+            .push(TextEdit {
+                range: Range::new(diag.range.end, diag.range.end),
+                new_text: ";".to_string(),
+            });
+        
+        Some(CodeAction::quick_fix("Add semicolon")
+            .with_edit(edit)
+            .with_diagnostics(vec![diag.clone()])
+            .preferred())
+    }
+    
+    fn fix_type_mismatch(&self, uri: &str, diag: &Diagnostic) -> Option<CodeAction> {
+        let data = diag.data.as_ref()?;
+        let expected = data.fix_data.get("expected")?;
+        let found = data.fix_data.get("found")?;
+        
+        // Suggest cast or conversion
+        let title = format!("Convert `{}` to `{}`", found, expected);
+        
+        Some(CodeAction::quick_fix(title)
+            .with_data(CodeActionData {
+                action_id: "type_mismatch_fix".to_string(),
+                uri: uri.to_string(),
+                range: diag.range,
+                context: data.fix_data.clone(),
+            })
+            .with_diagnostics(vec![diag.clone()]))
+    }
+    
+    fn fix_missing_return_type(&self, uri: &str, diag: &Diagnostic) -> Option<CodeAction> {
+        let data = diag.data.as_ref()?;
+        let inferred_type = data.fix_data.get("inferred_type")?;
+        
+        let mut edit = WorkspaceEdit::default();
+        let insert_pos = diag.range.end;
+        
+        edit.changes.entry(uri.to_string())
+            .or_default()
+            .push(TextEdit {
+                range: Range::new(insert_pos, insert_pos),
+                new_text: format!(" -> {}", inferred_type),
+            });
+        
+        Some(CodeAction::quick_fix(format!("Add return type `{}`", inferred_type))
+            .with_edit(edit)
+            .with_diagnostics(vec![diag.clone()]))
+    }
+}
+
+impl Default for BuiltinQuickFixes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUILT-IN REFACTORINGS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Built-in refactoring provider
+pub struct BuiltinRefactorings;
+
+impl BuiltinRefactorings {
+    pub fn new() -> Self {
+        BuiltinRefactorings
+    }
+}
+
+impl RefactoringProvider for BuiltinRefactorings {
+    fn refactorings(
+        &self,
+        uri: &str,
+        range: Range,
+        analysis: &CodeActionAnalysis,
+    ) -> Vec<CodeAction> {
+        let mut actions = Vec::new();
+        
+        // Check what's selected
+        let selected_nodes: Vec<_> = analysis.ast_nodes.iter()
+            .filter(|n| range.intersects(&n.range))
+            .collect();
+        
+        // Extract variable (if expression selected)
+        if selected_nodes.iter().any(|n| n.kind == "expression") {
+            actions.push(
+                CodeAction::new("Extract variable")
+                    .with_kind(CodeActionKind::refactor_extract())
+                    .with_data(CodeActionData {
+                        action_id: "extract_variable".to_string(),
+                        uri: uri.to_string(),
+                        range,
+                        context: BTreeMap::new(),
+                    })
+            );
+        }
+        
+        // Extract function (if statements selected)
+        if selected_nodes.iter().any(|n| n.kind == "statement" || n.kind == "block") {
+            actions.push(
+                CodeAction::new("Extract function")
+                    .with_kind(CodeActionKind::refactor_extract())
+                    .with_data(CodeActionData {
+                        action_id: "extract_function".to_string(),
+                        uri: uri.to_string(),
+                        range,
+                        context: BTreeMap::new(),
+                    })
+            );
+        }
+        
+        // Inline variable (if variable selected)
+        if let Some(symbol) = analysis.symbols.iter().find(|s| 
+            s.kind == "variable" && range.intersects(&s.range)
+        ) {
+            actions.push(
+                CodeAction::new(format!("Inline variable `{}`", symbol.name))
+                    .with_kind(CodeActionKind::refactor_inline())
+                    .with_data(CodeActionData {
+                        action_id: "inline_variable".to_string(),
+                        uri: uri.to_string(),
+                        range: symbol.range,
+                        context: BTreeMap::new(),
+                    })
+            );
+        }
+        
+        // Convert if-let to match
+        if selected_nodes.iter().any(|n| n.kind == "if_let") {
+            actions.push(
+                CodeAction::new("Convert to match")
+                    .with_kind(CodeActionKind::refactor_rewrite())
+                    .with_data(CodeActionData {
+                        action_id: "if_let_to_match".to_string(),
+                        uri: uri.to_string(),
+                        range,
+                        context: BTreeMap::new(),
+                    })
+            );
+        }
+        
+        actions
+    }
+    
+    fn resolve(&self, action: &CodeAction, analysis: &CodeActionAnalysis) -> Option<CodeAction> {
+        let data = action.data.as_ref()?;
+        
+        match data.action_id.as_str() {
+            "extract_variable" => self.resolve_extract_variable(action, data),
+            "extract_function" => self.resolve_extract_function(action, data),
+            "inline_variable" => self.resolve_inline_variable(action, data, analysis),
+            _ => None,
+        }
+    }
+}
+
+impl BuiltinRefactorings {
+    fn resolve_extract_variable(&self, action: &CodeAction, data: &CodeActionData) -> Option<CodeAction> {
+        // Would compute actual edit based on selected expression
+        let mut edit = WorkspaceEdit::default();
+        
+        // Placeholder implementation
+        edit.changes.entry(data.uri.clone())
+            .or_default()
+            .push(TextEdit {
+                range: Range::new(
+                    Position { line: data.range.start.line, character: 0 },
+                    Position { line: data.range.start.line, character: 0 },
+                ),
+                new_text: "let extracted = ".to_string(),
+            });
+        
+        Some(CodeAction {
+            edit: Some(edit),
+            ..action.clone()
+        })
+    }
+    
+    fn resolve_extract_function(&self, action: &CodeAction, data: &CodeActionData) -> Option<CodeAction> {
+        // Would compute actual edit based on selected statements
+        None
+    }
+    
+    fn resolve_inline_variable(
+        &self,
+        action: &CodeAction,
+        data: &CodeActionData,
+        analysis: &CodeActionAnalysis,
+    ) -> Option<CodeAction> {
+        // Would find all uses and inline the value
+        None
+    }
+}
+
+impl Default for BuiltinRefactorings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUILT-IN SOURCE ACTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Built-in source action provider
+pub struct BuiltinSourceActions;
+
+impl BuiltinSourceActions {
+    pub fn new() -> Self {
+        BuiltinSourceActions
+    }
+}
+
+impl SourceActionProvider for BuiltinSourceActions {
+    fn actions(&self, uri: &str, analysis: &CodeActionAnalysis) -> Vec<CodeAction> {
+        let mut actions = Vec::new();
+        
+        // Organize imports
+        let has_imports = !analysis.imports.is_empty();
+        let has_unused = analysis.imports.iter().any(|i| !i.is_used);
+        
+        if has_imports {
+            actions.push(
+                CodeAction::new("Organize imports")
+                    .with_kind(CodeActionKind::organize_imports())
+                    .with_data(CodeActionData {
+                        action_id: "organize_imports".to_string(),
+                        uri: uri.to_string(),
+                        range: Range::new(Position { line: 0, character: 0 }, Position { line: 0, character: 0 }),
+                        context: BTreeMap::new(),
+                    })
+            );
+        }
+        
+        if has_unused {
+            actions.push(
+                CodeAction::new("Remove unused imports")
+                    .with_kind(CodeActionKind::new("source.removeUnusedImports"))
+                    .with_data(CodeActionData {
+                        action_id: "remove_unused_imports".to_string(),
+                        uri: uri.to_string(),
+                        range: Range::new(Position { line: 0, character: 0 }, Position { line: 0, character: 0 }),
+                        context: BTreeMap::new(),
+                    })
+            );
+        }
+        
+        // Add missing imports for all unresolved symbols
+        actions.push(
+            CodeAction::new("Add all missing imports")
+                .with_kind(CodeActionKind::new("source.addMissingImports"))
+                .with_data(CodeActionData {
+                    action_id: "add_missing_imports".to_string(),
+                    uri: uri.to_string(),
+                    range: Range::new(Position { line: 0, character: 0 }, Position { line: 0, character: 0 }),
+                    context: BTreeMap::new(),
+                })
+        );
+        
+        actions
+    }
+    
+    fn resolve(&self, action: &CodeAction, analysis: &CodeActionAnalysis) -> Option<CodeAction> {
+        let data = action.data.as_ref()?;
+        
+        match data.action_id.as_str() {
+            "organize_imports" => self.resolve_organize_imports(action, data, analysis),
+            "remove_unused_imports" => self.resolve_remove_unused(action, data, analysis),
+            _ => None,
+        }
+    }
+}
+
+impl BuiltinSourceActions {
+    fn resolve_organize_imports(
+        &self,
+        action: &CodeAction,
+        data: &CodeActionData,
+        analysis: &CodeActionAnalysis,
+    ) -> Option<CodeAction> {
+        if analysis.imports.is_empty() {
+            return None;
+        }
+        
+        // Sort imports
+        let mut sorted_imports: Vec<_> = analysis.imports.iter()
+            .filter(|i| i.is_used)
+            .map(|i| i.path.clone())
+            .collect();
+        sorted_imports.sort();
+        sorted_imports.dedup();
+        
+        // Build edit
+        let first_import = analysis.imports.first()?;
+        let last_import = analysis.imports.last()?;
+        
+        let mut edit = WorkspaceEdit::default();
+        edit.changes.entry(data.uri.clone())
+            .or_default()
+            .push(TextEdit {
+                range: Range::new(first_import.range.start, last_import.range.end),
+                new_text: sorted_imports.iter()
+                    .map(|p| format!("use {};", p))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            });
+        
+        Some(CodeAction {
+            edit: Some(edit),
+            ..action.clone()
+        })
+    }
+    
+    fn resolve_remove_unused(
+        &self,
+        action: &CodeAction,
+        data: &CodeActionData,
+        analysis: &CodeActionAnalysis,
+    ) -> Option<CodeAction> {
+        let unused: Vec<_> = analysis.imports.iter()
+            .filter(|i| !i.is_used)
+            .collect();
+        
+        if unused.is_empty() {
+            return None;
+        }
+        
+        let mut edit = WorkspaceEdit::default();
+        let edits = edit.changes.entry(data.uri.clone()).or_default();
+        
+        for import in unused {
+            edits.push(TextEdit {
+                range: Range::new(
+                    Position { line: import.range.start.line, character: 0 },
+                    Position { line: import.range.end.line + 1, character: 0 },
+                ),
+                new_text: String::new(),
+            });
+        }
+        
+        Some(CodeAction {
+            edit: Some(edit),
+            ..action.clone()
+        })
+    }
+}
+
+impl Default for BuiltinSourceActions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_code_action_kind() {
+        let kind = CodeActionKind::quick_fix();
+        assert_eq!(kind.as_str(), "quickfix");
+        assert!(kind.is_preferred_fix());
+    }
+    
+    #[test]
+    fn test_code_action_builder() {
+        let action = CodeAction::quick_fix("Fix typo")
+            .preferred()
+            .with_diagnostics(vec![]);
+        
+        assert_eq!(action.title, "Fix typo");
+        assert!(action.is_preferred.unwrap_or(false));
+    }
+    
+    #[test]
+    fn test_context_filter() {
+        let context = CodeActionContext::new(vec![])
+            .with_filter(vec![CodeActionKind::quick_fix()]);
+        
+        assert!(context.should_include(&CodeActionKind::quick_fix()));
+        assert!(!context.should_include(&CodeActionKind::refactor()));
+    }
+    
+    #[test]
+    fn test_range_intersects() {
+        let r1 = Range::new(Position { line: 5, character: 0 }, Position { line: 10, character: 0 });
+        let r2 = Range::new(Position { line: 8, character: 0 }, Position { line: 15, character: 0 });
+        let r3 = Range::new(Position { line: 20, character: 0 }, Position { line: 25, character: 0 });
+        
+        assert!(r1.intersects(&r2));
+        assert!(!r1.intersects(&r3));
+    }
+}

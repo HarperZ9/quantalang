@@ -1,0 +1,847 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DOCUMENTATION GENERATOR — Doc Parser
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Parses documentation comments from QuantaLang source files.
+// Supports:
+// - /// Line doc comments (outer)
+// - //! Line doc comments (inner/module)
+// - /** Block doc comments */ (outer)
+// - /*! Block doc comments */ (inner/module)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::doc::parser
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use core::fmt;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOC COMMENT TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type of documentation comment
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocKind {
+    /// Outer doc comment (///, /**)  - documents the following item
+    Outer,
+    /// Inner doc comment (//!, /*!) - documents the enclosing item
+    Inner,
+}
+
+/// A parsed documentation comment
+#[derive(Debug, Clone)]
+pub struct DocComment {
+    /// The kind of doc comment
+    pub kind: DocKind,
+    /// Raw content (with leading /// or //! stripped)
+    pub content: String,
+    /// Line number where the comment starts
+    pub line: u32,
+    /// Column number
+    pub column: u32,
+}
+
+impl DocComment {
+    pub fn new(kind: DocKind, content: String, line: u32, column: u32) -> Self {
+        DocComment { kind, content, line, column }
+    }
+    
+    /// Check if this is an outer doc comment
+    pub fn is_outer(&self) -> bool {
+        self.kind == DocKind::Outer
+    }
+    
+    /// Check if this is an inner doc comment
+    pub fn is_inner(&self) -> bool {
+        self.kind == DocKind::Inner
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOC SECTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A documentation section (like # Examples, # Panics, etc.)
+#[derive(Debug, Clone)]
+pub struct DocSection {
+    /// Section heading (e.g., "Examples", "Panics", "Safety")
+    pub heading: String,
+    /// Section content
+    pub content: String,
+}
+
+/// Standard documentation sections
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StandardSection {
+    /// Brief description (first paragraph)
+    Brief,
+    /// Extended description (remaining paragraphs before sections)
+    Description,
+    /// # Examples
+    Examples,
+    /// # Panics
+    Panics,
+    /// # Errors
+    Errors,
+    /// # Safety
+    Safety,
+    /// # Arguments / # Parameters
+    Arguments,
+    /// # Returns
+    Returns,
+    /// # See Also
+    SeeAlso,
+    /// # Notes
+    Notes,
+    /// # Remarks
+    Remarks,
+    /// Custom section
+    Custom,
+}
+
+impl StandardSection {
+    pub fn from_heading(heading: &str) -> Self {
+        match heading.to_lowercase().trim() {
+            "examples" | "example" => StandardSection::Examples,
+            "panics" | "panic" => StandardSection::Panics,
+            "errors" | "error" => StandardSection::Errors,
+            "safety" => StandardSection::Safety,
+            "arguments" | "parameters" | "params" | "args" => StandardSection::Arguments,
+            "returns" | "return" => StandardSection::Returns,
+            "see also" | "see" => StandardSection::SeeAlso,
+            "notes" | "note" => StandardSection::Notes,
+            "remarks" | "remark" => StandardSection::Remarks,
+            _ => StandardSection::Custom,
+        }
+    }
+    
+    pub fn heading(&self) -> &'static str {
+        match self {
+            StandardSection::Brief => "Brief",
+            StandardSection::Description => "Description",
+            StandardSection::Examples => "Examples",
+            StandardSection::Panics => "Panics",
+            StandardSection::Errors => "Errors",
+            StandardSection::Safety => "Safety",
+            StandardSection::Arguments => "Arguments",
+            StandardSection::Returns => "Returns",
+            StandardSection::SeeAlso => "See Also",
+            StandardSection::Notes => "Notes",
+            StandardSection::Remarks => "Remarks",
+            StandardSection::Custom => "Custom",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PARSED DOCUMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Fully parsed documentation for an item
+#[derive(Debug, Clone, Default)]
+pub struct ParsedDoc {
+    /// Brief description (first paragraph)
+    pub brief: Option<String>,
+    /// Extended description
+    pub description: Option<String>,
+    /// Standard sections
+    pub sections: BTreeMap<StandardSection, String>,
+    /// Custom sections (heading -> content)
+    pub custom_sections: Vec<DocSection>,
+    /// Code examples extracted from ```quanta blocks
+    pub examples: Vec<CodeExample>,
+    /// Intra-doc links found
+    pub links: Vec<DocLink>,
+    /// Attributes like #[doc(hidden)], #[deprecated]
+    pub attributes: DocAttributes,
+}
+
+impl ParsedDoc {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Check if documentation is empty
+    pub fn is_empty(&self) -> bool {
+        self.brief.is_none() 
+            && self.description.is_none() 
+            && self.sections.is_empty()
+            && self.custom_sections.is_empty()
+    }
+    
+    /// Get the brief description
+    pub fn brief(&self) -> Option<&str> {
+        self.brief.as_deref()
+    }
+    
+    /// Get the full description (brief + extended)
+    pub fn full_description(&self) -> String {
+        match (&self.brief, &self.description) {
+            (Some(b), Some(d)) => format!("{}\n\n{}", b, d),
+            (Some(b), None) => b.clone(),
+            (None, Some(d)) => d.clone(),
+            (None, None) => String::new(),
+        }
+    }
+    
+    /// Get examples section
+    pub fn examples_section(&self) -> Option<&str> {
+        self.sections.get(&StandardSection::Examples).map(|s| s.as_str())
+    }
+    
+    /// Get panics section
+    pub fn panics_section(&self) -> Option<&str> {
+        self.sections.get(&StandardSection::Panics).map(|s| s.as_str())
+    }
+    
+    /// Get errors section
+    pub fn errors_section(&self) -> Option<&str> {
+        self.sections.get(&StandardSection::Errors).map(|s| s.as_str())
+    }
+    
+    /// Get safety section
+    pub fn safety_section(&self) -> Option<&str> {
+        self.sections.get(&StandardSection::Safety).map(|s| s.as_str())
+    }
+}
+
+/// A code example from documentation
+#[derive(Debug, Clone)]
+pub struct CodeExample {
+    /// The code content
+    pub code: String,
+    /// Language hint (e.g., "quanta", "rust", "")
+    pub language: String,
+    /// Whether this should be tested (not marked with ignore/no_run)
+    pub testable: bool,
+    /// Whether this should compile but not run
+    pub compile_only: bool,
+    /// Whether to ignore this example
+    pub ignore: bool,
+    /// Whether this should fail to compile
+    pub should_panic: bool,
+}
+
+impl CodeExample {
+    pub fn new(code: String) -> Self {
+        CodeExample {
+            code,
+            language: "quanta".to_string(),
+            testable: true,
+            compile_only: false,
+            ignore: false,
+            should_panic: false,
+        }
+    }
+}
+
+/// An intra-doc link
+#[derive(Debug, Clone)]
+pub struct DocLink {
+    /// The link text as written
+    pub text: String,
+    /// The resolved path (if known)
+    pub path: Option<String>,
+    /// Link kind
+    pub kind: DocLinkKind,
+    /// Position in the doc comment
+    pub span: (u32, u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocLinkKind {
+    /// [`Type`] or [Type]
+    Type,
+    /// [`function`] or [function()]
+    Function,
+    /// [`module`]
+    Module,
+    /// [`Type::method`]
+    Method,
+    /// [`Type::CONST`]
+    Constant,
+    /// [`macro!`]
+    Macro,
+    /// External URL
+    Url,
+    /// Unknown/unresolved
+    Unknown,
+}
+
+/// Documentation attributes
+#[derive(Debug, Clone, Default)]
+pub struct DocAttributes {
+    /// #[doc(hidden)]
+    pub hidden: bool,
+    /// #[deprecated]
+    pub deprecated: Option<DeprecationInfo>,
+    /// #[doc(alias = "...")]
+    pub aliases: Vec<String>,
+    /// #[doc(cfg(...))]
+    pub cfg: Option<String>,
+    /// #[must_use]
+    pub must_use: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeprecationInfo {
+    pub since: Option<String>,
+    pub note: Option<String>,
+    pub suggestion: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOC PARSER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Documentation comment parser
+pub struct DocParser {
+    /// Current position in source
+    pos: usize,
+    /// Source text
+    source: String,
+    /// Current line
+    line: u32,
+    /// Current column
+    column: u32,
+}
+
+impl DocParser {
+    pub fn new(source: &str) -> Self {
+        DocParser {
+            pos: 0,
+            source: source.to_string(),
+            line: 1,
+            column: 1,
+        }
+    }
+    
+    /// Parse all doc comments from source
+    pub fn parse_all(&mut self) -> Vec<DocComment> {
+        let mut comments = Vec::new();
+        
+        while self.pos < self.source.len() {
+            self.skip_whitespace();
+            
+            if self.pos >= self.source.len() {
+                break;
+            }
+            
+            if let Some(comment) = self.try_parse_doc_comment() {
+                comments.push(comment);
+            } else {
+                // Skip to next line or character
+                self.advance();
+            }
+        }
+        
+        comments
+    }
+    
+    /// Try to parse a doc comment at current position
+    fn try_parse_doc_comment(&mut self) -> Option<DocComment> {
+        let start_line = self.line;
+        let start_col = self.column;
+        
+        // Check for line doc comments
+        if self.matches("///") && !self.matches("////") {
+            self.advance_by(3);
+            let content = self.consume_line();
+            return Some(DocComment::new(DocKind::Outer, content, start_line, start_col));
+        }
+        
+        if self.matches("//!") {
+            self.advance_by(3);
+            let content = self.consume_line();
+            return Some(DocComment::new(DocKind::Inner, content, start_line, start_col));
+        }
+        
+        // Check for block doc comments
+        if self.matches("/**") && !self.matches("/***") {
+            self.advance_by(3);
+            let content = self.consume_block_comment();
+            return Some(DocComment::new(DocKind::Outer, content, start_line, start_col));
+        }
+        
+        if self.matches("/*!") {
+            self.advance_by(3);
+            let content = self.consume_block_comment();
+            return Some(DocComment::new(DocKind::Inner, content, start_line, start_col));
+        }
+        
+        None
+    }
+    
+    fn matches(&self, s: &str) -> bool {
+        self.source[self.pos..].starts_with(s)
+    }
+    
+    fn advance(&mut self) {
+        if self.pos < self.source.len() {
+            let c = self.source[self.pos..].chars().next().unwrap();
+            if c == '\n' {
+                self.line += 1;
+                self.column = 1;
+            } else {
+                self.column += 1;
+            }
+            self.pos += c.len_utf8();
+        }
+    }
+    
+    fn advance_by(&mut self, n: usize) {
+        for _ in 0..n {
+            self.advance();
+        }
+    }
+    
+    fn skip_whitespace(&mut self) {
+        while self.pos < self.source.len() {
+            let c = self.source[self.pos..].chars().next().unwrap();
+            if c.is_whitespace() && c != '\n' {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+    }
+    
+    fn consume_line(&mut self) -> String {
+        let start = self.pos;
+        while self.pos < self.source.len() {
+            let c = self.source[self.pos..].chars().next().unwrap();
+            if c == '\n' {
+                break;
+            }
+            self.advance();
+        }
+        
+        let content = self.source[start..self.pos].to_string();
+        
+        // Skip the newline
+        if self.pos < self.source.len() {
+            self.advance();
+        }
+        
+        // Trim leading space if present
+        if content.starts_with(' ') {
+            content[1..].to_string()
+        } else {
+            content
+        }
+    }
+    
+    fn consume_block_comment(&mut self) -> String {
+        let mut content = String::new();
+        let mut depth = 1;
+        
+        while self.pos < self.source.len() && depth > 0 {
+            if self.matches("*/") {
+                depth -= 1;
+                if depth == 0 {
+                    self.advance_by(2);
+                    break;
+                }
+            } else if self.matches("/*") {
+                depth += 1;
+                self.advance_by(2);
+                content.push_str("/*");
+            } else {
+                let c = self.source[self.pos..].chars().next().unwrap();
+                content.push(c);
+                self.advance();
+            }
+        }
+        
+        // Clean up block comment content
+        self.clean_block_comment(&content)
+    }
+    
+    fn clean_block_comment(&self, content: &str) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut result = Vec::new();
+        
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            
+            // Remove leading * if present (common block comment style)
+            let cleaned = if trimmed.starts_with('*') && !trimmed.starts_with("*/") {
+                let after_star = &trimmed[1..];
+                if after_star.starts_with(' ') {
+                    &after_star[1..]
+                } else {
+                    after_star
+                }
+            } else {
+                // For first line, keep as-is
+                if i == 0 {
+                    trimmed
+                } else {
+                    line.trim_start()
+                }
+            };
+            
+            result.push(cleaned);
+        }
+        
+        // Join and trim trailing whitespace
+        result.join("\n").trim().to_string()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOC CONTENT PARSER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parser for documentation content (Markdown-like)
+pub struct DocContentParser;
+
+impl DocContentParser {
+    /// Parse documentation content into structured form
+    pub fn parse(content: &str) -> ParsedDoc {
+        let mut doc = ParsedDoc::new();
+        let mut lines: Vec<&str> = content.lines().collect();
+        
+        if lines.is_empty() {
+            return doc;
+        }
+        
+        // Extract brief (first paragraph)
+        let mut brief_lines = Vec::new();
+        let mut i = 0;
+        
+        while i < lines.len() {
+            let line = lines[i].trim();
+            if line.is_empty() {
+                break;
+            }
+            brief_lines.push(line);
+            i += 1;
+        }
+        
+        if !brief_lines.is_empty() {
+            doc.brief = Some(brief_lines.join(" "));
+        }
+        
+        // Skip empty lines after brief
+        while i < lines.len() && lines[i].trim().is_empty() {
+            i += 1;
+        }
+        
+        // Parse remaining content
+        let mut current_section: Option<(String, Vec<String>)> = None;
+        let mut description_lines = Vec::new();
+        let mut in_code_block = false;
+        let mut code_block_lang = String::new();
+        let mut code_block_content = Vec::new();
+        
+        while i < lines.len() {
+            let line = lines[i];
+            let trimmed = line.trim();
+            
+            // Check for code block
+            if trimmed.starts_with("```") {
+                if in_code_block {
+                    // End of code block
+                    let example = Self::parse_code_example(
+                        &code_block_lang,
+                        &code_block_content.join("\n"),
+                    );
+                    doc.examples.push(example);
+                    code_block_content.clear();
+                    code_block_lang.clear();
+                    in_code_block = false;
+                } else {
+                    // Start of code block
+                    in_code_block = true;
+                    code_block_lang = trimmed[3..].trim().to_string();
+                }
+                i += 1;
+                continue;
+            }
+            
+            if in_code_block {
+                code_block_content.push(line.to_string());
+                i += 1;
+                continue;
+            }
+            
+            // Check for section header (# Header)
+            if trimmed.starts_with("# ") {
+                // Save previous section
+                if let Some((heading, content)) = current_section.take() {
+                    Self::add_section(&mut doc, &heading, &content.join("\n"));
+                }
+                
+                let heading = trimmed[2..].trim().to_string();
+                current_section = Some((heading, Vec::new()));
+                i += 1;
+                continue;
+            }
+            
+            // Add line to current section or description
+            if let Some((_, ref mut content)) = current_section {
+                content.push(line.to_string());
+            } else {
+                description_lines.push(line);
+            }
+            
+            i += 1;
+        }
+        
+        // Save last section
+        if let Some((heading, content)) = current_section.take() {
+            Self::add_section(&mut doc, &heading, &content.join("\n"));
+        }
+        
+        // Set extended description
+        if !description_lines.is_empty() {
+            let desc = description_lines.join("\n").trim().to_string();
+            if !desc.is_empty() {
+                doc.description = Some(desc);
+            }
+        }
+        
+        // Parse intra-doc links
+        doc.links = Self::parse_links(content);
+        
+        doc
+    }
+    
+    fn add_section(doc: &mut ParsedDoc, heading: &str, content: &str) {
+        let content = content.trim().to_string();
+        if content.is_empty() {
+            return;
+        }
+        
+        let section_type = StandardSection::from_heading(heading);
+        
+        if section_type == StandardSection::Custom {
+            doc.custom_sections.push(DocSection {
+                heading: heading.to_string(),
+                content,
+            });
+        } else {
+            doc.sections.insert(section_type, content);
+        }
+    }
+    
+    fn parse_code_example(lang: &str, code: &str) -> CodeExample {
+        let mut example = CodeExample::new(code.to_string());
+        
+        // Parse language and attributes
+        let parts: Vec<&str> = lang.split(',').map(|s| s.trim()).collect();
+        
+        if let Some(language) = parts.first() {
+            example.language = language.to_string();
+        }
+        
+        for attr in parts.iter().skip(1) {
+            match *attr {
+                "ignore" => example.ignore = true,
+                "no_run" => example.compile_only = true,
+                "should_panic" => example.should_panic = true,
+                _ => {}
+            }
+        }
+        
+        example
+    }
+    
+    fn parse_links(content: &str) -> Vec<DocLink> {
+        let mut links = Vec::new();
+        let mut pos = 0;
+        
+        while let Some(start) = content[pos..].find('[') {
+            let start = pos + start;
+            
+            // Check for [`...`] pattern
+            if content[start..].starts_with("[`") {
+                if let Some(end) = content[start + 2..].find("`]") {
+                    let link_text = &content[start + 2..start + 2 + end];
+                    let kind = Self::determine_link_kind(link_text);
+                    
+                    links.push(DocLink {
+                        text: link_text.to_string(),
+                        path: None,
+                        kind,
+                        span: (start as u32, (start + 4 + end) as u32),
+                    });
+                    
+                    pos = start + 4 + end;
+                    continue;
+                }
+            }
+            
+            // Check for [text](url) pattern
+            if let Some(close) = content[start + 1..].find(']') {
+                let close = start + 1 + close;
+                if content[close..].starts_with("](") {
+                    if let Some(url_end) = content[close + 2..].find(')') {
+                        let link_text = &content[start + 1..close];
+                        let url = &content[close + 2..close + 2 + url_end];
+                        
+                        let kind = if url.starts_with("http://") || url.starts_with("https://") {
+                            DocLinkKind::Url
+                        } else {
+                            DocLinkKind::Unknown
+                        };
+                        
+                        links.push(DocLink {
+                            text: link_text.to_string(),
+                            path: Some(url.to_string()),
+                            kind,
+                            span: (start as u32, (close + 3 + url_end) as u32),
+                        });
+                        
+                        pos = close + 3 + url_end;
+                        continue;
+                    }
+                }
+            }
+            
+            pos = start + 1;
+        }
+        
+        links
+    }
+    
+    fn determine_link_kind(text: &str) -> DocLinkKind {
+        if text.ends_with('!') {
+            DocLinkKind::Macro
+        } else if text.ends_with("()") {
+            DocLinkKind::Function
+        } else if text.contains("::") {
+            if text.chars().last().map(|c| c.is_uppercase()).unwrap_or(false) {
+                DocLinkKind::Constant
+            } else {
+                DocLinkKind::Method
+            }
+        } else if text.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            DocLinkKind::Type
+        } else {
+            DocLinkKind::Unknown
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MERGE DOC COMMENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Merge consecutive doc comments into a single content string
+pub fn merge_doc_comments(comments: &[DocComment]) -> String {
+    comments.iter()
+        .map(|c| c.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Group consecutive outer doc comments
+pub fn group_outer_comments(comments: &[DocComment]) -> Vec<Vec<&DocComment>> {
+    let mut groups = Vec::new();
+    let mut current_group = Vec::new();
+    let mut last_line = 0u32;
+    
+    for comment in comments {
+        if !comment.is_outer() {
+            continue;
+        }
+        
+        // Start new group if there's a gap
+        if !current_group.is_empty() && comment.line > last_line + 1 {
+            groups.push(core::mem::take(&mut current_group));
+        }
+        
+        current_group.push(comment);
+        last_line = comment.line;
+    }
+    
+    if !current_group.is_empty() {
+        groups.push(current_group);
+    }
+    
+    groups
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_parse_line_doc() {
+        let source = "/// This is a doc comment\n/// With multiple lines";
+        let mut parser = DocParser::new(source);
+        let comments = parser.parse_all();
+        
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].kind, DocKind::Outer);
+        assert_eq!(comments[0].content, "This is a doc comment");
+    }
+    
+    #[test]
+    fn test_parse_inner_doc() {
+        let source = "//! Module documentation\n//! More info";
+        let mut parser = DocParser::new(source);
+        let comments = parser.parse_all();
+        
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].kind, DocKind::Inner);
+    }
+    
+    #[test]
+    fn test_parse_block_doc() {
+        let source = "/** Block doc\n * with stars */";
+        let mut parser = DocParser::new(source);
+        let comments = parser.parse_all();
+        
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].kind, DocKind::Outer);
+    }
+    
+    #[test]
+    fn test_parse_content() {
+        let content = r#"Brief description.
+
+Extended description here.
+
+# Examples
+
+```quanta
+let x = 42;
+```
+
+# Panics
+
+Panics if x is negative."#;
+        
+        let doc = DocContentParser::parse(content);
+        
+        assert_eq!(doc.brief.as_deref(), Some("Brief description."));
+        assert!(doc.sections.contains_key(&StandardSection::Examples));
+        assert!(doc.sections.contains_key(&StandardSection::Panics));
+        assert_eq!(doc.examples.len(), 1);
+    }
+    
+    #[test]
+    fn test_parse_links() {
+        let content = "See [`String`] and [`Vec::push()`] for details.";
+        let doc = DocContentParser::parse(content);
+        
+        assert_eq!(doc.links.len(), 2);
+        assert_eq!(doc.links[0].text, "String");
+        assert_eq!(doc.links[0].kind, DocLinkKind::Type);
+        assert_eq!(doc.links[1].text, "Vec::push()");
+        assert_eq!(doc.links[1].kind, DocLinkKind::Method);
+    }
+}

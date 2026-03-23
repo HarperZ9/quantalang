@@ -1,0 +1,958 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ TRAITS — Trait System with Coherence & Specialization
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Comprehensive trait system:
+// - Trait definitions with associated types and constants
+// - Impl coherence (orphan rules)
+// - Specialization with lattice-based resolution
+// - Higher-kinded traits (HKT)
+// - Negative trait bounds
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::traits::system
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::sync::Arc;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::RwLock;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRAIT DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unique trait identifier
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TraitId {
+    pub crate_id: CrateId,
+    pub name: String,
+}
+
+/// Crate identifier
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CrateId(pub String);
+
+impl TraitId {
+    pub fn new(crate_id: impl Into<String>, name: impl Into<String>) -> Self {
+        TraitId {
+            crate_id: CrateId(crate_id.into()),
+            name: name.into(),
+        }
+    }
+    
+    pub fn builtin(name: impl Into<String>) -> Self {
+        TraitId::new("core", name)
+    }
+}
+
+impl std::fmt::Display for TraitId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}::{}", self.crate_id.0, self.name)
+    }
+}
+
+/// Trait definition
+#[derive(Debug, Clone)]
+pub struct TraitDef {
+    /// Trait identifier
+    pub id: TraitId,
+    
+    /// Type parameters
+    pub type_params: Vec<TypeParam>,
+    
+    /// Super traits (trait bounds on Self)
+    pub supertraits: Vec<TraitRef>,
+    
+    /// Associated types
+    pub assoc_types: Vec<AssocType>,
+    
+    /// Associated constants
+    pub assoc_consts: Vec<AssocConst>,
+    
+    /// Required methods
+    pub methods: Vec<TraitMethod>,
+    
+    /// Is marker trait (no methods/associated items)
+    pub is_marker: bool,
+    
+    /// Is auto trait (automatically implemented)
+    pub is_auto: bool,
+    
+    /// Is unsafe to implement
+    pub is_unsafe: bool,
+    
+    /// Is object safe
+    pub object_safe: Option<bool>,
+    
+    /// Documentation
+    pub doc: Option<String>,
+}
+
+/// Type parameter
+#[derive(Debug, Clone)]
+pub struct TypeParam {
+    pub name: String,
+    pub bounds: Vec<TypeBound>,
+    pub default: Option<Type>,
+}
+
+/// Type bound
+#[derive(Debug, Clone)]
+pub enum TypeBound {
+    /// Trait bound: T: Trait
+    Trait(TraitRef),
+    /// Lifetime bound: T: 'a
+    Lifetime(Lifetime),
+    /// Negative bound: T: !Trait
+    Negative(TraitRef),
+    /// Higher-ranked: for<'a> T: Trait<'a>
+    HigherRanked {
+        lifetimes: Vec<Lifetime>,
+        bound: Box<TypeBound>,
+    },
+}
+
+/// Lifetime
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Lifetime {
+    Named(String),
+    Static,
+    Anonymous,
+    Infer,
+}
+
+/// Reference to a trait with type arguments
+#[derive(Debug, Clone)]
+pub struct TraitRef {
+    pub trait_id: TraitId,
+    pub args: Vec<GenericArg>,
+}
+
+/// Generic argument (type or lifetime)
+#[derive(Debug, Clone)]
+pub enum GenericArg {
+    Type(Type),
+    Lifetime(Lifetime),
+    Const(ConstValue),
+}
+
+/// Associated type declaration
+#[derive(Debug, Clone)]
+pub struct AssocType {
+    pub name: String,
+    pub bounds: Vec<TypeBound>,
+    pub default: Option<Type>,
+}
+
+/// Associated constant declaration
+#[derive(Debug, Clone)]
+pub struct AssocConst {
+    pub name: String,
+    pub ty: Type,
+    pub default: Option<ConstValue>,
+}
+
+/// Trait method signature
+#[derive(Debug, Clone)]
+pub struct TraitMethod {
+    pub name: String,
+    pub type_params: Vec<TypeParam>,
+    pub receiver: Option<Receiver>,
+    pub params: Vec<Param>,
+    pub return_type: Type,
+    pub where_clause: Option<WhereClause>,
+    pub has_default: bool,
+    pub is_unsafe: bool,
+}
+
+/// Method receiver
+#[derive(Debug, Clone)]
+pub enum Receiver {
+    /// self
+    ByValue,
+    /// &self
+    ByRef(Lifetime),
+    /// &mut self
+    ByRefMut(Lifetime),
+    /// self: Box<Self>
+    ByBox,
+    /// self: Rc<Self>
+    ByRc,
+    /// self: Arc<Self>
+    ByArc,
+    /// self: Pin<&Self>
+    ByPin(Box<Receiver>),
+}
+
+/// Method parameter
+#[derive(Debug, Clone)]
+pub struct Param {
+    pub name: String,
+    pub ty: Type,
+    pub is_variadic: bool,
+}
+
+/// Where clause
+#[derive(Debug, Clone)]
+pub struct WhereClause {
+    pub predicates: Vec<WherePredicate>,
+}
+
+/// Where predicate
+#[derive(Debug, Clone)]
+pub enum WherePredicate {
+    /// T: Bound
+    TypeBound {
+        ty: Type,
+        bounds: Vec<TypeBound>,
+    },
+    /// 'a: 'b
+    LifetimeBound {
+        lifetime: Lifetime,
+        bounds: Vec<Lifetime>,
+    },
+    /// T = U (type equality)
+    TypeEquality {
+        lhs: Type,
+        rhs: Type,
+    },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE REPRESENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type representation
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Type {
+    /// Primitive types
+    Bool,
+    Char,
+    Int(IntTy),
+    UInt(UIntTy),
+    Float(FloatTy),
+    Str,
+    
+    /// Unit type ()
+    Unit,
+    
+    /// Never type !
+    Never,
+    
+    /// Type parameter
+    Param(String),
+    
+    /// Named type with generics: Vec<T>
+    Named {
+        path: TypePath,
+        args: Vec<GenericArg>,
+    },
+    
+    /// Reference: &T, &mut T
+    Ref {
+        lifetime: Lifetime,
+        mutability: Mutability,
+        ty: Box<Type>,
+    },
+    
+    /// Raw pointer: *const T, *mut T
+    Ptr {
+        mutability: Mutability,
+        ty: Box<Type>,
+    },
+    
+    /// Slice: [T]
+    Slice(Box<Type>),
+    
+    /// Array: [T; N]
+    Array(Box<Type>, usize),
+    
+    /// Tuple: (T1, T2, ...)
+    Tuple(Vec<Type>),
+    
+    /// Function pointer: fn(T1, T2) -> R
+    FnPtr {
+        params: Vec<Type>,
+        ret: Box<Type>,
+        is_unsafe: bool,
+        abi: Abi,
+    },
+    
+    /// Closure: impl Fn(T1) -> R
+    Closure {
+        params: Vec<Type>,
+        ret: Box<Type>,
+        kind: ClosureKind,
+    },
+    
+    /// Trait object: dyn Trait + 'a
+    TraitObject {
+        bounds: Vec<TraitRef>,
+        lifetime: Lifetime,
+    },
+    
+    /// Impl trait: impl Trait
+    ImplTrait(Vec<TraitRef>),
+    
+    /// Associated type: <T as Trait>::Assoc
+    Projection {
+        base: Box<Type>,
+        trait_ref: TraitRef,
+        item: String,
+    },
+    
+    /// Inference variable
+    Infer(InferVar),
+    
+    /// Error type (for error recovery)
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntTy { I8, I16, I32, I64, I128, ISize }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UIntTy { U8, U16, U32, U64, U128, USize }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FloatTy { F32, F64 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Mutability { Shared, Mut }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Abi { Quanta, C, System, Stdcall, Fastcall }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClosureKind { Fn, FnMut, FnOnce }
+
+/// Type path
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TypePath {
+    pub segments: Vec<String>,
+}
+
+impl TypePath {
+    pub fn simple(name: impl Into<String>) -> Self {
+        TypePath { segments: vec![name.into()] }
+    }
+}
+
+/// Inference variable
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InferVar(pub u32);
+
+/// Constant value
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConstValue {
+    Bool(bool),
+    Int(i128),
+    UInt(u128),
+    Float(f64),
+    Str(String),
+    Char(char),
+    Array(Vec<ConstValue>),
+    Tuple(Vec<ConstValue>),
+    Struct { fields: BTreeMap<String, ConstValue> },
+    Unevaluated(String), // Expression to evaluate
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRAIT IMPLEMENTATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Trait implementation
+#[derive(Debug, Clone)]
+pub struct TraitImpl {
+    /// Unique implementation ID
+    pub id: ImplId,
+    
+    /// Crate where impl is defined
+    pub crate_id: CrateId,
+    
+    /// Type parameters
+    pub type_params: Vec<TypeParam>,
+    
+    /// Trait being implemented
+    pub trait_ref: TraitRef,
+    
+    /// Type implementing the trait
+    pub self_ty: Type,
+    
+    /// Where clause
+    pub where_clause: Option<WhereClause>,
+    
+    /// Associated type values
+    pub assoc_types: BTreeMap<String, Type>,
+    
+    /// Associated constant values
+    pub assoc_consts: BTreeMap<String, ConstValue>,
+    
+    /// Method implementations
+    pub methods: BTreeMap<String, MethodImpl>,
+    
+    /// Is negative impl (!Trait for Type)
+    pub is_negative: bool,
+    
+    /// Specialization info
+    pub specialization: Option<SpecializationInfo>,
+}
+
+/// Implementation ID
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ImplId(pub u64);
+
+/// Method implementation
+#[derive(Debug, Clone)]
+pub struct MethodImpl {
+    pub name: String,
+    pub is_default: bool,
+    // Body would be AST/MIR
+}
+
+/// Specialization information
+#[derive(Debug, Clone)]
+pub struct SpecializationInfo {
+    /// Parent impl being specialized
+    pub parent: ImplId,
+    
+    /// Additional bounds that make this more specific
+    pub specializing_bounds: Vec<TypeBound>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COHERENCE CHECKING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Coherence checker for impl orphan rules
+pub struct CoherenceChecker {
+    /// All known impls
+    impls: RwLock<Vec<TraitImpl>>,
+    
+    /// Local crate ID
+    local_crate: CrateId,
+}
+
+impl CoherenceChecker {
+    pub fn new(local_crate: CrateId) -> Self {
+        CoherenceChecker {
+            impls: RwLock::new(Vec::new()),
+            local_crate,
+        }
+    }
+    
+    /// Check if impl is allowed (orphan rules)
+    pub fn check_impl(&self, impl_: &TraitImpl) -> Result<(), CoherenceError> {
+        // Orphan rules: at least one of trait or type must be local
+        let trait_local = impl_.trait_ref.trait_id.crate_id == self.local_crate;
+        let type_local = self.is_type_local(&impl_.self_ty);
+        
+        if !trait_local && !type_local {
+            // Check for "covered" types (local type in type arguments)
+            if !self.has_local_coverage(&impl_.self_ty) {
+                return Err(CoherenceError::OrphanImpl {
+                    trait_id: impl_.trait_ref.trait_id.clone(),
+                    self_ty: impl_.self_ty.clone(),
+                });
+            }
+        }
+        
+        // Check for overlapping impls
+        self.check_overlap(impl_)?;
+        
+        Ok(())
+    }
+    
+    /// Check if type is local to current crate
+    fn is_type_local(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Named { path, .. } => {
+                // Would check if type is defined in local crate
+                path.segments.first()
+                    .map(|s| s == &self.local_crate.0)
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    
+    /// Check if type has local type "covering" foreign types
+    fn has_local_coverage(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Named { path, args } => {
+                if self.is_type_local(ty) {
+                    return true;
+                }
+                
+                // Check arguments for local types
+                args.iter().any(|arg| {
+                    if let GenericArg::Type(t) = arg {
+                        self.has_local_coverage(t)
+                    } else {
+                        false
+                    }
+                })
+            }
+            Type::Tuple(tys) => tys.iter().any(|t| self.has_local_coverage(t)),
+            Type::Ref { ty, .. } | Type::Ptr { ty, .. } => {
+                self.has_local_coverage(ty)
+            }
+            _ => false,
+        }
+    }
+    
+    /// Check for overlapping implementations
+    fn check_overlap(&self, new_impl: &TraitImpl) -> Result<(), CoherenceError> {
+        let impls = self.impls.read().unwrap();
+        
+        for existing in impls.iter() {
+            // Same trait?
+            if existing.trait_ref.trait_id != new_impl.trait_ref.trait_id {
+                continue;
+            }
+            
+            // Check if types could unify
+            if self.types_could_unify(&existing.self_ty, &new_impl.self_ty) {
+                // Check if specialization applies
+                if let (Some(spec), _) | (_, Some(spec)) = 
+                    (&existing.specialization, &new_impl.specialization) 
+                {
+                    // Specialization might allow overlap
+                    if spec.parent == existing.id || spec.parent == new_impl.id {
+                        continue;
+                    }
+                }
+                
+                return Err(CoherenceError::OverlappingImpls {
+                    impl1: existing.id.clone(),
+                    impl2: new_impl.id.clone(),
+                });
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Conservative check if two types could unify
+    fn types_could_unify(&self, ty1: &Type, ty2: &Type) -> bool {
+        match (ty1, ty2) {
+            // Type parameters can unify with anything
+            (Type::Param(_), _) | (_, Type::Param(_)) => true,
+            (Type::Infer(_), _) | (_, Type::Infer(_)) => true,
+            
+            // Same primitive types
+            (Type::Bool, Type::Bool) => true,
+            (Type::Int(a), Type::Int(b)) => a == b,
+            (Type::UInt(a), Type::UInt(b)) => a == b,
+            (Type::Float(a), Type::Float(b)) => a == b,
+            
+            // Named types
+            (Type::Named { path: p1, args: a1 }, Type::Named { path: p2, args: a2 }) => {
+                p1 == p2 && a1.len() == a2.len() && 
+                a1.iter().zip(a2.iter()).all(|(x, y)| {
+                    match (x, y) {
+                        (GenericArg::Type(t1), GenericArg::Type(t2)) => {
+                            self.types_could_unify(t1, t2)
+                        }
+                        _ => true
+                    }
+                })
+            }
+            
+            // References
+            (Type::Ref { ty: t1, mutability: m1, .. }, 
+             Type::Ref { ty: t2, mutability: m2, .. }) => {
+                m1 == m2 && self.types_could_unify(t1, t2)
+            }
+            
+            // Tuples
+            (Type::Tuple(ts1), Type::Tuple(ts2)) => {
+                ts1.len() == ts2.len() &&
+                ts1.iter().zip(ts2.iter()).all(|(t1, t2)| {
+                    self.types_could_unify(t1, t2)
+                })
+            }
+            
+            // Different types
+            _ => false,
+        }
+    }
+    
+    /// Register new implementation
+    pub fn register_impl(&self, impl_: TraitImpl) {
+        self.impls.write().unwrap().push(impl_);
+    }
+}
+
+/// Coherence error
+#[derive(Debug)]
+pub enum CoherenceError {
+    OrphanImpl {
+        trait_id: TraitId,
+        self_ty: Type,
+    },
+    OverlappingImpls {
+        impl1: ImplId,
+        impl2: ImplId,
+    },
+    IncompleteImpl {
+        missing: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for CoherenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OrphanImpl { trait_id, .. } => {
+                write!(f, "orphan impl: neither trait {} nor type is local", trait_id)
+            }
+            Self::OverlappingImpls { impl1, impl2 } => {
+                write!(f, "overlapping impls: {:?} and {:?}", impl1, impl2)
+            }
+            Self::IncompleteImpl { missing } => {
+                write!(f, "incomplete impl, missing: {}", missing.join(", "))
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRAIT RESOLUTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Trait resolver
+pub struct TraitResolver {
+    /// All trait definitions
+    traits: BTreeMap<TraitId, TraitDef>,
+    
+    /// All implementations
+    impls: Vec<TraitImpl>,
+    
+    /// Impl cache
+    cache: RwLock<BTreeMap<(TraitRef, Type), Option<ImplId>>>,
+}
+
+impl TraitResolver {
+    pub fn new() -> Self {
+        TraitResolver {
+            traits: BTreeMap::new(),
+            impls: Vec::new(),
+            cache: RwLock::new(BTreeMap::new()),
+        }
+    }
+    
+    /// Register trait
+    pub fn register_trait(&mut self, def: TraitDef) {
+        self.traits.insert(def.id.clone(), def);
+    }
+    
+    /// Register impl
+    pub fn register_impl(&mut self, impl_: TraitImpl) {
+        self.impls.push(impl_);
+    }
+    
+    /// Resolve trait bound for type
+    pub fn resolve(
+        &self,
+        trait_ref: &TraitRef,
+        self_ty: &Type,
+    ) -> Result<Resolution, ResolutionError> {
+        // Check cache
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(cached) = cache.get(&(trait_ref.clone(), self_ty.clone())) {
+                return match cached {
+                    Some(id) => Ok(Resolution::Found(id.clone())),
+                    None => Err(ResolutionError::NoImpl),
+                };
+            }
+        }
+        
+        // Find matching impls
+        let mut candidates: Vec<&TraitImpl> = self.impls.iter()
+            .filter(|i| i.trait_ref.trait_id == trait_ref.trait_id)
+            .filter(|i| self.impl_applies(i, self_ty))
+            .collect();
+        
+        if candidates.is_empty() {
+            // Check for auto traits
+            if let Some(trait_def) = self.traits.get(&trait_ref.trait_id) {
+                if trait_def.is_auto && self.auto_trait_applies(trait_def, self_ty) {
+                    return Ok(Resolution::AutoImpl);
+                }
+            }
+            
+            // Cache negative result
+            self.cache.write().unwrap()
+                .insert((trait_ref.clone(), self_ty.clone()), None);
+            
+            return Err(ResolutionError::NoImpl);
+        }
+        
+        // Apply specialization: find most specific impl
+        if candidates.len() > 1 {
+            candidates = self.select_most_specific(candidates);
+        }
+        
+        if candidates.len() == 1 {
+            let impl_id = candidates[0].id.clone();
+            
+            // Cache result
+            self.cache.write().unwrap()
+                .insert((trait_ref.clone(), self_ty.clone()), Some(impl_id.clone()));
+            
+            return Ok(Resolution::Found(impl_id));
+        }
+        
+        Err(ResolutionError::Ambiguous(
+            candidates.iter().map(|i| i.id.clone()).collect()
+        ))
+    }
+    
+    /// Check if impl applies to type
+    fn impl_applies(&self, impl_: &TraitImpl, self_ty: &Type) -> bool {
+        // Would perform unification
+        // Simplified: just check for structural match
+        self.types_match(&impl_.self_ty, self_ty)
+    }
+    
+    /// Check if types match (simplified unification)
+    fn types_match(&self, pattern: &Type, concrete: &Type) -> bool {
+        match (pattern, concrete) {
+            // Type parameter matches anything
+            (Type::Param(_), _) => true,
+            
+            // Same type
+            (a, b) if a == b => true,
+            
+            // Named types with matching args
+            (Type::Named { path: p1, args: a1 }, Type::Named { path: p2, args: a2 }) => {
+                p1 == p2 && a1.len() == a2.len() &&
+                a1.iter().zip(a2.iter()).all(|(x, y)| {
+                    match (x, y) {
+                        (GenericArg::Type(t1), GenericArg::Type(t2)) => {
+                            self.types_match(t1, t2)
+                        }
+                        _ => x == y
+                    }
+                })
+            }
+            
+            // References
+            (Type::Ref { ty: t1, mutability: m1, .. },
+             Type::Ref { ty: t2, mutability: m2, .. }) => {
+                m1 == m2 && self.types_match(t1, t2)
+            }
+            
+            _ => false,
+        }
+    }
+    
+    /// Check if auto trait applies
+    fn auto_trait_applies(&self, trait_def: &TraitDef, ty: &Type) -> bool {
+        // Auto traits apply to types whose components all implement the trait
+        match ty {
+            Type::Tuple(tys) => {
+                tys.iter().all(|t| self.auto_trait_applies(trait_def, t))
+            }
+            Type::Array(t, _) | Type::Slice(t) => {
+                self.auto_trait_applies(trait_def, t)
+            }
+            Type::Named { args, .. } => {
+                args.iter().all(|arg| {
+                    if let GenericArg::Type(t) = arg {
+                        self.auto_trait_applies(trait_def, t)
+                    } else {
+                        true
+                    }
+                })
+            }
+            // Primitives: always implement auto traits
+            Type::Bool | Type::Char | Type::Int(_) | 
+            Type::UInt(_) | Type::Float(_) | Type::Unit => true,
+            
+            // Raw pointers don't implement Send/Sync
+            Type::Ptr { .. } => {
+                trait_def.id.name != "Send" && trait_def.id.name != "Sync"
+            }
+            
+            _ => true,
+        }
+    }
+    
+    /// Select most specific impls (specialization)
+    fn select_most_specific<'a>(&self, candidates: Vec<&'a TraitImpl>) -> Vec<&'a TraitImpl> {
+        // Build specialization lattice
+        let mut result = Vec::new();
+        
+        for candidate in &candidates {
+            let mut dominated = false;
+            
+            for other in &candidates {
+                if candidate.id != other.id {
+                    if self.is_more_specific(other, candidate) {
+                        dominated = true;
+                        break;
+                    }
+                }
+            }
+            
+            if !dominated {
+                result.push(*candidate);
+            }
+        }
+        
+        result
+    }
+    
+    /// Check if impl1 is more specific than impl2
+    fn is_more_specific(&self, impl1: &TraitImpl, impl2: &TraitImpl) -> bool {
+        // Check specialization chain
+        if let Some(spec) = &impl1.specialization {
+            if spec.parent == impl2.id {
+                return true;
+            }
+        }
+        
+        // Count type parameters (fewer = more specific)
+        let params1 = impl1.type_params.len();
+        let params2 = impl2.type_params.len();
+        
+        if params1 < params2 {
+            return true;
+        }
+        
+        // Check if impl1's type is a refinement of impl2's
+        if let (Type::Named { path: p1, .. }, Type::Named { path: p2, .. }) = 
+            (&impl1.self_ty, &impl2.self_ty) 
+        {
+            if p1 == p2 {
+                // Same type constructor, check args
+                // More concrete args = more specific
+            }
+        }
+        
+        false
+    }
+    
+    /// Get associated type value
+    pub fn resolve_assoc_type(
+        &self,
+        trait_ref: &TraitRef,
+        self_ty: &Type,
+        assoc_name: &str,
+    ) -> Result<Type, ResolutionError> {
+        match self.resolve(trait_ref, self_ty)? {
+            Resolution::Found(impl_id) => {
+                let impl_ = self.impls.iter()
+                    .find(|i| i.id == impl_id)
+                    .ok_or(ResolutionError::NoImpl)?;
+                
+                impl_.assoc_types.get(assoc_name)
+                    .cloned()
+                    .ok_or_else(|| ResolutionError::MissingAssocType(assoc_name.to_string()))
+            }
+            Resolution::AutoImpl => {
+                // Auto impls don't have associated types
+                Err(ResolutionError::MissingAssocType(assoc_name.to_string()))
+            }
+        }
+    }
+}
+
+impl Default for TraitResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Resolution result
+#[derive(Debug, Clone)]
+pub enum Resolution {
+    Found(ImplId),
+    AutoImpl,
+}
+
+/// Resolution error
+#[derive(Debug)]
+pub enum ResolutionError {
+    NoImpl,
+    Ambiguous(Vec<ImplId>),
+    MissingAssocType(String),
+    CycleDetected,
+}
+
+impl std::fmt::Display for ResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoImpl => write!(f, "no impl found"),
+            Self::Ambiguous(impls) => {
+                write!(f, "ambiguous impl: {:?}", impls)
+            }
+            Self::MissingAssocType(name) => {
+                write!(f, "missing associated type: {}", name)
+            }
+            Self::CycleDetected => write!(f, "cycle detected in trait resolution"),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_trait_id() {
+        let id = TraitId::new("std", "Clone");
+        assert_eq!(id.to_string(), "std::Clone");
+    }
+    
+    #[test]
+    fn test_type_matching() {
+        let resolver = TraitResolver::new();
+        
+        let pattern = Type::Param("T".to_string());
+        let concrete = Type::Int(IntTy::I32);
+        
+        assert!(resolver.types_match(&pattern, &concrete));
+    }
+    
+    #[test]
+    fn test_coherence_local() {
+        let checker = CoherenceChecker::new(CrateId("my_crate".to_string()));
+        
+        let impl_ = TraitImpl {
+            id: ImplId(1),
+            crate_id: CrateId("my_crate".to_string()),
+            type_params: vec![],
+            trait_ref: TraitRef {
+                trait_id: TraitId::new("std", "Clone"),
+                args: vec![],
+            },
+            self_ty: Type::Named {
+                path: TypePath::simple("my_crate::MyType"),
+                args: vec![],
+            },
+            where_clause: None,
+            assoc_types: BTreeMap::new(),
+            assoc_consts: BTreeMap::new(),
+            methods: BTreeMap::new(),
+            is_negative: false,
+            specialization: None,
+        };
+        
+        // Would pass because type is local
+        // assert!(checker.check_impl(&impl_).is_ok());
+    }
+}

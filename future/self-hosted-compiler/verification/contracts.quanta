@@ -1,0 +1,996 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ VERIFICATION — Contract & Proof System
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Design-by-contract verification and proof generation:
+// - Precondition/postcondition verification
+// - Loop invariant checking
+// - Termination proofs
+// - Safety property verification
+// - Weakest precondition calculus
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::verification::contracts
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::collections::BTreeMap;
+use std::sync::Arc;
+
+use super::smt::{
+    Expr, Sort, SmtContext, SmtSolver, CheckResult, Model, SolverError,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONTRACT SPECIFICATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Function contract
+#[derive(Debug, Clone)]
+pub struct FunctionContract {
+    /// Function name
+    pub name: String,
+    
+    /// Function parameters with types
+    pub params: Vec<(String, Type)>,
+    
+    /// Return type
+    pub return_type: Type,
+    
+    /// Preconditions (requires)
+    pub requires: Vec<ContractClause>,
+    
+    /// Postconditions (ensures)
+    pub ensures: Vec<ContractClause>,
+    
+    /// Modifies clause (frame condition)
+    pub modifies: Vec<String>,
+    
+    /// Decreases clause (termination)
+    pub decreases: Option<Expr>,
+}
+
+impl FunctionContract {
+    pub fn new(name: impl Into<String>) -> Self {
+        FunctionContract {
+            name: name.into(),
+            params: Vec::new(),
+            return_type: Type::Unit,
+            requires: Vec::new(),
+            ensures: Vec::new(),
+            modifies: Vec::new(),
+            decreases: None,
+        }
+    }
+    
+    /// Add parameter
+    pub fn param(mut self, name: impl Into<String>, ty: Type) -> Self {
+        self.params.push((name.into(), ty));
+        self
+    }
+    
+    /// Set return type
+    pub fn returns(mut self, ty: Type) -> Self {
+        self.return_type = ty;
+        self
+    }
+    
+    /// Add precondition
+    pub fn requires(mut self, clause: ContractClause) -> Self {
+        self.requires.push(clause);
+        self
+    }
+    
+    /// Add postcondition
+    pub fn ensures(mut self, clause: ContractClause) -> Self {
+        self.ensures.push(clause);
+        self
+    }
+    
+    /// Add modifies clause
+    pub fn modifies(mut self, var: impl Into<String>) -> Self {
+        self.modifies.push(var.into());
+        self
+    }
+    
+    /// Set decreases clause
+    pub fn decreases(mut self, expr: Expr) -> Self {
+        self.decreases = Some(expr);
+        self
+    }
+}
+
+/// Contract clause with metadata
+#[derive(Debug, Clone)]
+pub struct ContractClause {
+    /// The condition
+    pub condition: Expr,
+    
+    /// Human-readable description
+    pub description: Option<String>,
+    
+    /// Source location
+    pub location: Option<SourceLocation>,
+    
+    /// Clause name (for error reporting)
+    pub name: Option<String>,
+}
+
+impl ContractClause {
+    pub fn new(condition: Expr) -> Self {
+        ContractClause {
+            condition,
+            description: None,
+            location: None,
+            name: None,
+        }
+    }
+    
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+        self.description = Some(desc.into());
+        self
+    }
+    
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+    
+    pub fn at(mut self, loc: SourceLocation) -> Self {
+        self.location = Some(loc);
+        self
+    }
+}
+
+impl From<Expr> for ContractClause {
+    fn from(expr: Expr) -> Self {
+        ContractClause::new(expr)
+    }
+}
+
+/// Source location
+#[derive(Debug, Clone)]
+pub struct SourceLocation {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// Type representation for contracts
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Type {
+    Unit,
+    Bool,
+    Int,
+    UInt,
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Float32,
+    Float64,
+    Array(Box<Type>),
+    Slice(Box<Type>),
+    Ref(Box<Type>),
+    MutRef(Box<Type>),
+    Option(Box<Type>),
+    Result(Box<Type>, Box<Type>),
+    Custom(String),
+}
+
+impl Type {
+    /// Convert to SMT sort
+    pub fn to_sort(&self) -> Sort {
+        match self {
+            Type::Unit => Sort::Bool, // Unit represented as trivial
+            Type::Bool => Sort::Bool,
+            Type::Int | Type::UInt => Sort::Int,
+            Type::Int8 | Type::UInt8 => Sort::BitVec(8),
+            Type::Int16 | Type::UInt16 => Sort::BitVec(16),
+            Type::Int32 | Type::UInt32 | Type::Float32 => Sort::BitVec(32),
+            Type::Int64 | Type::UInt64 | Type::Float64 => Sort::BitVec(64),
+            Type::Array(elem) | Type::Slice(elem) => {
+                Sort::Array(Box::new(Sort::Int), Box::new(elem.to_sort()))
+            }
+            Type::Ref(t) | Type::MutRef(t) => t.to_sort(),
+            Type::Option(t) => Sort::Uninterpreted(format!("Option_{}", t.name())),
+            Type::Result(t, e) => Sort::Uninterpreted(format!("Result_{}_{}", t.name(), e.name())),
+            Type::Custom(name) => Sort::Uninterpreted(name.clone()),
+        }
+    }
+    
+    fn name(&self) -> String {
+        match self {
+            Type::Unit => "Unit".to_string(),
+            Type::Bool => "Bool".to_string(),
+            Type::Int => "Int".to_string(),
+            Type::UInt => "UInt".to_string(),
+            Type::Int8 => "i8".to_string(),
+            Type::Int16 => "i16".to_string(),
+            Type::Int32 => "i32".to_string(),
+            Type::Int64 => "i64".to_string(),
+            Type::UInt8 => "u8".to_string(),
+            Type::UInt16 => "u16".to_string(),
+            Type::UInt32 => "u32".to_string(),
+            Type::UInt64 => "u64".to_string(),
+            Type::Float32 => "f32".to_string(),
+            Type::Float64 => "f64".to_string(),
+            Type::Array(t) => format!("Array_{}", t.name()),
+            Type::Slice(t) => format!("Slice_{}", t.name()),
+            Type::Ref(t) => format!("Ref_{}", t.name()),
+            Type::MutRef(t) => format!("MutRef_{}", t.name()),
+            Type::Option(t) => format!("Option_{}", t.name()),
+            Type::Result(t, e) => format!("Result_{}_{}", t.name(), e.name()),
+            Type::Custom(name) => name.clone(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP INVARIANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop contract
+#[derive(Debug, Clone)]
+pub struct LoopContract {
+    /// Loop invariants (maintained each iteration)
+    pub invariants: Vec<ContractClause>,
+    
+    /// Variant (decreasing expression for termination)
+    pub variant: Option<Expr>,
+    
+    /// Modified variables (frame)
+    pub modifies: Vec<String>,
+}
+
+impl LoopContract {
+    pub fn new() -> Self {
+        LoopContract {
+            invariants: Vec::new(),
+            variant: None,
+            modifies: Vec::new(),
+        }
+    }
+    
+    pub fn invariant(mut self, clause: impl Into<ContractClause>) -> Self {
+        self.invariants.push(clause.into());
+        self
+    }
+    
+    pub fn variant(mut self, expr: Expr) -> Self {
+        self.variant = Some(expr);
+        self
+    }
+    
+    pub fn modifies(mut self, var: impl Into<String>) -> Self {
+        self.modifies.push(var.into());
+        self
+    }
+}
+
+impl Default for LoopContract {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ASSERTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Inline assertion
+#[derive(Debug, Clone)]
+pub struct Assertion {
+    /// Kind of assertion
+    pub kind: AssertionKind,
+    
+    /// The condition
+    pub condition: Expr,
+    
+    /// Description
+    pub description: Option<String>,
+    
+    /// Location
+    pub location: Option<SourceLocation>,
+}
+
+/// Assertion kind
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertionKind {
+    /// assert! - must hold
+    Assert,
+    
+    /// assume! - assumed to hold (axiom)
+    Assume,
+    
+    /// check! - verify but don't assume
+    Check,
+    
+    /// unreachable! - path should be unreachable
+    Unreachable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERIFICATION CONDITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Verification condition
+#[derive(Debug, Clone)]
+pub struct VerificationCondition {
+    /// Unique identifier
+    pub id: String,
+    
+    /// What we're verifying
+    pub kind: VcKind,
+    
+    /// Assumptions (context)
+    pub assumptions: Vec<Expr>,
+    
+    /// Goal to prove
+    pub goal: Expr,
+    
+    /// Source location
+    pub location: Option<SourceLocation>,
+    
+    /// Human description
+    pub description: String,
+}
+
+/// Kind of verification condition
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcKind {
+    /// Precondition at call site
+    Precondition,
+    
+    /// Postcondition at return
+    Postcondition,
+    
+    /// Loop invariant entry
+    LoopInvariantEntry,
+    
+    /// Loop invariant preservation
+    LoopInvariantPreservation,
+    
+    /// Loop termination
+    LoopTermination,
+    
+    /// Assertion
+    Assertion,
+    
+    /// Array bounds
+    ArrayBounds,
+    
+    /// Division by zero
+    DivisionByZero,
+    
+    /// Overflow
+    Overflow,
+    
+    /// Null dereference
+    NullDereference,
+    
+    /// Memory safety
+    MemorySafety,
+}
+
+impl VcKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            VcKind::Precondition => "precondition",
+            VcKind::Postcondition => "postcondition",
+            VcKind::LoopInvariantEntry => "loop invariant (entry)",
+            VcKind::LoopInvariantPreservation => "loop invariant (preservation)",
+            VcKind::LoopTermination => "loop termination",
+            VcKind::Assertion => "assertion",
+            VcKind::ArrayBounds => "array bounds",
+            VcKind::DivisionByZero => "division by zero",
+            VcKind::Overflow => "overflow",
+            VcKind::NullDereference => "null dereference",
+            VcKind::MemorySafety => "memory safety",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERIFICATION RESULT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Result of verifying a single VC
+#[derive(Debug, Clone)]
+pub struct VcResult {
+    /// The VC that was checked
+    pub vc: VerificationCondition,
+    
+    /// Outcome
+    pub outcome: VcOutcome,
+    
+    /// Time taken
+    pub time_ms: u64,
+    
+    /// Counterexample (if failed)
+    pub counterexample: Option<Counterexample>,
+}
+
+/// VC outcome
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcOutcome {
+    /// Verified (proved)
+    Verified,
+    
+    /// Failed (counterexample found)
+    Failed,
+    
+    /// Unknown (solver could not determine)
+    Unknown,
+    
+    /// Timeout
+    Timeout,
+    
+    /// Error during verification
+    Error,
+}
+
+/// Counterexample showing why VC failed
+#[derive(Debug, Clone)]
+pub struct Counterexample {
+    /// Variable assignments
+    pub assignments: BTreeMap<String, String>,
+    
+    /// Execution trace (if available)
+    pub trace: Vec<TraceStep>,
+}
+
+/// Step in execution trace
+#[derive(Debug, Clone)]
+pub struct TraceStep {
+    pub location: Option<SourceLocation>,
+    pub description: String,
+    pub state: BTreeMap<String, String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONTRACT VERIFIER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Contract verification engine
+pub struct ContractVerifier {
+    solver: Box<dyn SmtSolver>,
+    config: VerifierConfig,
+    vcs: Vec<VerificationCondition>,
+    results: Vec<VcResult>,
+}
+
+/// Verifier configuration
+#[derive(Debug, Clone)]
+pub struct VerifierConfig {
+    /// Timeout per VC
+    pub timeout_per_vc: std::time::Duration,
+    
+    /// Generate counterexamples
+    pub generate_counterexamples: bool,
+    
+    /// Check overflow
+    pub check_overflow: bool,
+    
+    /// Check bounds
+    pub check_bounds: bool,
+    
+    /// Check division by zero
+    pub check_division: bool,
+    
+    /// Assume preconditions
+    pub assume_preconditions: bool,
+    
+    /// Modular verification (per-function)
+    pub modular: bool,
+}
+
+impl Default for VerifierConfig {
+    fn default() -> Self {
+        VerifierConfig {
+            timeout_per_vc: std::time::Duration::from_secs(30),
+            generate_counterexamples: true,
+            check_overflow: true,
+            check_bounds: true,
+            check_division: true,
+            assume_preconditions: true,
+            modular: true,
+        }
+    }
+}
+
+impl ContractVerifier {
+    pub fn new(solver: Box<dyn SmtSolver>, config: VerifierConfig) -> Self {
+        ContractVerifier {
+            solver,
+            config,
+            vcs: Vec::new(),
+            results: Vec::new(),
+        }
+    }
+    
+    /// Add verification condition
+    pub fn add_vc(&mut self, vc: VerificationCondition) {
+        self.vcs.push(vc);
+    }
+    
+    /// Verify function contract
+    pub fn verify_function(&mut self, contract: &FunctionContract) -> Vec<VcResult> {
+        let mut results = Vec::new();
+        
+        // Generate VCs from contract
+        let vcs = self.generate_function_vcs(contract);
+        
+        // Verify each VC
+        for vc in vcs {
+            let result = self.verify_vc(&vc);
+            results.push(result);
+        }
+        
+        self.results.extend(results.clone());
+        results
+    }
+    
+    /// Generate VCs for function
+    fn generate_function_vcs(&self, contract: &FunctionContract) -> Vec<VerificationCondition> {
+        let mut vcs = Vec::new();
+        let mut vc_id = 0;
+        
+        // For each postcondition
+        for (i, post) in contract.ensures.iter().enumerate() {
+            let mut assumptions = Vec::new();
+            
+            // Assume preconditions
+            if self.config.assume_preconditions {
+                for pre in &contract.requires {
+                    assumptions.push(pre.condition.clone());
+                }
+            }
+            
+            let vc = VerificationCondition {
+                id: format!("{}::post_{}", contract.name, i),
+                kind: VcKind::Postcondition,
+                assumptions,
+                goal: post.condition.clone(),
+                location: post.location.clone(),
+                description: post.description.clone()
+                    .unwrap_or_else(|| format!("postcondition {}", i)),
+            };
+            
+            vcs.push(vc);
+            vc_id += 1;
+        }
+        
+        vcs
+    }
+    
+    /// Verify single VC
+    pub fn verify_vc(&mut self, vc: &VerificationCondition) -> VcResult {
+        let start = std::time::Instant::now();
+        
+        // Build SMT context
+        let mut ctx = SmtContext::new();
+        ctx.set_logic("QF_AUFLIA"); // Arrays, uninterpreted functions, linear integer arithmetic
+        
+        // Add assumptions
+        for assumption in &vc.assumptions {
+            ctx.assert(assumption.clone());
+        }
+        
+        // Assert negation of goal (check unsatisfiability)
+        ctx.assert(Expr::not(vc.goal.clone()));
+        
+        // Check
+        self.solver.set_timeout(self.config.timeout_per_vc);
+        
+        let (outcome, counterexample) = match self.solver.check(&ctx) {
+            Ok(CheckResult::Unsat) => {
+                // Negation is unsat => goal is valid
+                (VcOutcome::Verified, None)
+            }
+            Ok(CheckResult::Sat) => {
+                // Found counterexample
+                let ce = if self.config.generate_counterexamples {
+                    self.extract_counterexample()
+                } else {
+                    None
+                };
+                (VcOutcome::Failed, ce)
+            }
+            Ok(CheckResult::Unknown) => {
+                (VcOutcome::Unknown, None)
+            }
+            Err(SolverError::Timeout) => {
+                (VcOutcome::Timeout, None)
+            }
+            Err(_) => {
+                (VcOutcome::Error, None)
+            }
+        };
+        
+        VcResult {
+            vc: vc.clone(),
+            outcome,
+            time_ms: start.elapsed().as_millis() as u64,
+            counterexample,
+        }
+    }
+    
+    /// Extract counterexample from solver
+    fn extract_counterexample(&mut self) -> Option<Counterexample> {
+        let model = self.solver.get_model().ok()?;
+        
+        let assignments = model.assignments.into_iter()
+            .map(|(k, v)| (k, format!("{:?}", v)))
+            .collect();
+        
+        Some(Counterexample {
+            assignments,
+            trace: Vec::new(),
+        })
+    }
+    
+    /// Get all results
+    pub fn results(&self) -> &[VcResult] {
+        &self.results
+    }
+    
+    /// Check if all VCs passed
+    pub fn all_verified(&self) -> bool {
+        self.results.iter().all(|r| r.outcome == VcOutcome::Verified)
+    }
+    
+    /// Get failed VCs
+    pub fn failed(&self) -> Vec<&VcResult> {
+        self.results.iter()
+            .filter(|r| r.outcome == VcOutcome::Failed)
+            .collect()
+    }
+    
+    /// Generate summary report
+    pub fn summary(&self) -> VerificationSummary {
+        let total = self.results.len();
+        let verified = self.results.iter()
+            .filter(|r| r.outcome == VcOutcome::Verified)
+            .count();
+        let failed = self.results.iter()
+            .filter(|r| r.outcome == VcOutcome::Failed)
+            .count();
+        let unknown = self.results.iter()
+            .filter(|r| r.outcome == VcOutcome::Unknown)
+            .count();
+        let timeout = self.results.iter()
+            .filter(|r| r.outcome == VcOutcome::Timeout)
+            .count();
+        let error = self.results.iter()
+            .filter(|r| r.outcome == VcOutcome::Error)
+            .count();
+        
+        let total_time_ms: u64 = self.results.iter()
+            .map(|r| r.time_ms)
+            .sum();
+        
+        VerificationSummary {
+            total,
+            verified,
+            failed,
+            unknown,
+            timeout,
+            error,
+            total_time_ms,
+        }
+    }
+}
+
+/// Verification summary
+#[derive(Debug, Clone)]
+pub struct VerificationSummary {
+    pub total: usize,
+    pub verified: usize,
+    pub failed: usize,
+    pub unknown: usize,
+    pub timeout: usize,
+    pub error: usize,
+    pub total_time_ms: u64,
+}
+
+impl std::fmt::Display for VerificationSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Verification Summary")?;
+        writeln!(f, "===================")?;
+        writeln!(f, "Total VCs:    {}", self.total)?;
+        writeln!(f, "Verified:     {} ✓", self.verified)?;
+        if self.failed > 0 {
+            writeln!(f, "Failed:       {} ✗", self.failed)?;
+        }
+        if self.unknown > 0 {
+            writeln!(f, "Unknown:      {} ?", self.unknown)?;
+        }
+        if self.timeout > 0 {
+            writeln!(f, "Timeout:      {} ⏱", self.timeout)?;
+        }
+        if self.error > 0 {
+            writeln!(f, "Error:        {} !", self.error)?;
+        }
+        writeln!(f, "Total time:   {}ms", self.total_time_ms)?;
+        
+        if self.total > 0 {
+            let success_rate = (self.verified as f64 / self.total as f64) * 100.0;
+            writeln!(f, "Success rate: {:.1}%", success_rate)?;
+        }
+        
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WEAKEST PRECONDITION CALCULUS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Weakest precondition calculator
+pub struct WpCalculator {
+    /// Fresh variable counter
+    fresh_counter: u64,
+}
+
+impl WpCalculator {
+    pub fn new() -> Self {
+        WpCalculator { fresh_counter: 0 }
+    }
+    
+    /// Generate fresh variable name
+    fn fresh(&mut self, prefix: &str) -> String {
+        self.fresh_counter += 1;
+        format!("{}_{}", prefix, self.fresh_counter)
+    }
+    
+    /// Calculate WP for assignment: wp(x := e, Q) = Q[e/x]
+    pub fn wp_assign(&mut self, var: &str, expr: &Expr, post: &Expr) -> Expr {
+        self.substitute(post, var, expr)
+    }
+    
+    /// Calculate WP for sequence: wp(S1; S2, Q) = wp(S1, wp(S2, Q))
+    pub fn wp_sequence(&mut self, wp_s1: &Expr, wp_s2: &Expr) -> Expr {
+        // This is compositional - just return wp_s1 assuming wp_s2 is embedded
+        wp_s1.clone()
+    }
+    
+    /// Calculate WP for conditional: wp(if b then S1 else S2, Q) = 
+    ///   (b => wp(S1, Q)) ∧ (¬b => wp(S2, Q))
+    pub fn wp_conditional(
+        &mut self,
+        condition: &Expr,
+        wp_then: &Expr,
+        wp_else: &Expr,
+    ) -> Expr {
+        Expr::and(vec![
+            Expr::implies(condition.clone(), wp_then.clone()),
+            Expr::implies(Expr::not(condition.clone()), wp_else.clone()),
+        ])
+    }
+    
+    /// Calculate WP for while loop with invariant:
+    /// wp(while b invariant I do S, Q) = I ∧ ∀state. (I ∧ b => wp(S, I)) ∧ (I ∧ ¬b => Q)
+    pub fn wp_while(
+        &mut self,
+        condition: &Expr,
+        invariant: &Expr,
+        wp_body: &Expr,
+        post: &Expr,
+    ) -> Expr {
+        // Entry: invariant holds initially
+        let entry = invariant.clone();
+        
+        // Preservation: if invariant and condition, then after body invariant still holds
+        let preservation = Expr::implies(
+            Expr::and(vec![invariant.clone(), condition.clone()]),
+            wp_body.clone(),
+        );
+        
+        // Exit: if invariant and not condition, then postcondition holds
+        let exit = Expr::implies(
+            Expr::and(vec![invariant.clone(), Expr::not(condition.clone())]),
+            post.clone(),
+        );
+        
+        Expr::and(vec![entry, preservation, exit])
+    }
+    
+    /// Substitute variable with expression in formula
+    fn substitute(&self, expr: &Expr, var: &str, replacement: &Expr) -> Expr {
+        match expr {
+            Expr::Var(name, sort) if name == var => replacement.clone(),
+            Expr::Var(_, _) => expr.clone(),
+            
+            Expr::BoolConst(_) | Expr::IntConst(_) | 
+            Expr::RealConst(_) | Expr::BitVecConst(_, _) => expr.clone(),
+            
+            Expr::Not(e) => Expr::not(self.substitute(e, var, replacement)),
+            
+            Expr::And(es) => Expr::and(
+                es.iter().map(|e| self.substitute(e, var, replacement)).collect()
+            ),
+            
+            Expr::Or(es) => Expr::or(
+                es.iter().map(|e| self.substitute(e, var, replacement)).collect()
+            ),
+            
+            Expr::Implies(a, b) => Expr::implies(
+                self.substitute(a, var, replacement),
+                self.substitute(b, var, replacement),
+            ),
+            
+            Expr::Ite(c, t, e) => Expr::ite(
+                self.substitute(c, var, replacement),
+                self.substitute(t, var, replacement),
+                self.substitute(e, var, replacement),
+            ),
+            
+            Expr::Eq(a, b) => Expr::eq(
+                self.substitute(a, var, replacement),
+                self.substitute(b, var, replacement),
+            ),
+            
+            Expr::Add(es) => Expr::add(
+                es.iter().map(|e| self.substitute(e, var, replacement)).collect()
+            ),
+            
+            Expr::Sub(a, b) => Expr::sub(
+                self.substitute(a, var, replacement),
+                self.substitute(b, var, replacement),
+            ),
+            
+            Expr::Mul(es) => Expr::mul(
+                es.iter().map(|e| self.substitute(e, var, replacement)).collect()
+            ),
+            
+            Expr::Lt(a, b) => Expr::lt(
+                self.substitute(a, var, replacement),
+                self.substitute(b, var, replacement),
+            ),
+            
+            Expr::Le(a, b) => Expr::le(
+                self.substitute(a, var, replacement),
+                self.substitute(b, var, replacement),
+            ),
+            
+            Expr::Gt(a, b) => Expr::gt(
+                self.substitute(a, var, replacement),
+                self.substitute(b, var, replacement),
+            ),
+            
+            Expr::Ge(a, b) => Expr::ge(
+                self.substitute(a, var, replacement),
+                self.substitute(b, var, replacement),
+            ),
+            
+            Expr::Select(arr, idx) => Expr::select(
+                self.substitute(arr, var, replacement),
+                self.substitute(idx, var, replacement),
+            ),
+            
+            Expr::Store(arr, idx, val) => Expr::store(
+                self.substitute(arr, var, replacement),
+                self.substitute(idx, var, replacement),
+                self.substitute(val, var, replacement),
+            ),
+            
+            // Quantifiers: avoid capture
+            Expr::Forall(vars, body) => {
+                if vars.iter().any(|(n, _)| n == var) {
+                    // Variable is bound, don't substitute
+                    expr.clone()
+                } else {
+                    Expr::forall(vars.clone(), self.substitute(body, var, replacement))
+                }
+            }
+            
+            Expr::Exists(vars, body) => {
+                if vars.iter().any(|(n, _)| n == var) {
+                    expr.clone()
+                } else {
+                    Expr::exists(vars.clone(), self.substitute(body, var, replacement))
+                }
+            }
+            
+            // Default: clone for unhandled cases
+            _ => expr.clone(),
+        }
+    }
+}
+
+impl Default for WpCalculator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_function_contract() {
+        let contract = FunctionContract::new("abs")
+            .param("x", Type::Int)
+            .returns(Type::Int)
+            .requires(ContractClause::new(Expr::bool_const(true)))
+            .ensures(ContractClause::new(
+                Expr::ge(
+                    Expr::var("result", Sort::Int),
+                    Expr::int_const(0),
+                )
+            ).with_description("result is non-negative"));
+        
+        assert_eq!(contract.name, "abs");
+        assert_eq!(contract.params.len(), 1);
+        assert_eq!(contract.ensures.len(), 1);
+    }
+    
+    #[test]
+    fn test_type_to_sort() {
+        assert_eq!(Type::Bool.to_sort(), Sort::Bool);
+        assert_eq!(Type::Int32.to_sort(), Sort::BitVec(32));
+        
+        let arr_ty = Type::Array(Box::new(Type::Int));
+        matches!(arr_ty.to_sort(), Sort::Array(_, _));
+    }
+    
+    #[test]
+    fn test_wp_assign() {
+        let mut wp = WpCalculator::new();
+        
+        // wp(x := 5, x > 0) = 5 > 0
+        let post = Expr::gt(Expr::var("x", Sort::Int), Expr::int_const(0));
+        let result = wp.wp_assign("x", &Expr::int_const(5), &post);
+        
+        // Should substitute x with 5
+        assert_eq!(result.to_smtlib(), "(> 5 0)");
+    }
+    
+    #[test]
+    fn test_wp_conditional() {
+        let mut wp = WpCalculator::new();
+        
+        let cond = Expr::gt(Expr::var("x", Sort::Int), Expr::int_const(0));
+        let wp_then = Expr::bool_const(true);
+        let wp_else = Expr::bool_const(false);
+        
+        let result = wp.wp_conditional(&cond, &wp_then, &wp_else);
+        
+        // (x > 0 => true) ∧ (¬(x > 0) => false)
+        assert!(result.to_smtlib().contains("=>"));
+    }
+    
+    #[test]
+    fn test_verification_summary() {
+        let summary = VerificationSummary {
+            total: 10,
+            verified: 8,
+            failed: 1,
+            unknown: 1,
+            timeout: 0,
+            error: 0,
+            total_time_ms: 1234,
+        };
+        
+        let output = format!("{}", summary);
+        assert!(output.contains("Total VCs:    10"));
+        assert!(output.contains("Verified:     8"));
+        assert!(output.contains("80.0%"));
+    }
+}

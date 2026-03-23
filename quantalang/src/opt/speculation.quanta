@@ -1,0 +1,827 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Speculation and Branch Prediction
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Speculation and branch prediction optimization:
+//   - Static branch prediction
+//   - Profile-guided branch hints
+//   - Speculative execution optimization
+//   - Branch probability propagation
+//   - Cold path outlining
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::speculation
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BRANCH PROBABILITY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Branch probability (0.0 to 1.0)
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct BranchProbability(f64);
+
+impl BranchProbability {
+    pub const ALWAYS: BranchProbability = BranchProbability(1.0);
+    pub const NEVER: BranchProbability = BranchProbability(0.0);
+    pub const LIKELY: BranchProbability = BranchProbability(0.8);
+    pub const UNLIKELY: BranchProbability = BranchProbability(0.2);
+    pub const EVEN: BranchProbability = BranchProbability(0.5);
+    
+    pub fn new(p: f64) -> Self {
+        BranchProbability(p.clamp(0.0, 1.0))
+    }
+    
+    pub fn value(&self) -> f64 {
+        self.0
+    }
+    
+    pub fn complement(&self) -> BranchProbability {
+        BranchProbability(1.0 - self.0)
+    }
+    
+    pub fn is_likely(&self) -> bool {
+        self.0 >= 0.8
+    }
+    
+    pub fn is_unlikely(&self) -> bool {
+        self.0 <= 0.2
+    }
+    
+    /// Combine probabilities (multiplication)
+    pub fn combine(&self, other: BranchProbability) -> BranchProbability {
+        BranchProbability::new(self.0 * other.0)
+    }
+    
+    /// Scale by a factor
+    pub fn scale(&self, factor: f64) -> BranchProbability {
+        BranchProbability::new(self.0 * factor)
+    }
+}
+
+impl Default for BranchProbability {
+    fn default() -> Self {
+        BranchProbability::EVEN
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BRANCH WEIGHTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Branch weight metadata
+#[derive(Debug, Clone)]
+pub struct BranchWeight {
+    /// True branch weight
+    pub true_weight: u64,
+    /// False branch weight
+    pub false_weight: u64,
+}
+
+impl BranchWeight {
+    pub fn new(true_weight: u64, false_weight: u64) -> Self {
+        BranchWeight { true_weight, false_weight }
+    }
+    
+    pub fn true_probability(&self) -> BranchProbability {
+        let total = self.true_weight + self.false_weight;
+        if total == 0 {
+            BranchProbability::EVEN
+        } else {
+            BranchProbability::new(self.true_weight as f64 / total as f64)
+        }
+    }
+    
+    pub fn false_probability(&self) -> BranchProbability {
+        self.true_probability().complement()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATIC BRANCH PREDICTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Static branch prediction heuristics
+pub struct StaticBranchPredictor {
+    /// Heuristic weights
+    heuristics: Vec<BranchHeuristic>,
+}
+
+/// Branch prediction heuristic
+#[derive(Debug, Clone)]
+pub struct BranchHeuristic {
+    /// Heuristic name
+    pub name: String,
+    /// Confidence level
+    pub confidence: f64,
+    /// Predicted probability for true branch
+    pub true_probability: BranchProbability,
+}
+
+impl StaticBranchPredictor {
+    pub fn new() -> Self {
+        let heuristics = vec![
+            // Pointer null check: pointer is usually not null
+            BranchHeuristic {
+                name: "pointer_not_null".to_string(),
+                confidence: 0.9,
+                true_probability: BranchProbability::new(0.1), // ptr == null is unlikely
+            },
+            // Loop continuation: loops usually continue
+            BranchHeuristic {
+                name: "loop_continuation".to_string(),
+                confidence: 0.85,
+                true_probability: BranchProbability::LIKELY,
+            },
+            // Return comparison: functions usually succeed
+            BranchHeuristic {
+                name: "return_success".to_string(),
+                confidence: 0.75,
+                true_probability: BranchProbability::new(0.25), // error return is unlikely
+            },
+            // Zero comparison: values are usually non-zero
+            BranchHeuristic {
+                name: "non_zero".to_string(),
+                confidence: 0.7,
+                true_probability: BranchProbability::new(0.2), // x == 0 is unlikely
+            },
+            // Negative comparison: values are usually non-negative
+            BranchHeuristic {
+                name: "non_negative".to_string(),
+                confidence: 0.65,
+                true_probability: BranchProbability::new(0.3), // x < 0 is unlikely
+            },
+        ];
+        
+        StaticBranchPredictor { heuristics }
+    }
+    
+    /// Predict branch probability
+    pub fn predict(&self, branch: &BranchInfo) -> BranchProbability {
+        let mut combined_prob = BranchProbability::EVEN;
+        let mut total_confidence = 0.0;
+        
+        for heuristic in &self.heuristics {
+            if let Some(match_confidence) = self.matches_heuristic(branch, heuristic) {
+                let weight = heuristic.confidence * match_confidence;
+                total_confidence += weight;
+                
+                // Weighted combination
+                let weighted_prob = heuristic.true_probability.scale(weight);
+                combined_prob = BranchProbability::new(
+                    (combined_prob.value() * (1.0 - weight / 2.0)) + weighted_prob.value()
+                );
+            }
+        }
+        
+        if total_confidence > 0.0 {
+            combined_prob
+        } else {
+            BranchProbability::EVEN
+        }
+    }
+    
+    fn matches_heuristic(&self, branch: &BranchInfo, heuristic: &BranchHeuristic) -> Option<f64> {
+        match heuristic.name.as_str() {
+            "pointer_not_null" => {
+                if branch.is_null_check {
+                    Some(1.0)
+                } else {
+                    None
+                }
+            }
+            "loop_continuation" => {
+                if branch.is_loop_exit {
+                    Some(1.0)
+                } else {
+                    None
+                }
+            }
+            "return_success" => {
+                if branch.is_error_check {
+                    Some(1.0)
+                } else {
+                    None
+                }
+            }
+            "zero_comparison" => {
+                if branch.compares_to_zero {
+                    Some(0.8)
+                } else {
+                    None
+                }
+            }
+            "non_negative" => {
+                if branch.compares_to_negative {
+                    Some(0.7)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Default for StaticBranchPredictor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Information about a branch for prediction
+#[derive(Debug, Clone, Default)]
+pub struct BranchInfo {
+    /// Is this a null pointer check?
+    pub is_null_check: bool,
+    /// Is this a loop exit condition?
+    pub is_loop_exit: bool,
+    /// Is this an error check?
+    pub is_error_check: bool,
+    /// Does this compare to zero?
+    pub compares_to_zero: bool,
+    /// Does this compare to a negative value?
+    pub compares_to_negative: bool,
+    /// Comparison operator
+    pub comparison: Option<Comparison>,
+}
+
+/// Comparison type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Comparison {
+    Eq, Ne, Lt, Le, Gt, Ge,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BRANCH PROBABILITY ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Branch probability analysis
+pub struct BranchProbabilityAnalysis {
+    /// Static predictor
+    predictor: StaticBranchPredictor,
+    /// Branch probabilities
+    probabilities: BTreeMap<(u32, u32), BranchProbability>,
+    /// Block frequencies (relative)
+    block_freq: BTreeMap<u32, f64>,
+    /// Profile data if available
+    profile: Option<ProfileData>,
+}
+
+/// Profile data for branches
+#[derive(Debug, Clone)]
+pub struct ProfileData {
+    /// Edge counts (from, to) -> count
+    pub edge_counts: BTreeMap<(u32, u32), u64>,
+    /// Block execution counts
+    pub block_counts: BTreeMap<u32, u64>,
+}
+
+impl BranchProbabilityAnalysis {
+    pub fn new() -> Self {
+        BranchProbabilityAnalysis {
+            predictor: StaticBranchPredictor::new(),
+            probabilities: BTreeMap::new(),
+            block_freq: BTreeMap::new(),
+            profile: None,
+        }
+    }
+    
+    /// Set profile data
+    pub fn set_profile(&mut self, profile: ProfileData) {
+        self.profile = Some(profile);
+    }
+    
+    /// Analyze branch probabilities
+    pub fn analyze(&mut self, func: &MirFunction) {
+        self.probabilities.clear();
+        self.block_freq.clear();
+        
+        // Use profile data if available
+        if let Some(profile) = &self.profile {
+            self.analyze_from_profile(func, profile);
+        } else {
+            self.analyze_static(func);
+        }
+        
+        // Compute block frequencies
+        self.compute_block_frequencies(func);
+    }
+    
+    fn analyze_from_profile(&mut self, func: &MirFunction, profile: &ProfileData) {
+        for block in &func.blocks {
+            if let MirTerminator::Branch { then_bb, else_bb, .. } = &block.terminator {
+                let true_count = profile.edge_counts.get(&(block.id, *then_bb)).copied().unwrap_or(0);
+                let false_count = profile.edge_counts.get(&(block.id, *else_bb)).copied().unwrap_or(0);
+                
+                let weight = BranchWeight::new(true_count, false_count);
+                
+                self.probabilities.insert((block.id, *then_bb), weight.true_probability());
+                self.probabilities.insert((block.id, *else_bb), weight.false_probability());
+            }
+        }
+    }
+    
+    fn analyze_static(&mut self, func: &MirFunction) {
+        for block in &func.blocks {
+            if let MirTerminator::Branch { cond, then_bb, else_bb } = &block.terminator {
+                let branch_info = self.extract_branch_info(func, block, cond);
+                let prob = self.predictor.predict(&branch_info);
+                
+                self.probabilities.insert((block.id, *then_bb), prob);
+                self.probabilities.insert((block.id, *else_bb), prob.complement());
+            }
+        }
+    }
+    
+    fn extract_branch_info(&self, func: &MirFunction, block: &MirBlock, cond: &MirOperand) -> BranchInfo {
+        let mut info = BranchInfo::default();
+        
+        // Find the comparison that produces the condition
+        if let MirOperand::Variable(var) = cond {
+            for stmt in &block.statements {
+                if let MirStatement::Compare { dest, op, lhs, rhs } = stmt {
+                    if dest == var {
+                        info.comparison = Some(*op);
+                        
+                        // Check for null comparison
+                        if matches!(rhs, MirOperand::Constant(0)) {
+                            info.compares_to_zero = true;
+                            
+                            if matches!(op, Comparison::Eq | Comparison::Ne) {
+                                info.is_null_check = true;
+                            }
+                        }
+                        
+                        // Check for negative comparison
+                        if let MirOperand::Constant(c) = rhs {
+                            if *c < 0 {
+                                info.compares_to_negative = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Check if this is a loop exit
+        // (simplified - real impl would use loop analysis)
+        
+        info
+    }
+    
+    fn compute_block_frequencies(&mut self, func: &MirFunction) {
+        // Entry block has frequency 1.0
+        if let Some(entry) = func.blocks.first() {
+            self.block_freq.insert(entry.id, 1.0);
+        }
+        
+        // Propagate frequencies
+        let mut changed = true;
+        let mut iterations = 0;
+        
+        while changed && iterations < 100 {
+            changed = false;
+            iterations += 1;
+            
+            for block in &func.blocks {
+                if self.block_freq.contains_key(&block.id) {
+                    let freq = *self.block_freq.get(&block.id).unwrap();
+                    
+                    // Propagate to successors
+                    match &block.terminator {
+                        MirTerminator::Goto(target) => {
+                            changed |= self.update_freq(*target, freq);
+                        }
+                        MirTerminator::Branch { then_bb, else_bb, .. } => {
+                            let then_prob = self.probabilities.get(&(block.id, *then_bb))
+                                .copied()
+                                .unwrap_or(BranchProbability::EVEN);
+                            let else_prob = self.probabilities.get(&(block.id, *else_bb))
+                                .copied()
+                                .unwrap_or(BranchProbability::EVEN);
+                            
+                            changed |= self.update_freq(*then_bb, freq * then_prob.value());
+                            changed |= self.update_freq(*else_bb, freq * else_prob.value());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    
+    fn update_freq(&mut self, block: u32, additional: f64) -> bool {
+        let current = self.block_freq.entry(block).or_insert(0.0);
+        let new_freq = *current + additional;
+        
+        if (new_freq - *current).abs() > 0.001 {
+            *current = new_freq;
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Get branch probability
+    pub fn get_probability(&self, from: u32, to: u32) -> BranchProbability {
+        self.probabilities.get(&(from, to))
+            .copied()
+            .unwrap_or(BranchProbability::EVEN)
+    }
+    
+    /// Get block frequency
+    pub fn get_frequency(&self, block: u32) -> f64 {
+        self.block_freq.get(&block).copied().unwrap_or(0.0)
+    }
+    
+    /// Check if block is hot (frequently executed)
+    pub fn is_hot_block(&self, block: u32) -> bool {
+        self.get_frequency(block) >= 0.5
+    }
+    
+    /// Check if block is cold (rarely executed)
+    pub fn is_cold_block(&self, block: u32) -> bool {
+        self.get_frequency(block) < 0.1
+    }
+}
+
+impl Default for BranchProbabilityAnalysis {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BRANCH HINT INSERTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Branch hint insertion pass
+pub struct BranchHintInsertion {
+    /// Probability analysis
+    analysis: BranchProbabilityAnalysis,
+    /// Statistics
+    stats: BranchHintStats,
+}
+
+/// Statistics for branch hint insertion
+#[derive(Debug, Clone, Default)]
+pub struct BranchHintStats {
+    /// Branches analyzed
+    pub branches_analyzed: usize,
+    /// Likely hints inserted
+    pub likely_hints: usize,
+    /// Unlikely hints inserted
+    pub unlikely_hints: usize,
+    /// Cold blocks identified
+    pub cold_blocks: usize,
+}
+
+impl BranchHintInsertion {
+    pub fn new() -> Self {
+        BranchHintInsertion {
+            analysis: BranchProbabilityAnalysis::new(),
+            stats: BranchHintStats::default(),
+        }
+    }
+    
+    /// Set profile data
+    pub fn set_profile(&mut self, profile: ProfileData) {
+        self.analysis.set_profile(profile);
+    }
+    
+    /// Run branch hint insertion
+    pub fn run(&mut self, func: &mut MirFunction) -> &BranchHintStats {
+        self.stats = BranchHintStats::default();
+        
+        // Analyze probabilities
+        self.analysis.analyze(func);
+        
+        // Insert hints
+        for block in &mut func.blocks {
+            self.process_block(block);
+        }
+        
+        // Identify cold blocks
+        for block in &func.blocks {
+            if self.analysis.is_cold_block(block.id) {
+                self.stats.cold_blocks += 1;
+            }
+        }
+        
+        &self.stats
+    }
+    
+    fn process_block(&mut self, block: &mut MirBlock) {
+        if let MirTerminator::Branch { then_bb, else_bb, hint, .. } = &mut block.terminator {
+            self.stats.branches_analyzed += 1;
+            
+            let then_prob = self.analysis.get_probability(block.id, *then_bb);
+            let else_prob = self.analysis.get_probability(block.id, *else_bb);
+            
+            if then_prob.is_likely() {
+                *hint = Some(BranchHint::Likely);
+                self.stats.likely_hints += 1;
+            } else if else_prob.is_likely() {
+                *hint = Some(BranchHint::Unlikely);
+                self.stats.unlikely_hints += 1;
+            }
+        }
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &BranchHintStats {
+        &self.stats
+    }
+}
+
+impl Default for BranchHintInsertion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COLD PATH OUTLINING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cold path outlining pass
+pub struct ColdPathOutlining {
+    /// Probability analysis
+    analysis: BranchProbabilityAnalysis,
+    /// Outlined functions
+    outlined: Vec<MirFunction>,
+    /// Statistics
+    stats: OutliningStats,
+}
+
+/// Statistics for cold path outlining
+#[derive(Debug, Clone, Default)]
+pub struct OutliningStats {
+    /// Blocks analyzed
+    pub blocks_analyzed: usize,
+    /// Cold paths found
+    pub cold_paths: usize,
+    /// Functions outlined
+    pub functions_outlined: usize,
+}
+
+impl ColdPathOutlining {
+    pub fn new() -> Self {
+        ColdPathOutlining {
+            analysis: BranchProbabilityAnalysis::new(),
+            outlined: Vec::new(),
+            stats: OutliningStats::default(),
+        }
+    }
+    
+    /// Run cold path outlining
+    pub fn run(&mut self, func: &mut MirFunction) -> &OutliningStats {
+        self.stats = OutliningStats::default();
+        self.outlined.clear();
+        
+        // Analyze probabilities
+        self.analysis.analyze(func);
+        
+        // Find cold regions
+        let cold_blocks = self.find_cold_regions(func);
+        self.stats.blocks_analyzed = func.blocks.len();
+        self.stats.cold_paths = cold_blocks.len();
+        
+        // Outline cold regions
+        for region in cold_blocks {
+            if region.len() >= 2 {
+                self.outline_region(func, &region);
+                self.stats.functions_outlined += 1;
+            }
+        }
+        
+        &self.stats
+    }
+    
+    fn find_cold_regions(&self, func: &MirFunction) -> Vec<Vec<u32>> {
+        let mut regions = Vec::new();
+        let mut visited = BTreeSet::new();
+        
+        for block in &func.blocks {
+            if visited.contains(&block.id) {
+                continue;
+            }
+            
+            if self.analysis.is_cold_block(block.id) {
+                // Start a cold region
+                let region = self.expand_cold_region(func, block.id, &mut visited);
+                if !region.is_empty() {
+                    regions.push(region);
+                }
+            }
+        }
+        
+        regions
+    }
+    
+    fn expand_cold_region(&self, func: &MirFunction, start: u32, visited: &mut BTreeSet<u32>) -> Vec<u32> {
+        let mut region = Vec::new();
+        let mut worklist = vec![start];
+        
+        while let Some(block_id) = worklist.pop() {
+            if visited.contains(&block_id) {
+                continue;
+            }
+            
+            if !self.analysis.is_cold_block(block_id) {
+                continue;
+            }
+            
+            visited.insert(block_id);
+            region.push(block_id);
+            
+            // Add cold successors
+            if let Some(block) = func.blocks.iter().find(|b| b.id == block_id) {
+                for succ in self.get_successors(block) {
+                    if !visited.contains(&succ) && self.analysis.is_cold_block(succ) {
+                        worklist.push(succ);
+                    }
+                }
+            }
+        }
+        
+        region
+    }
+    
+    fn get_successors(&self, block: &MirBlock) -> Vec<u32> {
+        match &block.terminator {
+            MirTerminator::Goto(t) => vec![*t],
+            MirTerminator::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+            _ => vec![],
+        }
+    }
+    
+    fn outline_region(&mut self, func: &mut MirFunction, region: &[u32]) {
+        // Create outlined function
+        let outlined_name = format!("{}_cold_{}", func.name, self.outlined.len());
+        
+        // Extract blocks
+        let mut outlined_blocks = Vec::new();
+        for &block_id in region {
+            if let Some(idx) = func.blocks.iter().position(|b| b.id == block_id) {
+                outlined_blocks.push(func.blocks[idx].clone());
+            }
+        }
+        
+        if outlined_blocks.is_empty() {
+            return;
+        }
+        
+        let outlined_func = MirFunction {
+            name: outlined_name.clone(),
+            blocks: outlined_blocks,
+        };
+        
+        self.outlined.push(outlined_func);
+        
+        // Replace region entry with call to outlined function
+        // (simplified - real implementation would handle parameters/returns)
+    }
+    
+    /// Get outlined functions
+    pub fn get_outlined(&self) -> &[MirFunction] {
+        &self.outlined
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &OutliningStats {
+        &self.stats
+    }
+}
+
+impl Default for ColdPathOutlining {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Branch hint
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchHint {
+    Likely,
+    Unlikely,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    Compare { dest: String, op: Comparison, lhs: MirOperand, rhs: MirOperand },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32, hint: Option<BranchHint> },
+    Return { value: Option<MirOperand> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_branch_probability() {
+        let p = BranchProbability::new(0.75);
+        assert_eq!(p.complement().value(), 0.25);
+        assert!(!p.is_likely());
+        assert!(!p.is_unlikely());
+    }
+    
+    #[test]
+    fn test_branch_weight() {
+        let w = BranchWeight::new(80, 20);
+        assert!((w.true_probability().value() - 0.8).abs() < 0.001);
+    }
+    
+    #[test]
+    fn test_static_prediction() {
+        let predictor = StaticBranchPredictor::new();
+        
+        // Null check should predict unlikely
+        let info = BranchInfo {
+            is_null_check: true,
+            compares_to_zero: true,
+            comparison: Some(Comparison::Eq),
+            ..Default::default()
+        };
+        
+        let prob = predictor.predict(&info);
+        assert!(prob.is_unlikely());
+    }
+    
+    #[test]
+    fn test_branch_hints() {
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![],
+                    terminator: MirTerminator::Branch {
+                        cond: MirOperand::Variable("c".to_string()),
+                        then_bb: 1,
+                        else_bb: 2,
+                        hint: None,
+                    },
+                },
+                MirBlock {
+                    id: 1,
+                    statements: vec![],
+                    terminator: MirTerminator::Return { value: None },
+                },
+                MirBlock {
+                    id: 2,
+                    statements: vec![],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let mut pass = BranchHintInsertion::new();
+        pass.run(&mut func);
+        
+        assert_eq!(pass.stats().branches_analyzed, 1);
+    }
+}

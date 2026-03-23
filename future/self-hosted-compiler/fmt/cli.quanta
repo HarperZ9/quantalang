@@ -1,0 +1,757 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ FORMATTER — CLI Driver
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Command-line interface for the QuantaLang formatter (quantafmt).
+//
+// Usage:
+//   quantafmt [OPTIONS] [FILES...]
+//
+// Options:
+//   --check             Check if files are formatted (exit 1 if not)
+//   --diff              Show diff of changes
+//   --write             Write changes to files (default: stdout)
+//   --stdin             Format stdin
+//   --config <FILE>     Use custom config file
+//   --print-config      Print effective configuration
+//   --verbose           Verbose output
+//   --quiet             Suppress non-error output
+//   --edition <YEAR>    Edition to use (2024, 2025)
+//   --help              Show help
+//   --version           Show version
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::fmt::cli
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::format;
+use std::path::{Path, PathBuf};
+use std::io::{self, Read, Write};
+use std::fs;
+use crate::fmt::config::{Config, EmitMode, Edition, ConfigError};
+use crate::fmt::printer::{Doc, Printer};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+pub const CONFIG_FILE: &str = ".quantafmt.toml";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLI OPTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// CLI options
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// Files to format
+    pub files: Vec<PathBuf>,
+    
+    /// Check mode (don't write, exit 1 if changes needed)
+    pub check: bool,
+    
+    /// Show diff
+    pub diff: bool,
+    
+    /// Write to files (vs stdout)
+    pub write: bool,
+    
+    /// Read from stdin
+    pub stdin: bool,
+    
+    /// Custom config file
+    pub config_path: Option<PathBuf>,
+    
+    /// Print effective config
+    pub print_config: bool,
+    
+    /// Verbose output
+    pub verbose: bool,
+    
+    /// Quiet mode
+    pub quiet: bool,
+    
+    /// Edition override
+    pub edition: Option<Edition>,
+    
+    /// Emit mode
+    pub emit_mode: Option<EmitMode>,
+    
+    /// Skip children (don't recurse into directories)
+    pub skip_children: bool,
+    
+    /// Error on unformatted
+    pub error_on_unformatted: bool,
+    
+    /// Backup files before overwriting
+    pub backup: bool,
+    
+    /// File name for stdin
+    pub stdin_filepath: Option<PathBuf>,
+    
+    /// Color output
+    pub color: ColorChoice,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            files: Vec::new(),
+            check: false,
+            diff: false,
+            write: false,
+            stdin: false,
+            config_path: None,
+            print_config: false,
+            verbose: false,
+            quiet: false,
+            edition: None,
+            emit_mode: None,
+            skip_children: false,
+            error_on_unformatted: false,
+            backup: false,
+            stdin_filepath: None,
+            color: ColorChoice::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorChoice {
+    Auto,
+    Always,
+    Never,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ARGUMENT PARSING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parse command-line arguments
+pub fn parse_args(args: &[String]) -> Result<Options, String> {
+    let mut opts = Options::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("quantafmt {}", VERSION);
+                std::process::exit(0);
+            }
+            "-c" | "--check" => {
+                opts.check = true;
+                opts.emit_mode = Some(EmitMode::Check);
+            }
+            "-d" | "--diff" => {
+                opts.diff = true;
+                opts.emit_mode = Some(EmitMode::Diff);
+            }
+            "-w" | "--write" => {
+                opts.write = true;
+                opts.emit_mode = Some(EmitMode::Overwrite);
+            }
+            "--stdin" => {
+                opts.stdin = true;
+            }
+            "--stdin-filepath" => {
+                i += 1;
+                opts.stdin_filepath = args.get(i).map(PathBuf::from);
+            }
+            "--config" | "--config-path" => {
+                i += 1;
+                opts.config_path = args.get(i).map(PathBuf::from);
+            }
+            "--print-config" => {
+                opts.print_config = true;
+            }
+            "-v" | "--verbose" => {
+                opts.verbose = true;
+            }
+            "-q" | "--quiet" => {
+                opts.quiet = true;
+            }
+            "--edition" => {
+                i += 1;
+                if let Some(ed) = args.get(i) {
+                    opts.edition = Some(Edition::from_str(ed)?);
+                }
+            }
+            "--emit" => {
+                i += 1;
+                if let Some(mode) = args.get(i) {
+                    opts.emit_mode = Some(EmitMode::from_str(mode)?);
+                }
+            }
+            "--skip-children" => {
+                opts.skip_children = true;
+            }
+            "--error-on-unformatted" => {
+                opts.error_on_unformatted = true;
+            }
+            "--backup" => {
+                opts.backup = true;
+            }
+            "--color" => {
+                i += 1;
+                opts.color = match args.get(i).map(|s| s.as_str()) {
+                    Some("always") => ColorChoice::Always,
+                    Some("never") => ColorChoice::Never,
+                    _ => ColorChoice::Auto,
+                };
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("unknown option: {}", arg));
+            }
+            _ => {
+                opts.files.push(PathBuf::from(arg));
+            }
+        }
+        
+        i += 1;
+    }
+    
+    // Set default emit mode if not specified
+    if opts.emit_mode.is_none() {
+        opts.emit_mode = Some(if opts.write {
+            EmitMode::Overwrite
+        } else {
+            EmitMode::Stdout
+        });
+    }
+    
+    Ok(opts)
+}
+
+fn print_help() {
+    println!(r#"quantafmt - QuantaLang Code Formatter
+
+USAGE:
+    quantafmt [OPTIONS] [FILES...]
+
+OPTIONS:
+    -h, --help              Show this help message
+    -V, --version           Show version
+    -c, --check             Check if files are formatted (exit 1 if not)
+    -d, --diff              Show diff of changes
+    -w, --write             Write changes to files
+    --stdin                 Read from stdin
+    --stdin-filepath PATH   File path to use for stdin (for config lookup)
+    --config PATH           Path to config file
+    --print-config          Print effective configuration
+    -v, --verbose           Verbose output
+    -q, --quiet             Suppress non-error output
+    --edition YEAR          Edition (2024, 2025)
+    --emit MODE             Output mode (overwrite, stdout, diff, check)
+    --skip-children         Don't recurse into directories
+    --error-on-unformatted  Exit with error if files need formatting
+    --backup                Create backup before overwriting
+    --color WHEN            Color output (auto, always, never)
+
+EXAMPLES:
+    quantafmt src/main.quanta           Format file to stdout
+    quantafmt -w src/                   Format all files in directory
+    quantafmt --check src/              Check if files are formatted
+    quantafmt --diff src/main.quanta    Show diff of changes
+    cat code.quanta | quantafmt --stdin Format from stdin
+
+CONFIGURATION:
+    Config files are searched in order:
+    1. Path specified with --config
+    2. .quantafmt.toml in current directory
+    3. .quantafmt.toml in parent directories
+    4. Default configuration
+
+    See documentation for config options.
+"#);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FORMATTER DRIVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Format result
+#[derive(Debug)]
+pub struct FormatResult {
+    pub path: Option<PathBuf>,
+    pub original: String,
+    pub formatted: String,
+    pub changed: bool,
+    pub error: Option<String>,
+}
+
+impl FormatResult {
+    pub fn is_changed(&self) -> bool {
+        self.changed
+    }
+    
+    pub fn diff(&self) -> String {
+        if !self.changed {
+            return String::new();
+        }
+        compute_diff(&self.original, &self.formatted)
+    }
+}
+
+/// Run the formatter with given options
+pub fn run(opts: &Options) -> Result<i32, String> {
+    // Load configuration
+    let config = load_config(opts)?;
+    
+    // Print config if requested
+    if opts.print_config {
+        println!("{}", config.to_toml());
+        return Ok(0);
+    }
+    
+    // Handle stdin
+    if opts.stdin {
+        return run_stdin(opts, &config);
+    }
+    
+    // Collect files
+    let files = collect_files(&opts.files, opts.skip_children)?;
+    
+    if files.is_empty() {
+        if !opts.quiet {
+            eprintln!("No input files");
+        }
+        return Ok(0);
+    }
+    
+    // Format each file
+    let mut changed_count = 0;
+    let mut error_count = 0;
+    
+    for path in &files {
+        match format_file(path, &config) {
+            Ok(result) => {
+                if result.changed {
+                    changed_count += 1;
+                }
+                
+                handle_result(opts, &result)?;
+            }
+            Err(e) => {
+                error_count += 1;
+                if !opts.quiet {
+                    eprintln!("error: {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+    
+    // Summary
+    if opts.verbose && !opts.quiet {
+        eprintln!(
+            "\nFormatted {} files, {} changed, {} errors",
+            files.len(),
+            changed_count,
+            error_count
+        );
+    }
+    
+    // Exit code
+    if error_count > 0 {
+        return Ok(1);
+    }
+    
+    if opts.check && changed_count > 0 {
+        return Ok(1);
+    }
+    
+    if opts.error_on_unformatted && changed_count > 0 {
+        return Ok(1);
+    }
+    
+    Ok(0)
+}
+
+fn run_stdin(opts: &Options, config: &Config) -> Result<i32, String> {
+    let mut input = String::new();
+    io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|e| format!("failed to read stdin: {}", e))?;
+    
+    let result = format_string(&input, config);
+    
+    match result {
+        Ok(formatted) => {
+            let changed = formatted != input;
+            
+            if opts.check {
+                return Ok(if changed { 1 } else { 0 });
+            }
+            
+            if opts.diff {
+                let diff = compute_diff(&input, &formatted);
+                print!("{}", diff);
+            } else {
+                print!("{}", formatted);
+            }
+            
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            Ok(1)
+        }
+    }
+}
+
+/// Load configuration from file or defaults
+fn load_config(opts: &Options) -> Result<Config, String> {
+    // Use specified config path
+    if let Some(ref path) = opts.config_path {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("failed to read config: {}", e))?;
+        let mut config = Config::from_toml(&content)
+            .map_err(|e| format!("failed to parse config: {}", e))?;
+        apply_overrides(&mut config, opts);
+        return Ok(config);
+    }
+    
+    // Search for config file
+    if let Some(path) = find_config_file() {
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read config: {}", e))?;
+        let mut config = Config::from_toml(&content)
+            .map_err(|e| format!("failed to parse config: {}", e))?;
+        apply_overrides(&mut config, opts);
+        return Ok(config);
+    }
+    
+    // Use defaults
+    let mut config = Config::default();
+    apply_overrides(&mut config, opts);
+    Ok(config)
+}
+
+fn apply_overrides(config: &mut Config, opts: &Options) {
+    if let Some(edition) = opts.edition {
+        config.edition = edition;
+    }
+    if let Some(emit_mode) = opts.emit_mode {
+        config.emit_mode = emit_mode;
+    }
+}
+
+/// Find config file in current directory or parents
+fn find_config_file() -> Option<PathBuf> {
+    let mut current = std::env::current_dir().ok()?;
+    
+    loop {
+        let config_path = current.join(CONFIG_FILE);
+        if config_path.exists() {
+            return Some(config_path);
+        }
+        
+        if !current.pop() {
+            break;
+        }
+    }
+    
+    None
+}
+
+/// Collect files to format
+fn collect_files(paths: &[PathBuf], skip_children: bool) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    
+    for path in paths {
+        if path.is_file() {
+            if is_quanta_file(path) {
+                files.push(path.clone());
+            }
+        } else if path.is_dir() && !skip_children {
+            collect_directory(&mut files, path)?;
+        }
+    }
+    
+    files.sort();
+    files.dedup();
+    
+    Ok(files)
+}
+
+fn collect_directory(files: &mut Vec<PathBuf>, dir: &Path) -> Result<(), String> {
+    let entries = fs::read_dir(dir)
+        .map_err(|e| format!("failed to read directory {}: {}", dir.display(), e))?;
+    
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("failed to read entry: {}", e))?;
+        let path = entry.path();
+        
+        // Skip hidden files and target directories
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with('.') || name == "target" {
+                continue;
+            }
+        }
+        
+        if path.is_file() && is_quanta_file(&path) {
+            files.push(path);
+        } else if path.is_dir() {
+            collect_directory(files, &path)?;
+        }
+    }
+    
+    Ok(())
+}
+
+fn is_quanta_file(path: &Path) -> bool {
+    path.extension()
+        .map(|ext| ext == "quanta")
+        .unwrap_or(false)
+}
+
+/// Format a file
+pub fn format_file(path: &Path, config: &Config) -> Result<FormatResult, String> {
+    let original = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read file: {}", e))?;
+    
+    let formatted = format_string(&original, config)?;
+    let changed = formatted != original;
+    
+    Ok(FormatResult {
+        path: Some(path.to_path_buf()),
+        original,
+        formatted,
+        changed,
+        error: None,
+    })
+}
+
+/// Format a string
+pub fn format_string(source: &str, config: &Config) -> Result<String, String> {
+    // Parse source to AST
+    let ast = parse_source(source)?;
+    
+    // Visit AST to create document
+    let visitor = crate::fmt::visitor::FormatVisitor::new(config);
+    let doc = visitor.visit_source_file(&ast);
+    
+    // Print document
+    let mut printer = Printer::new(config.clone());
+    Ok(printer.print(&doc))
+}
+
+/// Parse source code (simplified - would use actual parser)
+fn parse_source(source: &str) -> Result<crate::fmt::visitor::SourceFile, String> {
+    // This is a placeholder - actual implementation would use the QuantaLang parser
+    // For now, return a minimal AST
+    Ok(crate::fmt::visitor::SourceFile {
+        shebang: None,
+        attrs: Vec::new(),
+        items: Vec::new(),
+    })
+}
+
+/// Handle format result based on options
+fn handle_result(opts: &Options, result: &FormatResult) -> Result<(), String> {
+    let emit_mode = opts.emit_mode.unwrap_or(EmitMode::Stdout);
+    
+    match emit_mode {
+        EmitMode::Stdout => {
+            print!("{}", result.formatted);
+        }
+        EmitMode::Diff => {
+            if result.changed {
+                let diff = result.diff();
+                print!("{}", colorize_diff(&diff, opts.color));
+            }
+        }
+        EmitMode::Check => {
+            if result.changed {
+                if let Some(ref path) = result.path {
+                    if !opts.quiet {
+                        eprintln!("would reformat: {}", path.display());
+                    }
+                }
+            }
+        }
+        EmitMode::Overwrite => {
+            if result.changed {
+                if let Some(ref path) = result.path {
+                    // Create backup if requested
+                    if opts.backup {
+                        let backup_path = path.with_extension("quanta.bak");
+                        fs::write(&backup_path, &result.original)
+                            .map_err(|e| format!("failed to create backup: {}", e))?;
+                    }
+                    
+                    // Write formatted content
+                    fs::write(path, &result.formatted)
+                        .map_err(|e| format!("failed to write file: {}", e))?;
+                    
+                    if opts.verbose && !opts.quiet {
+                        eprintln!("formatted: {}", path.display());
+                    }
+                }
+            }
+        }
+        EmitMode::Coverage => {
+            // Coverage info (for IDE integration)
+        }
+    }
+    
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DIFF
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compute unified diff between two strings
+fn compute_diff(original: &str, formatted: &str) -> String {
+    let mut diff = String::new();
+    
+    let old_lines: Vec<&str> = original.lines().collect();
+    let new_lines: Vec<&str> = formatted.lines().collect();
+    
+    // Simple line-by-line diff
+    let mut old_idx = 0;
+    let mut new_idx = 0;
+    
+    while old_idx < old_lines.len() || new_idx < new_lines.len() {
+        let old_line = old_lines.get(old_idx);
+        let new_line = new_lines.get(new_idx);
+        
+        match (old_line, new_line) {
+            (Some(o), Some(n)) if o == n => {
+                diff.push_str(&format!(" {}\n", o));
+                old_idx += 1;
+                new_idx += 1;
+            }
+            (Some(o), Some(n)) => {
+                diff.push_str(&format!("-{}\n", o));
+                diff.push_str(&format!("+{}\n", n));
+                old_idx += 1;
+                new_idx += 1;
+            }
+            (Some(o), None) => {
+                diff.push_str(&format!("-{}\n", o));
+                old_idx += 1;
+            }
+            (None, Some(n)) => {
+                diff.push_str(&format!("+{}\n", n));
+                new_idx += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    
+    diff
+}
+
+/// Colorize diff output
+fn colorize_diff(diff: &str, color: ColorChoice) -> String {
+    let use_color = match color {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => atty::is(atty::Stream::Stdout),
+    };
+    
+    if !use_color {
+        return diff.to_string();
+    }
+    
+    let mut result = String::new();
+    
+    for line in diff.lines() {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            result.push_str("\x1b[32m"); // Green
+            result.push_str(line);
+            result.push_str("\x1b[0m\n");
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            result.push_str("\x1b[31m"); // Red
+            result.push_str(line);
+            result.push_str("\x1b[0m\n");
+        } else if line.starts_with("@@") {
+            result.push_str("\x1b[36m"); // Cyan
+            result.push_str(line);
+            result.push_str("\x1b[0m\n");
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    
+    result
+}
+
+/// TTY detection stub
+mod atty {
+    pub enum Stream {
+        Stdout,
+        Stderr,
+    }
+    
+    pub fn is(_stream: Stream) -> bool {
+        // In production, use actual TTY detection
+        true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Main entry point
+pub fn main() -> Result<i32, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let opts = parse_args(&args)?;
+    run(&opts)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_parse_args_check() {
+        let args = vec!["--check".to_string(), "src/".to_string()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.check);
+        assert_eq!(opts.files.len(), 1);
+    }
+    
+    #[test]
+    fn test_parse_args_write() {
+        let args = vec!["-w".to_string(), "file.quanta".to_string()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.write);
+    }
+    
+    #[test]
+    fn test_compute_diff() {
+        let original = "line1\nline2\nline3\n";
+        let formatted = "line1\nmodified\nline3\n";
+        
+        let diff = compute_diff(original, formatted);
+        assert!(diff.contains("-line2"));
+        assert!(diff.contains("+modified"));
+    }
+    
+    #[test]
+    fn test_is_quanta_file() {
+        assert!(is_quanta_file(Path::new("test.quanta")));
+        assert!(!is_quanta_file(Path::new("test.rs")));
+        assert!(!is_quanta_file(Path::new("test")));
+    }
+}

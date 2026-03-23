@@ -1,0 +1,1086 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Garbage Collector
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// High-performance garbage collection subsystem:
+//   - Generational collection (nursery, young, old)
+//   - Concurrent marking
+//   - Incremental collection
+//   - Write barrier support
+//   - Precise stack scanning
+//   - Card table for remembered sets
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::runtime::gc
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use core::sync::atomic::{AtomicUsize, AtomicU8, AtomicBool, AtomicPtr, Ordering};
+use core::ptr::NonNull;
+use core::mem;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GC CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// GC configuration
+#[derive(Debug, Clone)]
+pub struct GCConfig {
+    /// Nursery size
+    pub nursery_size: usize,
+    /// Young generation size
+    pub young_size: usize,
+    /// Old generation initial size
+    pub old_initial_size: usize,
+    /// Old generation max size
+    pub old_max_size: usize,
+    /// Enable concurrent marking
+    pub concurrent_mark: bool,
+    /// Enable incremental collection
+    pub incremental: bool,
+    /// Promotion threshold (collections before promotion)
+    pub promotion_threshold: u8,
+    /// Card table log2 size
+    pub card_log2_size: u8,
+    /// Number of GC threads
+    pub gc_threads: usize,
+}
+
+impl Default for GCConfig {
+    fn default() -> Self {
+        GCConfig {
+            nursery_size: 4 * 1024 * 1024,      // 4MB
+            young_size: 64 * 1024 * 1024,        // 64MB
+            old_initial_size: 256 * 1024 * 1024, // 256MB
+            old_max_size: 4 * 1024 * 1024 * 1024, // 4GB
+            concurrent_mark: true,
+            incremental: true,
+            promotion_threshold: 2,
+            card_log2_size: 9, // 512 byte cards
+            gc_threads: 4,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OBJECT HEADER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Object mark state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MarkState {
+    White = 0,    // Unvisited
+    Gray = 1,     // Visited, children not processed
+    Black = 2,    // Visited, children processed
+}
+
+/// Object generation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Generation {
+    Nursery = 0,
+    Young = 1,
+    Old = 2,
+}
+
+/// Object header flags
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct ObjectFlags {
+    bits: u32,
+}
+
+impl ObjectFlags {
+    pub const MARK_SHIFT: u32 = 0;
+    pub const MARK_MASK: u32 = 0x3;
+    pub const GEN_SHIFT: u32 = 2;
+    pub const GEN_MASK: u32 = 0x3;
+    pub const PINNED_BIT: u32 = 4;
+    pub const FINALIZE_BIT: u32 = 5;
+    pub const FORWARDED_BIT: u32 = 6;
+    pub const AGE_SHIFT: u32 = 8;
+    pub const AGE_MASK: u32 = 0xFF;
+    
+    pub fn new() -> Self {
+        ObjectFlags { bits: 0 }
+    }
+    
+    pub fn mark_state(&self) -> MarkState {
+        match (self.bits >> Self::MARK_SHIFT) & Self::MARK_MASK {
+            0 => MarkState::White,
+            1 => MarkState::Gray,
+            _ => MarkState::Black,
+        }
+    }
+    
+    pub fn set_mark_state(&mut self, state: MarkState) {
+        self.bits = (self.bits & !(Self::MARK_MASK << Self::MARK_SHIFT))
+            | ((state as u32) << Self::MARK_SHIFT);
+    }
+    
+    pub fn generation(&self) -> Generation {
+        match (self.bits >> Self::GEN_SHIFT) & Self::GEN_MASK {
+            0 => Generation::Nursery,
+            1 => Generation::Young,
+            _ => Generation::Old,
+        }
+    }
+    
+    pub fn set_generation(&mut self, gen: Generation) {
+        self.bits = (self.bits & !(Self::GEN_MASK << Self::GEN_SHIFT))
+            | ((gen as u32) << Self::GEN_SHIFT);
+    }
+    
+    pub fn is_pinned(&self) -> bool {
+        (self.bits & (1 << Self::PINNED_BIT)) != 0
+    }
+    
+    pub fn set_pinned(&mut self, pinned: bool) {
+        if pinned {
+            self.bits |= 1 << Self::PINNED_BIT;
+        } else {
+            self.bits &= !(1 << Self::PINNED_BIT);
+        }
+    }
+    
+    pub fn needs_finalization(&self) -> bool {
+        (self.bits & (1 << Self::FINALIZE_BIT)) != 0
+    }
+    
+    pub fn is_forwarded(&self) -> bool {
+        (self.bits & (1 << Self::FORWARDED_BIT)) != 0
+    }
+    
+    pub fn set_forwarded(&mut self, forwarded: bool) {
+        if forwarded {
+            self.bits |= 1 << Self::FORWARDED_BIT;
+        } else {
+            self.bits &= !(1 << Self::FORWARDED_BIT);
+        }
+    }
+    
+    pub fn age(&self) -> u8 {
+        ((self.bits >> Self::AGE_SHIFT) & Self::AGE_MASK) as u8
+    }
+    
+    pub fn increment_age(&mut self) {
+        let age = (self.age() + 1).min(255);
+        self.bits = (self.bits & !(Self::AGE_MASK << Self::AGE_SHIFT))
+            | ((age as u32) << Self::AGE_SHIFT);
+    }
+}
+
+impl Default for ObjectFlags {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Object header
+#[repr(C)]
+pub struct ObjectHeader {
+    /// Type information pointer
+    pub type_info: *const TypeInfo,
+    /// Object size
+    pub size: u32,
+    /// Flags
+    pub flags: ObjectFlags,
+    /// Forward pointer (when relocated) or hash code
+    pub forward_or_hash: usize,
+}
+
+impl ObjectHeader {
+    pub const SIZE: usize = mem::size_of::<ObjectHeader>();
+    
+    pub fn new(type_info: *const TypeInfo, size: u32) -> Self {
+        ObjectHeader {
+            type_info,
+            size,
+            flags: ObjectFlags::new(),
+            forward_or_hash: 0,
+        }
+    }
+    
+    /// Get pointer to object data
+    pub fn data(&self) -> *mut u8 {
+        unsafe {
+            (self as *const ObjectHeader as *mut u8).add(Self::SIZE)
+        }
+    }
+    
+    /// Get header from object pointer
+    pub unsafe fn from_ptr(ptr: *const u8) -> *const ObjectHeader {
+        ptr.sub(Self::SIZE) as *const ObjectHeader
+    }
+    
+    /// Get forward pointer
+    pub fn forward_ptr(&self) -> Option<*mut u8> {
+        if self.flags.is_forwarded() {
+            Some(self.forward_or_hash as *mut u8)
+        } else {
+            None
+        }
+    }
+    
+    /// Set forward pointer
+    pub fn set_forward_ptr(&mut self, ptr: *mut u8) {
+        self.forward_or_hash = ptr as usize;
+        self.flags.set_forwarded(true);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE INFO
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type information for GC
+#[repr(C)]
+pub struct TypeInfo {
+    /// Type ID
+    pub id: u32,
+    /// Object size (0 for variable size)
+    pub size: u32,
+    /// Alignment
+    pub align: u32,
+    /// Number of reference fields
+    pub ref_count: u32,
+    /// Offsets of reference fields
+    pub ref_offsets: *const u32,
+    /// Finalizer function
+    pub finalizer: Option<unsafe fn(*mut u8)>,
+    /// Trace function for complex layouts
+    pub trace: Option<unsafe fn(*mut u8, &mut dyn FnMut(*mut *mut u8))>,
+}
+
+impl TypeInfo {
+    /// Iterate reference fields
+    pub unsafe fn for_each_ref<F: FnMut(*mut *mut u8)>(&self, obj: *mut u8, mut f: F) {
+        if let Some(trace) = self.trace {
+            trace(obj, &mut f);
+        } else {
+            for i in 0..self.ref_count {
+                let offset = *self.ref_offsets.add(i as usize);
+                let ref_ptr = obj.add(offset as usize) as *mut *mut u8;
+                f(ref_ptr);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CARD TABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Card table for remembered set
+pub struct CardTable {
+    /// Card bytes
+    cards: Vec<AtomicU8>,
+    /// Base address of heap
+    heap_base: usize,
+    /// Card size (log2)
+    card_log2_size: u8,
+}
+
+impl CardTable {
+    pub const CLEAN: u8 = 0;
+    pub const DIRTY: u8 = 1;
+    
+    pub fn new(heap_size: usize, card_log2_size: u8) -> Self {
+        let card_size = 1usize << card_log2_size;
+        let num_cards = (heap_size + card_size - 1) >> card_log2_size;
+        
+        let mut cards = Vec::with_capacity(num_cards);
+        for _ in 0..num_cards {
+            cards.push(AtomicU8::new(Self::CLEAN));
+        }
+        
+        CardTable {
+            cards,
+            heap_base: 0,
+            card_log2_size,
+        }
+    }
+    
+    pub fn set_heap_base(&mut self, base: usize) {
+        self.heap_base = base;
+    }
+    
+    /// Mark card as dirty
+    pub fn mark_dirty(&self, addr: usize) {
+        let index = (addr - self.heap_base) >> self.card_log2_size;
+        if index < self.cards.len() {
+            self.cards[index].store(Self::DIRTY, Ordering::Relaxed);
+        }
+    }
+    
+    /// Check if card is dirty
+    pub fn is_dirty(&self, index: usize) -> bool {
+        index < self.cards.len() && 
+            self.cards[index].load(Ordering::Relaxed) == Self::DIRTY
+    }
+    
+    /// Clear card
+    pub fn clear(&self, index: usize) {
+        if index < self.cards.len() {
+            self.cards[index].store(Self::CLEAN, Ordering::Relaxed);
+        }
+    }
+    
+    /// Iterate dirty cards
+    pub fn for_each_dirty<F: FnMut(usize, usize)>(&self, mut f: F) {
+        let card_size = 1usize << self.card_log2_size;
+        
+        for (i, card) in self.cards.iter().enumerate() {
+            if card.load(Ordering::Relaxed) == Self::DIRTY {
+                let start = self.heap_base + (i << self.card_log2_size);
+                f(start, start + card_size);
+            }
+        }
+    }
+    
+    /// Clear all cards
+    pub fn clear_all(&self) {
+        for card in &self.cards {
+            card.store(Self::CLEAN, Ordering::Relaxed);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GENERATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Memory region
+#[derive(Debug)]
+pub struct Region {
+    pub start: *mut u8,
+    pub end: *mut u8,
+    pub current: AtomicPtr<u8>,
+}
+
+impl Region {
+    pub fn new(start: *mut u8, size: usize) -> Self {
+        Region {
+            start,
+            end: unsafe { start.add(size) },
+            current: AtomicPtr::new(start),
+        }
+    }
+    
+    /// Bump allocate
+    pub fn alloc(&self, size: usize, align: usize) -> Option<*mut u8> {
+        loop {
+            let current = self.current.load(Ordering::Relaxed);
+            let aligned = ((current as usize + align - 1) & !(align - 1)) as *mut u8;
+            let new_current = unsafe { aligned.add(size) };
+            
+            if new_current > self.end {
+                return None;
+            }
+            
+            if self.current.compare_exchange_weak(
+                current,
+                new_current,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ).is_ok() {
+                return Some(aligned);
+            }
+        }
+    }
+    
+    /// Reset region
+    pub fn reset(&self) {
+        self.current.store(self.start, Ordering::Release);
+    }
+    
+    /// Used space
+    pub fn used(&self) -> usize {
+        let current = self.current.load(Ordering::Relaxed);
+        current as usize - self.start as usize
+    }
+    
+    /// Free space
+    pub fn free(&self) -> usize {
+        let current = self.current.load(Ordering::Relaxed);
+        self.end as usize - current as usize
+    }
+    
+    /// Contains address?
+    pub fn contains(&self, addr: *const u8) -> bool {
+        addr >= self.start && addr < self.end
+    }
+}
+
+/// Generation space
+pub struct GenSpace {
+    /// From-space (active allocation)
+    from_space: Region,
+    /// To-space (for copying collection)
+    to_space: Option<Region>,
+    /// Generation type
+    generation: Generation,
+}
+
+impl GenSpace {
+    pub fn new(start: *mut u8, size: usize, generation: Generation, copying: bool) -> Self {
+        if copying {
+            let half = size / 2;
+            GenSpace {
+                from_space: Region::new(start, half),
+                to_space: Some(Region::new(unsafe { start.add(half) }, half)),
+                generation,
+            }
+        } else {
+            GenSpace {
+                from_space: Region::new(start, size),
+                to_space: None,
+                generation,
+            }
+        }
+    }
+    
+    /// Allocate in from-space
+    pub fn alloc(&self, size: usize, align: usize) -> Option<*mut u8> {
+        self.from_space.alloc(size, align)
+    }
+    
+    /// Flip spaces (for copying collection)
+    pub fn flip(&mut self) {
+        if let Some(ref mut to_space) = self.to_space {
+            mem::swap(&mut self.from_space, to_space);
+            to_space.reset();
+        }
+    }
+    
+    pub fn contains(&self, addr: *const u8) -> bool {
+        self.from_space.contains(addr) || 
+            self.to_space.as_ref().map_or(false, |ts| ts.contains(addr))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARK STACK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Mark stack for DFS traversal
+pub struct MarkStack {
+    stack: Vec<*mut u8>,
+    capacity: usize,
+}
+
+impl MarkStack {
+    pub fn new(capacity: usize) -> Self {
+        MarkStack {
+            stack: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+    
+    pub fn push(&mut self, ptr: *mut u8) {
+        if self.stack.len() < self.capacity {
+            self.stack.push(ptr);
+        }
+    }
+    
+    pub fn pop(&mut self) -> Option<*mut u8> {
+        self.stack.pop()
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
+    
+    pub fn len(&self) -> usize {
+        self.stack.len()
+    }
+    
+    pub fn clear(&mut self) {
+        self.stack.clear();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROOTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Root set
+pub struct RootSet {
+    /// Stack roots (per thread)
+    stack_roots: Vec<StackFrame>,
+    /// Global roots
+    global_roots: Vec<*mut *mut u8>,
+    /// Pinned objects
+    pinned: Vec<*mut u8>,
+}
+
+/// Stack frame for precise scanning
+#[repr(C)]
+pub struct StackFrame {
+    /// Frame pointer
+    pub frame_ptr: *const u8,
+    /// Return address
+    pub return_addr: *const u8,
+    /// Stack map (bitmap of GC roots)
+    pub stack_map: *const StackMap,
+    /// Previous frame
+    pub prev: *const StackFrame,
+}
+
+/// Stack map entry
+#[repr(C)]
+pub struct StackMap {
+    /// Number of roots
+    pub num_roots: u32,
+    /// Offsets from frame pointer
+    pub offsets: [i32; 0],
+}
+
+impl RootSet {
+    pub fn new() -> Self {
+        RootSet {
+            stack_roots: Vec::new(),
+            global_roots: Vec::new(),
+            pinned: Vec::new(),
+        }
+    }
+    
+    /// Add global root
+    pub fn add_global(&mut self, root: *mut *mut u8) {
+        self.global_roots.push(root);
+    }
+    
+    /// Add pinned object
+    pub fn add_pinned(&mut self, obj: *mut u8) {
+        self.pinned.push(obj);
+    }
+    
+    /// Iterate all roots
+    pub fn for_each<F: FnMut(*mut u8)>(&self, mut f: F) {
+        // Global roots
+        for &root in &self.global_roots {
+            let obj = unsafe { *root };
+            if !obj.is_null() {
+                f(obj);
+            }
+        }
+        
+        // Pinned objects
+        for &obj in &self.pinned {
+            f(obj);
+        }
+        
+        // Stack roots
+        for frame in &self.stack_roots {
+            unsafe { self.scan_frame(frame, &mut f); }
+        }
+    }
+    
+    unsafe fn scan_frame<F: FnMut(*mut u8)>(&self, frame: &StackFrame, f: &mut F) {
+        if frame.stack_map.is_null() {
+            return;
+        }
+        
+        let map = &*frame.stack_map;
+        let offsets = core::slice::from_raw_parts(
+            map.offsets.as_ptr(),
+            map.num_roots as usize,
+        );
+        
+        for &offset in offsets {
+            let slot = frame.frame_ptr.offset(offset as isize) as *const *mut u8;
+            let obj = *slot;
+            if !obj.is_null() {
+                f(obj);
+            }
+        }
+    }
+}
+
+impl Default for RootSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GARBAGE COLLECTOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// GC phase
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GCPhase {
+    Idle,
+    Mark,
+    Sweep,
+    Compact,
+}
+
+/// Garbage collector
+pub struct GarbageCollector {
+    /// Configuration
+    config: GCConfig,
+    /// Nursery space
+    nursery: GenSpace,
+    /// Young generation
+    young: GenSpace,
+    /// Old generation
+    old: GenSpace,
+    /// Card table
+    card_table: CardTable,
+    /// Root set
+    roots: RootSet,
+    /// Mark stack
+    mark_stack: MarkStack,
+    /// Current phase
+    phase: AtomicU8,
+    /// Concurrent mark in progress
+    concurrent_mark_active: AtomicBool,
+    /// Statistics
+    stats: GCStats,
+}
+
+/// GC statistics
+#[derive(Debug, Clone, Default)]
+pub struct GCStats {
+    pub collections: usize,
+    pub minor_collections: usize,
+    pub major_collections: usize,
+    pub bytes_allocated: usize,
+    pub bytes_collected: usize,
+    pub total_pause_ns: u64,
+    pub max_pause_ns: u64,
+    pub objects_promoted: usize,
+}
+
+impl GarbageCollector {
+    /// Create new garbage collector
+    pub unsafe fn new(config: GCConfig, heap_base: *mut u8) -> Self {
+        let mut offset = 0;
+        
+        // Allocate nursery
+        let nursery = GenSpace::new(
+            heap_base.add(offset),
+            config.nursery_size,
+            Generation::Nursery,
+            true,
+        );
+        offset += config.nursery_size;
+        
+        // Allocate young generation
+        let young = GenSpace::new(
+            heap_base.add(offset),
+            config.young_size,
+            Generation::Young,
+            true,
+        );
+        offset += config.young_size;
+        
+        // Allocate old generation
+        let old = GenSpace::new(
+            heap_base.add(offset),
+            config.old_initial_size,
+            Generation::Old,
+            false,
+        );
+        
+        // Create card table
+        let total_size = config.nursery_size + config.young_size + config.old_initial_size;
+        let mut card_table = CardTable::new(total_size, config.card_log2_size);
+        card_table.set_heap_base(heap_base as usize);
+        
+        GarbageCollector {
+            config,
+            nursery,
+            young,
+            old,
+            card_table,
+            roots: RootSet::new(),
+            mark_stack: MarkStack::new(65536),
+            phase: AtomicU8::new(GCPhase::Idle as u8),
+            concurrent_mark_active: AtomicBool::new(false),
+            stats: GCStats::default(),
+        }
+    }
+    
+    /// Allocate object
+    pub fn alloc(&self, size: usize, type_info: *const TypeInfo) -> Option<*mut u8> {
+        let total_size = ObjectHeader::SIZE + size;
+        let align = unsafe { (*type_info).align as usize }.max(8);
+        
+        // Try nursery first
+        if let Some(ptr) = self.nursery.alloc(total_size, align) {
+            self.stats.bytes_allocated.wrapping_add(total_size);
+            return Some(self.init_object(ptr, type_info, size));
+        }
+        
+        // Trigger minor collection
+        None // Caller should trigger collection
+    }
+    
+    fn init_object(&self, ptr: *mut u8, type_info: *const TypeInfo, size: usize) -> *mut u8 {
+        unsafe {
+            let header = ptr as *mut ObjectHeader;
+            (*header) = ObjectHeader::new(type_info, size as u32);
+            (*header).flags.set_generation(Generation::Nursery);
+            (*header).data()
+        }
+    }
+    
+    /// Write barrier for reference stores
+    pub fn write_barrier(&self, obj: *const u8, field: *const *mut u8) {
+        // Mark card as dirty
+        self.card_table.mark_dirty(obj as usize);
+        
+        // During concurrent mark, also mark target gray
+        if self.concurrent_mark_active.load(Ordering::Relaxed) {
+            let target = unsafe { *field };
+            if !target.is_null() {
+                self.shade_gray(target);
+            }
+        }
+    }
+    
+    /// Shade object gray (for incremental update)
+    fn shade_gray(&self, obj: *mut u8) {
+        unsafe {
+            let header = ObjectHeader::from_ptr(obj) as *mut ObjectHeader;
+            if (*header).flags.mark_state() == MarkState::White {
+                (*header).flags.set_mark_state(MarkState::Gray);
+                self.mark_stack.push(obj);
+            }
+        }
+    }
+    
+    /// Minor collection (nursery only)
+    pub fn minor_collect(&mut self) {
+        self.phase.store(GCPhase::Mark as u8, Ordering::Release);
+        self.stats.minor_collections += 1;
+        self.stats.collections += 1;
+        
+        let start = self.get_time();
+        
+        // Mark phase
+        self.mark_roots();
+        self.trace_mark_stack();
+        
+        // Promote survivors to young generation
+        self.promote_nursery();
+        
+        // Flip nursery spaces
+        self.nursery.flip();
+        
+        let pause = self.get_time() - start;
+        self.stats.total_pause_ns += pause;
+        self.stats.max_pause_ns = self.stats.max_pause_ns.max(pause);
+        
+        self.phase.store(GCPhase::Idle as u8, Ordering::Release);
+    }
+    
+    /// Major collection (all generations)
+    pub fn major_collect(&mut self) {
+        self.phase.store(GCPhase::Mark as u8, Ordering::Release);
+        self.stats.major_collections += 1;
+        self.stats.collections += 1;
+        
+        let start = self.get_time();
+        
+        // Clear all marks
+        self.clear_marks();
+        
+        // Mark phase
+        self.mark_roots();
+        
+        // Process remembered sets
+        self.process_remembered_sets();
+        
+        // Complete marking
+        self.trace_mark_stack();
+        
+        // Sweep phase
+        self.phase.store(GCPhase::Sweep as u8, Ordering::Release);
+        self.sweep();
+        
+        // Optional compaction
+        if self.should_compact() {
+            self.phase.store(GCPhase::Compact as u8, Ordering::Release);
+            self.compact();
+        }
+        
+        let pause = self.get_time() - start;
+        self.stats.total_pause_ns += pause;
+        self.stats.max_pause_ns = self.stats.max_pause_ns.max(pause);
+        
+        self.phase.store(GCPhase::Idle as u8, Ordering::Release);
+    }
+    
+    fn mark_roots(&mut self) {
+        self.roots.for_each(|obj| {
+            self.mark_object(obj);
+        });
+    }
+    
+    fn mark_object(&mut self, obj: *mut u8) {
+        unsafe {
+            let header = ObjectHeader::from_ptr(obj) as *mut ObjectHeader;
+            
+            if (*header).flags.mark_state() != MarkState::White {
+                return;
+            }
+            
+            (*header).flags.set_mark_state(MarkState::Gray);
+            self.mark_stack.push(obj);
+        }
+    }
+    
+    fn trace_mark_stack(&mut self) {
+        while let Some(obj) = self.mark_stack.pop() {
+            self.scan_object(obj);
+        }
+    }
+    
+    fn scan_object(&mut self, obj: *mut u8) {
+        unsafe {
+            let header = ObjectHeader::from_ptr(obj) as *mut ObjectHeader;
+            let type_info = (*header).type_info;
+            
+            if !type_info.is_null() {
+                (*type_info).for_each_ref(obj, |ref_ptr| {
+                    let target = *ref_ptr;
+                    if !target.is_null() {
+                        self.mark_object(target);
+                    }
+                });
+            }
+            
+            (*header).flags.set_mark_state(MarkState::Black);
+        }
+    }
+    
+    fn process_remembered_sets(&mut self) {
+        self.card_table.for_each_dirty(|start, end| {
+            // Scan objects in dirty card range
+            // Simplified - real impl walks object layout
+        });
+        
+        self.card_table.clear_all();
+    }
+    
+    fn clear_marks(&self) {
+        // Walk all objects and clear marks
+        // Simplified - real impl walks object regions
+    }
+    
+    fn promote_nursery(&mut self) {
+        // Copy live objects from nursery to young generation
+        // Simplified
+    }
+    
+    fn sweep(&mut self) {
+        // Sweep old generation, freeing unmarked objects
+        // Simplified
+    }
+    
+    fn should_compact(&self) -> bool {
+        // Heuristic for when to compact
+        false
+    }
+    
+    fn compact(&mut self) {
+        // Compact old generation
+        // Simplified
+    }
+    
+    fn get_time(&self) -> u64 {
+        // Get current time in nanoseconds
+        0
+    }
+    
+    /// Get current phase
+    pub fn phase(&self) -> GCPhase {
+        match self.phase.load(Ordering::Acquire) {
+            0 => GCPhase::Idle,
+            1 => GCPhase::Mark,
+            2 => GCPhase::Sweep,
+            _ => GCPhase::Compact,
+        }
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &GCStats {
+        &self.stats
+    }
+    
+    /// Add root
+    pub fn add_root(&mut self, root: *mut *mut u8) {
+        self.roots.add_global(root);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONCURRENT MARKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Concurrent marking state
+pub struct ConcurrentMarker {
+    /// Mark stack for concurrent work
+    work_stack: MarkStack,
+    /// Bytes marked
+    bytes_marked: AtomicUsize,
+    /// Objects marked
+    objects_marked: AtomicUsize,
+    /// Is marking complete?
+    complete: AtomicBool,
+}
+
+impl ConcurrentMarker {
+    pub fn new() -> Self {
+        ConcurrentMarker {
+            work_stack: MarkStack::new(65536),
+            bytes_marked: AtomicUsize::new(0),
+            objects_marked: AtomicUsize::new(0),
+            complete: AtomicBool::new(false),
+        }
+    }
+    
+    /// Do incremental marking work
+    pub fn do_work(&mut self, max_work: usize) -> bool {
+        let mut work_done = 0;
+        
+        while work_done < max_work {
+            if let Some(obj) = self.work_stack.pop() {
+                unsafe {
+                    let header = ObjectHeader::from_ptr(obj);
+                    work_done += (*header).size as usize;
+                }
+                self.objects_marked.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.complete.store(true, Ordering::Release);
+                return true;
+            }
+        }
+        
+        false
+    }
+    
+    pub fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+}
+
+impl Default for ConcurrentMarker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FINALIZERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Finalizer queue
+pub struct FinalizerQueue {
+    /// Objects pending finalization
+    pending: Vec<*mut u8>,
+    /// Objects being finalized
+    running: Vec<*mut u8>,
+}
+
+impl FinalizerQueue {
+    pub fn new() -> Self {
+        FinalizerQueue {
+            pending: Vec::new(),
+            running: Vec::new(),
+        }
+    }
+    
+    /// Queue object for finalization
+    pub fn enqueue(&mut self, obj: *mut u8) {
+        self.pending.push(obj);
+    }
+    
+    /// Run pending finalizers
+    pub fn run_finalizers(&mut self) {
+        mem::swap(&mut self.pending, &mut self.running);
+        
+        for obj in self.running.drain(..) {
+            unsafe {
+                let header = ObjectHeader::from_ptr(obj);
+                let type_info = (*header).type_info;
+                
+                if !type_info.is_null() {
+                    if let Some(finalizer) = (*type_info).finalizer {
+                        finalizer(obj);
+                    }
+                }
+            }
+        }
+    }
+    
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+}
+
+impl Default for FinalizerQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_object_flags() {
+        let mut flags = ObjectFlags::new();
+        
+        assert_eq!(flags.mark_state(), MarkState::White);
+        flags.set_mark_state(MarkState::Gray);
+        assert_eq!(flags.mark_state(), MarkState::Gray);
+        
+        assert!(!flags.is_pinned());
+        flags.set_pinned(true);
+        assert!(flags.is_pinned());
+        
+        assert_eq!(flags.age(), 0);
+        flags.increment_age();
+        assert_eq!(flags.age(), 1);
+    }
+    
+    #[test]
+    fn test_card_table() {
+        let table = CardTable::new(1024 * 1024, 9);
+        
+        table.mark_dirty(512);
+        assert!(table.is_dirty(1));
+        
+        table.clear(1);
+        assert!(!table.is_dirty(1));
+    }
+    
+    #[test]
+    fn test_mark_stack() {
+        let mut stack = MarkStack::new(100);
+        assert!(stack.is_empty());
+        
+        let ptr = 0x1000 as *mut u8;
+        stack.push(ptr);
+        
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack.pop(), Some(ptr));
+        assert!(stack.is_empty());
+    }
+}

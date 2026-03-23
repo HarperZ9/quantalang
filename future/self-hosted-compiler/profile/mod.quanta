@@ -1,0 +1,707 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ PROFILER — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// CPU and memory profiler with sampling and instrumentation modes.
+//
+// Features:
+// - CPU sampling profiler (configurable frequency)
+// - Instrumentation-based precise timing
+// - Memory allocation tracking
+// - Call graph generation
+// - Flamegraph output
+// - Multiple output formats (text, JSON, callgrind, pprof)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang Profiler
+//!
+//! Performance profiling toolkit for QuantaLang programs.
+//!
+//! ## Quick Start
+//!
+//! ```bash
+//! # Profile a program
+//! quanta-profile run program.quanta
+//!
+//! # Attach to running process
+//! quanta-profile attach --pid 12345
+//!
+//! # Generate flamegraph
+//! quanta-profile run --format flamegraph program.quanta > profile.svg
+//! ```
+//!
+//! ## Programmatic API
+//!
+//! ```quanta
+//! use quantalang::profile::{Profiler, ProfilerConfig};
+//!
+//! // Start profiling
+//! let profiler = Profiler::new();
+//! profiler.start()?;
+//!
+//! // ... run code ...
+//!
+//! // Stop and analyze
+//! let report = profiler.stop_and_report()?;
+//! println!("{}", report);
+//! ```
+//!
+//! ## Instrumentation
+//!
+//! ```quanta
+//! use quantalang::profile::instrument;
+//!
+//! #[instrument]
+//! fn expensive_function() {
+//!     // Automatically timed
+//! }
+//! ```
+
+module quantalang::profile
+
+// Submodules
+pub mod sampler;
+pub mod analysis;
+
+// Re-exports
+pub use sampler::{
+    ProfilerConfig, OutputFormat, Sample, StackFrame, CpuState, MemoryUsage,
+    Sampler, Instrumenter, Span, SpanGuard,
+    AllocationTracker, Allocation, AllocKind, AllocationInfo, AllocationStats,
+};
+
+pub use analysis::{
+    Analyzer, ProfileAnalysis, FunctionStats, CallGraph, CallGraphNode, CallGraphEdge,
+    HotPath, ThreadStats, MemoryAnalysis, AllocatorInfo, LeakInfo,
+    SpanAnalysis, SpanFunctionStats, ReportGenerator,
+};
+
+use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIGH-LEVEL PROFILER API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// High-level profiler interface
+pub struct Profiler {
+    config: ProfilerConfig,
+    sampler: Sampler,
+    instrumenter: Instrumenter,
+    allocation_tracker: AllocationTracker,
+    start_time: Option<Instant>,
+}
+
+impl Profiler {
+    /// Create profiler with default config
+    pub fn new() -> Self {
+        Self::with_config(ProfilerConfig::default())
+    }
+    
+    /// Create profiler with custom config
+    pub fn with_config(config: ProfilerConfig) -> Self {
+        Profiler {
+            sampler: Sampler::new(config.clone()),
+            instrumenter: Instrumenter::new(),
+            allocation_tracker: AllocationTracker::new(),
+            config,
+            start_time: None,
+        }
+    }
+    
+    /// Get configuration
+    pub fn config(&self) -> &ProfilerConfig {
+        &self.config
+    }
+    
+    /// Start profiling
+    pub fn start(&mut self) -> Result<(), String> {
+        self.start_time = Some(Instant::now());
+        
+        if self.config.cpu_profiling {
+            self.sampler.start()?;
+        }
+        
+        if self.config.allocation_tracking {
+            // In real impl, hook into allocator
+        }
+        
+        Ok(())
+    }
+    
+    /// Stop profiling
+    pub fn stop(&mut self) {
+        self.sampler.stop();
+    }
+    
+    /// Check if profiling
+    pub fn is_profiling(&self) -> bool {
+        self.sampler.is_running()
+    }
+    
+    /// Get profiling duration
+    pub fn duration(&self) -> Duration {
+        self.start_time
+            .map(|s| s.elapsed())
+            .unwrap_or(Duration::ZERO)
+    }
+    
+    /// Get sample count
+    pub fn sample_count(&self) -> u64 {
+        self.sampler.sample_count()
+    }
+    
+    /// Stop and generate report
+    pub fn stop_and_report(&mut self) -> Result<String, String> {
+        self.stop();
+        
+        let samples = self.sampler.samples();
+        let duration = self.duration();
+        
+        let analyzer = Analyzer::new(self.config.clone());
+        let analysis = analyzer.analyze(&samples, duration);
+        
+        let generator = ReportGenerator::new(self.config.clone());
+        Ok(generator.generate(&analysis))
+    }
+    
+    /// Get full analysis
+    pub fn analyze(&self) -> ProfileAnalysis {
+        let samples = self.sampler.samples();
+        let duration = self.duration();
+        
+        let analyzer = Analyzer::new(self.config.clone());
+        analyzer.analyze(&samples, duration)
+    }
+    
+    /// Enter instrumentation span
+    pub fn enter(&self, name: &str) -> Option<SpanGuard> {
+        self.instrumenter.enter(name)
+    }
+    
+    /// Get instrumentation spans
+    pub fn spans(&self) -> Vec<Span> {
+        self.instrumenter.spans()
+    }
+    
+    /// Analyze instrumentation
+    pub fn analyze_spans(&self) -> SpanAnalysis {
+        let analyzer = Analyzer::new(self.config.clone());
+        analyzer.analyze_spans(&self.instrumenter.spans())
+    }
+    
+    /// Record allocation
+    pub fn record_alloc(&self, ptr: u64, size: u64) {
+        self.allocation_tracker.record_alloc(ptr, size);
+    }
+    
+    /// Record deallocation
+    pub fn record_free(&self, ptr: u64) {
+        self.allocation_tracker.record_free(ptr);
+    }
+    
+    /// Get allocation statistics
+    pub fn allocation_stats(&self) -> AllocationStats {
+        self.allocation_tracker.stats()
+    }
+    
+    /// Reset profiler state
+    pub fn reset(&mut self) {
+        self.sampler.clear();
+        self.instrumenter.clear();
+        self.allocation_tracker.clear();
+        self.start_time = None;
+    }
+}
+
+impl Default for Profiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONVENIENCE MACROS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Profile a code block
+/// 
+/// ```quanta
+/// let result = profile!("expensive_operation", {
+///     compute_something()
+/// });
+/// ```
+#[macro_export]
+macro_rules! profile {
+    ($name:expr, $block:expr) => {{
+        let _guard = PROFILER.enter($name);
+        $block
+    }};
+}
+
+/// Global profiler instance
+pub static PROFILER: std::sync::LazyLock<std::sync::Mutex<Profiler>> = 
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Profiler::new()));
+
+/// Start global profiler
+pub fn start_profiling() -> Result<(), String> {
+    PROFILER.lock().unwrap().start()
+}
+
+/// Stop global profiler and get report
+pub fn stop_profiling() -> Result<String, String> {
+    PROFILER.lock().unwrap().stop_and_report()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLI
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct CliArgs {
+    pub command: ProfileCommand,
+    pub config: ProfilerConfig,
+    pub verbose: bool,
+    pub help: bool,
+    pub version: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProfileCommand {
+    /// Run and profile a program
+    Run {
+        program: String,
+        args: Vec<String>,
+    },
+    /// Attach to running process
+    Attach {
+        pid: u32,
+    },
+    /// Analyze existing profile data
+    Analyze {
+        input: PathBuf,
+    },
+    /// Convert profile format
+    Convert {
+        input: PathBuf,
+        output: PathBuf,
+        format: OutputFormat,
+    },
+}
+
+impl Default for CliArgs {
+    fn default() -> Self {
+        CliArgs {
+            command: ProfileCommand::Run {
+                program: String::new(),
+                args: Vec::new(),
+            },
+            config: ProfilerConfig::default(),
+            verbose: false,
+            help: false,
+            version: false,
+        }
+    }
+}
+
+pub fn parse_args(args: &[String]) -> Result<CliArgs, String> {
+    let mut cli = CliArgs::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        
+        match arg.as_str() {
+            "-h" | "--help" => cli.help = true,
+            "-V" | "--version" => cli.version = true,
+            "-v" | "--verbose" => cli.verbose = true,
+            
+            "-f" | "--frequency" => {
+                i += 1;
+                cli.config.sample_frequency = args.get(i)
+                    .ok_or("--frequency requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid frequency")?;
+            }
+            
+            "-d" | "--duration" => {
+                i += 1;
+                let secs: u64 = args.get(i)
+                    .ok_or("--duration requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid duration")?;
+                cli.config.duration = Some(Duration::from_secs(secs));
+            }
+            
+            "--format" => {
+                i += 1;
+                cli.config.output_format = match args.get(i).map(|s| s.as_str()) {
+                    Some("text") => OutputFormat::Text,
+                    Some("json") => OutputFormat::Json,
+                    Some("flamegraph") => OutputFormat::Flamegraph,
+                    Some("callgrind") => OutputFormat::Callgrind,
+                    Some("pprof") => OutputFormat::Pprof,
+                    Some("chrome") => OutputFormat::Chrome,
+                    Some(f) => return Err(format!("unknown format: {}", f)),
+                    None => return Err("--format requires a value".to_string()),
+                };
+            }
+            
+            "-o" | "--output" => {
+                i += 1;
+                cli.config.output_path = Some(PathBuf::from(
+                    args.get(i).ok_or("--output requires a value")?
+                ));
+            }
+            
+            "--memory" => cli.config.memory_profiling = true,
+            "--allocations" => cli.config.allocation_tracking = true,
+            "--no-cpu" => cli.config.cpu_profiling = false,
+            "--kernel" => cli.config.include_kernel = true,
+            "--idle" => cli.config.include_idle = true,
+            
+            "--depth" => {
+                i += 1;
+                cli.config.max_stack_depth = args.get(i)
+                    .ok_or("--depth requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid depth")?;
+            }
+            
+            "--min-samples" => {
+                i += 1;
+                cli.config.min_samples = args.get(i)
+                    .ok_or("--min-samples requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid min-samples")?;
+            }
+            
+            "run" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("run requires a program".to_string());
+                }
+                let program = args[i].clone();
+                i += 1;
+                
+                let mut run_args = Vec::new();
+                while i < args.len() && !args[i].starts_with('-') {
+                    run_args.push(args[i].clone());
+                    i += 1;
+                }
+                i -= 1; // Back up one since outer loop increments
+                
+                cli.command = ProfileCommand::Run { program, args: run_args };
+            }
+            
+            "attach" => {
+                i += 1;
+                let pid: u32 = args.get(i)
+                    .ok_or("attach requires a PID")?
+                    .parse()
+                    .map_err(|_| "invalid PID")?;
+                cli.command = ProfileCommand::Attach { pid };
+            }
+            
+            "analyze" => {
+                i += 1;
+                let input = PathBuf::from(
+                    args.get(i).ok_or("analyze requires an input file")?
+                );
+                cli.command = ProfileCommand::Analyze { input };
+            }
+            
+            "convert" => {
+                i += 1;
+                let input = PathBuf::from(
+                    args.get(i).ok_or("convert requires input file")?
+                );
+                i += 1;
+                let output = PathBuf::from(
+                    args.get(i).ok_or("convert requires output file")?
+                );
+                cli.command = ProfileCommand::Convert {
+                    input,
+                    output,
+                    format: cli.config.output_format,
+                };
+            }
+            
+            _ if arg.starts_with('-') => {
+                return Err(format!("unknown option: {}", arg));
+            }
+            
+            _ => {
+                // Assume it's a program to run
+                let program = arg.clone();
+                i += 1;
+                let mut run_args = Vec::new();
+                while i < args.len() && !args[i].starts_with('-') {
+                    run_args.push(args[i].clone());
+                    i += 1;
+                }
+                i -= 1;
+                cli.command = ProfileCommand::Run { program, args: run_args };
+            }
+        }
+        
+        i += 1;
+    }
+    
+    Ok(cli)
+}
+
+fn print_help() {
+    println!(r#"quanta-profile - QuantaLang Performance Profiler
+
+USAGE:
+    quanta-profile [OPTIONS] <COMMAND>
+
+COMMANDS:
+    run <program> [args]    Run and profile a program
+    attach <pid>            Attach to running process
+    analyze <file>          Analyze existing profile data
+    convert <in> <out>      Convert profile format
+
+OPTIONS:
+    -h, --help              Show this help message
+    -V, --version           Show version
+    -v, --verbose           Verbose output
+    
+PROFILING OPTIONS:
+    -f, --frequency <Hz>    Sampling frequency (default: 99)
+    -d, --duration <secs>   Profile duration limit
+    --depth <N>             Maximum stack depth (default: 128)
+    --min-samples <N>       Minimum samples for reporting
+    --memory                Enable memory profiling
+    --allocations           Track allocations
+    --no-cpu                Disable CPU profiling
+    --kernel                Include kernel frames
+    --idle                  Include idle samples
+    
+OUTPUT OPTIONS:
+    -o, --output <file>     Output file path
+    --format <fmt>          Output format:
+                              text       Human-readable (default)
+                              json       JSON format
+                              flamegraph Folded stacks for flamegraph
+                              callgrind  Callgrind format
+                              pprof      Google pprof format
+                              chrome     Chrome trace format
+
+EXAMPLES:
+    quanta-profile run program.quanta
+    quanta-profile run --format flamegraph program.quanta > out.txt
+    quanta-profile attach 12345 --duration 30
+    quanta-profile convert profile.json profile.svg --format flamegraph
+"#);
+}
+
+fn print_version() {
+    println!("quanta-profile {}", VERSION);
+}
+
+pub fn run(cli: &CliArgs) -> Result<i32, String> {
+    if cli.help {
+        print_help();
+        return Ok(0);
+    }
+    
+    if cli.version {
+        print_version();
+        return Ok(0);
+    }
+    
+    match &cli.command {
+        ProfileCommand::Run { program, args } => {
+            run_and_profile(program, args, &cli.config, cli.verbose)
+        }
+        
+        ProfileCommand::Attach { pid } => {
+            attach_and_profile(*pid, &cli.config, cli.verbose)
+        }
+        
+        ProfileCommand::Analyze { input } => {
+            analyze_file(input, &cli.config)
+        }
+        
+        ProfileCommand::Convert { input, output, format } => {
+            convert_file(input, output, *format)
+        }
+    }
+}
+
+fn run_and_profile(
+    program: &str,
+    args: &[String],
+    config: &ProfilerConfig,
+    verbose: bool,
+) -> Result<i32, String> {
+    if verbose {
+        eprintln!("Profiling: {} {:?}", program, args);
+        eprintln!("Frequency: {} Hz", config.sample_frequency);
+    }
+    
+    let mut profiler = Profiler::with_config(config.clone());
+    
+    // Start profiling
+    profiler.start()?;
+    
+    // Run program (simplified - in real impl, fork/exec with ptrace)
+    let status = std::process::Command::new(program)
+        .args(args)
+        .status()
+        .map_err(|e| format!("failed to run program: {}", e))?;
+    
+    // Stop and report
+    let report = profiler.stop_and_report()?;
+    
+    // Output
+    if let Some(ref path) = config.output_path {
+        std::fs::write(path, &report)
+            .map_err(|e| format!("failed to write output: {}", e))?;
+        if verbose {
+            eprintln!("Profile written to: {}", path.display());
+        }
+    } else {
+        println!("{}", report);
+    }
+    
+    Ok(status.code().unwrap_or(1))
+}
+
+fn attach_and_profile(
+    pid: u32,
+    config: &ProfilerConfig,
+    verbose: bool,
+) -> Result<i32, String> {
+    if verbose {
+        eprintln!("Attaching to process: {}", pid);
+    }
+    
+    let mut sampler = Sampler::new(config.clone());
+    sampler.set_target_pid(pid);
+    
+    sampler.start()?;
+    
+    // Wait for duration or interrupt
+    if let Some(duration) = config.duration {
+        std::thread::sleep(duration);
+    } else {
+        eprintln!("Press Ctrl+C to stop profiling...");
+        // In real impl, handle SIGINT
+        std::thread::sleep(Duration::from_secs(60));
+    }
+    
+    sampler.stop();
+    
+    // Analyze and report
+    let samples = sampler.samples();
+    let duration = sampler.duration().unwrap_or(Duration::ZERO);
+    
+    let analyzer = Analyzer::new(config.clone());
+    let analysis = analyzer.analyze(&samples, duration);
+    
+    let generator = ReportGenerator::new(config.clone());
+    let report = generator.generate(&analysis);
+    
+    if let Some(ref path) = config.output_path {
+        std::fs::write(path, &report)
+            .map_err(|e| format!("failed to write output: {}", e))?;
+    } else {
+        println!("{}", report);
+    }
+    
+    Ok(0)
+}
+
+fn analyze_file(input: &PathBuf, config: &ProfilerConfig) -> Result<i32, String> {
+    let content = std::fs::read_to_string(input)
+        .map_err(|e| format!("failed to read file: {}", e))?;
+    
+    // Parse based on format (simplified)
+    eprintln!("Analyzing: {}", input.display());
+    
+    // In real impl, detect format and parse
+    
+    Ok(0)
+}
+
+fn convert_file(input: &PathBuf, output: &PathBuf, format: OutputFormat) -> Result<i32, String> {
+    eprintln!("Converting {} to {} (format: {:?})", 
+        input.display(), output.display(), format);
+    
+    // In real impl, parse input and re-serialize
+    
+    Ok(0)
+}
+
+/// Main entry point
+pub fn main() -> Result<i32, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = parse_args(&args)?;
+    run(&cli)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_profiler_new() {
+        let profiler = Profiler::new();
+        assert!(!profiler.is_profiling());
+        assert_eq!(profiler.sample_count(), 0);
+    }
+    
+    #[test]
+    fn test_profiler_config() {
+        let mut config = ProfilerConfig::default();
+        config.sample_frequency = 1000;
+        config.memory_profiling = true;
+        
+        let profiler = Profiler::with_config(config);
+        assert_eq!(profiler.config().sample_frequency, 1000);
+        assert!(profiler.config().memory_profiling);
+    }
+    
+    #[test]
+    fn test_parse_args_run() {
+        let args = vec!["run".to_string(), "program.quanta".to_string()];
+        let cli = parse_args(&args).unwrap();
+        
+        match cli.command {
+            ProfileCommand::Run { program, .. } => {
+                assert_eq!(program, "program.quanta");
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+    
+    #[test]
+    fn test_parse_args_format() {
+        let args = vec![
+            "--format".to_string(),
+            "flamegraph".to_string(),
+            "run".to_string(),
+            "prog.quanta".to_string(),
+        ];
+        let cli = parse_args(&args).unwrap();
+        assert_eq!(cli.config.output_format, OutputFormat::Flamegraph);
+    }
+}

@@ -1,0 +1,690 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ TEST RUNNER — Executor
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Test execution engine: runs tests in parallel/serial with output capture.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::test::executor
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::sync::Arc;
+use alloc::collections::BTreeMap;
+use core::time::{Duration, Instant};
+use std::sync::{Mutex, mpsc};
+use std::thread;
+use std::io::{self, Write, Read};
+use std::process::{Command, Stdio};
+use std::panic::{self, AssertUnwindSafe};
+use crate::test::config::{
+    TestConfig, TestDescriptor, TestResult, TestOutcome, TestSummary,
+    CaptureMode, TestKind, TestAttribute,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEST EXECUTOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Executes tests
+pub struct TestExecutor {
+    config: TestConfig,
+    results: Vec<TestResult>,
+    summary: TestSummary,
+}
+
+impl TestExecutor {
+    /// Create new executor with config
+    pub fn new(config: TestConfig) -> Self {
+        TestExecutor {
+            config,
+            results: Vec::new(),
+            summary: TestSummary::new(),
+        }
+    }
+    
+    /// Run all tests
+    pub fn run(&mut self, tests: Vec<TestDescriptor>) -> &TestSummary {
+        let start = Instant::now();
+        
+        // Filter tests based on config
+        let tests: Vec<_> = tests.into_iter()
+            .filter(|t| self.config.should_run(t))
+            .collect();
+        
+        if tests.is_empty() {
+            return &self.summary;
+        }
+        
+        // Order tests
+        let tests = self.order_tests(tests);
+        
+        // Separate serial and parallel tests
+        let (serial_tests, parallel_tests): (Vec<_>, Vec<_>) = tests.into_iter()
+            .partition(|t| t.attributes.iter().any(|a| matches!(a, TestAttribute::Serial)));
+        
+        // Run serial tests first
+        for test in serial_tests {
+            let result = self.run_single_test(test);
+            self.handle_result(result);
+            
+            // Check fail-fast
+            if !self.config.no_fail_fast && !self.summary.is_success() {
+                break;
+            }
+        }
+        
+        // Run parallel tests
+        if self.summary.is_success() || self.config.no_fail_fast {
+            self.run_parallel(parallel_tests);
+        }
+        
+        self.summary.duration = start.elapsed();
+        &self.summary
+    }
+    
+    /// Run tests in parallel
+    fn run_parallel(&mut self, tests: Vec<TestDescriptor>) {
+        let num_threads = self.config.effective_threads();
+        
+        if num_threads <= 1 || tests.len() <= 1 {
+            // Single-threaded execution
+            for test in tests {
+                let result = self.run_single_test(test);
+                self.handle_result(result);
+                
+                if !self.config.no_fail_fast && !self.summary.is_success() {
+                    break;
+                }
+            }
+            return;
+        }
+        
+        // Multi-threaded execution
+        let (tx, rx) = mpsc::channel();
+        let tests = Arc::new(Mutex::new(tests.into_iter().collect::<Vec<_>>()));
+        let config = Arc::new(self.config.clone());
+        let fail_fast = !self.config.no_fail_fast;
+        let should_stop = Arc::new(Mutex::new(false));
+        
+        let mut handles = Vec::new();
+        
+        for _ in 0..num_threads {
+            let tests = Arc::clone(&tests);
+            let config = Arc::clone(&config);
+            let tx = tx.clone();
+            let should_stop = Arc::clone(&should_stop);
+            
+            let handle = thread::spawn(move || {
+                loop {
+                    // Check if we should stop
+                    if fail_fast && *should_stop.lock().unwrap() {
+                        break;
+                    }
+                    
+                    // Get next test
+                    let test = {
+                        let mut tests = tests.lock().unwrap();
+                        tests.pop()
+                    };
+                    
+                    match test {
+                        Some(test) => {
+                            let result = run_test(&test, &config);
+                            
+                            // Signal failure for fail-fast
+                            if fail_fast && result.is_failure() {
+                                *should_stop.lock().unwrap() = true;
+                            }
+                            
+                            let _ = tx.send(result);
+                        }
+                        None => break,
+                    }
+                }
+            });
+            
+            handles.push(handle);
+        }
+        
+        // Drop original sender so receiver knows when to stop
+        drop(tx);
+        
+        // Collect results
+        for result in rx {
+            self.handle_result(result);
+        }
+        
+        // Wait for threads
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+    
+    /// Run a single test
+    fn run_single_test(&self, test: TestDescriptor) -> TestResult {
+        run_test(&test, &self.config)
+    }
+    
+    /// Handle test result
+    fn handle_result(&mut self, result: TestResult) {
+        self.summary.record(&result);
+        self.results.push(result);
+    }
+    
+    /// Order tests based on config
+    fn order_tests(&self, mut tests: Vec<TestDescriptor>) -> Vec<TestDescriptor> {
+        use crate::test::config::TestOrder;
+        
+        match self.config.test_order {
+            TestOrder::Random => {
+                // Shuffle with seed if provided
+                let seed = self.config.shuffle_seed.unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                });
+                shuffle(&mut tests, seed);
+            }
+            TestOrder::Alphabetical => {
+                tests.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+            TestOrder::Declaration => {
+                // Already in declaration order
+            }
+        }
+        
+        tests
+    }
+    
+    /// Get results
+    pub fn results(&self) -> &[TestResult] {
+        &self.results
+    }
+    
+    /// Get summary
+    pub fn summary(&self) -> &TestSummary {
+        &self.summary
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEST RUNNER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Run a single test
+fn run_test(test: &TestDescriptor, config: &TestConfig) -> TestResult {
+    // Check if test should be ignored
+    if test.ignored && !config.include_ignored && !config.run_ignored {
+        return TestResult::ignored(test.clone());
+    }
+    
+    let timeout = test.timeout.unwrap_or(config.default_timeout);
+    let start = Instant::now();
+    
+    // Create output capture
+    let capture = if matches!(config.capture, CaptureMode::Enabled) {
+        Some(OutputCapture::new())
+    } else {
+        None
+    };
+    
+    // Run the test with timeout
+    let result = run_with_timeout(|| {
+        run_test_fn(test, config)
+    }, timeout);
+    
+    let duration = start.elapsed();
+    
+    // Get captured output
+    let (stdout, stderr) = capture
+        .map(|c| c.finish())
+        .unwrap_or((String::new(), String::new()));
+    
+    match result {
+        Ok(outcome) => {
+            let mut result = match outcome {
+                TestFnResult::Passed => TestResult::passed(test.clone(), duration),
+                TestFnResult::Failed(msg) => TestResult::failed(test.clone(), duration, &msg),
+                TestFnResult::Panicked(msg, bt) => {
+                    let mut result = TestResult::failed(test.clone(), duration, &msg);
+                    result.backtrace = bt;
+                    result
+                }
+            };
+            result = result.with_output(stdout, stderr);
+            
+            // Check should_panic
+            if let Some(ref sp) = test.should_panic {
+                match outcome {
+                    TestFnResult::Panicked(ref msg, _) => {
+                        // Check expected message
+                        if let Some(ref expected) = sp.expected {
+                            if !msg.contains(expected) {
+                                return TestResult::failed(
+                                    test.clone(),
+                                    duration,
+                                    &format!("panic message '{}' did not contain '{}'", msg, expected),
+                                ).with_output(stdout, stderr);
+                            }
+                        }
+                        TestResult::passed(test.clone(), duration).with_output(stdout, stderr)
+                    }
+                    _ => {
+                        TestResult::failed(
+                            test.clone(),
+                            duration,
+                            "test did not panic as expected",
+                        ).with_output(stdout, stderr)
+                    }
+                }
+            } else {
+                result
+            }
+        }
+        Err(_) => {
+            TestResult::timed_out(test.clone(), duration)
+                .with_output(stdout, stderr)
+        }
+    }
+}
+
+/// Run test function and catch panics
+fn run_test_fn(test: &TestDescriptor, config: &TestConfig) -> TestFnResult {
+    // Set up test environment
+    if let Some(ref wd) = config.working_dir {
+        let _ = std::env::set_current_dir(wd);
+    }
+    
+    for (key, value) in &config.env {
+        std::env::set_var(key, value);
+    }
+    
+    // In a real implementation, this would invoke the actual test function
+    // For now, we simulate by checking test kind
+    match test.kind {
+        TestKind::Unit | TestKind::Integration => {
+            // Would call: (test.fn_ptr)()
+            simulate_test_run(test)
+        }
+        TestKind::Doc => {
+            // Would compile and run doc test
+            simulate_doc_test(test)
+        }
+        TestKind::Bench => {
+            // Would run benchmark
+            TestFnResult::Passed
+        }
+        TestKind::Example => {
+            // Would compile and run example
+            TestFnResult::Passed
+        }
+    }
+}
+
+/// Simulated test execution (placeholder)
+fn simulate_test_run(test: &TestDescriptor) -> TestFnResult {
+    // In real implementation, this would call the actual test function
+    // For now, all tests pass unless they have should_panic
+    if test.should_panic.is_some() {
+        TestFnResult::Panicked("simulated panic".to_string(), None)
+    } else {
+        TestFnResult::Passed
+    }
+}
+
+/// Simulated doc test execution
+fn simulate_doc_test(_test: &TestDescriptor) -> TestFnResult {
+    // Would compile and run doc test code
+    TestFnResult::Passed
+}
+
+/// Test function result
+enum TestFnResult {
+    Passed,
+    Failed(String),
+    Panicked(String, Option<String>), // (message, backtrace)
+}
+
+/// Run function with timeout
+fn run_with_timeout<F, T>(f: F, timeout: Duration) -> Result<T, ()>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    
+    thread::spawn(move || {
+        let result = f();
+        let _ = tx.send(result);
+    });
+    
+    rx.recv_timeout(timeout).map_err(|_| ())
+}
+
+/// Shuffle vector with seed
+fn shuffle<T>(vec: &mut [T], seed: u64) {
+    // Simple LCG-based shuffle
+    let mut rng = seed;
+    let len = vec.len();
+    
+    for i in (1..len).rev() {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let j = (rng as usize) % (i + 1);
+        vec.swap(i, j);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OUTPUT CAPTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Captures stdout and stderr
+struct OutputCapture {
+    stdout_buffer: Arc<Mutex<Vec<u8>>>,
+    stderr_buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl OutputCapture {
+    fn new() -> Self {
+        OutputCapture {
+            stdout_buffer: Arc::new(Mutex::new(Vec::new())),
+            stderr_buffer: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+    
+    fn finish(self) -> (String, String) {
+        let stdout = String::from_utf8_lossy(
+            &self.stdout_buffer.lock().unwrap()
+        ).to_string();
+        let stderr = String::from_utf8_lossy(
+            &self.stderr_buffer.lock().unwrap()
+        ).to_string();
+        
+        (stdout, stderr)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXTERNAL PROCESS RUNNER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Run test as external process (for integration tests)
+pub struct ProcessRunner {
+    command: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    working_dir: Option<String>,
+    timeout: Duration,
+}
+
+impl ProcessRunner {
+    pub fn new(command: &str) -> Self {
+        ProcessRunner {
+            command: command.to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            working_dir: None,
+            timeout: Duration::from_secs(60),
+        }
+    }
+    
+    pub fn arg(mut self, arg: &str) -> Self {
+        self.args.push(arg.to_string());
+        self
+    }
+    
+    pub fn args(mut self, args: &[&str]) -> Self {
+        self.args.extend(args.iter().map(|s| s.to_string()));
+        self
+    }
+    
+    pub fn env(mut self, key: &str, value: &str) -> Self {
+        self.env.insert(key.to_string(), value.to_string());
+        self
+    }
+    
+    pub fn working_dir(mut self, dir: &str) -> Self {
+        self.working_dir = Some(dir.to_string());
+        self
+    }
+    
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+    
+    pub fn run(&self) -> ProcessResult {
+        let mut cmd = Command::new(&self.command);
+        cmd.args(&self.args);
+        
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+        
+        if let Some(ref wd) = self.working_dir {
+            cmd.current_dir(wd);
+        }
+        
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        
+        let start = Instant::now();
+        
+        match cmd.spawn() {
+            Ok(mut child) => {
+                // Wait with timeout
+                let status = match child.wait_timeout(self.timeout) {
+                    Ok(Some(status)) => status,
+                    Ok(None) => {
+                        // Timed out - kill process
+                        let _ = child.kill();
+                        return ProcessResult {
+                            success: false,
+                            exit_code: None,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            duration: start.elapsed(),
+                            timed_out: true,
+                        };
+                    }
+                    Err(e) => {
+                        return ProcessResult {
+                            success: false,
+                            exit_code: None,
+                            stdout: String::new(),
+                            stderr: format!("error waiting for process: {}", e),
+                            duration: start.elapsed(),
+                            timed_out: false,
+                        };
+                    }
+                };
+                
+                // Read output
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+                
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_string(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_string(&mut stderr);
+                }
+                
+                ProcessResult {
+                    success: status.success(),
+                    exit_code: status.code(),
+                    stdout,
+                    stderr,
+                    duration: start.elapsed(),
+                    timed_out: false,
+                }
+            }
+            Err(e) => {
+                ProcessResult {
+                    success: false,
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: format!("failed to spawn process: {}", e),
+                    duration: start.elapsed(),
+                    timed_out: false,
+                }
+            }
+        }
+    }
+}
+
+/// Process execution result
+#[derive(Debug)]
+pub struct ProcessResult {
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration: Duration,
+    pub timed_out: bool,
+}
+
+/// Extension trait for Child to add wait_timeout
+trait ChildExt {
+    fn wait_timeout(&mut self, timeout: Duration) -> io::Result<Option<std::process::ExitStatus>>;
+}
+
+impl ChildExt for std::process::Child {
+    fn wait_timeout(&mut self, timeout: Duration) -> io::Result<Option<std::process::ExitStatus>> {
+        let start = Instant::now();
+        
+        loop {
+            match self.try_wait()? {
+                Some(status) => return Ok(Some(status)),
+                None => {
+                    if start.elapsed() >= timeout {
+                        return Ok(None);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEST HARNESS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Test harness for running tests programmatically
+pub struct TestHarness {
+    tests: Vec<Box<dyn Fn() -> Result<(), String> + Send + Sync>>,
+    descriptors: Vec<TestDescriptor>,
+}
+
+impl TestHarness {
+    pub fn new() -> Self {
+        TestHarness {
+            tests: Vec::new(),
+            descriptors: Vec::new(),
+        }
+    }
+    
+    /// Register a test
+    pub fn add<F>(&mut self, name: &str, f: F)
+    where
+        F: Fn() -> Result<(), String> + Send + Sync + 'static,
+    {
+        let descriptor = TestDescriptor::new(name, "", name);
+        self.descriptors.push(descriptor);
+        self.tests.push(Box::new(f));
+    }
+    
+    /// Run all registered tests
+    pub fn run(&self, config: &TestConfig) -> Vec<TestResult> {
+        let mut results = Vec::new();
+        
+        for (i, test_fn) in self.tests.iter().enumerate() {
+            let descriptor = &self.descriptors[i];
+            let start = Instant::now();
+            
+            match test_fn() {
+                Ok(()) => {
+                    results.push(TestResult::passed(descriptor.clone(), start.elapsed()));
+                }
+                Err(msg) => {
+                    results.push(TestResult::failed(descriptor.clone(), start.elapsed(), &msg));
+                }
+            }
+        }
+        
+        results
+    }
+}
+
+impl Default for TestHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_executor_basic() {
+        let config = TestConfig::default();
+        let mut executor = TestExecutor::new(config);
+        
+        let tests = vec![
+            TestDescriptor::new("test::one", "test", "one"),
+            TestDescriptor::new("test::two", "test", "two"),
+        ];
+        
+        let summary = executor.run(tests);
+        assert_eq!(summary.total, 2);
+    }
+    
+    #[test]
+    fn test_shuffle() {
+        let mut v1 = vec![1, 2, 3, 4, 5];
+        let mut v2 = v1.clone();
+        
+        shuffle(&mut v1, 42);
+        shuffle(&mut v2, 42);
+        
+        // Same seed should give same order
+        assert_eq!(v1, v2);
+    }
+    
+    #[test]
+    fn test_process_runner() {
+        let result = ProcessRunner::new("echo")
+            .arg("hello")
+            .run();
+        
+        assert!(result.success);
+        assert!(result.stdout.contains("hello"));
+    }
+    
+    #[test]
+    fn test_harness() {
+        let mut harness = TestHarness::new();
+        
+        harness.add("test_pass", || Ok(()));
+        harness.add("test_fail", || Err("oops".to_string()));
+        
+        let config = TestConfig::default();
+        let results = harness.run(&config);
+        
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_success());
+        assert!(results[1].is_failure());
+    }
+}

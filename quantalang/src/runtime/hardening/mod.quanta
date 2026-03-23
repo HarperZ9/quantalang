@@ -1,0 +1,662 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ RUNTIME HARDENING — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Unified runtime hardening system:
+// - Memory safety (stack canaries, guard pages, UAF detection)
+// - Control flow integrity (CFI, shadow stack)
+// - Integrity verification (code signing, memory protection)
+// - Security monitoring and violation handling
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # Runtime Hardening
+//!
+//! Comprehensive security hardening for QuantaLang runtime.
+//!
+//! ## Features
+//!
+//! - **Memory Safety**: Stack canaries, guard pages, UAF detection
+//! - **Control Flow Integrity**: Forward/backward edge CFI, shadow stack
+//! - **Code Integrity**: Verification of executable code
+//! - **Security Monitoring**: Centralized violation handling
+//!
+//! ## Quick Start
+//!
+//! ```quanta
+//! use quantalang::runtime::hardening::prelude::*;
+//!
+//! // Initialize with default configuration
+//! let hardening = HardeningRuntime::new(HardeningConfig::default());
+//! hardening.initialize();
+//!
+//! // Or with custom configuration
+//! let config = HardeningConfig::builder()
+//!     .memory_safety(true)
+//!     .cfi_level(CfiLevel::Full)
+//!     .shadow_stack(true)
+//!     .build();
+//!
+//! let hardening = HardeningRuntime::new(config);
+//! hardening.initialize();
+//! ```
+
+module quantalang::runtime::hardening
+
+// Submodules
+pub mod memory;
+pub mod cfi;
+
+// Re-exports from memory
+pub use memory::{
+    // Stack protection
+    init_stack_canary, get_stack_canary, check_stack_canary,
+    
+    // Guard pages
+    GuardPageConfig, GuardPageManager,
+    
+    // UAF detection
+    UafDetectorConfig, UafDetector, MemoryState,
+    
+    // Buffer safety
+    SafeBuffer,
+    
+    // ASLR
+    AslrConfig, random_stack_offset, random_heap_offset,
+    
+    // Security monitoring
+    SecurityViolation, SecurityHandler, SecurityMonitor,
+    init_security_monitor, security_monitor,
+};
+
+// Re-exports from CFI
+pub use cfi::{
+    // Configuration
+    CfiLevel, CfiConfig,
+    
+    // Type signatures
+    TypeHash,
+    
+    // Call target registry
+    CallTarget, CallTargetRegistry, CfiResult, CfiStats,
+    
+    // Shadow stack
+    ShadowStack, init_thread_shadow_stack,
+    shadow_push, shadow_pop_validate,
+    
+    // Jump tables
+    JumpTable,
+    
+    // Enforcement
+    CfiEnforcer,
+    
+    // Hardware support
+    HardwareCfiSupport,
+};
+
+use alloc::sync::Arc;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HARDENING CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unified hardening configuration
+#[derive(Debug, Clone)]
+pub struct HardeningConfig {
+    /// Enable memory safety features
+    pub memory_safety: bool,
+    
+    /// Stack canary configuration
+    pub stack_canary: bool,
+    
+    /// Guard page configuration
+    pub guard_pages: GuardPageConfig,
+    
+    /// UAF detector configuration
+    pub uaf_detection: UafDetectorConfig,
+    
+    /// ASLR configuration
+    pub aslr: AslrConfig,
+    
+    /// CFI configuration
+    pub cfi: CfiConfig,
+    
+    /// Enable code integrity checks
+    pub code_integrity: bool,
+    
+    /// Abort on any security violation
+    pub abort_on_violation: bool,
+    
+    /// Log security events
+    pub logging_enabled: bool,
+}
+
+impl HardeningConfig {
+    /// Create minimal configuration (performance-focused)
+    pub fn minimal() -> Self {
+        HardeningConfig {
+            memory_safety: false,
+            stack_canary: true, // Low overhead, always enable
+            guard_pages: GuardPageConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            uaf_detection: UafDetectorConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            aslr: AslrConfig::default(),
+            cfi: CfiConfig {
+                level: CfiLevel::None,
+                shadow_stack: false,
+                ..Default::default()
+            },
+            code_integrity: false,
+            abort_on_violation: true,
+            logging_enabled: false,
+        }
+    }
+    
+    /// Create standard configuration (balanced)
+    pub fn standard() -> Self {
+        HardeningConfig {
+            memory_safety: true,
+            stack_canary: true,
+            guard_pages: GuardPageConfig::default(),
+            uaf_detection: UafDetectorConfig {
+                enabled: true,
+                quarantine_enabled: false, // Disabled for performance
+                ..Default::default()
+            },
+            aslr: AslrConfig::default(),
+            cfi: CfiConfig {
+                level: CfiLevel::Basic,
+                shadow_stack: false,
+                ..Default::default()
+            },
+            code_integrity: false,
+            abort_on_violation: true,
+            logging_enabled: true,
+        }
+    }
+    
+    /// Create maximum security configuration
+    pub fn maximum() -> Self {
+        HardeningConfig {
+            memory_safety: true,
+            stack_canary: true,
+            guard_pages: GuardPageConfig {
+                enabled: true,
+                heap_guard: true,
+                ..Default::default()
+            },
+            uaf_detection: UafDetectorConfig {
+                enabled: true,
+                quarantine_enabled: true,
+                ..Default::default()
+            },
+            aslr: AslrConfig::default(),
+            cfi: CfiConfig {
+                level: CfiLevel::Full,
+                shadow_stack: true,
+                ..Default::default()
+            },
+            code_integrity: true,
+            abort_on_violation: true,
+            logging_enabled: true,
+        }
+    }
+    
+    /// Create builder
+    pub fn builder() -> HardeningConfigBuilder {
+        HardeningConfigBuilder::new()
+    }
+}
+
+impl Default for HardeningConfig {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
+
+/// Builder for HardeningConfig
+pub struct HardeningConfigBuilder {
+    config: HardeningConfig,
+}
+
+impl HardeningConfigBuilder {
+    pub fn new() -> Self {
+        HardeningConfigBuilder {
+            config: HardeningConfig::minimal(),
+        }
+    }
+    
+    pub fn memory_safety(mut self, enabled: bool) -> Self {
+        self.config.memory_safety = enabled;
+        self
+    }
+    
+    pub fn stack_canary(mut self, enabled: bool) -> Self {
+        self.config.stack_canary = enabled;
+        self
+    }
+    
+    pub fn guard_pages(mut self, enabled: bool) -> Self {
+        self.config.guard_pages.enabled = enabled;
+        self
+    }
+    
+    pub fn heap_guard_pages(mut self, enabled: bool) -> Self {
+        self.config.guard_pages.heap_guard = enabled;
+        self
+    }
+    
+    pub fn uaf_detection(mut self, enabled: bool) -> Self {
+        self.config.uaf_detection.enabled = enabled;
+        self
+    }
+    
+    pub fn uaf_quarantine(mut self, enabled: bool) -> Self {
+        self.config.uaf_detection.quarantine_enabled = enabled;
+        self
+    }
+    
+    pub fn quarantine_size(mut self, size: usize) -> Self {
+        self.config.uaf_detection.quarantine_size = size;
+        self
+    }
+    
+    pub fn cfi_level(mut self, level: CfiLevel) -> Self {
+        self.config.cfi.level = level;
+        self
+    }
+    
+    pub fn shadow_stack(mut self, enabled: bool) -> Self {
+        self.config.cfi.shadow_stack = enabled;
+        self
+    }
+    
+    pub fn shadow_stack_size(mut self, size: usize) -> Self {
+        self.config.cfi.shadow_stack_size = size;
+        self
+    }
+    
+    pub fn code_integrity(mut self, enabled: bool) -> Self {
+        self.config.code_integrity = enabled;
+        self
+    }
+    
+    pub fn abort_on_violation(mut self, enabled: bool) -> Self {
+        self.config.abort_on_violation = enabled;
+        self
+    }
+    
+    pub fn logging(mut self, enabled: bool) -> Self {
+        self.config.logging_enabled = enabled;
+        self
+    }
+    
+    pub fn build(self) -> HardeningConfig {
+        self.config
+    }
+}
+
+impl Default for HardeningConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HARDENING RUNTIME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Runtime hardening system
+pub struct HardeningRuntime {
+    config: HardeningConfig,
+    
+    /// Guard page manager
+    guard_manager: Option<GuardPageManager>,
+    
+    /// UAF detector
+    uaf_detector: Option<Arc<UafDetector>>,
+    
+    /// CFI enforcer
+    cfi_enforcer: Option<Arc<CfiEnforcer>>,
+    
+    /// Initialized flag
+    initialized: AtomicBool,
+    
+    /// Hardware CFI support
+    hw_cfi: HardwareCfiSupport,
+}
+
+impl HardeningRuntime {
+    /// Create new hardening runtime
+    pub fn new(config: HardeningConfig) -> Self {
+        HardeningRuntime {
+            config,
+            guard_manager: None,
+            uaf_detector: None,
+            cfi_enforcer: None,
+            initialized: AtomicBool::new(false),
+            hw_cfi: HardwareCfiSupport::detect(),
+        }
+    }
+    
+    /// Initialize the hardening runtime
+    pub fn initialize(&mut self) -> Result<(), HardeningError> {
+        if self.initialized.swap(true, Ordering::SeqCst) {
+            return Err(HardeningError::AlreadyInitialized);
+        }
+        
+        // Initialize security monitor
+        let mut monitor = SecurityMonitor::new();
+        monitor.set_abort_on_violation(self.config.abort_on_violation);
+        
+        if self.config.logging_enabled {
+            monitor.add_handler(Box::new(LoggingHandler));
+        }
+        
+        init_security_monitor(monitor);
+        
+        // Initialize stack canary
+        if self.config.stack_canary {
+            init_stack_canary();
+        }
+        
+        // Initialize guard pages
+        if self.config.guard_pages.enabled {
+            self.guard_manager = Some(GuardPageManager::new(self.config.guard_pages.clone()));
+        }
+        
+        // Initialize UAF detector
+        if self.config.uaf_detection.enabled {
+            self.uaf_detector = Some(Arc::new(UafDetector::new(self.config.uaf_detection.clone())));
+        }
+        
+        // Initialize CFI enforcer
+        if self.config.cfi.level != CfiLevel::None {
+            self.cfi_enforcer = Some(Arc::new(CfiEnforcer::new(self.config.cfi.clone())));
+            
+            // Initialize thread shadow stack
+            if self.config.cfi.shadow_stack {
+                init_thread_shadow_stack(self.config.cfi.shadow_stack_size);
+            }
+        }
+        
+        // Log hardware CFI capabilities
+        if self.config.logging_enabled {
+            self.log_hardware_capabilities();
+        }
+        
+        Ok(())
+    }
+    
+    /// Log hardware CFI capabilities
+    fn log_hardware_capabilities(&self) {
+        #[cfg(feature = "std")]
+        {
+            if self.hw_cfi.intel_cet_ss {
+                eprintln!("[hardening] Intel CET Shadow Stack: available");
+            }
+            if self.hw_cfi.intel_cet_ibt {
+                eprintln!("[hardening] Intel CET IBT: available");
+            }
+            if self.hw_cfi.arm_bti {
+                eprintln!("[hardening] ARM BTI: available");
+            }
+            if self.hw_cfi.arm_pac {
+                eprintln!("[hardening] ARM PAC: available");
+            }
+        }
+    }
+    
+    /// Get configuration
+    pub fn config(&self) -> &HardeningConfig {
+        &self.config
+    }
+    
+    /// Get guard page manager
+    pub fn guard_manager(&self) -> Option<&GuardPageManager> {
+        self.guard_manager.as_ref()
+    }
+    
+    /// Get UAF detector
+    pub fn uaf_detector(&self) -> Option<&Arc<UafDetector>> {
+        self.uaf_detector.as_ref()
+    }
+    
+    /// Get CFI enforcer
+    pub fn cfi_enforcer(&self) -> Option<&Arc<CfiEnforcer>> {
+        self.cfi_enforcer.as_ref()
+    }
+    
+    /// Check if initialized
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::Relaxed)
+    }
+    
+    /// Get hardware CFI support info
+    pub fn hardware_cfi_support(&self) -> &HardwareCfiSupport {
+        &self.hw_cfi
+    }
+    
+    /// Get runtime statistics
+    pub fn stats(&self) -> HardeningStats {
+        let cfi_stats = self.cfi_enforcer
+            .as_ref()
+            .map(|e| e.registry().stats());
+        
+        let uaf_detections = self.uaf_detector
+            .as_ref()
+            .map(|d| d.detection_count())
+            .unwrap_or(0);
+        
+        let violations = security_monitor()
+            .map(|m| m.violation_count())
+            .unwrap_or(0);
+        
+        HardeningStats {
+            cfi_stats,
+            uaf_detections,
+            total_violations: violations,
+        }
+    }
+}
+
+/// Logging security handler
+struct LoggingHandler;
+
+impl SecurityHandler for LoggingHandler {
+    fn handle_violation(&self, violation: &SecurityViolation) {
+        #[cfg(feature = "std")]
+        eprintln!("[SECURITY VIOLATION] {:?}", violation);
+    }
+}
+
+/// Hardening runtime statistics
+#[derive(Debug, Clone)]
+pub struct HardeningStats {
+    pub cfi_stats: Option<CfiStats>,
+    pub uaf_detections: usize,
+    pub total_violations: usize,
+}
+
+/// Hardening error
+#[derive(Debug)]
+pub enum HardeningError {
+    AlreadyInitialized,
+    InitializationFailed(String),
+    ConfigurationError(String),
+}
+
+impl std::fmt::Display for HardeningError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyInitialized => write!(f, "hardening runtime already initialized"),
+            Self::InitializationFailed(msg) => write!(f, "initialization failed: {}", msg),
+            Self::ConfigurationError(msg) => write!(f, "configuration error: {}", msg),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL RUNTIME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static GLOBAL_RUNTIME: std::sync::OnceLock<HardeningRuntime> = std::sync::OnceLock::new();
+
+/// Initialize global hardening runtime
+pub fn init_global(config: HardeningConfig) -> Result<(), HardeningError> {
+    let mut runtime = HardeningRuntime::new(config);
+    runtime.initialize()?;
+    
+    GLOBAL_RUNTIME.set(runtime)
+        .map_err(|_| HardeningError::AlreadyInitialized)
+}
+
+/// Get global hardening runtime
+pub fn global_runtime() -> Option<&'static HardeningRuntime> {
+    GLOBAL_RUNTIME.get()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONVENIENCE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Quick initialization with default configuration
+pub fn init_default() -> Result<(), HardeningError> {
+    init_global(HardeningConfig::default())
+}
+
+/// Quick initialization with maximum security
+pub fn init_maximum_security() -> Result<(), HardeningError> {
+    init_global(HardeningConfig::maximum())
+}
+
+/// Validate indirect call (if CFI enabled)
+#[inline]
+pub fn validate_call(target: usize, type_hash: TypeHash) -> bool {
+    if let Some(runtime) = global_runtime() {
+        if let Some(enforcer) = runtime.cfi_enforcer() {
+            return enforcer.validate_indirect_call(target, type_hash);
+        }
+    }
+    true
+}
+
+/// Validate return address (if shadow stack enabled)
+#[inline]
+pub fn validate_return(return_address: usize) -> bool {
+    if let Some(runtime) = global_runtime() {
+        if let Some(enforcer) = runtime.cfi_enforcer() {
+            return enforcer.validate_return(return_address);
+        }
+    }
+    true
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub mod prelude {
+    pub use super::{
+        // Configuration
+        HardeningConfig, HardeningConfigBuilder,
+        CfiLevel, CfiConfig,
+        GuardPageConfig, UafDetectorConfig, AslrConfig,
+        
+        // Runtime
+        HardeningRuntime, HardeningStats, HardeningError,
+        
+        // Global
+        init_global, init_default, init_maximum_security,
+        global_runtime,
+        
+        // Memory safety
+        SafeBuffer, SecurityViolation,
+        
+        // CFI
+        TypeHash, CfiResult, validate_call, validate_return,
+        
+        // Hardware
+        HardwareCfiSupport,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_config_minimal() {
+        let config = HardeningConfig::minimal();
+        assert!(!config.memory_safety);
+        assert!(config.stack_canary);
+        assert_eq!(config.cfi.level, CfiLevel::None);
+    }
+    
+    #[test]
+    fn test_config_standard() {
+        let config = HardeningConfig::standard();
+        assert!(config.memory_safety);
+        assert!(config.stack_canary);
+        assert_eq!(config.cfi.level, CfiLevel::Basic);
+    }
+    
+    #[test]
+    fn test_config_maximum() {
+        let config = HardeningConfig::maximum();
+        assert!(config.memory_safety);
+        assert!(config.guard_pages.heap_guard);
+        assert!(config.uaf_detection.quarantine_enabled);
+        assert_eq!(config.cfi.level, CfiLevel::Full);
+        assert!(config.cfi.shadow_stack);
+    }
+    
+    #[test]
+    fn test_config_builder() {
+        let config = HardeningConfig::builder()
+            .memory_safety(true)
+            .cfi_level(CfiLevel::Strict)
+            .shadow_stack(true)
+            .uaf_detection(true)
+            .build();
+        
+        assert!(config.memory_safety);
+        assert_eq!(config.cfi.level, CfiLevel::Strict);
+        assert!(config.cfi.shadow_stack);
+        assert!(config.uaf_detection.enabled);
+    }
+    
+    #[test]
+    fn test_runtime_creation() {
+        let runtime = HardeningRuntime::new(HardeningConfig::minimal());
+        assert!(!runtime.is_initialized());
+    }
+    
+    #[test]
+    fn test_hardware_detection() {
+        let hw = HardwareCfiSupport::detect();
+        // Just verify it completes without panic
+        let _ = hw.has_hardware_cfi();
+    }
+}

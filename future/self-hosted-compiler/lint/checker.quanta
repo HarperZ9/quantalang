@@ -1,0 +1,803 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ LINTER — Checker (AST Visitor)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// AST visitor that checks code against lint rules.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::lint::checker
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use crate::lint::config::{LintConfig, LintLevel, LintGroup};
+use crate::lint::rules::RuleRegistry;
+use crate::lint::diagnostic::{Diagnostic, DiagnosticBuilder, Severity, Span, Fix};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINT CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Context for running lint checks
+pub struct LintContext<'a> {
+    /// Configuration
+    pub config: &'a LintConfig,
+    
+    /// Rule registry
+    pub rules: &'a RuleRegistry,
+    
+    /// Current file path
+    pub file_path: PathBuf,
+    
+    /// Source code
+    pub source: &'a str,
+    
+    /// Collected diagnostics
+    diagnostics: Vec<Diagnostic>,
+    
+    /// Allowed lints in current scope
+    allowed_lints: BTreeSet<String>,
+    
+    /// Scope stack for tracking allow attributes
+    scope_stack: Vec<BTreeSet<String>>,
+    
+    /// Variable usage tracking
+    var_usages: BTreeMap<String, VarInfo>,
+    
+    /// Import tracking
+    imports: BTreeMap<String, ImportInfo>,
+    
+    /// Current function context
+    current_function: Option<FunctionContext>,
+    
+    /// Nesting depth
+    nesting_depth: usize,
+}
+
+impl<'a> LintContext<'a> {
+    pub fn new(
+        config: &'a LintConfig,
+        rules: &'a RuleRegistry,
+        file_path: &Path,
+        source: &'a str,
+    ) -> Self {
+        LintContext {
+            config,
+            rules,
+            file_path: file_path.to_path_buf(),
+            source,
+            diagnostics: Vec::new(),
+            allowed_lints: BTreeSet::new(),
+            scope_stack: Vec::new(),
+            var_usages: BTreeMap::new(),
+            imports: BTreeMap::new(),
+            current_function: None,
+            nesting_depth: 0,
+        }
+    }
+    
+    /// Emit a diagnostic
+    pub fn emit(&mut self, diagnostic: Diagnostic) {
+        // Check if lint is allowed
+        if self.config.respect_allows {
+            if let Some(ref lint) = diagnostic.lint_name {
+                if self.allowed_lints.contains(lint) {
+                    return;
+                }
+            }
+        }
+        
+        self.diagnostics.push(diagnostic);
+    }
+    
+    /// Create diagnostic builder
+    pub fn diagnostic(&mut self, lint: &str) -> DiagnosticBuilder {
+        let level = self.rules.get(lint)
+            .map(|r| self.config.lint_level(r))
+            .unwrap_or(LintLevel::Warn);
+        
+        let severity = match level {
+            LintLevel::Allow => Severity::Note,
+            LintLevel::Warn => Severity::Warning,
+            LintLevel::Deny | LintLevel::Forbid => Severity::Error,
+        };
+        
+        DiagnosticBuilder::new(severity)
+            .lint(lint)
+            .file(&self.file_path)
+    }
+    
+    /// Get collected diagnostics
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+    
+    /// Take diagnostics
+    pub fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
+        std::mem::take(&mut self.diagnostics)
+    }
+    
+    /// Push scope (enter block)
+    pub fn push_scope(&mut self) {
+        self.scope_stack.push(self.allowed_lints.clone());
+        self.nesting_depth += 1;
+    }
+    
+    /// Pop scope (exit block)
+    pub fn pop_scope(&mut self) {
+        if let Some(allowed) = self.scope_stack.pop() {
+            self.allowed_lints = allowed;
+        }
+        self.nesting_depth = self.nesting_depth.saturating_sub(1);
+    }
+    
+    /// Allow a lint in current scope
+    pub fn allow_lint(&mut self, lint: &str) {
+        self.allowed_lints.insert(lint.to_string());
+    }
+    
+    /// Deny a lint in current scope
+    pub fn deny_lint(&mut self, lint: &str) {
+        self.allowed_lints.remove(lint);
+    }
+    
+    /// Register variable declaration
+    pub fn declare_var(&mut self, name: &str, span: Span, mutable: bool) {
+        self.var_usages.insert(name.to_string(), VarInfo {
+            declared_at: span,
+            used: false,
+            mutable,
+            mutated: false,
+        });
+    }
+    
+    /// Mark variable as used
+    pub fn use_var(&mut self, name: &str) {
+        if let Some(info) = self.var_usages.get_mut(name) {
+            info.used = true;
+        }
+    }
+    
+    /// Mark variable as mutated
+    pub fn mutate_var(&mut self, name: &str) {
+        if let Some(info) = self.var_usages.get_mut(name) {
+            info.mutated = true;
+        }
+    }
+    
+    /// Register import
+    pub fn declare_import(&mut self, name: &str, path: &str, span: Span) {
+        self.imports.insert(name.to_string(), ImportInfo {
+            path: path.to_string(),
+            declared_at: span,
+            used: false,
+        });
+    }
+    
+    /// Mark import as used
+    pub fn use_import(&mut self, name: &str) {
+        if let Some(info) = self.imports.get_mut(name) {
+            info.used = true;
+        }
+    }
+    
+    /// Enter function
+    pub fn enter_function(&mut self, name: &str, span: Span) {
+        self.current_function = Some(FunctionContext {
+            name: name.to_string(),
+            span,
+            line_count: 0,
+            arg_count: 0,
+            return_count: 0,
+            complexity: 1,
+        });
+        self.push_scope();
+    }
+    
+    /// Exit function
+    pub fn exit_function(&mut self) {
+        self.pop_scope();
+        self.current_function = None;
+    }
+    
+    /// Get current function
+    pub fn current_function(&self) -> Option<&FunctionContext> {
+        self.current_function.as_ref()
+    }
+    
+    /// Get current function mutably
+    pub fn current_function_mut(&mut self) -> Option<&mut FunctionContext> {
+        self.current_function.as_mut()
+    }
+    
+    /// Get nesting depth
+    pub fn nesting_depth(&self) -> usize {
+        self.nesting_depth
+    }
+    
+    /// Get source line at offset
+    pub fn source_line(&self, offset: usize) -> Option<&str> {
+        let mut current = 0;
+        for line in self.source.lines() {
+            let line_end = current + line.len() + 1;
+            if offset < line_end {
+                return Some(line);
+            }
+            current = line_end;
+        }
+        None
+    }
+    
+    /// Get line number at offset
+    pub fn line_number(&self, offset: usize) -> usize {
+        self.source[..offset.min(self.source.len())]
+            .chars()
+            .filter(|&c| c == '\n')
+            .count() + 1
+    }
+    
+    /// Get column at offset
+    pub fn column(&self, offset: usize) -> usize {
+        let offset = offset.min(self.source.len());
+        let line_start = self.source[..offset]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        offset - line_start + 1
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VarInfo {
+    pub declared_at: Span,
+    pub used: bool,
+    pub mutable: bool,
+    pub mutated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportInfo {
+    pub path: String,
+    pub declared_at: Span,
+    pub used: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionContext {
+    pub name: String,
+    pub span: Span,
+    pub line_count: usize,
+    pub arg_count: usize,
+    pub return_count: usize,
+    pub complexity: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINT CHECKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Main lint checker
+pub struct LintChecker {
+    config: LintConfig,
+    rules: RuleRegistry,
+}
+
+impl LintChecker {
+    pub fn new(config: LintConfig) -> Self {
+        LintChecker {
+            config,
+            rules: RuleRegistry::new(),
+        }
+    }
+    
+    /// Check a source file
+    pub fn check_file(&self, path: &Path) -> Result<Vec<Diagnostic>, String> {
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read file: {}", e))?;
+        
+        self.check_source(path, &source)
+    }
+    
+    /// Check source code
+    pub fn check_source(&self, path: &Path, source: &str) -> Result<Vec<Diagnostic>, String> {
+        let mut ctx = LintContext::new(&self.config, &self.rules, path, source);
+        
+        // Parse attributes at file level
+        self.check_file_attributes(&mut ctx);
+        
+        // Run syntactic checks
+        self.check_syntax(&mut ctx);
+        
+        // Run semantic checks
+        self.check_semantics(&mut ctx);
+        
+        // Run post-processing checks
+        self.check_unused(&mut ctx);
+        
+        Ok(ctx.take_diagnostics())
+    }
+    
+    /// Check file-level attributes
+    fn check_file_attributes(&self, ctx: &mut LintContext) {
+        // Parse #![allow(...)] and #![deny(...)] at file level
+        for line in ctx.source.lines().take(50) {
+            let line = line.trim();
+            
+            if line.starts_with("#![allow(") {
+                if let Some(lints) = extract_attr_list(line, "allow") {
+                    for lint in lints {
+                        ctx.allow_lint(&lint);
+                    }
+                }
+            } else if line.starts_with("#![deny(") {
+                if let Some(lints) = extract_attr_list(line, "deny") {
+                    for lint in lints {
+                        ctx.deny_lint(&lint);
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Syntactic checks (pattern-based)
+    fn check_syntax(&self, ctx: &mut LintContext) {
+        let source = ctx.source;
+        let lines: Vec<&str> = source.lines().collect();
+        
+        for (line_idx, line) in lines.iter().enumerate() {
+            let line_num = line_idx + 1;
+            let trimmed = line.trim();
+            
+            // Check for todo!/unimplemented!/dbg!
+            self.check_debug_macros(ctx, trimmed, line_num);
+            
+            // Check naming conventions
+            self.check_naming(ctx, trimmed, line_num);
+            
+            // Check suspicious patterns
+            self.check_suspicious_patterns(ctx, trimmed, line_num);
+            
+            // Check complexity indicators
+            self.check_complexity_indicators(ctx, line, line_idx);
+        }
+        
+        // Check function-level metrics
+        self.check_functions(ctx, source);
+    }
+    
+    /// Check for debug macros
+    fn check_debug_macros(&self, ctx: &mut LintContext, line: &str, line_num: usize) {
+        let checks = [
+            ("todo!(", "todo", "Use of todo! macro"),
+            ("unimplemented!(", "unimplemented", "Use of unimplemented! macro"),
+            ("dbg!(", "dbg_macro", "Use of dbg! macro"),
+            ("println!(", "print_stdout", "Use of println! macro"),
+            ("print!(", "print_stdout", "Use of print! macro"),
+        ];
+        
+        for (pattern, lint, msg) in checks {
+            if line.contains(pattern) {
+                let col = line.find(pattern).unwrap_or(0) + 1;
+                ctx.emit(
+                    ctx.diagnostic(lint)
+                        .message(msg)
+                        .span(Span::new(line_num, col, line_num, col + pattern.len()))
+                        .build()
+                );
+            }
+        }
+    }
+    
+    /// Check naming conventions
+    fn check_naming(&self, ctx: &mut LintContext, line: &str, line_num: usize) {
+        // Check function names (should be snake_case)
+        if let Some(name) = extract_fn_name(line) {
+            if !is_snake_case(&name) && !name.starts_with('_') {
+                ctx.emit(
+                    ctx.diagnostic("non_snake_case")
+                        .message(&format!("function `{}` should have a snake_case name", name))
+                        .span(Span::new(line_num, 1, line_num, line.len()))
+                        .suggestion(&format!("rename to `{}`", to_snake_case(&name)))
+                        .build()
+                );
+            }
+        }
+        
+        // Check type names (should be CamelCase)
+        if let Some(name) = extract_type_name(line) {
+            if !is_camel_case(&name) {
+                ctx.emit(
+                    ctx.diagnostic("non_camel_case_types")
+                        .message(&format!("type `{}` should have a CamelCase name", name))
+                        .span(Span::new(line_num, 1, line_num, line.len()))
+                        .suggestion(&format!("rename to `{}`", to_camel_case(&name)))
+                        .build()
+                );
+            }
+        }
+        
+        // Check constant names (should be UPPER_CASE)
+        if let Some(name) = extract_const_name(line) {
+            if !is_upper_case(&name) {
+                ctx.emit(
+                    ctx.diagnostic("non_upper_case_globals")
+                        .message(&format!("constant `{}` should have an UPPER_CASE name", name))
+                        .span(Span::new(line_num, 1, line_num, line.len()))
+                        .suggestion(&format!("rename to `{}`", to_upper_case(&name)))
+                        .build()
+                );
+            }
+        }
+    }
+    
+    /// Check suspicious patterns
+    fn check_suspicious_patterns(&self, ctx: &mut LintContext, line: &str, line_num: usize) {
+        // Assignment in condition (if x = y instead of if x == y)
+        if (line.contains("if ") || line.contains("while ")) && 
+           line.contains(" = ") && !line.contains(" == ") && !line.contains(" != ") {
+            // More precise check
+            let pattern_check = line.contains("if let") || line.contains("while let");
+            if !pattern_check {
+                ctx.emit(
+                    ctx.diagnostic("assignment_in_condition")
+                        .message("assignment in condition (likely meant `==`)")
+                        .span(Span::new(line_num, 1, line_num, line.len()))
+                        .build()
+                );
+            }
+        }
+        
+        // .len() == 0 instead of .is_empty()
+        if line.contains(".len() == 0") || line.contains(".len() < 1") {
+            let col = line.find(".len()").unwrap_or(0) + 1;
+            ctx.emit(
+                ctx.diagnostic("len_zero")
+                    .message("using `.len() == 0` instead of `.is_empty()`")
+                    .span(Span::new(line_num, col, line_num, col + 12))
+                    .suggestion("use `.is_empty()` instead")
+                    .build()
+            );
+        }
+        
+        // Redundant .clone() on Copy type patterns
+        if line.contains(".clone()") {
+            // Simple heuristic: cloning integer/bool literals
+            let before_clone = line.split(".clone()").next().unwrap_or("");
+            if before_clone.ends_with("i32") || before_clone.ends_with("bool") ||
+               before_clone.ends_with("char") || before_clone.ends_with("usize") {
+                ctx.emit(
+                    ctx.diagnostic("clone_on_copy")
+                        .message("calling `.clone()` on a Copy type")
+                        .span(Span::new(line_num, 1, line_num, line.len()))
+                        .build()
+                );
+            }
+        }
+        
+        // Check for hardcoded credentials patterns
+        let secret_patterns = [
+            ("password", "hardcoded_credentials"),
+            ("api_key", "hardcoded_credentials"),
+            ("secret_key", "hardcoded_credentials"),
+            ("auth_token", "hardcoded_credentials"),
+        ];
+        
+        let line_lower = line.to_lowercase();
+        for (pattern, lint) in secret_patterns {
+            if line_lower.contains(pattern) && line.contains("= \"") {
+                ctx.emit(
+                    ctx.diagnostic(lint)
+                        .message(&format!("possible hardcoded {} detected", pattern))
+                        .span(Span::new(line_num, 1, line_num, line.len()))
+                        .build()
+                );
+            }
+        }
+    }
+    
+    /// Check complexity indicators
+    fn check_complexity_indicators(&self, ctx: &mut LintContext, line: &str, line_idx: usize) {
+        let line_num = line_idx + 1;
+        
+        // Track nesting by counting leading whitespace and braces
+        let indent = line.len() - line.trim_start().len();
+        let nesting = indent / 4; // Assuming 4-space indent
+        
+        if nesting > 5 {
+            ctx.emit(
+                ctx.diagnostic("too_many_nested_blocks")
+                    .message(&format!("code is nested {} levels deep", nesting))
+                    .span(Span::new(line_num, 1, line_num, line.len()))
+                    .build()
+            );
+        }
+    }
+    
+    /// Check functions
+    fn check_functions(&self, ctx: &mut LintContext, source: &str) {
+        // Simple function detection
+        let mut in_function = false;
+        let mut fn_start_line = 0;
+        let mut fn_name = String::new();
+        let mut line_count = 0;
+        let mut arg_count = 0;
+        let mut brace_depth = 0;
+        
+        for (idx, line) in source.lines().enumerate() {
+            let line_num = idx + 1;
+            let trimmed = line.trim();
+            
+            if !in_function {
+                if let Some(name) = extract_fn_name(trimmed) {
+                    in_function = true;
+                    fn_start_line = line_num;
+                    fn_name = name;
+                    line_count = 0;
+                    
+                    // Count arguments
+                    if let Some(paren_start) = trimmed.find('(') {
+                        if let Some(paren_end) = trimmed.find(')') {
+                            let args = &trimmed[paren_start+1..paren_end];
+                            arg_count = if args.trim().is_empty() {
+                                0
+                            } else {
+                                args.split(',').count()
+                            };
+                        }
+                    }
+                }
+            }
+            
+            if in_function {
+                line_count += 1;
+                brace_depth += line.matches('{').count();
+                brace_depth = brace_depth.saturating_sub(line.matches('}').count());
+                
+                if brace_depth == 0 && line.contains('}') {
+                    // Function ended
+                    
+                    // Check too many arguments
+                    if arg_count > 7 {
+                        ctx.emit(
+                            ctx.diagnostic("too_many_arguments")
+                                .message(&format!(
+                                    "function `{}` has {} arguments (maximum recommended: 7)",
+                                    fn_name, arg_count
+                                ))
+                                .span(Span::new(fn_start_line, 1, fn_start_line, 80))
+                                .build()
+                        );
+                    }
+                    
+                    // Check too many lines
+                    if line_count > 100 {
+                        ctx.emit(
+                            ctx.diagnostic("too_many_lines")
+                                .message(&format!(
+                                    "function `{}` has {} lines (maximum recommended: 100)",
+                                    fn_name, line_count
+                                ))
+                                .span(Span::new(fn_start_line, 1, line_num, 1))
+                                .build()
+                        );
+                    }
+                    
+                    in_function = false;
+                }
+            }
+        }
+    }
+    
+    /// Semantic checks
+    fn check_semantics(&self, ctx: &mut LintContext) {
+        // These would require a proper AST - simplified here
+    }
+    
+    /// Check for unused items
+    fn check_unused(&self, ctx: &mut LintContext) {
+        // Check unused variables
+        for (name, info) in &ctx.var_usages {
+            if !info.used && !name.starts_with('_') {
+                ctx.emit(
+                    ctx.diagnostic("unused_variable")
+                        .message(&format!("unused variable: `{}`", name))
+                        .span(info.declared_at.clone())
+                        .suggestion(&format!("prefix with underscore: `_{}`", name))
+                        .build()
+                );
+            }
+            
+            // Check unused mut
+            if info.mutable && !info.mutated && !name.starts_with('_') {
+                ctx.emit(
+                    ctx.diagnostic("unused_mut")
+                        .message(&format!("variable `{}` is declared mutable but never mutated", name))
+                        .span(info.declared_at.clone())
+                        .suggestion("remove `mut` keyword")
+                        .build()
+                );
+            }
+        }
+        
+        // Check unused imports
+        for (name, info) in &ctx.imports {
+            if !info.used {
+                ctx.emit(
+                    ctx.diagnostic("unused_import")
+                        .message(&format!("unused import: `{}`", name))
+                        .span(info.declared_at.clone())
+                        .suggestion("remove the import")
+                        .build()
+                );
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn extract_attr_list(line: &str, attr: &str) -> Option<Vec<String>> {
+    let pattern = format!("#![{}(", attr);
+    let start = line.find(&pattern)? + pattern.len();
+    let end = line[start..].find(')')? + start;
+    let content = &line[start..end];
+    
+    Some(content.split(',').map(|s| s.trim().to_string()).collect())
+}
+
+fn extract_fn_name(line: &str) -> Option<String> {
+    let line = line.trim();
+    
+    let fn_idx = if line.starts_with("fn ") {
+        3
+    } else if line.starts_with("pub fn ") {
+        7
+    } else if line.starts_with("async fn ") {
+        9
+    } else if line.starts_with("pub async fn ") {
+        13
+    } else {
+        return None;
+    };
+    
+    let rest = &line[fn_idx..];
+    let end = rest.find('(').or_else(|| rest.find('<'))?;
+    Some(rest[..end].trim().to_string())
+}
+
+fn extract_type_name(line: &str) -> Option<String> {
+    let line = line.trim();
+    
+    let patterns = [
+        ("struct ", 7),
+        ("pub struct ", 11),
+        ("enum ", 5),
+        ("pub enum ", 9),
+        ("trait ", 6),
+        ("pub trait ", 10),
+        ("type ", 5),
+        ("pub type ", 9),
+    ];
+    
+    for (prefix, len) in patterns {
+        if line.starts_with(prefix) {
+            let rest = &line[len..];
+            let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(rest.len());
+            return Some(rest[..end].to_string());
+        }
+    }
+    
+    None
+}
+
+fn extract_const_name(line: &str) -> Option<String> {
+    let line = line.trim();
+    
+    let patterns = [
+        ("const ", 6),
+        ("pub const ", 10),
+        ("static ", 7),
+        ("pub static ", 11),
+    ];
+    
+    for (prefix, len) in patterns {
+        if line.starts_with(prefix) {
+            let rest = &line[len..];
+            let end = rest.find(':').or_else(|| rest.find(' '))?;
+            return Some(rest[..end].trim().to_string());
+        }
+    }
+    
+    None
+}
+
+fn is_snake_case(s: &str) -> bool {
+    s.chars().all(|c| c.is_lowercase() || c.is_numeric() || c == '_')
+}
+
+fn is_camel_case(s: &str) -> bool {
+    s.chars().next().map(|c| c.is_uppercase()).unwrap_or(true)
+}
+
+fn is_upper_case(s: &str) -> bool {
+    s.chars().all(|c| c.is_uppercase() || c.is_numeric() || c == '_')
+}
+
+fn to_snake_case(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                result.push('_');
+            }
+            result.push(c.to_ascii_lowercase());
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+fn to_camel_case(s: &str) -> String {
+    let mut result = String::new();
+    let mut capitalize_next = true;
+    
+    for c in s.chars() {
+        if c == '_' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            result.push(c.to_ascii_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+fn to_upper_case(s: &str) -> String {
+    s.to_uppercase()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_snake_case() {
+        assert!(is_snake_case("hello_world"));
+        assert!(!is_snake_case("helloWorld"));
+        assert!(!is_snake_case("HelloWorld"));
+    }
+    
+    #[test]
+    fn test_camel_case() {
+        assert!(is_camel_case("HelloWorld"));
+        assert!(!is_camel_case("hello_world"));
+    }
+    
+    #[test]
+    fn test_extract_fn_name() {
+        assert_eq!(extract_fn_name("fn hello()"), Some("hello".to_string()));
+        assert_eq!(extract_fn_name("pub fn world()"), Some("world".to_string()));
+        assert_eq!(extract_fn_name("async fn foo()"), Some("foo".to_string()));
+    }
+    
+    #[test]
+    fn test_extract_type_name() {
+        assert_eq!(extract_type_name("struct Foo"), Some("Foo".to_string()));
+        assert_eq!(extract_type_name("pub enum Bar"), Some("Bar".to_string()));
+    }
+}

@@ -1,0 +1,691 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ TEST RUNNER — Reporter
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Test output formatting and report generation.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::test::reporter
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::format;
+use core::time::Duration;
+use std::io::{self, Write};
+use crate::test::config::{
+    TestConfig, TestDescriptor, TestResult, TestOutcome, TestSummary,
+    OutputFormat, ReportFormat, ColorChoice,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REPORTER TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Trait for test reporters
+pub trait Reporter {
+    /// Called at start of test run
+    fn start(&mut self, total_tests: usize);
+    
+    /// Called before running a test
+    fn test_start(&mut self, test: &TestDescriptor);
+    
+    /// Called after a test completes
+    fn test_end(&mut self, result: &TestResult);
+    
+    /// Called at end of test run
+    fn finish(&mut self, summary: &TestSummary);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRETTY REPORTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Human-readable pretty output
+pub struct PrettyReporter {
+    writer: Box<dyn Write>,
+    color: bool,
+    verbose: bool,
+    quiet: bool,
+    show_output: bool,
+    test_count: usize,
+    current: usize,
+    failures: Vec<TestResult>,
+}
+
+impl PrettyReporter {
+    pub fn new(config: &TestConfig) -> Self {
+        let color = match config.color {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => is_tty(),
+        };
+        
+        PrettyReporter {
+            writer: Box::new(io::stdout()),
+            color,
+            verbose: config.verbose,
+            quiet: config.quiet,
+            show_output: config.show_output,
+            test_count: 0,
+            current: 0,
+            failures: Vec::new(),
+        }
+    }
+    
+    pub fn with_writer<W: Write + 'static>(mut self, writer: W) -> Self {
+        self.writer = Box::new(writer);
+        self
+    }
+    
+    fn write_colored(&mut self, text: &str, color: Color) {
+        if self.color {
+            let _ = write!(self.writer, "{}{}{}", color.ansi_code(), text, Color::Reset.ansi_code());
+        } else {
+            let _ = write!(self.writer, "{}", text);
+        }
+    }
+    
+    fn writeln(&mut self, text: &str) {
+        let _ = writeln!(self.writer, "{}", text);
+    }
+    
+    fn print_failure_details(&mut self, result: &TestResult) {
+        self.writeln("");
+        self.writeln("---- ");
+        self.write_colored(&result.test.name, Color::Red);
+        self.writeln(" ----");
+        
+        if let Some(ref msg) = result.message {
+            self.writeln(msg);
+        }
+        
+        if let Some(ref bt) = result.backtrace {
+            self.writeln("");
+            self.writeln("stack backtrace:");
+            self.writeln(bt);
+        }
+        
+        if !result.stdout.is_empty() || !result.stderr.is_empty() {
+            self.writeln("");
+            if !result.stdout.is_empty() {
+                self.writeln("stdout:");
+                self.writeln(&result.stdout);
+            }
+            if !result.stderr.is_empty() {
+                self.writeln("stderr:");
+                self.writeln(&result.stderr);
+            }
+        }
+    }
+}
+
+impl Reporter for PrettyReporter {
+    fn start(&mut self, total_tests: usize) {
+        self.test_count = total_tests;
+        self.current = 0;
+        self.failures.clear();
+        
+        if !self.quiet {
+            let _ = writeln!(self.writer, "\nrunning {} tests", total_tests);
+        }
+    }
+    
+    fn test_start(&mut self, test: &TestDescriptor) {
+        self.current += 1;
+        
+        if self.verbose && !self.quiet {
+            let _ = write!(self.writer, "test {} ... ", test.name);
+            let _ = self.writer.flush();
+        }
+    }
+    
+    fn test_end(&mut self, result: &TestResult) {
+        if self.quiet && result.is_success() {
+            return;
+        }
+        
+        if !self.verbose {
+            // Terse output
+            match result.outcome {
+                TestOutcome::Passed => self.write_colored(".", Color::Green),
+                TestOutcome::Failed => self.write_colored("F", Color::Red),
+                TestOutcome::Ignored => self.write_colored("i", Color::Yellow),
+                TestOutcome::TimedOut => self.write_colored("T", Color::Red),
+                TestOutcome::Filtered => {}
+            }
+            let _ = self.writer.flush();
+        } else {
+            // Verbose output
+            match result.outcome {
+                TestOutcome::Passed => self.write_colored("ok", Color::Green),
+                TestOutcome::Failed => self.write_colored("FAILED", Color::Red),
+                TestOutcome::Ignored => self.write_colored("ignored", Color::Yellow),
+                TestOutcome::TimedOut => self.write_colored("TIMED OUT", Color::Red),
+                TestOutcome::Filtered => self.write_colored("filtered", Color::Cyan),
+            }
+            
+            let _ = writeln!(self.writer, " ({:.3}s)", result.duration.as_secs_f64());
+        }
+        
+        // Store failures for later
+        if result.is_failure() {
+            self.failures.push(result.clone());
+        }
+        
+        // Show output if requested
+        if self.show_output && !result.stdout.is_empty() {
+            self.writeln(&result.stdout);
+        }
+    }
+    
+    fn finish(&mut self, summary: &TestSummary) {
+        if !self.verbose {
+            self.writeln("");
+        }
+        
+        // Print failure details
+        if !self.failures.is_empty() {
+            self.writeln("\nfailures:");
+            
+            for result in &self.failures {
+                self.print_failure_details(result);
+            }
+            
+            self.writeln("\nfailures:");
+            for name in &summary.failures {
+                self.writeln(&format!("    {}", name));
+            }
+        }
+        
+        // Print summary
+        self.writeln("");
+        let status = if summary.is_success() { "ok" } else { "FAILED" };
+        
+        if self.color {
+            let color = if summary.is_success() { Color::Green } else { Color::Red };
+            let _ = write!(self.writer, "test result: ");
+            self.write_colored(status, color);
+        } else {
+            let _ = write!(self.writer, "test result: {}", status);
+        }
+        
+        let _ = writeln!(
+            self.writer,
+            ". {} passed; {} failed; {} ignored; {} filtered out; finished in {:.2}s",
+            summary.passed,
+            summary.failed + summary.timed_out,
+            summary.ignored,
+            summary.filtered,
+            summary.duration.as_secs_f64()
+        );
+        
+        self.writeln("");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TERSE REPORTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Minimal terse output
+pub struct TerseReporter {
+    writer: Box<dyn Write>,
+    color: bool,
+    line_width: usize,
+    current_width: usize,
+}
+
+impl TerseReporter {
+    pub fn new(config: &TestConfig) -> Self {
+        let color = match config.color {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => is_tty(),
+        };
+        
+        TerseReporter {
+            writer: Box::new(io::stdout()),
+            color,
+            line_width: 60,
+            current_width: 0,
+        }
+    }
+    
+    fn write_char(&mut self, c: char, color: Color) {
+        if self.color {
+            let _ = write!(
+                self.writer, 
+                "{}{}{}", 
+                color.ansi_code(), 
+                c, 
+                Color::Reset.ansi_code()
+            );
+        } else {
+            let _ = write!(self.writer, "{}", c);
+        }
+        
+        self.current_width += 1;
+        if self.current_width >= self.line_width {
+            let _ = writeln!(self.writer);
+            self.current_width = 0;
+        }
+    }
+}
+
+impl Reporter for TerseReporter {
+    fn start(&mut self, total_tests: usize) {
+        let _ = writeln!(self.writer, "running {} tests", total_tests);
+        self.current_width = 0;
+    }
+    
+    fn test_start(&mut self, _test: &TestDescriptor) {}
+    
+    fn test_end(&mut self, result: &TestResult) {
+        match result.outcome {
+            TestOutcome::Passed => self.write_char('.', Color::Green),
+            TestOutcome::Failed => self.write_char('F', Color::Red),
+            TestOutcome::Ignored => self.write_char('i', Color::Yellow),
+            TestOutcome::TimedOut => self.write_char('T', Color::Red),
+            TestOutcome::Filtered => {}
+        }
+        let _ = self.writer.flush();
+    }
+    
+    fn finish(&mut self, summary: &TestSummary) {
+        if self.current_width > 0 {
+            let _ = writeln!(self.writer);
+        }
+        let _ = writeln!(self.writer, "\n{}", summary);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JSON REPORTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// JSON output format
+pub struct JsonReporter {
+    writer: Box<dyn Write>,
+    results: Vec<TestResult>,
+    pretty: bool,
+}
+
+impl JsonReporter {
+    pub fn new(_config: &TestConfig) -> Self {
+        JsonReporter {
+            writer: Box::new(io::stdout()),
+            results: Vec::new(),
+            pretty: true,
+        }
+    }
+    
+    pub fn with_writer<W: Write + 'static>(mut self, writer: W) -> Self {
+        self.writer = Box::new(writer);
+        self
+    }
+    
+    fn write_json(&mut self, summary: &TestSummary) {
+        let indent = if self.pretty { "  " } else { "" };
+        let newline = if self.pretty { "\n" } else { "" };
+        
+        let _ = write!(self.writer, "{{{}\"type\": \"suite\",{}", newline, newline);
+        let _ = write!(self.writer, "{}\"passed\": {},{}", indent, summary.passed, newline);
+        let _ = write!(self.writer, "{}\"failed\": {},{}", indent, summary.failed, newline);
+        let _ = write!(self.writer, "{}\"ignored\": {},{}", indent, summary.ignored, newline);
+        let _ = write!(self.writer, "{}\"duration\": {:.6},{}", indent, summary.duration.as_secs_f64(), newline);
+        let _ = write!(self.writer, "{}\"tests\": [{}", indent, newline);
+        
+        for (i, result) in self.results.iter().enumerate() {
+            if i > 0 {
+                let _ = write!(self.writer, ",{}", newline);
+            }
+            self.write_test_json(result, indent);
+        }
+        
+        let _ = write!(self.writer, "{}]{}}}{}", newline, newline, newline);
+    }
+    
+    fn write_test_json(&mut self, result: &TestResult, indent: &str) {
+        let double_indent = format!("{}{}",indent, indent);
+        let newline = if self.pretty { "\n" } else { "" };
+        
+        let _ = write!(self.writer, "{}{{{}{}\"name\": \"{}\",{}", 
+            double_indent, newline, double_indent, 
+            escape_json(&result.test.name), newline);
+        let _ = write!(self.writer, "{}\"outcome\": \"{}\",{}", 
+            double_indent, result.outcome, newline);
+        let _ = write!(self.writer, "{}\"duration\": {:.6}", 
+            double_indent, result.duration.as_secs_f64());
+        
+        if let Some(ref msg) = result.message {
+            let _ = write!(self.writer, ",{}{}\"message\": \"{}\"", 
+                newline, double_indent, escape_json(msg));
+        }
+        
+        let _ = write!(self.writer, "{}{}}}", newline, indent);
+    }
+}
+
+impl Reporter for JsonReporter {
+    fn start(&mut self, _total_tests: usize) {
+        self.results.clear();
+    }
+    
+    fn test_start(&mut self, _test: &TestDescriptor) {}
+    
+    fn test_end(&mut self, result: &TestResult) {
+        self.results.push(result.clone());
+    }
+    
+    fn finish(&mut self, summary: &TestSummary) {
+        self.write_json(summary);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JUNIT REPORTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// JUnit XML output format
+pub struct JunitReporter {
+    writer: Box<dyn Write>,
+    suite_name: String,
+    results: Vec<TestResult>,
+}
+
+impl JunitReporter {
+    pub fn new(_config: &TestConfig) -> Self {
+        JunitReporter {
+            writer: Box::new(io::stdout()),
+            suite_name: "QuantaLang Tests".to_string(),
+            results: Vec::new(),
+        }
+    }
+    
+    pub fn with_suite_name(mut self, name: &str) -> Self {
+        self.suite_name = name.to_string();
+        self
+    }
+    
+    pub fn with_writer<W: Write + 'static>(mut self, writer: W) -> Self {
+        self.writer = Box::new(writer);
+        self
+    }
+    
+    fn write_xml(&mut self, summary: &TestSummary) {
+        let _ = writeln!(self.writer, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+        let _ = writeln!(
+            self.writer,
+            "<testsuite name=\"{}\" tests=\"{}\" failures=\"{}\" errors=\"{}\" skipped=\"{}\" time=\"{:.6}\">",
+            escape_xml(&self.suite_name),
+            summary.total,
+            summary.failed + summary.timed_out,
+            0,
+            summary.ignored,
+            summary.duration.as_secs_f64()
+        );
+        
+        for result in &self.results {
+            self.write_testcase(result);
+        }
+        
+        let _ = writeln!(self.writer, "</testsuite>");
+    }
+    
+    fn write_testcase(&mut self, result: &TestResult) {
+        let classname = result.test.module.replace("::", ".");
+        
+        let _ = write!(
+            self.writer,
+            "  <testcase name=\"{}\" classname=\"{}\" time=\"{:.6}\"",
+            escape_xml(&result.test.fn_name),
+            escape_xml(&classname),
+            result.duration.as_secs_f64()
+        );
+        
+        match result.outcome {
+            TestOutcome::Passed => {
+                let _ = writeln!(self.writer, " />");
+            }
+            TestOutcome::Failed | TestOutcome::TimedOut => {
+                let _ = writeln!(self.writer, ">");
+                let msg = result.message.as_deref().unwrap_or("test failed");
+                let _ = writeln!(
+                    self.writer,
+                    "    <failure message=\"{}\"><![CDATA[{}]]></failure>",
+                    escape_xml(msg),
+                    msg
+                );
+                
+                if !result.stdout.is_empty() {
+                    let _ = writeln!(
+                        self.writer,
+                        "    <system-out><![CDATA[{}]]></system-out>",
+                        result.stdout
+                    );
+                }
+                if !result.stderr.is_empty() {
+                    let _ = writeln!(
+                        self.writer,
+                        "    <system-err><![CDATA[{}]]></system-err>",
+                        result.stderr
+                    );
+                }
+                
+                let _ = writeln!(self.writer, "  </testcase>");
+            }
+            TestOutcome::Ignored => {
+                let _ = writeln!(self.writer, ">");
+                let reason = result.test.ignore_reason.as_deref().unwrap_or("ignored");
+                let _ = writeln!(
+                    self.writer,
+                    "    <skipped message=\"{}\"/>",
+                    escape_xml(reason)
+                );
+                let _ = writeln!(self.writer, "  </testcase>");
+            }
+            TestOutcome::Filtered => {}
+        }
+    }
+}
+
+impl Reporter for JunitReporter {
+    fn start(&mut self, _total_tests: usize) {
+        self.results.clear();
+    }
+    
+    fn test_start(&mut self, _test: &TestDescriptor) {}
+    
+    fn test_end(&mut self, result: &TestResult) {
+        self.results.push(result.clone());
+    }
+    
+    fn finish(&mut self, summary: &TestSummary) {
+        self.write_xml(summary);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TAP REPORTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// TAP (Test Anything Protocol) output
+pub struct TapReporter {
+    writer: Box<dyn Write>,
+    test_num: usize,
+}
+
+impl TapReporter {
+    pub fn new(_config: &TestConfig) -> Self {
+        TapReporter {
+            writer: Box::new(io::stdout()),
+            test_num: 0,
+        }
+    }
+}
+
+impl Reporter for TapReporter {
+    fn start(&mut self, total_tests: usize) {
+        self.test_num = 0;
+        let _ = writeln!(self.writer, "TAP version 13");
+        let _ = writeln!(self.writer, "1..{}", total_tests);
+    }
+    
+    fn test_start(&mut self, _test: &TestDescriptor) {}
+    
+    fn test_end(&mut self, result: &TestResult) {
+        self.test_num += 1;
+        
+        let status = match result.outcome {
+            TestOutcome::Passed => "ok",
+            TestOutcome::Failed | TestOutcome::TimedOut => "not ok",
+            TestOutcome::Ignored => "ok",
+            TestOutcome::Filtered => return,
+        };
+        
+        let directive = match result.outcome {
+            TestOutcome::Ignored => " # SKIP",
+            _ => "",
+        };
+        
+        let _ = writeln!(
+            self.writer,
+            "{} {} - {}{}",
+            status,
+            self.test_num,
+            result.test.name,
+            directive
+        );
+        
+        // YAML diagnostics for failures
+        if result.is_failure() {
+            let _ = writeln!(self.writer, "  ---");
+            if let Some(ref msg) = result.message {
+                let _ = writeln!(self.writer, "  message: {}", msg);
+            }
+            let _ = writeln!(self.writer, "  duration: {:.6}s", result.duration.as_secs_f64());
+            let _ = writeln!(self.writer, "  ...");
+        }
+    }
+    
+    fn finish(&mut self, _summary: &TestSummary) {}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FACTORY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create reporter based on format
+pub fn create_reporter(config: &TestConfig) -> Box<dyn Reporter> {
+    match config.format {
+        OutputFormat::Pretty => Box::new(PrettyReporter::new(config)),
+        OutputFormat::Terse => Box::new(TerseReporter::new(config)),
+        OutputFormat::Json => Box::new(JsonReporter::new(config)),
+        OutputFormat::Junit => Box::new(JunitReporter::new(config)),
+    }
+}
+
+/// Create file reporter based on format
+pub fn create_file_reporter(config: &TestConfig) -> Option<Box<dyn Reporter>> {
+    let path = config.report_path.as_ref()?;
+    
+    let file = std::fs::File::create(path).ok()?;
+    
+    match config.report_format {
+        ReportFormat::Json => Some(Box::new(JsonReporter::new(config).with_writer(file))),
+        ReportFormat::Junit => Some(Box::new(JunitReporter::new(config).with_writer(file))),
+        ReportFormat::Html => None, // TODO: HTML reporter
+        ReportFormat::Tap => Some(Box::new(TapReporter::new(config))),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Copy)]
+enum Color {
+    Reset,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Cyan,
+}
+
+impl Color {
+    fn ansi_code(&self) -> &'static str {
+        match self {
+            Color::Reset => "\x1b[0m",
+            Color::Red => "\x1b[31m",
+            Color::Green => "\x1b[32m",
+            Color::Yellow => "\x1b[33m",
+            Color::Blue => "\x1b[34m",
+            Color::Cyan => "\x1b[36m",
+        }
+    }
+}
+
+fn is_tty() -> bool {
+    // Simple TTY detection
+    #[cfg(unix)]
+    {
+        unsafe { libc::isatty(1) != 0 }
+    }
+    
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn escape_json(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            c if c.is_control() => result.push_str(&format!("\\u{:04x}", c as u32)),
+            c => result.push(c),
+        }
+    }
+    result
+}
+
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_escape_json() {
+        assert_eq!(escape_json("hello"), "hello");
+        assert_eq!(escape_json("hello\nworld"), "hello\\nworld");
+        assert_eq!(escape_json("say \"hi\""), "say \\\"hi\\\"");
+    }
+    
+    #[test]
+    fn test_escape_xml() {
+        assert_eq!(escape_xml("hello"), "hello");
+        assert_eq!(escape_xml("<tag>"), "&lt;tag&gt;");
+        assert_eq!(escape_xml("a & b"), "a &amp; b");
+    }
+}

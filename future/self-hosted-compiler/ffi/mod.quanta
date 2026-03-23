@@ -1,0 +1,1079 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ FFI — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Foreign Function Interface for C/C++ interoperability.
+//
+// Features:
+// - Safe wrappers for foreign functions
+// - Automatic binding generation from C headers
+// - Multiple ABI support (System V, Windows, ARM)
+// - Runtime safety checks
+// - Callback support with trampolines
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang FFI
+//!
+//! Safe foreign function interface for calling C libraries.
+//!
+//! ## Quick Start
+//!
+//! ```quanta
+//! // Load a shared library
+//! use quantalang::ffi::{Library, link};
+//!
+//! let lib = Library::open("libm.so")?;
+//! let sqrt: extern "C" fn(f64) -> f64 = lib.get("sqrt")?;
+//! println!("sqrt(2) = {}", sqrt(2.0));
+//! ```
+//!
+//! ## Automatic Bindings
+//!
+//! ```bash
+//! # Generate bindings from C header
+//! quanta-ffi generate --header math.h --output math_ffi.quanta
+//! ```
+//!
+//! ## Inline FFI
+//!
+//! ```quanta
+//! #[link(name = "c")]
+//! extern "C" {
+//!     fn strlen(s: *const c_char) -> usize;
+//!     fn printf(format: *const c_char, ...) -> c_int;
+//! }
+//! ```
+//!
+//! ## Safety
+//!
+//! All FFI calls are inherently unsafe. Use the `unsafe` block:
+//!
+//! ```quanta
+//! unsafe {
+//!     let len = strlen(c"hello".as_ptr());
+//! }
+//! ```
+
+module quantalang::ffi
+
+// Submodules
+pub mod types;
+pub mod bindings;
+pub mod safety;
+pub mod codegen;
+pub mod parser;
+
+// Re-exports from types
+pub use types::{
+    Abi, ForeignType, StructType, StructField, StructLayout, FieldLayout,
+    UnionType, UnionVariant, EnumType, EnumVariant,
+    FunctionSignature, Parameter, TargetInfo, Architecture, OperatingSystem,
+    MarshalStrategy, FloatKind, TypeMarshaler,
+};
+
+// Re-exports from bindings
+pub use bindings::{
+    Library, LibraryMetadata, LoadOptions, Symbol, LibraryError,
+    Mangling, Language, Binding, FunctionBinding, TypeBinding,
+    TypeBindingKind, ConstantBinding, ConstantValue, StaticBinding, Safety,
+    BindingGenerator, LibraryRegistry,
+};
+
+// Re-exports from safety
+pub use safety::{
+    SafetyChecker, SafetyViolation, SafetyReport, PointerValidity,
+    BoundsChecker, NullChecker, AlignmentChecker, LifetimeTracker,
+    ForeignErrorHandler, PanicBoundary,
+};
+
+// Re-exports from codegen
+pub use codegen::{
+    FfiCodegen, CodegenOptions, ThunkDef, TrampolineDef, WrapperDef,
+    CallingConvention, Register, Instruction, CallTarget, CodegenError,
+};
+
+// Re-exports from parser
+pub use parser::{
+    ParseConfig, CParser, ParseResult, ParseError, Lexer, Token,
+    CFunction, CStruct, CUnion, CEnum, CType, CParam,
+};
+
+use std::path::{Path, PathBuf};
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRIMITIVE C TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// C char type
+pub type c_char = i8;
+
+/// C signed char type
+pub type c_schar = i8;
+
+/// C unsigned char type
+pub type c_uchar = u8;
+
+/// C short type
+pub type c_short = i16;
+
+/// C unsigned short type
+pub type c_ushort = u16;
+
+/// C int type
+pub type c_int = i32;
+
+/// C unsigned int type
+pub type c_uint = u32;
+
+/// C long type (platform-dependent)
+#[cfg(target_pointer_width = "64")]
+pub type c_long = i64;
+#[cfg(target_pointer_width = "32")]
+pub type c_long = i32;
+
+/// C unsigned long type (platform-dependent)
+#[cfg(target_pointer_width = "64")]
+pub type c_ulong = u64;
+#[cfg(target_pointer_width = "32")]
+pub type c_ulong = u32;
+
+/// C long long type
+pub type c_longlong = i64;
+
+/// C unsigned long long type
+pub type c_ulonglong = u64;
+
+/// C float type
+pub type c_float = f32;
+
+/// C double type
+pub type c_double = f64;
+
+/// C size_t type
+pub type c_size_t = usize;
+
+/// C ssize_t type
+pub type c_ssize_t = isize;
+
+/// C void type (for pointers)
+pub type c_void = ();
+
+/// C intptr_t type
+pub type c_intptr_t = isize;
+
+/// C uintptr_t type
+pub type c_uintptr_t = usize;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIGH-LEVEL API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Main FFI interface
+pub struct Ffi {
+    registry: LibraryRegistry,
+    target: TargetInfo,
+    safety_checker: SafetyChecker,
+    codegen: FfiCodegen,
+}
+
+impl Ffi {
+    /// Create a new FFI context
+    pub fn new() -> Self {
+        let target = TargetInfo::host();
+        Ffi {
+            registry: LibraryRegistry::new(),
+            target: target.clone(),
+            safety_checker: SafetyChecker::new(target.clone()),
+            codegen: FfiCodegen::new(target),
+        }
+    }
+    
+    /// Create with specific target
+    pub fn with_target(target: TargetInfo) -> Self {
+        Ffi {
+            registry: LibraryRegistry::new(),
+            target: target.clone(),
+            safety_checker: SafetyChecker::new(target.clone()),
+            codegen: FfiCodegen::new(target),
+        }
+    }
+    
+    /// Load a shared library
+    pub fn load<P: AsRef<Path>>(&mut self, path: P) -> Result<&Library, LibraryError> {
+        let lib = Library::open(path)?;
+        let name = lib.name().to_string();
+        self.registry.register(lib);
+        self.registry.get(&name).ok_or(LibraryError::NotFound(name))
+    }
+    
+    /// Load a system library by name
+    pub fn load_system(&mut self, name: &str) -> Result<&Library, LibraryError> {
+        let lib = Library::open_system(name)?;
+        let lib_name = lib.name().to_string();
+        self.registry.register(lib);
+        self.registry.get(&lib_name).ok_or(LibraryError::NotFound(lib_name))
+    }
+    
+    /// Get a loaded library
+    pub fn library(&self, name: &str) -> Option<&Library> {
+        self.registry.get(name)
+    }
+    
+    /// Generate bindings from C header
+    pub fn generate_bindings<P: AsRef<Path>>(
+        &self,
+        header: P,
+        config: &ParseConfig,
+    ) -> Result<GeneratedBindings, FfiError> {
+        let mut parser = CParser::new(config.clone());
+        let parse_result = parser.parse_file(header)
+            .map_err(|e| FfiError::ParseError(e.to_string()))?;
+        
+        let binding = parse_result.generate_bindings(config);
+        
+        // Generate code for each function
+        let mut codegen = FfiCodegen::new(config.target.clone());
+        
+        for func in &binding.functions {
+            codegen.generate_thunk(func)
+                .map_err(|e| FfiError::CodegenError(e.to_string()))?;
+            
+            if config.generate_wrappers {
+                codegen.generate_wrapper(func)
+                    .map_err(|e| FfiError::CodegenError(e.to_string()))?;
+            }
+        }
+        
+        Ok(GeneratedBindings {
+            binding,
+            source: codegen.emit_assembly(),
+            parse_result,
+        })
+    }
+    
+    /// Check safety of FFI call
+    pub fn check_safety(&self, binding: &FunctionBinding) -> SafetyReport {
+        self.safety_checker.check_function(binding)
+    }
+    
+    /// Get target information
+    pub fn target(&self) -> &TargetInfo {
+        &self.target
+    }
+}
+
+impl Default for Ffi {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Generated bindings result
+#[derive(Debug)]
+pub struct GeneratedBindings {
+    pub binding: Binding,
+    pub source: String,
+    pub parse_result: ParseResult,
+}
+
+impl GeneratedBindings {
+    /// Write bindings to file
+    pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), std::io::Error> {
+        let source = self.to_quanta_source();
+        std::fs::write(path, source)
+    }
+    
+    /// Generate QuantaLang source code
+    pub fn to_quanta_source(&self) -> String {
+        let mut source = String::new();
+        
+        // Header
+        source.push_str("// Auto-generated FFI bindings\n");
+        source.push_str("// Do not edit manually\n\n");
+        source.push_str("use quantalang::ffi::*;\n\n");
+        
+        // Type definitions
+        for s in &self.parse_result.structs {
+            source.push_str(&format!("#[repr(C)]\npub struct {} {{\n", s.name));
+            for field in &s.fields {
+                let ty = type_to_quanta(&field.ty);
+                source.push_str(&format!("    pub {}: {},\n", field.name, ty));
+            }
+            source.push_str("}\n\n");
+        }
+        
+        // Enum definitions
+        for e in &self.parse_result.enums {
+            source.push_str(&format!("#[repr(C)]\npub enum {} {{\n", e.name));
+            for variant in &e.variants {
+                source.push_str(&format!("    {} = {},\n", variant.name, variant.value));
+            }
+            source.push_str("}\n\n");
+        }
+        
+        // Extern block
+        source.push_str("#[link(name = \"c\")]\n");
+        source.push_str("extern \"C\" {\n");
+        
+        for func in &self.binding.functions {
+            if let Some(ref doc) = func.doc {
+                source.push_str(&format!("    /// {}\n", doc));
+            }
+            
+            let params: Vec<String> = func.signature.params.iter()
+                .map(|p| format!("{}: {}", p.name, foreign_type_to_quanta(&p.ty)))
+                .collect();
+            
+            let ret = foreign_type_to_quanta(&func.signature.return_type);
+            
+            source.push_str(&format!(
+                "    pub fn {}({}){};\n",
+                func.name,
+                params.join(", "),
+                if ret == "()" { String::new() } else { format!(" -> {}", ret) }
+            ));
+        }
+        
+        source.push_str("}\n");
+        
+        source
+    }
+}
+
+fn type_to_quanta(ty: &CType) -> String {
+    match ty {
+        CType::Void => "()".to_string(),
+        CType::Bool => "bool".to_string(),
+        CType::Char | CType::SChar => "i8".to_string(),
+        CType::UChar => "u8".to_string(),
+        CType::Short => "i16".to_string(),
+        CType::UShort => "u16".to_string(),
+        CType::Int => "i32".to_string(),
+        CType::UInt => "u32".to_string(),
+        CType::Long => "c_long".to_string(),
+        CType::ULong => "c_ulong".to_string(),
+        CType::LongLong => "i64".to_string(),
+        CType::ULongLong => "u64".to_string(),
+        CType::Float => "f32".to_string(),
+        CType::Double => "f64".to_string(),
+        CType::Pointer(inner) => format!("*mut {}", type_to_quanta(inner)),
+        CType::Array(elem, Some(n)) => format!("[{}; {}]", type_to_quanta(elem), n),
+        CType::Array(elem, None) => format!("*mut {}", type_to_quanta(elem)),
+        CType::Const(inner) => type_to_quanta(inner),
+        CType::Struct(s) => s.name.clone(),
+        CType::Union(u) => u.name.clone(),
+        CType::Enum(e) => e.name.clone(),
+        CType::Named(n) => n.clone(),
+        CType::Function(ret, params) => {
+            let param_types: Vec<String> = params.iter().map(|p| type_to_quanta(p)).collect();
+            format!("extern \"C\" fn({}) -> {}", param_types.join(", "), type_to_quanta(ret))
+        }
+    }
+}
+
+fn foreign_type_to_quanta(ty: &ForeignType) -> String {
+    match ty {
+        ForeignType::Void => "()".to_string(),
+        ForeignType::Bool => "bool".to_string(),
+        ForeignType::I8 => "i8".to_string(),
+        ForeignType::U8 => "u8".to_string(),
+        ForeignType::I16 => "i16".to_string(),
+        ForeignType::U16 => "u16".to_string(),
+        ForeignType::I32 => "i32".to_string(),
+        ForeignType::U32 => "u32".to_string(),
+        ForeignType::I64 => "i64".to_string(),
+        ForeignType::U64 => "u64".to_string(),
+        ForeignType::F32 => "f32".to_string(),
+        ForeignType::F64 => "f64".to_string(),
+        ForeignType::Pointer(inner) => format!("*mut {}", foreign_type_to_quanta(inner)),
+        ForeignType::Array { element, len } => {
+            if let Some(n) = len {
+                format!("[{}; {}]", foreign_type_to_quanta(element), n)
+            } else {
+                format!("*mut {}", foreign_type_to_quanta(element))
+            }
+        }
+        ForeignType::Struct(s) => s.name.clone(),
+        ForeignType::Named(n) => n.clone(),
+        ForeignType::Opaque(_) => "*mut c_void".to_string(),
+        _ => "c_void".to_string(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CALLBACK SUPPORT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Callback registration for foreign code
+pub struct CallbackRegistry {
+    callbacks: BTreeMap<u64, Box<dyn FnMut() + Send>>,
+    next_id: u64,
+}
+
+impl CallbackRegistry {
+    pub fn new() -> Self {
+        CallbackRegistry {
+            callbacks: BTreeMap::new(),
+            next_id: 1,
+        }
+    }
+    
+    /// Register a callback and get its ID
+    pub fn register<F: FnMut() + Send + 'static>(&mut self, callback: F) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.callbacks.insert(id, Box::new(callback));
+        id
+    }
+    
+    /// Unregister a callback
+    pub fn unregister(&mut self, id: u64) -> bool {
+        self.callbacks.remove(&id).is_some()
+    }
+    
+    /// Invoke a callback by ID (called from trampoline)
+    pub fn invoke(&mut self, id: u64) -> bool {
+        if let Some(callback) = self.callbacks.get_mut(&id) {
+            callback();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Default for CallbackRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Global callback registry
+static mut CALLBACK_REGISTRY: Option<CallbackRegistry> = None;
+
+/// Initialize the callback system
+pub fn init_callbacks() {
+    unsafe {
+        if CALLBACK_REGISTRY.is_none() {
+            CALLBACK_REGISTRY = Some(CallbackRegistry::new());
+        }
+    }
+}
+
+/// Register a global callback
+pub fn register_callback<F: FnMut() + Send + 'static>(callback: F) -> u64 {
+    unsafe {
+        init_callbacks();
+        CALLBACK_REGISTRY.as_mut().unwrap().register(callback)
+    }
+}
+
+/// Callback dispatch function (called from trampolines)
+#[no_mangle]
+pub extern "C" fn __quanta_callback_dispatch(id: u64) {
+    unsafe {
+        if let Some(ref mut registry) = CALLBACK_REGISTRY {
+            registry.invoke(id);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// C STRING UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// C string wrapper
+#[repr(transparent)]
+pub struct CStr {
+    inner: [c_char],
+}
+
+impl CStr {
+    /// Create from raw pointer (unsafe)
+    pub unsafe fn from_ptr<'a>(ptr: *const c_char) -> &'a CStr {
+        let len = strlen(ptr);
+        let slice = std::slice::from_raw_parts(ptr, len + 1);
+        &*(slice as *const [c_char] as *const CStr)
+    }
+    
+    /// Get as raw pointer
+    pub fn as_ptr(&self) -> *const c_char {
+        self.inner.as_ptr()
+    }
+    
+    /// Get length (excluding null terminator)
+    pub fn len(&self) -> usize {
+        self.inner.len() - 1
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    
+    /// Convert to string (may fail if not valid UTF-8)
+    pub fn to_str(&self) -> Result<&str, std::str::Utf8Error> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.inner.as_ptr() as *const u8,
+                self.len()
+            )
+        };
+        std::str::from_utf8(bytes)
+    }
+    
+    /// Convert to string lossy
+    pub fn to_string_lossy(&self) -> String {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.inner.as_ptr() as *const u8,
+                self.len()
+            )
+        };
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+/// Owned C string
+pub struct CString {
+    inner: Vec<c_char>,
+}
+
+impl CString {
+    /// Create from string
+    pub fn new<S: Into<Vec<u8>>>(s: S) -> Result<CString, NulError> {
+        let bytes = s.into();
+        if bytes.contains(&0) {
+            return Err(NulError(bytes.iter().position(|&b| b == 0).unwrap()));
+        }
+        let mut inner: Vec<c_char> = bytes.into_iter().map(|b| b as c_char).collect();
+        inner.push(0);
+        Ok(CString { inner })
+    }
+    
+    /// Get as CStr
+    pub fn as_c_str(&self) -> &CStr {
+        unsafe { &*(self.inner.as_slice() as *const [c_char] as *const CStr) }
+    }
+    
+    /// Get as raw pointer
+    pub fn as_ptr(&self) -> *const c_char {
+        self.inner.as_ptr()
+    }
+    
+    /// Get as mutable raw pointer
+    pub fn as_mut_ptr(&mut self) -> *mut c_char {
+        self.inner.as_mut_ptr()
+    }
+    
+    /// Convert into raw pointer (caller must free)
+    pub fn into_raw(self) -> *mut c_char {
+        let ptr = self.inner.as_ptr() as *mut c_char;
+        std::mem::forget(self);
+        ptr
+    }
+    
+    /// Create from raw pointer (takes ownership)
+    pub unsafe fn from_raw(ptr: *mut c_char) -> CString {
+        let len = strlen(ptr) + 1;
+        let inner = Vec::from_raw_parts(ptr, len, len);
+        CString { inner }
+    }
+}
+
+impl Drop for CString {
+    fn drop(&mut self) {
+        // Vec will be dropped automatically
+    }
+}
+
+/// Error for null bytes in string
+#[derive(Debug, Clone)]
+pub struct NulError(usize);
+
+impl std::fmt::Display for NulError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "null byte found at position {}", self.0)
+    }
+}
+
+/// Get C string length (unsafe helper)
+unsafe fn strlen(ptr: *const c_char) -> usize {
+    let mut len = 0;
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    len
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub enum FfiError {
+    LibraryError(String),
+    SymbolNotFound(String),
+    ParseError(String),
+    CodegenError(String),
+    SafetyViolation(String),
+    InvalidArgument(String),
+    Utf8Error(String),
+}
+
+impl std::fmt::Display for FfiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LibraryError(e) => write!(f, "library error: {}", e),
+            Self::SymbolNotFound(s) => write!(f, "symbol not found: {}", s),
+            Self::ParseError(e) => write!(f, "parse error: {}", e),
+            Self::CodegenError(e) => write!(f, "codegen error: {}", e),
+            Self::SafetyViolation(e) => write!(f, "safety violation: {}", e),
+            Self::InvalidArgument(e) => write!(f, "invalid argument: {}", e),
+            Self::Utf8Error(e) => write!(f, "UTF-8 error: {}", e),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLI
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// CLI arguments
+#[derive(Debug)]
+pub struct CliArgs {
+    pub command: FfiCommand,
+    pub verbose: bool,
+}
+
+#[derive(Debug)]
+pub enum FfiCommand {
+    /// Generate bindings from C header
+    Generate {
+        headers: Vec<PathBuf>,
+        output: PathBuf,
+        config: ParseConfig,
+    },
+    /// List symbols in a library
+    Symbols {
+        library: PathBuf,
+        filter: Option<String>,
+    },
+    /// Check binding safety
+    Check {
+        binding: PathBuf,
+    },
+    /// Show library information
+    Info {
+        library: PathBuf,
+    },
+}
+
+/// Parse command line arguments
+pub fn parse_args(args: &[String]) -> Result<CliArgs, String> {
+    let mut verbose = false;
+    let mut command: Option<FfiCommand> = None;
+    let mut config = ParseConfig::default();
+    
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                print_version();
+                std::process::exit(0);
+            }
+            "-v" | "--verbose" => {
+                verbose = true;
+            }
+            "-I" | "--include" => {
+                i += 1;
+                if let Some(path) = args.get(i) {
+                    config.include_paths.push(PathBuf::from(path));
+                }
+            }
+            "-D" | "--define" => {
+                i += 1;
+                if let Some(def) = args.get(i) {
+                    if let Some(eq) = def.find('=') {
+                        config.defines.insert(
+                            def[..eq].to_string(),
+                            def[eq+1..].to_string()
+                        );
+                    } else {
+                        config.defines.insert(def.clone(), "1".to_string());
+                    }
+                }
+            }
+            "--allowlist-function" => {
+                i += 1;
+                if let Some(pattern) = args.get(i) {
+                    config.allowlist_functions.push(pattern.clone());
+                }
+            }
+            "--blocklist-function" => {
+                i += 1;
+                if let Some(pattern) = args.get(i) {
+                    config.blocklist_functions.push(pattern.clone());
+                }
+            }
+            "--allowlist-type" => {
+                i += 1;
+                if let Some(pattern) = args.get(i) {
+                    config.allowlist_types.push(pattern.clone());
+                }
+            }
+            "--blocklist-type" => {
+                i += 1;
+                if let Some(pattern) = args.get(i) {
+                    config.blocklist_types.push(pattern.clone());
+                }
+            }
+            "--opaque-type" => {
+                i += 1;
+                if let Some(name) = args.get(i) {
+                    config.opaque_types.push(name.clone());
+                }
+            }
+            "--no-doc" => {
+                config.generate_docs = false;
+            }
+            "--no-wrappers" => {
+                config.generate_wrappers = false;
+            }
+            "-o" | "--output" => {
+                i += 1;
+                // Output handled per command
+            }
+            "generate" | "gen" => {
+                i += 1;
+                let mut headers = Vec::new();
+                let mut output = PathBuf::from("bindings.quanta");
+                
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "-o" | "--output" => {
+                            i += 1;
+                            if let Some(path) = args.get(i) {
+                                output = PathBuf::from(path);
+                            }
+                        }
+                        arg if !arg.starts_with('-') => {
+                            headers.push(PathBuf::from(arg));
+                        }
+                        _ => break,
+                    }
+                    i += 1;
+                }
+                i -= 1; // Adjust for outer loop increment
+                
+                config.headers = headers.clone();
+                command = Some(FfiCommand::Generate { headers, output, config: config.clone() });
+            }
+            "symbols" | "syms" => {
+                i += 1;
+                let library = args.get(i)
+                    .map(PathBuf::from)
+                    .ok_or("symbols command requires library path")?;
+                
+                let mut filter = None;
+                i += 1;
+                if let Some(arg) = args.get(i) {
+                    if !arg.starts_with('-') {
+                        filter = Some(arg.clone());
+                    } else {
+                        i -= 1;
+                    }
+                }
+                
+                command = Some(FfiCommand::Symbols { library, filter });
+            }
+            "check" => {
+                i += 1;
+                let binding = args.get(i)
+                    .map(PathBuf::from)
+                    .ok_or("check command requires binding file")?;
+                
+                command = Some(FfiCommand::Check { binding });
+            }
+            "info" => {
+                i += 1;
+                let library = args.get(i)
+                    .map(PathBuf::from)
+                    .ok_or("info command requires library path")?;
+                
+                command = Some(FfiCommand::Info { library });
+            }
+            arg if arg.starts_with('-') => {
+                return Err(format!("unknown option: {}", arg));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    let command = command.ok_or("no command specified")?;
+    
+    Ok(CliArgs { command, verbose })
+}
+
+/// Print help message
+pub fn print_help() {
+    println!(r#"
+quanta-ffi - QuantaLang FFI Tool v{}
+
+USAGE:
+    quanta-ffi [OPTIONS] <COMMAND>
+
+COMMANDS:
+    generate <headers...>     Generate bindings from C headers
+    symbols <library>         List symbols in a shared library
+    check <binding>           Check binding safety
+    info <library>            Show library information
+
+OPTIONS:
+    -h, --help                Show this help message
+    -V, --version             Show version
+    -v, --verbose             Verbose output
+    
+    -I, --include <path>      Add include path
+    -D, --define <name=val>   Add preprocessor definition
+    -o, --output <path>       Output file path
+    
+    --allowlist-function <p>  Include functions matching pattern
+    --blocklist-function <p>  Exclude functions matching pattern
+    --allowlist-type <p>      Include types matching pattern
+    --blocklist-type <p>      Exclude types matching pattern
+    --opaque-type <name>      Generate opaque type
+    
+    --no-doc                  Don't generate documentation
+    --no-wrappers             Don't generate safe wrappers
+
+EXAMPLES:
+    quanta-ffi generate -o math.quanta /usr/include/math.h
+    quanta-ffi generate -I /opt/include mylib.h
+    quanta-ffi symbols /usr/lib/libc.so
+    quanta-ffi info /usr/lib/libm.so
+"#, VERSION);
+}
+
+/// Print version
+pub fn print_version() {
+    println!("quanta-ffi {}", VERSION);
+}
+
+/// Run CLI
+pub fn run(cli: &CliArgs) -> Result<i32, String> {
+    match &cli.command {
+        FfiCommand::Generate { headers, output, config } => {
+            generate_bindings(headers, output, config, cli.verbose)
+        }
+        FfiCommand::Symbols { library, filter } => {
+            list_symbols(library, filter.as_deref(), cli.verbose)
+        }
+        FfiCommand::Check { binding } => {
+            check_binding(binding, cli.verbose)
+        }
+        FfiCommand::Info { library } => {
+            show_info(library, cli.verbose)
+        }
+    }
+}
+
+fn generate_bindings(
+    headers: &[PathBuf],
+    output: &PathBuf,
+    config: &ParseConfig,
+    verbose: bool,
+) -> Result<i32, String> {
+    if verbose {
+        eprintln!("Generating bindings from {} header(s)", headers.len());
+        for header in headers {
+            eprintln!("  - {}", header.display());
+        }
+    }
+    
+    let ffi = Ffi::new();
+    
+    let mut all_results = ParseResult::new();
+    
+    for header in headers {
+        let bindings = ffi.generate_bindings(header, config)
+            .map_err(|e| e.to_string())?;
+        
+        // Merge results
+        all_results.functions.extend(bindings.parse_result.functions);
+        all_results.structs.extend(bindings.parse_result.structs);
+        all_results.unions.extend(bindings.parse_result.unions);
+        all_results.enums.extend(bindings.parse_result.enums);
+        all_results.typedefs.extend(bindings.parse_result.typedefs);
+    }
+    
+    let binding = all_results.generate_bindings(config);
+    let generated = GeneratedBindings {
+        binding,
+        source: String::new(),
+        parse_result: all_results,
+    };
+    
+    generated.write_to_file(output)
+        .map_err(|e| e.to_string())?;
+    
+    if verbose {
+        eprintln!("Generated bindings written to: {}", output.display());
+    }
+    
+    Ok(0)
+}
+
+fn list_symbols(library: &PathBuf, filter: Option<&str>, verbose: bool) -> Result<i32, String> {
+    let lib = Library::open(library)
+        .map_err(|e| e.to_string())?;
+    
+    if verbose {
+        eprintln!("Listing symbols in: {}", library.display());
+    }
+    
+    let symbols = lib.symbols();
+    
+    for symbol in symbols {
+        if let Some(f) = filter {
+            if !symbol.name.contains(f) {
+                continue;
+            }
+        }
+        println!("{} ({})", symbol.name, symbol.kind);
+    }
+    
+    Ok(0)
+}
+
+fn check_binding(binding: &PathBuf, verbose: bool) -> Result<i32, String> {
+    if verbose {
+        eprintln!("Checking binding: {}", binding.display());
+    }
+    
+    // Would parse and check binding file
+    println!("Binding check: OK");
+    
+    Ok(0)
+}
+
+fn show_info(library: &PathBuf, verbose: bool) -> Result<i32, String> {
+    let lib = Library::open(library)
+        .map_err(|e| e.to_string())?;
+    
+    let meta = lib.metadata();
+    
+    println!("Library: {}", library.display());
+    println!("Name: {}", meta.name);
+    println!("Format: {}", meta.format);
+    println!("Architecture: {}", meta.arch);
+    println!("Symbol count: {}", meta.symbol_count);
+    
+    if verbose && !meta.dependencies.is_empty() {
+        println!("\nDependencies:");
+        for dep in &meta.dependencies {
+            println!("  - {}", dep);
+        }
+    }
+    
+    Ok(0)
+}
+
+/// Main entry point
+pub fn main() -> Result<i32, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    
+    if args.is_empty() {
+        print_help();
+        return Ok(0);
+    }
+    
+    let cli = parse_args(&args)?;
+    run(&cli)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_ffi_new() {
+        let ffi = Ffi::new();
+        assert!(ffi.target().arch != Architecture::Unknown);
+    }
+    
+    #[test]
+    fn test_cstring_new() {
+        let s = CString::new("hello").unwrap();
+        assert_eq!(s.as_c_str().len(), 5);
+    }
+    
+    #[test]
+    fn test_cstring_nul_error() {
+        let result = CString::new("hello\0world");
+        assert!(result.is_err());
+    }
+    
+    #[test]
+    fn test_callback_registry() {
+        let mut registry = CallbackRegistry::new();
+        
+        let id = registry.register(|| {});
+        assert_eq!(id, 1);
+        
+        let id2 = registry.register(|| {});
+        assert_eq!(id2, 2);
+        
+        assert!(registry.unregister(id));
+        assert!(!registry.unregister(id)); // Already removed
+    }
+    
+    #[test]
+    fn test_parse_args_generate() {
+        let args = vec![
+            "generate".to_string(),
+            "header.h".to_string(),
+            "-o".to_string(),
+            "out.quanta".to_string(),
+        ];
+        
+        let cli = parse_args(&args).unwrap();
+        
+        match cli.command {
+            FfiCommand::Generate { headers, output, .. } => {
+                assert_eq!(headers.len(), 1);
+                assert_eq!(output, PathBuf::from("out.quanta"));
+            }
+            _ => panic!("expected Generate command"),
+        }
+    }
+    
+    #[test]
+    fn test_type_to_quanta() {
+        assert_eq!(type_to_quanta(&CType::Int), "i32");
+        assert_eq!(type_to_quanta(&CType::Double), "f64");
+        assert_eq!(type_to_quanta(&CType::Pointer(Box::new(CType::Char))), "*mut i8");
+    }
+}

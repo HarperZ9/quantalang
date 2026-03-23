@@ -1,0 +1,1018 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ CORE — Raw Pointer Operations
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Raw pointer types and operations. These are the foundation for:
+// - Safe abstractions like Box, Vec, Rc
+// - FFI with C code
+// - Memory-mapped I/O in kernel mode
+//
+// Safety invariants must be manually maintained when using raw pointers.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#![no_std]
+
+module core::ptr
+
+use crate::intrinsics;
+use crate::marker::{Copy, Sized, PhantomData};
+use crate::cmp::{PartialEq, Eq, PartialOrd, Ord, Ordering};
+use crate::mem::MaybeUninit;
+use crate::option::{Option, Some, None};
+use crate::hash::{Hash, Hasher};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NULL POINTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Creates a null raw pointer.
+/// 
+/// # Examples
+/// ```
+/// let p: *const i32 = null();
+/// assert!(p.is_null());
+/// ```
+#[inline]
+#[must_use]
+pub const fn null<T>() -> *const T {
+    0 as *const T
+}
+
+/// Creates a null mutable raw pointer.
+#[inline]
+#[must_use]
+pub const fn null_mut<T>() -> *mut T {
+    0 as *mut T
+}
+
+/// Creates a raw pointer from an address without going through a reference.
+/// 
+/// This is the inverse of `addr()`.
+#[inline]
+#[must_use]
+pub const fn from_exposed_addr<T>(addr: usize) -> *const T {
+    addr as *const T
+}
+
+/// Creates a mutable raw pointer from an address.
+#[inline]
+#[must_use]
+pub const fn from_exposed_addr_mut<T>(addr: usize) -> *mut T {
+    addr as *mut T
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POINTER OPERATIONS (CONST)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl<T: ?Sized> *const T {
+    /// Returns `true` if the pointer is null.
+    #[inline]
+    #[must_use]
+    pub const fn is_null(self) -> bool {
+        (self as *const u8).addr() == 0
+    }
+    
+    /// Casts to a pointer of another type.
+    #[inline]
+    #[must_use]
+    pub const fn cast<U>(self) -> *const U {
+        self as *const U
+    }
+    
+    /// Casts to a mutable pointer.
+    #[inline]
+    #[must_use]
+    pub const fn cast_mut(self) -> *mut T {
+        self as *mut T
+    }
+    
+    /// Gets the address portion of the pointer.
+    #[inline]
+    #[must_use]
+    pub fn addr(self) -> usize
+    where
+        T: Sized,
+    {
+        self as usize
+    }
+    
+    /// Creates a pointer with the given address, preserving provenance.
+    #[inline]
+    #[must_use]
+    pub fn with_addr(self, addr: usize) -> Self
+    where
+        T: Sized,
+    {
+        // Mask off the old address, OR in the new one
+        let self_addr = self.addr();
+        let offset = addr.wrapping_sub(self_addr);
+        self.wrapping_byte_offset(offset as isize)
+    }
+    
+    /// Maps the address, preserving provenance.
+    #[inline]
+    #[must_use]
+    pub fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self
+    where
+        T: Sized,
+    {
+        self.with_addr(f(self.addr()))
+    }
+    
+    /// Calculates the offset from a pointer.
+    /// 
+    /// # Safety
+    /// - Both the starting and resulting pointer must be in bounds
+    /// - The computed offset cannot overflow
+    #[inline]
+    #[must_use]
+    pub const unsafe fn offset(self, count: isize) -> *const T
+    where
+        T: Sized,
+    {
+        intrinsics::offset(self, count)
+    }
+    
+    /// Calculates the offset from a pointer (wrapping arithmetic).
+    #[inline]
+    #[must_use]
+    pub const fn wrapping_offset(self, count: isize) -> *const T
+    where
+        T: Sized,
+    {
+        intrinsics::wrapping_offset(self, count)
+    }
+    
+    /// Calculates the byte offset from a pointer.
+    #[inline]
+    #[must_use]
+    pub const unsafe fn byte_offset(self, count: isize) -> Self {
+        self.cast::<u8>().offset(count).cast()
+    }
+    
+    /// Calculates the byte offset (wrapping).
+    #[inline]
+    #[must_use]
+    pub const fn wrapping_byte_offset(self, count: isize) -> Self {
+        self.cast::<u8>().wrapping_offset(count).cast()
+    }
+    
+    /// Calculates the offset to add to get from `self` to `origin`.
+    /// 
+    /// # Safety
+    /// Both pointers must point to the same allocated object.
+    #[inline]
+    #[must_use]
+    pub const unsafe fn offset_from(self, origin: *const T) -> isize
+    where
+        T: Sized,
+    {
+        intrinsics::ptr_offset_from(self, origin)
+    }
+    
+    /// Adds an offset to a pointer.
+    /// 
+    /// # Safety
+    /// Same as `offset`.
+    #[inline]
+    #[must_use]
+    pub const unsafe fn add(self, count: usize) -> Self
+    where
+        T: Sized,
+    {
+        self.offset(count as isize)
+    }
+    
+    /// Subtracts an offset from a pointer.
+    #[inline]
+    #[must_use]
+    pub const unsafe fn sub(self, count: usize) -> Self
+    where
+        T: Sized,
+    {
+        self.offset((count as isize).wrapping_neg())
+    }
+    
+    /// Adds an offset (wrapping).
+    #[inline]
+    #[must_use]
+    pub const fn wrapping_add(self, count: usize) -> Self
+    where
+        T: Sized,
+    {
+        self.wrapping_offset(count as isize)
+    }
+    
+    /// Subtracts an offset (wrapping).
+    #[inline]
+    #[must_use]
+    pub const fn wrapping_sub(self, count: usize) -> Self
+    where
+        T: Sized,
+    {
+        self.wrapping_offset((count as isize).wrapping_neg())
+    }
+    
+    /// Reads the value from the pointer.
+    /// 
+    /// # Safety
+    /// - The pointer must be valid for reads
+    /// - The pointer must be properly aligned
+    /// - The value must be properly initialized
+    #[inline]
+    #[must_use]
+    pub const unsafe fn read(self) -> T
+    where
+        T: Sized,
+    {
+        intrinsics::read(self)
+    }
+    
+    /// Reads the value from the pointer (volatile).
+    /// 
+    /// The compiler will not optimize away or reorder this read.
+    #[inline]
+    #[must_use]
+    pub unsafe fn read_volatile(self) -> T
+    where
+        T: Sized,
+    {
+        intrinsics::volatile_read(self)
+    }
+    
+    /// Reads the value from a potentially unaligned pointer.
+    #[inline]
+    #[must_use]
+    pub const unsafe fn read_unaligned(self) -> T
+    where
+        T: Sized,
+    {
+        intrinsics::read_unaligned(self)
+    }
+    
+    /// Copies `count` values to `dst`.
+    /// 
+    /// # Safety
+    /// - Both regions must be valid
+    /// - Both must be properly aligned
+    /// - Regions must not overlap (use `copy_to` for overlapping)
+    #[inline]
+    pub const unsafe fn copy_to_nonoverlapping(self, dst: *mut T, count: usize)
+    where
+        T: Sized,
+    {
+        intrinsics::copy_nonoverlapping(self, dst, count)
+    }
+    
+    /// Copies `count` values to `dst` (handles overlap).
+    #[inline]
+    pub const unsafe fn copy_to(self, dst: *mut T, count: usize)
+    where
+        T: Sized,
+    {
+        intrinsics::copy(self, dst, count)
+    }
+    
+    /// Returns `None` if the pointer is null, otherwise returns a reference.
+    /// 
+    /// # Safety
+    /// - The pointer must be aligned and dereferenceable
+    /// - The value must be initialized
+    /// - The memory must not be mutated during the lifetime of the reference
+    #[inline]
+    pub const unsafe fn as_ref<'a>(self) -> Option<&'a T> {
+        if self.is_null() { None } else { Some(&*self) }
+    }
+    
+    /// Returns a reference without checking for null.
+    /// 
+    /// # Safety
+    /// Same as `as_ref`, plus the pointer must not be null.
+    #[inline]
+    pub const unsafe fn as_ref_unchecked<'a>(self) -> &'a T {
+        &*self
+    }
+    
+    /// Returns `true` if the pointer is aligned to `align`.
+    #[inline]
+    #[must_use]
+    pub fn is_aligned(self) -> bool
+    where
+        T: Sized,
+    {
+        self.is_aligned_to(crate::mem::align_of::<T>())
+    }
+    
+    /// Returns `true` if the pointer is aligned to the given alignment.
+    #[inline]
+    #[must_use]
+    pub fn is_aligned_to(self, align: usize) -> bool {
+        debug_assert!(align.is_power_of_two());
+        self.addr() & (align - 1) == 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POINTER OPERATIONS (MUT)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl<T: ?Sized> *mut T {
+    /// Returns `true` if the pointer is null.
+    #[inline]
+    #[must_use]
+    pub const fn is_null(self) -> bool {
+        (self as *const T).is_null()
+    }
+    
+    /// Casts to a pointer of another type.
+    #[inline]
+    #[must_use]
+    pub const fn cast<U>(self) -> *mut U {
+        self as *mut U
+    }
+    
+    /// Casts to a const pointer.
+    #[inline]
+    #[must_use]
+    pub const fn cast_const(self) -> *const T {
+        self as *const T
+    }
+    
+    /// Gets the address portion of the pointer.
+    #[inline]
+    #[must_use]
+    pub fn addr(self) -> usize
+    where
+        T: Sized,
+    {
+        self as usize
+    }
+    
+    /// Creates a pointer with the given address, preserving provenance.
+    #[inline]
+    #[must_use]
+    pub fn with_addr(self, addr: usize) -> Self
+    where
+        T: Sized,
+    {
+        self.cast_const().with_addr(addr).cast_mut()
+    }
+    
+    /// Calculates the offset from a pointer.
+    #[inline]
+    #[must_use]
+    pub const unsafe fn offset(self, count: isize) -> *mut T
+    where
+        T: Sized,
+    {
+        (self as *const T).offset(count) as *mut T
+    }
+    
+    /// Calculates the offset from a pointer (wrapping).
+    #[inline]
+    #[must_use]
+    pub const fn wrapping_offset(self, count: isize) -> *mut T
+    where
+        T: Sized,
+    {
+        (self as *const T).wrapping_offset(count) as *mut T
+    }
+    
+    /// Adds an offset to a pointer.
+    #[inline]
+    #[must_use]
+    pub const unsafe fn add(self, count: usize) -> Self
+    where
+        T: Sized,
+    {
+        self.offset(count as isize)
+    }
+    
+    /// Subtracts an offset from a pointer.
+    #[inline]
+    #[must_use]
+    pub const unsafe fn sub(self, count: usize) -> Self
+    where
+        T: Sized,
+    {
+        self.offset((count as isize).wrapping_neg())
+    }
+    
+    /// Adds an offset (wrapping).
+    #[inline]
+    #[must_use]
+    pub const fn wrapping_add(self, count: usize) -> Self
+    where
+        T: Sized,
+    {
+        self.wrapping_offset(count as isize)
+    }
+    
+    /// Subtracts an offset (wrapping).
+    #[inline]
+    #[must_use]
+    pub const fn wrapping_sub(self, count: usize) -> Self
+    where
+        T: Sized,
+    {
+        self.wrapping_offset((count as isize).wrapping_neg())
+    }
+    
+    /// Reads the value from the pointer.
+    #[inline]
+    #[must_use]
+    pub const unsafe fn read(self) -> T
+    where
+        T: Sized,
+    {
+        (self as *const T).read()
+    }
+    
+    /// Reads the value from the pointer (volatile).
+    #[inline]
+    #[must_use]
+    pub unsafe fn read_volatile(self) -> T
+    where
+        T: Sized,
+    {
+        (self as *const T).read_volatile()
+    }
+    
+    /// Reads the value from a potentially unaligned pointer.
+    #[inline]
+    #[must_use]
+    pub const unsafe fn read_unaligned(self) -> T
+    where
+        T: Sized,
+    {
+        (self as *const T).read_unaligned()
+    }
+    
+    /// Writes a value to the pointer.
+    /// 
+    /// # Safety
+    /// - The pointer must be valid for writes
+    /// - The pointer must be properly aligned
+    #[inline]
+    pub const unsafe fn write(self, val: T)
+    where
+        T: Sized,
+    {
+        intrinsics::write(self, val)
+    }
+    
+    /// Writes a value to the pointer (volatile).
+    #[inline]
+    pub unsafe fn write_volatile(self, val: T)
+    where
+        T: Sized,
+    {
+        intrinsics::volatile_write(self, val)
+    }
+    
+    /// Writes a value to a potentially unaligned pointer.
+    #[inline]
+    pub const unsafe fn write_unaligned(self, val: T)
+    where
+        T: Sized,
+    {
+        intrinsics::write_unaligned(self, val)
+    }
+    
+    /// Sets `count` bytes to `val`.
+    /// 
+    /// # Safety
+    /// The region must be valid for writes.
+    #[inline]
+    pub unsafe fn write_bytes(self, val: u8, count: usize)
+    where
+        T: Sized,
+    {
+        intrinsics::write_bytes(self, val, count)
+    }
+    
+    /// Replaces the value at the pointer, returning the old value.
+    /// 
+    /// # Safety
+    /// - The pointer must be valid for both reads and writes
+    /// - The pointer must be properly aligned
+    #[inline]
+    pub unsafe fn replace(self, val: T) -> T
+    where
+        T: Sized,
+    {
+        intrinsics::replace(self, val)
+    }
+    
+    /// Swaps the values at two pointers.
+    /// 
+    /// # Safety
+    /// Both pointers must be valid and properly aligned.
+    #[inline]
+    pub unsafe fn swap(self, other: *mut T)
+    where
+        T: Sized,
+    {
+        intrinsics::swap(self, other)
+    }
+    
+    /// Runs the destructor on the pointed-to value.
+    /// 
+    /// # Safety
+    /// - The value must be valid and initialized
+    /// - The value must not be accessed after this call
+    #[inline]
+    pub unsafe fn drop_in_place(self) {
+        intrinsics::drop_in_place(self)
+    }
+    
+    /// Returns `None` if the pointer is null, otherwise returns a reference.
+    #[inline]
+    pub const unsafe fn as_ref<'a>(self) -> Option<&'a T> {
+        (self as *const T).as_ref()
+    }
+    
+    /// Returns `None` if the pointer is null, otherwise returns a mutable reference.
+    /// 
+    /// # Safety
+    /// Same as const version, plus no other references to the memory may exist.
+    #[inline]
+    pub unsafe fn as_mut<'a>(self) -> Option<&'a mut T> {
+        if self.is_null() { None } else { Some(&mut *self) }
+    }
+    
+    /// Returns a mutable reference without checking for null.
+    #[inline]
+    pub unsafe fn as_mut_unchecked<'a>(self) -> &'a mut T {
+        &mut *self
+    }
+    
+    /// Copies `count` values from `src`.
+    #[inline]
+    pub const unsafe fn copy_from_nonoverlapping(self, src: *const T, count: usize)
+    where
+        T: Sized,
+    {
+        src.copy_to_nonoverlapping(self, count)
+    }
+    
+    /// Copies `count` values from `src` (handles overlap).
+    #[inline]
+    pub const unsafe fn copy_from(self, src: *const T, count: usize)
+    where
+        T: Sized,
+    {
+        src.copy_to(self, count)
+    }
+    
+    /// Returns `true` if the pointer is aligned.
+    #[inline]
+    #[must_use]
+    pub fn is_aligned(self) -> bool
+    where
+        T: Sized,
+    {
+        (self as *const T).is_aligned()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLICE POINTER EXTENSIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl<T> *const [T] {
+    /// Returns the length of the slice.
+    #[inline]
+    #[must_use]
+    pub const fn len(self) -> usize {
+        // Slice pointers are fat: (ptr, len)
+        unsafe { (*(self as *const SliceRepr)).len }
+    }
+    
+    /// Returns a pointer to the first element.
+    #[inline]
+    #[must_use]
+    pub const fn as_ptr(self) -> *const T {
+        self as *const T
+    }
+}
+
+impl<T> *mut [T] {
+    /// Returns the length of the slice.
+    #[inline]
+    #[must_use]
+    pub const fn len(self) -> usize {
+        (self as *const [T]).len()
+    }
+    
+    /// Returns a mutable pointer to the first element.
+    #[inline]
+    #[must_use]
+    pub const fn as_mut_ptr(self) -> *mut T {
+        self as *mut T
+    }
+}
+
+#[repr(C)]
+struct SliceRepr {
+    ptr: *const (),
+    len: usize,
+}
+
+/// Creates a slice from a pointer and length.
+/// 
+/// # Safety
+/// - `data` must be valid for reads of `len * size_of::<T>()` bytes
+/// - `data` must be properly aligned
+/// - The memory must not be mutated during the lifetime of the slice
+/// - `len * size_of::<T>()` must not overflow `isize::MAX`
+#[inline]
+#[must_use]
+pub const unsafe fn slice_from_raw_parts<'a, T>(data: *const T, len: usize) -> &'a [T] {
+    &*slice_from_raw_parts_ptr(data, len)
+}
+
+/// Creates a mutable slice from a pointer and length.
+#[inline]
+#[must_use]
+pub unsafe fn slice_from_raw_parts_mut<'a, T>(data: *mut T, len: usize) -> &'a mut [T] {
+    &mut *slice_from_raw_parts_mut_ptr(data, len)
+}
+
+/// Creates a raw slice pointer from a data pointer and length.
+#[inline]
+#[must_use]
+pub const fn slice_from_raw_parts_ptr<T>(data: *const T, len: usize) -> *const [T] {
+    unsafe {
+        crate::mem::transmute(SliceRepr { ptr: data as *const (), len })
+    }
+}
+
+/// Creates a raw mutable slice pointer from a data pointer and length.
+#[inline]
+#[must_use]
+pub const fn slice_from_raw_parts_mut_ptr<T>(data: *mut T, len: usize) -> *mut [T] {
+    slice_from_raw_parts_ptr(data, len) as *mut [T]
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NON-NULL POINTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A non-null raw pointer.
+/// 
+/// This type has the same layout as `*mut T` but is guaranteed non-null.
+/// This enables niche optimizations: `Option<NonNull<T>>` is the same size as `*mut T`.
+/// 
+/// # Covariance
+/// Unlike `*mut T` which is invariant, `NonNull<T>` is covariant in `T`.
+/// This is achieved using `PhantomData<*const T>` instead of `*mut T` semantics.
+#[repr(transparent)]
+pub struct NonNull<T: ?Sized> {
+    pointer: *const T,
+}
+
+impl<T: Sized> NonNull<T> {
+    /// Creates a dangling `NonNull` that is well-aligned.
+    /// 
+    /// The pointer is not valid for reads/writes but is useful as a sentinel.
+    #[inline]
+    #[must_use]
+    pub const fn dangling() -> Self {
+        unsafe { NonNull::new_unchecked(crate::mem::align_of::<T>() as *mut T) }
+    }
+}
+
+impl<T: ?Sized> NonNull<T> {
+    /// Creates a new `NonNull` if the pointer is non-null.
+    #[inline]
+    #[must_use]
+    pub const fn new(ptr: *mut T) -> Option<Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { NonNull::new_unchecked(ptr) })
+        }
+    }
+    
+    /// Creates a new `NonNull` without checking for null.
+    /// 
+    /// # Safety
+    /// `ptr` must be non-null.
+    #[inline]
+    #[must_use]
+    pub const unsafe fn new_unchecked(ptr: *mut T) -> Self {
+        NonNull { pointer: ptr as *const T }
+    }
+    
+    /// Acquires the underlying `*mut` pointer.
+    #[inline]
+    #[must_use]
+    pub const fn as_ptr(self) -> *mut T {
+        self.pointer as *mut T
+    }
+    
+    /// Returns a shared reference to the value.
+    /// 
+    /// # Safety
+    /// - The pointer must be dereferenceable
+    /// - The value must be initialized
+    /// - The memory must not be mutated during the lifetime
+    #[inline]
+    #[must_use]
+    pub const unsafe fn as_ref<'a>(&self) -> &'a T {
+        &*self.as_ptr()
+    }
+    
+    /// Returns a mutable reference to the value.
+    /// 
+    /// # Safety
+    /// Same as `as_ref`, plus no other references may exist.
+    #[inline]
+    #[must_use]
+    pub unsafe fn as_mut<'a>(&mut self) -> &'a mut T {
+        &mut *self.as_ptr()
+    }
+    
+    /// Casts to a pointer of another type.
+    #[inline]
+    #[must_use]
+    pub const fn cast<U>(self) -> NonNull<U> {
+        unsafe { NonNull::new_unchecked(self.as_ptr() as *mut U) }
+    }
+}
+
+impl<T: ?Sized> Clone for NonNull<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: ?Sized> Copy for NonNull<T> {}
+
+impl<T: ?Sized> PartialEq for NonNull<T> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ptr() == other.as_ptr()
+    }
+}
+
+impl<T: ?Sized> Eq for NonNull<T> {}
+
+impl<T: ?Sized> PartialOrd for NonNull<T> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T: ?Sized> Ord for NonNull<T> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_ptr().cmp(&other.as_ptr())
+    }
+}
+
+impl<T: ?Sized> Hash for NonNull<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_ptr().hash(state);
+    }
+}
+
+// NonNull is covariant in T
+unsafe impl<T: ?Sized> Send for NonNull<T> where T: Send {}
+unsafe impl<T: ?Sized> Sync for NonNull<T> where T: Sync {}
+
+impl<T: ?Sized> From<&T> for NonNull<T> {
+    #[inline]
+    fn from(reference: &T) -> Self {
+        unsafe { NonNull::new_unchecked(reference as *const T as *mut T) }
+    }
+}
+
+impl<T: ?Sized> From<&mut T> for NonNull<T> {
+    #[inline]
+    fn from(reference: &mut T) -> Self {
+        unsafe { NonNull::new_unchecked(reference as *mut T) }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UNIQUE POINTER (internal)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A non-null pointer with ownership semantics.
+/// 
+/// This is an internal type used by `Box`, `Vec`, etc.
+/// Unlike `NonNull`, `Unique` implies:
+/// - Exclusive ownership of the referent
+/// - The pointer is aligned for `T`
+/// - The value is initialized
+#[repr(transparent)]
+pub struct Unique<T: ?Sized> {
+    pointer: NonNull<T>,
+    _marker: PhantomData<T>,
+}
+
+impl<T: Sized> Unique<T> {
+    /// Creates a dangling `Unique` that is well-aligned.
+    #[inline]
+    #[must_use]
+    pub const fn dangling() -> Self {
+        unsafe { Unique::new_unchecked(NonNull::dangling().as_ptr()) }
+    }
+}
+
+impl<T: ?Sized> Unique<T> {
+    /// Creates a new `Unique` without checking for null.
+    /// 
+    /// # Safety
+    /// `ptr` must be non-null.
+    #[inline]
+    #[must_use]
+    pub const unsafe fn new_unchecked(ptr: *mut T) -> Self {
+        Unique {
+            pointer: NonNull::new_unchecked(ptr),
+            _marker: PhantomData,
+        }
+    }
+    
+    /// Creates a new `Unique` if the pointer is non-null.
+    #[inline]
+    #[must_use]
+    pub const fn new(ptr: *mut T) -> Option<Self> {
+        match NonNull::new(ptr) {
+            Some(p) => Some(Unique { pointer: p, _marker: PhantomData }),
+            None => None,
+        }
+    }
+    
+    /// Acquires the underlying `*mut` pointer.
+    #[inline]
+    #[must_use]
+    pub const fn as_ptr(self) -> *mut T {
+        self.pointer.as_ptr()
+    }
+    
+    /// Returns a shared reference to the value.
+    #[inline]
+    #[must_use]
+    pub const unsafe fn as_ref(&self) -> &T {
+        self.pointer.as_ref()
+    }
+    
+    /// Returns a mutable reference to the value.
+    #[inline]
+    #[must_use]
+    pub unsafe fn as_mut(&mut self) -> &mut T {
+        self.pointer.as_mut()
+    }
+    
+    /// Casts to a pointer of another type.
+    #[inline]
+    #[must_use]
+    pub const fn cast<U>(self) -> Unique<U> {
+        unsafe { Unique::new_unchecked(self.as_ptr() as *mut U) }
+    }
+}
+
+impl<T: ?Sized> Clone for Unique<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: ?Sized> Copy for Unique<T> {}
+
+// Unique implies ownership, so it's Send/Sync if T is
+unsafe impl<T: ?Sized + Send> Send for Unique<T> {}
+unsafe impl<T: ?Sized + Sync> Sync for Unique<T> {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FREE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Copies `count` values from `src` to `dst`.
+/// 
+/// # Safety
+/// - Both regions must be valid
+/// - Both must be properly aligned
+/// - Regions must not overlap
+#[inline]
+pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {
+    intrinsics::copy_nonoverlapping(src, dst, count)
+}
+
+/// Copies `count` values from `src` to `dst` (handles overlap).
+#[inline]
+pub const unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize) {
+    intrinsics::copy(src, dst, count)
+}
+
+/// Sets `count` bytes of memory to `val`.
+#[inline]
+pub unsafe fn write_bytes<T>(dst: *mut T, val: u8, count: usize) {
+    intrinsics::write_bytes(dst, val, count)
+}
+
+/// Reads the value from a pointer.
+#[inline]
+#[must_use]
+pub const unsafe fn read<T>(src: *const T) -> T {
+    intrinsics::read(src)
+}
+
+/// Reads the value from a pointer (volatile).
+#[inline]
+#[must_use]
+pub unsafe fn read_volatile<T>(src: *const T) -> T {
+    intrinsics::volatile_read(src)
+}
+
+/// Reads the value from a potentially unaligned pointer.
+#[inline]
+#[must_use]
+pub const unsafe fn read_unaligned<T>(src: *const T) -> T {
+    intrinsics::read_unaligned(src)
+}
+
+/// Writes a value to a pointer.
+#[inline]
+pub const unsafe fn write<T>(dst: *mut T, val: T) {
+    intrinsics::write(dst, val)
+}
+
+/// Writes a value to a pointer (volatile).
+#[inline]
+pub unsafe fn write_volatile<T>(dst: *mut T, val: T) {
+    intrinsics::volatile_write(dst, val)
+}
+
+/// Writes a value to a potentially unaligned pointer.
+#[inline]
+pub const unsafe fn write_unaligned<T>(dst: *mut T, val: T) {
+    intrinsics::write_unaligned(dst, val)
+}
+
+/// Replaces the value at a pointer, returning the old value.
+#[inline]
+pub unsafe fn replace<T>(dst: *mut T, val: T) -> T {
+    intrinsics::replace(dst, val)
+}
+
+/// Swaps the values at two pointers.
+#[inline]
+pub unsafe fn swap<T>(x: *mut T, y: *mut T) {
+    intrinsics::swap(x, y)
+}
+
+/// Runs the destructor on the pointed-to value.
+#[inline]
+pub unsafe fn drop_in_place<T: ?Sized>(ptr: *mut T) {
+    intrinsics::drop_in_place(ptr)
+}
+
+/// Compares raw pointers for equality.
+#[inline]
+#[must_use]
+pub fn eq<T: ?Sized>(a: *const T, b: *const T) -> bool {
+    a == b
+}
+
+/// Gets a pointer to a static value.
+#[inline]
+#[must_use]
+pub const fn addr_of<T>(val: &T) -> *const T {
+    val as *const T
+}
+
+/// Gets a mutable pointer to a static value.
+#[inline]
+#[must_use]
+pub fn addr_of_mut<T>(val: &mut T) -> *mut T {
+    val as *mut T
+}
+
+/// Creates a `*const T` without going through a reference.
+/// 
+/// This macro is used when creating pointers to uninitialized memory.
+#[macro_export]
+macro_rules! addr_of {
+    ($place:expr) => {
+        &raw const $place
+    };
+}
+
+/// Creates a `*mut T` without going through a reference.
+#[macro_export]
+macro_rules! addr_of_mut {
+    ($place:expr) => {
+        &raw mut $place
+    };
+}

@@ -1,0 +1,834 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ LSP — Semantic Tokens Provider
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// LSP 3.16+ Semantic Tokens for rich, semantic-aware syntax highlighting:
+// - Token types (keyword, variable, function, type, etc.)
+// - Token modifiers (declaration, definition, readonly, async, etc.)
+// - Delta encoding for efficient updates
+// - Range-based partial updates
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::lsp::semantic_tokens
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SEMANTIC TOKEN TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Standard LSP semantic token types
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum SemanticTokenType {
+    Namespace = 0,
+    Type = 1,
+    Class = 2,
+    Enum = 3,
+    Interface = 4,
+    Struct = 5,
+    TypeParameter = 6,
+    Parameter = 7,
+    Variable = 8,
+    Property = 9,
+    EnumMember = 10,
+    Event = 11,
+    Function = 12,
+    Method = 13,
+    Macro = 14,
+    Keyword = 15,
+    Modifier = 16,
+    Comment = 17,
+    String = 18,
+    Number = 19,
+    Regexp = 20,
+    Operator = 21,
+    Decorator = 22,
+    
+    // QuantaLang extensions
+    Lifetime = 23,
+    Label = 24,
+    SelfKeyword = 25,
+    SelfType = 26,
+    BuiltinType = 27,
+    Attribute = 28,
+    Effect = 29,
+    Contract = 30,
+    UnresolvedReference = 31,
+}
+
+impl SemanticTokenType {
+    /// Get all standard token types
+    pub fn standard_types() -> &'static [&'static str] {
+        &[
+            "namespace", "type", "class", "enum", "interface", "struct",
+            "typeParameter", "parameter", "variable", "property",
+            "enumMember", "event", "function", "method", "macro",
+            "keyword", "modifier", "comment", "string", "number",
+            "regexp", "operator", "decorator",
+            // Extensions
+            "lifetime", "label", "selfKeyword", "selfType",
+            "builtinType", "attribute", "effect", "contract",
+            "unresolvedReference",
+        ]
+    }
+    
+    pub fn as_str(&self) -> &'static str {
+        Self::standard_types()[*self as usize]
+    }
+    
+    pub fn from_index(index: u32) -> Option<Self> {
+        if index < 32 {
+            Some(unsafe { std::mem::transmute(index) })
+        } else {
+            None
+        }
+    }
+}
+
+/// Semantic token modifiers (bit flags)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum SemanticTokenModifier {
+    Declaration = 1 << 0,
+    Definition = 1 << 1,
+    Readonly = 1 << 2,
+    Static = 1 << 3,
+    Deprecated = 1 << 4,
+    Abstract = 1 << 5,
+    Async = 1 << 6,
+    Modification = 1 << 7,
+    Documentation = 1 << 8,
+    DefaultLibrary = 1 << 9,
+    
+    // QuantaLang extensions
+    Mutable = 1 << 10,
+    Unsafe = 1 << 11,
+    Public = 1 << 12,
+    Consuming = 1 << 13,
+    Reference = 1 << 14,
+    Effectful = 1 << 15,
+    Generic = 1 << 16,
+    Callable = 1 << 17,
+    Constant = 1 << 18,
+    Associated = 1 << 19,
+}
+
+impl SemanticTokenModifier {
+    pub fn standard_modifiers() -> &'static [&'static str] {
+        &[
+            "declaration", "definition", "readonly", "static",
+            "deprecated", "abstract", "async", "modification",
+            "documentation", "defaultLibrary",
+            // Extensions
+            "mutable", "unsafe", "public", "consuming",
+            "reference", "effectful", "generic", "callable",
+            "constant", "associated",
+        ]
+    }
+    
+    pub fn bit_index(&self) -> u32 {
+        (*self as u32).trailing_zeros()
+    }
+}
+
+/// Token modifier set (bitfield)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenModifiers(pub u32);
+
+impl TokenModifiers {
+    pub fn new() -> Self {
+        TokenModifiers(0)
+    }
+    
+    pub fn add(&mut self, modifier: SemanticTokenModifier) {
+        self.0 |= modifier as u32;
+    }
+    
+    pub fn remove(&mut self, modifier: SemanticTokenModifier) {
+        self.0 &= !(modifier as u32);
+    }
+    
+    pub fn contains(&self, modifier: SemanticTokenModifier) -> bool {
+        (self.0 & modifier as u32) != 0
+    }
+    
+    pub fn union(self, other: TokenModifiers) -> Self {
+        TokenModifiers(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitOr<SemanticTokenModifier> for TokenModifiers {
+    type Output = Self;
+    
+    fn bitor(self, rhs: SemanticTokenModifier) -> Self {
+        TokenModifiers(self.0 | rhs as u32)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SEMANTIC TOKEN DATA
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A single semantic token
+#[derive(Debug, Clone, Copy)]
+pub struct SemanticToken {
+    /// Line number (0-indexed)
+    pub line: u32,
+    /// Column (0-indexed, UTF-16 code units)
+    pub start_char: u32,
+    /// Length (UTF-16 code units)
+    pub length: u32,
+    /// Token type index
+    pub token_type: SemanticTokenType,
+    /// Modifier bitfield
+    pub modifiers: TokenModifiers,
+}
+
+impl SemanticToken {
+    pub fn new(
+        line: u32,
+        start_char: u32,
+        length: u32,
+        token_type: SemanticTokenType,
+    ) -> Self {
+        SemanticToken {
+            line,
+            start_char,
+            length,
+            token_type,
+            modifiers: TokenModifiers::new(),
+        }
+    }
+    
+    pub fn with_modifiers(mut self, modifiers: TokenModifiers) -> Self {
+        self.modifiers = modifiers;
+        self
+    }
+}
+
+/// Encoded semantic tokens (LSP wire format)
+#[derive(Debug, Clone, Default)]
+pub struct SemanticTokensData {
+    /// Flat array: [deltaLine, deltaStart, length, tokenType, modifiers, ...]
+    pub data: Vec<u32>,
+    
+    /// Result ID for incremental updates
+    pub result_id: Option<String>,
+}
+
+impl SemanticTokensData {
+    pub fn new() -> Self {
+        SemanticTokensData {
+            data: Vec::new(),
+            result_id: None,
+        }
+    }
+    
+    pub fn with_result_id(mut self, id: String) -> Self {
+        self.result_id = Some(id);
+        self
+    }
+    
+    /// Encode tokens into LSP format
+    pub fn encode(tokens: &[SemanticToken]) -> Self {
+        let mut data = Vec::with_capacity(tokens.len() * 5);
+        let mut prev_line = 0u32;
+        let mut prev_char = 0u32;
+        
+        // Tokens must be sorted by position
+        let mut sorted: Vec<_> = tokens.iter().collect();
+        sorted.sort_by_key(|t| (t.line, t.start_char));
+        
+        for token in sorted {
+            let delta_line = token.line - prev_line;
+            let delta_char = if delta_line == 0 {
+                token.start_char - prev_char
+            } else {
+                token.start_char
+            };
+            
+            data.push(delta_line);
+            data.push(delta_char);
+            data.push(token.length);
+            data.push(token.token_type as u32);
+            data.push(token.modifiers.0);
+            
+            prev_line = token.line;
+            prev_char = token.start_char;
+        }
+        
+        SemanticTokensData {
+            data,
+            result_id: None,
+        }
+    }
+    
+    /// Decode from LSP format
+    pub fn decode(&self) -> Vec<SemanticToken> {
+        let mut tokens = Vec::new();
+        let mut line = 0u32;
+        let mut char_pos = 0u32;
+        
+        for chunk in self.data.chunks_exact(5) {
+            let delta_line = chunk[0];
+            let delta_char = chunk[1];
+            let length = chunk[2];
+            let token_type = chunk[3];
+            let modifiers = chunk[4];
+            
+            if delta_line > 0 {
+                line += delta_line;
+                char_pos = delta_char;
+            } else {
+                char_pos += delta_char;
+            }
+            
+            if let Some(tt) = SemanticTokenType::from_index(token_type) {
+                tokens.push(SemanticToken {
+                    line,
+                    start_char: char_pos,
+                    length,
+                    token_type: tt,
+                    modifiers: TokenModifiers(modifiers),
+                });
+            }
+        }
+        
+        tokens
+    }
+}
+
+/// Semantic tokens delta (incremental update)
+#[derive(Debug, Clone)]
+pub struct SemanticTokensDelta {
+    pub result_id: Option<String>,
+    pub edits: Vec<SemanticTokensEdit>,
+}
+
+/// Single edit in delta
+#[derive(Debug, Clone)]
+pub struct SemanticTokensEdit {
+    /// Start offset in the previous data array
+    pub start: u32,
+    /// Number of elements to delete
+    pub delete_count: u32,
+    /// Elements to insert
+    pub data: Vec<u32>,
+}
+
+impl SemanticTokensDelta {
+    /// Compute delta between old and new tokens
+    pub fn compute(old: &SemanticTokensData, new: &SemanticTokensData) -> Self {
+        let edits = compute_edits(&old.data, &new.data);
+        
+        SemanticTokensDelta {
+            result_id: new.result_id.clone(),
+            edits,
+        }
+    }
+    
+    /// Apply delta to get new data
+    pub fn apply(&self, old: &SemanticTokensData) -> SemanticTokensData {
+        let mut data = old.data.clone();
+        
+        // Apply edits in reverse order to preserve indices
+        let mut edits: Vec<_> = self.edits.iter().collect();
+        edits.sort_by_key(|e| std::cmp::Reverse(e.start));
+        
+        for edit in edits {
+            let start = edit.start as usize;
+            let end = start + edit.delete_count as usize;
+            
+            data.splice(start..end, edit.data.iter().copied());
+        }
+        
+        SemanticTokensData {
+            data,
+            result_id: self.result_id.clone(),
+        }
+    }
+}
+
+/// Compute minimal edits between two arrays
+fn compute_edits(old: &[u32], new: &[u32]) -> Vec<SemanticTokensEdit> {
+    // Simple diff algorithm - find longest common subsequence regions
+    let mut edits = Vec::new();
+    
+    let mut old_idx = 0;
+    let mut new_idx = 0;
+    
+    while old_idx < old.len() || new_idx < new.len() {
+        // Skip common elements
+        let common_start = old_idx;
+        while old_idx < old.len() && new_idx < new.len() && old[old_idx] == new[new_idx] {
+            old_idx += 1;
+            new_idx += 1;
+        }
+        
+        if old_idx >= old.len() && new_idx >= new.len() {
+            break;
+        }
+        
+        // Find next sync point (matching 5-element token)
+        let mut delete_end = old_idx;
+        let mut insert_end = new_idx;
+        
+        'search: while delete_end < old.len() || insert_end < new.len() {
+            // Try to find a matching token at various offsets
+            for look_old in 0..((old.len() - delete_end).min(50)) {
+                for look_new in 0..((new.len() - insert_end).min(50)) {
+                    if delete_end + look_old + 5 <= old.len() 
+                        && insert_end + look_new + 5 <= new.len()
+                    {
+                        let old_slice = &old[delete_end + look_old..delete_end + look_old + 5];
+                        let new_slice = &new[insert_end + look_new..insert_end + look_new + 5];
+                        
+                        if old_slice == new_slice {
+                            delete_end += look_old;
+                            insert_end += look_new;
+                            break 'search;
+                        }
+                    }
+                }
+            }
+            
+            // No sync found, consume everything
+            delete_end = old.len();
+            insert_end = new.len();
+            break;
+        }
+        
+        // Create edit
+        let delete_count = (delete_end - old_idx) as u32;
+        let insert_data: Vec<u32> = new[new_idx..insert_end].to_vec();
+        
+        if delete_count > 0 || !insert_data.is_empty() {
+            edits.push(SemanticTokensEdit {
+                start: old_idx as u32,
+                delete_count,
+                data: insert_data,
+            });
+        }
+        
+        old_idx = delete_end;
+        new_idx = insert_end;
+    }
+    
+    edits
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SEMANTIC TOKEN PROVIDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Provides semantic tokens for source code
+pub struct SemanticTokensProvider {
+    /// Cache of computed tokens per document
+    cache: BTreeMap<DocumentId, CachedTokens>,
+    
+    /// Next result ID
+    next_result_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DocumentId(pub u64);
+
+#[derive(Debug, Clone)]
+struct CachedTokens {
+    version: u64,
+    result_id: String,
+    tokens: SemanticTokensData,
+}
+
+impl SemanticTokensProvider {
+    pub fn new() -> Self {
+        SemanticTokensProvider {
+            cache: BTreeMap::new(),
+            next_result_id: 0,
+        }
+    }
+    
+    /// Get semantic tokens for full document
+    pub fn full(
+        &mut self,
+        doc_id: DocumentId,
+        version: u64,
+        analysis: &SemanticAnalysis,
+    ) -> SemanticTokensData {
+        let tokens = self.compute_tokens(analysis);
+        let result_id = self.generate_result_id();
+        
+        let data = SemanticTokensData::encode(&tokens)
+            .with_result_id(result_id.clone());
+        
+        self.cache.insert(doc_id, CachedTokens {
+            version,
+            result_id,
+            tokens: data.clone(),
+        });
+        
+        data
+    }
+    
+    /// Get semantic tokens delta
+    pub fn delta(
+        &mut self,
+        doc_id: DocumentId,
+        version: u64,
+        previous_result_id: &str,
+        analysis: &SemanticAnalysis,
+    ) -> Result<SemanticTokensDelta, SemanticTokensData> {
+        // Check if we have the previous result cached
+        let cached = match self.cache.get(&doc_id) {
+            Some(c) if c.result_id == previous_result_id => c.clone(),
+            _ => {
+                // Cache miss - return full tokens
+                return Err(self.full(doc_id, version, analysis));
+            }
+        };
+        
+        let new_tokens = self.compute_tokens(analysis);
+        let new_data = SemanticTokensData::encode(&new_tokens);
+        let result_id = self.generate_result_id();
+        
+        let delta = SemanticTokensDelta::compute(&cached.tokens, &new_data);
+        let delta = SemanticTokensDelta {
+            result_id: Some(result_id.clone()),
+            edits: delta.edits,
+        };
+        
+        self.cache.insert(doc_id, CachedTokens {
+            version,
+            result_id,
+            tokens: new_data,
+        });
+        
+        Ok(delta)
+    }
+    
+    /// Get semantic tokens for range
+    pub fn range(
+        &mut self,
+        doc_id: DocumentId,
+        version: u64,
+        start_line: u32,
+        end_line: u32,
+        analysis: &SemanticAnalysis,
+    ) -> SemanticTokensData {
+        let all_tokens = self.compute_tokens(analysis);
+        
+        let filtered: Vec<_> = all_tokens.into_iter()
+            .filter(|t| t.line >= start_line && t.line <= end_line)
+            .collect();
+        
+        SemanticTokensData::encode(&filtered)
+    }
+    
+    /// Compute semantic tokens from analysis
+    fn compute_tokens(&self, analysis: &SemanticAnalysis) -> Vec<SemanticToken> {
+        let mut tokens = Vec::new();
+        
+        // Process each analyzed item
+        for item in &analysis.items {
+            let token = self.item_to_token(item);
+            tokens.push(token);
+        }
+        
+        // Sort by position
+        tokens.sort_by_key(|t| (t.line, t.start_char));
+        
+        tokens
+    }
+    
+    /// Convert analyzed item to semantic token
+    fn item_to_token(&self, item: &AnalyzedItem) -> SemanticToken {
+        let token_type = match item.kind {
+            ItemKind::Namespace => SemanticTokenType::Namespace,
+            ItemKind::Module => SemanticTokenType::Namespace,
+            ItemKind::Type => SemanticTokenType::Type,
+            ItemKind::Struct => SemanticTokenType::Struct,
+            ItemKind::Enum => SemanticTokenType::Enum,
+            ItemKind::Trait => SemanticTokenType::Interface,
+            ItemKind::TypeAlias => SemanticTokenType::Type,
+            ItemKind::TypeParameter => SemanticTokenType::TypeParameter,
+            ItemKind::Parameter => SemanticTokenType::Parameter,
+            ItemKind::Variable => SemanticTokenType::Variable,
+            ItemKind::Field => SemanticTokenType::Property,
+            ItemKind::EnumVariant => SemanticTokenType::EnumMember,
+            ItemKind::Function => SemanticTokenType::Function,
+            ItemKind::Method => SemanticTokenType::Method,
+            ItemKind::Macro => SemanticTokenType::Macro,
+            ItemKind::Keyword => SemanticTokenType::Keyword,
+            ItemKind::Comment => SemanticTokenType::Comment,
+            ItemKind::String => SemanticTokenType::String,
+            ItemKind::Number => SemanticTokenType::Number,
+            ItemKind::Operator => SemanticTokenType::Operator,
+            ItemKind::Lifetime => SemanticTokenType::Lifetime,
+            ItemKind::Label => SemanticTokenType::Label,
+            ItemKind::Attribute => SemanticTokenType::Attribute,
+            ItemKind::Effect => SemanticTokenType::Effect,
+            ItemKind::Contract => SemanticTokenType::Contract,
+            ItemKind::SelfKeyword => SemanticTokenType::SelfKeyword,
+            ItemKind::SelfType => SemanticTokenType::SelfType,
+            ItemKind::BuiltinType => SemanticTokenType::BuiltinType,
+            ItemKind::Unresolved => SemanticTokenType::UnresolvedReference,
+        };
+        
+        let mut modifiers = TokenModifiers::new();
+        
+        if item.is_declaration { modifiers.add(SemanticTokenModifier::Declaration); }
+        if item.is_definition { modifiers.add(SemanticTokenModifier::Definition); }
+        if item.is_readonly { modifiers.add(SemanticTokenModifier::Readonly); }
+        if item.is_static { modifiers.add(SemanticTokenModifier::Static); }
+        if item.is_deprecated { modifiers.add(SemanticTokenModifier::Deprecated); }
+        if item.is_async { modifiers.add(SemanticTokenModifier::Async); }
+        if item.is_mutable { modifiers.add(SemanticTokenModifier::Mutable); }
+        if item.is_unsafe { modifiers.add(SemanticTokenModifier::Unsafe); }
+        if item.is_public { modifiers.add(SemanticTokenModifier::Public); }
+        if item.is_generic { modifiers.add(SemanticTokenModifier::Generic); }
+        if item.is_effectful { modifiers.add(SemanticTokenModifier::Effectful); }
+        if item.is_constant { modifiers.add(SemanticTokenModifier::Constant); }
+        
+        SemanticToken {
+            line: item.line,
+            start_char: item.column,
+            length: item.length,
+            token_type,
+            modifiers,
+        }
+    }
+    
+    fn generate_result_id(&mut self) -> String {
+        let id = self.next_result_id;
+        self.next_result_id += 1;
+        format!("semantic-{}", id)
+    }
+    
+    /// Invalidate cache for document
+    pub fn invalidate(&mut self, doc_id: DocumentId) {
+        self.cache.remove(&doc_id);
+    }
+    
+    /// Clear all caches
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+}
+
+impl Default for SemanticTokensProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SEMANTIC ANALYSIS INTERFACE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Result of semantic analysis
+#[derive(Debug, Clone)]
+pub struct SemanticAnalysis {
+    pub items: Vec<AnalyzedItem>,
+}
+
+/// Single analyzed item
+#[derive(Debug, Clone)]
+pub struct AnalyzedItem {
+    pub line: u32,
+    pub column: u32,
+    pub length: u32,
+    pub kind: ItemKind,
+    
+    // Modifiers
+    pub is_declaration: bool,
+    pub is_definition: bool,
+    pub is_readonly: bool,
+    pub is_static: bool,
+    pub is_deprecated: bool,
+    pub is_async: bool,
+    pub is_mutable: bool,
+    pub is_unsafe: bool,
+    pub is_public: bool,
+    pub is_generic: bool,
+    pub is_effectful: bool,
+    pub is_constant: bool,
+}
+
+impl AnalyzedItem {
+    pub fn new(line: u32, column: u32, length: u32, kind: ItemKind) -> Self {
+        AnalyzedItem {
+            line, column, length, kind,
+            is_declaration: false,
+            is_definition: false,
+            is_readonly: false,
+            is_static: false,
+            is_deprecated: false,
+            is_async: false,
+            is_mutable: false,
+            is_unsafe: false,
+            is_public: false,
+            is_generic: false,
+            is_effectful: false,
+            is_constant: false,
+        }
+    }
+}
+
+/// Kind of analyzed item
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemKind {
+    Namespace,
+    Module,
+    Type,
+    Struct,
+    Enum,
+    Trait,
+    TypeAlias,
+    TypeParameter,
+    Parameter,
+    Variable,
+    Field,
+    EnumVariant,
+    Function,
+    Method,
+    Macro,
+    Keyword,
+    Comment,
+    String,
+    Number,
+    Operator,
+    Lifetime,
+    Label,
+    Attribute,
+    Effect,
+    Contract,
+    SelfKeyword,
+    SelfType,
+    BuiltinType,
+    Unresolved,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CAPABILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Server capabilities for semantic tokens
+#[derive(Debug, Clone)]
+pub struct SemanticTokensCapabilities {
+    pub token_types: Vec<String>,
+    pub token_modifiers: Vec<String>,
+    pub full: bool,
+    pub full_delta: bool,
+    pub range: bool,
+    pub multiline_token_support: bool,
+    pub overlapping_token_support: bool,
+}
+
+impl Default for SemanticTokensCapabilities {
+    fn default() -> Self {
+        SemanticTokensCapabilities {
+            token_types: SemanticTokenType::standard_types()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            token_modifiers: SemanticTokenModifier::standard_modifiers()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            full: true,
+            full_delta: true,
+            range: true,
+            multiline_token_support: true,
+            overlapping_token_support: false,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_token_encoding() {
+        let tokens = vec![
+            SemanticToken::new(0, 0, 3, SemanticTokenType::Keyword),
+            SemanticToken::new(0, 4, 4, SemanticTokenType::Function),
+            SemanticToken::new(1, 4, 5, SemanticTokenType::Variable),
+        ];
+        
+        let encoded = SemanticTokensData::encode(&tokens);
+        
+        // First token: delta_line=0, delta_char=0
+        assert_eq!(encoded.data[0], 0); // deltaLine
+        assert_eq!(encoded.data[1], 0); // deltaStart
+        assert_eq!(encoded.data[2], 3); // length
+        
+        // Second token: same line, delta_char=4
+        assert_eq!(encoded.data[5], 0); // deltaLine
+        assert_eq!(encoded.data[6], 4); // deltaStart
+        
+        // Third token: next line, char=4
+        assert_eq!(encoded.data[10], 1); // deltaLine
+        assert_eq!(encoded.data[11], 4); // deltaStart (absolute on new line)
+    }
+    
+    #[test]
+    fn test_roundtrip() {
+        let tokens = vec![
+            SemanticToken::new(0, 0, 3, SemanticTokenType::Keyword)
+                .with_modifiers(TokenModifiers::new() | SemanticTokenModifier::Declaration),
+            SemanticToken::new(2, 8, 10, SemanticTokenType::Function),
+        ];
+        
+        let encoded = SemanticTokensData::encode(&tokens);
+        let decoded = encoded.decode();
+        
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].line, 0);
+        assert_eq!(decoded[0].token_type, SemanticTokenType::Keyword);
+        assert!(decoded[0].modifiers.contains(SemanticTokenModifier::Declaration));
+    }
+    
+    #[test]
+    fn test_modifiers() {
+        let mut mods = TokenModifiers::new();
+        assert!(!mods.contains(SemanticTokenModifier::Async));
+        
+        mods.add(SemanticTokenModifier::Async);
+        mods.add(SemanticTokenModifier::Public);
+        
+        assert!(mods.contains(SemanticTokenModifier::Async));
+        assert!(mods.contains(SemanticTokenModifier::Public));
+        assert!(!mods.contains(SemanticTokenModifier::Static));
+    }
+    
+    #[test]
+    fn test_delta_computation() {
+        let old = SemanticTokensData {
+            data: vec![0, 0, 3, 15, 0, 0, 4, 4, 12, 0],
+            result_id: Some("old".to_string()),
+        };
+        
+        let new = SemanticTokensData {
+            data: vec![0, 0, 3, 15, 0, 0, 4, 5, 12, 0], // Changed length 4->5
+            result_id: Some("new".to_string()),
+        };
+        
+        let delta = SemanticTokensDelta::compute(&old, &new);
+        let applied = delta.apply(&old);
+        
+        assert_eq!(applied.data, new.data);
+    }
+}

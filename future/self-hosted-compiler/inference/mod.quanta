@@ -1,0 +1,704 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ INFERENCE — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+//! # Type Inference Engine
+//!
+//! Hindley-Milner type inference with modern extensions:
+//!
+//! - **Algorithm W**: Classical Hindley-Milner unification
+//! - **Bidirectional Typing**: Mode-based checking/synthesis
+//! - **Row Polymorphism**: Extensible records and variants
+//! - **Effect Inference**: Automatic effect tracking
+//!
+//! ## Inference Algorithm
+//!
+//! ```text
+//! Γ ⊢ e ⇒ A   (synthesis: infer type A from expression e)
+//! Γ ⊢ e ⇐ A   (checking: check expression e against type A)
+//!
+//! Key rules:
+//! - Variables: lookup in context Γ
+//! - Lambdas: check mode introduces parameter type
+//! - Application: synthesize function, check argument
+//! - Let: generalize inferred type to scheme
+//! ```
+//!
+//! ## Example
+//!
+//! ```quanta
+//! // Type inferred as: fn<T>(x: T) -> T
+//! let id = |x| x;
+//!
+//! // Type inferred as: fn(a: i32, b: i32) -> i32
+//! let add = |a, b| a + b;
+//!
+//! // Row polymorphism: works on any record with field .x
+//! let get_x = |r| r.x;
+//! ```
+
+module quantalang::inference
+
+pub mod engine;
+
+pub use engine::{
+    // Type variables
+    TyVar, TyVarKind, LifetimeVar,
+    
+    // Types
+    Ty, IntSize, UIntSize, FloatSize, Mutability,
+    TypeName, Row, EffectRow, EffectName,
+    
+    // Schemes
+    Scheme,
+    
+    // Constraints
+    Constraint,
+    
+    // Substitution
+    Substitution,
+    
+    // Unification
+    Unifier, TypeError,
+};
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::collections::BTreeMap;
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE ENVIRONMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type environment (Γ)
+#[derive(Debug, Clone, Default)]
+pub struct TypeEnv {
+    /// Variable bindings: name -> type scheme
+    bindings: BTreeMap<String, Scheme>,
+    
+    /// Type definitions
+    types: BTreeMap<TypeName, TypeDef>,
+    
+    /// Parent environment (for scoping)
+    parent: Option<Arc<TypeEnv>>,
+}
+
+/// Type definition
+#[derive(Debug, Clone)]
+pub struct TypeDef {
+    pub name: TypeName,
+    pub params: Vec<TyVar>,
+    pub kind: TypeKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeKind {
+    /// Type alias
+    Alias(Ty),
+    /// Struct definition
+    Struct { fields: Vec<(String, Ty)> },
+    /// Enum definition
+    Enum { variants: Vec<(String, Vec<Ty>)> },
+    /// Newtype wrapper
+    Newtype(Ty),
+    /// Abstract type (opaque)
+    Abstract,
+}
+
+impl TypeEnv {
+    pub fn new() -> Self {
+        TypeEnv::default()
+    }
+    
+    /// Create child environment
+    pub fn child(parent: Arc<TypeEnv>) -> Self {
+        TypeEnv {
+            bindings: BTreeMap::new(),
+            types: BTreeMap::new(),
+            parent: Some(parent),
+        }
+    }
+    
+    /// Insert binding
+    pub fn insert(&mut self, name: String, scheme: Scheme) {
+        self.bindings.insert(name, scheme);
+    }
+    
+    /// Lookup binding
+    pub fn lookup(&self, name: &str) -> Option<&Scheme> {
+        self.bindings.get(name)
+            .or_else(|| self.parent.as_ref()?.lookup(name))
+    }
+    
+    /// Insert type definition
+    pub fn insert_type(&mut self, def: TypeDef) {
+        self.types.insert(def.name.clone(), def);
+    }
+    
+    /// Lookup type definition
+    pub fn lookup_type(&self, name: &TypeName) -> Option<&TypeDef> {
+        self.types.get(name)
+            .or_else(|| self.parent.as_ref()?.lookup_type(name))
+    }
+    
+    /// Free type variables in environment
+    pub fn free_vars(&self) -> Vec<TyVar> {
+        let mut vars = Vec::new();
+        
+        for scheme in self.bindings.values() {
+            vars.extend(free_vars_in_type(&scheme.ty));
+            for &bound_var in &scheme.vars {
+                vars.retain(|&v| v != bound_var);
+            }
+        }
+        
+        if let Some(parent) = &self.parent {
+            vars.extend(parent.free_vars());
+        }
+        
+        vars.sort();
+        vars.dedup();
+        vars
+    }
+}
+
+/// Get free type variables in type
+pub fn free_vars_in_type(ty: &Ty) -> Vec<TyVar> {
+    let mut vars = Vec::new();
+    collect_free_vars(ty, &mut vars);
+    vars
+}
+
+fn collect_free_vars(ty: &Ty, vars: &mut Vec<TyVar>) {
+    match ty {
+        Ty::Var(v) => vars.push(*v),
+        Ty::Fun { params, ret, effects } => {
+            for p in params {
+                collect_free_vars(p, vars);
+            }
+            collect_free_vars(ret, vars);
+            if let Some(v) = effects.tail {
+                vars.push(v);
+            }
+        }
+        Ty::Tuple(ts) => {
+            for t in ts {
+                collect_free_vars(t, vars);
+            }
+        }
+        Ty::Array(t, _) | Ty::Slice(t) | Ty::Ref { ty: t, .. } => {
+            collect_free_vars(t, vars);
+        }
+        Ty::Named { args, .. } => {
+            for t in args {
+                collect_free_vars(t, vars);
+            }
+        }
+        Ty::Record(row) | Ty::Variant(row) => {
+            for t in row.fields.values() {
+                collect_free_vars(t, vars);
+            }
+            if let Some(v) = row.tail {
+                vars.push(v);
+            }
+        }
+        Ty::Forall { vars: bound, body } => {
+            let mut inner = Vec::new();
+            collect_free_vars(body, &mut inner);
+            for v in inner {
+                if !bound.contains(&v) {
+                    vars.push(v);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BIDIRECTIONAL TYPE CHECKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Bidirectional type checker
+pub struct TypeChecker {
+    /// Type environment
+    env: TypeEnv,
+    
+    /// Unifier for constraint solving
+    unifier: Unifier,
+    
+    /// Accumulated constraints
+    constraints: Vec<Constraint>,
+    
+    /// Error messages
+    errors: Vec<TypeError>,
+}
+
+impl TypeChecker {
+    pub fn new() -> Self {
+        TypeChecker {
+            env: TypeEnv::new(),
+            unifier: Unifier::new(),
+            constraints: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+    
+    pub fn with_env(env: TypeEnv) -> Self {
+        TypeChecker {
+            env,
+            unifier: Unifier::new(),
+            constraints: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+    
+    /// Synthesize type from expression (Γ ⊢ e ⇒ A)
+    pub fn synth(&mut self, expr: &Expr) -> Ty {
+        match expr {
+            Expr::Var(name) => {
+                match self.env.lookup(name) {
+                    Some(scheme) => {
+                        let (ty, constraints) = scheme.instantiate();
+                        self.constraints.extend(constraints);
+                        ty
+                    }
+                    None => {
+                        self.errors.push(TypeError::UnboundVariable(name.clone()));
+                        Ty::Error
+                    }
+                }
+            }
+            
+            Expr::Lit(lit) => self.synth_literal(lit),
+            
+            Expr::App { func, arg } => {
+                let func_ty = self.synth(func);
+                let arg_ty = self.synth(arg);
+                
+                let ret_ty = Ty::Var(TyVar::fresh());
+                let effect = EffectRow::total();
+                
+                self.unifier.defer(Constraint::Eq(
+                    func_ty,
+                    Ty::Fun {
+                        params: vec![arg_ty],
+                        ret: Box::new(ret_ty.clone()),
+                        effects: effect,
+                    },
+                ));
+                
+                ret_ty
+            }
+            
+            Expr::Lambda { param, body } => {
+                let param_ty = Ty::Var(TyVar::fresh());
+                
+                // Extend environment with parameter
+                self.env.insert(param.clone(), Scheme::mono(param_ty.clone()));
+                
+                let body_ty = self.synth(body);
+                
+                Ty::Fun {
+                    params: vec![param_ty],
+                    ret: Box::new(body_ty),
+                    effects: EffectRow::pure(),
+                }
+            }
+            
+            Expr::Let { name, value, body } => {
+                let value_ty = self.synth(value);
+                
+                // Solve constraints before generalization
+                if let Err(errors) = self.unifier.solve_deferred() {
+                    self.errors.extend(errors);
+                }
+                
+                // Generalize the type
+                let scheme = self.generalize(&value_ty);
+                self.env.insert(name.clone(), scheme);
+                
+                self.synth(body)
+            }
+            
+            Expr::Ann { expr, ty } => {
+                self.check(expr, ty);
+                ty.clone()
+            }
+            
+            Expr::If { cond, then_branch, else_branch } => {
+                self.check(cond, &Ty::Bool);
+                
+                let then_ty = self.synth(then_branch);
+                let else_ty = self.synth(else_branch);
+                
+                self.unifier.defer(Constraint::Eq(then_ty.clone(), else_ty));
+                
+                then_ty
+            }
+            
+            Expr::Record { fields } => {
+                let field_types: BTreeMap<String, Ty> = fields.iter()
+                    .map(|(name, expr)| (name.clone(), self.synth(expr)))
+                    .collect();
+                
+                Ty::Record(Row {
+                    fields: field_types,
+                    tail: None,
+                })
+            }
+            
+            Expr::FieldAccess { record, field } => {
+                let record_ty = self.synth(record);
+                let field_ty = Ty::Var(TyVar::fresh());
+                let row_tail = TyVar::fresh();
+                
+                self.unifier.defer(Constraint::Eq(
+                    record_ty,
+                    Ty::Record(Row {
+                        fields: [(field.clone(), field_ty.clone())].into_iter().collect(),
+                        tail: Some(row_tail),
+                    }),
+                ));
+                
+                field_ty
+            }
+            
+            Expr::Binary { op, left, right } => {
+                self.synth_binary(op, left, right)
+            }
+            
+            Expr::Tuple(exprs) => {
+                let types: Vec<Ty> = exprs.iter()
+                    .map(|e| self.synth(e))
+                    .collect();
+                Ty::Tuple(types)
+            }
+            
+            Expr::Unit => Ty::Unit,
+        }
+    }
+    
+    /// Check expression against type (Γ ⊢ e ⇐ A)
+    pub fn check(&mut self, expr: &Expr, expected: &Ty) {
+        match (expr, expected) {
+            // Lambda with known parameter type
+            (Expr::Lambda { param, body }, Ty::Fun { params, ret, .. }) => {
+                if let Some(param_ty) = params.first() {
+                    self.env.insert(param.clone(), Scheme::mono(param_ty.clone()));
+                    self.check(body, ret);
+                } else {
+                    self.errors.push(TypeError::ArityMismatch {
+                        expected: params.len(),
+                        found: 1,
+                    });
+                }
+            }
+            
+            // Tuple with known element types
+            (Expr::Tuple(exprs), Ty::Tuple(expected_tys)) => {
+                if exprs.len() != expected_tys.len() {
+                    self.errors.push(TypeError::TupleLengthMismatch {
+                        expected: expected_tys.len(),
+                        found: exprs.len(),
+                    });
+                } else {
+                    for (expr, ty) in exprs.iter().zip(expected_tys.iter()) {
+                        self.check(expr, ty);
+                    }
+                }
+            }
+            
+            // If with known result type
+            (Expr::If { cond, then_branch, else_branch }, expected) => {
+                self.check(cond, &Ty::Bool);
+                self.check(then_branch, expected);
+                self.check(else_branch, expected);
+            }
+            
+            // Default: synthesize and unify
+            _ => {
+                let actual = self.synth(expr);
+                if let Err(e) = self.unifier.unify(&actual, expected) {
+                    self.errors.push(e);
+                }
+            }
+        }
+    }
+    
+    /// Synthesize literal type
+    fn synth_literal(&mut self, lit: &Literal) -> Ty {
+        match lit {
+            Literal::Unit => Ty::Unit,
+            Literal::Bool(_) => Ty::Bool,
+            Literal::Char(_) => Ty::Char,
+            Literal::String(_) => Ty::String,
+            Literal::Int(_) => {
+                let ty = Ty::Var(TyVar::fresh());
+                self.unifier.defer(Constraint::IntLiteral(ty.clone()));
+                ty
+            }
+            Literal::Float(_) => {
+                let ty = Ty::Var(TyVar::fresh());
+                self.unifier.defer(Constraint::FloatLiteral(ty.clone()));
+                ty
+            }
+        }
+    }
+    
+    /// Synthesize binary operation type
+    fn synth_binary(&mut self, op: &BinOp, left: &Expr, right: &Expr) -> Ty {
+        let left_ty = self.synth(left);
+        let right_ty = self.synth(right);
+        
+        match op {
+            // Arithmetic: both operands same numeric type
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                if let Err(e) = self.unifier.unify(&left_ty, &right_ty) {
+                    self.errors.push(e);
+                }
+                left_ty
+            }
+            
+            // Comparison: same type, returns bool
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                if let Err(e) = self.unifier.unify(&left_ty, &right_ty) {
+                    self.errors.push(e);
+                }
+                Ty::Bool
+            }
+            
+            // Logical: both bool
+            BinOp::And | BinOp::Or => {
+                self.check_is_bool(&left_ty);
+                self.check_is_bool(&right_ty);
+                Ty::Bool
+            }
+        }
+    }
+    
+    fn check_is_bool(&mut self, ty: &Ty) {
+        if let Err(e) = self.unifier.unify(ty, &Ty::Bool) {
+            self.errors.push(e);
+        }
+    }
+    
+    /// Generalize type to scheme
+    pub fn generalize(&self, ty: &Ty) -> Scheme {
+        let ty = self.unifier.substitution().apply(ty);
+        let free_in_env: Vec<TyVar> = self.env.free_vars();
+        let free_in_ty = free_vars_in_type(&ty);
+        
+        // Variables to quantify: free in type but not in environment
+        let vars: Vec<TyVar> = free_in_ty.into_iter()
+            .filter(|v| !free_in_env.contains(v))
+            .collect();
+        
+        if vars.is_empty() {
+            Scheme::mono(ty)
+        } else {
+            Scheme {
+                vars,
+                lifetimes: Vec::new(),
+                constraints: Vec::new(),
+                ty,
+            }
+        }
+    }
+    
+    /// Solve all constraints and finalize
+    pub fn finalize(&mut self) -> Result<Substitution, Vec<TypeError>> {
+        // Solve remaining constraints
+        if let Err(errors) = self.unifier.solve_deferred() {
+            self.errors.extend(errors);
+        }
+        
+        if self.errors.is_empty() {
+            Ok(self.unifier.substitution().clone())
+        } else {
+            Err(std::mem::take(&mut self.errors))
+        }
+    }
+    
+    /// Get current errors
+    pub fn errors(&self) -> &[TypeError] {
+        &self.errors
+    }
+}
+
+impl Default for TypeChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXPRESSION AST (Simplified)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Expression for type checking
+#[derive(Debug, Clone)]
+pub enum Expr {
+    Var(String),
+    Lit(Literal),
+    App { func: Box<Expr>, arg: Box<Expr> },
+    Lambda { param: String, body: Box<Expr> },
+    Let { name: String, value: Box<Expr>, body: Box<Expr> },
+    Ann { expr: Box<Expr>, ty: Ty },
+    If { cond: Box<Expr>, then_branch: Box<Expr>, else_branch: Box<Expr> },
+    Record { fields: Vec<(String, Expr)> },
+    FieldAccess { record: Box<Expr>, field: String },
+    Binary { op: BinOp, left: Box<Expr>, right: Box<Expr> },
+    Tuple(Vec<Expr>),
+    Unit,
+}
+
+#[derive(Debug, Clone)]
+pub enum Literal {
+    Unit,
+    Bool(bool),
+    Char(char),
+    String(String),
+    Int(i64),
+    Float(f64),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    Eq, Ne, Lt, Le, Gt, Ge,
+    And, Or,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub mod prelude {
+    pub use super::{
+        // Core types
+        Ty, TyVar, Scheme, Constraint,
+        
+        // Environment
+        TypeEnv, TypeDef, TypeKind,
+        
+        // Type checker
+        TypeChecker,
+        
+        // Expressions
+        Expr, Literal, BinOp,
+        
+        // Unification
+        Unifier, Substitution, TypeError,
+        
+        // Utilities
+        free_vars_in_type,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_synth_literal() {
+        let mut tc = TypeChecker::new();
+        
+        let ty = tc.synth(&Expr::Lit(Literal::Bool(true)));
+        assert_eq!(ty, Ty::Bool);
+    }
+    
+    #[test]
+    fn test_synth_lambda() {
+        let mut tc = TypeChecker::new();
+        
+        // |x| x (identity)
+        let expr = Expr::Lambda {
+            param: "x".to_string(),
+            body: Box::new(Expr::Var("x".to_string())),
+        };
+        
+        let ty = tc.synth(&expr);
+        
+        // Should be Fun { params: [?0], ret: ?0 }
+        assert!(matches!(ty, Ty::Fun { .. }));
+    }
+    
+    #[test]
+    fn test_synth_application() {
+        let mut tc = TypeChecker::new();
+        
+        // Add id function to env
+        let id_ty = Ty::Forall {
+            vars: vec![TyVar(1000)],
+            body: Box::new(Ty::Fun {
+                params: vec![Ty::Var(TyVar(1000))],
+                ret: Box::new(Ty::Var(TyVar(1000))),
+                effects: EffectRow::pure(),
+            }),
+        };
+        tc.env.insert("id".to_string(), Scheme {
+            vars: vec![TyVar(1000)],
+            lifetimes: vec![],
+            constraints: vec![],
+            ty: Ty::Fun {
+                params: vec![Ty::Var(TyVar(1000))],
+                ret: Box::new(Ty::Var(TyVar(1000))),
+                effects: EffectRow::pure(),
+            },
+        });
+        
+        // id true
+        let expr = Expr::App {
+            func: Box::new(Expr::Var("id".to_string())),
+            arg: Box::new(Expr::Lit(Literal::Bool(true))),
+        };
+        
+        let ty = tc.synth(&expr);
+        tc.finalize().unwrap();
+        
+        let final_ty = tc.unifier.substitution().apply(&ty);
+        assert_eq!(final_ty, Ty::Bool);
+    }
+    
+    #[test]
+    fn test_record_inference() {
+        let mut tc = TypeChecker::new();
+        
+        let expr = Expr::Record {
+            fields: vec![
+                ("x".to_string(), Expr::Lit(Literal::Int(42))),
+                ("y".to_string(), Expr::Lit(Literal::Bool(true))),
+            ],
+        };
+        
+        let ty = tc.synth(&expr);
+        
+        assert!(matches!(ty, Ty::Record(_)));
+    }
+    
+    #[test]
+    fn test_generalize() {
+        let tc = TypeChecker::new();
+        
+        // Type with free variable
+        let ty = Ty::Fun {
+            params: vec![Ty::Var(TyVar(100))],
+            ret: Box::new(Ty::Var(TyVar(100))),
+            effects: EffectRow::pure(),
+        };
+        
+        let scheme = tc.generalize(&ty);
+        
+        // Should quantify over TyVar(100)
+        assert!(!scheme.vars.is_empty());
+    }
+}

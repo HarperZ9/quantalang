@@ -1,0 +1,973 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ CONCURRENT — Parallel Iterators
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Parallel iterator framework (rayon-style):
+// - Parallel map, filter, reduce
+// - Work-stealing execution
+// - Automatic chunking
+// - Join/fork parallelism
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::concurrent::parallel
+
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+use std::sync::Mutex;
+
+use super::pool::{ThreadPool, global_pool};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PARALLEL ITERATOR TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A parallel iterator that can be processed concurrently
+pub trait ParallelIterator: Sized {
+    type Item: Send;
+    
+    /// Drive the parallel computation
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result;
+    
+    /// Get length hint if known
+    fn len_hint(&self) -> Option<usize> {
+        None
+    }
+    
+    /// Map items in parallel
+    fn map<F, R>(self, f: F) -> Map<Self, F>
+    where
+        F: Fn(Self::Item) -> R + Sync + Send,
+        R: Send,
+    {
+        Map { iter: self, f }
+    }
+    
+    /// Filter items in parallel
+    fn filter<F>(self, f: F) -> Filter<Self, F>
+    where
+        F: Fn(&Self::Item) -> bool + Sync + Send,
+    {
+        Filter { iter: self, f }
+    }
+    
+    /// Filter and map in one step
+    fn filter_map<F, R>(self, f: F) -> FilterMap<Self, F>
+    where
+        F: Fn(Self::Item) -> Option<R> + Sync + Send,
+        R: Send,
+    {
+        FilterMap { iter: self, f }
+    }
+    
+    /// Flat map in parallel
+    fn flat_map<F, I>(self, f: F) -> FlatMap<Self, F>
+    where
+        F: Fn(Self::Item) -> I + Sync + Send,
+        I: IntoIterator,
+        I::Item: Send,
+    {
+        FlatMap { iter: self, f }
+    }
+    
+    /// Apply function to each item
+    fn for_each<F>(self, f: F)
+    where
+        F: Fn(Self::Item) + Sync + Send,
+    {
+        self.drive(ForEachConsumer { f });
+    }
+    
+    /// Collect into a vector
+    fn collect<C: FromParallelIterator<Self::Item>>(self) -> C {
+        C::from_par_iter(self)
+    }
+    
+    /// Reduce with identity and combine
+    fn reduce<ID, F>(self, identity: ID, f: F) -> Self::Item
+    where
+        ID: Fn() -> Self::Item + Sync + Send,
+        F: Fn(Self::Item, Self::Item) -> Self::Item + Sync + Send,
+    {
+        self.drive(ReduceConsumer { identity, f }).unwrap_or_else(&identity)
+    }
+    
+    /// Reduce with initial value
+    fn fold<ID, F>(self, identity: ID, f: F) -> Self::Item
+    where
+        ID: Fn() -> Self::Item + Sync + Send,
+        F: Fn(Self::Item, Self::Item) -> Self::Item + Sync + Send,
+    {
+        self.reduce(identity, f)
+    }
+    
+    /// Sum items
+    fn sum<S>(self) -> S
+    where
+        S: std::iter::Sum<Self::Item> + std::iter::Sum + Send,
+    {
+        self.drive(SumConsumer::new())
+    }
+    
+    /// Find first matching item
+    fn find<F>(self, f: F) -> Option<Self::Item>
+    where
+        F: Fn(&Self::Item) -> bool + Sync + Send,
+    {
+        self.drive(FindConsumer { f, found: AtomicBool::new(false) })
+    }
+    
+    /// Check if any item matches
+    fn any<F>(self, f: F) -> bool
+    where
+        F: Fn(&Self::Item) -> bool + Sync + Send,
+    {
+        self.find(f).is_some()
+    }
+    
+    /// Check if all items match
+    fn all<F>(self, f: F) -> bool
+    where
+        F: Fn(&Self::Item) -> bool + Sync + Send,
+    {
+        !self.any(|x| !f(x))
+    }
+    
+    /// Count items
+    fn count(self) -> usize {
+        self.map(|_| 1usize).reduce(|| 0, |a, b| a + b)
+    }
+    
+    /// Find minimum item
+    fn min(self) -> Option<Self::Item>
+    where
+        Self::Item: Ord,
+    {
+        self.reduce_with(|a, b| if a < b { a } else { b })
+    }
+    
+    /// Find maximum item
+    fn max(self) -> Option<Self::Item>
+    where
+        Self::Item: Ord,
+    {
+        self.reduce_with(|a, b| if a > b { a } else { b })
+    }
+    
+    /// Reduce without identity (returns Option)
+    fn reduce_with<F>(self, f: F) -> Option<Self::Item>
+    where
+        F: Fn(Self::Item, Self::Item) -> Self::Item + Sync + Send,
+    {
+        self.drive(ReduceWithConsumer { f })
+    }
+    
+    /// Chain with another parallel iterator
+    fn chain<I>(self, other: I) -> Chain<Self, I::Iter>
+    where
+        I: IntoParallelIterator<Item = Self::Item>,
+    {
+        Chain {
+            a: self,
+            b: other.into_par_iter(),
+        }
+    }
+    
+    /// Enumerate items
+    fn enumerate(self) -> Enumerate<Self> {
+        Enumerate { iter: self, offset: 0 }
+    }
+    
+    /// Take first n items
+    fn take(self, n: usize) -> Take<Self> {
+        Take { iter: self, n }
+    }
+    
+    /// Skip first n items
+    fn skip(self, n: usize) -> Skip<Self> {
+        Skip { iter: self, n }
+    }
+    
+    /// Chunk items
+    fn chunks(self, chunk_size: usize) -> Chunks<Self> {
+        Chunks { iter: self, chunk_size }
+    }
+}
+
+/// Convert into parallel iterator
+pub trait IntoParallelIterator {
+    type Item: Send;
+    type Iter: ParallelIterator<Item = Self::Item>;
+    
+    fn into_par_iter(self) -> Self::Iter;
+}
+
+/// Collect from parallel iterator
+pub trait FromParallelIterator<T: Send>: Sized {
+    fn from_par_iter<I: ParallelIterator<Item = T>>(iter: I) -> Self;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONSUMER TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Consumer that processes parallel iterator items
+pub trait Consumer<T>: Send + Sync {
+    type Result: Send;
+    
+    /// Process a batch of items
+    fn consume(&self, items: Vec<T>) -> Self::Result;
+    
+    /// Combine results from parallel execution
+    fn combine(&self, left: Self::Result, right: Self::Result) -> Self::Result;
+    
+    /// Get identity result
+    fn identity(&self) -> Self::Result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLICE PARALLEL ITERATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parallel iterator over a slice
+pub struct SliceParIter<'a, T: Sync> {
+    slice: &'a [T],
+    chunk_size: usize,
+}
+
+impl<'a, T: Sync + Send> ParallelIterator for SliceParIter<'a, T> {
+    type Item = &'a T;
+    
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+        if self.slice.len() <= self.chunk_size {
+            let items: Vec<_> = self.slice.iter().collect();
+            consumer.consume(items)
+        } else {
+            let mid = self.slice.len() / 2;
+            let (left, right) = self.slice.split_at(mid);
+            
+            let left_iter = SliceParIter { slice: left, chunk_size: self.chunk_size };
+            let right_iter = SliceParIter { slice: right, chunk_size: self.chunk_size };
+            
+            let (left_result, right_result) = join(
+                || left_iter.drive(&consumer),
+                || right_iter.drive(&consumer),
+            );
+            
+            consumer.combine(left_result, right_result)
+        }
+    }
+    
+    fn len_hint(&self) -> Option<usize> {
+        Some(self.slice.len())
+    }
+}
+
+impl<'a, T: Sync + Send> IntoParallelIterator for &'a [T] {
+    type Item = &'a T;
+    type Iter = SliceParIter<'a, T>;
+    
+    fn into_par_iter(self) -> Self::Iter {
+        SliceParIter {
+            slice: self,
+            chunk_size: compute_chunk_size(self.len()),
+        }
+    }
+}
+
+impl<'a, T: Sync + Send> IntoParallelIterator for &'a Vec<T> {
+    type Item = &'a T;
+    type Iter = SliceParIter<'a, T>;
+    
+    fn into_par_iter(self) -> Self::Iter {
+        self.as_slice().into_par_iter()
+    }
+}
+
+/// Mutable parallel iterator over a slice
+pub struct SliceParIterMut<'a, T: Send> {
+    slice: &'a mut [T],
+    chunk_size: usize,
+}
+
+impl<'a, T: Send> ParallelIterator for SliceParIterMut<'a, T> {
+    type Item = &'a mut T;
+    
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+        if self.slice.len() <= self.chunk_size {
+            let items: Vec<_> = self.slice.iter_mut().collect();
+            consumer.consume(items)
+        } else {
+            let mid = self.slice.len() / 2;
+            let (left, right) = self.slice.split_at_mut(mid);
+            
+            let left_iter = SliceParIterMut { slice: left, chunk_size: self.chunk_size };
+            let right_iter = SliceParIterMut { slice: right, chunk_size: self.chunk_size };
+            
+            let (left_result, right_result) = join(
+                || left_iter.drive(&consumer),
+                || right_iter.drive(&consumer),
+            );
+            
+            consumer.combine(left_result, right_result)
+        }
+    }
+}
+
+impl<'a, T: Send> IntoParallelIterator for &'a mut [T] {
+    type Item = &'a mut T;
+    type Iter = SliceParIterMut<'a, T>;
+    
+    fn into_par_iter(self) -> Self::Iter {
+        let len = self.len();
+        SliceParIterMut {
+            slice: self,
+            chunk_size: compute_chunk_size(len),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RANGE PARALLEL ITERATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parallel iterator over a range
+pub struct RangeParIter {
+    start: usize,
+    end: usize,
+    chunk_size: usize,
+}
+
+impl ParallelIterator for RangeParIter {
+    type Item = usize;
+    
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+        let len = self.end - self.start;
+        
+        if len <= self.chunk_size {
+            let items: Vec<_> = (self.start..self.end).collect();
+            consumer.consume(items)
+        } else {
+            let mid = self.start + len / 2;
+            
+            let left = RangeParIter { start: self.start, end: mid, chunk_size: self.chunk_size };
+            let right = RangeParIter { start: mid, end: self.end, chunk_size: self.chunk_size };
+            
+            let (left_result, right_result) = join(
+                || left.drive(&consumer),
+                || right.drive(&consumer),
+            );
+            
+            consumer.combine(left_result, right_result)
+        }
+    }
+    
+    fn len_hint(&self) -> Option<usize> {
+        Some(self.end - self.start)
+    }
+}
+
+impl IntoParallelIterator for std::ops::Range<usize> {
+    type Item = usize;
+    type Iter = RangeParIter;
+    
+    fn into_par_iter(self) -> Self::Iter {
+        let len = self.end - self.start;
+        RangeParIter {
+            start: self.start,
+            end: self.end,
+            chunk_size: compute_chunk_size(len),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ITERATOR ADAPTERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Map adapter
+pub struct Map<I, F> {
+    iter: I,
+    f: F,
+}
+
+impl<I, F, R> ParallelIterator for Map<I, F>
+where
+    I: ParallelIterator,
+    F: Fn(I::Item) -> R + Sync + Send,
+    R: Send,
+{
+    type Item = R;
+    
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+        let f = Arc::new(self.f);
+        self.iter.drive(MapConsumer { f, inner: consumer })
+    }
+}
+
+struct MapConsumer<F, C> {
+    f: Arc<F>,
+    inner: C,
+}
+
+impl<T, F, R, C> Consumer<T> for MapConsumer<F, C>
+where
+    F: Fn(T) -> R + Sync + Send,
+    R: Send,
+    C: Consumer<R>,
+{
+    type Result = C::Result;
+    
+    fn consume(&self, items: Vec<T>) -> Self::Result {
+        let mapped: Vec<_> = items.into_iter().map(|x| (self.f)(x)).collect();
+        self.inner.consume(mapped)
+    }
+    
+    fn combine(&self, left: Self::Result, right: Self::Result) -> Self::Result {
+        self.inner.combine(left, right)
+    }
+    
+    fn identity(&self) -> Self::Result {
+        self.inner.identity()
+    }
+}
+
+/// Filter adapter
+pub struct Filter<I, F> {
+    iter: I,
+    f: F,
+}
+
+impl<I, F> ParallelIterator for Filter<I, F>
+where
+    I: ParallelIterator,
+    F: Fn(&I::Item) -> bool + Sync + Send,
+{
+    type Item = I::Item;
+    
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+        let f = Arc::new(self.f);
+        self.iter.drive(FilterConsumer { f, inner: consumer })
+    }
+}
+
+struct FilterConsumer<F, C> {
+    f: Arc<F>,
+    inner: C,
+}
+
+impl<T: Send, F, C> Consumer<T> for FilterConsumer<F, C>
+where
+    F: Fn(&T) -> bool + Sync + Send,
+    C: Consumer<T>,
+{
+    type Result = C::Result;
+    
+    fn consume(&self, items: Vec<T>) -> Self::Result {
+        let filtered: Vec<_> = items.into_iter().filter(|x| (self.f)(x)).collect();
+        self.inner.consume(filtered)
+    }
+    
+    fn combine(&self, left: Self::Result, right: Self::Result) -> Self::Result {
+        self.inner.combine(left, right)
+    }
+    
+    fn identity(&self) -> Self::Result {
+        self.inner.identity()
+    }
+}
+
+/// FilterMap adapter
+pub struct FilterMap<I, F> {
+    iter: I,
+    f: F,
+}
+
+impl<I, F, R> ParallelIterator for FilterMap<I, F>
+where
+    I: ParallelIterator,
+    F: Fn(I::Item) -> Option<R> + Sync + Send,
+    R: Send,
+{
+    type Item = R;
+    
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+        let f = Arc::new(self.f);
+        self.iter.drive(FilterMapConsumer { f, inner: consumer })
+    }
+}
+
+struct FilterMapConsumer<F, C> {
+    f: Arc<F>,
+    inner: C,
+}
+
+impl<T, F, R, C> Consumer<T> for FilterMapConsumer<F, C>
+where
+    F: Fn(T) -> Option<R> + Sync + Send,
+    R: Send,
+    C: Consumer<R>,
+{
+    type Result = C::Result;
+    
+    fn consume(&self, items: Vec<T>) -> Self::Result {
+        let mapped: Vec<_> = items.into_iter().filter_map(|x| (self.f)(x)).collect();
+        self.inner.consume(mapped)
+    }
+    
+    fn combine(&self, left: Self::Result, right: Self::Result) -> Self::Result {
+        self.inner.combine(left, right)
+    }
+    
+    fn identity(&self) -> Self::Result {
+        self.inner.identity()
+    }
+}
+
+/// FlatMap adapter
+pub struct FlatMap<I, F> {
+    iter: I,
+    f: F,
+}
+
+impl<I, F, J> ParallelIterator for FlatMap<I, F>
+where
+    I: ParallelIterator,
+    F: Fn(I::Item) -> J + Sync + Send,
+    J: IntoIterator,
+    J::Item: Send,
+{
+    type Item = J::Item;
+    
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+        let f = Arc::new(self.f);
+        self.iter.drive(FlatMapConsumer { f, inner: consumer })
+    }
+}
+
+struct FlatMapConsumer<F, C> {
+    f: Arc<F>,
+    inner: C,
+}
+
+impl<T, F, J, C> Consumer<T> for FlatMapConsumer<F, C>
+where
+    F: Fn(T) -> J + Sync + Send,
+    J: IntoIterator,
+    J::Item: Send,
+    C: Consumer<J::Item>,
+{
+    type Result = C::Result;
+    
+    fn consume(&self, items: Vec<T>) -> Self::Result {
+        let mapped: Vec<_> = items.into_iter().flat_map(|x| (self.f)(x)).collect();
+        self.inner.consume(mapped)
+    }
+    
+    fn combine(&self, left: Self::Result, right: Self::Result) -> Self::Result {
+        self.inner.combine(left, right)
+    }
+    
+    fn identity(&self) -> Self::Result {
+        self.inner.identity()
+    }
+}
+
+/// Chain adapter
+pub struct Chain<A, B> {
+    a: A,
+    b: B,
+}
+
+/// Enumerate adapter
+pub struct Enumerate<I> {
+    iter: I,
+    offset: usize,
+}
+
+/// Take adapter
+pub struct Take<I> {
+    iter: I,
+    n: usize,
+}
+
+/// Skip adapter
+pub struct Skip<I> {
+    iter: I,
+    n: usize,
+}
+
+/// Chunks adapter
+pub struct Chunks<I> {
+    iter: I,
+    chunk_size: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONSUMERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// ForEach consumer
+struct ForEachConsumer<F> {
+    f: F,
+}
+
+impl<T, F> Consumer<T> for ForEachConsumer<F>
+where
+    F: Fn(T) + Sync + Send,
+{
+    type Result = ();
+    
+    fn consume(&self, items: Vec<T>) -> Self::Result {
+        for item in items {
+            (self.f)(item);
+        }
+    }
+    
+    fn combine(&self, _: Self::Result, _: Self::Result) -> Self::Result {
+        ()
+    }
+    
+    fn identity(&self) -> Self::Result {
+        ()
+    }
+}
+
+/// Collect consumer
+struct CollectConsumer;
+
+impl<T: Send> Consumer<T> for CollectConsumer {
+    type Result = Vec<T>;
+    
+    fn consume(&self, items: Vec<T>) -> Self::Result {
+        items
+    }
+    
+    fn combine(&self, mut left: Self::Result, right: Self::Result) -> Self::Result {
+        left.extend(right);
+        left
+    }
+    
+    fn identity(&self) -> Self::Result {
+        Vec::new()
+    }
+}
+
+impl<T: Send> FromParallelIterator<T> for Vec<T> {
+    fn from_par_iter<I: ParallelIterator<Item = T>>(iter: I) -> Self {
+        iter.drive(CollectConsumer)
+    }
+}
+
+/// Reduce consumer
+struct ReduceConsumer<ID, F> {
+    identity: ID,
+    f: F,
+}
+
+impl<T, ID, F> Consumer<T> for ReduceConsumer<ID, F>
+where
+    T: Send,
+    ID: Fn() -> T + Sync + Send,
+    F: Fn(T, T) -> T + Sync + Send,
+{
+    type Result = Option<T>;
+    
+    fn consume(&self, items: Vec<T>) -> Self::Result {
+        items.into_iter().reduce(|a, b| (self.f)(a, b))
+    }
+    
+    fn combine(&self, left: Self::Result, right: Self::Result) -> Self::Result {
+        match (left, right) {
+            (Some(l), Some(r)) => Some((self.f)(l, r)),
+            (Some(l), None) => Some(l),
+            (None, Some(r)) => Some(r),
+            (None, None) => None,
+        }
+    }
+    
+    fn identity(&self) -> Self::Result {
+        None
+    }
+}
+
+/// ReduceWith consumer
+struct ReduceWithConsumer<F> {
+    f: F,
+}
+
+impl<T, F> Consumer<T> for ReduceWithConsumer<F>
+where
+    T: Send,
+    F: Fn(T, T) -> T + Sync + Send,
+{
+    type Result = Option<T>;
+    
+    fn consume(&self, items: Vec<T>) -> Self::Result {
+        items.into_iter().reduce(|a, b| (self.f)(a, b))
+    }
+    
+    fn combine(&self, left: Self::Result, right: Self::Result) -> Self::Result {
+        match (left, right) {
+            (Some(l), Some(r)) => Some((self.f)(l, r)),
+            (Some(l), None) => Some(l),
+            (None, Some(r)) => Some(r),
+            (None, None) => None,
+        }
+    }
+    
+    fn identity(&self) -> Self::Result {
+        None
+    }
+}
+
+/// Sum consumer
+struct SumConsumer<S> {
+    _marker: std::marker::PhantomData<S>,
+}
+
+impl<S> SumConsumer<S> {
+    fn new() -> Self {
+        SumConsumer { _marker: std::marker::PhantomData }
+    }
+}
+
+impl<T, S> Consumer<T> for SumConsumer<S>
+where
+    S: std::iter::Sum<T> + std::iter::Sum + Send,
+{
+    type Result = S;
+    
+    fn consume(&self, items: Vec<T>) -> Self::Result {
+        items.into_iter().sum()
+    }
+    
+    fn combine(&self, left: Self::Result, right: Self::Result) -> Self::Result {
+        [left, right].into_iter().sum()
+    }
+    
+    fn identity(&self) -> Self::Result {
+        std::iter::empty().sum()
+    }
+}
+
+/// Find consumer
+struct FindConsumer<F> {
+    f: F,
+    found: AtomicBool,
+}
+
+impl<T, F> Consumer<T> for FindConsumer<F>
+where
+    T: Send,
+    F: Fn(&T) -> bool + Sync + Send,
+{
+    type Result = Option<T>;
+    
+    fn consume(&self, items: Vec<T>) -> Self::Result {
+        if self.found.load(Ordering::Relaxed) {
+            return None;
+        }
+        
+        for item in items {
+            if (self.f)(&item) {
+                self.found.store(true, Ordering::Relaxed);
+                return Some(item);
+            }
+        }
+        
+        None
+    }
+    
+    fn combine(&self, left: Self::Result, right: Self::Result) -> Self::Result {
+        left.or(right)
+    }
+    
+    fn identity(&self) -> Self::Result {
+        None
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOIN / FORK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Execute two closures in parallel and return both results
+pub fn join<A, B, RA, RB>(a: A, b: B) -> (RA, RB)
+where
+    A: FnOnce() -> RA + Send,
+    B: FnOnce() -> RB + Send,
+    RA: Send,
+    RB: Send,
+{
+    let pool = global_pool();
+    
+    let result_b = Arc::new(Mutex::new(None));
+    let result_b_clone = result_b.clone();
+    
+    pool.submit(move || {
+        let rb = b();
+        *result_b_clone.lock().unwrap() = Some(rb);
+    });
+    
+    let ra = a();
+    
+    // Wait for b to complete
+    loop {
+        if let Some(rb) = result_b.lock().unwrap().take() {
+            return (ra, rb);
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// Execute a closure for each item in a slice
+pub fn par_for_each<T, F>(slice: &[T], f: F)
+where
+    T: Sync + Send,
+    F: Fn(&T) + Sync + Send,
+{
+    slice.into_par_iter().for_each(f);
+}
+
+/// Parallel map over a slice
+pub fn par_map<T, R, F>(slice: &[T], f: F) -> Vec<R>
+where
+    T: Sync + Send,
+    R: Send,
+    F: Fn(&T) -> R + Sync + Send,
+{
+    slice.into_par_iter().map(f).collect()
+}
+
+/// Parallel sort
+pub fn par_sort<T>(slice: &mut [T])
+where
+    T: Ord + Send,
+{
+    par_sort_by(slice, |a, b| a.cmp(b));
+}
+
+/// Parallel sort with comparator
+pub fn par_sort_by<T, F>(slice: &mut [T], compare: F)
+where
+    T: Send,
+    F: Fn(&T, &T) -> std::cmp::Ordering + Sync + Send,
+{
+    const SEQUENTIAL_THRESHOLD: usize = 32;
+    
+    if slice.len() <= SEQUENTIAL_THRESHOLD {
+        slice.sort_by(&compare);
+        return;
+    }
+    
+    // Quicksort with parallel recursive calls
+    let pivot = partition(slice, &compare);
+    let (left, right) = slice.split_at_mut(pivot);
+    
+    join(
+        || par_sort_by(left, &compare),
+        || par_sort_by(&mut right[1..], &compare),
+    );
+}
+
+fn partition<T, F>(slice: &mut [T], compare: &F) -> usize
+where
+    F: Fn(&T, &T) -> std::cmp::Ordering,
+{
+    let len = slice.len();
+    let pivot = len / 2;
+    slice.swap(pivot, len - 1);
+    
+    let mut i = 0;
+    for j in 0..len - 1 {
+        if compare(&slice[j], &slice[len - 1]) == std::cmp::Ordering::Less {
+            slice.swap(i, j);
+            i += 1;
+        }
+    }
+    
+    slice.swap(i, len - 1);
+    i
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn compute_chunk_size(len: usize) -> usize {
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    
+    std::cmp::max(1, len / (num_cpus * 4))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_parallel_map() {
+        let data: Vec<i32> = (0..1000).collect();
+        let result: Vec<_> = data.as_slice().into_par_iter()
+            .map(|x| x * 2)
+            .collect();
+        
+        for (i, &v) in result.iter().enumerate() {
+            assert_eq!(v, (i as i32) * 2);
+        }
+    }
+    
+    #[test]
+    fn test_parallel_filter() {
+        let data: Vec<i32> = (0..100).collect();
+        let result: Vec<_> = data.as_slice().into_par_iter()
+            .filter(|&x| *x % 2 == 0)
+            .map(|x| *x)
+            .collect();
+        
+        assert!(result.iter().all(|x| x % 2 == 0));
+    }
+    
+    #[test]
+    fn test_parallel_reduce() {
+        let data: Vec<i32> = (1..=100).collect();
+        let sum: i32 = data.as_slice().into_par_iter()
+            .map(|x| *x)
+            .reduce(|| 0, |a, b| a + b);
+        
+        assert_eq!(sum, 5050);
+    }
+    
+    #[test]
+    fn test_range_par_iter() {
+        let sum: usize = (0..100usize).into_par_iter()
+            .reduce(|| 0, |a, b| a + b);
+        
+        assert_eq!(sum, 4950);
+    }
+    
+    #[test]
+    fn test_join() {
+        let (a, b) = join(|| 1 + 1, || 2 + 2);
+        assert_eq!(a, 2);
+        assert_eq!(b, 4);
+    }
+    
+    #[test]
+    fn test_par_sort() {
+        let mut data: Vec<i32> = vec![5, 2, 8, 1, 9, 3, 7, 4, 6, 0];
+        par_sort(&mut data);
+        assert_eq!(data, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+}

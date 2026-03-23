@@ -1,0 +1,449 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ LINTER — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The QuantaLang Linter (quantalint) provides static analysis, code quality
+// checks, and best practices enforcement.
+//
+// Features:
+// - 80+ built-in lint rules across 12 categories
+// - Auto-fix support for applicable lints
+// - Multiple output formats (human, JSON, SARIF, Checkstyle)
+// - Configurable severity levels
+// - IDE integration support
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang Linter
+//!
+//! Static analysis for QuantaLang source code.
+//!
+//! ## Quick Start
+//!
+//! ```bash
+//! # Lint current directory
+//! quantalint
+//!
+//! # Lint specific files
+//! quantalint src/main.quanta src/lib.quanta
+//!
+//! # Auto-fix issues
+//! quantalint --fix
+//!
+//! # JSON output for CI
+//! quantalint --format json
+//!
+//! # Deny specific lints
+//! quantalint -D unused_variable -D todo
+//! ```
+//!
+//! ## Configuration
+//!
+//! Create `.quantalint.toml` in your project root:
+//!
+//! ```toml
+//! # Lint levels
+//! unused_variable = "warn"
+//! todo = "deny"
+//! dbg_macro = "deny"
+//!
+//! # Options
+//! fix = false
+//! verbose = false
+//! max_issues = 100
+//! edition = "2025"
+//! ```
+//!
+//! ## Programmatic API
+//!
+//! ```quanta
+//! use quantalang::lint::{Linter, LintConfig};
+//!
+//! let config = LintConfig::default();
+//! let linter = Linter::new(config);
+//!
+//! let diagnostics = linter.check_file("src/main.quanta")?;
+//! for diag in &diagnostics {
+//!     println!("{}: {}", diag.severity, diag.message);
+//! }
+//! ```
+//!
+//! ## Modules
+//!
+//! - [`config`] - Lint configuration and rule definitions
+//! - [`rules`] - Built-in lint rule registry
+//! - [`checker`] - AST visitor and checking logic
+//! - [`diagnostic`] - Diagnostic types and output formatting
+//! - [`cli`] - Command-line interface
+
+module quantalang::lint
+
+// Submodules
+pub mod config;
+pub mod rules;
+pub mod checker;
+pub mod diagnostic;
+pub mod cli;
+
+// Re-exports
+pub use config::{
+    LintConfig, LintLevel, LintGroup, LintRule, Applicability,
+    OutputFormat, ColorChoice, Edition, ConfigError,
+};
+
+pub use rules::RuleRegistry;
+
+pub use checker::{
+    LintChecker, LintContext,
+    VarInfo, ImportInfo, FunctionContext,
+};
+
+pub use diagnostic::{
+    Diagnostic, DiagnosticBuilder, DiagnosticEmitter,
+    Span, Severity, Fix, Replacement,
+};
+
+pub use cli::{
+    CliArgs, parse_args, run,
+    VERSION, CONFIG_FILE,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIGH-LEVEL API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// High-level linter API
+///
+/// # Examples
+///
+/// ```quanta
+/// use quantalang::lint::Linter;
+///
+/// // Lint with defaults
+/// let diagnostics = Linter::check_path("src/")?;
+///
+/// // Lint with custom config
+/// let linter = Linter::new()
+///     .deny("unused_variable")
+///     .deny("todo")
+///     .enable_group(LintGroup::Perf);
+///
+/// let diagnostics = linter.check("src/main.quanta")?;
+/// ```
+pub struct Linter {
+    config: LintConfig,
+    checker: LintChecker,
+}
+
+impl Linter {
+    /// Create a new linter with default configuration
+    pub fn new() -> Self {
+        let config = LintConfig::default();
+        Linter {
+            checker: LintChecker::new(config.clone()),
+            config,
+        }
+    }
+    
+    /// Create with custom configuration
+    pub fn with_config(config: LintConfig) -> Self {
+        Linter {
+            checker: LintChecker::new(config.clone()),
+            config,
+        }
+    }
+    
+    /// Allow a specific lint
+    pub fn allow(mut self, lint: &str) -> Self {
+        self.config.set_lint(lint, LintLevel::Allow);
+        self.checker = LintChecker::new(self.config.clone());
+        self
+    }
+    
+    /// Warn on a specific lint
+    pub fn warn(mut self, lint: &str) -> Self {
+        self.config.set_lint(lint, LintLevel::Warn);
+        self.checker = LintChecker::new(self.config.clone());
+        self
+    }
+    
+    /// Deny a specific lint
+    pub fn deny(mut self, lint: &str) -> Self {
+        self.config.set_lint(lint, LintLevel::Deny);
+        self.checker = LintChecker::new(self.config.clone());
+        self
+    }
+    
+    /// Forbid a specific lint
+    pub fn forbid(mut self, lint: &str) -> Self {
+        self.config.set_lint(lint, LintLevel::Forbid);
+        self.checker = LintChecker::new(self.config.clone());
+        self
+    }
+    
+    /// Enable a lint group
+    pub fn enable_group(mut self, group: LintGroup) -> Self {
+        self.config.enable_group(group);
+        self.checker = LintChecker::new(self.config.clone());
+        self
+    }
+    
+    /// Disable a lint group
+    pub fn disable_group(mut self, group: LintGroup) -> Self {
+        self.config.disable_group(group);
+        self.checker = LintChecker::new(self.config.clone());
+        self
+    }
+    
+    /// Enable auto-fix
+    pub fn fix(mut self, enable: bool) -> Self {
+        self.config.fix = enable;
+        self
+    }
+    
+    /// Get configuration
+    pub fn config(&self) -> &LintConfig {
+        &self.config
+    }
+    
+    /// Check a single file
+    pub fn check(&self, path: &std::path::Path) -> Result<Vec<Diagnostic>, String> {
+        self.checker.check_file(path)
+    }
+    
+    /// Check source code
+    pub fn check_source(&self, path: &std::path::Path, source: &str) -> Result<Vec<Diagnostic>, String> {
+        self.checker.check_source(path, source)
+    }
+    
+    /// Check multiple files
+    pub fn check_files(&self, paths: &[std::path::PathBuf]) -> Result<Vec<Diagnostic>, String> {
+        let mut all_diagnostics = Vec::new();
+        
+        for path in paths {
+            let diagnostics = self.check(path)?;
+            all_diagnostics.extend(diagnostics);
+        }
+        
+        Ok(all_diagnostics)
+    }
+    
+    /// Check a path (file or directory)
+    pub fn check_path(path: &str) -> Result<Vec<Diagnostic>, String> {
+        let linter = Self::new();
+        let path = std::path::Path::new(path);
+        
+        if path.is_file() {
+            linter.check(path)
+        } else {
+            let files = collect_quanta_files(path)?;
+            linter.check_files(&files)
+        }
+    }
+}
+
+impl Default for Linter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Collect all .quanta files in a directory
+fn collect_quanta_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut files = Vec::new();
+    collect_files_recursive(dir, &mut files)?;
+    Ok(files)
+}
+
+fn collect_files_recursive(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("failed to read directory: {}", e))?;
+    
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("failed to read entry: {}", e))?;
+        let path = entry.path();
+        
+        if path.is_file() {
+            if path.extension().and_then(|e| e.to_str()) == Some("quanta") {
+                files.push(path);
+            }
+        } else if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with('.') && name != "target" {
+                collect_files_recursive(&path, files)?;
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINT RESULT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Summary of lint results
+#[derive(Debug, Clone, Default)]
+pub struct LintSummary {
+    /// Total files checked
+    pub files_checked: usize,
+    
+    /// Total errors
+    pub error_count: usize,
+    
+    /// Total warnings
+    pub warning_count: usize,
+    
+    /// Total notes
+    pub note_count: usize,
+    
+    /// Files with issues
+    pub files_with_issues: usize,
+}
+
+impl LintSummary {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    pub fn from_diagnostics(diagnostics: &[Diagnostic]) -> Self {
+        let mut summary = Self::new();
+        
+        let mut files_seen = std::collections::BTreeSet::new();
+        
+        for diag in diagnostics {
+            match diag.severity {
+                Severity::Error => summary.error_count += 1,
+                Severity::Warning => summary.warning_count += 1,
+                Severity::Note => summary.note_count += 1,
+            }
+            
+            if let Some(ref file) = diag.file {
+                files_seen.insert(file.clone());
+            }
+        }
+        
+        summary.files_with_issues = files_seen.len();
+        summary
+    }
+    
+    pub fn is_success(&self) -> bool {
+        self.error_count == 0
+    }
+    
+    pub fn total_issues(&self) -> usize {
+        self.error_count + self.warning_count + self.note_count
+    }
+}
+
+impl std::fmt::Display for LintSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Checked {} files: {} errors, {} warnings",
+            self.files_checked, self.error_count, self.warning_count
+        )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRESETS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Predefined lint configurations
+pub mod presets {
+    use super::*;
+    
+    /// Default configuration
+    pub fn default_config() -> LintConfig {
+        LintConfig::default()
+    }
+    
+    /// Strict configuration (all warnings as errors)
+    pub fn strict() -> LintConfig {
+        LintConfig::strict()
+    }
+    
+    /// Minimal configuration (only correctness)
+    pub fn minimal() -> LintConfig {
+        LintConfig::minimal()
+    }
+    
+    /// CI-friendly configuration (errors only, JSON output)
+    pub fn ci() -> LintConfig {
+        let mut config = LintConfig::default();
+        config.quiet = true;
+        config.output_format = OutputFormat::Json;
+        config
+    }
+    
+    /// Pedantic configuration (all lints enabled)
+    pub fn pedantic() -> LintConfig {
+        let mut config = LintConfig::strict();
+        config.enable_group(LintGroup::Pedantic);
+        config.enable_group(LintGroup::Documentation);
+        config
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Main entry point for quantalint binary
+pub fn main() -> Result<i32, String> {
+    cli::main()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_linter_new() {
+        let linter = Linter::new();
+        assert!(linter.config().enabled_groups.contains(&LintGroup::Correctness));
+    }
+    
+    #[test]
+    fn test_linter_builder() {
+        let linter = Linter::new()
+            .deny("todo")
+            .deny("dbg_macro")
+            .enable_group(LintGroup::Perf);
+        
+        assert_eq!(linter.config().lint_levels.get("todo"), Some(&LintLevel::Deny));
+        assert!(linter.config().enabled_groups.contains(&LintGroup::Perf));
+    }
+    
+    #[test]
+    fn test_lint_summary() {
+        let diagnostics = vec![
+            Diagnostic::error("error 1"),
+            Diagnostic::warning("warning 1"),
+            Diagnostic::warning("warning 2"),
+        ];
+        
+        let summary = LintSummary::from_diagnostics(&diagnostics);
+        assert_eq!(summary.error_count, 1);
+        assert_eq!(summary.warning_count, 2);
+        assert!(!summary.is_success());
+    }
+    
+    #[test]
+    fn test_presets() {
+        let strict = presets::strict();
+        assert!(strict.enabled_groups.contains(&LintGroup::Pedantic));
+        
+        let minimal = presets::minimal();
+        assert!(minimal.enabled_groups.contains(&LintGroup::Correctness));
+        assert!(!minimal.enabled_groups.contains(&LintGroup::Style));
+    }
+}

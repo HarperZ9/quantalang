@@ -1,0 +1,1306 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ MLIR — LLVM IR Code Generation
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Generates LLVM IR from MLIR LLVM dialect.
+//
+// Pipeline: MLIR LLVM Dialect → LLVM IR → Native Code
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::mlir::codegen
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use std::sync::Arc;
+
+use super::dialect::{MlirContext, MlirType, MlirTypeKind, MlirAttribute, MlirAttrKind, TypeId};
+use super::ir::{Module, Operation, Block, Region, Value, TypedValue, Location, BlockId};
+use super::target::{TargetMachine, TargetTriple, DataLayout};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LLVM IR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// LLVM Value reference
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LlvmValueRef(pub u64);
+
+/// LLVM Basic Block reference
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LlvmBlockRef(pub u64);
+
+/// LLVM Function reference
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LlvmFuncRef(pub u64);
+
+/// LLVM Type
+#[derive(Debug, Clone, PartialEq)]
+pub enum LlvmType {
+    Void,
+    Int(u32),
+    Float,
+    Double,
+    Ptr(Box<LlvmType>),
+    Array(Box<LlvmType>, u64),
+    Vector(Box<LlvmType>, u32),
+    Struct(Vec<LlvmType>, bool), // fields, packed
+    Function(Vec<LlvmType>, Box<LlvmType>, bool), // params, return, vararg
+    Label,
+    Metadata,
+    Token,
+}
+
+impl LlvmType {
+    pub fn to_string(&self) -> String {
+        match self {
+            LlvmType::Void => "void".to_string(),
+            LlvmType::Int(bits) => format!("i{}", bits),
+            LlvmType::Float => "float".to_string(),
+            LlvmType::Double => "double".to_string(),
+            LlvmType::Ptr(inner) => format!("{}*", inner.to_string()),
+            LlvmType::Array(elem, size) => format!("[{} x {}]", size, elem.to_string()),
+            LlvmType::Vector(elem, size) => format!("<{} x {}>", size, elem.to_string()),
+            LlvmType::Struct(fields, packed) => {
+                let fields_str: Vec<String> = fields.iter().map(|f| f.to_string()).collect();
+                if *packed {
+                    format!("<{{ {} }}>", fields_str.join(", "))
+                } else {
+                    format!("{{ {} }}", fields_str.join(", "))
+                }
+            }
+            LlvmType::Function(params, ret, vararg) => {
+                let params_str: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+                let params_with_vararg = if *vararg {
+                    format!("{}, ...", params_str.join(", "))
+                } else {
+                    params_str.join(", ")
+                };
+                format!("{} ({})", ret.to_string(), params_with_vararg)
+            }
+            LlvmType::Label => "label".to_string(),
+            LlvmType::Metadata => "metadata".to_string(),
+            LlvmType::Token => "token".to_string(),
+        }
+    }
+}
+
+/// LLVM Linkage
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Linkage {
+    Private,
+    Internal,
+    External,
+    ExternalWeak,
+    LinkOnceOdr,
+    WeakOdr,
+    Common,
+    Appending,
+}
+
+impl Linkage {
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            Linkage::Private => "private",
+            Linkage::Internal => "internal",
+            Linkage::External => "external",
+            Linkage::ExternalWeak => "extern_weak",
+            Linkage::LinkOnceOdr => "linkonce_odr",
+            Linkage::WeakOdr => "weak_odr",
+            Linkage::Common => "common",
+            Linkage::Appending => "appending",
+        }
+    }
+}
+
+/// Calling convention
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallingConvention {
+    C,
+    Fast,
+    Cold,
+    GhcCC,
+    HiPE,
+    WebKitJS,
+    AnyReg,
+    PreserveMost,
+    PreserveAll,
+    Swift,
+    CxxFastTls,
+    Tail,
+    SwiftTail,
+    X86Stdcall,
+    X86Fastcall,
+    ArmApcs,
+    ArmAapcs,
+    ArmAapcsVfp,
+    Win64,
+    SysV,
+}
+
+impl CallingConvention {
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            CallingConvention::C => "ccc",
+            CallingConvention::Fast => "fastcc",
+            CallingConvention::Cold => "coldcc",
+            CallingConvention::GhcCC => "cc 10",
+            CallingConvention::HiPE => "cc 11",
+            CallingConvention::WebKitJS => "webkit_jscc",
+            CallingConvention::AnyReg => "anyregcc",
+            CallingConvention::PreserveMost => "preserve_mostcc",
+            CallingConvention::PreserveAll => "preserve_allcc",
+            CallingConvention::Swift => "swiftcc",
+            CallingConvention::CxxFastTls => "cxx_fast_tlscc",
+            CallingConvention::Tail => "tailcc",
+            CallingConvention::SwiftTail => "swifttailcc",
+            CallingConvention::X86Stdcall => "x86_stdcallcc",
+            CallingConvention::X86Fastcall => "x86_fastcallcc",
+            CallingConvention::ArmApcs => "arm_apcscc",
+            CallingConvention::ArmAapcs => "arm_aapcscc",
+            CallingConvention::ArmAapcsVfp => "arm_aapcs_vfpcc",
+            CallingConvention::Win64 => "win64cc",
+            CallingConvention::SysV => "x86_64_sysvcc",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LLVM IR INSTRUCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// LLVM IR Instruction
+#[derive(Debug, Clone)]
+pub enum LlvmInstruction {
+    // Terminator instructions
+    Ret(Option<LlvmOperand>),
+    Br(LlvmBlockRef),
+    CondBr(LlvmOperand, LlvmBlockRef, LlvmBlockRef),
+    Switch(LlvmOperand, LlvmBlockRef, Vec<(i64, LlvmBlockRef)>),
+    Unreachable,
+    
+    // Binary operations
+    Add(LlvmOperand, LlvmOperand, bool, bool), // nuw, nsw
+    Sub(LlvmOperand, LlvmOperand, bool, bool),
+    Mul(LlvmOperand, LlvmOperand, bool, bool),
+    UDiv(LlvmOperand, LlvmOperand, bool), // exact
+    SDiv(LlvmOperand, LlvmOperand, bool),
+    URem(LlvmOperand, LlvmOperand),
+    SRem(LlvmOperand, LlvmOperand),
+    
+    // Floating point operations
+    FAdd(LlvmOperand, LlvmOperand),
+    FSub(LlvmOperand, LlvmOperand),
+    FMul(LlvmOperand, LlvmOperand),
+    FDiv(LlvmOperand, LlvmOperand),
+    FRem(LlvmOperand, LlvmOperand),
+    
+    // Bitwise operations
+    Shl(LlvmOperand, LlvmOperand, bool, bool),
+    LShr(LlvmOperand, LlvmOperand, bool),
+    AShr(LlvmOperand, LlvmOperand, bool),
+    And(LlvmOperand, LlvmOperand),
+    Or(LlvmOperand, LlvmOperand),
+    Xor(LlvmOperand, LlvmOperand),
+    
+    // Memory operations
+    Alloca(LlvmType, Option<u32>), // type, alignment
+    Load(LlvmType, LlvmOperand, Option<u32>), // type, ptr, alignment
+    Store(LlvmOperand, LlvmOperand, Option<u32>), // value, ptr, alignment
+    GetElementPtr(LlvmType, LlvmOperand, Vec<LlvmOperand>, bool), // type, base, indices, inbounds
+    
+    // Conversion operations
+    Trunc(LlvmOperand, LlvmType),
+    ZExt(LlvmOperand, LlvmType),
+    SExt(LlvmOperand, LlvmType),
+    FPTrunc(LlvmOperand, LlvmType),
+    FPExt(LlvmOperand, LlvmType),
+    FPToUI(LlvmOperand, LlvmType),
+    FPToSI(LlvmOperand, LlvmType),
+    UIToFP(LlvmOperand, LlvmType),
+    SIToFP(LlvmOperand, LlvmType),
+    PtrToInt(LlvmOperand, LlvmType),
+    IntToPtr(LlvmOperand, LlvmType),
+    Bitcast(LlvmOperand, LlvmType),
+    
+    // Comparison operations
+    ICmp(IcmpPredicate, LlvmOperand, LlvmOperand),
+    FCmp(FcmpPredicate, LlvmOperand, LlvmOperand),
+    
+    // Other operations
+    Phi(LlvmType, Vec<(LlvmOperand, LlvmBlockRef)>),
+    Select(LlvmOperand, LlvmOperand, LlvmOperand),
+    Call(Option<LlvmType>, String, Vec<LlvmOperand>, Option<CallingConvention>),
+    ExtractValue(LlvmOperand, Vec<u32>),
+    InsertValue(LlvmOperand, LlvmOperand, Vec<u32>),
+    ExtractElement(LlvmOperand, LlvmOperand),
+    InsertElement(LlvmOperand, LlvmOperand, LlvmOperand),
+    ShuffleVector(LlvmOperand, LlvmOperand, Vec<i32>),
+}
+
+/// LLVM Operand
+#[derive(Debug, Clone)]
+pub enum LlvmOperand {
+    Value(LlvmValueRef, LlvmType),
+    Constant(LlvmConstant),
+    Global(String, LlvmType),
+}
+
+impl LlvmOperand {
+    pub fn get_type(&self) -> LlvmType {
+        match self {
+            LlvmOperand::Value(_, ty) => ty.clone(),
+            LlvmOperand::Constant(c) => c.get_type(),
+            LlvmOperand::Global(_, ty) => ty.clone(),
+        }
+    }
+}
+
+/// LLVM Constant
+#[derive(Debug, Clone)]
+pub enum LlvmConstant {
+    Int(i128, u32), // value, bits
+    Float(f64),
+    Double(f64),
+    Null(LlvmType),
+    Undef(LlvmType),
+    Poison(LlvmType),
+    Array(LlvmType, Vec<LlvmConstant>),
+    Struct(Vec<LlvmConstant>, bool),
+    Vector(Vec<LlvmConstant>),
+    ZeroInitializer(LlvmType),
+    GlobalRef(String),
+    BlockAddress(String, String),
+}
+
+impl LlvmConstant {
+    pub fn get_type(&self) -> LlvmType {
+        match self {
+            LlvmConstant::Int(_, bits) => LlvmType::Int(*bits),
+            LlvmConstant::Float(_) => LlvmType::Float,
+            LlvmConstant::Double(_) => LlvmType::Double,
+            LlvmConstant::Null(ty) => ty.clone(),
+            LlvmConstant::Undef(ty) => ty.clone(),
+            LlvmConstant::Poison(ty) => ty.clone(),
+            LlvmConstant::Array(elem_ty, elems) => {
+                LlvmType::Array(Box::new(elem_ty.clone()), elems.len() as u64)
+            }
+            LlvmConstant::Struct(fields, packed) => {
+                LlvmType::Struct(fields.iter().map(|f| f.get_type()).collect(), *packed)
+            }
+            LlvmConstant::Vector(elems) => {
+                let elem_ty = elems.first().map(|e| e.get_type()).unwrap_or(LlvmType::Int(32));
+                LlvmType::Vector(Box::new(elem_ty), elems.len() as u32)
+            }
+            LlvmConstant::ZeroInitializer(ty) => ty.clone(),
+            LlvmConstant::GlobalRef(_) => LlvmType::Ptr(Box::new(LlvmType::Int(8))),
+            LlvmConstant::BlockAddress(_, _) => LlvmType::Ptr(Box::new(LlvmType::Int(8))),
+        }
+    }
+}
+
+/// Integer comparison predicate
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcmpPredicate {
+    Eq,
+    Ne,
+    Ugt,
+    Uge,
+    Ult,
+    Ule,
+    Sgt,
+    Sge,
+    Slt,
+    Sle,
+}
+
+impl IcmpPredicate {
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            IcmpPredicate::Eq => "eq",
+            IcmpPredicate::Ne => "ne",
+            IcmpPredicate::Ugt => "ugt",
+            IcmpPredicate::Uge => "uge",
+            IcmpPredicate::Ult => "ult",
+            IcmpPredicate::Ule => "ule",
+            IcmpPredicate::Sgt => "sgt",
+            IcmpPredicate::Sge => "sge",
+            IcmpPredicate::Slt => "slt",
+            IcmpPredicate::Sle => "sle",
+        }
+    }
+}
+
+/// Float comparison predicate
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FcmpPredicate {
+    False,
+    Oeq,
+    Ogt,
+    Oge,
+    Olt,
+    Ole,
+    One,
+    Ord,
+    Ueq,
+    Ugt,
+    Uge,
+    Ult,
+    Ule,
+    Une,
+    Uno,
+    True,
+}
+
+impl FcmpPredicate {
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            FcmpPredicate::False => "false",
+            FcmpPredicate::Oeq => "oeq",
+            FcmpPredicate::Ogt => "ogt",
+            FcmpPredicate::Oge => "oge",
+            FcmpPredicate::Olt => "olt",
+            FcmpPredicate::Ole => "ole",
+            FcmpPredicate::One => "one",
+            FcmpPredicate::Ord => "ord",
+            FcmpPredicate::Ueq => "ueq",
+            FcmpPredicate::Ugt => "ugt",
+            FcmpPredicate::Uge => "uge",
+            FcmpPredicate::Ult => "ult",
+            FcmpPredicate::Ule => "ule",
+            FcmpPredicate::Une => "une",
+            FcmpPredicate::Uno => "uno",
+            FcmpPredicate::True => "true",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LLVM IR MODULE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// LLVM IR Module
+#[derive(Debug, Clone)]
+pub struct LlvmModule {
+    pub name: String,
+    pub source_filename: Option<String>,
+    pub target_triple: Option<String>,
+    pub data_layout: Option<String>,
+    
+    pub globals: Vec<LlvmGlobal>,
+    pub functions: Vec<LlvmFunction>,
+    pub declarations: Vec<LlvmDeclaration>,
+    pub type_definitions: Vec<(String, LlvmType)>,
+    pub attributes: Vec<LlvmAttributeGroup>,
+    pub metadata: Vec<LlvmMetadata>,
+}
+
+impl LlvmModule {
+    pub fn new(name: impl Into<String>) -> Self {
+        LlvmModule {
+            name: name.into(),
+            source_filename: None,
+            target_triple: None,
+            data_layout: None,
+            globals: Vec::new(),
+            functions: Vec::new(),
+            declarations: Vec::new(),
+            type_definitions: Vec::new(),
+            attributes: Vec::new(),
+            metadata: Vec::new(),
+        }
+    }
+    
+    pub fn with_target(mut self, triple: &str, data_layout: &str) -> Self {
+        self.target_triple = Some(triple.to_string());
+        self.data_layout = Some(data_layout.to_string());
+        self
+    }
+    
+    pub fn add_global(&mut self, global: LlvmGlobal) {
+        self.globals.push(global);
+    }
+    
+    pub fn add_function(&mut self, func: LlvmFunction) {
+        self.functions.push(func);
+    }
+    
+    pub fn add_declaration(&mut self, decl: LlvmDeclaration) {
+        self.declarations.push(decl);
+    }
+    
+    /// Emit LLVM IR text
+    pub fn emit(&self) -> String {
+        let mut output = String::new();
+        
+        // Module header
+        if let Some(filename) = &self.source_filename {
+            output.push_str(&format!("; ModuleID = '{}'\n", filename));
+        }
+        
+        output.push_str(&format!("source_filename = \"{}\"\n", self.name));
+        
+        if let Some(triple) = &self.target_triple {
+            output.push_str(&format!("target triple = \"{}\"\n", triple));
+        }
+        
+        if let Some(layout) = &self.data_layout {
+            output.push_str(&format!("target datalayout = \"{}\"\n", layout));
+        }
+        
+        output.push('\n');
+        
+        // Type definitions
+        for (name, ty) in &self.type_definitions {
+            output.push_str(&format!("%{} = type {}\n", name, ty.to_string()));
+        }
+        
+        if !self.type_definitions.is_empty() {
+            output.push('\n');
+        }
+        
+        // Globals
+        for global in &self.globals {
+            output.push_str(&global.emit());
+            output.push('\n');
+        }
+        
+        if !self.globals.is_empty() {
+            output.push('\n');
+        }
+        
+        // Declarations
+        for decl in &self.declarations {
+            output.push_str(&decl.emit());
+            output.push('\n');
+        }
+        
+        if !self.declarations.is_empty() {
+            output.push('\n');
+        }
+        
+        // Functions
+        for func in &self.functions {
+            output.push_str(&func.emit());
+            output.push('\n');
+        }
+        
+        // Metadata
+        for meta in &self.metadata {
+            output.push_str(&meta.emit());
+            output.push('\n');
+        }
+        
+        // Attributes
+        for attr in &self.attributes {
+            output.push_str(&attr.emit());
+            output.push('\n');
+        }
+        
+        output
+    }
+}
+
+/// LLVM Global variable
+#[derive(Debug, Clone)]
+pub struct LlvmGlobal {
+    pub name: String,
+    pub ty: LlvmType,
+    pub linkage: Linkage,
+    pub constant: bool,
+    pub initializer: Option<LlvmConstant>,
+    pub alignment: Option<u32>,
+    pub section: Option<String>,
+}
+
+impl LlvmGlobal {
+    pub fn emit(&self) -> String {
+        let linkage = if self.linkage != Linkage::External {
+            format!("{} ", self.linkage.to_string())
+        } else {
+            String::new()
+        };
+        
+        let constant = if self.constant { "constant" } else { "global" };
+        
+        let init = self.initializer.as_ref()
+            .map(|i| format!(" {}", emit_constant(i)))
+            .unwrap_or_default();
+        
+        let align = self.alignment
+            .map(|a| format!(", align {}", a))
+            .unwrap_or_default();
+        
+        let section = self.section.as_ref()
+            .map(|s| format!(", section \"{}\"", s))
+            .unwrap_or_default();
+        
+        format!(
+            "@{} = {}{} {}{}{}{}",
+            self.name, linkage, constant, self.ty.to_string(), init, align, section
+        )
+    }
+}
+
+/// LLVM Function declaration
+#[derive(Debug, Clone)]
+pub struct LlvmDeclaration {
+    pub name: String,
+    pub return_type: LlvmType,
+    pub params: Vec<LlvmType>,
+    pub vararg: bool,
+    pub calling_convention: Option<CallingConvention>,
+}
+
+impl LlvmDeclaration {
+    pub fn emit(&self) -> String {
+        let params_str: Vec<String> = self.params.iter().map(|p| p.to_string()).collect();
+        let params = if self.vararg {
+            format!("{}, ...", params_str.join(", "))
+        } else {
+            params_str.join(", ")
+        };
+        
+        let cc = self.calling_convention
+            .map(|c| format!("{} ", c.to_string()))
+            .unwrap_or_default();
+        
+        format!(
+            "declare {}{}@{}({})",
+            cc, self.return_type.to_string(), self.name, params
+        )
+    }
+}
+
+/// LLVM Function
+#[derive(Debug, Clone)]
+pub struct LlvmFunction {
+    pub name: String,
+    pub return_type: LlvmType,
+    pub params: Vec<(String, LlvmType)>,
+    pub linkage: Linkage,
+    pub calling_convention: Option<CallingConvention>,
+    pub blocks: Vec<LlvmBasicBlock>,
+    pub attributes: Vec<String>,
+}
+
+impl LlvmFunction {
+    pub fn new(name: impl Into<String>, return_type: LlvmType) -> Self {
+        LlvmFunction {
+            name: name.into(),
+            return_type,
+            params: Vec::new(),
+            linkage: Linkage::External,
+            calling_convention: None,
+            blocks: Vec::new(),
+            attributes: Vec::new(),
+        }
+    }
+    
+    pub fn emit(&self) -> String {
+        let mut output = String::new();
+        
+        // Function signature
+        let linkage = if self.linkage != Linkage::External {
+            format!("{} ", self.linkage.to_string())
+        } else {
+            String::new()
+        };
+        
+        let cc = self.calling_convention
+            .map(|c| format!("{} ", c.to_string()))
+            .unwrap_or_default();
+        
+        let params: Vec<String> = self.params.iter()
+            .map(|(name, ty)| format!("{} %{}", ty.to_string(), name))
+            .collect();
+        
+        let attrs = if self.attributes.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", self.attributes.join(" "))
+        };
+        
+        output.push_str(&format!(
+            "define {}{}{} @{}({}){} {{\n",
+            linkage, cc, self.return_type.to_string(), self.name,
+            params.join(", "), attrs
+        ));
+        
+        // Blocks
+        for (i, block) in self.blocks.iter().enumerate() {
+            if i > 0 {
+                output.push('\n');
+            }
+            output.push_str(&block.emit());
+        }
+        
+        output.push_str("}\n");
+        output
+    }
+}
+
+/// LLVM Basic Block
+#[derive(Debug, Clone)]
+pub struct LlvmBasicBlock {
+    pub name: String,
+    pub instructions: Vec<(Option<String>, LlvmInstruction)>,
+}
+
+impl LlvmBasicBlock {
+    pub fn new(name: impl Into<String>) -> Self {
+        LlvmBasicBlock {
+            name: name.into(),
+            instructions: Vec::new(),
+        }
+    }
+    
+    pub fn emit(&self) -> String {
+        let mut output = String::new();
+        
+        output.push_str(&format!("{}:\n", self.name));
+        
+        for (result, inst) in &self.instructions {
+            let inst_str = emit_instruction(inst);
+            if let Some(res) = result {
+                output.push_str(&format!("  %{} = {}\n", res, inst_str));
+            } else {
+                output.push_str(&format!("  {}\n", inst_str));
+            }
+        }
+        
+        output
+    }
+}
+
+/// LLVM Attribute group
+#[derive(Debug, Clone)]
+pub struct LlvmAttributeGroup {
+    pub id: u32,
+    pub attributes: Vec<String>,
+}
+
+impl LlvmAttributeGroup {
+    pub fn emit(&self) -> String {
+        format!(
+            "attributes #{} = {{ {} }}",
+            self.id,
+            self.attributes.join(" ")
+        )
+    }
+}
+
+/// LLVM Metadata
+#[derive(Debug, Clone)]
+pub struct LlvmMetadata {
+    pub id: String,
+    pub value: String,
+}
+
+impl LlvmMetadata {
+    pub fn emit(&self) -> String {
+        format!("!{} = {}", self.id, self.value)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSTRUCTION EMISSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn emit_instruction(inst: &LlvmInstruction) -> String {
+    match inst {
+        LlvmInstruction::Ret(None) => "ret void".to_string(),
+        LlvmInstruction::Ret(Some(op)) => format!("ret {} {}", op.get_type().to_string(), emit_operand(op)),
+        
+        LlvmInstruction::Br(block) => format!("br label %bb{}", block.0),
+        
+        LlvmInstruction::CondBr(cond, then_bb, else_bb) => {
+            format!(
+                "br {} {}, label %bb{}, label %bb{}",
+                cond.get_type().to_string(), emit_operand(cond), then_bb.0, else_bb.0
+            )
+        }
+        
+        LlvmInstruction::Switch(op, default, cases) => {
+            let cases_str: Vec<String> = cases.iter()
+                .map(|(val, bb)| format!("{} {}, label %bb{}", op.get_type().to_string(), val, bb.0))
+                .collect();
+            format!(
+                "switch {} {}, label %bb{} [\n    {}\n  ]",
+                op.get_type().to_string(), emit_operand(op), default.0, cases_str.join("\n    ")
+            )
+        }
+        
+        LlvmInstruction::Unreachable => "unreachable".to_string(),
+        
+        // Binary operations
+        LlvmInstruction::Add(lhs, rhs, nuw, nsw) => {
+            let flags = format!("{}{}", if *nuw { " nuw" } else { "" }, if *nsw { " nsw" } else { "" });
+            format!("add{} {} {}, {}", flags, lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::Sub(lhs, rhs, nuw, nsw) => {
+            let flags = format!("{}{}", if *nuw { " nuw" } else { "" }, if *nsw { " nsw" } else { "" });
+            format!("sub{} {} {}, {}", flags, lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::Mul(lhs, rhs, nuw, nsw) => {
+            let flags = format!("{}{}", if *nuw { " nuw" } else { "" }, if *nsw { " nsw" } else { "" });
+            format!("mul{} {} {}, {}", flags, lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::SDiv(lhs, rhs, exact) => {
+            let flags = if *exact { " exact" } else { "" };
+            format!("sdiv{} {} {}, {}", flags, lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::UDiv(lhs, rhs, exact) => {
+            let flags = if *exact { " exact" } else { "" };
+            format!("udiv{} {} {}, {}", flags, lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::SRem(lhs, rhs) => {
+            format!("srem {} {}, {}", lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::URem(lhs, rhs) => {
+            format!("urem {} {}, {}", lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        // Floating point
+        LlvmInstruction::FAdd(lhs, rhs) => {
+            format!("fadd {} {}, {}", lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::FSub(lhs, rhs) => {
+            format!("fsub {} {}, {}", lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::FMul(lhs, rhs) => {
+            format!("fmul {} {}, {}", lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::FDiv(lhs, rhs) => {
+            format!("fdiv {} {}, {}", lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::FRem(lhs, rhs) => {
+            format!("frem {} {}, {}", lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        // Bitwise
+        LlvmInstruction::And(lhs, rhs) => {
+            format!("and {} {}, {}", lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::Or(lhs, rhs) => {
+            format!("or {} {}, {}", lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::Xor(lhs, rhs) => {
+            format!("xor {} {}, {}", lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::Shl(lhs, rhs, nuw, nsw) => {
+            let flags = format!("{}{}", if *nuw { " nuw" } else { "" }, if *nsw { " nsw" } else { "" });
+            format!("shl{} {} {}, {}", flags, lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::LShr(lhs, rhs, exact) => {
+            let flags = if *exact { " exact" } else { "" };
+            format!("lshr{} {} {}, {}", flags, lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::AShr(lhs, rhs, exact) => {
+            let flags = if *exact { " exact" } else { "" };
+            format!("ashr{} {} {}, {}", flags, lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        // Memory
+        LlvmInstruction::Alloca(ty, align) => {
+            let align_str = align.map(|a| format!(", align {}", a)).unwrap_or_default();
+            format!("alloca {}{}", ty.to_string(), align_str)
+        }
+        
+        LlvmInstruction::Load(ty, ptr, align) => {
+            let align_str = align.map(|a| format!(", align {}", a)).unwrap_or_default();
+            format!("load {}, {} {}{}", ty.to_string(), ptr.get_type().to_string(), emit_operand(ptr), align_str)
+        }
+        
+        LlvmInstruction::Store(val, ptr, align) => {
+            let align_str = align.map(|a| format!(", align {}", a)).unwrap_or_default();
+            format!("store {} {}, {} {}{}", val.get_type().to_string(), emit_operand(val), ptr.get_type().to_string(), emit_operand(ptr), align_str)
+        }
+        
+        LlvmInstruction::GetElementPtr(ty, base, indices, inbounds) => {
+            let inbounds_str = if *inbounds { "inbounds " } else { "" };
+            let indices_str: Vec<String> = indices.iter()
+                .map(|i| format!("{} {}", i.get_type().to_string(), emit_operand(i)))
+                .collect();
+            format!("getelementptr {}{}, {} {}, {}", inbounds_str, ty.to_string(), base.get_type().to_string(), emit_operand(base), indices_str.join(", "))
+        }
+        
+        // Conversions
+        LlvmInstruction::Trunc(op, ty) => {
+            format!("trunc {} {} to {}", op.get_type().to_string(), emit_operand(op), ty.to_string())
+        }
+        
+        LlvmInstruction::ZExt(op, ty) => {
+            format!("zext {} {} to {}", op.get_type().to_string(), emit_operand(op), ty.to_string())
+        }
+        
+        LlvmInstruction::SExt(op, ty) => {
+            format!("sext {} {} to {}", op.get_type().to_string(), emit_operand(op), ty.to_string())
+        }
+        
+        LlvmInstruction::Bitcast(op, ty) => {
+            format!("bitcast {} {} to {}", op.get_type().to_string(), emit_operand(op), ty.to_string())
+        }
+        
+        // Comparisons
+        LlvmInstruction::ICmp(pred, lhs, rhs) => {
+            format!("icmp {} {} {}, {}", pred.to_string(), lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        LlvmInstruction::FCmp(pred, lhs, rhs) => {
+            format!("fcmp {} {} {}, {}", pred.to_string(), lhs.get_type().to_string(), emit_operand(lhs), emit_operand(rhs))
+        }
+        
+        // Other
+        LlvmInstruction::Phi(ty, incoming) => {
+            let vals: Vec<String> = incoming.iter()
+                .map(|(val, bb)| format!("[ {}, %bb{} ]", emit_operand(val), bb.0))
+                .collect();
+            format!("phi {} {}", ty.to_string(), vals.join(", "))
+        }
+        
+        LlvmInstruction::Select(cond, true_val, false_val) => {
+            format!(
+                "select {} {}, {} {}, {} {}",
+                cond.get_type().to_string(), emit_operand(cond),
+                true_val.get_type().to_string(), emit_operand(true_val),
+                false_val.get_type().to_string(), emit_operand(false_val)
+            )
+        }
+        
+        LlvmInstruction::Call(ret_ty, callee, args, cc) => {
+            let args_str: Vec<String> = args.iter()
+                .map(|a| format!("{} {}", a.get_type().to_string(), emit_operand(a)))
+                .collect();
+            
+            let cc_str = cc.map(|c| format!("{} ", c.to_string())).unwrap_or_default();
+            let ret_str = ret_ty.as_ref().map(|t| t.to_string()).unwrap_or_else(|| "void".to_string());
+            
+            format!("call {}{} @{}({})", cc_str, ret_str, callee, args_str.join(", "))
+        }
+        
+        LlvmInstruction::ExtractValue(agg, indices) => {
+            let idx_str: Vec<String> = indices.iter().map(|i| i.to_string()).collect();
+            format!("extractvalue {} {}, {}", agg.get_type().to_string(), emit_operand(agg), idx_str.join(", "))
+        }
+        
+        LlvmInstruction::InsertValue(agg, val, indices) => {
+            let idx_str: Vec<String> = indices.iter().map(|i| i.to_string()).collect();
+            format!(
+                "insertvalue {} {}, {} {}, {}",
+                agg.get_type().to_string(), emit_operand(agg),
+                val.get_type().to_string(), emit_operand(val),
+                idx_str.join(", ")
+            )
+        }
+        
+        _ => "; unimplemented instruction".to_string(),
+    }
+}
+
+fn emit_operand(op: &LlvmOperand) -> String {
+    match op {
+        LlvmOperand::Value(val, _) => format!("%v{}", val.0),
+        LlvmOperand::Constant(c) => emit_constant(c),
+        LlvmOperand::Global(name, _) => format!("@{}", name),
+    }
+}
+
+fn emit_constant(c: &LlvmConstant) -> String {
+    match c {
+        LlvmConstant::Int(val, _) => val.to_string(),
+        LlvmConstant::Float(val) => format!("{:.6e}", val),
+        LlvmConstant::Double(val) => format!("{:.15e}", val),
+        LlvmConstant::Null(_) => "null".to_string(),
+        LlvmConstant::Undef(_) => "undef".to_string(),
+        LlvmConstant::Poison(_) => "poison".to_string(),
+        LlvmConstant::ZeroInitializer(_) => "zeroinitializer".to_string(),
+        LlvmConstant::GlobalRef(name) => format!("@{}", name),
+        LlvmConstant::Array(elem_ty, elems) => {
+            let elems_str: Vec<String> = elems.iter()
+                .map(|e| format!("{} {}", elem_ty.to_string(), emit_constant(e)))
+                .collect();
+            format!("[{}]", elems_str.join(", "))
+        }
+        LlvmConstant::Struct(fields, packed) => {
+            let fields_str: Vec<String> = fields.iter()
+                .map(|f| format!("{} {}", f.get_type().to_string(), emit_constant(f)))
+                .collect();
+            if *packed {
+                format!("<{{ {} }}>", fields_str.join(", "))
+            } else {
+                format!("{{ {} }}", fields_str.join(", "))
+            }
+        }
+        LlvmConstant::Vector(elems) => {
+            let elem_ty = elems.first().map(|e| e.get_type()).unwrap_or(LlvmType::Int(32));
+            let elems_str: Vec<String> = elems.iter()
+                .map(|e| format!("{} {}", elem_ty.to_string(), emit_constant(e)))
+                .collect();
+            format!("<{}>", elems_str.join(", "))
+        }
+        LlvmConstant::BlockAddress(func, block) => format!("blockaddress(@{}, %{})", func, block),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MLIR TO LLVM IR TRANSLATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Translate MLIR module to LLVM IR
+pub struct MlirToLlvm {
+    /// Value mapping
+    value_map: BTreeMap<u64, LlvmValueRef>,
+    
+    /// Block mapping
+    block_map: BTreeMap<u64, LlvmBlockRef>,
+    
+    /// Next value ID
+    next_value: u64,
+    
+    /// Target machine
+    target: Option<TargetMachine>,
+}
+
+impl MlirToLlvm {
+    pub fn new() -> Self {
+        MlirToLlvm {
+            value_map: BTreeMap::new(),
+            block_map: BTreeMap::new(),
+            next_value: 0,
+            target: None,
+        }
+    }
+    
+    pub fn with_target(mut self, target: TargetMachine) -> Self {
+        self.target = Some(target);
+        self
+    }
+    
+    /// Translate MLIR module to LLVM module
+    pub fn translate(&mut self, mlir_module: &Module) -> LlvmModule {
+        let mut llvm_module = LlvmModule::new(mlir_module.name.clone().unwrap_or_else(|| "module".to_string()));
+        
+        // Set target info
+        if let Some(target) = &self.target {
+            llvm_module.target_triple = Some(target.triple.to_string());
+            llvm_module.data_layout = Some(target.data_layout.to_string());
+        }
+        
+        // Translate functions
+        for block in &mlir_module.body.blocks {
+            for op in &block.operations {
+                if op.name == "llvm.func" || op.name == "func.func" {
+                    if let Some(func) = self.translate_function(op) {
+                        llvm_module.add_function(func);
+                    }
+                }
+            }
+        }
+        
+        llvm_module
+    }
+    
+    fn translate_function(&mut self, op: &Operation) -> Option<LlvmFunction> {
+        let name = op.get_attribute("sym_name")
+            .and_then(|a| match &a.kind {
+                MlirAttrKind::String(s) => Some(s.clone()),
+                _ => None,
+            })?;
+        
+        // Get function type
+        let (param_types, return_type) = self.extract_function_type(op)?;
+        
+        let mut func = LlvmFunction::new(name, return_type);
+        
+        // Add parameters
+        for (i, ty) in param_types.into_iter().enumerate() {
+            func.params.push((format!("arg{}", i), ty));
+        }
+        
+        // Translate blocks
+        for region in &op.regions {
+            for (i, block) in region.blocks.iter().enumerate() {
+                let llvm_block = self.translate_block(block, i)?;
+                func.blocks.push(llvm_block);
+            }
+        }
+        
+        Some(func)
+    }
+    
+    fn translate_block(&mut self, block: &Block, index: usize) -> Option<LlvmBasicBlock> {
+        let name = if index == 0 { "entry".to_string() } else { format!("bb{}", block.id.0) };
+        let mut llvm_block = LlvmBasicBlock::new(name);
+        
+        for op in &block.operations {
+            if let Some((result, inst)) = self.translate_operation(op) {
+                llvm_block.instructions.push((result, inst));
+            }
+        }
+        
+        Some(llvm_block)
+    }
+    
+    fn translate_operation(&mut self, op: &Operation) -> Option<(Option<String>, LlvmInstruction)> {
+        let result_name = op.results.first().map(|r| format!("v{}", r.value.id.0));
+        
+        let inst = match op.name.as_str() {
+            "llvm.return" | "func.return" => {
+                if op.operands.is_empty() {
+                    LlvmInstruction::Ret(None)
+                } else {
+                    let operand = self.translate_operand(&op.operands[0], &op.results)?;
+                    LlvmInstruction::Ret(Some(operand))
+                }
+            }
+            
+            "llvm.add" | "arith.addi" => {
+                let lhs = self.translate_operand(&op.operands[0], &op.results)?;
+                let rhs = self.translate_operand(&op.operands[1], &op.results)?;
+                LlvmInstruction::Add(lhs, rhs, false, false)
+            }
+            
+            "llvm.sub" | "arith.subi" => {
+                let lhs = self.translate_operand(&op.operands[0], &op.results)?;
+                let rhs = self.translate_operand(&op.operands[1], &op.results)?;
+                LlvmInstruction::Sub(lhs, rhs, false, false)
+            }
+            
+            "llvm.mul" | "arith.muli" => {
+                let lhs = self.translate_operand(&op.operands[0], &op.results)?;
+                let rhs = self.translate_operand(&op.operands[1], &op.results)?;
+                LlvmInstruction::Mul(lhs, rhs, false, false)
+            }
+            
+            "llvm.sdiv" | "arith.divsi" => {
+                let lhs = self.translate_operand(&op.operands[0], &op.results)?;
+                let rhs = self.translate_operand(&op.operands[1], &op.results)?;
+                LlvmInstruction::SDiv(lhs, rhs, false)
+            }
+            
+            "llvm.icmp" | "arith.cmpi" => {
+                let pred = self.get_icmp_predicate(op)?;
+                let lhs = self.translate_operand(&op.operands[0], &op.results)?;
+                let rhs = self.translate_operand(&op.operands[1], &op.results)?;
+                LlvmInstruction::ICmp(pred, lhs, rhs)
+            }
+            
+            "llvm.alloca" | "memref.alloc" => {
+                let ty = self.translate_type(&op.results.first()?.ty)?;
+                LlvmInstruction::Alloca(ty, Some(8))
+            }
+            
+            "llvm.load" | "memref.load" => {
+                let ty = self.translate_type(&op.results.first()?.ty)?;
+                let ptr = self.translate_operand(&op.operands[0], &op.results)?;
+                LlvmInstruction::Load(ty, ptr, Some(8))
+            }
+            
+            "llvm.store" | "memref.store" => {
+                let val = self.translate_operand(&op.operands[0], &op.results)?;
+                let ptr = self.translate_operand(&op.operands[1], &op.results)?;
+                LlvmInstruction::Store(val, ptr, Some(8))
+            }
+            
+            "llvm.br" | "cf.br" => {
+                let target = op.successors.first()?;
+                LlvmInstruction::Br(LlvmBlockRef(target.0))
+            }
+            
+            "llvm.cond_br" | "cf.cond_br" => {
+                let cond = self.translate_operand(&op.operands[0], &op.results)?;
+                let then_bb = op.successors.get(0)?;
+                let else_bb = op.successors.get(1)?;
+                LlvmInstruction::CondBr(cond, LlvmBlockRef(then_bb.0), LlvmBlockRef(else_bb.0))
+            }
+            
+            "llvm.call" | "func.call" => {
+                let callee = op.get_attribute("callee")
+                    .and_then(|a| match &a.kind {
+                        MlirAttrKind::FlatSymbolRef(s) | MlirAttrKind::SymbolRef(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                
+                let args: Vec<LlvmOperand> = op.operands.iter()
+                    .filter_map(|v| self.translate_operand(v, &op.results))
+                    .collect();
+                
+                let ret_ty = op.results.first().map(|r| self.translate_type(&r.ty)).flatten();
+                
+                LlvmInstruction::Call(ret_ty, callee, args, None)
+            }
+            
+            "llvm.unreachable" => LlvmInstruction::Unreachable,
+            
+            _ => return None,
+        };
+        
+        Some((result_name, inst))
+    }
+    
+    fn translate_operand(&self, value: &Value, results: &[TypedValue]) -> Option<LlvmOperand> {
+        // Try to find a result type
+        let ty = results.first()
+            .map(|r| self.translate_type(&r.ty))
+            .flatten()
+            .unwrap_or(LlvmType::Int(64));
+        
+        Some(LlvmOperand::Value(LlvmValueRef(value.id.0), ty))
+    }
+    
+    fn translate_type(&self, ty: &MlirType) -> Option<LlvmType> {
+        Some(match &ty.kind {
+            MlirTypeKind::Integer { width, .. } => LlvmType::Int(*width),
+            MlirTypeKind::Float { width: 32 } => LlvmType::Float,
+            MlirTypeKind::Float { width: 64 } => LlvmType::Double,
+            MlirTypeKind::Float { width } => LlvmType::Int(*width),
+            MlirTypeKind::Index => LlvmType::Int(64),
+            MlirTypeKind::LlvmPtr => LlvmType::Ptr(Box::new(LlvmType::Int(8))),
+            MlirTypeKind::LlvmVoid => LlvmType::Void,
+            MlirTypeKind::Tuple(elems) if elems.is_empty() => LlvmType::Void,
+            MlirTypeKind::Tuple(elems) => {
+                let fields: Vec<LlvmType> = elems.iter()
+                    .filter_map(|e| self.translate_type(e))
+                    .collect();
+                LlvmType::Struct(fields, false)
+            }
+            MlirTypeKind::LlvmArray { element, size } => {
+                LlvmType::Array(Box::new(self.translate_type(element)?), *size)
+            }
+            MlirTypeKind::LlvmStruct { fields, packed } => {
+                let llvm_fields: Vec<LlvmType> = fields.iter()
+                    .filter_map(|f| self.translate_type(f))
+                    .collect();
+                LlvmType::Struct(llvm_fields, *packed)
+            }
+            MlirTypeKind::Function { inputs, results } => {
+                let params: Vec<LlvmType> = inputs.iter()
+                    .filter_map(|t| self.translate_type(t))
+                    .collect();
+                let ret = results.first()
+                    .and_then(|t| self.translate_type(t))
+                    .unwrap_or(LlvmType::Void);
+                LlvmType::Function(params, Box::new(ret), false)
+            }
+            _ => LlvmType::Ptr(Box::new(LlvmType::Int(8))),
+        })
+    }
+    
+    fn extract_function_type(&self, op: &Operation) -> Option<(Vec<LlvmType>, LlvmType)> {
+        let func_type = op.get_attribute("function_type")
+            .and_then(|a| match &a.kind {
+                MlirAttrKind::Type(t) => Some(t),
+                _ => None,
+            })?;
+        
+        match &func_type.kind {
+            MlirTypeKind::Function { inputs, results } => {
+                let param_types: Vec<LlvmType> = inputs.iter()
+                    .filter_map(|t| self.translate_type(t))
+                    .collect();
+                let return_type = results.first()
+                    .and_then(|t| self.translate_type(t))
+                    .unwrap_or(LlvmType::Void);
+                Some((param_types, return_type))
+            }
+            _ => None,
+        }
+    }
+    
+    fn get_icmp_predicate(&self, op: &Operation) -> Option<IcmpPredicate> {
+        let pred_val = op.get_attribute("predicate")
+            .and_then(|a| match &a.kind {
+                MlirAttrKind::Integer { value, .. } => Some(*value as u32),
+                _ => None,
+            })?;
+        
+        Some(match pred_val {
+            0 => IcmpPredicate::Eq,
+            1 => IcmpPredicate::Ne,
+            2 => IcmpPredicate::Slt,
+            3 => IcmpPredicate::Sle,
+            4 => IcmpPredicate::Sgt,
+            5 => IcmpPredicate::Sge,
+            6 => IcmpPredicate::Ult,
+            7 => IcmpPredicate::Ule,
+            8 => IcmpPredicate::Ugt,
+            9 => IcmpPredicate::Uge,
+            _ => IcmpPredicate::Eq,
+        })
+    }
+}
+
+impl Default for MlirToLlvm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_llvm_type_string() {
+        assert_eq!(LlvmType::Int(32).to_string(), "i32");
+        assert_eq!(LlvmType::Void.to_string(), "void");
+        assert_eq!(LlvmType::Ptr(Box::new(LlvmType::Int(8))).to_string(), "i8*");
+    }
+    
+    #[test]
+    fn test_llvm_module_emit() {
+        let mut module = LlvmModule::new("test");
+        module.target_triple = Some("x86_64-unknown-linux-gnu".to_string());
+        
+        let output = module.emit();
+        
+        assert!(output.contains("source_filename = \"test\""));
+        assert!(output.contains("target triple = \"x86_64-unknown-linux-gnu\""));
+    }
+    
+    #[test]
+    fn test_instruction_emit() {
+        let inst = LlvmInstruction::Ret(None);
+        assert_eq!(emit_instruction(&inst), "ret void");
+        
+        let add = LlvmInstruction::Add(
+            LlvmOperand::Value(LlvmValueRef(0), LlvmType::Int(32)),
+            LlvmOperand::Value(LlvmValueRef(1), LlvmType::Int(32)),
+            false, false
+        );
+        assert!(emit_instruction(&add).contains("add"));
+    }
+    
+    #[test]
+    fn test_mlir_to_llvm() {
+        let translator = MlirToLlvm::new();
+        // Basic instantiation test
+        assert!(translator.value_map.is_empty());
+    }
+}

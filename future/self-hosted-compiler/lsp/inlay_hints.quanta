@@ -1,0 +1,946 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ LSP — Inlay Hints Provider
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// LSP 3.17+ Inlay Hints for inline annotations:
+// - Type hints for inferred types
+// - Parameter name hints at call sites
+// - Chaining hints for method chains
+// - Lifetime elision hints
+// - Implicit dereference/reference hints
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::lsp::inlay_hints
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INLAY HINT TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Kind of inlay hint
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InlayHintKind {
+    /// Type annotation hint
+    Type,
+    /// Parameter name hint
+    Parameter,
+}
+
+/// Position in document
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Position {
+    pub line: u32,
+    pub character: u32,
+}
+
+impl Position {
+    pub fn new(line: u32, character: u32) -> Self {
+        Position { line, character }
+    }
+}
+
+impl PartialOrd for Position {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Position {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.line, self.character).cmp(&(other.line, other.character))
+    }
+}
+
+/// Range in document
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Range {
+    pub start: Position,
+    pub end: Position,
+}
+
+impl Range {
+    pub fn new(start: Position, end: Position) -> Self {
+        Range { start, end }
+    }
+    
+    pub fn contains(&self, pos: Position) -> bool {
+        pos >= self.start && pos < self.end
+    }
+}
+
+/// Inlay hint label part
+#[derive(Debug, Clone)]
+pub struct InlayHintLabelPart {
+    /// Text to display
+    pub value: String,
+    
+    /// Optional tooltip
+    pub tooltip: Option<InlayHintTooltip>,
+    
+    /// Optional location for click-to-navigate
+    pub location: Option<Location>,
+    
+    /// Optional command to execute on click
+    pub command: Option<Command>,
+}
+
+impl InlayHintLabelPart {
+    pub fn text(value: impl Into<String>) -> Self {
+        InlayHintLabelPart {
+            value: value.into(),
+            tooltip: None,
+            location: None,
+            command: None,
+        }
+    }
+    
+    pub fn with_tooltip(mut self, tooltip: impl Into<String>) -> Self {
+        self.tooltip = Some(InlayHintTooltip::String(tooltip.into()));
+        self
+    }
+    
+    pub fn with_location(mut self, location: Location) -> Self {
+        self.location = Some(location);
+        self
+    }
+}
+
+/// Tooltip content
+#[derive(Debug, Clone)]
+pub enum InlayHintTooltip {
+    String(String),
+    Markdown(MarkupContent),
+}
+
+/// Markdown content
+#[derive(Debug, Clone)]
+pub struct MarkupContent {
+    pub kind: MarkupKind,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkupKind {
+    PlainText,
+    Markdown,
+}
+
+/// Location reference
+#[derive(Debug, Clone)]
+pub struct Location {
+    pub uri: String,
+    pub range: Range,
+}
+
+/// Command to execute
+#[derive(Debug, Clone)]
+pub struct Command {
+    pub title: String,
+    pub command: String,
+    pub arguments: Option<Vec<String>>,
+}
+
+/// Inlay hint label (string or structured parts)
+#[derive(Debug, Clone)]
+pub enum InlayHintLabel {
+    String(String),
+    Parts(Vec<InlayHintLabelPart>),
+}
+
+impl From<String> for InlayHintLabel {
+    fn from(s: String) -> Self {
+        InlayHintLabel::String(s)
+    }
+}
+
+impl From<&str> for InlayHintLabel {
+    fn from(s: &str) -> Self {
+        InlayHintLabel::String(s.to_string())
+    }
+}
+
+impl From<Vec<InlayHintLabelPart>> for InlayHintLabel {
+    fn from(parts: Vec<InlayHintLabelPart>) -> Self {
+        InlayHintLabel::Parts(parts)
+    }
+}
+
+/// Complete inlay hint
+#[derive(Debug, Clone)]
+pub struct InlayHint {
+    /// Position where hint is displayed
+    pub position: Position,
+    
+    /// Label to display
+    pub label: InlayHintLabel,
+    
+    /// Kind of hint
+    pub kind: Option<InlayHintKind>,
+    
+    /// Text edits to apply when accepting hint
+    pub text_edits: Option<Vec<TextEdit>>,
+    
+    /// Tooltip on hover
+    pub tooltip: Option<InlayHintTooltip>,
+    
+    /// Whether hint is before or after position
+    pub padding_left: bool,
+    pub padding_right: bool,
+    
+    /// Custom data for resolve
+    pub data: Option<String>,
+}
+
+impl InlayHint {
+    pub fn type_hint(position: Position, type_str: impl Into<String>) -> Self {
+        InlayHint {
+            position,
+            label: format!(": {}", type_str.into()).into(),
+            kind: Some(InlayHintKind::Type),
+            text_edits: None,
+            tooltip: None,
+            padding_left: false,
+            padding_right: false,
+            data: None,
+        }
+    }
+    
+    pub fn parameter_hint(position: Position, param_name: impl Into<String>) -> Self {
+        InlayHint {
+            position,
+            label: format!("{}:", param_name.into()).into(),
+            kind: Some(InlayHintKind::Parameter),
+            text_edits: None,
+            tooltip: None,
+            padding_left: false,
+            padding_right: true,
+            data: None,
+        }
+    }
+    
+    pub fn with_tooltip(mut self, tooltip: impl Into<String>) -> Self {
+        self.tooltip = Some(InlayHintTooltip::String(tooltip.into()));
+        self
+    }
+    
+    pub fn with_text_edit(mut self, edit: TextEdit) -> Self {
+        self.text_edits.get_or_insert_with(Vec::new).push(edit);
+        self
+    }
+}
+
+/// Text edit
+#[derive(Debug, Clone)]
+pub struct TextEdit {
+    pub range: Range,
+    pub new_text: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INLAY HINTS PROVIDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Configuration for inlay hints
+#[derive(Debug, Clone)]
+pub struct InlayHintsConfig {
+    /// Show type hints for variables
+    pub type_hints_enabled: bool,
+    
+    /// Show type hints for closures
+    pub closure_return_type_hints: bool,
+    
+    /// Show parameter name hints
+    pub parameter_hints_enabled: bool,
+    
+    /// Show chaining hints
+    pub chaining_hints_enabled: bool,
+    
+    /// Show lifetime elision hints
+    pub lifetime_elision_hints: LifetimeElisionHints,
+    
+    /// Show implicit deref/ref hints
+    pub adjustment_hints: AdjustmentHints,
+    
+    /// Maximum length before truncating
+    pub max_length: Option<usize>,
+    
+    /// Hide trivial types (e.g., i32 from literal)
+    pub hide_trivial_types: bool,
+    
+    /// Hide parameter hints for single-param functions
+    pub hide_single_param_hints: bool,
+    
+    /// Hide parameter hints when argument matches parameter name
+    pub hide_matching_names: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifetimeElisionHints {
+    Never,
+    SkipTrivial,
+    Always,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdjustmentHints {
+    Never,
+    Reborrow,
+    Always,
+}
+
+impl Default for InlayHintsConfig {
+    fn default() -> Self {
+        InlayHintsConfig {
+            type_hints_enabled: true,
+            closure_return_type_hints: true,
+            parameter_hints_enabled: true,
+            chaining_hints_enabled: true,
+            lifetime_elision_hints: LifetimeElisionHints::SkipTrivial,
+            adjustment_hints: AdjustmentHints::Never,
+            max_length: Some(50),
+            hide_trivial_types: true,
+            hide_single_param_hints: true,
+            hide_matching_names: true,
+        }
+    }
+}
+
+/// Provides inlay hints for source code
+pub struct InlayHintsProvider {
+    /// Configuration
+    config: InlayHintsConfig,
+    
+    /// Type database for rendering types
+    type_db: Arc<TypeDatabase>,
+}
+
+impl InlayHintsProvider {
+    pub fn new(config: InlayHintsConfig, type_db: Arc<TypeDatabase>) -> Self {
+        InlayHintsProvider { config, type_db }
+    }
+    
+    /// Get inlay hints for range
+    pub fn hints(&self, analysis: &InlayAnalysis, range: Range) -> Vec<InlayHint> {
+        let mut hints = Vec::new();
+        
+        // Type hints for let bindings
+        if self.config.type_hints_enabled {
+            for binding in &analysis.bindings {
+                if self.should_show_type_hint(binding) && range.contains(binding.position) {
+                    if let Some(hint) = self.type_hint_for_binding(binding) {
+                        hints.push(hint);
+                    }
+                }
+            }
+        }
+        
+        // Closure return type hints
+        if self.config.closure_return_type_hints {
+            for closure in &analysis.closures {
+                if range.contains(closure.position) {
+                    if let Some(hint) = self.type_hint_for_closure(closure) {
+                        hints.push(hint);
+                    }
+                }
+            }
+        }
+        
+        // Parameter hints at call sites
+        if self.config.parameter_hints_enabled {
+            for call in &analysis.calls {
+                if range.contains(call.position) {
+                    hints.extend(self.parameter_hints_for_call(call));
+                }
+            }
+        }
+        
+        // Chaining hints
+        if self.config.chaining_hints_enabled {
+            for chain in &analysis.chains {
+                if range.contains(chain.position) {
+                    if let Some(hint) = self.chaining_hint(chain) {
+                        hints.push(hint);
+                    }
+                }
+            }
+        }
+        
+        // Lifetime elision hints
+        if self.config.lifetime_elision_hints != LifetimeElisionHints::Never {
+            for func in &analysis.functions {
+                if range.contains(func.position) {
+                    hints.extend(self.lifetime_hints_for_function(func));
+                }
+            }
+        }
+        
+        // Adjustment hints
+        if self.config.adjustment_hints != AdjustmentHints::Never {
+            for adj in &analysis.adjustments {
+                if range.contains(adj.position) {
+                    if let Some(hint) = self.adjustment_hint(adj) {
+                        hints.push(hint);
+                    }
+                }
+            }
+        }
+        
+        // Sort by position
+        hints.sort_by_key(|h| h.position);
+        
+        hints
+    }
+    
+    /// Resolve hint details (for deferred computation)
+    pub fn resolve(&self, hint: InlayHint) -> InlayHint {
+        // Could add detailed tooltip, text edits, etc.
+        hint
+    }
+    
+    fn should_show_type_hint(&self, binding: &BindingInfo) -> bool {
+        // Skip if explicit type annotation exists
+        if binding.has_type_annotation {
+            return false;
+        }
+        
+        // Skip trivial types
+        if self.config.hide_trivial_types {
+            if self.is_trivial_type(&binding.inferred_type) {
+                return false;
+            }
+        }
+        
+        true
+    }
+    
+    fn is_trivial_type(&self, ty: &TypeInfo) -> bool {
+        matches!(ty.kind, 
+            TypeKind::Literal(_) | 
+            TypeKind::Unit |
+            TypeKind::Bool |
+            TypeKind::Char
+        )
+    }
+    
+    fn type_hint_for_binding(&self, binding: &BindingInfo) -> Option<InlayHint> {
+        let type_str = self.render_type(&binding.inferred_type);
+        let truncated = self.truncate_if_needed(&type_str);
+        
+        let hint = InlayHint::type_hint(binding.hint_position, &truncated)
+            .with_tooltip(format!("Inferred type: `{}`", type_str));
+        
+        // Add text edit to insert explicit type
+        let edit = TextEdit {
+            range: Range::new(binding.hint_position, binding.hint_position),
+            new_text: format!(": {}", type_str),
+        };
+        
+        Some(hint.with_text_edit(edit))
+    }
+    
+    fn type_hint_for_closure(&self, closure: &ClosureInfo) -> Option<InlayHint> {
+        if closure.return_type.kind == TypeKind::Unit {
+            return None;
+        }
+        
+        let type_str = self.render_type(&closure.return_type);
+        let truncated = self.truncate_if_needed(&type_str);
+        
+        Some(InlayHint {
+            position: closure.return_position,
+            label: format!(" -> {}", truncated).into(),
+            kind: Some(InlayHintKind::Type),
+            text_edits: None,
+            tooltip: Some(InlayHintTooltip::String(
+                format!("Return type: `{}`", type_str)
+            )),
+            padding_left: false,
+            padding_right: false,
+            data: None,
+        })
+    }
+    
+    fn parameter_hints_for_call(&self, call: &CallInfo) -> Vec<InlayHint> {
+        let mut hints = Vec::new();
+        
+        // Skip single-param if configured
+        if self.config.hide_single_param_hints && call.arguments.len() == 1 {
+            return hints;
+        }
+        
+        for arg in &call.arguments {
+            // Skip if argument matches parameter name
+            if self.config.hide_matching_names {
+                if let Some(arg_name) = &arg.expression_name {
+                    if self.names_match(arg_name, &arg.parameter_name) {
+                        continue;
+                    }
+                }
+            }
+            
+            // Skip obvious arguments
+            if self.is_obvious_argument(arg) {
+                continue;
+            }
+            
+            let hint = InlayHint::parameter_hint(arg.position, &arg.parameter_name)
+                .with_tooltip(format!(
+                    "Parameter `{}` of `{}`",
+                    arg.parameter_name,
+                    call.function_name
+                ));
+            
+            hints.push(hint);
+        }
+        
+        hints
+    }
+    
+    fn names_match(&self, arg_name: &str, param_name: &str) -> bool {
+        // Exact match
+        if arg_name == param_name {
+            return true;
+        }
+        
+        // Case-insensitive match
+        if arg_name.to_lowercase() == param_name.to_lowercase() {
+            return true;
+        }
+        
+        // Suffix match (e.g., user_name matches name)
+        if arg_name.ends_with(&format!("_{}", param_name)) {
+            return true;
+        }
+        
+        false
+    }
+    
+    fn is_obvious_argument(&self, arg: &ArgumentInfo) -> bool {
+        // Skip &str literals
+        if arg.is_string_literal {
+            return true;
+        }
+        
+        // Skip boolean literals for boolean params
+        if arg.is_bool_literal && arg.parameter_type.kind == TypeKind::Bool {
+            return true;
+        }
+        
+        false
+    }
+    
+    fn chaining_hint(&self, chain: &ChainInfo) -> Option<InlayHint> {
+        let type_str = self.render_type(&chain.result_type);
+        let truncated = self.truncate_if_needed(&type_str);
+        
+        let parts = vec![
+            InlayHintLabelPart::text(&truncated)
+                .with_tooltip(format!("Chain result: `{}`", type_str)),
+        ];
+        
+        Some(InlayHint {
+            position: chain.position,
+            label: InlayHintLabel::Parts(parts),
+            kind: Some(InlayHintKind::Type),
+            text_edits: None,
+            tooltip: None,
+            padding_left: true,
+            padding_right: false,
+            data: None,
+        })
+    }
+    
+    fn lifetime_hints_for_function(&self, func: &FunctionInfo) -> Vec<InlayHint> {
+        let mut hints = Vec::new();
+        
+        if self.config.lifetime_elision_hints == LifetimeElisionHints::SkipTrivial {
+            // Only show non-trivial elisions
+            if func.has_trivial_elision {
+                return hints;
+            }
+        }
+        
+        for elision in &func.elided_lifetimes {
+            let hint = InlayHint {
+                position: elision.position,
+                label: format!("'{}", elision.name).into(),
+                kind: Some(InlayHintKind::Type),
+                text_edits: None,
+                tooltip: Some(InlayHintTooltip::String(
+                    format!("Elided lifetime `'{}`", elision.name)
+                )),
+                padding_left: false,
+                padding_right: false,
+                data: None,
+            };
+            hints.push(hint);
+        }
+        
+        hints
+    }
+    
+    fn adjustment_hint(&self, adj: &AdjustmentInfo) -> Option<InlayHint> {
+        if self.config.adjustment_hints == AdjustmentHints::Reborrow {
+            if !matches!(adj.kind, AdjustmentKind::Reborrow) {
+                return None;
+            }
+        }
+        
+        let label = match adj.kind {
+            AdjustmentKind::Deref => "*",
+            AdjustmentKind::Ref => "&",
+            AdjustmentKind::RefMut => "&mut ",
+            AdjustmentKind::Reborrow => "&*",
+        };
+        
+        Some(InlayHint {
+            position: adj.position,
+            label: label.into(),
+            kind: Some(InlayHintKind::Type),
+            text_edits: None,
+            tooltip: Some(InlayHintTooltip::String(
+                format!("Implicit {}", adj.kind.description())
+            )),
+            padding_left: false,
+            padding_right: false,
+            data: None,
+        })
+    }
+    
+    fn render_type(&self, ty: &TypeInfo) -> String {
+        self.type_db.render(ty)
+    }
+    
+    fn truncate_if_needed(&self, s: &str) -> String {
+        match self.config.max_length {
+            Some(max) if s.len() > max => {
+                format!("{}…", &s[..max - 1])
+            }
+            _ => s.to_string(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ANALYSIS DATA STRUCTURES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Analysis result for inlay hints
+#[derive(Debug, Clone, Default)]
+pub struct InlayAnalysis {
+    pub bindings: Vec<BindingInfo>,
+    pub closures: Vec<ClosureInfo>,
+    pub calls: Vec<CallInfo>,
+    pub chains: Vec<ChainInfo>,
+    pub functions: Vec<FunctionInfo>,
+    pub adjustments: Vec<AdjustmentInfo>,
+}
+
+/// Variable binding info
+#[derive(Debug, Clone)]
+pub struct BindingInfo {
+    pub position: Position,
+    pub hint_position: Position,
+    pub name: String,
+    pub inferred_type: TypeInfo,
+    pub has_type_annotation: bool,
+}
+
+/// Closure info
+#[derive(Debug, Clone)]
+pub struct ClosureInfo {
+    pub position: Position,
+    pub return_position: Position,
+    pub return_type: TypeInfo,
+}
+
+/// Function call info
+#[derive(Debug, Clone)]
+pub struct CallInfo {
+    pub position: Position,
+    pub function_name: String,
+    pub arguments: Vec<ArgumentInfo>,
+}
+
+/// Argument info
+#[derive(Debug, Clone)]
+pub struct ArgumentInfo {
+    pub position: Position,
+    pub parameter_name: String,
+    pub parameter_type: TypeInfo,
+    pub expression_name: Option<String>,
+    pub is_string_literal: bool,
+    pub is_bool_literal: bool,
+}
+
+/// Method chain info
+#[derive(Debug, Clone)]
+pub struct ChainInfo {
+    pub position: Position,
+    pub result_type: TypeInfo,
+}
+
+/// Function info for lifetime elision
+#[derive(Debug, Clone)]
+pub struct FunctionInfo {
+    pub position: Position,
+    pub has_trivial_elision: bool,
+    pub elided_lifetimes: Vec<ElidedLifetime>,
+}
+
+/// Elided lifetime
+#[derive(Debug, Clone)]
+pub struct ElidedLifetime {
+    pub position: Position,
+    pub name: String,
+}
+
+/// Implicit adjustment info
+#[derive(Debug, Clone)]
+pub struct AdjustmentInfo {
+    pub position: Position,
+    pub kind: AdjustmentKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdjustmentKind {
+    Deref,
+    Ref,
+    RefMut,
+    Reborrow,
+}
+
+impl AdjustmentKind {
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Deref => "dereference",
+            Self::Ref => "reference",
+            Self::RefMut => "mutable reference",
+            Self::Reborrow => "reborrow",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE DATABASE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Database for type rendering
+pub struct TypeDatabase {
+    /// Type names cache
+    names: BTreeMap<TypeId, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TypeId(pub u64);
+
+/// Type information
+#[derive(Debug, Clone)]
+pub struct TypeInfo {
+    pub id: TypeId,
+    pub kind: TypeKind,
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeKind {
+    Unit,
+    Bool,
+    Char,
+    Int(IntKind),
+    Float(FloatKind),
+    Str,
+    Literal(String),
+    Reference { mutable: bool, lifetime: Option<String>, inner: Box<TypeInfo> },
+    Pointer { mutable: bool, inner: Box<TypeInfo> },
+    Array { element: Box<TypeInfo>, size: usize },
+    Slice(Box<TypeInfo>),
+    Tuple(Vec<TypeInfo>),
+    Function { params: Vec<TypeInfo>, ret: Box<TypeInfo> },
+    Named { name: String, args: Vec<TypeInfo> },
+    Generic(String),
+    Infer,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntKind { I8, I16, I32, I64, I128, ISize, U8, U16, U32, U64, U128, USize }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatKind { F32, F64 }
+
+impl TypeDatabase {
+    pub fn new() -> Self {
+        TypeDatabase {
+            names: BTreeMap::new(),
+        }
+    }
+    
+    /// Render type to string
+    pub fn render(&self, ty: &TypeInfo) -> String {
+        if let Some(cached) = self.names.get(&ty.id) {
+            return cached.clone();
+        }
+        
+        if let Some(name) = &ty.display_name {
+            return name.clone();
+        }
+        
+        match &ty.kind {
+            TypeKind::Unit => "()".to_string(),
+            TypeKind::Bool => "bool".to_string(),
+            TypeKind::Char => "char".to_string(),
+            TypeKind::Str => "str".to_string(),
+            TypeKind::Int(k) => self.render_int(*k),
+            TypeKind::Float(k) => self.render_float(*k),
+            TypeKind::Literal(s) => s.clone(),
+            TypeKind::Reference { mutable, lifetime, inner } => {
+                let lt = lifetime.as_ref().map(|l| format!("'{} ", l)).unwrap_or_default();
+                let m = if *mutable { "mut " } else { "" };
+                format!("&{}{}{}", lt, m, self.render(inner))
+            }
+            TypeKind::Pointer { mutable, inner } => {
+                let m = if *mutable { "mut" } else { "const" };
+                format!("*{} {}", m, self.render(inner))
+            }
+            TypeKind::Array { element, size } => {
+                format!("[{}; {}]", self.render(element), size)
+            }
+            TypeKind::Slice(inner) => format!("[{}]", self.render(inner)),
+            TypeKind::Tuple(elems) => {
+                let parts: Vec<_> = elems.iter().map(|t| self.render(t)).collect();
+                format!("({})", parts.join(", "))
+            }
+            TypeKind::Function { params, ret } => {
+                let params: Vec<_> = params.iter().map(|t| self.render(t)).collect();
+                format!("fn({}) -> {}", params.join(", "), self.render(ret))
+            }
+            TypeKind::Named { name, args } => {
+                if args.is_empty() {
+                    name.clone()
+                } else {
+                    let args: Vec<_> = args.iter().map(|t| self.render(t)).collect();
+                    format!("{}<{}>", name, args.join(", "))
+                }
+            }
+            TypeKind::Generic(name) => name.clone(),
+            TypeKind::Infer => "_".to_string(),
+            TypeKind::Error => "{error}".to_string(),
+        }
+    }
+    
+    fn render_int(&self, kind: IntKind) -> String {
+        match kind {
+            IntKind::I8 => "i8",
+            IntKind::I16 => "i16",
+            IntKind::I32 => "i32",
+            IntKind::I64 => "i64",
+            IntKind::I128 => "i128",
+            IntKind::ISize => "isize",
+            IntKind::U8 => "u8",
+            IntKind::U16 => "u16",
+            IntKind::U32 => "u32",
+            IntKind::U64 => "u64",
+            IntKind::U128 => "u128",
+            IntKind::USize => "usize",
+        }.to_string()
+    }
+    
+    fn render_float(&self, kind: FloatKind) -> String {
+        match kind {
+            FloatKind::F32 => "f32",
+            FloatKind::F64 => "f64",
+        }.to_string()
+    }
+}
+
+impl Default for TypeDatabase {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_type_hint() {
+        let hint = InlayHint::type_hint(Position::new(0, 5), "i32");
+        
+        assert_eq!(hint.position, Position::new(0, 5));
+        assert_eq!(hint.kind, Some(InlayHintKind::Type));
+        
+        match hint.label {
+            InlayHintLabel::String(s) => assert_eq!(s, ": i32"),
+            _ => panic!("Expected string label"),
+        }
+    }
+    
+    #[test]
+    fn test_parameter_hint() {
+        let hint = InlayHint::parameter_hint(Position::new(1, 10), "count");
+        
+        assert_eq!(hint.kind, Some(InlayHintKind::Parameter));
+        assert!(hint.padding_right);
+        
+        match hint.label {
+            InlayHintLabel::String(s) => assert_eq!(s, "count:"),
+            _ => panic!("Expected string label"),
+        }
+    }
+    
+    #[test]
+    fn test_type_database_render() {
+        let db = TypeDatabase::new();
+        
+        let ty = TypeInfo {
+            id: TypeId(1),
+            kind: TypeKind::Named {
+                name: "Vec".to_string(),
+                args: vec![TypeInfo {
+                    id: TypeId(2),
+                    kind: TypeKind::Int(IntKind::I32),
+                    display_name: None,
+                }],
+            },
+            display_name: None,
+        };
+        
+        assert_eq!(db.render(&ty), "Vec<i32>");
+    }
+    
+    #[test]
+    fn test_position_ordering() {
+        let p1 = Position::new(0, 5);
+        let p2 = Position::new(0, 10);
+        let p3 = Position::new(1, 0);
+        
+        assert!(p1 < p2);
+        assert!(p2 < p3);
+        assert!(p1 < p3);
+    }
+    
+    #[test]
+    fn test_range_contains() {
+        let range = Range::new(Position::new(0, 0), Position::new(2, 0));
+        
+        assert!(range.contains(Position::new(0, 5)));
+        assert!(range.contains(Position::new(1, 100)));
+        assert!(!range.contains(Position::new(2, 0)));
+        assert!(!range.contains(Position::new(3, 0)));
+    }
+}

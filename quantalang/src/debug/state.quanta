@@ -1,0 +1,1041 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DEBUGGER — State Management
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Debug session state, thread management, and execution control.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::debug::state
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Mutex, RwLock, Condvar};
+use std::path::PathBuf;
+use crate::debug::protocol::*;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEBUG SESSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Debug session state
+pub struct DebugSession {
+    /// Session ID
+    id: i64,
+    
+    /// Session state
+    state: RwLock<SessionState>,
+    
+    /// Process being debugged
+    process: RwLock<Option<DebuggedProcess>>,
+    
+    /// Thread states
+    threads: RwLock<BTreeMap<i64, ThreadState>>,
+    
+    /// Breakpoint manager
+    breakpoints: RwLock<BreakpointManager>,
+    
+    /// Stack frame cache
+    frames: RwLock<BTreeMap<i64, FrameInfo>>,
+    
+    /// Variable references
+    variables: RwLock<VariableStore>,
+    
+    /// Source files
+    sources: RwLock<SourceManager>,
+    
+    /// Next sequence number
+    seq: AtomicI64,
+    
+    /// Stop requested flag
+    stop_requested: AtomicBool,
+    
+    /// Configuration
+    config: RwLock<DebugConfig>,
+    
+    /// Event queue
+    events: Mutex<Vec<Event>>,
+    
+    /// Event condvar for notification
+    event_signal: Condvar,
+}
+
+impl DebugSession {
+    pub fn new(id: i64) -> Self {
+        DebugSession {
+            id,
+            state: RwLock::new(SessionState::Uninitialized),
+            process: RwLock::new(None),
+            threads: RwLock::new(BTreeMap::new()),
+            breakpoints: RwLock::new(BreakpointManager::new()),
+            frames: RwLock::new(BTreeMap::new()),
+            variables: RwLock::new(VariableStore::new()),
+            sources: RwLock::new(SourceManager::new()),
+            seq: AtomicI64::new(1),
+            stop_requested: AtomicBool::new(false),
+            config: RwLock::new(DebugConfig::default()),
+            events: Mutex::new(Vec::new()),
+            event_signal: Condvar::new(),
+        }
+    }
+    
+    /// Get session ID
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+    
+    /// Get next sequence number
+    pub fn next_seq(&self) -> i64 {
+        self.seq.fetch_add(1, Ordering::SeqCst)
+    }
+    
+    /// Get current state
+    pub fn state(&self) -> SessionState {
+        *self.state.read().unwrap()
+    }
+    
+    /// Set state
+    pub fn set_state(&self, state: SessionState) {
+        *self.state.write().unwrap() = state;
+    }
+    
+    /// Check if initialized
+    pub fn is_initialized(&self) -> bool {
+        matches!(self.state(), SessionState::Initialized | SessionState::Running | SessionState::Stopped)
+    }
+    
+    /// Check if running
+    pub fn is_running(&self) -> bool {
+        matches!(self.state(), SessionState::Running)
+    }
+    
+    /// Check if stopped
+    pub fn is_stopped(&self) -> bool {
+        matches!(self.state(), SessionState::Stopped)
+    }
+    
+    /// Request stop
+    pub fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::SeqCst);
+    }
+    
+    /// Check if stop requested
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::SeqCst)
+    }
+    
+    /// Clear stop request
+    pub fn clear_stop_request(&self) {
+        self.stop_requested.store(false, Ordering::SeqCst);
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PROCESS MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Launch process
+    pub fn launch(&self, args: &LaunchRequestArguments) -> Result<(), String> {
+        let process = DebuggedProcess::launch(
+            &args.program,
+            &args.args,
+            args.cwd.as_deref(),
+            &args.env,
+        )?;
+        
+        *self.process.write().unwrap() = Some(process);
+        
+        // Create main thread
+        self.threads.write().unwrap().insert(1, ThreadState {
+            id: 1,
+            name: "main".to_string(),
+            state: ThreadExecutionState::Running,
+            stop_reason: None,
+            current_frame: None,
+        });
+        
+        self.set_state(SessionState::Running);
+        
+        if args.stop_on_entry {
+            self.pause_thread(1)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Attach to process
+    pub fn attach(&self, args: &AttachRequestArguments) -> Result<(), String> {
+        let process = if let Some(pid) = args.process_id {
+            DebuggedProcess::attach(pid as u32)?
+        } else if let (Some(host), Some(port)) = (&args.host, args.port) {
+            DebuggedProcess::connect(host, port)?
+        } else {
+            return Err("must specify process_id or host/port".to_string());
+        };
+        
+        *self.process.write().unwrap() = Some(process);
+        self.set_state(SessionState::Running);
+        
+        Ok(())
+    }
+    
+    /// Terminate process
+    pub fn terminate(&self) -> Result<(), String> {
+        if let Some(ref mut process) = *self.process.write().unwrap() {
+            process.terminate()?;
+        }
+        self.set_state(SessionState::Terminated);
+        Ok(())
+    }
+    
+    /// Disconnect from process
+    pub fn disconnect(&self, terminate: bool) -> Result<(), String> {
+        if terminate {
+            self.terminate()?;
+        }
+        *self.process.write().unwrap() = None;
+        self.set_state(SessionState::Disconnected);
+        Ok(())
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXECUTION CONTROL
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Continue execution
+    pub fn continue_execution(&self, thread_id: i64, single_thread: bool) -> Result<bool, String> {
+        let mut threads = self.threads.write().unwrap();
+        
+        if single_thread {
+            if let Some(thread) = threads.get_mut(&thread_id) {
+                thread.state = ThreadExecutionState::Running;
+                thread.stop_reason = None;
+            }
+        } else {
+            for thread in threads.values_mut() {
+                thread.state = ThreadExecutionState::Running;
+                thread.stop_reason = None;
+            }
+        }
+        
+        self.set_state(SessionState::Running);
+        self.clear_stop_request();
+        
+        // Clear frame cache
+        self.frames.write().unwrap().clear();
+        
+        Ok(!single_thread)
+    }
+    
+    /// Step next (step over)
+    pub fn step_next(&self, thread_id: i64, granularity: SteppingGranularity) -> Result<(), String> {
+        self.step_internal(thread_id, StepType::Over, granularity)
+    }
+    
+    /// Step in
+    pub fn step_in(&self, thread_id: i64, granularity: SteppingGranularity) -> Result<(), String> {
+        self.step_internal(thread_id, StepType::In, granularity)
+    }
+    
+    /// Step out
+    pub fn step_out(&self, thread_id: i64, granularity: SteppingGranularity) -> Result<(), String> {
+        self.step_internal(thread_id, StepType::Out, granularity)
+    }
+    
+    fn step_internal(&self, thread_id: i64, step_type: StepType, granularity: SteppingGranularity) -> Result<(), String> {
+        let mut threads = self.threads.write().unwrap();
+        
+        if let Some(thread) = threads.get_mut(&thread_id) {
+            thread.state = ThreadExecutionState::Stepping(step_type);
+        } else {
+            return Err(format!("unknown thread: {}", thread_id));
+        }
+        
+        // Clear frame cache for this thread
+        self.frames.write().unwrap().clear();
+        
+        // In real implementation, set hardware breakpoint or use ptrace
+        // Then wait for stop
+        
+        Ok(())
+    }
+    
+    /// Pause thread
+    pub fn pause_thread(&self, thread_id: i64) -> Result<(), String> {
+        let mut threads = self.threads.write().unwrap();
+        
+        if let Some(thread) = threads.get_mut(&thread_id) {
+            thread.state = ThreadExecutionState::Stopped;
+            thread.stop_reason = Some(StopReason::Pause);
+        } else {
+            return Err(format!("unknown thread: {}", thread_id));
+        }
+        
+        self.set_state(SessionState::Stopped);
+        
+        Ok(())
+    }
+    
+    /// Handle breakpoint hit
+    pub fn breakpoint_hit(&self, thread_id: i64, breakpoint_id: i64) {
+        let mut threads = self.threads.write().unwrap();
+        
+        if let Some(thread) = threads.get_mut(&thread_id) {
+            thread.state = ThreadExecutionState::Stopped;
+            thread.stop_reason = Some(StopReason::Breakpoint);
+        }
+        
+        drop(threads);
+        
+        self.set_state(SessionState::Stopped);
+        
+        self.emit_event(Event {
+            seq: self.next_seq(),
+            event: "stopped".to_string(),
+            body: Some(EventBody::Stopped(StoppedEventBody {
+                reason: StopReason::Breakpoint,
+                description: Some("Breakpoint hit".to_string()),
+                thread_id: Some(thread_id),
+                preserve_focus_hint: false,
+                text: None,
+                all_threads_stopped: true,
+                hit_breakpoint_ids: vec![breakpoint_id],
+            })),
+        });
+    }
+    
+    /// Handle exception
+    pub fn exception_hit(&self, thread_id: i64, exception: &str) {
+        let mut threads = self.threads.write().unwrap();
+        
+        if let Some(thread) = threads.get_mut(&thread_id) {
+            thread.state = ThreadExecutionState::Stopped;
+            thread.stop_reason = Some(StopReason::Exception);
+        }
+        
+        drop(threads);
+        
+        self.set_state(SessionState::Stopped);
+        
+        self.emit_event(Event {
+            seq: self.next_seq(),
+            event: "stopped".to_string(),
+            body: Some(EventBody::Stopped(StoppedEventBody {
+                reason: StopReason::Exception,
+                description: Some(exception.to_string()),
+                thread_id: Some(thread_id),
+                preserve_focus_hint: false,
+                text: Some(exception.to_string()),
+                all_threads_stopped: true,
+                hit_breakpoint_ids: Vec::new(),
+            })),
+        });
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // THREAD MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Get all threads
+    pub fn get_threads(&self) -> Vec<Thread> {
+        self.threads.read().unwrap()
+            .values()
+            .map(|t| Thread {
+                id: t.id,
+                name: t.name.clone(),
+            })
+            .collect()
+    }
+    
+    /// Get thread state
+    pub fn get_thread(&self, thread_id: i64) -> Option<ThreadState> {
+        self.threads.read().unwrap().get(&thread_id).cloned()
+    }
+    
+    /// Add thread
+    pub fn add_thread(&self, id: i64, name: &str) {
+        self.threads.write().unwrap().insert(id, ThreadState {
+            id,
+            name: name.to_string(),
+            state: ThreadExecutionState::Running,
+            stop_reason: None,
+            current_frame: None,
+        });
+        
+        self.emit_event(Event {
+            seq: self.next_seq(),
+            event: "thread".to_string(),
+            body: Some(EventBody::Thread(ThreadEventBody {
+                reason: ThreadReason::Started,
+                thread_id: id,
+            })),
+        });
+    }
+    
+    /// Remove thread
+    pub fn remove_thread(&self, id: i64) {
+        self.threads.write().unwrap().remove(&id);
+        
+        self.emit_event(Event {
+            seq: self.next_seq(),
+            event: "thread".to_string(),
+            body: Some(EventBody::Thread(ThreadEventBody {
+                reason: ThreadReason::Exited,
+                thread_id: id,
+            })),
+        });
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STACK TRACES
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Get stack trace for thread
+    pub fn get_stack_trace(&self, thread_id: i64, start: i64, levels: i64) -> Result<(Vec<StackFrame>, i64), String> {
+        let threads = self.threads.read().unwrap();
+        
+        let thread = threads.get(&thread_id)
+            .ok_or_else(|| format!("unknown thread: {}", thread_id))?;
+        
+        // In real implementation, walk the stack using DWARF debug info
+        // For now, return mock data
+        
+        let frames = vec![
+            StackFrame {
+                id: self.allocate_frame_id(),
+                name: "main".to_string(),
+                source: Some(Source {
+                    name: Some("main.quanta".to_string()),
+                    path: Some("/project/src/main.quanta".to_string()),
+                    source_reference: None,
+                    presentation_hint: None,
+                    origin: None,
+                    sources: Vec::new(),
+                    adapter_data: None,
+                    checksums: Vec::new(),
+                }),
+                line: 10,
+                column: 1,
+                end_line: None,
+                end_column: None,
+                can_restart: false,
+                instruction_pointer_reference: None,
+                module_id: None,
+                presentation_hint: None,
+            },
+        ];
+        
+        let total = frames.len() as i64;
+        
+        Ok((frames, total))
+    }
+    
+    fn allocate_frame_id(&self) -> i64 {
+        static FRAME_ID: AtomicI64 = AtomicI64::new(1);
+        FRAME_ID.fetch_add(1, Ordering::SeqCst)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SCOPES & VARIABLES
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Get scopes for frame
+    pub fn get_scopes(&self, frame_id: i64) -> Vec<Scope> {
+        let locals_ref = self.variables.write().unwrap().allocate_reference();
+        let args_ref = self.variables.write().unwrap().allocate_reference();
+        let globals_ref = self.variables.write().unwrap().allocate_reference();
+        
+        vec![
+            Scope {
+                name: "Locals".to_string(),
+                presentation_hint: Some(ScopePresentationHint::Locals),
+                variables_reference: locals_ref,
+                named_variables: None,
+                indexed_variables: None,
+                expensive: false,
+                source: None,
+                line: None,
+                column: None,
+                end_line: None,
+                end_column: None,
+            },
+            Scope {
+                name: "Arguments".to_string(),
+                presentation_hint: Some(ScopePresentationHint::Arguments),
+                variables_reference: args_ref,
+                named_variables: None,
+                indexed_variables: None,
+                expensive: false,
+                source: None,
+                line: None,
+                column: None,
+                end_line: None,
+                end_column: None,
+            },
+            Scope {
+                name: "Globals".to_string(),
+                presentation_hint: None,
+                variables_reference: globals_ref,
+                named_variables: None,
+                indexed_variables: None,
+                expensive: true,
+                source: None,
+                line: None,
+                column: None,
+                end_line: None,
+                end_column: None,
+            },
+        ]
+    }
+    
+    /// Get variables for reference
+    pub fn get_variables(&self, reference: i64) -> Vec<Variable> {
+        // In real implementation, read from process memory
+        // For now, return mock data
+        
+        vec![
+            Variable {
+                name: "x".to_string(),
+                value: "42".to_string(),
+                ty: Some("i32".to_string()),
+                presentation_hint: None,
+                evaluate_name: Some("x".to_string()),
+                variables_reference: 0,
+                named_variables: None,
+                indexed_variables: None,
+                memory_reference: None,
+            },
+            Variable {
+                name: "name".to_string(),
+                value: "\"hello\"".to_string(),
+                ty: Some("String".to_string()),
+                presentation_hint: None,
+                evaluate_name: Some("name".to_string()),
+                variables_reference: 0,
+                named_variables: None,
+                indexed_variables: None,
+                memory_reference: None,
+            },
+        ]
+    }
+    
+    /// Set variable value
+    pub fn set_variable(&self, reference: i64, name: &str, value: &str) -> Result<String, String> {
+        // In real implementation, write to process memory
+        Ok(value.to_string())
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EVALUATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Evaluate expression
+    pub fn evaluate(&self, expression: &str, frame_id: Option<i64>, context: EvaluateContext) -> Result<EvaluateResponseBody, String> {
+        // In real implementation, parse and evaluate expression in target context
+        
+        Ok(EvaluateResponseBody {
+            result: format!("<evaluated: {}>", expression),
+            ty: Some("unknown".to_string()),
+            presentation_hint: None,
+            variables_reference: 0,
+            named_variables: None,
+            indexed_variables: None,
+            memory_reference: None,
+        })
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BREAKPOINTS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Set breakpoints in source
+    pub fn set_breakpoints(&self, source: &Source, breakpoints: &[SourceBreakpoint]) -> Vec<Breakpoint> {
+        self.breakpoints.write().unwrap().set_source_breakpoints(source, breakpoints)
+    }
+    
+    /// Set function breakpoints
+    pub fn set_function_breakpoints(&self, breakpoints: &[FunctionBreakpoint]) -> Vec<Breakpoint> {
+        self.breakpoints.write().unwrap().set_function_breakpoints(breakpoints)
+    }
+    
+    /// Get breakpoint at location
+    pub fn get_breakpoint_at(&self, file: &str, line: i64) -> Option<i64> {
+        self.breakpoints.read().unwrap().get_at(file, line)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EVENTS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Emit event
+    pub fn emit_event(&self, event: Event) {
+        let mut events = self.events.lock().unwrap();
+        events.push(event);
+        self.event_signal.notify_all();
+    }
+    
+    /// Take pending events
+    pub fn take_events(&self) -> Vec<Event> {
+        let mut events = self.events.lock().unwrap();
+        std::mem::take(&mut *events)
+    }
+    
+    /// Wait for events
+    pub fn wait_for_events(&self, timeout_ms: u64) -> Vec<Event> {
+        let mut events = self.events.lock().unwrap();
+        
+        if events.is_empty() {
+            let timeout = std::time::Duration::from_millis(timeout_ms);
+            let _ = self.event_signal.wait_timeout(events, timeout);
+            events = self.events.lock().unwrap();
+        }
+        
+        std::mem::take(&mut *events)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONFIGURATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Get configuration
+    pub fn config(&self) -> DebugConfig {
+        self.config.read().unwrap().clone()
+    }
+    
+    /// Update configuration
+    pub fn update_config<F: FnOnce(&mut DebugConfig)>(&self, f: F) {
+        f(&mut *self.config.write().unwrap());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SESSION STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    Uninitialized,
+    Initialized,
+    Running,
+    Stopped,
+    Terminated,
+    Disconnected,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THREAD STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct ThreadState {
+    pub id: i64,
+    pub name: String,
+    pub state: ThreadExecutionState,
+    pub stop_reason: Option<StopReason>,
+    pub current_frame: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadExecutionState {
+    Running,
+    Stopped,
+    Stepping(StepType),
+    Terminated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepType {
+    In,
+    Over,
+    Out,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FRAME INFO
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct FrameInfo {
+    pub id: i64,
+    pub thread_id: i64,
+    pub name: String,
+    pub source_path: Option<PathBuf>,
+    pub line: i64,
+    pub column: i64,
+    pub instruction_pointer: u64,
+    pub frame_pointer: u64,
+    pub stack_pointer: u64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEBUGGED PROCESS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct DebuggedProcess {
+    pid: u32,
+    program: PathBuf,
+    #[cfg(unix)]
+    child: Option<std::process::Child>,
+}
+
+impl DebuggedProcess {
+    pub fn launch(
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        env: &BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
+        
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        
+        let child = cmd.spawn()
+            .map_err(|e| format!("failed to launch: {}", e))?;
+        
+        let pid = child.id();
+        
+        Ok(DebuggedProcess {
+            pid,
+            program: PathBuf::from(program),
+            #[cfg(unix)]
+            child: Some(child),
+        })
+    }
+    
+    pub fn attach(pid: u32) -> Result<Self, String> {
+        #[cfg(unix)]
+        unsafe {
+            if libc::ptrace(libc::PTRACE_ATTACH, pid as i32, 0, 0) == -1 {
+                return Err(format!("failed to attach to process {}", pid));
+            }
+        }
+        
+        Ok(DebuggedProcess {
+            pid,
+            program: PathBuf::new(),
+            #[cfg(unix)]
+            child: None,
+        })
+    }
+    
+    pub fn connect(host: &str, port: u16) -> Result<Self, String> {
+        // Remote debugging - connect to debug server
+        Err("remote debugging not yet implemented".to_string())
+    }
+    
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+    
+    pub fn terminate(&mut self) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            if let Some(ref mut child) = self.child {
+                child.kill().map_err(|e| format!("failed to terminate: {}", e))?;
+            } else {
+                unsafe {
+                    libc::kill(self.pid as i32, libc::SIGTERM);
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    pub fn read_memory(&self, address: u64, size: usize) -> Result<Vec<u8>, String> {
+        // In real implementation, use ptrace or /proc/pid/mem
+        Err("memory reading not yet implemented".to_string())
+    }
+    
+    pub fn write_memory(&self, address: u64, data: &[u8]) -> Result<(), String> {
+        // In real implementation, use ptrace
+        Err("memory writing not yet implemented".to_string())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BREAKPOINT MANAGER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct BreakpointManager {
+    next_id: i64,
+    source_breakpoints: BTreeMap<String, Vec<BreakpointInfo>>,
+    function_breakpoints: Vec<BreakpointInfo>,
+    data_breakpoints: Vec<BreakpointInfo>,
+}
+
+impl BreakpointManager {
+    pub fn new() -> Self {
+        BreakpointManager {
+            next_id: 1,
+            source_breakpoints: BTreeMap::new(),
+            function_breakpoints: Vec::new(),
+            data_breakpoints: Vec::new(),
+        }
+    }
+    
+    pub fn set_source_breakpoints(&mut self, source: &Source, breakpoints: &[SourceBreakpoint]) -> Vec<Breakpoint> {
+        let path = source.path.clone().unwrap_or_default();
+        
+        let infos: Vec<BreakpointInfo> = breakpoints.iter().map(|bp| {
+            let id = self.next_id;
+            self.next_id += 1;
+            
+            BreakpointInfo {
+                id,
+                verified: true,
+                line: bp.line,
+                column: bp.column,
+                condition: bp.condition.clone(),
+                hit_condition: bp.hit_condition.clone(),
+                log_message: bp.log_message.clone(),
+                hit_count: 0,
+                enabled: true,
+            }
+        }).collect();
+        
+        let result: Vec<Breakpoint> = infos.iter().map(|info| {
+            Breakpoint {
+                id: Some(info.id),
+                verified: info.verified,
+                message: None,
+                source: Some(source.clone()),
+                line: Some(info.line),
+                column: info.column,
+                end_line: None,
+                end_column: None,
+                instruction_reference: None,
+                offset: None,
+            }
+        }).collect();
+        
+        self.source_breakpoints.insert(path, infos);
+        
+        result
+    }
+    
+    pub fn set_function_breakpoints(&mut self, breakpoints: &[FunctionBreakpoint]) -> Vec<Breakpoint> {
+        self.function_breakpoints.clear();
+        
+        breakpoints.iter().map(|bp| {
+            let id = self.next_id;
+            self.next_id += 1;
+            
+            self.function_breakpoints.push(BreakpointInfo {
+                id,
+                verified: true,
+                line: 0,
+                column: None,
+                condition: bp.condition.clone(),
+                hit_condition: bp.hit_condition.clone(),
+                log_message: None,
+                hit_count: 0,
+                enabled: true,
+            });
+            
+            Breakpoint {
+                id: Some(id),
+                verified: true,
+                message: None,
+                source: None,
+                line: None,
+                column: None,
+                end_line: None,
+                end_column: None,
+                instruction_reference: None,
+                offset: None,
+            }
+        }).collect()
+    }
+    
+    pub fn get_at(&self, file: &str, line: i64) -> Option<i64> {
+        self.source_breakpoints.get(file)
+            .and_then(|bps| bps.iter().find(|bp| bp.line == line && bp.enabled))
+            .map(|bp| bp.id)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BreakpointInfo {
+    id: i64,
+    verified: bool,
+    line: i64,
+    column: Option<i64>,
+    condition: Option<String>,
+    hit_condition: Option<String>,
+    log_message: Option<String>,
+    hit_count: i64,
+    enabled: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VARIABLE STORE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct VariableStore {
+    next_reference: i64,
+    references: BTreeMap<i64, VariableContainer>,
+}
+
+impl VariableStore {
+    pub fn new() -> Self {
+        VariableStore {
+            next_reference: 1,
+            references: BTreeMap::new(),
+        }
+    }
+    
+    pub fn allocate_reference(&mut self) -> i64 {
+        let ref_id = self.next_reference;
+        self.next_reference += 1;
+        ref_id
+    }
+    
+    pub fn store(&mut self, reference: i64, container: VariableContainer) {
+        self.references.insert(reference, container);
+    }
+    
+    pub fn get(&self, reference: i64) -> Option<&VariableContainer> {
+        self.references.get(&reference)
+    }
+    
+    pub fn clear(&mut self) {
+        self.references.clear();
+        self.next_reference = 1;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum VariableContainer {
+    Scope { frame_id: i64, scope_type: ScopePresentationHint },
+    Struct { fields: Vec<(String, String, String)> },
+    Array { elements: Vec<String> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOURCE MANAGER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct SourceManager {
+    sources: BTreeMap<i64, SourceContent>,
+    next_reference: i64,
+    path_to_reference: BTreeMap<PathBuf, i64>,
+}
+
+impl SourceManager {
+    pub fn new() -> Self {
+        SourceManager {
+            sources: BTreeMap::new(),
+            next_reference: 1,
+            path_to_reference: BTreeMap::new(),
+        }
+    }
+    
+    pub fn get_source(&self, reference: i64) -> Option<&SourceContent> {
+        self.sources.get(&reference)
+    }
+    
+    pub fn load_file(&mut self, path: &std::path::Path) -> Result<i64, String> {
+        if let Some(&ref_id) = self.path_to_reference.get(path) {
+            return Ok(ref_id);
+        }
+        
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read source: {}", e))?;
+        
+        let ref_id = self.next_reference;
+        self.next_reference += 1;
+        
+        self.sources.insert(ref_id, SourceContent {
+            path: path.to_path_buf(),
+            content,
+        });
+        
+        self.path_to_reference.insert(path.to_path_buf(), ref_id);
+        
+        Ok(ref_id)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceContent {
+    pub path: PathBuf,
+    pub content: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEBUG CONFIG
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct DebugConfig {
+    pub lines_start_at_1: bool,
+    pub columns_start_at_1: bool,
+    pub path_format: PathFormat,
+    pub supports_variable_type: bool,
+    pub supports_memory_references: bool,
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        DebugConfig {
+            lines_start_at_1: true,
+            columns_start_at_1: true,
+            path_format: PathFormat::Path,
+            supports_variable_type: true,
+            supports_memory_references: true,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_session_state() {
+        let session = DebugSession::new(1);
+        assert_eq!(session.state(), SessionState::Uninitialized);
+        
+        session.set_state(SessionState::Initialized);
+        assert!(session.is_initialized());
+    }
+    
+    #[test]
+    fn test_breakpoint_manager() {
+        let mut mgr = BreakpointManager::new();
+        
+        let source = Source {
+            name: Some("test.quanta".to_string()),
+            path: Some("/test.quanta".to_string()),
+            source_reference: None,
+            presentation_hint: None,
+            origin: None,
+            sources: Vec::new(),
+            adapter_data: None,
+            checksums: Vec::new(),
+        };
+        
+        let bps = mgr.set_source_breakpoints(&source, &[
+            SourceBreakpoint { line: 10, column: None, condition: None, hit_condition: None, log_message: None },
+        ]);
+        
+        assert_eq!(bps.len(), 1);
+        assert!(bps[0].verified);
+    }
+}

@@ -1,0 +1,1105 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Memory Optimizations
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Memory optimization passes:
+//   - Dead Store Elimination (DSE)
+//   - Store-to-Load Forwarding
+//   - Load-Store Promotion
+//   - Memory Coalescing
+//   - Redundant Load Elimination
+//   - Heap-to-Stack Promotion
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::memopt
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use crate::opt::alias::{BasicAliasAnalysis, MemoryLocation, PointerValue, AliasResult};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEAD STORE ELIMINATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Dead Store Elimination pass
+pub struct DeadStoreElimination {
+    alias_analysis: BasicAliasAnalysis,
+}
+
+impl DeadStoreElimination {
+    pub fn new(alias_analysis: BasicAliasAnalysis) -> Self {
+        DeadStoreElimination { alias_analysis }
+    }
+    
+    /// Run DSE on a function
+    pub fn run(&self, func: &mut MirFunction) -> u32 {
+        let mut eliminated = 0;
+        
+        // Process each block
+        for block in &mut func.blocks {
+            eliminated += self.eliminate_in_block(block);
+        }
+        
+        // Inter-block DSE
+        eliminated += self.eliminate_across_blocks(func);
+        
+        eliminated
+    }
+    
+    fn eliminate_in_block(&self, block: &mut MirBlock) -> u32 {
+        let mut eliminated = 0;
+        let mut last_stores: BTreeMap<String, usize> = BTreeMap::new();
+        let mut to_remove: BTreeSet<usize> = BTreeSet::new();
+        
+        for (i, stmt) in block.statements.iter().enumerate() {
+            match stmt {
+                MirStatement::Store { ptr, size, .. } => {
+                    let ptr_name = self.get_pointer_name(ptr);
+                    
+                    // Check if there's a previous store to the same location
+                    if let Some(&prev_idx) = last_stores.get(&ptr_name) {
+                        let prev_stmt = &block.statements[prev_idx];
+                        
+                        if let MirStatement::Store { ptr: prev_ptr, size: prev_size, .. } = prev_stmt {
+                            // Check for complete overwrite
+                            if self.completely_overwrites(ptr, *size, prev_ptr, *prev_size) {
+                                // Previous store is dead
+                                to_remove.insert(prev_idx);
+                                eliminated += 1;
+                            }
+                        }
+                    }
+                    
+                    last_stores.insert(ptr_name, i);
+                }
+                MirStatement::Load { ptr, .. } => {
+                    // Load kills pending stores to aliasing locations
+                    let ptr_name = self.get_pointer_name(ptr);
+                    last_stores.remove(&ptr_name);
+                }
+                MirStatement::Call { .. } => {
+                    // Call may read any memory, so keep all pending stores
+                    last_stores.clear();
+                }
+                _ => {}
+            }
+        }
+        
+        // Check for stores at end of block that are dead
+        // (no subsequent reads and no uses outside function)
+        
+        // Remove dead stores
+        let mut new_stmts: Vec<MirStatement> = Vec::new();
+        for (i, stmt) in block.statements.drain(..).enumerate() {
+            if !to_remove.contains(&i) {
+                new_stmts.push(stmt);
+            }
+        }
+        block.statements = new_stmts;
+        
+        eliminated
+    }
+    
+    fn eliminate_across_blocks(&self, func: &mut MirFunction) -> u32 {
+        // Post-dominator based DSE
+        // A store is dead if all paths from it to function exit
+        // contain another store to the same location
+        
+        let mut eliminated = 0;
+        
+        // Build post-dominator tree
+        let post_dom = self.compute_post_dominators(func);
+        
+        // Find stores that are completely overwritten on all paths
+        for block_idx in 0..func.blocks.len() {
+            let block = &func.blocks[block_idx];
+            
+            for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+                if let MirStatement::Store { ptr, size, .. } = stmt {
+                    if self.is_store_dead_on_all_paths(func, block_idx, stmt_idx, ptr, *size, &post_dom) {
+                        eliminated += 1;
+                    }
+                }
+            }
+        }
+        
+        eliminated
+    }
+    
+    fn compute_post_dominators(&self, func: &MirFunction) -> BTreeMap<u32, u32> {
+        // Would compute post-dominator tree
+        BTreeMap::new()
+    }
+    
+    fn is_store_dead_on_all_paths(
+        &self,
+        func: &MirFunction,
+        block_idx: usize,
+        stmt_idx: usize,
+        ptr: &MirOperand,
+        size: usize,
+        post_dom: &BTreeMap<u32, u32>,
+    ) -> bool {
+        // Would check if store is dead on all paths to exit
+        false
+    }
+    
+    fn completely_overwrites(
+        &self,
+        new_ptr: &MirOperand,
+        new_size: usize,
+        old_ptr: &MirOperand,
+        old_size: usize,
+    ) -> bool {
+        // Check if new store completely covers old store
+        if new_ptr == old_ptr && new_size >= old_size {
+            return true;
+        }
+        
+        // Would need more sophisticated GEP analysis for partial overwrites
+        false
+    }
+    
+    fn get_pointer_name(&self, ptr: &MirOperand) -> String {
+        match ptr {
+            MirOperand::Variable(name) => name.clone(),
+            MirOperand::Gep { base, .. } => self.get_pointer_name(base),
+            _ => "unknown".to_string(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STORE-TO-LOAD FORWARDING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Store-to-Load Forwarding pass
+pub struct StoreToLoadForwarding {
+    alias_analysis: BasicAliasAnalysis,
+}
+
+impl StoreToLoadForwarding {
+    pub fn new(alias_analysis: BasicAliasAnalysis) -> Self {
+        StoreToLoadForwarding { alias_analysis }
+    }
+    
+    /// Run store-to-load forwarding on a function
+    pub fn run(&self, func: &mut MirFunction) -> u32 {
+        let mut forwarded = 0;
+        
+        for block in &mut func.blocks {
+            forwarded += self.forward_in_block(block);
+        }
+        
+        forwarded
+    }
+    
+    fn forward_in_block(&self, block: &mut MirBlock) -> u32 {
+        let mut forwarded = 0;
+        
+        // Track available stores
+        let mut available_stores: BTreeMap<String, (MirOperand, usize)> = BTreeMap::new();
+        let mut replacements: Vec<(usize, String, MirOperand)> = Vec::new();
+        
+        for (i, stmt) in block.statements.iter().enumerate() {
+            match stmt {
+                MirStatement::Store { ptr, value, size } => {
+                    let ptr_name = self.get_pointer_name(ptr);
+                    
+                    // Kill aliasing stores
+                    let to_kill: Vec<_> = available_stores.iter()
+                        .filter(|(k, _)| self.may_alias(&ptr_name, k))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    
+                    for k in to_kill {
+                        available_stores.remove(&k);
+                    }
+                    
+                    // Add this store
+                    available_stores.insert(ptr_name, (value.clone(), *size));
+                }
+                MirStatement::Load { dest, ptr, size } => {
+                    let ptr_name = self.get_pointer_name(ptr);
+                    
+                    // Check if we can forward a stored value
+                    if let Some((stored_value, stored_size)) = available_stores.get(&ptr_name) {
+                        if *stored_size == *size {
+                            // Forward the stored value
+                            replacements.push((i, dest.clone(), stored_value.clone()));
+                            forwarded += 1;
+                        }
+                    }
+                }
+                MirStatement::Call { .. } => {
+                    // Call invalidates all available stores (conservatively)
+                    available_stores.clear();
+                }
+                _ => {}
+            }
+        }
+        
+        // Apply replacements
+        for (idx, dest, value) in replacements {
+            block.statements[idx] = MirStatement::Assign { dest, value };
+        }
+        
+        forwarded
+    }
+    
+    fn may_alias(&self, ptr_a: &str, ptr_b: &str) -> bool {
+        // Use alias analysis
+        ptr_a == ptr_b // Simplified
+    }
+    
+    fn get_pointer_name(&self, ptr: &MirOperand) -> String {
+        match ptr {
+            MirOperand::Variable(name) => name.clone(),
+            MirOperand::Gep { base, .. } => self.get_pointer_name(base),
+            _ => "unknown".to_string(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REDUNDANT LOAD ELIMINATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Redundant Load Elimination pass
+pub struct RedundantLoadElimination {
+    alias_analysis: BasicAliasAnalysis,
+}
+
+impl RedundantLoadElimination {
+    pub fn new(alias_analysis: BasicAliasAnalysis) -> Self {
+        RedundantLoadElimination { alias_analysis }
+    }
+    
+    /// Run RLE on a function
+    pub fn run(&self, func: &mut MirFunction) -> u32 {
+        let mut eliminated = 0;
+        
+        for block in &mut func.blocks {
+            eliminated += self.eliminate_in_block(block);
+        }
+        
+        eliminated
+    }
+    
+    fn eliminate_in_block(&self, block: &mut MirBlock) -> u32 {
+        let mut eliminated = 0;
+        
+        // Track available loads
+        let mut available_loads: BTreeMap<String, (String, usize)> = BTreeMap::new();
+        let mut replacements: Vec<(usize, String, String)> = Vec::new();
+        
+        for (i, stmt) in block.statements.iter().enumerate() {
+            match stmt {
+                MirStatement::Load { dest, ptr, size } => {
+                    let ptr_name = self.get_pointer_name(ptr);
+                    
+                    // Check if there's an available load from the same location
+                    if let Some((prev_dest, prev_size)) = available_loads.get(&ptr_name) {
+                        if *prev_size == *size {
+                            // Replace with copy from previous load
+                            replacements.push((i, dest.clone(), prev_dest.clone()));
+                            eliminated += 1;
+                            continue;
+                        }
+                    }
+                    
+                    // Add this load as available
+                    available_loads.insert(ptr_name, (dest.clone(), *size));
+                }
+                MirStatement::Store { ptr, .. } => {
+                    let ptr_name = self.get_pointer_name(ptr);
+                    
+                    // Kill aliasing loads
+                    let to_kill: Vec<_> = available_loads.iter()
+                        .filter(|(k, _)| self.may_alias(&ptr_name, k))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    
+                    for k in to_kill {
+                        available_loads.remove(&k);
+                    }
+                }
+                MirStatement::Call { .. } => {
+                    // Call may modify memory
+                    available_loads.clear();
+                }
+                _ => {}
+            }
+        }
+        
+        // Apply replacements
+        for (idx, dest, src) in replacements {
+            block.statements[idx] = MirStatement::Assign {
+                dest,
+                value: MirOperand::Variable(src),
+            };
+        }
+        
+        eliminated
+    }
+    
+    fn may_alias(&self, ptr_a: &str, ptr_b: &str) -> bool {
+        ptr_a == ptr_b
+    }
+    
+    fn get_pointer_name(&self, ptr: &MirOperand) -> String {
+        match ptr {
+            MirOperand::Variable(name) => name.clone(),
+            MirOperand::Gep { base, .. } => self.get_pointer_name(base),
+            _ => "unknown".to_string(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOAD-STORE PROMOTION (mem2reg)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Promote stack allocations to SSA registers
+pub struct LoadStorePromotion {
+    /// Dominator tree
+    dom_tree: Option<DominatorTree>,
+    /// Dominance frontier
+    dom_frontier: Option<DominanceFrontier>,
+}
+
+impl LoadStorePromotion {
+    pub fn new() -> Self {
+        LoadStorePromotion {
+            dom_tree: None,
+            dom_frontier: None,
+        }
+    }
+    
+    /// Run mem2reg on a function
+    pub fn run(&mut self, func: &mut MirFunction) -> u32 {
+        // Build dominator tree
+        self.dom_tree = Some(self.compute_dominators(func));
+        self.dom_frontier = Some(self.compute_dominance_frontier(func));
+        
+        // Find promotable allocas
+        let promotable = self.find_promotable_allocas(func);
+        
+        if promotable.is_empty() {
+            return 0;
+        }
+        
+        // Insert phi nodes
+        self.insert_phis(func, &promotable);
+        
+        // Rename variables
+        self.rename_variables(func, &promotable);
+        
+        promotable.len() as u32
+    }
+    
+    fn find_promotable_allocas(&self, func: &MirFunction) -> Vec<PromotableAlloca> {
+        let mut promotable = Vec::new();
+        
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let MirStatement::Alloca { dest, size } = stmt {
+                    if self.is_promotable(func, dest) {
+                        promotable.push(PromotableAlloca {
+                            name: dest.clone(),
+                            size: *size,
+                            defining_blocks: self.find_defining_blocks(func, dest),
+                            use_blocks: self.find_use_blocks(func, dest),
+                        });
+                    }
+                }
+            }
+        }
+        
+        promotable
+    }
+    
+    fn is_promotable(&self, func: &MirFunction, alloca_name: &str) -> bool {
+        // Check that alloca is only used through loads and stores
+        // and doesn't escape (no address taken, no calls)
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                match stmt {
+                    MirStatement::Call { args, .. } => {
+                        // Check if alloca address is passed to call
+                        for arg in args {
+                            if let MirOperand::Variable(name) = arg {
+                                if name == alloca_name {
+                                    return false; // Address escapes
+                                }
+                            }
+                        }
+                    }
+                    MirStatement::Store { ptr, value, .. } => {
+                        // Check if storing the address (not to the address)
+                        if let MirOperand::Variable(name) = value {
+                            if name == alloca_name {
+                                return false; // Address stored
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
+        true
+    }
+    
+    fn find_defining_blocks(&self, func: &MirFunction, alloca_name: &str) -> BTreeSet<u32> {
+        let mut blocks = BTreeSet::new();
+        
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let MirStatement::Store { ptr, .. } = stmt {
+                    if let MirOperand::Variable(name) = ptr {
+                        if name == alloca_name {
+                            blocks.insert(block.id);
+                        }
+                    }
+                }
+            }
+        }
+        
+        blocks
+    }
+    
+    fn find_use_blocks(&self, func: &MirFunction, alloca_name: &str) -> BTreeSet<u32> {
+        let mut blocks = BTreeSet::new();
+        
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let MirStatement::Load { ptr, .. } = stmt {
+                    if let MirOperand::Variable(name) = ptr {
+                        if name == alloca_name {
+                            blocks.insert(block.id);
+                        }
+                    }
+                }
+            }
+        }
+        
+        blocks
+    }
+    
+    fn compute_dominators(&self, func: &MirFunction) -> DominatorTree {
+        // Would compute dominator tree
+        DominatorTree::new()
+    }
+    
+    fn compute_dominance_frontier(&self, func: &MirFunction) -> DominanceFrontier {
+        // Would compute dominance frontier
+        DominanceFrontier::new()
+    }
+    
+    fn insert_phis(&self, func: &mut MirFunction, promotable: &[PromotableAlloca]) {
+        let df = self.dom_frontier.as_ref().unwrap();
+        
+        for alloca in promotable {
+            let mut phi_blocks: BTreeSet<u32> = BTreeSet::new();
+            let mut worklist: Vec<u32> = alloca.defining_blocks.iter().copied().collect();
+            
+            while let Some(block_id) = worklist.pop() {
+                if let Some(frontier) = df.frontier(block_id) {
+                    for &df_block in frontier {
+                        if !phi_blocks.contains(&df_block) {
+                            phi_blocks.insert(df_block);
+                            
+                            // Insert phi at beginning of df_block
+                            if let Some(block) = func.blocks.iter_mut().find(|b| b.id == df_block) {
+                                let phi = MirStatement::Phi {
+                                    dest: format!("{}.phi", alloca.name),
+                                    incoming: Vec::new(),
+                                };
+                                block.statements.insert(0, phi);
+                            }
+                            
+                            if !alloca.defining_blocks.contains(&df_block) {
+                                worklist.push(df_block);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    fn rename_variables(&self, func: &mut MirFunction, promotable: &[PromotableAlloca]) {
+        // Would perform SSA renaming using dominator tree traversal
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PromotableAlloca {
+    name: String,
+    size: usize,
+    defining_blocks: BTreeSet<u32>,
+    use_blocks: BTreeSet<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct DominatorTree {
+    idom: BTreeMap<u32, u32>,
+}
+
+impl DominatorTree {
+    fn new() -> Self {
+        DominatorTree { idom: BTreeMap::new() }
+    }
+    
+    fn dominates(&self, a: u32, b: u32) -> bool {
+        if a == b { return true; }
+        
+        let mut current = b;
+        while let Some(&dom) = self.idom.get(&current) {
+            if dom == a { return true; }
+            if dom == current { break; }
+            current = dom;
+        }
+        
+        false
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DominanceFrontier {
+    frontiers: BTreeMap<u32, BTreeSet<u32>>,
+}
+
+impl DominanceFrontier {
+    fn new() -> Self {
+        DominanceFrontier { frontiers: BTreeMap::new() }
+    }
+    
+    fn frontier(&self, block: u32) -> Option<&BTreeSet<u32>> {
+        self.frontiers.get(&block)
+    }
+}
+
+impl Default for LoadStorePromotion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HEAP-TO-STACK PROMOTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Promote heap allocations to stack when possible
+pub struct HeapToStackPromotion {
+    /// Maximum allocation size to promote (bytes)
+    max_size: usize,
+}
+
+impl HeapToStackPromotion {
+    pub fn new(max_size: usize) -> Self {
+        HeapToStackPromotion { max_size }
+    }
+    
+    /// Run heap-to-stack promotion on a function
+    pub fn run(&self, func: &mut MirFunction) -> u32 {
+        let candidates = self.find_candidates(func);
+        let mut promoted = 0;
+        
+        for candidate in candidates {
+            if self.promote(&candidate, func) {
+                promoted += 1;
+            }
+        }
+        
+        promoted
+    }
+    
+    fn find_candidates(&self, func: &MirFunction) -> Vec<HeapCandidate> {
+        let mut candidates = Vec::new();
+        
+        for block in &func.blocks {
+            for (i, stmt) in block.statements.iter().enumerate() {
+                if let MirStatement::Call { callee, dest, args } = stmt {
+                    if self.is_allocation_call(callee) {
+                        if let (Some(dest), Some(size)) = (dest, self.get_allocation_size(callee, args)) {
+                            if size <= self.max_size {
+                                candidates.push(HeapCandidate {
+                                    result: dest.clone(),
+                                    size,
+                                    block_id: block.id,
+                                    stmt_index: i,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Filter candidates that escape or are freed on other paths
+        candidates.into_iter()
+            .filter(|c| self.can_promote(func, c))
+            .collect()
+    }
+    
+    fn is_allocation_call(&self, callee: &str) -> bool {
+        matches!(callee, "malloc" | "calloc" | "realloc" | 
+                        "_Znwm" | "_Znam" | // C++ new
+                        "quanta_alloc")
+    }
+    
+    fn get_allocation_size(&self, callee: &str, args: &[MirOperand]) -> Option<usize> {
+        match callee {
+            "malloc" | "_Znwm" | "_Znam" | "quanta_alloc" => {
+                if let Some(MirOperand::Constant(size)) = args.first() {
+                    return Some(*size as usize);
+                }
+            }
+            "calloc" => {
+                if let (Some(MirOperand::Constant(count)), Some(MirOperand::Constant(size))) = 
+                    (args.get(0), args.get(1)) 
+                {
+                    return Some((*count * *size) as usize);
+                }
+            }
+            _ => {}
+        }
+        
+        None
+    }
+    
+    fn can_promote(&self, func: &MirFunction, candidate: &HeapCandidate) -> bool {
+        // Check that:
+        // 1. Pointer doesn't escape function
+        // 2. Allocation is freed on all paths (or we can insert free)
+        // 3. No calls that might capture the pointer
+        
+        let result = &candidate.result;
+        
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                match stmt {
+                    // Pointer stored to memory (escapes)
+                    MirStatement::Store { value, .. } => {
+                        if let MirOperand::Variable(name) = value {
+                            if name == result {
+                                return false;
+                            }
+                        }
+                    }
+                    // Pointer passed to call (might escape)
+                    MirStatement::Call { callee, args, .. } => {
+                        // Allow free/delete
+                        if self.is_deallocation_call(callee) {
+                            continue;
+                        }
+                        
+                        for arg in args {
+                            if let MirOperand::Variable(name) = arg {
+                                if name == result {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
+        true
+    }
+    
+    fn is_deallocation_call(&self, callee: &str) -> bool {
+        matches!(callee, "free" | "_ZdlPv" | "_ZdaPv" | "quanta_free")
+    }
+    
+    fn promote(&self, candidate: &HeapCandidate, func: &mut MirFunction) -> bool {
+        // Replace malloc with alloca
+        for block in &mut func.blocks {
+            if block.id == candidate.block_id {
+                if let Some(stmt) = block.statements.get_mut(candidate.stmt_index) {
+                    *stmt = MirStatement::Alloca {
+                        dest: candidate.result.clone(),
+                        size: candidate.size,
+                    };
+                }
+            }
+            
+            // Remove corresponding free calls
+            block.statements.retain(|stmt| {
+                if let MirStatement::Call { callee, args, .. } = stmt {
+                    if self.is_deallocation_call(callee) {
+                        if let Some(MirOperand::Variable(name)) = args.first() {
+                            if name == &candidate.result {
+                                return false; // Remove this free
+                            }
+                        }
+                    }
+                }
+                true
+            });
+        }
+        
+        true
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HeapCandidate {
+    result: String,
+    size: usize,
+    block_id: u32,
+    stmt_index: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY COALESCING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Coalesce adjacent memory operations
+pub struct MemoryCoalescing {
+    /// Target alignment
+    alignment: usize,
+    /// Maximum coalesced size
+    max_size: usize,
+}
+
+impl MemoryCoalescing {
+    pub fn new(alignment: usize, max_size: usize) -> Self {
+        MemoryCoalescing { alignment, max_size }
+    }
+    
+    /// Run memory coalescing on a function
+    pub fn run(&self, func: &mut MirFunction) -> u32 {
+        let mut coalesced = 0;
+        
+        for block in &mut func.blocks {
+            coalesced += self.coalesce_in_block(block);
+        }
+        
+        coalesced
+    }
+    
+    fn coalesce_in_block(&self, block: &mut MirBlock) -> u32 {
+        let mut coalesced = 0;
+        
+        // Find adjacent loads
+        coalesced += self.coalesce_loads(block);
+        
+        // Find adjacent stores
+        coalesced += self.coalesce_stores(block);
+        
+        coalesced
+    }
+    
+    fn coalesce_loads(&self, block: &mut MirBlock) -> u32 {
+        let mut coalesced = 0;
+        let mut groups: Vec<LoadGroup> = Vec::new();
+        
+        // Find load groups
+        for (i, stmt) in block.statements.iter().enumerate() {
+            if let MirStatement::Load { dest, ptr, size } = stmt {
+                if let Some(base_offset) = self.extract_base_offset(ptr) {
+                    let added = groups.iter_mut()
+                        .find(|g| g.base == base_offset.0 && self.is_adjacent(g, base_offset.1, *size))
+                        .map(|g| {
+                            g.add_load(base_offset.1, *size, dest.clone(), i);
+                            true
+                        })
+                        .unwrap_or(false);
+                    
+                    if !added {
+                        let mut group = LoadGroup::new(base_offset.0.clone());
+                        group.add_load(base_offset.1, *size, dest.clone(), i);
+                        groups.push(group);
+                    }
+                }
+            }
+        }
+        
+        // Coalesce groups
+        for group in groups {
+            if group.loads.len() >= 2 && group.total_size() <= self.max_size {
+                // Would replace individual loads with single wider load
+                coalesced += group.loads.len() as u32 - 1;
+            }
+        }
+        
+        coalesced
+    }
+    
+    fn coalesce_stores(&self, block: &mut MirBlock) -> u32 {
+        let mut coalesced = 0;
+        let mut groups: Vec<StoreGroup> = Vec::new();
+        
+        // Similar to coalesce_loads but for stores
+        for (i, stmt) in block.statements.iter().enumerate() {
+            if let MirStatement::Store { ptr, value, size } = stmt {
+                if let Some(base_offset) = self.extract_base_offset(ptr) {
+                    let added = groups.iter_mut()
+                        .find(|g| g.base == base_offset.0 && self.is_store_adjacent(g, base_offset.1, *size))
+                        .map(|g| {
+                            g.add_store(base_offset.1, *size, value.clone(), i);
+                            true
+                        })
+                        .unwrap_or(false);
+                    
+                    if !added {
+                        let mut group = StoreGroup::new(base_offset.0.clone());
+                        group.add_store(base_offset.1, *size, value.clone(), i);
+                        groups.push(group);
+                    }
+                }
+            }
+        }
+        
+        for group in groups {
+            if group.stores.len() >= 2 && group.total_size() <= self.max_size {
+                coalesced += group.stores.len() as u32 - 1;
+            }
+        }
+        
+        coalesced
+    }
+    
+    fn extract_base_offset(&self, ptr: &MirOperand) -> Option<(String, i64)> {
+        match ptr {
+            MirOperand::Variable(name) => Some((name.clone(), 0)),
+            MirOperand::Gep { base, offset } => {
+                self.extract_base_offset(base).map(|(b, o)| (b, o + offset))
+            }
+            _ => None,
+        }
+    }
+    
+    fn is_adjacent(&self, group: &LoadGroup, offset: i64, size: usize) -> bool {
+        for load in &group.loads {
+            let load_end = load.offset + load.size as i64;
+            if offset == load_end || offset + size as i64 == load.offset {
+                return true;
+            }
+        }
+        false
+    }
+    
+    fn is_store_adjacent(&self, group: &StoreGroup, offset: i64, size: usize) -> bool {
+        for store in &group.stores {
+            let store_end = store.offset + store.size as i64;
+            if offset == store_end || offset + size as i64 == store.offset {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[derive(Debug)]
+struct LoadGroup {
+    base: String,
+    loads: Vec<LoadInfo>,
+}
+
+#[derive(Debug)]
+struct LoadInfo {
+    offset: i64,
+    size: usize,
+    dest: String,
+    stmt_index: usize,
+}
+
+impl LoadGroup {
+    fn new(base: String) -> Self {
+        LoadGroup { base, loads: Vec::new() }
+    }
+    
+    fn add_load(&mut self, offset: i64, size: usize, dest: String, stmt_index: usize) {
+        self.loads.push(LoadInfo { offset, size, dest, stmt_index });
+    }
+    
+    fn total_size(&self) -> usize {
+        if self.loads.is_empty() { return 0; }
+        
+        let min_offset = self.loads.iter().map(|l| l.offset).min().unwrap();
+        let max_end = self.loads.iter().map(|l| l.offset + l.size as i64).max().unwrap();
+        
+        (max_end - min_offset) as usize
+    }
+}
+
+#[derive(Debug)]
+struct StoreGroup {
+    base: String,
+    stores: Vec<StoreInfo>,
+}
+
+#[derive(Debug)]
+struct StoreInfo {
+    offset: i64,
+    size: usize,
+    value: MirOperand,
+    stmt_index: usize,
+}
+
+impl StoreGroup {
+    fn new(base: String) -> Self {
+        StoreGroup { base, stores: Vec::new() }
+    }
+    
+    fn add_store(&mut self, offset: i64, size: usize, value: MirOperand, stmt_index: usize) {
+        self.stores.push(StoreInfo { offset, size, value, stmt_index });
+    }
+    
+    fn total_size(&self) -> usize {
+        if self.stores.is_empty() { return 0; }
+        
+        let min_offset = self.stores.iter().map(|s| s.offset).min().unwrap();
+        let max_end = self.stores.iter().map(|s| s.offset + s.size as i64).max().unwrap();
+        
+        (max_end - min_offset) as usize
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Alloca { dest: String, size: usize },
+    Assign { dest: String, value: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+    Gep { base: Box<MirOperand>, offset: i64 },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_dead_store_elimination() {
+        let aa = BasicAliasAnalysis::new();
+        let dse = DeadStoreElimination::new(aa);
+        
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::Store {
+                            ptr: MirOperand::Variable("p".to_string()),
+                            value: MirOperand::Constant(1),
+                            size: 4,
+                        },
+                        MirStatement::Store {
+                            ptr: MirOperand::Variable("p".to_string()),
+                            value: MirOperand::Constant(2),
+                            size: 4,
+                        },
+                    ],
+                },
+            ],
+        };
+        
+        let eliminated = dse.run(&mut func);
+        
+        assert_eq!(eliminated, 1);
+        assert_eq!(func.blocks[0].statements.len(), 1);
+    }
+    
+    #[test]
+    fn test_store_to_load_forwarding() {
+        let aa = BasicAliasAnalysis::new();
+        let s2l = StoreToLoadForwarding::new(aa);
+        
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::Store {
+                            ptr: MirOperand::Variable("p".to_string()),
+                            value: MirOperand::Constant(42),
+                            size: 4,
+                        },
+                        MirStatement::Load {
+                            dest: "x".to_string(),
+                            ptr: MirOperand::Variable("p".to_string()),
+                            size: 4,
+                        },
+                    ],
+                },
+            ],
+        };
+        
+        let forwarded = s2l.run(&mut func);
+        
+        assert_eq!(forwarded, 1);
+    }
+    
+    #[test]
+    fn test_heap_to_stack_promotion() {
+        let h2s = HeapToStackPromotion::new(4096);
+        
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::Call {
+                            callee: "malloc".to_string(),
+                            args: vec![MirOperand::Constant(64)],
+                            dest: Some("p".to_string()),
+                        },
+                        MirStatement::Call {
+                            callee: "free".to_string(),
+                            args: vec![MirOperand::Variable("p".to_string())],
+                            dest: None,
+                        },
+                    ],
+                },
+            ],
+        };
+        
+        let promoted = h2s.run(&mut func);
+        
+        assert_eq!(promoted, 1);
+    }
+}

@@ -1,0 +1,1044 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ TYPE SYSTEM — Hindley-Milner + Linear Types + Effects
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending (P076-P082)
+// Trademarks: LINEAR TYPES™, EFFECT SYSTEM™, QUANTA TYPE INFERENCE™
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Type system features:
+// 1. Hindley-Milner type inference with let-polymorphism
+// 2. Linear types for compile-time resource safety (use-exactly-once)
+// 3. Affine types (use-at-most-once) for optional consumption
+// 4. Effect system tracking: alloc, panic, block, io, unsafe
+// 5. Physical quantity types with compile-time unit checking
+// 6. Substructural type checking (linearity, relevance)
+// 7. Row polymorphism for extensible records
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::types
+
+use std::collections::{HashMap, HashSet, BTreeMap, BTreeSet}
+use crate::ast::{Span, Identifier, Path}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE REPRESENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unique identifier for type variables
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TypeVar(pub u32);
+
+/// Unique identifier for effect variables
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EffectVar(pub u32);
+
+/// Core type representation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ty {
+    // ─────────────────────────────────────────────────────────────────────────
+    // Primitive types
+    // ─────────────────────────────────────────────────────────────────────────
+    Never,
+    Unit,
+    Bool,
+    Char,
+    Int(IntTy),
+    Float(FloatTy),
+    Str,
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Physical quantity types (compile-time unit checking)
+    // ─────────────────────────────────────────────────────────────────────────
+    PhysAddr,
+    VirtAddr,
+    Bytes,
+    Pages,
+    Microseconds,
+    Nanoseconds,
+    Hertz,
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Compound types
+    // ─────────────────────────────────────────────────────────────────────────
+    Tuple(Vec<Ty>),
+    Array(Box<Ty>, u64),        // [T; N]
+    Slice(Box<Ty>),             // [T]
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Reference types
+    // ─────────────────────────────────────────────────────────────────────────
+    Ref(Lifetime, Mutability, Box<Ty>),      // &'a T, &'a mut T
+    Ptr(Mutability, Box<Ty>),                 // *const T, *mut T
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // User-defined types
+    // ─────────────────────────────────────────────────────────────────────────
+    Adt(AdtId, Vec<Ty>),        // struct/enum/union with type args
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Function types
+    // ─────────────────────────────────────────────────────────────────────────
+    Fn(FnSig),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Type variables (for inference)
+    // ─────────────────────────────────────────────────────────────────────────
+    Var(TypeVar),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Polymorphic types
+    // ─────────────────────────────────────────────────────────────────────────
+    Forall(Vec<TypeVar>, Vec<EffectVar>, Box<Ty>),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Substructural wrappers
+    // ─────────────────────────────────────────────────────────────────────────
+    Linear(Box<Ty>),            // Must be used exactly once
+    Affine(Box<Ty>),            // May be used at most once
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Volatile wrapper (for hardware access)
+    // ─────────────────────────────────────────────────────────────────────────
+    Volatile(VolatileAccess, Box<Ty>),
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // State machine state type
+    // ─────────────────────────────────────────────────────────────────────────
+    State(AdtId, StateId),      // Process<Running>
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Error recovery
+    // ─────────────────────────────────────────────────────────────────────────
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntTy {
+    U8, U16, U32, U64, U128, Usize,
+    I8, I16, I32, I64, I128, Isize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FloatTy {
+    F32, F64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Mutability {
+    Immutable,
+    Mutable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VolatileAccess {
+    ReadWrite,
+    ReadOnly,
+    WriteOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Lifetime(pub String);
+
+impl Lifetime {
+    pub fn static_() -> Self { Lifetime("'static".to_string()) }
+    pub fn anonymous() -> Self { Lifetime("'_".to_string()) }
+}
+
+/// Algebraic data type identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AdtId(pub u32);
+
+/// State identifier within a state machine
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StateId(pub u32);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUNCTION SIGNATURES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FnSig {
+    pub params: Vec<Ty>,
+    pub ret: Box<Ty>,
+    pub effects: EffectSet,
+    pub is_unsafe: bool,
+    pub abi: Abi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Abi {
+    #[default]
+    Quanta,
+    C,
+    System,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EFFECT SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Set of effects a function may perform
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EffectSet {
+    pub effects: BTreeSet<Effect>,
+    pub var: Option<EffectVar>,  // For polymorphic effects
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Effect {
+    /// May allocate heap memory
+    Alloc,
+    /// May panic (unwind)
+    Panic,
+    /// May block (sleep, wait, I/O)
+    Block,
+    /// May perform I/O operations
+    Io,
+    /// Contains unsafe code
+    Unsafe,
+    /// May diverge (infinite loop)
+    Diverge,
+    /// May access global state
+    Global,
+}
+
+impl EffectSet {
+    pub fn pure() -> Self {
+        EffectSet { effects: BTreeSet::new(), var: None }
+    }
+    
+    pub fn total() -> Self {
+        let mut effects = BTreeSet::new();
+        effects.insert(Effect::Alloc);
+        effects.insert(Effect::Panic);
+        effects.insert(Effect::Block);
+        effects.insert(Effect::Io);
+        effects.insert(Effect::Unsafe);
+        effects.insert(Effect::Diverge);
+        effects.insert(Effect::Global);
+        EffectSet { effects, var: None }
+    }
+    
+    pub fn with(mut self, effect: Effect) -> Self {
+        self.effects.insert(effect);
+        self
+    }
+    
+    pub fn without(mut self, effect: Effect) -> Self {
+        self.effects.remove(&effect);
+        self
+    }
+    
+    pub fn union(&self, other: &EffectSet) -> EffectSet {
+        EffectSet {
+            effects: self.effects.union(&other.effects).copied().collect(),
+            var: self.var.or(other.var),
+        }
+    }
+    
+    pub fn is_subset_of(&self, other: &EffectSet) -> bool {
+        self.effects.is_subset(&other.effects)
+    }
+    
+    pub fn has(&self, effect: Effect) -> bool {
+        self.effects.contains(&effect)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE SCHEME (Polymorphic types)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A type scheme represents a polymorphic type: ∀α₁...αₙ. τ
+#[derive(Debug, Clone)]
+pub struct TypeScheme {
+    pub type_vars: Vec<TypeVar>,
+    pub effect_vars: Vec<EffectVar>,
+    pub bounds: Vec<TypeBound>,
+    pub ty: Ty,
+}
+
+impl TypeScheme {
+    pub fn monomorphic(ty: Ty) -> Self {
+        TypeScheme {
+            type_vars: Vec::new(),
+            effect_vars: Vec::new(),
+            bounds: Vec::new(),
+            ty,
+        }
+    }
+    
+    pub fn is_monomorphic(&self) -> bool {
+        self.type_vars.is_empty() && self.effect_vars.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeBound {
+    pub var: TypeVar,
+    pub trait_: TraitId,
+    pub args: Vec<Ty>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TraitId(pub u32);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE ENVIRONMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Typing context: maps names to type schemes
+#[derive(Debug, Clone, Default)]
+pub struct TypeEnv {
+    /// Variable bindings
+    bindings: HashMap<String, TypeScheme>,
+    
+    /// Type definitions (struct, enum, union)
+    adts: HashMap<AdtId, AdtDef>,
+    
+    /// Trait definitions
+    traits: HashMap<TraitId, TraitDef>,
+    
+    /// Trait implementations
+    impls: Vec<ImplDef>,
+    
+    /// Linear variable usage tracking
+    linear_vars: HashMap<String, LinearState>,
+    
+    /// Current effect constraints
+    effect_constraints: EffectSet,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdtDef {
+    pub id: AdtId,
+    pub name: String,
+    pub type_params: Vec<TypeVar>,
+    pub kind: AdtKind,
+    pub is_linear: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum AdtKind {
+    Struct(Vec<FieldDef>),
+    Enum(Vec<VariantDef>),
+    Union(Vec<FieldDef>),
+    Bitfield { backing: IntTy, fields: Vec<BitfieldFieldDef> },
+    StateMachine { states: Vec<StateDef>, transitions: Vec<TransitionDef> },
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldDef {
+    pub name: String,
+    pub ty: Ty,
+    pub is_volatile: bool,
+    pub volatile_access: Option<VolatileAccess>,
+    pub offset: Option<u64>,  // For MMIO
+}
+
+#[derive(Debug, Clone)]
+pub struct VariantDef {
+    pub name: String,
+    pub fields: Vec<Ty>,
+    pub discriminant: Option<i128>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BitfieldFieldDef {
+    pub name: String,
+    pub start_bit: u8,
+    pub end_bit: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct StateDef {
+    pub id: StateId,
+    pub name: String,
+    pub data: Vec<FieldDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransitionDef {
+    pub from: StateId,
+    pub to: StateId,
+    pub trigger: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraitDef {
+    pub id: TraitId,
+    pub name: String,
+    pub type_params: Vec<TypeVar>,
+    pub supertraits: Vec<TraitId>,
+    pub methods: Vec<TraitMethod>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraitMethod {
+    pub name: String,
+    pub sig: FnSig,
+    pub has_default: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImplDef {
+    pub trait_: Option<TraitId>,
+    pub self_ty: Ty,
+    pub type_args: Vec<Ty>,
+    pub bounds: Vec<TypeBound>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinearState {
+    /// Variable has not been used
+    Unused,
+    /// Variable has been used (moved)
+    Used,
+    /// Variable has been partially moved (struct fields)
+    PartiallyUsed,
+    /// Variable is borrowed
+    Borrowed,
+}
+
+impl TypeEnv {
+    pub fn new() -> Self {
+        TypeEnv::default()
+    }
+    
+    pub fn insert(&mut self, name: String, scheme: TypeScheme) {
+        self.bindings.insert(name, scheme);
+    }
+    
+    pub fn lookup(&self, name: &str) -> Option<&TypeScheme> {
+        self.bindings.get(name)
+    }
+    
+    pub fn extend(&self) -> TypeEnv {
+        TypeEnv {
+            bindings: self.bindings.clone(),
+            adts: self.adts.clone(),
+            traits: self.traits.clone(),
+            impls: self.impls.clone(),
+            linear_vars: HashMap::new(),
+            effect_constraints: self.effect_constraints.clone(),
+        }
+    }
+    
+    pub fn with_effect_constraints(&self, effects: EffectSet) -> TypeEnv {
+        let mut env = self.clone();
+        env.effect_constraints = effects;
+        env
+    }
+    
+    pub fn mark_linear_used(&mut self, name: &str) -> Result<(), TypeError> {
+        if let Some(state) = self.linear_vars.get_mut(name) {
+            match *state {
+                LinearState::Unused => {
+                    *state = LinearState::Used;
+                    Ok(())
+                }
+                LinearState::Used => Err(TypeError::LinearUseAfterMove(name.to_string())),
+                LinearState::PartiallyUsed => Err(TypeError::LinearPartialMove(name.to_string())),
+                LinearState::Borrowed => Err(TypeError::LinearUseWhileBorrowed(name.to_string())),
+            }
+        } else {
+            Ok(())
+        }
+    }
+    
+    pub fn register_linear(&mut self, name: String) {
+        self.linear_vars.insert(name, LinearState::Unused);
+    }
+    
+    pub fn check_linear_consumed(&self) -> Vec<TypeError> {
+        self.linear_vars
+            .iter()
+            .filter(|(_, state)| **state == LinearState::Unused)
+            .map(|(name, _)| TypeError::LinearNotConsumed(name.clone()))
+            .collect()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub enum TypeError {
+    Mismatch { expected: Ty, found: Ty, span: Span },
+    OccursCheck { var: TypeVar, ty: Ty, span: Span },
+    UndefinedVar { name: String, span: Span },
+    UndefinedType { name: String, span: Span },
+    ArityMismatch { expected: usize, found: usize, span: Span },
+    NoSuchField { ty: Ty, field: String, span: Span },
+    NoSuchMethod { ty: Ty, method: String, span: Span },
+    NotCallable { ty: Ty, span: Span },
+    NotIndexable { ty: Ty, span: Span },
+    LinearUseAfterMove(String),
+    LinearNotConsumed(String),
+    LinearPartialMove(String),
+    LinearUseWhileBorrowed(String),
+    EffectNotAllowed { effect: Effect, span: Span },
+    InvalidStateTransition { from: String, to: String, span: Span },
+    UnitMismatch { expected: String, found: String, span: Span },
+    VolatileViolation { expected: VolatileAccess, found: VolatileAccess, span: Span },
+    CannotMutate { span: Span },
+    TraitNotImplemented { ty: Ty, trait_: TraitId, span: Span },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SUBSTITUTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Default)]
+pub struct Substitution {
+    type_map: HashMap<TypeVar, Ty>,
+    effect_map: HashMap<EffectVar, EffectSet>,
+}
+
+impl Substitution {
+    pub fn new() -> Self { Substitution::default() }
+    
+    pub fn insert(&mut self, var: TypeVar, ty: Ty) {
+        self.type_map.insert(var, ty);
+    }
+    
+    pub fn insert_effect(&mut self, var: EffectVar, effects: EffectSet) {
+        self.effect_map.insert(var, effects);
+    }
+    
+    pub fn lookup(&self, var: TypeVar) -> Option<&Ty> {
+        self.type_map.get(&var)
+    }
+    
+    pub fn apply(&self, ty: &Ty) -> Ty {
+        match ty {
+            Ty::Var(v) => {
+                if let Some(t) = self.type_map.get(v) {
+                    self.apply(t)
+                } else {
+                    ty.clone()
+                }
+            }
+            Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| self.apply(t)).collect()),
+            Ty::Array(elem, n) => Ty::Array(Box::new(self.apply(elem)), *n),
+            Ty::Slice(elem) => Ty::Slice(Box::new(self.apply(elem))),
+            Ty::Ref(lt, m, inner) => Ty::Ref(lt.clone(), *m, Box::new(self.apply(inner))),
+            Ty::Ptr(m, inner) => Ty::Ptr(*m, Box::new(self.apply(inner))),
+            Ty::Adt(id, args) => Ty::Adt(*id, args.iter().map(|t| self.apply(t)).collect()),
+            Ty::Fn(sig) => Ty::Fn(self.apply_sig(sig)),
+            Ty::Forall(tvs, evs, inner) => Ty::Forall(tvs.clone(), evs.clone(), Box::new(self.apply(inner))),
+            Ty::Linear(inner) => Ty::Linear(Box::new(self.apply(inner))),
+            Ty::Affine(inner) => Ty::Affine(Box::new(self.apply(inner))),
+            Ty::Volatile(access, inner) => Ty::Volatile(*access, Box::new(self.apply(inner))),
+            _ => ty.clone(),
+        }
+    }
+    
+    pub fn apply_sig(&self, sig: &FnSig) -> FnSig {
+        FnSig {
+            params: sig.params.iter().map(|t| self.apply(t)).collect(),
+            ret: Box::new(self.apply(&sig.ret)),
+            effects: self.apply_effects(&sig.effects),
+            is_unsafe: sig.is_unsafe,
+            abi: sig.abi,
+        }
+    }
+    
+    pub fn apply_effects(&self, effects: &EffectSet) -> EffectSet {
+        if let Some(var) = effects.var {
+            if let Some(resolved) = self.effect_map.get(&var) {
+                return effects.union(resolved);
+            }
+        }
+        effects.clone()
+    }
+    
+    pub fn compose(&self, other: &Substitution) -> Substitution {
+        let mut result = Substitution::new();
+        for (var, ty) in &other.type_map {
+            result.insert(*var, self.apply(ty));
+        }
+        for (var, ty) in &self.type_map {
+            if !result.type_map.contains_key(var) {
+                result.insert(*var, ty.clone());
+            }
+        }
+        for (var, eff) in &other.effect_map {
+            result.insert_effect(*var, self.apply_effects(eff));
+        }
+        for (var, eff) in &self.effect_map {
+            if !result.effect_map.contains_key(var) {
+                result.insert_effect(*var, eff.clone());
+            }
+        }
+        result
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE INFERENCE ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct TypeChecker {
+    next_type_var: u32,
+    next_effect_var: u32,
+    subst: Substitution,
+    errors: Vec<TypeError>,
+    env: TypeEnv,
+}
+
+impl TypeChecker {
+    pub fn new() -> Self {
+        TypeChecker {
+            next_type_var: 0,
+            next_effect_var: 0,
+            subst: Substitution::new(),
+            errors: Vec::new(),
+            env: TypeEnv::new(),
+        }
+    }
+    
+    pub fn fresh_var(&mut self) -> Ty {
+        let var = TypeVar(self.next_type_var);
+        self.next_type_var += 1;
+        Ty::Var(var)
+    }
+    
+    pub fn fresh_effect_var(&mut self) -> EffectVar {
+        let var = EffectVar(self.next_effect_var);
+        self.next_effect_var += 1;
+        var
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // UNIFICATION (Algorithm W core)
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    pub fn unify(&mut self, t1: &Ty, t2: &Ty, span: Span) -> Result<(), TypeError> {
+        let t1 = self.subst.apply(t1);
+        let t2 = self.subst.apply(t2);
+        
+        match (&t1, &t2) {
+            (Ty::Var(v1), Ty::Var(v2)) if v1 == v2 => Ok(()),
+            
+            (Ty::Var(v), t) | (t, Ty::Var(v)) => {
+                if self.occurs_check(*v, t) {
+                    Err(TypeError::OccursCheck { var: *v, ty: t.clone(), span })
+                } else {
+                    self.subst.insert(*v, t.clone());
+                    Ok(())
+                }
+            }
+            
+            // Structural equality for primitives
+            (Ty::Never, Ty::Never) | (Ty::Unit, Ty::Unit) | (Ty::Bool, Ty::Bool) |
+            (Ty::Char, Ty::Char) | (Ty::Str, Ty::Str) => Ok(()),
+            (Ty::Int(i1), Ty::Int(i2)) if i1 == i2 => Ok(()),
+            (Ty::Float(f1), Ty::Float(f2)) if f1 == f2 => Ok(()),
+            
+            // Physical types (strict equality - no implicit conversion)
+            (Ty::PhysAddr, Ty::PhysAddr) | (Ty::VirtAddr, Ty::VirtAddr) |
+            (Ty::Bytes, Ty::Bytes) | (Ty::Pages, Ty::Pages) |
+            (Ty::Microseconds, Ty::Microseconds) | (Ty::Nanoseconds, Ty::Nanoseconds) |
+            (Ty::Hertz, Ty::Hertz) => Ok(()),
+            
+            // Compound types
+            (Ty::Tuple(ts1), Ty::Tuple(ts2)) if ts1.len() == ts2.len() => {
+                for (a, b) in ts1.iter().zip(ts2.iter()) {
+                    self.unify(a, b, span)?;
+                }
+                Ok(())
+            }
+            
+            (Ty::Array(e1, n1), Ty::Array(e2, n2)) if n1 == n2 => self.unify(e1, e2, span),
+            (Ty::Slice(e1), Ty::Slice(e2)) => self.unify(e1, e2, span),
+            
+            (Ty::Ref(_, m1, t1), Ty::Ref(_, m2, t2)) if m1 == m2 => self.unify(t1, t2, span),
+            (Ty::Ptr(m1, t1), Ty::Ptr(m2, t2)) if m1 == m2 => self.unify(t1, t2, span),
+            
+            (Ty::Adt(id1, args1), Ty::Adt(id2, args2)) if id1 == id2 && args1.len() == args2.len() => {
+                for (a, b) in args1.iter().zip(args2.iter()) {
+                    self.unify(a, b, span)?;
+                }
+                Ok(())
+            }
+            
+            (Ty::Fn(sig1), Ty::Fn(sig2)) => {
+                if sig1.params.len() != sig2.params.len() {
+                    return Err(TypeError::ArityMismatch {
+                        expected: sig1.params.len(),
+                        found: sig2.params.len(),
+                        span,
+                    });
+                }
+                // Contravariant in params
+                for (p1, p2) in sig1.params.iter().zip(sig2.params.iter()) {
+                    self.unify(p2, p1, span)?;
+                }
+                // Covariant in return
+                self.unify(&sig1.ret, &sig2.ret, span)?;
+                Ok(())
+            }
+            
+            (Ty::Linear(t1), Ty::Linear(t2)) => self.unify(t1, t2, span),
+            (Ty::Affine(t1), Ty::Affine(t2)) => self.unify(t1, t2, span),
+            (Ty::Volatile(a1, t1), Ty::Volatile(a2, t2)) if a1 == a2 => self.unify(t1, t2, span),
+            (Ty::State(adt1, s1), Ty::State(adt2, s2)) if adt1 == adt2 && s1 == s2 => Ok(()),
+            
+            (Ty::Error, _) | (_, Ty::Error) => Ok(()),
+            
+            _ => Err(TypeError::Mismatch { expected: t2, found: t1, span }),
+        }
+    }
+    
+    fn occurs_check(&self, var: TypeVar, ty: &Ty) -> bool {
+        match ty {
+            Ty::Var(v) => *v == var,
+            Ty::Tuple(ts) => ts.iter().any(|t| self.occurs_check(var, t)),
+            Ty::Array(elem, _) | Ty::Slice(elem) => self.occurs_check(var, elem),
+            Ty::Ref(_, _, inner) | Ty::Ptr(_, inner) => self.occurs_check(var, inner),
+            Ty::Adt(_, args) => args.iter().any(|t| self.occurs_check(var, t)),
+            Ty::Fn(sig) => {
+                sig.params.iter().any(|t| self.occurs_check(var, t)) ||
+                self.occurs_check(var, &sig.ret)
+            }
+            Ty::Forall(_, _, inner) | Ty::Linear(inner) | Ty::Affine(inner) | 
+            Ty::Volatile(_, inner) => self.occurs_check(var, inner),
+            _ => false,
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // INSTANTIATION AND GENERALIZATION
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    pub fn instantiate(&mut self, scheme: &TypeScheme) -> Ty {
+        let mut subst = Substitution::new();
+        for tv in &scheme.type_vars {
+            subst.insert(*tv, self.fresh_var());
+        }
+        for ev in &scheme.effect_vars {
+            subst.insert_effect(*ev, EffectSet {
+                effects: BTreeSet::new(),
+                var: Some(self.fresh_effect_var()),
+            });
+        }
+        subst.apply(&scheme.ty)
+    }
+    
+    pub fn generalize(&self, env: &TypeEnv, ty: &Ty) -> TypeScheme {
+        let ty = self.subst.apply(ty);
+        let env_vars = self.free_vars_in_env(env);
+        let ty_vars = self.free_vars(&ty);
+        
+        let type_vars: Vec<TypeVar> = ty_vars
+            .difference(&env_vars)
+            .copied()
+            .collect();
+        
+        TypeScheme {
+            type_vars,
+            effect_vars: Vec::new(),
+            bounds: Vec::new(),
+            ty,
+        }
+    }
+    
+    fn free_vars(&self, ty: &Ty) -> HashSet<TypeVar> {
+        let mut vars = HashSet::new();
+        self.collect_free_vars(ty, &mut vars);
+        vars
+    }
+    
+    fn collect_free_vars(&self, ty: &Ty, vars: &mut HashSet<TypeVar>) {
+        match ty {
+            Ty::Var(v) => {
+                if let Some(t) = self.subst.lookup(*v) {
+                    self.collect_free_vars(t, vars);
+                } else {
+                    vars.insert(*v);
+                }
+            }
+            Ty::Tuple(ts) => ts.iter().for_each(|t| self.collect_free_vars(t, vars)),
+            Ty::Array(elem, _) | Ty::Slice(elem) => self.collect_free_vars(elem, vars),
+            Ty::Ref(_, _, inner) | Ty::Ptr(_, inner) => self.collect_free_vars(inner, vars),
+            Ty::Adt(_, args) => args.iter().for_each(|t| self.collect_free_vars(t, vars)),
+            Ty::Fn(sig) => {
+                sig.params.iter().for_each(|p| self.collect_free_vars(p, vars));
+                self.collect_free_vars(&sig.ret, vars);
+            }
+            Ty::Forall(bound, _, inner) => {
+                self.collect_free_vars(inner, vars);
+                bound.iter().for_each(|v| { vars.remove(v); });
+            }
+            Ty::Linear(inner) | Ty::Affine(inner) | Ty::Volatile(_, inner) => {
+                self.collect_free_vars(inner, vars);
+            }
+            _ => {}
+        }
+    }
+    
+    fn free_vars_in_env(&self, env: &TypeEnv) -> HashSet<TypeVar> {
+        let mut vars = HashSet::new();
+        for scheme in env.bindings.values() {
+            let scheme_vars = self.free_vars(&scheme.ty);
+            for v in scheme_vars {
+                if !scheme.type_vars.contains(&v) {
+                    vars.insert(v);
+                }
+            }
+        }
+        vars
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // LINEAR TYPE CHECKING
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    pub fn is_linear(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Linear(_) => true,
+            Ty::Adt(id, _) => self.env.adts.get(id).map_or(false, |a| a.is_linear),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.is_linear(t)),
+            _ => false,
+        }
+    }
+    
+    pub fn is_affine(&self, ty: &Ty) -> bool {
+        matches!(ty, Ty::Affine(_)) || self.is_linear(ty)
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // EFFECT CHECKING
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    pub fn check_effect(&mut self, effect: Effect, span: Span) -> Result<(), TypeError> {
+        if !self.env.effect_constraints.effects.is_empty() &&
+           !self.env.effect_constraints.has(effect) {
+            let err = TypeError::EffectNotAllowed { effect, span };
+            self.errors.push(err.clone());
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // PHYSICAL UNIT CHECKING
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    pub fn check_unit_compat(&self, t1: &Ty, t2: &Ty, span: Span) -> Result<(), TypeError> {
+        match (t1, t2) {
+            (Ty::PhysAddr, Ty::PhysAddr) | (Ty::VirtAddr, Ty::VirtAddr) |
+            (Ty::Bytes, Ty::Bytes) | (Ty::Pages, Ty::Pages) => Ok(()),
+            
+            // PhysAddr ± Bytes = PhysAddr (offset calculation)
+            (Ty::PhysAddr, Ty::Bytes) | (Ty::Bytes, Ty::PhysAddr) => Ok(()),
+            (Ty::VirtAddr, Ty::Bytes) | (Ty::Bytes, Ty::VirtAddr) => Ok(()),
+            
+            // FORBIDDEN: PhysAddr ± VirtAddr (address space confusion)
+            (Ty::PhysAddr, Ty::VirtAddr) | (Ty::VirtAddr, Ty::PhysAddr) => {
+                Err(TypeError::UnitMismatch {
+                    expected: "same address space".to_string(),
+                    found: "PhysAddr mixed with VirtAddr".to_string(),
+                    span,
+                })
+            }
+            
+            _ => Ok(()),
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // STATE MACHINE CHECKING
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    pub fn check_state_transition(
+        &self,
+        adt_id: AdtId,
+        from: StateId,
+        trigger: &str,
+        span: Span,
+    ) -> Result<StateId, TypeError> {
+        if let Some(adt) = self.env.adts.get(&adt_id) {
+            if let AdtKind::StateMachine { transitions, states } = &adt.kind {
+                for trans in transitions {
+                    if trans.from == from && trans.trigger == trigger {
+                        return Ok(trans.to);
+                    }
+                }
+                
+                let from_name = states.iter()
+                    .find(|s| s.id == from)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| format!("{:?}", from));
+                
+                return Err(TypeError::InvalidStateTransition {
+                    from: from_name,
+                    to: trigger.to_string(),
+                    span,
+                });
+            }
+        }
+        
+        Err(TypeError::InvalidStateTransition {
+            from: "unknown".to_string(),
+            to: trigger.to_string(),
+            span,
+        })
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // FINALIZATION
+    // ─────────────────────────────────────────────────────────────────────────
+    
+    pub fn finalize(&self, ty: &Ty) -> Ty {
+        self.subst.apply(ty)
+    }
+    
+    pub fn errors(&self) -> &[TypeError] {
+        &self.errors
+    }
+    
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUILT-IN TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl TypeEnv {
+    pub fn with_builtins() -> Self {
+        let mut env = TypeEnv::new();
+        
+        let copy_id = TraitId(0);
+        let clone_id = TraitId(1);
+        let drop_id = TraitId(2);
+        
+        env.traits.insert(copy_id, TraitDef {
+            id: copy_id,
+            name: "Copy".to_string(),
+            type_params: Vec::new(),
+            supertraits: vec![clone_id],
+            methods: Vec::new(),
+        });
+        
+        env.traits.insert(clone_id, TraitDef {
+            id: clone_id,
+            name: "Clone".to_string(),
+            type_params: Vec::new(),
+            supertraits: Vec::new(),
+            methods: vec![TraitMethod {
+                name: "clone".to_string(),
+                sig: FnSig {
+                    params: Vec::new(),
+                    ret: Box::new(Ty::Var(TypeVar(0))),
+                    effects: EffectSet::pure(),
+                    is_unsafe: false,
+                    abi: Abi::Quanta,
+                },
+                has_default: false,
+            }],
+        });
+        
+        env.traits.insert(drop_id, TraitDef {
+            id: drop_id,
+            name: "Drop".to_string(),
+            type_params: Vec::new(),
+            supertraits: Vec::new(),
+            methods: vec![TraitMethod {
+                name: "drop".to_string(),
+                sig: FnSig {
+                    params: Vec::new(),
+                    ret: Box::new(Ty::Unit),
+                    effects: EffectSet::pure().with(Effect::Alloc),
+                    is_unsafe: false,
+                    abi: Abi::Quanta,
+                },
+                has_default: false,
+            }],
+        });
+        
+        env
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn span() -> Span { Span::new(0, 0, 0) }
+    
+    #[test]
+    fn test_unify_primitives() {
+        let mut tc = TypeChecker::new();
+        assert!(tc.unify(&Ty::Int(IntTy::U32), &Ty::Int(IntTy::U32), span()).is_ok());
+        assert!(tc.unify(&Ty::Int(IntTy::U32), &Ty::Int(IntTy::U64), span()).is_err());
+    }
+    
+    #[test]
+    fn test_unify_var() {
+        let mut tc = TypeChecker::new();
+        let var = tc.fresh_var();
+        assert!(tc.unify(&var, &Ty::Int(IntTy::U32), span()).is_ok());
+        assert_eq!(tc.finalize(&var), Ty::Int(IntTy::U32));
+    }
+    
+    #[test]
+    fn test_occurs_check() {
+        let mut tc = TypeChecker::new();
+        let var = tc.fresh_var();
+        let infinite = Ty::Tuple(vec![var.clone()]);
+        assert!(tc.unify(&var, &infinite, span()).is_err());
+    }
+    
+    #[test]
+    fn test_generalize() {
+        let mut tc = TypeChecker::new();
+        let env = TypeEnv::new();
+        let var = tc.fresh_var();
+        let fn_ty = Ty::Fn(FnSig {
+            params: vec![var.clone()],
+            ret: Box::new(var.clone()),
+            effects: EffectSet::pure(),
+            is_unsafe: false,
+            abi: Abi::Quanta,
+        });
+        let scheme = tc.generalize(&env, &fn_ty);
+        assert_eq!(scheme.type_vars.len(), 1);
+    }
+    
+    #[test]
+    fn test_linear_tracking() {
+        let mut env = TypeEnv::new();
+        env.register_linear("buf".to_string());
+        assert!(env.mark_linear_used("buf").is_ok());
+        assert!(env.mark_linear_used("buf").is_err());
+    }
+    
+    #[test]
+    fn test_effect_set() {
+        let mut effects = EffectSet::pure();
+        assert!(!effects.has(Effect::Alloc));
+        effects = effects.with(Effect::Alloc);
+        assert!(effects.has(Effect::Alloc));
+        assert!(effects.is_subset_of(&EffectSet::total()));
+    }
+    
+    #[test]
+    fn test_physical_units() {
+        let tc = TypeChecker::new();
+        assert!(tc.check_unit_compat(&Ty::PhysAddr, &Ty::Bytes, span()).is_ok());
+        assert!(tc.check_unit_compat(&Ty::PhysAddr, &Ty::VirtAddr, span()).is_err());
+    }
+}

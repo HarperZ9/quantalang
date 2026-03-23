@@ -1,0 +1,1084 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ ASYNC — Synchronization Primitives
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Async-aware synchronization primitives:
+// - Mutex (mutual exclusion)
+// - RwLock (reader-writer lock)
+// - Semaphore (counting semaphore)
+// - Barrier (synchronization barrier)
+// - Notify (async notification)
+// - OnceCell (lazy initialization)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::async::sync
+
+use alloc::vec::Vec;
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex as StdMutex;
+
+use super::waker::Waker;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ASYNC MUTEX
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// An async-aware mutual exclusion lock
+pub struct Mutex<T> {
+    locked: AtomicBool,
+    waiters: StdMutex<VecDeque<Waker>>,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for Mutex<T> {}
+unsafe impl<T: Send> Sync for Mutex<T> {}
+
+impl<T> Mutex<T> {
+    /// Create a new mutex
+    pub const fn new(value: T) -> Self {
+        Mutex {
+            locked: AtomicBool::new(false),
+            waiters: StdMutex::new(VecDeque::new()),
+            data: UnsafeCell::new(value),
+        }
+    }
+    
+    /// Try to acquire the lock without blocking
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+        if self.locked.compare_exchange(
+            false,
+            true,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ).is_ok() {
+            Some(MutexGuard { mutex: self })
+        } else {
+            None
+        }
+    }
+    
+    /// Acquire the lock (blocking)
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        loop {
+            if let Some(guard) = self.try_lock() {
+                return guard;
+            }
+            std::thread::yield_now();
+        }
+    }
+    
+    /// Poll to acquire the lock (async)
+    pub fn poll_lock(&self, waker: &Waker) -> Poll<MutexGuard<'_, T>> {
+        if let Some(guard) = self.try_lock() {
+            return Poll::Ready(guard);
+        }
+        
+        self.waiters.lock().unwrap().push_back(waker.clone());
+        
+        // Double-check after registering
+        if let Some(guard) = self.try_lock() {
+            return Poll::Ready(guard);
+        }
+        
+        Poll::Pending
+    }
+    
+    /// Get mutable reference without locking (unsafe)
+    pub fn get_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.data.get() }
+    }
+    
+    /// Check if lock is currently held
+    pub fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::Relaxed)
+    }
+    
+    /// Consume mutex and return inner value
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+    
+    fn unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+        
+        // Wake one waiter
+        if let Some(waker) = self.waiters.lock().unwrap().pop_front() {
+            waker.wake();
+        }
+    }
+}
+
+/// Guard for exclusive access to mutex data
+pub struct MutexGuard<'a, T> {
+    mutex: &'a Mutex<T>,
+}
+
+impl<'a, T> Deref for MutexGuard<'a, T> {
+    type Target = T;
+    
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.mutex.data.get() }
+    }
+}
+
+impl<'a, T> DerefMut for MutexGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.mutex.data.get() }
+    }
+}
+
+impl<'a, T> Drop for MutexGuard<'a, T> {
+    fn drop(&mut self) {
+        self.mutex.unlock();
+    }
+}
+
+/// Owned mutex guard (for 'static lifetime)
+pub struct OwnedMutexGuard<T> {
+    mutex: Arc<Mutex<T>>,
+}
+
+impl<T> Deref for OwnedMutexGuard<T> {
+    type Target = T;
+    
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.mutex.data.get() }
+    }
+}
+
+impl<T> DerefMut for OwnedMutexGuard<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.mutex.data.get() }
+    }
+}
+
+impl<T> Drop for OwnedMutexGuard<T> {
+    fn drop(&mut self) {
+        self.mutex.unlock();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ASYNC RWLOCK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// An async-aware reader-writer lock
+pub struct RwLock<T> {
+    state: AtomicUsize,
+    read_waiters: StdMutex<VecDeque<Waker>>,
+    write_waiters: StdMutex<VecDeque<Waker>>,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for RwLock<T> {}
+unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+
+// State encoding:
+// 0: unlocked
+// 1..MAX_READERS: reader count
+// MAX_READERS: write locked
+const MAX_READERS: usize = usize::MAX / 2;
+const WRITE_LOCKED: usize = usize::MAX;
+
+impl<T> RwLock<T> {
+    /// Create a new RwLock
+    pub const fn new(value: T) -> Self {
+        RwLock {
+            state: AtomicUsize::new(0),
+            read_waiters: StdMutex::new(VecDeque::new()),
+            write_waiters: StdMutex::new(VecDeque::new()),
+            data: UnsafeCell::new(value),
+        }
+    }
+    
+    /// Try to acquire read lock
+    pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
+        let mut state = self.state.load(Ordering::Relaxed);
+        
+        loop {
+            if state == WRITE_LOCKED || state >= MAX_READERS {
+                return None;
+            }
+            
+            match self.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(RwLockReadGuard { lock: self }),
+                Err(s) => state = s,
+            }
+        }
+    }
+    
+    /// Acquire read lock (blocking)
+    pub fn read(&self) -> RwLockReadGuard<'_, T> {
+        loop {
+            if let Some(guard) = self.try_read() {
+                return guard;
+            }
+            std::thread::yield_now();
+        }
+    }
+    
+    /// Poll for read lock (async)
+    pub fn poll_read(&self, waker: &Waker) -> Poll<RwLockReadGuard<'_, T>> {
+        if let Some(guard) = self.try_read() {
+            return Poll::Ready(guard);
+        }
+        
+        self.read_waiters.lock().unwrap().push_back(waker.clone());
+        
+        if let Some(guard) = self.try_read() {
+            return Poll::Ready(guard);
+        }
+        
+        Poll::Pending
+    }
+    
+    /// Try to acquire write lock
+    pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
+        if self.state.compare_exchange(
+            0,
+            WRITE_LOCKED,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ).is_ok() {
+            Some(RwLockWriteGuard { lock: self })
+        } else {
+            None
+        }
+    }
+    
+    /// Acquire write lock (blocking)
+    pub fn write(&self) -> RwLockWriteGuard<'_, T> {
+        loop {
+            if let Some(guard) = self.try_write() {
+                return guard;
+            }
+            std::thread::yield_now();
+        }
+    }
+    
+    /// Poll for write lock (async)
+    pub fn poll_write(&self, waker: &Waker) -> Poll<RwLockWriteGuard<'_, T>> {
+        if let Some(guard) = self.try_write() {
+            return Poll::Ready(guard);
+        }
+        
+        self.write_waiters.lock().unwrap().push_back(waker.clone());
+        
+        if let Some(guard) = self.try_write() {
+            return Poll::Ready(guard);
+        }
+        
+        Poll::Pending
+    }
+    
+    /// Get mutable reference without locking
+    pub fn get_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.data.get() }
+    }
+    
+    /// Consume and return inner value
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+    
+    fn release_read(&self) {
+        let prev = self.state.fetch_sub(1, Ordering::Release);
+        
+        // If we were the last reader, wake a writer
+        if prev == 1 {
+            if let Some(waker) = self.write_waiters.lock().unwrap().pop_front() {
+                waker.wake();
+            }
+        }
+    }
+    
+    fn release_write(&self) {
+        self.state.store(0, Ordering::Release);
+        
+        // Prefer waking readers (multiple can proceed)
+        let readers: Vec<_> = std::mem::take(&mut *self.read_waiters.lock().unwrap()).into();
+        if !readers.is_empty() {
+            for waker in readers {
+                waker.wake();
+            }
+        } else if let Some(waker) = self.write_waiters.lock().unwrap().pop_front() {
+            waker.wake();
+        }
+    }
+}
+
+/// Guard for shared read access
+pub struct RwLockReadGuard<'a, T> {
+    lock: &'a RwLock<T>,
+}
+
+impl<'a, T> Deref for RwLockReadGuard<'a, T> {
+    type Target = T;
+    
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<'a, T> Drop for RwLockReadGuard<'a, T> {
+    fn drop(&mut self) {
+        self.lock.release_read();
+    }
+}
+
+/// Guard for exclusive write access
+pub struct RwLockWriteGuard<'a, T> {
+    lock: &'a RwLock<T>,
+}
+
+impl<'a, T> Deref for RwLockWriteGuard<'a, T> {
+    type Target = T;
+    
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<'a, T> DerefMut for RwLockWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<'a, T> Drop for RwLockWriteGuard<'a, T> {
+    fn drop(&mut self) {
+        self.lock.release_write();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SEMAPHORE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A counting semaphore
+pub struct Semaphore {
+    permits: AtomicUsize,
+    max_permits: usize,
+    waiters: StdMutex<VecDeque<(usize, Waker)>>,
+    closed: AtomicBool,
+}
+
+impl Semaphore {
+    /// Create a new semaphore with given permits
+    pub fn new(permits: usize) -> Self {
+        Semaphore {
+            permits: AtomicUsize::new(permits),
+            max_permits: permits,
+            waiters: StdMutex::new(VecDeque::new()),
+            closed: AtomicBool::new(false),
+        }
+    }
+    
+    /// Create a constant semaphore
+    pub const fn const_new(permits: usize) -> Self {
+        Semaphore {
+            permits: AtomicUsize::new(permits),
+            max_permits: permits,
+            waiters: StdMutex::new(VecDeque::new()),
+            closed: AtomicBool::new(false),
+        }
+    }
+    
+    /// Try to acquire a permit
+    pub fn try_acquire(&self) -> Option<SemaphorePermit<'_>> {
+        self.try_acquire_many(1).map(|p| SemaphorePermit {
+            semaphore: self,
+            permits: 1,
+        })
+    }
+    
+    /// Try to acquire multiple permits
+    pub fn try_acquire_many(&self, n: usize) -> Option<SemaphorePermit<'_>> {
+        if self.closed.load(Ordering::Relaxed) {
+            return None;
+        }
+        
+        let mut current = self.permits.load(Ordering::Relaxed);
+        
+        loop {
+            if current < n {
+                return None;
+            }
+            
+            match self.permits.compare_exchange_weak(
+                current,
+                current - n,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(SemaphorePermit {
+                    semaphore: self,
+                    permits: n,
+                }),
+                Err(c) => current = c,
+            }
+        }
+    }
+    
+    /// Acquire a permit (blocking)
+    pub fn acquire(&self) -> Result<SemaphorePermit<'_>, AcquireError> {
+        self.acquire_many(1)
+    }
+    
+    /// Acquire multiple permits (blocking)
+    pub fn acquire_many(&self, n: usize) -> Result<SemaphorePermit<'_>, AcquireError> {
+        loop {
+            if self.closed.load(Ordering::Relaxed) {
+                return Err(AcquireError::Closed);
+            }
+            
+            if let Some(permit) = self.try_acquire_many(n) {
+                return Ok(permit);
+            }
+            
+            std::thread::yield_now();
+        }
+    }
+    
+    /// Poll to acquire permits (async)
+    pub fn poll_acquire(&self, n: usize, waker: &Waker) -> Poll<Result<SemaphorePermit<'_>, AcquireError>> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Poll::Ready(Err(AcquireError::Closed));
+        }
+        
+        if let Some(permit) = self.try_acquire_many(n) {
+            return Poll::Ready(Ok(permit));
+        }
+        
+        self.waiters.lock().unwrap().push_back((n, waker.clone()));
+        
+        // Double-check
+        if let Some(permit) = self.try_acquire_many(n) {
+            return Poll::Ready(Ok(permit));
+        }
+        
+        Poll::Pending
+    }
+    
+    /// Add permits (can exceed initial count)
+    pub fn add_permits(&self, n: usize) {
+        self.permits.fetch_add(n, Ordering::Release);
+        self.wake_waiters();
+    }
+    
+    /// Get available permits
+    pub fn available_permits(&self) -> usize {
+        self.permits.load(Ordering::Relaxed)
+    }
+    
+    /// Close the semaphore
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        
+        let waiters: Vec<_> = std::mem::take(&mut *self.waiters.lock().unwrap()).into();
+        for (_, waker) in waiters {
+            waker.wake();
+        }
+    }
+    
+    /// Check if closed
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+    
+    fn release(&self, n: usize) {
+        self.permits.fetch_add(n, Ordering::Release);
+        self.wake_waiters();
+    }
+    
+    fn wake_waiters(&self) {
+        let available = self.permits.load(Ordering::Acquire);
+        let mut waiters = self.waiters.lock().unwrap();
+        
+        // Wake waiters that can now proceed
+        while let Some(&(needed, _)) = waiters.front() {
+            if needed <= available {
+                let (_, waker) = waiters.pop_front().unwrap();
+                waker.wake();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Permit from a semaphore
+pub struct SemaphorePermit<'a> {
+    semaphore: &'a Semaphore,
+    permits: usize,
+}
+
+impl<'a> SemaphorePermit<'a> {
+    /// Forget the permit (don't release on drop)
+    pub fn forget(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl<'a> Drop for SemaphorePermit<'a> {
+    fn drop(&mut self) {
+        self.semaphore.release(self.permits);
+    }
+}
+
+/// Owned semaphore permit
+pub struct OwnedSemaphorePermit {
+    semaphore: Arc<Semaphore>,
+    permits: usize,
+}
+
+impl Drop for OwnedSemaphorePermit {
+    fn drop(&mut self) {
+        self.semaphore.release(self.permits);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BARRIER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A synchronization barrier
+pub struct Barrier {
+    count: usize,
+    arrived: AtomicUsize,
+    generation: AtomicUsize,
+    waiters: StdMutex<Vec<Waker>>,
+}
+
+impl Barrier {
+    /// Create a barrier for `count` tasks
+    pub fn new(count: usize) -> Self {
+        assert!(count > 0, "barrier count must be positive");
+        
+        Barrier {
+            count,
+            arrived: AtomicUsize::new(0),
+            generation: AtomicUsize::new(0),
+            waiters: StdMutex::new(Vec::with_capacity(count)),
+        }
+    }
+    
+    /// Wait at the barrier (blocking)
+    pub fn wait(&self) -> BarrierWaitResult {
+        let gen = self.generation.load(Ordering::Acquire);
+        let arrived = self.arrived.fetch_add(1, Ordering::AcqRel) + 1;
+        
+        if arrived == self.count {
+            // Last to arrive - reset and wake everyone
+            self.arrived.store(0, Ordering::Release);
+            self.generation.fetch_add(1, Ordering::Release);
+            
+            let waiters = std::mem::take(&mut *self.waiters.lock().unwrap());
+            for waker in waiters {
+                waker.wake();
+            }
+            
+            BarrierWaitResult { is_leader: true }
+        } else {
+            // Wait for others
+            loop {
+                if self.generation.load(Ordering::Acquire) != gen {
+                    return BarrierWaitResult { is_leader: false };
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+    
+    /// Poll to wait at barrier (async)
+    pub fn poll_wait(&self, waker: &Waker) -> Poll<BarrierWaitResult> {
+        let gen = self.generation.load(Ordering::Acquire);
+        
+        // Check if we've already passed this generation
+        let mut waiters = self.waiters.lock().unwrap();
+        
+        // Try to arrive
+        let arrived = self.arrived.load(Ordering::Acquire);
+        
+        if arrived == 0 && self.generation.load(Ordering::Acquire) != gen {
+            // Generation changed, we passed
+            return Poll::Ready(BarrierWaitResult { is_leader: false });
+        }
+        
+        // Try to increment
+        if self.arrived.compare_exchange(
+            arrived,
+            arrived + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ).is_ok() {
+            if arrived + 1 == self.count {
+                // We're the last one
+                self.arrived.store(0, Ordering::Release);
+                self.generation.fetch_add(1, Ordering::Release);
+                
+                let ws = std::mem::take(&mut *waiters);
+                for w in ws {
+                    w.wake();
+                }
+                
+                return Poll::Ready(BarrierWaitResult { is_leader: true });
+            }
+        }
+        
+        // Register to wait
+        waiters.push(waker.clone());
+        Poll::Pending
+    }
+}
+
+/// Result from waiting at a barrier
+#[derive(Debug, Clone)]
+pub struct BarrierWaitResult {
+    is_leader: bool,
+}
+
+impl BarrierWaitResult {
+    /// Returns true if this task was the leader
+    pub fn is_leader(&self) -> bool {
+        self.is_leader
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NOTIFY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Async notification primitive
+pub struct Notify {
+    notified: AtomicBool,
+    waiters: StdMutex<Vec<Waker>>,
+}
+
+impl Notify {
+    /// Create a new Notify
+    pub const fn new() -> Self {
+        Notify {
+            notified: AtomicBool::new(false),
+            waiters: StdMutex::new(Vec::new()),
+        }
+    }
+    
+    /// Notify one waiting task
+    pub fn notify_one(&self) {
+        if let Some(waker) = self.waiters.lock().unwrap().pop() {
+            waker.wake();
+        } else {
+            // Store permit for next waiter
+            self.notified.store(true, Ordering::Release);
+        }
+    }
+    
+    /// Notify all waiting tasks
+    pub fn notify_all(&self) {
+        let waiters = std::mem::take(&mut *self.waiters.lock().unwrap());
+        
+        if waiters.is_empty() {
+            self.notified.store(true, Ordering::Release);
+        } else {
+            for waker in waiters {
+                waker.wake();
+            }
+        }
+    }
+    
+    /// Wait for notification (blocking)
+    pub fn notified(&self) {
+        // Try to consume existing notification
+        if self.notified.compare_exchange(
+            true,
+            false,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ).is_ok() {
+            return;
+        }
+        
+        loop {
+            if self.notified.compare_exchange(
+                true,
+                false,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ).is_ok() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+    
+    /// Poll for notification (async)
+    pub fn poll_notified(&self, waker: &Waker) -> Poll<()> {
+        // Try to consume existing notification
+        if self.notified.compare_exchange(
+            true,
+            false,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ).is_ok() {
+            return Poll::Ready(());
+        }
+        
+        // Register waiter
+        self.waiters.lock().unwrap().push(waker.clone());
+        
+        // Double-check
+        if self.notified.compare_exchange(
+            true,
+            false,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ).is_ok() {
+            return Poll::Ready(());
+        }
+        
+        Poll::Pending
+    }
+}
+
+impl Default for Notify {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ONCE CELL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A cell that can be initialized once
+pub struct OnceCell<T> {
+    state: AtomicUsize,
+    value: UnsafeCell<Option<T>>,
+    waiters: StdMutex<Vec<Waker>>,
+}
+
+unsafe impl<T: Send + Sync> Send for OnceCell<T> {}
+unsafe impl<T: Send + Sync> Sync for OnceCell<T> {}
+
+const EMPTY: usize = 0;
+const INITIALIZING: usize = 1;
+const INITIALIZED: usize = 2;
+
+impl<T> OnceCell<T> {
+    /// Create a new empty OnceCell
+    pub const fn new() -> Self {
+        OnceCell {
+            state: AtomicUsize::new(EMPTY),
+            value: UnsafeCell::new(None),
+            waiters: StdMutex::new(Vec::new()),
+        }
+    }
+    
+    /// Create an initialized OnceCell
+    pub const fn new_with(value: T) -> Self {
+        OnceCell {
+            state: AtomicUsize::new(INITIALIZED),
+            value: UnsafeCell::new(Some(value)),
+            waiters: StdMutex::new(Vec::new()),
+        }
+    }
+    
+    /// Get the value if initialized
+    pub fn get(&self) -> Option<&T> {
+        if self.state.load(Ordering::Acquire) == INITIALIZED {
+            unsafe { (*self.value.get()).as_ref() }
+        } else {
+            None
+        }
+    }
+    
+    /// Get mutable reference if initialized
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        if *self.state.get_mut() == INITIALIZED {
+            self.value.get_mut().as_mut()
+        } else {
+            None
+        }
+    }
+    
+    /// Set the value (fails if already set)
+    pub fn set(&self, value: T) -> Result<(), T> {
+        if self.state.compare_exchange(
+            EMPTY,
+            INITIALIZING,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ).is_err() {
+            return Err(value);
+        }
+        
+        unsafe { *self.value.get() = Some(value) };
+        self.state.store(INITIALIZED, Ordering::Release);
+        
+        // Wake waiters
+        let waiters = std::mem::take(&mut *self.waiters.lock().unwrap());
+        for waker in waiters {
+            waker.wake();
+        }
+        
+        Ok(())
+    }
+    
+    /// Get or initialize the value
+    pub fn get_or_init<F: FnOnce() -> T>(&self, f: F) -> &T {
+        if let Some(value) = self.get() {
+            return value;
+        }
+        
+        match self.state.compare_exchange(
+            EMPTY,
+            INITIALIZING,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                let value = f();
+                unsafe { *self.value.get() = Some(value) };
+                self.state.store(INITIALIZED, Ordering::Release);
+                
+                let waiters = std::mem::take(&mut *self.waiters.lock().unwrap());
+                for waker in waiters {
+                    waker.wake();
+                }
+            }
+            Err(_) => {
+                // Wait for initialization
+                while self.state.load(Ordering::Acquire) != INITIALIZED {
+                    std::thread::yield_now();
+                }
+            }
+        }
+        
+        unsafe { (*self.value.get()).as_ref().unwrap() }
+    }
+    
+    /// Get or try to initialize
+    pub fn get_or_try_init<F, E>(&self, f: F) -> Result<&T, E>
+    where
+        F: FnOnce() -> Result<T, E>,
+    {
+        if let Some(value) = self.get() {
+            return Ok(value);
+        }
+        
+        match self.state.compare_exchange(
+            EMPTY,
+            INITIALIZING,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                match f() {
+                    Ok(value) => {
+                        unsafe { *self.value.get() = Some(value) };
+                        self.state.store(INITIALIZED, Ordering::Release);
+                        
+                        let waiters = std::mem::take(&mut *self.waiters.lock().unwrap());
+                        for waker in waiters {
+                            waker.wake();
+                        }
+                        
+                        Ok(unsafe { (*self.value.get()).as_ref().unwrap() })
+                    }
+                    Err(e) => {
+                        self.state.store(EMPTY, Ordering::Release);
+                        Err(e)
+                    }
+                }
+            }
+            Err(_) => {
+                while self.state.load(Ordering::Acquire) == INITIALIZING {
+                    std::thread::yield_now();
+                }
+                
+                if self.state.load(Ordering::Acquire) == INITIALIZED {
+                    Ok(unsafe { (*self.value.get()).as_ref().unwrap() })
+                } else {
+                    self.get_or_try_init(f)
+                }
+            }
+        }
+    }
+    
+    /// Poll for initialization (async)
+    pub fn poll_get(&self, waker: &Waker) -> Poll<Option<&T>> {
+        match self.state.load(Ordering::Acquire) {
+            INITIALIZED => Poll::Ready(unsafe { (*self.value.get()).as_ref() }),
+            EMPTY => Poll::Ready(None),
+            INITIALIZING => {
+                self.waiters.lock().unwrap().push(waker.clone());
+                Poll::Pending
+            }
+            _ => unreachable!(),
+        }
+    }
+    
+    /// Take the value (if initialized)
+    pub fn take(&mut self) -> Option<T> {
+        if *self.state.get_mut() == INITIALIZED {
+            *self.state.get_mut() = EMPTY;
+            self.value.get_mut().take()
+        } else {
+            None
+        }
+    }
+    
+    /// Consume and return inner value
+    pub fn into_inner(self) -> Option<T> {
+        if self.state.into_inner() == INITIALIZED {
+            self.value.into_inner()
+        } else {
+            None
+        }
+    }
+}
+
+impl<T> Default for OnceCell<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POLL TYPE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Poll result
+pub enum Poll<T> {
+    Ready(T),
+    Pending,
+}
+
+impl<T> Poll<T> {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Poll::Ready(_))
+    }
+    
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Poll::Pending)
+    }
+    
+    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Poll<U> {
+        match self {
+            Poll::Ready(t) => Poll::Ready(f(t)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Error when acquiring from semaphore fails
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireError {
+    Closed,
+}
+
+impl std::fmt::Display for AcquireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Closed => write!(f, "semaphore closed"),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_mutex_lock() {
+        let mutex = Mutex::new(42);
+        let guard = mutex.lock();
+        assert_eq!(*guard, 42);
+    }
+    
+    #[test]
+    fn test_mutex_try_lock() {
+        let mutex = Mutex::new(42);
+        let guard1 = mutex.try_lock().unwrap();
+        assert!(mutex.try_lock().is_none());
+        drop(guard1);
+        assert!(mutex.try_lock().is_some());
+    }
+    
+    #[test]
+    fn test_rwlock_read() {
+        let lock = RwLock::new(42);
+        let r1 = lock.read();
+        let r2 = lock.read();
+        assert_eq!(*r1, 42);
+        assert_eq!(*r2, 42);
+    }
+    
+    #[test]
+    fn test_rwlock_write() {
+        let lock = RwLock::new(42);
+        {
+            let mut w = lock.write();
+            *w = 100;
+        }
+        let r = lock.read();
+        assert_eq!(*r, 100);
+    }
+    
+    #[test]
+    fn test_semaphore() {
+        let sem = Semaphore::new(2);
+        let p1 = sem.try_acquire().unwrap();
+        let p2 = sem.try_acquire().unwrap();
+        assert!(sem.try_acquire().is_none());
+        drop(p1);
+        assert!(sem.try_acquire().is_some());
+    }
+    
+    #[test]
+    fn test_notify() {
+        let notify = Notify::new();
+        notify.notify_one();
+        // Would block without prior notification
+    }
+    
+    #[test]
+    fn test_once_cell() {
+        let cell: OnceCell<i32> = OnceCell::new();
+        assert!(cell.get().is_none());
+        cell.set(42).unwrap();
+        assert_eq!(*cell.get().unwrap(), 42);
+        assert!(cell.set(100).is_err());
+    }
+    
+    #[test]
+    fn test_once_cell_get_or_init() {
+        let cell: OnceCell<i32> = OnceCell::new();
+        let value = cell.get_or_init(|| 42);
+        assert_eq!(*value, 42);
+        let value2 = cell.get_or_init(|| 100);
+        assert_eq!(*value2, 42);
+    }
+}

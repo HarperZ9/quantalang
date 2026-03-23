@@ -1,0 +1,1104 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ FFI — Safety Layer
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Safe abstractions over unsafe FFI operations:
+// - Owned and borrowed foreign pointers with RAII
+// - Automatic resource cleanup
+// - Null pointer handling
+// - String conversions (CStr, CString)
+// - Slice conversions with bounds checking
+// - Error code translation
+// - Exception safety
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::ffi::safety
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use std::ffi::{CStr, CString};
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
+
+use super::types::ForeignType;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FOREIGN POINTER WRAPPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Owned pointer to foreign-allocated memory with automatic cleanup
+pub struct ForeignOwned<T> {
+    ptr: NonNull<T>,
+    dropper: Option<Box<dyn FnOnce(*mut T) + Send>>,
+    _marker: PhantomData<T>,
+}
+
+impl<T> ForeignOwned<T> {
+    /// Create from raw pointer with custom destructor
+    ///
+    /// # Safety
+    /// - `ptr` must be valid and properly aligned
+    /// - `ptr` must have been allocated by compatible allocator
+    /// - `dropper` must properly deallocate the memory
+    pub unsafe fn from_raw_with_dropper<F>(ptr: *mut T, dropper: F) -> Option<Self>
+    where
+        F: FnOnce(*mut T) + Send + 'static,
+    {
+        NonNull::new(ptr).map(|ptr| ForeignOwned {
+            ptr,
+            dropper: Some(Box::new(dropper)),
+            _marker: PhantomData,
+        })
+    }
+    
+    /// Create from raw pointer (uses libc free for deallocation)
+    ///
+    /// # Safety
+    /// Same requirements as `from_raw_with_dropper`
+    pub unsafe fn from_raw(ptr: *mut T) -> Option<Self> {
+        Self::from_raw_with_dropper(ptr, |p| {
+            libc_free(p as *mut std::ffi::c_void);
+        })
+    }
+    
+    /// Create from raw pointer without automatic deallocation
+    ///
+    /// # Safety
+    /// Caller is responsible for deallocation
+    pub unsafe fn from_raw_no_drop(ptr: *mut T) -> Option<Self> {
+        NonNull::new(ptr).map(|ptr| ForeignOwned {
+            ptr,
+            dropper: None,
+            _marker: PhantomData,
+        })
+    }
+    
+    /// Get raw pointer
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.as_ptr()
+    }
+    
+    /// Get mutable raw pointer
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr.as_ptr()
+    }
+    
+    /// Consume and return raw pointer (prevents automatic cleanup)
+    pub fn into_raw(mut self) -> *mut T {
+        self.dropper = None;
+        self.ptr.as_ptr()
+    }
+    
+    /// Check if pointer is non-null (always true for ForeignOwned)
+    pub fn is_valid(&self) -> bool {
+        true
+    }
+}
+
+impl<T> Deref for ForeignOwned<T> {
+    type Target = T;
+    
+    fn deref(&self) -> &T {
+        // Safety: NonNull guarantees valid pointer
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<T> DerefMut for ForeignOwned<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // Safety: NonNull guarantees valid pointer
+        unsafe { self.ptr.as_mut() }
+    }
+}
+
+impl<T> Drop for ForeignOwned<T> {
+    fn drop(&mut self) {
+        if let Some(dropper) = self.dropper.take() {
+            dropper(self.ptr.as_ptr());
+        }
+    }
+}
+
+// Safety: ForeignOwned is Send if T is Send
+unsafe impl<T: Send> Send for ForeignOwned<T> {}
+
+// Safety: ForeignOwned is Sync if T is Sync
+unsafe impl<T: Sync> Sync for ForeignOwned<T> {}
+
+/// Borrowed pointer to foreign memory (non-owning)
+pub struct ForeignRef<'a, T> {
+    ptr: NonNull<T>,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<'a, T> ForeignRef<'a, T> {
+    /// Create from raw pointer
+    ///
+    /// # Safety
+    /// - `ptr` must be valid for lifetime `'a`
+    /// - `ptr` must be properly aligned
+    /// - The pointed-to data must not be mutated during `'a`
+    pub unsafe fn from_raw(ptr: *const T) -> Option<Self> {
+        NonNull::new(ptr as *mut T).map(|ptr| ForeignRef {
+            ptr,
+            _marker: PhantomData,
+        })
+    }
+    
+    /// Get raw pointer
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.as_ptr()
+    }
+}
+
+impl<'a, T> Deref for ForeignRef<'a, T> {
+    type Target = T;
+    
+    fn deref(&self) -> &T {
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<'a, T> Clone for ForeignRef<'a, T> {
+    fn clone(&self) -> Self {
+        ForeignRef {
+            ptr: self.ptr,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, T> Copy for ForeignRef<'a, T> {}
+
+/// Mutable borrowed pointer to foreign memory
+pub struct ForeignMut<'a, T> {
+    ptr: NonNull<T>,
+    _marker: PhantomData<&'a mut T>,
+}
+
+impl<'a, T> ForeignMut<'a, T> {
+    /// Create from raw mutable pointer
+    ///
+    /// # Safety
+    /// - `ptr` must be valid for lifetime `'a`
+    /// - `ptr` must be properly aligned
+    /// - Must have exclusive access during `'a`
+    pub unsafe fn from_raw(ptr: *mut T) -> Option<Self> {
+        NonNull::new(ptr).map(|ptr| ForeignMut {
+            ptr,
+            _marker: PhantomData,
+        })
+    }
+    
+    /// Get raw pointer
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.as_ptr()
+    }
+    
+    /// Get mutable raw pointer
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr.as_ptr()
+    }
+}
+
+impl<'a, T> Deref for ForeignMut<'a, T> {
+    type Target = T;
+    
+    fn deref(&self) -> &T {
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<'a, T> DerefMut for ForeignMut<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { self.ptr.as_mut() }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NULLABLE POINTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Optional pointer that may be null
+pub struct NullablePtr<T> {
+    ptr: *mut T,
+    _marker: PhantomData<T>,
+}
+
+impl<T> NullablePtr<T> {
+    /// Create from raw pointer
+    pub fn new(ptr: *mut T) -> Self {
+        NullablePtr {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+    
+    /// Create null pointer
+    pub fn null() -> Self {
+        NullablePtr {
+            ptr: std::ptr::null_mut(),
+            _marker: PhantomData,
+        }
+    }
+    
+    /// Check if null
+    pub fn is_null(&self) -> bool {
+        self.ptr.is_null()
+    }
+    
+    /// Convert to Option
+    pub fn as_option(&self) -> Option<&T> {
+        if self.ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*self.ptr })
+        }
+    }
+    
+    /// Convert to mutable Option
+    pub fn as_option_mut(&mut self) -> Option<&mut T> {
+        if self.ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &mut *self.ptr })
+        }
+    }
+    
+    /// Get raw pointer
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+    
+    /// Get mutable raw pointer
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
+    
+    /// Unwrap or panic
+    pub fn unwrap(&self) -> &T {
+        self.as_option().expect("null pointer dereference")
+    }
+    
+    /// Unwrap mutable or panic
+    pub fn unwrap_mut(&mut self) -> &mut T {
+        self.as_option_mut().expect("null pointer dereference")
+    }
+}
+
+impl<T> Default for NullablePtr<T> {
+    fn default() -> Self {
+        Self::null()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRING CONVERSIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Safe wrapper for C strings
+pub struct SafeCString {
+    inner: CString,
+}
+
+impl SafeCString {
+    /// Create from Quanta String
+    pub fn new(s: &str) -> Result<Self, NulError> {
+        CString::new(s)
+            .map(|inner| SafeCString { inner })
+            .map_err(|e| NulError { position: e.nul_position() })
+    }
+    
+    /// Create, replacing interior nulls with replacement char
+    pub fn new_lossy(s: &str, replacement: char) -> Self {
+        let cleaned: String = s.chars()
+            .map(|c| if c == '\0' { replacement } else { c })
+            .collect();
+        
+        // Safe because we removed all nulls
+        SafeCString {
+            inner: CString::new(cleaned).unwrap(),
+        }
+    }
+    
+    /// Get as C pointer
+    pub fn as_ptr(&self) -> *const i8 {
+        self.inner.as_ptr()
+    }
+    
+    /// Get as byte slice (without null terminator)
+    pub fn as_bytes(&self) -> &[u8] {
+        self.inner.as_bytes()
+    }
+    
+    /// Get as byte slice (with null terminator)
+    pub fn as_bytes_with_nul(&self) -> &[u8] {
+        self.inner.as_bytes_with_nul()
+    }
+    
+    /// Convert back to String
+    pub fn to_string(&self) -> String {
+        self.inner.to_string_lossy().into_owned()
+    }
+}
+
+/// Error when string contains interior null
+#[derive(Debug, Clone)]
+pub struct NulError {
+    pub position: usize,
+}
+
+impl std::fmt::Display for NulError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "interior null byte at position {}", self.position)
+    }
+}
+
+/// Safe wrapper for borrowed C strings
+pub struct SafeCStr<'a> {
+    inner: &'a CStr,
+}
+
+impl<'a> SafeCStr<'a> {
+    /// Create from raw C string pointer
+    ///
+    /// # Safety
+    /// - `ptr` must be a valid null-terminated string
+    /// - String must be valid for lifetime `'a`
+    pub unsafe fn from_ptr(ptr: *const i8) -> Option<Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(SafeCStr {
+                inner: CStr::from_ptr(ptr),
+            })
+        }
+    }
+    
+    /// Create from byte slice with null terminator
+    pub fn from_bytes_with_nul(bytes: &'a [u8]) -> Result<Self, CStrError> {
+        CStr::from_bytes_with_nul(bytes)
+            .map(|inner| SafeCStr { inner })
+            .map_err(|_| CStrError::NotNulTerminated)
+    }
+    
+    /// Convert to str (may fail if not valid UTF-8)
+    pub fn to_str(&self) -> Result<&str, std::str::Utf8Error> {
+        self.inner.to_str()
+    }
+    
+    /// Convert to str (lossy)
+    pub fn to_string_lossy(&self) -> std::borrow::Cow<'a, str> {
+        self.inner.to_string_lossy()
+    }
+    
+    /// Get as byte slice (without null terminator)
+    pub fn to_bytes(&self) -> &[u8] {
+        self.inner.to_bytes()
+    }
+    
+    /// Get length (excluding null terminator)
+    pub fn len(&self) -> usize {
+        self.inner.to_bytes().len()
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum CStrError {
+    NotNulTerminated,
+    InteriorNul(usize),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLICE CONVERSIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Safe wrapper for foreign arrays/slices
+pub struct ForeignSlice<'a, T> {
+    ptr: *const T,
+    len: usize,
+    _marker: PhantomData<&'a [T]>,
+}
+
+impl<'a, T> ForeignSlice<'a, T> {
+    /// Create from pointer and length
+    ///
+    /// # Safety
+    /// - `ptr` must be valid for reads of `len * size_of::<T>()` bytes
+    /// - `ptr` must be properly aligned
+    /// - Memory must be valid for lifetime `'a`
+    pub unsafe fn from_raw_parts(ptr: *const T, len: usize) -> Self {
+        ForeignSlice {
+            ptr,
+            len,
+            _marker: PhantomData,
+        }
+    }
+    
+    /// Create empty slice
+    pub fn empty() -> Self {
+        ForeignSlice {
+            ptr: std::ptr::null(),
+            len: 0,
+            _marker: PhantomData,
+        }
+    }
+    
+    /// Get length
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    
+    /// Get element at index
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index < self.len {
+            Some(unsafe { &*self.ptr.add(index) })
+        } else {
+            None
+        }
+    }
+    
+    /// Convert to Rust slice
+    pub fn as_slice(&self) -> &[T] {
+        if self.len == 0 || self.ptr.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+    
+    /// Copy to Vec
+    pub fn to_vec(&self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        self.as_slice().to_vec()
+    }
+    
+    /// Get raw pointer
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+}
+
+impl<'a, T> Deref for ForeignSlice<'a, T> {
+    type Target = [T];
+    
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+/// Mutable foreign slice
+pub struct ForeignSliceMut<'a, T> {
+    ptr: *mut T,
+    len: usize,
+    _marker: PhantomData<&'a mut [T]>,
+}
+
+impl<'a, T> ForeignSliceMut<'a, T> {
+    /// Create from pointer and length
+    ///
+    /// # Safety
+    /// Same as ForeignSlice, plus exclusive access
+    pub unsafe fn from_raw_parts(ptr: *mut T, len: usize) -> Self {
+        ForeignSliceMut {
+            ptr,
+            len,
+            _marker: PhantomData,
+        }
+    }
+    
+    /// Get length
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    
+    /// Get element at index
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index < self.len {
+            Some(unsafe { &*self.ptr.add(index) })
+        } else {
+            None
+        }
+    }
+    
+    /// Get mutable element at index
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index < self.len {
+            Some(unsafe { &mut *self.ptr.add(index) })
+        } else {
+            None
+        }
+    }
+    
+    /// Convert to Rust slice
+    pub fn as_slice(&self) -> &[T] {
+        if self.len == 0 || self.ptr.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+    
+    /// Convert to mutable Rust slice
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        if self.len == 0 || self.ptr.is_null() {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        }
+    }
+}
+
+impl<'a, T> Deref for ForeignSliceMut<'a, T> {
+    type Target = [T];
+    
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl<'a, T> DerefMut for ForeignSliceMut<'a, T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        self.as_mut_slice()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR HANDLING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// FFI error with optional error code
+#[derive(Debug, Clone)]
+pub struct FfiError {
+    pub code: i32,
+    pub message: String,
+    pub source: Option<String>,
+}
+
+impl FfiError {
+    pub fn new(code: i32, message: impl Into<String>) -> Self {
+        FfiError {
+            code,
+            message: message.into(),
+            source: None,
+        }
+    }
+    
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+    
+    /// Create from errno
+    pub fn from_errno() -> Self {
+        let code = get_errno();
+        let message = strerror(code);
+        FfiError::new(code, message)
+    }
+    
+    /// Check if represents success (code 0)
+    pub fn is_success(&self) -> bool {
+        self.code == 0
+    }
+}
+
+impl std::fmt::Display for FfiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FFI error {}: {}", self.code, self.message)?;
+        if let Some(ref source) = self.source {
+            write!(f, " (from {})", source)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for FfiError {}
+
+/// FFI result type
+pub type FfiResult<T> = Result<T, FfiError>;
+
+/// Convert C return code to Result
+pub fn check_return_code(code: i32) -> FfiResult<()> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(FfiError::from_errno())
+    }
+}
+
+/// Convert negative return code to Result (POSIX style)
+pub fn check_posix_return<T: TryInto<usize>>(code: T) -> FfiResult<usize>
+where
+    T: Copy + PartialOrd + Default,
+{
+    let zero = T::default();
+    if code >= zero {
+        // Safe: we checked >= 0
+        Ok(unsafe { std::mem::transmute_copy(&code) })
+    } else {
+        Err(FfiError::from_errno())
+    }
+}
+
+/// Convert null pointer to Result
+pub fn check_null_ptr<T>(ptr: *mut T, context: &str) -> FfiResult<NonNull<T>> {
+    NonNull::new(ptr).ok_or_else(|| {
+        let mut err = FfiError::from_errno();
+        err.source = Some(context.to_string());
+        err
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRNO HANDLING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Get current errno value
+pub fn get_errno() -> i32 {
+    #[cfg(unix)]
+    {
+        unsafe { *libc_errno_location() }
+    }
+    
+    #[cfg(windows)]
+    {
+        unsafe { GetLastError() as i32 }
+    }
+    
+    #[cfg(not(any(unix, windows)))]
+    {
+        0
+    }
+}
+
+/// Set errno value
+pub fn set_errno(value: i32) {
+    #[cfg(unix)]
+    {
+        unsafe { *libc_errno_location() = value; }
+    }
+    
+    #[cfg(windows)]
+    {
+        unsafe { SetLastError(value as u32); }
+    }
+}
+
+/// Clear errno (set to 0)
+pub fn clear_errno() {
+    set_errno(0);
+}
+
+/// Get error message for errno
+pub fn strerror(errno: i32) -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0i8; 256];
+        let result = unsafe { libc_strerror_r(errno, buf.as_mut_ptr(), buf.len()) };
+        if result == 0 {
+            unsafe { CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned() }
+        } else {
+            format!("Unknown error {}", errno)
+        }
+    }
+    
+    #[cfg(windows)]
+    {
+        // Would use FormatMessage
+        format!("Error code {}", errno)
+    }
+    
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!("Error {}", errno)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RESOURCE GUARD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// RAII guard for foreign resources
+pub struct ResourceGuard<T, F>
+where
+    F: FnOnce(T),
+{
+    resource: Option<T>,
+    cleanup: Option<F>,
+}
+
+impl<T, F> ResourceGuard<T, F>
+where
+    F: FnOnce(T),
+{
+    /// Create new resource guard
+    pub fn new(resource: T, cleanup: F) -> Self {
+        ResourceGuard {
+            resource: Some(resource),
+            cleanup: Some(cleanup),
+        }
+    }
+    
+    /// Get reference to resource
+    pub fn get(&self) -> &T {
+        self.resource.as_ref().unwrap()
+    }
+    
+    /// Get mutable reference to resource
+    pub fn get_mut(&mut self) -> &mut T {
+        self.resource.as_mut().unwrap()
+    }
+    
+    /// Release resource without cleanup
+    pub fn release(mut self) -> T {
+        self.cleanup = None;
+        self.resource.take().unwrap()
+    }
+    
+    /// Manually trigger cleanup
+    pub fn cleanup(mut self) {
+        if let (Some(resource), Some(cleanup)) = (self.resource.take(), self.cleanup.take()) {
+            cleanup(resource);
+        }
+    }
+}
+
+impl<T, F> Deref for ResourceGuard<T, F>
+where
+    F: FnOnce(T),
+{
+    type Target = T;
+    
+    fn deref(&self) -> &T {
+        self.get()
+    }
+}
+
+impl<T, F> DerefMut for ResourceGuard<T, F>
+where
+    F: FnOnce(T),
+{
+    fn deref_mut(&mut self) -> &mut T {
+        self.get_mut()
+    }
+}
+
+impl<T, F> Drop for ResourceGuard<T, F>
+where
+    F: FnOnce(T),
+{
+    fn drop(&mut self) {
+        if let (Some(resource), Some(cleanup)) = (self.resource.take(), self.cleanup.take()) {
+            cleanup(resource);
+        }
+    }
+}
+
+/// Create a resource guard for file descriptors
+pub fn guard_fd(fd: i32) -> ResourceGuard<i32, impl FnOnce(i32)> {
+    ResourceGuard::new(fd, |fd| {
+        if fd >= 0 {
+            unsafe { close_fd(fd); }
+        }
+    })
+}
+
+/// Create a resource guard for heap allocations
+pub fn guard_ptr<T>(ptr: *mut T) -> ResourceGuard<*mut T, impl FnOnce(*mut T)> {
+    ResourceGuard::new(ptr, |ptr| {
+        if !ptr.is_null() {
+            unsafe { libc_free(ptr as *mut std::ffi::c_void); }
+        }
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCOPE GUARD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Execute cleanup code on scope exit
+pub struct ScopeGuard<F: FnOnce()> {
+    cleanup: Option<F>,
+}
+
+impl<F: FnOnce()> ScopeGuard<F> {
+    pub fn new(cleanup: F) -> Self {
+        ScopeGuard {
+            cleanup: Some(cleanup),
+        }
+    }
+    
+    /// Cancel the cleanup
+    pub fn dismiss(mut self) {
+        self.cleanup = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for ScopeGuard<F> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
+/// Create scope guard
+pub fn defer<F: FnOnce()>(f: F) -> ScopeGuard<F> {
+    ScopeGuard::new(f)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PANIC SAFETY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Catch panics at FFI boundary
+pub fn catch_unwind_ffi<F, R>(f: F, default: R) -> R
+where
+    F: FnOnce() -> R + std::panic::UnwindSafe,
+{
+    std::panic::catch_unwind(f).unwrap_or(default)
+}
+
+/// Catch panics and convert to error code
+pub fn catch_unwind_to_errno<F>(f: F) -> i32
+where
+    F: FnOnce() -> i32 + std::panic::UnwindSafe,
+{
+    std::panic::catch_unwind(f).unwrap_or(-1)
+}
+
+/// Abort-safe FFI boundary
+pub fn abort_on_panic<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    struct AbortOnDrop;
+    
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            std::process::abort();
+        }
+    }
+    
+    let _guard = AbortOnDrop;
+    let result = f();
+    std::mem::forget(_guard);
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXTERN DECLARATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// libc functions
+extern "C" {
+    fn free(ptr: *mut std::ffi::c_void);
+    
+    #[cfg(unix)]
+    fn close(fd: i32) -> i32;
+    
+    #[cfg(unix)]
+    fn __errno_location() -> *mut i32;
+    
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn strerror_r(errnum: i32, buf: *mut i8, buflen: usize) -> i32;
+    
+    #[cfg(target_os = "macos")]
+    fn strerror_r(errnum: i32, buf: *mut i8, buflen: usize) -> i32;
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn GetLastError() -> u32;
+    fn SetLastError(dwErrCode: u32);
+    fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+}
+
+// Wrapper functions to handle platform differences
+fn libc_free(ptr: *mut std::ffi::c_void) {
+    unsafe { free(ptr); }
+}
+
+#[cfg(unix)]
+fn libc_errno_location() -> *mut i32 {
+    unsafe { __errno_location() }
+}
+
+#[cfg(unix)]
+fn libc_strerror_r(errnum: i32, buf: *mut i8, buflen: usize) -> i32 {
+    unsafe { strerror_r(errnum, buf, buflen) }
+}
+
+#[cfg(unix)]
+fn close_fd(fd: i32) -> i32 {
+    unsafe { close(fd) }
+}
+
+#[cfg(windows)]
+fn close_fd(_fd: i32) -> i32 {
+    // Windows uses CloseHandle for handles
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_safe_cstring() {
+        let s = SafeCString::new("hello").unwrap();
+        assert_eq!(s.as_bytes(), b"hello");
+        assert_eq!(s.to_string(), "hello");
+    }
+    
+    #[test]
+    fn test_safe_cstring_with_null() {
+        let result = SafeCString::new("hel\0lo");
+        assert!(result.is_err());
+    }
+    
+    #[test]
+    fn test_safe_cstring_lossy() {
+        let s = SafeCString::new_lossy("hel\0lo", '?');
+        assert_eq!(s.to_string(), "hel?lo");
+    }
+    
+    #[test]
+    fn test_nullable_ptr_null() {
+        let ptr: NullablePtr<i32> = NullablePtr::null();
+        assert!(ptr.is_null());
+        assert!(ptr.as_option().is_none());
+    }
+    
+    #[test]
+    fn test_nullable_ptr_valid() {
+        let mut value = 42i32;
+        let mut ptr = NullablePtr::new(&mut value);
+        assert!(!ptr.is_null());
+        assert_eq!(*ptr.unwrap(), 42);
+    }
+    
+    #[test]
+    fn test_foreign_slice() {
+        let data = [1, 2, 3, 4, 5];
+        let slice = unsafe { ForeignSlice::from_raw_parts(data.as_ptr(), data.len()) };
+        
+        assert_eq!(slice.len(), 5);
+        assert_eq!(slice.get(0), Some(&1));
+        assert_eq!(slice.get(4), Some(&5));
+        assert_eq!(slice.get(5), None);
+        assert_eq!(slice.as_slice(), &[1, 2, 3, 4, 5]);
+    }
+    
+    #[test]
+    fn test_ffi_error() {
+        let err = FfiError::new(1, "test error")
+            .with_source("test_function");
+        
+        assert_eq!(err.code, 1);
+        assert_eq!(err.message, "test error");
+        assert_eq!(err.source, Some("test_function".to_string()));
+    }
+    
+    #[test]
+    fn test_check_return_code() {
+        assert!(check_return_code(0).is_ok());
+        // Note: Non-zero return codes will include errno message
+    }
+    
+    #[test]
+    fn test_resource_guard() {
+        use std::cell::Cell;
+        
+        let cleaned = Cell::new(false);
+        
+        {
+            let _guard = ResourceGuard::new(42, |_| cleaned.set(true));
+            assert!(!cleaned.get());
+        }
+        
+        assert!(cleaned.get());
+    }
+    
+    #[test]
+    fn test_resource_guard_release() {
+        use std::cell::Cell;
+        
+        let cleaned = Cell::new(false);
+        
+        let value = {
+            let guard = ResourceGuard::new(42, |_| cleaned.set(true));
+            guard.release()
+        };
+        
+        assert_eq!(value, 42);
+        assert!(!cleaned.get());
+    }
+    
+    #[test]
+    fn test_scope_guard() {
+        use std::cell::Cell;
+        
+        let cleaned = Cell::new(false);
+        
+        {
+            let _guard = defer(|| cleaned.set(true));
+            assert!(!cleaned.get());
+        }
+        
+        assert!(cleaned.get());
+    }
+    
+    #[test]
+    fn test_scope_guard_dismiss() {
+        use std::cell::Cell;
+        
+        let cleaned = Cell::new(false);
+        
+        {
+            let guard = defer(|| cleaned.set(true));
+            guard.dismiss();
+        }
+        
+        assert!(!cleaned.get());
+    }
+    
+    #[test]
+    fn test_catch_unwind_ffi() {
+        let result = catch_unwind_ffi(|| 42, -1);
+        assert_eq!(result, 42);
+    }
+    
+    #[test]
+    fn test_catch_unwind_ffi_panic() {
+        let result = catch_unwind_ffi(|| panic!("test"), -1);
+        assert_eq!(result, -1);
+    }
+}

@@ -1,0 +1,680 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Signal Handler Runtime
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Platform-abstracted signal handling:
+//   - POSIX signal registration
+//   - Windows Structured Exception Handling
+//   - Stack overflow detection
+//   - Segfault recovery
+//   - Ctrl+C handling
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::runtime::signal
+
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use core::sync::atomic::{AtomicU32, AtomicPtr, AtomicBool, Ordering};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Signal types (platform abstracted)
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Signal {
+    /// Interrupt (Ctrl+C)
+    Interrupt = 1,
+    /// Terminate request
+    Terminate = 2,
+    /// Segmentation fault
+    Segfault = 3,
+    /// Bus error
+    BusError = 4,
+    /// Floating point exception
+    FloatingPointException = 5,
+    /// Illegal instruction
+    IllegalInstruction = 6,
+    /// Abort
+    Abort = 7,
+    /// Alarm/timer
+    Alarm = 8,
+    /// Child process status change
+    Child = 9,
+    /// Continue if stopped
+    Continue = 10,
+    /// Stop process
+    Stop = 11,
+    /// User-defined 1
+    User1 = 12,
+    /// User-defined 2
+    User2 = 13,
+    /// Broken pipe
+    Pipe = 14,
+    /// Stack overflow
+    StackOverflow = 15,
+    /// Unknown/other
+    Unknown = 255,
+}
+
+impl Signal {
+    /// Convert from platform-specific signal number
+    #[cfg(unix)]
+    pub fn from_raw(sig: i32) -> Self {
+        match sig {
+            libc::SIGINT => Signal::Interrupt,
+            libc::SIGTERM => Signal::Terminate,
+            libc::SIGSEGV => Signal::Segfault,
+            libc::SIGBUS => Signal::BusError,
+            libc::SIGFPE => Signal::FloatingPointException,
+            libc::SIGILL => Signal::IllegalInstruction,
+            libc::SIGABRT => Signal::Abort,
+            libc::SIGALRM => Signal::Alarm,
+            libc::SIGCHLD => Signal::Child,
+            libc::SIGCONT => Signal::Continue,
+            libc::SIGSTOP => Signal::Stop,
+            libc::SIGUSR1 => Signal::User1,
+            libc::SIGUSR2 => Signal::User2,
+            libc::SIGPIPE => Signal::Pipe,
+            _ => Signal::Unknown,
+        }
+    }
+    
+    /// Convert to platform-specific signal number
+    #[cfg(unix)]
+    pub fn to_raw(self) -> i32 {
+        match self {
+            Signal::Interrupt => libc::SIGINT,
+            Signal::Terminate => libc::SIGTERM,
+            Signal::Segfault => libc::SIGSEGV,
+            Signal::BusError => libc::SIGBUS,
+            Signal::FloatingPointException => libc::SIGFPE,
+            Signal::IllegalInstruction => libc::SIGILL,
+            Signal::Abort => libc::SIGABRT,
+            Signal::Alarm => libc::SIGALRM,
+            Signal::Child => libc::SIGCHLD,
+            Signal::Continue => libc::SIGCONT,
+            Signal::Stop => libc::SIGSTOP,
+            Signal::User1 => libc::SIGUSR1,
+            Signal::User2 => libc::SIGUSR2,
+            Signal::Pipe => libc::SIGPIPE,
+            _ => 0,
+        }
+    }
+    
+    /// Check if signal is fatal by default
+    pub fn is_fatal(self) -> bool {
+        matches!(self,
+            Signal::Segfault |
+            Signal::BusError |
+            Signal::FloatingPointException |
+            Signal::IllegalInstruction |
+            Signal::Abort |
+            Signal::StackOverflow
+        )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Context when signal was raised
+#[repr(C)]
+pub struct SignalContext {
+    /// Program counter
+    pub pc: usize,
+    /// Stack pointer
+    pub sp: usize,
+    /// Frame pointer
+    pub fp: usize,
+    /// Faulting address (for SIGSEGV/SIGBUS)
+    pub fault_addr: usize,
+    /// Error code (platform specific)
+    pub error_code: u32,
+    /// Platform-specific context
+    #[cfg(unix)]
+    pub ucontext: *mut libc::ucontext_t,
+    #[cfg(windows)]
+    pub exception_record: *mut EXCEPTION_RECORD,
+}
+
+impl SignalContext {
+    /// Create empty context
+    pub const fn empty() -> Self {
+        SignalContext {
+            pc: 0,
+            sp: 0,
+            fp: 0,
+            fault_addr: 0,
+            error_code: 0,
+            #[cfg(unix)]
+            ucontext: core::ptr::null_mut(),
+            #[cfg(windows)]
+            exception_record: core::ptr::null_mut(),
+        }
+    }
+    
+    /// Check if this is a stack overflow
+    pub fn is_stack_overflow(&self) -> bool {
+        // Check if fault address is near stack pointer
+        let stack_diff = if self.fault_addr > self.sp {
+            self.fault_addr - self.sp
+        } else {
+            self.sp - self.fault_addr
+        };
+        
+        // Within one page of stack pointer
+        stack_diff < 4096
+    }
+    
+    /// Get general purpose register
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    pub fn get_register(&self, reg: usize) -> Option<usize> {
+        unsafe {
+            if self.ucontext.is_null() {
+                return None;
+            }
+            
+            let uc = &*self.ucontext;
+            let gregs = &uc.uc_mcontext.gregs;
+            
+            match reg {
+                0 => Some(gregs[libc::REG_RAX as usize] as usize),
+                1 => Some(gregs[libc::REG_RBX as usize] as usize),
+                2 => Some(gregs[libc::REG_RCX as usize] as usize),
+                3 => Some(gregs[libc::REG_RDX as usize] as usize),
+                4 => Some(gregs[libc::REG_RSI as usize] as usize),
+                5 => Some(gregs[libc::REG_RDI as usize] as usize),
+                6 => Some(gregs[libc::REG_RBP as usize] as usize),
+                7 => Some(gregs[libc::REG_RSP as usize] as usize),
+                _ => None,
+            }
+        }
+    }
+    
+    /// Set program counter (for recovery)
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    pub fn set_pc(&mut self, pc: usize) {
+        unsafe {
+            if !self.ucontext.is_null() {
+                (*self.ucontext).uc_mcontext.gregs[libc::REG_RIP as usize] = pc as i64;
+                self.pc = pc;
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL HANDLER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Handler result
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HandlerResult {
+    /// Continue normal execution (if possible)
+    Continue,
+    /// Re-raise the signal with default behavior
+    Default,
+    /// Abort the process
+    Abort,
+    /// Call next handler in chain
+    Chain,
+}
+
+/// Signal handler function type
+pub type SignalHandler = fn(Signal, &mut SignalContext) -> HandlerResult;
+
+/// Registered handler entry
+struct HandlerEntry {
+    signal: Signal,
+    handler: SignalHandler,
+    priority: i32,
+}
+
+/// Signal handler registry
+static HANDLERS: SignalHandlerRegistry = SignalHandlerRegistry::new();
+
+struct SignalHandlerRegistry {
+    /// Handlers by signal type
+    handlers: [AtomicPtr<Vec<HandlerEntry>>; 16],
+    /// Global flag for interrupt received
+    interrupt_flag: AtomicBool,
+    /// Initialization flag
+    initialized: AtomicBool,
+}
+
+impl SignalHandlerRegistry {
+    const fn new() -> Self {
+        const EMPTY: AtomicPtr<Vec<HandlerEntry>> = AtomicPtr::new(core::ptr::null_mut());
+        
+        SignalHandlerRegistry {
+            handlers: [EMPTY; 16],
+            interrupt_flag: AtomicBool::new(false),
+            initialized: AtomicBool::new(false),
+        }
+    }
+    
+    fn init(&self) {
+        if self.initialized.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        
+        // Initialize handler vectors
+        for slot in &self.handlers {
+            let vec = Box::into_raw(Box::new(Vec::new()));
+            slot.store(vec, Ordering::Release);
+        }
+        
+        // Install platform-specific handlers
+        #[cfg(unix)]
+        install_unix_handlers();
+        
+        #[cfg(windows)]
+        install_windows_handlers();
+    }
+    
+    fn register(&self, signal: Signal, handler: SignalHandler, priority: i32) {
+        self.init();
+        
+        let idx = (signal as usize) % self.handlers.len();
+        let vec_ptr = self.handlers[idx].load(Ordering::Acquire);
+        
+        if vec_ptr.is_null() {
+            return;
+        }
+        
+        unsafe {
+            let vec = &mut *vec_ptr;
+            vec.push(HandlerEntry { signal, handler, priority });
+            vec.sort_by(|a, b| b.priority.cmp(&a.priority));
+        }
+    }
+    
+    fn handle(&self, signal: Signal, ctx: &mut SignalContext) -> HandlerResult {
+        let idx = (signal as usize) % self.handlers.len();
+        let vec_ptr = self.handlers[idx].load(Ordering::Acquire);
+        
+        if vec_ptr.is_null() {
+            return HandlerResult::Default;
+        }
+        
+        unsafe {
+            let vec = &*vec_ptr;
+            
+            for entry in vec.iter() {
+                if entry.signal == signal {
+                    match (entry.handler)(signal, ctx) {
+                        HandlerResult::Chain => continue,
+                        result => return result,
+                    }
+                }
+            }
+        }
+        
+        HandlerResult::Default
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UNIX SIGNAL HANDLING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(unix)]
+fn install_unix_handlers() {
+    use core::mem::MaybeUninit;
+    
+    unsafe {
+        // Set up alternate signal stack for stack overflow handling
+        let stack_size = libc::SIGSTKSZ * 2;
+        let stack = libc::mmap(
+            core::ptr::null_mut(),
+            stack_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        
+        if stack != libc::MAP_FAILED {
+            let mut ss: libc::stack_t = MaybeUninit::zeroed().assume_init();
+            ss.ss_sp = stack;
+            ss.ss_size = stack_size;
+            ss.ss_flags = 0;
+            libc::sigaltstack(&ss, core::ptr::null_mut());
+        }
+        
+        // Install handlers for critical signals
+        install_unix_signal(libc::SIGSEGV);
+        install_unix_signal(libc::SIGBUS);
+        install_unix_signal(libc::SIGFPE);
+        install_unix_signal(libc::SIGILL);
+        install_unix_signal(libc::SIGABRT);
+        install_unix_signal(libc::SIGINT);
+        install_unix_signal(libc::SIGTERM);
+        install_unix_signal(libc::SIGPIPE);
+    }
+}
+
+#[cfg(unix)]
+unsafe fn install_unix_signal(sig: i32) {
+    use core::mem::MaybeUninit;
+    
+    let mut sa: libc::sigaction = MaybeUninit::zeroed().assume_init();
+    
+    sa.sa_sigaction = unix_signal_handler as usize;
+    sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+    libc::sigemptyset(&mut sa.sa_mask);
+    
+    libc::sigaction(sig, &sa, core::ptr::null_mut());
+}
+
+#[cfg(unix)]
+extern "C" fn unix_signal_handler(
+    sig: i32,
+    info: *mut libc::siginfo_t,
+    ucontext: *mut libc::c_void,
+) {
+    let signal = Signal::from_raw(sig);
+    
+    // Build context
+    let mut ctx = SignalContext::empty();
+    ctx.ucontext = ucontext as *mut libc::ucontext_t;
+    
+    unsafe {
+        if !info.is_null() {
+            ctx.fault_addr = (*info).si_addr() as usize;
+        }
+        
+        if !ctx.ucontext.is_null() {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let uc = &*ctx.ucontext;
+                ctx.pc = uc.uc_mcontext.gregs[libc::REG_RIP as usize] as usize;
+                ctx.sp = uc.uc_mcontext.gregs[libc::REG_RSP as usize] as usize;
+                ctx.fp = uc.uc_mcontext.gregs[libc::REG_RBP as usize] as usize;
+            }
+        }
+    }
+    
+    // Check for stack overflow
+    let actual_signal = if signal == Signal::Segfault && ctx.is_stack_overflow() {
+        Signal::StackOverflow
+    } else {
+        signal
+    };
+    
+    // Handle signal
+    let result = HANDLERS.handle(actual_signal, &mut ctx);
+    
+    match result {
+        HandlerResult::Continue => {
+            // Handler modified context, return to continue
+        }
+        HandlerResult::Abort => {
+            unsafe { libc::abort(); }
+        }
+        HandlerResult::Default | HandlerResult::Chain => {
+            // Re-raise with default handler
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+                libc::raise(sig);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WINDOWS EXCEPTION HANDLING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(windows)]
+#[repr(C)]
+struct EXCEPTION_RECORD {
+    exception_code: u32,
+    exception_flags: u32,
+    exception_record: *mut EXCEPTION_RECORD,
+    exception_address: *mut u8,
+    number_parameters: u32,
+    exception_information: [usize; 15],
+}
+
+#[cfg(windows)]
+const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC0000005;
+#[cfg(windows)]
+const EXCEPTION_STACK_OVERFLOW: u32 = 0xC00000FD;
+#[cfg(windows)]
+const EXCEPTION_INT_DIVIDE_BY_ZERO: u32 = 0xC0000094;
+#[cfg(windows)]
+const EXCEPTION_INT_OVERFLOW: u32 = 0xC0000095;
+#[cfg(windows)]
+const EXCEPTION_ILLEGAL_INSTRUCTION: u32 = 0xC000001D;
+#[cfg(windows)]
+const EXCEPTION_FLT_DIVIDE_BY_ZERO: u32 = 0xC000008E;
+
+#[cfg(windows)]
+fn install_windows_handlers() {
+    unsafe {
+        AddVectoredExceptionHandler(1, windows_exception_handler);
+        SetConsoleCtrlHandler(windows_ctrl_handler, 1);
+    }
+}
+
+#[cfg(windows)]
+extern "system" fn windows_exception_handler(
+    exception_info: *mut EXCEPTION_POINTERS,
+) -> i32 {
+    const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    
+    unsafe {
+        if exception_info.is_null() {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        
+        let info = &*exception_info;
+        let record = &*info.exception_record;
+        
+        let signal = match record.exception_code {
+            EXCEPTION_ACCESS_VIOLATION => Signal::Segfault,
+            EXCEPTION_STACK_OVERFLOW => Signal::StackOverflow,
+            EXCEPTION_INT_DIVIDE_BY_ZERO | EXCEPTION_FLT_DIVIDE_BY_ZERO => {
+                Signal::FloatingPointException
+            }
+            EXCEPTION_ILLEGAL_INSTRUCTION => Signal::IllegalInstruction,
+            _ => return EXCEPTION_CONTINUE_SEARCH,
+        };
+        
+        let mut ctx = SignalContext::empty();
+        ctx.exception_record = info.exception_record;
+        ctx.pc = record.exception_address as usize;
+        ctx.error_code = record.exception_code;
+        
+        if record.exception_code == EXCEPTION_ACCESS_VIOLATION && record.number_parameters >= 2 {
+            ctx.fault_addr = record.exception_information[1];
+        }
+        
+        let result = HANDLERS.handle(signal, &mut ctx);
+        
+        match result {
+            HandlerResult::Continue => EXCEPTION_CONTINUE_EXECUTION,
+            _ => EXCEPTION_CONTINUE_SEARCH,
+        }
+    }
+}
+
+#[cfg(windows)]
+extern "system" fn windows_ctrl_handler(ctrl_type: u32) -> i32 {
+    const CTRL_C_EVENT: u32 = 0;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    const CTRL_CLOSE_EVENT: u32 = 2;
+    
+    let signal = match ctrl_type {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT => Signal::Interrupt,
+        CTRL_CLOSE_EVENT => Signal::Terminate,
+        _ => return 0,
+    };
+    
+    HANDLERS.interrupt_flag.store(true, Ordering::Release);
+    
+    let mut ctx = SignalContext::empty();
+    let result = HANDLERS.handle(signal, &mut ctx);
+    
+    match result {
+        HandlerResult::Continue | HandlerResult::Chain => 1,
+        _ => 0,
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct EXCEPTION_POINTERS {
+    exception_record: *mut EXCEPTION_RECORD,
+    context_record: *mut u8,
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn AddVectoredExceptionHandler(first: u32, handler: extern "system" fn(*mut EXCEPTION_POINTERS) -> i32) -> *mut u8;
+    fn SetConsoleCtrlHandler(handler: extern "system" fn(u32) -> i32, add: i32) -> i32;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PUBLIC API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Initialize signal handling
+pub fn init() {
+    HANDLERS.init();
+}
+
+/// Register a signal handler
+pub fn register(signal: Signal, handler: SignalHandler, priority: i32) {
+    HANDLERS.register(signal, handler, priority);
+}
+
+/// Check if interrupt was received
+pub fn interrupt_received() -> bool {
+    HANDLERS.interrupt_flag.load(Ordering::Acquire)
+}
+
+/// Clear interrupt flag
+pub fn clear_interrupt() {
+    HANDLERS.interrupt_flag.store(false, Ordering::Release);
+}
+
+/// Raise a signal
+#[cfg(unix)]
+pub fn raise(signal: Signal) {
+    unsafe {
+        libc::raise(signal.to_raw());
+    }
+}
+
+/// Default handler that prints crash info
+pub fn default_crash_handler(signal: Signal, ctx: &mut SignalContext) -> HandlerResult {
+    // Print crash information
+    eprintln!("\n=== SIGNAL {} ===", signal as u32);
+    eprintln!("  PC: 0x{:016x}", ctx.pc);
+    eprintln!("  SP: 0x{:016x}", ctx.sp);
+    eprintln!("  FP: 0x{:016x}", ctx.fp);
+    
+    if ctx.fault_addr != 0 {
+        eprintln!("  Fault address: 0x{:016x}", ctx.fault_addr);
+    }
+    
+    // Print backtrace
+    print_backtrace();
+    
+    HandlerResult::Abort
+}
+
+fn print_backtrace() {
+    eprintln!("\nBacktrace:");
+    
+    // TODO: Implement proper unwinding
+    #[cfg(unix)]
+    unsafe {
+        const MAX_FRAMES: usize = 64;
+        let mut frames: [*mut libc::c_void; MAX_FRAMES] = [core::ptr::null_mut(); MAX_FRAMES];
+        
+        let n = libc::backtrace(frames.as_mut_ptr(), MAX_FRAMES as i32);
+        
+        for i in 0..n as usize {
+            eprintln!("  #{}: {:?}", i, frames[i]);
+        }
+    }
+}
+
+/// Install default handlers
+pub fn install_defaults() {
+    init();
+    
+    register(Signal::Segfault, default_crash_handler, 0);
+    register(Signal::BusError, default_crash_handler, 0);
+    register(Signal::FloatingPointException, default_crash_handler, 0);
+    register(Signal::IllegalInstruction, default_crash_handler, 0);
+    register(Signal::StackOverflow, default_crash_handler, 0);
+    
+    // Ignore SIGPIPE by default
+    register(Signal::Pipe, |_, _| HandlerResult::Continue, 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PANIC HOOK INTEGRATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Convert panic to signal
+pub fn panic_as_signal(info: &core::panic::PanicInfo) -> ! {
+    eprintln!("\n=== PANIC ===");
+    eprintln!("{}", info);
+    
+    #[cfg(unix)]
+    unsafe {
+        libc::raise(libc::SIGABRT);
+    }
+    
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_signal_conversion() {
+        assert!(Signal::Segfault.is_fatal());
+        assert!(Signal::StackOverflow.is_fatal());
+        assert!(!Signal::Interrupt.is_fatal());
+    }
+    
+    #[test]
+    fn test_signal_context() {
+        let ctx = SignalContext::empty();
+        assert_eq!(ctx.pc, 0);
+        assert_eq!(ctx.fault_addr, 0);
+    }
+    
+    #[test]
+    fn test_interrupt_flag() {
+        clear_interrupt();
+        assert!(!interrupt_received());
+        
+        HANDLERS.interrupt_flag.store(true, Ordering::Release);
+        assert!(interrupt_received());
+        
+        clear_interrupt();
+        assert!(!interrupt_received());
+    }
+}

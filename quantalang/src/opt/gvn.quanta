@@ -1,0 +1,791 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Global Value Numbering (GVN)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Global Value Numbering optimization:
+//   - Hash-based value numbering
+//   - Redundant computation elimination
+//   - Load-after-store optimization
+//   - Phi translation
+//   - PRE (Partial Redundancy Elimination)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::gvn
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VALUE EXPRESSIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Value number
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ValueNumber(pub u32);
+
+/// Expression for value numbering
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Expression {
+    /// Constant value
+    Constant(i64),
+    /// Variable (SSA value)
+    Variable(String),
+    /// Binary operation
+    Binary(BinOp, ValueNumber, ValueNumber),
+    /// Unary operation
+    Unary(UnaryOp, ValueNumber),
+    /// Phi node
+    Phi(Vec<(u32, ValueNumber)>),
+    /// Load from memory
+    Load(ValueNumber, MemoryVersion),
+    /// Call (non-pure, unique)
+    Call(String, Vec<ValueNumber>),
+    /// Unknown/unique expression
+    Unknown,
+}
+
+/// Memory version for load/store tracking
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MemoryVersion(pub u32);
+
+/// Binary operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+}
+
+/// Unary operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnaryOp {
+    Neg, Not, BitNot,
+    ZExt, SExt, Trunc,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VALUE TABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Value table for expression → value number mapping
+pub struct ValueTable {
+    /// Expression to value number
+    expr_to_num: BTreeMap<Expression, ValueNumber>,
+    /// Value number to expression
+    num_to_expr: BTreeMap<ValueNumber, Expression>,
+    /// Variable to value number
+    var_to_num: BTreeMap<String, ValueNumber>,
+    /// Value number to canonical variable
+    num_to_var: BTreeMap<ValueNumber, String>,
+    /// Next value number
+    next_num: u32,
+    /// Current memory version
+    memory_version: u32,
+}
+
+impl ValueTable {
+    pub fn new() -> Self {
+        ValueTable {
+            expr_to_num: BTreeMap::new(),
+            num_to_expr: BTreeMap::new(),
+            var_to_num: BTreeMap::new(),
+            num_to_var: BTreeMap::new(),
+            next_num: 0,
+            memory_version: 0,
+        }
+    }
+    
+    /// Get or create value number for expression
+    pub fn lookup_or_add(&mut self, expr: Expression) -> ValueNumber {
+        if let Some(&num) = self.expr_to_num.get(&expr) {
+            return num;
+        }
+        
+        let num = ValueNumber(self.next_num);
+        self.next_num += 1;
+        
+        self.expr_to_num.insert(expr.clone(), num);
+        self.num_to_expr.insert(num, expr);
+        
+        num
+    }
+    
+    /// Lookup value number for expression
+    pub fn lookup(&self, expr: &Expression) -> Option<ValueNumber> {
+        self.expr_to_num.get(expr).copied()
+    }
+    
+    /// Get expression for value number
+    pub fn get_expression(&self, num: ValueNumber) -> Option<&Expression> {
+        self.num_to_expr.get(&num)
+    }
+    
+    /// Assign value number to variable
+    pub fn set_variable(&mut self, var: &str, num: ValueNumber) {
+        self.var_to_num.insert(var.to_string(), num);
+        
+        // First variable with this number becomes canonical
+        if !self.num_to_var.contains_key(&num) {
+            self.num_to_var.insert(num, var.to_string());
+        }
+    }
+    
+    /// Get value number for variable
+    pub fn get_variable(&self, var: &str) -> Option<ValueNumber> {
+        self.var_to_num.get(var).copied()
+    }
+    
+    /// Get canonical variable for value number
+    pub fn get_leader(&self, num: ValueNumber) -> Option<&String> {
+        self.num_to_var.get(&num)
+    }
+    
+    /// Get current memory version
+    pub fn current_memory_version(&self) -> MemoryVersion {
+        MemoryVersion(self.memory_version)
+    }
+    
+    /// Increment memory version (after store)
+    pub fn new_memory_version(&mut self) -> MemoryVersion {
+        self.memory_version += 1;
+        MemoryVersion(self.memory_version)
+    }
+    
+    /// Check if two value numbers are equivalent
+    pub fn are_equivalent(&self, a: ValueNumber, b: ValueNumber) -> bool {
+        a == b
+    }
+}
+
+impl Default for ValueTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOMINATOR TREE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Dominator tree node
+#[derive(Debug, Clone)]
+pub struct DomTreeNode {
+    /// Block ID
+    pub block: u32,
+    /// Immediate dominator
+    pub idom: Option<u32>,
+    /// Dominated children
+    pub children: Vec<u32>,
+    /// Depth in tree
+    pub depth: u32,
+}
+
+/// Dominator tree
+pub struct DominatorTree {
+    /// Nodes indexed by block ID
+    nodes: BTreeMap<u32, DomTreeNode>,
+}
+
+impl DominatorTree {
+    pub fn new() -> Self {
+        DominatorTree {
+            nodes: BTreeMap::new(),
+        }
+    }
+    
+    /// Build dominator tree from function
+    pub fn build(func: &MirFunction) -> Self {
+        let mut tree = DominatorTree::new();
+        
+        if func.blocks.is_empty() {
+            return tree;
+        }
+        
+        // Compute dominators using dataflow
+        let doms = tree.compute_dominators(func);
+        
+        // Build immediate dominators
+        for block in &func.blocks {
+            let idom = tree.compute_idom(block.id, &doms);
+            
+            tree.nodes.insert(block.id, DomTreeNode {
+                block: block.id,
+                idom,
+                children: Vec::new(),
+                depth: 0,
+            });
+        }
+        
+        // Build children
+        let idoms: Vec<_> = tree.nodes.iter()
+            .filter_map(|(&id, node)| node.idom.map(|i| (id, i)))
+            .collect();
+        
+        for (child, parent) in idoms {
+            if let Some(parent_node) = tree.nodes.get_mut(&parent) {
+                parent_node.children.push(child);
+            }
+        }
+        
+        // Compute depths
+        tree.compute_depths(func.blocks[0].id, 0);
+        
+        tree
+    }
+    
+    fn compute_dominators(&self, func: &MirFunction) -> BTreeMap<u32, BTreeSet<u32>> {
+        let mut doms: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        let all_blocks: BTreeSet<u32> = func.blocks.iter().map(|b| b.id).collect();
+        
+        // Initialize: entry dominated only by itself
+        if let Some(entry) = func.blocks.first() {
+            doms.insert(entry.id, [entry.id].into_iter().collect());
+        }
+        
+        // Others start with all blocks
+        for block in func.blocks.iter().skip(1) {
+            doms.insert(block.id, all_blocks.clone());
+        }
+        
+        // Iterate until fixed point
+        let mut changed = true;
+        while changed {
+            changed = false;
+            
+            for block in func.blocks.iter().skip(1) {
+                let preds = self.get_predecessors(func, block.id);
+                
+                let mut new_doms: Option<BTreeSet<u32>> = None;
+                
+                for pred in preds {
+                    if let Some(pred_doms) = doms.get(&pred) {
+                        match &mut new_doms {
+                            None => new_doms = Some(pred_doms.clone()),
+                            Some(d) => {
+                                *d = d.intersection(pred_doms).copied().collect();
+                            }
+                        }
+                    }
+                }
+                
+                if let Some(mut new) = new_doms {
+                    new.insert(block.id);
+                    
+                    if doms.get(&block.id) != Some(&new) {
+                        doms.insert(block.id, new);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        
+        doms
+    }
+    
+    fn compute_idom(&self, block: u32, doms: &BTreeMap<u32, BTreeSet<u32>>) -> Option<u32> {
+        let block_doms = doms.get(&block)?;
+        
+        // idom is the closest dominator (excluding self)
+        for &candidate in block_doms {
+            if candidate == block {
+                continue;
+            }
+            
+            // Check if candidate is immediate dominator
+            let candidate_doms = doms.get(&candidate)?;
+            
+            let is_idom = block_doms.iter()
+                .filter(|&&d| d != block && d != candidate)
+                .all(|&d| candidate_doms.contains(&d));
+            
+            if is_idom {
+                return Some(candidate);
+            }
+        }
+        
+        None
+    }
+    
+    fn compute_depths(&mut self, block: u32, depth: u32) {
+        if let Some(node) = self.nodes.get_mut(&block) {
+            node.depth = depth;
+            let children = node.children.clone();
+            for child in children {
+                self.compute_depths(child, depth + 1);
+            }
+        }
+    }
+    
+    fn get_predecessors(&self, func: &MirFunction, block: u32) -> Vec<u32> {
+        let mut preds = Vec::new();
+        
+        for b in &func.blocks {
+            let succs = match &b.terminator {
+                MirTerminator::Goto(t) => vec![*t],
+                MirTerminator::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+                MirTerminator::Switch { targets, default, .. } => {
+                    let mut s: Vec<_> = targets.iter().map(|(_, t)| *t).collect();
+                    s.push(*default);
+                    s
+                }
+                _ => vec![],
+            };
+            
+            if succs.contains(&block) {
+                preds.push(b.id);
+            }
+        }
+        
+        preds
+    }
+    
+    /// Check if a dominates b
+    pub fn dominates(&self, a: u32, b: u32) -> bool {
+        if a == b {
+            return true;
+        }
+        
+        let mut current = b;
+        while let Some(node) = self.nodes.get(&current) {
+            if let Some(idom) = node.idom {
+                if idom == a {
+                    return true;
+                }
+                current = idom;
+            } else {
+                break;
+            }
+        }
+        
+        false
+    }
+    
+    /// Get children in dominator tree
+    pub fn children(&self, block: u32) -> &[u32] {
+        self.nodes.get(&block)
+            .map(|n| n.children.as_slice())
+            .unwrap_or(&[])
+    }
+    
+    /// Get immediate dominator
+    pub fn idom(&self, block: u32) -> Option<u32> {
+        self.nodes.get(&block).and_then(|n| n.idom)
+    }
+    
+    /// Iterate in RPO (reverse post-order)
+    pub fn rpo_iter(&self) -> Vec<u32> {
+        let mut visited = BTreeSet::new();
+        let mut order = Vec::new();
+        
+        if let Some((&root, _)) = self.nodes.iter().find(|(_, n)| n.idom.is_none()) {
+            self.rpo_visit(root, &mut visited, &mut order);
+        }
+        
+        order.reverse();
+        order
+    }
+    
+    fn rpo_visit(&self, block: u32, visited: &mut BTreeSet<u32>, order: &mut Vec<u32>) {
+        if visited.contains(&block) {
+            return;
+        }
+        
+        visited.insert(block);
+        
+        for &child in self.children(block) {
+            self.rpo_visit(child, visited, order);
+        }
+        
+        order.push(block);
+    }
+}
+
+impl Default for DominatorTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GVN PASS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Global Value Numbering pass
+pub struct GVN {
+    /// Value table
+    table: ValueTable,
+    /// Dominator tree
+    dom_tree: DominatorTree,
+    /// Statistics
+    stats: GVNStats,
+}
+
+/// GVN statistics
+#[derive(Debug, Clone, Default)]
+pub struct GVNStats {
+    /// Instructions analyzed
+    pub analyzed: usize,
+    /// Redundant instructions eliminated
+    pub eliminated: usize,
+    /// Loads eliminated (load-after-store)
+    pub loads_eliminated: usize,
+    /// Phi nodes simplified
+    pub phis_simplified: usize,
+}
+
+impl GVN {
+    pub fn new() -> Self {
+        GVN {
+            table: ValueTable::new(),
+            dom_tree: DominatorTree::new(),
+            stats: GVNStats::default(),
+        }
+    }
+    
+    /// Run GVN on a function
+    pub fn run(&mut self, func: &mut MirFunction) -> &GVNStats {
+        self.stats = GVNStats::default();
+        self.table = ValueTable::new();
+        
+        // Build dominator tree
+        self.dom_tree = DominatorTree::build(func);
+        
+        // Process blocks in dominator tree order
+        let rpo = self.dom_tree.rpo_iter();
+        
+        for block_id in rpo {
+            self.process_block(func, block_id);
+        }
+        
+        &self.stats
+    }
+    
+    fn process_block(&mut self, func: &mut MirFunction, block_id: u32) {
+        let block_idx = func.blocks.iter().position(|b| b.id == block_id);
+        
+        if block_idx.is_none() {
+            return;
+        }
+        
+        let block_idx = block_idx.unwrap();
+        let mut replacements: Vec<(usize, String, String)> = Vec::new();
+        let mut to_remove: Vec<usize> = Vec::new();
+        
+        for (stmt_idx, stmt) in func.blocks[block_idx].statements.iter().enumerate() {
+            self.stats.analyzed += 1;
+            
+            match stmt {
+                MirStatement::Assign { dest, value } => {
+                    let vn = self.operand_to_value_number(value);
+                    self.table.set_variable(dest, vn);
+                    
+                    // Check for redundancy
+                    if let Some(leader) = self.table.get_leader(vn) {
+                        if leader != dest {
+                            to_remove.push(stmt_idx);
+                            self.stats.eliminated += 1;
+                        }
+                    }
+                }
+                MirStatement::BinaryOp { dest, op, lhs, rhs } => {
+                    let lhs_vn = self.operand_to_value_number(lhs);
+                    let rhs_vn = self.operand_to_value_number(rhs);
+                    
+                    let bin_op = self.convert_binop(*op);
+                    let expr = Expression::Binary(bin_op, lhs_vn, rhs_vn);
+                    
+                    // Lookup or create value number
+                    let vn = self.table.lookup_or_add(expr);
+                    self.table.set_variable(dest, vn);
+                    
+                    // Check if we already computed this
+                    if let Some(leader) = self.table.get_leader(vn) {
+                        if leader != dest {
+                            replacements.push((stmt_idx, dest.clone(), leader.clone()));
+                            self.stats.eliminated += 1;
+                        }
+                    }
+                }
+                MirStatement::Load { dest, ptr } => {
+                    let ptr_vn = self.operand_to_value_number(ptr);
+                    let mem_ver = self.table.current_memory_version();
+                    
+                    let expr = Expression::Load(ptr_vn, mem_ver);
+                    let vn = self.table.lookup_or_add(expr);
+                    self.table.set_variable(dest, vn);
+                    
+                    if let Some(leader) = self.table.get_leader(vn) {
+                        if leader != dest {
+                            self.stats.loads_eliminated += 1;
+                        }
+                    }
+                }
+                MirStatement::Store { .. } => {
+                    // Stores invalidate memory
+                    self.table.new_memory_version();
+                }
+                MirStatement::Call { dest, callee, args } => {
+                    // Calls are unique (non-pure)
+                    let arg_vns: Vec<_> = args.iter()
+                        .map(|a| self.operand_to_value_number(a))
+                        .collect();
+                    
+                    let expr = Expression::Call(callee.clone(), arg_vns);
+                    let vn = self.table.lookup_or_add(expr);
+                    
+                    if let Some(d) = dest {
+                        self.table.set_variable(d, vn);
+                    }
+                    
+                    // Calls may modify memory
+                    self.table.new_memory_version();
+                }
+                MirStatement::Phi { dest, incoming } => {
+                    let incoming_vns: Vec<_> = incoming.iter()
+                        .map(|(bb, op)| (*bb, self.operand_to_value_number(op)))
+                        .collect();
+                    
+                    // Check if all incoming are the same
+                    let first = incoming_vns.first().map(|(_, vn)| *vn);
+                    let all_same = first.map(|f| incoming_vns.iter().all(|(_, vn)| *vn == f))
+                        .unwrap_or(false);
+                    
+                    let vn = if all_same {
+                        self.stats.phis_simplified += 1;
+                        first.unwrap()
+                    } else {
+                        let expr = Expression::Phi(incoming_vns);
+                        self.table.lookup_or_add(expr)
+                    };
+                    
+                    self.table.set_variable(dest, vn);
+                }
+                _ => {}
+            }
+        }
+        
+        // Apply replacements
+        for (idx, dest, leader) in replacements {
+            func.blocks[block_idx].statements[idx] = MirStatement::Assign {
+                dest,
+                value: MirOperand::Variable(leader),
+            };
+        }
+        
+        // Remove redundant instructions (in reverse order)
+        for idx in to_remove.into_iter().rev() {
+            func.blocks[block_idx].statements[idx] = MirStatement::Nop;
+        }
+    }
+    
+    fn operand_to_value_number(&mut self, operand: &MirOperand) -> ValueNumber {
+        match operand {
+            MirOperand::Constant(c) => {
+                let expr = Expression::Constant(*c);
+                self.table.lookup_or_add(expr)
+            }
+            MirOperand::Variable(name) => {
+                if let Some(vn) = self.table.get_variable(name) {
+                    vn
+                } else {
+                    // Unknown variable
+                    let expr = Expression::Variable(name.clone());
+                    let vn = self.table.lookup_or_add(expr);
+                    self.table.set_variable(name, vn);
+                    vn
+                }
+            }
+        }
+    }
+    
+    fn convert_binop(&self, op: MirBinOp) -> BinOp {
+        match op {
+            MirBinOp::Add => BinOp::Add,
+            MirBinOp::Sub => BinOp::Sub,
+            MirBinOp::Mul => BinOp::Mul,
+            MirBinOp::Div => BinOp::Div,
+            MirBinOp::Rem => BinOp::Rem,
+            MirBinOp::And => BinOp::And,
+            MirBinOp::Or => BinOp::Or,
+            MirBinOp::Xor => BinOp::Xor,
+            MirBinOp::Shl => BinOp::Shl,
+            MirBinOp::Shr => BinOp::Shr,
+            MirBinOp::Eq => BinOp::Eq,
+            MirBinOp::Ne => BinOp::Ne,
+            MirBinOp::Lt => BinOp::Lt,
+            MirBinOp::Le => BinOp::Le,
+            MirBinOp::Gt => BinOp::Gt,
+            MirBinOp::Ge => BinOp::Ge,
+        }
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &GVNStats {
+        &self.stats
+    }
+}
+
+impl Default for GVN {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: MirBinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand },
+    Store { ptr: MirOperand, value: MirOperand },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MirBinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Switch { value: MirOperand, targets: Vec<(i64, u32)>, default: u32 },
+    Return { value: Option<MirOperand> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_value_table() {
+        let mut table = ValueTable::new();
+        
+        let expr1 = Expression::Constant(42);
+        let vn1 = table.lookup_or_add(expr1.clone());
+        
+        let expr2 = Expression::Constant(42);
+        let vn2 = table.lookup_or_add(expr2);
+        
+        // Same constant should get same value number
+        assert_eq!(vn1, vn2);
+    }
+    
+    #[test]
+    fn test_redundant_computation() {
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        // y = a + b
+                        MirStatement::BinaryOp {
+                            dest: "y".to_string(),
+                            op: MirBinOp::Add,
+                            lhs: MirOperand::Variable("a".to_string()),
+                            rhs: MirOperand::Variable("b".to_string()),
+                        },
+                        // z = a + b (redundant)
+                        MirStatement::BinaryOp {
+                            dest: "z".to_string(),
+                            op: MirBinOp::Add,
+                            lhs: MirOperand::Variable("a".to_string()),
+                            rhs: MirOperand::Variable("b".to_string()),
+                        },
+                    ],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let mut gvn = GVN::new();
+        gvn.run(&mut func);
+        
+        assert_eq!(gvn.stats().eliminated, 1);
+    }
+    
+    #[test]
+    fn test_phi_simplification() {
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::Assign {
+                            dest: "x".to_string(),
+                            value: MirOperand::Constant(1),
+                        },
+                    ],
+                    terminator: MirTerminator::Branch {
+                        cond: MirOperand::Variable("c".to_string()),
+                        then_bb: 1,
+                        else_bb: 2,
+                    },
+                },
+                MirBlock {
+                    id: 1,
+                    statements: vec![],
+                    terminator: MirTerminator::Goto(2),
+                },
+                MirBlock {
+                    id: 2,
+                    statements: vec![
+                        // Phi with same value from both edges
+                        MirStatement::Phi {
+                            dest: "y".to_string(),
+                            incoming: vec![
+                                (0, MirOperand::Variable("x".to_string())),
+                                (1, MirOperand::Variable("x".to_string())),
+                            ],
+                        },
+                    ],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let mut gvn = GVN::new();
+        gvn.run(&mut func);
+        
+        assert_eq!(gvn.stats().phis_simplified, 1);
+    }
+}

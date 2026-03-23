@@ -1,0 +1,771 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ ASYNC — Task
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Task representation and lifecycle management.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::async::task
+
+use alloc::sync::Arc;
+use alloc::boxed::Box;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU8, AtomicBool, Ordering};
+use core::task::{Context, Poll};
+use core::pin::Pin;
+use core::future::Future;
+use core::marker::PhantomData;
+
+use std::sync::{Mutex, Condvar};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TASK ID
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unique task identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TaskId(pub u64);
+
+impl TaskId {
+    pub fn new(id: u64) -> Self {
+        TaskId(id)
+    }
+    
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Task({})", self.0)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TASK STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Task execution state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TaskState {
+    /// Task is scheduled but not yet polled
+    Scheduled = 0,
+    /// Task is currently being polled
+    Running = 1,
+    /// Task is waiting for a waker
+    Idle = 2,
+    /// Task has completed successfully
+    Completed = 3,
+    /// Task was cancelled
+    Cancelled = 4,
+    /// Task panicked during execution
+    Panicked = 5,
+}
+
+impl From<u8> for TaskState {
+    fn from(v: u8) -> Self {
+        match v {
+            0 => TaskState::Scheduled,
+            1 => TaskState::Running,
+            2 => TaskState::Idle,
+            3 => TaskState::Completed,
+            4 => TaskState::Cancelled,
+            5 => TaskState::Panicked,
+            _ => TaskState::Scheduled,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TASK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A spawned async task
+pub struct Task {
+    /// Task identifier
+    id: TaskId,
+    
+    /// Current state
+    state: AtomicU8,
+    
+    /// The future to poll
+    future: UnsafeCell<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
+    
+    /// Completion notification
+    completion: Arc<TaskCompletion>,
+    
+    /// Whether task has been scheduled for re-polling
+    scheduled: AtomicBool,
+}
+
+// Safety: Task uses atomic operations and UnsafeCell is only accessed
+// when we have exclusive access (during polling)
+unsafe impl Send for Task {}
+unsafe impl Sync for Task {}
+
+impl Task {
+    /// Create a new task
+    pub fn new<F>(id: TaskId, future: F) -> (Arc<Task>, JoinHandle<F::Output>)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let completion = Arc::new(TaskCompletion::new());
+        let result_slot = Arc::new(ResultSlot::new());
+        
+        // Wrap the future to store the result
+        let result_slot_clone = Arc::clone(&result_slot);
+        let wrapped = async move {
+            let result = future.await;
+            result_slot_clone.set(result);
+        };
+        
+        let task = Arc::new(Task {
+            id,
+            state: AtomicU8::new(TaskState::Scheduled as u8),
+            future: UnsafeCell::new(Some(Box::pin(wrapped))),
+            completion: Arc::clone(&completion),
+            scheduled: AtomicBool::new(true),
+        });
+        
+        let handle = JoinHandle {
+            id,
+            completion,
+            result: result_slot,
+            _marker: PhantomData,
+        };
+        
+        (task, handle)
+    }
+    
+    /// Create a local (non-Send) task
+    pub fn new_local<F>(id: TaskId, future: F) -> (Arc<Task>, JoinHandle<F::Output>)
+    where
+        F: Future + 'static,
+        F::Output: 'static,
+    {
+        let completion = Arc::new(TaskCompletion::new());
+        let result_slot = Arc::new(ResultSlot::new());
+        
+        let result_slot_clone = Arc::clone(&result_slot);
+        let wrapped = async move {
+            let result = future.await;
+            result_slot_clone.set(result);
+        };
+        
+        // Note: This is technically unsound if the task is sent to another thread
+        // We rely on the LocalExecutor to never do this
+        let boxed: Pin<Box<dyn Future<Output = ()>>> = Box::pin(wrapped);
+        let boxed_send: Pin<Box<dyn Future<Output = ()> + Send>> = 
+            unsafe { std::mem::transmute(boxed) };
+        
+        let task = Arc::new(Task {
+            id,
+            state: AtomicU8::new(TaskState::Scheduled as u8),
+            future: UnsafeCell::new(Some(boxed_send)),
+            completion: Arc::clone(&completion),
+            scheduled: AtomicBool::new(true),
+        });
+        
+        let handle = JoinHandle {
+            id,
+            completion,
+            result: result_slot,
+            _marker: PhantomData,
+        };
+        
+        (task, handle)
+    }
+    
+    /// Create an empty task (for testing)
+    pub fn empty(id: TaskId) -> Task {
+        Task {
+            id,
+            state: AtomicU8::new(TaskState::Completed as u8),
+            future: UnsafeCell::new(None),
+            completion: Arc::new(TaskCompletion::new()),
+            scheduled: AtomicBool::new(false),
+        }
+    }
+    
+    /// Get task ID
+    pub fn id(&self) -> TaskId {
+        self.id
+    }
+    
+    /// Get current state
+    pub fn state(&self) -> TaskState {
+        TaskState::from(self.state.load(Ordering::Acquire))
+    }
+    
+    /// Set state
+    fn set_state(&self, state: TaskState) {
+        self.state.store(state as u8, Ordering::Release);
+    }
+    
+    /// Check if task is complete
+    pub fn is_complete(&self) -> bool {
+        matches!(
+            self.state(),
+            TaskState::Completed | TaskState::Cancelled | TaskState::Panicked
+        )
+    }
+    
+    /// Poll the task
+    pub fn poll(&self, cx: &mut Context<'_>) -> Poll<()> {
+        // Check if already complete
+        if self.is_complete() {
+            return Poll::Ready(());
+        }
+        
+        // Mark as running
+        self.set_state(TaskState::Running);
+        
+        // Get mutable access to future
+        let future = unsafe { &mut *self.future.get() };
+        
+        let result = if let Some(ref mut fut) = future {
+            // Catch panics
+            let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fut.as_mut().poll(cx)
+            }));
+            
+            match poll_result {
+                Ok(Poll::Ready(())) => {
+                    // Task completed
+                    self.set_state(TaskState::Completed);
+                    self.completion.complete();
+                    *future = None; // Drop the future
+                    Poll::Ready(())
+                }
+                Ok(Poll::Pending) => {
+                    self.set_state(TaskState::Idle);
+                    self.scheduled.store(false, Ordering::Release);
+                    Poll::Pending
+                }
+                Err(_panic) => {
+                    // Task panicked
+                    self.set_state(TaskState::Panicked);
+                    self.completion.complete();
+                    *future = None;
+                    Poll::Ready(())
+                }
+            }
+        } else {
+            // No future (already completed or never had one)
+            Poll::Ready(())
+        };
+        
+        result
+    }
+    
+    /// Mark task as scheduled for re-polling
+    pub fn schedule(&self) -> bool {
+        !self.scheduled.swap(true, Ordering::AcqRel)
+    }
+    
+    /// Cancel the task
+    pub fn cancel(&self) {
+        let current = self.state();
+        if !self.is_complete() {
+            self.set_state(TaskState::Cancelled);
+            self.completion.complete();
+            
+            // Drop the future
+            let future = unsafe { &mut *self.future.get() };
+            *future = None;
+        }
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        // Ensure completion is signaled
+        self.completion.complete();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TASK COMPLETION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Synchronization primitive for task completion
+struct TaskCompletion {
+    completed: AtomicBool,
+    mutex: Mutex<()>,
+    condvar: Condvar,
+}
+
+impl TaskCompletion {
+    fn new() -> Self {
+        TaskCompletion {
+            completed: AtomicBool::new(false),
+            mutex: Mutex::new(()),
+            condvar: Condvar::new(),
+        }
+    }
+    
+    fn complete(&self) {
+        self.completed.store(true, Ordering::Release);
+        let _guard = self.mutex.lock().unwrap();
+        self.condvar.notify_all();
+    }
+    
+    fn is_complete(&self) -> bool {
+        self.completed.load(Ordering::Acquire)
+    }
+    
+    fn wait(&self) {
+        if self.is_complete() {
+            return;
+        }
+        
+        let mut guard = self.mutex.lock().unwrap();
+        while !self.is_complete() {
+            guard = self.condvar.wait(guard).unwrap();
+        }
+    }
+    
+    fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
+        if self.is_complete() {
+            return true;
+        }
+        
+        let mut guard = self.mutex.lock().unwrap();
+        let deadline = std::time::Instant::now() + timeout;
+        
+        while !self.is_complete() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            
+            let (new_guard, result) = self.condvar.wait_timeout(guard, remaining).unwrap();
+            guard = new_guard;
+            
+            if result.timed_out() {
+                return self.is_complete();
+            }
+        }
+        
+        true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RESULT SLOT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Storage for task result
+struct ResultSlot<T> {
+    value: UnsafeCell<Option<T>>,
+    filled: AtomicBool,
+}
+
+unsafe impl<T: Send> Send for ResultSlot<T> {}
+unsafe impl<T: Send> Sync for ResultSlot<T> {}
+
+impl<T> ResultSlot<T> {
+    fn new() -> Self {
+        ResultSlot {
+            value: UnsafeCell::new(None),
+            filled: AtomicBool::new(false),
+        }
+    }
+    
+    fn set(&self, value: T) {
+        unsafe {
+            *self.value.get() = Some(value);
+        }
+        self.filled.store(true, Ordering::Release);
+    }
+    
+    fn take(&self) -> Option<T> {
+        if self.filled.load(Ordering::Acquire) {
+            unsafe { (*self.value.get()).take() }
+        } else {
+            None
+        }
+    }
+    
+    fn is_filled(&self) -> bool {
+        self.filled.load(Ordering::Acquire)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOIN HANDLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Handle for awaiting task completion
+pub struct JoinHandle<T> {
+    id: TaskId,
+    completion: Arc<TaskCompletion>,
+    result: Arc<ResultSlot<T>>,
+    _marker: PhantomData<T>,
+}
+
+impl<T> JoinHandle<T> {
+    /// Get task ID
+    pub fn id(&self) -> TaskId {
+        self.id
+    }
+    
+    /// Check if task has completed
+    pub fn is_finished(&self) -> bool {
+        self.completion.is_complete()
+    }
+    
+    /// Block until the task completes and return its result
+    pub fn join(self) -> Result<T, JoinError> {
+        self.completion.wait();
+        
+        self.result.take().ok_or(JoinError::Panic)
+    }
+    
+    /// Block with timeout
+    pub fn join_timeout(self, timeout: std::time::Duration) -> Result<T, JoinError> {
+        if !self.completion.wait_timeout(timeout) {
+            return Err(JoinError::Timeout);
+        }
+        
+        self.result.take().ok_or(JoinError::Panic)
+    }
+    
+    /// Abort the task
+    pub fn abort(&self) {
+        // Note: In a real implementation, we'd need a reference to the task
+        // to cancel it. For now, this is a no-op.
+    }
+}
+
+impl<T> Future for JoinHandle<T> {
+    type Output = Result<T, JoinError>;
+    
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.completion.is_complete() {
+            Poll::Ready(self.result.take().ok_or(JoinError::Panic))
+        } else {
+            // Register waker
+            // In a real implementation, we'd store the waker in TaskCompletion
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for JoinHandle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinHandle")
+            .field("id", &self.id)
+            .field("finished", &self.is_finished())
+            .finish()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOIN ERROR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Error returned when joining a task fails
+#[derive(Debug, Clone)]
+pub enum JoinError {
+    /// Task was cancelled
+    Cancelled,
+    /// Task panicked
+    Panic,
+    /// Join timed out
+    Timeout,
+}
+
+impl std::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(f, "task was cancelled"),
+            Self::Panic => write!(f, "task panicked"),
+            Self::Timeout => write!(f, "join timed out"),
+        }
+    }
+}
+
+impl std::error::Error for JoinError {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOIN SET
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A collection of tasks that can be awaited together
+pub struct JoinSet<T> {
+    handles: Vec<JoinHandle<T>>,
+}
+
+impl<T> JoinSet<T> {
+    pub fn new() -> Self {
+        JoinSet {
+            handles: Vec::new(),
+        }
+    }
+    
+    /// Add a task to the set
+    pub fn push(&mut self, handle: JoinHandle<T>) {
+        self.handles.push(handle);
+    }
+    
+    /// Get number of tasks
+    pub fn len(&self) -> usize {
+        self.handles.len()
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+    
+    /// Wait for all tasks and collect results
+    pub fn join_all(self) -> Vec<Result<T, JoinError>> {
+        self.handles.into_iter().map(|h| h.join()).collect()
+    }
+    
+    /// Wait for the next task to complete
+    pub fn join_next(&mut self) -> Option<Result<T, JoinError>> {
+        // Simple implementation: find first completed
+        let index = self.handles.iter().position(|h| h.is_finished())?;
+        Some(self.handles.remove(index).join())
+    }
+    
+    /// Abort all tasks
+    pub fn abort_all(&self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
+impl<T> Default for JoinSet<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> FromIterator<JoinHandle<T>> for JoinSet<T> {
+    fn from_iter<I: IntoIterator<Item = JoinHandle<T>>>(iter: I) -> Self {
+        JoinSet {
+            handles: iter.into_iter().collect(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TASK BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Builder for configuring tasks
+pub struct TaskBuilder {
+    name: Option<String>,
+    priority: TaskPriority,
+}
+
+impl TaskBuilder {
+    pub fn new() -> Self {
+        TaskBuilder {
+            name: None,
+            priority: TaskPriority::Normal,
+        }
+    }
+    
+    /// Set task name (for debugging)
+    pub fn name<S: Into<String>>(mut self, name: S) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+    
+    /// Set task priority
+    pub fn priority(mut self, priority: TaskPriority) -> Self {
+        self.priority = priority;
+        self
+    }
+}
+
+impl Default for TaskBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Task priority levels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TaskPriority {
+    Low = 0,
+    Normal = 1,
+    High = 2,
+    Critical = 3,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ABORT HANDLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Handle for aborting a task without waiting for its result
+pub struct AbortHandle {
+    id: TaskId,
+    completion: Arc<TaskCompletion>,
+}
+
+impl AbortHandle {
+    /// Create from a join handle
+    pub fn from_join_handle<T>(handle: &JoinHandle<T>) -> Self {
+        AbortHandle {
+            id: handle.id,
+            completion: Arc::clone(&handle.completion),
+        }
+    }
+    
+    /// Get task ID
+    pub fn id(&self) -> TaskId {
+        self.id
+    }
+    
+    /// Check if task has finished
+    pub fn is_finished(&self) -> bool {
+        self.completion.is_complete()
+    }
+    
+    /// Abort the task
+    pub fn abort(&self) {
+        // In a real implementation, this would cancel the task
+    }
+}
+
+impl std::fmt::Debug for AbortHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AbortHandle")
+            .field("id", &self.id)
+            .field("finished", &self.is_finished())
+            .finish()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPAWN FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Spawn a task on the current runtime
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    use super::executor::Handle;
+    
+    Handle::current()
+        .expect("spawn called outside of runtime context")
+        .spawn(future)
+}
+
+/// Spawn a blocking task
+pub fn spawn_blocking<F, R>(f: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    spawn(async move { f() })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// YIELD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Yield control back to the executor
+pub async fn yield_now() {
+    struct YieldNow {
+        yielded: bool,
+    }
+    
+    impl Future for YieldNow {
+        type Output = ();
+        
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.yielded {
+                Poll::Ready(())
+            } else {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+    
+    YieldNow { yielded: false }.await
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_task_id() {
+        let id = TaskId::new(42);
+        assert_eq!(id.as_u64(), 42);
+        assert_eq!(format!("{}", id), "Task(42)");
+    }
+    
+    #[test]
+    fn test_task_state() {
+        assert_eq!(TaskState::from(0), TaskState::Scheduled);
+        assert_eq!(TaskState::from(3), TaskState::Completed);
+    }
+    
+    #[test]
+    fn test_task_creation() {
+        let (task, handle) = Task::new(TaskId(1), async { 42 });
+        
+        assert_eq!(task.id(), TaskId(1));
+        assert_eq!(task.state(), TaskState::Scheduled);
+        assert!(!task.is_complete());
+        assert!(!handle.is_finished());
+    }
+    
+    #[test]
+    fn test_empty_task() {
+        let task = Task::empty(TaskId(1));
+        assert!(task.is_complete());
+    }
+    
+    #[test]
+    fn test_join_set() {
+        let mut set = JoinSet::new();
+        assert!(set.is_empty());
+        assert_eq!(set.len(), 0);
+    }
+    
+    #[test]
+    fn test_task_builder() {
+        let builder = TaskBuilder::new()
+            .name("test-task")
+            .priority(TaskPriority::High);
+        
+        assert_eq!(builder.name, Some("test-task".to_string()));
+        assert_eq!(builder.priority, TaskPriority::High);
+    }
+    
+    #[test]
+    fn test_result_slot() {
+        let slot = ResultSlot::<i32>::new();
+        assert!(!slot.is_filled());
+        
+        slot.set(42);
+        assert!(slot.is_filled());
+        
+        assert_eq!(slot.take(), Some(42));
+    }
+}

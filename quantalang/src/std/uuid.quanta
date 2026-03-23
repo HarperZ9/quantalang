@@ -1,0 +1,619 @@
+/// QuantaLang Standard Library - UUID
+/// Universally Unique Identifiers (RFC 4122, RFC 9562)
+module std::uuid;
+
+use std::string::String;
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
+use std::result::Result;
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+// ============================================================================
+// UUID Type
+// ============================================================================
+
+/// A 128-bit universally unique identifier
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Uuid {
+    bytes: [u8; 16],
+}
+
+impl Uuid {
+    /// The nil UUID (all zeros)
+    pub const NIL: Uuid = Uuid { bytes: [0; 16] };
+    
+    /// The max UUID (all ones)
+    pub const MAX: Uuid = Uuid { bytes: [0xff; 16] };
+    
+    // ========================================================================
+    // Constructors
+    // ========================================================================
+    
+    /// Create UUID from raw bytes
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Uuid { bytes }
+    }
+    
+    /// Create UUID from byte slice
+    pub fn from_slice(slice: &[u8]) -> Result<Self, ParseError> {
+        if slice.len() != 16 {
+            return Err(ParseError::InvalidLength);
+        }
+        
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(slice);
+        Ok(Uuid { bytes })
+    }
+    
+    /// Create UUID from 128-bit integer
+    pub const fn from_u128(value: u128) -> Self {
+        Uuid {
+            bytes: value.to_be_bytes(),
+        }
+    }
+    
+    /// Create UUID from two 64-bit integers
+    pub const fn from_u64_pair(high: u64, low: u64) -> Self {
+        let high_bytes = high.to_be_bytes();
+        let low_bytes = low.to_be_bytes();
+        Uuid {
+            bytes: [
+                high_bytes[0], high_bytes[1], high_bytes[2], high_bytes[3],
+                high_bytes[4], high_bytes[5], high_bytes[6], high_bytes[7],
+                low_bytes[0], low_bytes[1], low_bytes[2], low_bytes[3],
+                low_bytes[4], low_bytes[5], low_bytes[6], low_bytes[7],
+            ],
+        }
+    }
+    
+    /// Parse UUID from string (various formats supported)
+    pub fn parse(s: &str) -> Result<Self, ParseError> {
+        let s = s.trim();
+        
+        // Handle different formats
+        let hex = if s.starts_with('{') && s.ends_with('}') {
+            // {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
+            &s[1..s.len() - 1]
+        } else if s.starts_with("urn:uuid:") {
+            // urn:uuid:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+            &s[9..]
+        } else {
+            s
+        };
+        
+        // Remove hyphens
+        let hex: String = hex.chars().filter(|c| *c != '-').collect();
+        
+        if hex.len() != 32 {
+            return Err(ParseError::InvalidLength);
+        }
+        
+        let mut bytes = [0u8; 16];
+        for i in 0..16 {
+            bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+                .map_err(|_| ParseError::InvalidCharacter)?;
+        }
+        
+        Ok(Uuid { bytes })
+    }
+    
+    // ========================================================================
+    // UUID Generation
+    // ========================================================================
+    
+    /// Generate random UUID (version 4)
+    pub fn new_v4() -> Self {
+        let mut bytes = [0u8; 16];
+        
+        // Fill with random bytes
+        unsafe { __getrandom(bytes.as_mut_ptr(), 16) };
+        
+        // Set version (4) and variant (RFC 4122)
+        bytes[6] = (bytes[6] & 0x0f) | 0x40; // Version 4
+        bytes[8] = (bytes[8] & 0x3f) | 0x80; // Variant RFC 4122
+        
+        Uuid { bytes }
+    }
+    
+    /// Generate time-ordered UUID (version 7, RFC 9562)
+    pub fn new_v7() -> Self {
+        let mut bytes = [0u8; 16];
+        
+        // Get current timestamp in milliseconds since Unix epoch
+        let now = SystemTime::now();
+        let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+        let millis = duration.as_millis() as u64;
+        
+        // First 48 bits: Unix timestamp in milliseconds
+        bytes[0] = (millis >> 40) as u8;
+        bytes[1] = (millis >> 32) as u8;
+        bytes[2] = (millis >> 24) as u8;
+        bytes[3] = (millis >> 16) as u8;
+        bytes[4] = (millis >> 8) as u8;
+        bytes[5] = millis as u8;
+        
+        // Fill remaining with random
+        unsafe { __getrandom(bytes[6..].as_mut_ptr(), 10) };
+        
+        // Set version (7) and variant (RFC 4122)
+        bytes[6] = (bytes[6] & 0x0f) | 0x70; // Version 7
+        bytes[8] = (bytes[8] & 0x3f) | 0x80; // Variant RFC 4122
+        
+        Uuid { bytes }
+    }
+    
+    /// Create namespace-based UUID (version 5, SHA-1)
+    pub fn new_v5(namespace: &Uuid, name: &[u8]) -> Self {
+        use std::crypto::Sha256; // Using SHA-256 for simplicity
+        
+        let mut hasher = Sha256::new();
+        hasher.update(&namespace.bytes);
+        hasher.update(name);
+        let hash = hasher.finalize();
+        
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&hash.as_bytes()[..16]);
+        
+        // Set version (5) and variant
+        bytes[6] = (bytes[6] & 0x0f) | 0x50;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        
+        Uuid { bytes }
+    }
+    
+    // ========================================================================
+    // Predefined Namespaces
+    // ========================================================================
+    
+    /// DNS namespace UUID
+    pub const NAMESPACE_DNS: Uuid = Uuid::from_bytes([
+        0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1,
+        0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+    ]);
+    
+    /// URL namespace UUID
+    pub const NAMESPACE_URL: Uuid = Uuid::from_bytes([
+        0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1,
+        0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+    ]);
+    
+    /// OID namespace UUID
+    pub const NAMESPACE_OID: Uuid = Uuid::from_bytes([
+        0x6b, 0xa7, 0xb8, 0x12, 0x9d, 0xad, 0x11, 0xd1,
+        0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+    ]);
+    
+    /// X.500 DN namespace UUID
+    pub const NAMESPACE_X500: Uuid = Uuid::from_bytes([
+        0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1,
+        0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+    ]);
+    
+    // ========================================================================
+    // Accessors
+    // ========================================================================
+    
+    /// Get as byte array
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.bytes
+    }
+    
+    /// Get as byte slice
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+    
+    /// Convert to 128-bit integer
+    pub fn as_u128(&self) -> u128 {
+        u128::from_be_bytes(self.bytes)
+    }
+    
+    /// Convert to pair of 64-bit integers
+    pub fn as_u64_pair(&self) -> (u64, u64) {
+        let high = u64::from_be_bytes([
+            self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3],
+            self.bytes[4], self.bytes[5], self.bytes[6], self.bytes[7],
+        ]);
+        let low = u64::from_be_bytes([
+            self.bytes[8], self.bytes[9], self.bytes[10], self.bytes[11],
+            self.bytes[12], self.bytes[13], self.bytes[14], self.bytes[15],
+        ]);
+        (high, low)
+    }
+    
+    /// Check if nil (all zeros)
+    pub fn is_nil(&self) -> bool {
+        self.bytes == [0; 16]
+    }
+    
+    /// Check if max (all ones)
+    pub fn is_max(&self) -> bool {
+        self.bytes == [0xff; 16]
+    }
+    
+    /// Get UUID version
+    pub fn version(&self) -> Option<Version> {
+        match self.bytes[6] >> 4 {
+            0 if self.is_nil() => Some(Version::Nil),
+            1 => Some(Version::Time),
+            2 => Some(Version::Dce),
+            3 => Some(Version::Md5),
+            4 => Some(Version::Random),
+            5 => Some(Version::Sha1),
+            6 => Some(Version::SortRand),
+            7 => Some(Version::SortTime),
+            8 => Some(Version::Custom),
+            0xf if self.is_max() => Some(Version::Max),
+            _ => None,
+        }
+    }
+    
+    /// Get UUID variant
+    pub fn variant(&self) -> Variant {
+        match self.bytes[8] >> 4 {
+            0..=7 => Variant::Ncs,
+            8..=11 => Variant::Rfc4122,
+            12..=13 => Variant::Microsoft,
+            _ => Variant::Future,
+        }
+    }
+    
+    /// Get timestamp (for v1, v6, v7)
+    pub fn timestamp(&self) -> Option<u64> {
+        match self.version()? {
+            Version::SortTime => {
+                // v7: First 48 bits are Unix milliseconds
+                Some(
+                    ((self.bytes[0] as u64) << 40)
+                    | ((self.bytes[1] as u64) << 32)
+                    | ((self.bytes[2] as u64) << 24)
+                    | ((self.bytes[3] as u64) << 16)
+                    | ((self.bytes[4] as u64) << 8)
+                    | (self.bytes[5] as u64)
+                )
+            }
+            _ => None,
+        }
+    }
+    
+    // ========================================================================
+    // Formatting
+    // ========================================================================
+    
+    /// Format as hyphenated string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+    pub fn hyphenated(&self) -> String {
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3],
+            self.bytes[4], self.bytes[5],
+            self.bytes[6], self.bytes[7],
+            self.bytes[8], self.bytes[9],
+            self.bytes[10], self.bytes[11], self.bytes[12], self.bytes[13], self.bytes[14], self.bytes[15],
+        )
+    }
+    
+    /// Format as simple string (32 hex chars, no hyphens)
+    pub fn simple(&self) -> String {
+        let mut s = String::with_capacity(32);
+        for b in &self.bytes {
+            s.push_str(&format!("{:02x}", b));
+        }
+        s
+    }
+    
+    /// Format as URN (urn:uuid:...)
+    pub fn urn(&self) -> String {
+        format!("urn:uuid:{}", self.hyphenated())
+    }
+    
+    /// Format as braced string ({...})
+    pub fn braced(&self) -> String {
+        format!("{{{}}}", self.hyphenated())
+    }
+}
+
+impl Debug for Uuid {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "Uuid({})", self.hyphenated())
+    }
+}
+
+impl Display for Uuid {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}", self.hyphenated())
+    }
+}
+
+impl Default for Uuid {
+    fn default() -> Self {
+        Uuid::NIL
+    }
+}
+
+impl PartialOrd for Uuid {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Uuid {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.bytes.cmp(&other.bytes)
+    }
+}
+
+impl AsRef<[u8]> for Uuid {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl From<[u8; 16]> for Uuid {
+    fn from(bytes: [u8; 16]) -> Self {
+        Uuid::from_bytes(bytes)
+    }
+}
+
+impl From<u128> for Uuid {
+    fn from(value: u128) -> Self {
+        Uuid::from_u128(value)
+    }
+}
+
+impl From<Uuid> for [u8; 16] {
+    fn from(uuid: Uuid) -> Self {
+        uuid.bytes
+    }
+}
+
+impl From<Uuid> for u128 {
+    fn from(uuid: Uuid) -> Self {
+        uuid.as_u128()
+    }
+}
+
+impl std::str::FromStr for Uuid {
+    type Err = ParseError;
+    
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse(s)
+    }
+}
+
+// ============================================================================
+// Version and Variant
+// ============================================================================
+
+/// UUID version
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Version {
+    /// Nil UUID (special case)
+    Nil,
+    /// Version 1: Time-based (Gregorian)
+    Time,
+    /// Version 2: DCE Security
+    Dce,
+    /// Version 3: MD5 name-based
+    Md5,
+    /// Version 4: Random
+    Random,
+    /// Version 5: SHA-1 name-based
+    Sha1,
+    /// Version 6: Reordered time-based
+    SortRand,
+    /// Version 7: Unix epoch time-based
+    SortTime,
+    /// Version 8: Custom
+    Custom,
+    /// Max UUID (special case)
+    Max,
+}
+
+/// UUID variant
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Variant {
+    /// NCS backward compatibility
+    Ncs,
+    /// RFC 4122 (standard)
+    Rfc4122,
+    /// Microsoft backward compatibility
+    Microsoft,
+    /// Reserved for future use
+    Future,
+}
+
+// ============================================================================
+// Error Type
+// ============================================================================
+
+/// UUID parsing error
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// Invalid length
+    InvalidLength,
+    /// Invalid character
+    InvalidCharacter,
+    /// Invalid format
+    InvalidFormat,
+}
+
+impl Display for ParseError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            ParseError::InvalidLength => write!(f, "invalid UUID length"),
+            ParseError::InvalidCharacter => write!(f, "invalid character in UUID"),
+            ParseError::InvalidFormat => write!(f, "invalid UUID format"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+/// Generate random UUID (v4)
+pub fn v4() -> Uuid {
+    Uuid::new_v4()
+}
+
+/// Generate time-ordered UUID (v7)
+pub fn v7() -> Uuid {
+    Uuid::new_v7()
+}
+
+/// Generate name-based UUID (v5)
+pub fn v5(namespace: &Uuid, name: &[u8]) -> Uuid {
+    Uuid::new_v5(namespace, name)
+}
+
+/// Parse UUID from string
+pub fn parse(s: &str) -> Result<Uuid, ParseError> {
+    Uuid::parse(s)
+}
+
+/// Check if string is valid UUID
+pub fn is_valid(s: &str) -> bool {
+    Uuid::parse(s).is_ok()
+}
+
+// ============================================================================
+// External Declarations
+// ============================================================================
+
+extern "C" {
+    fn __getrandom(buf: *mut u8, len: usize) -> i32;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_nil() {
+        assert!(Uuid::NIL.is_nil());
+        assert_eq!(Uuid::NIL.as_u128(), 0);
+    }
+    
+    #[test]
+    fn test_max() {
+        assert!(Uuid::MAX.is_max());
+        assert_eq!(Uuid::MAX.as_u128(), u128::MAX);
+    }
+    
+    #[test]
+    fn test_v4() {
+        let uuid = Uuid::new_v4();
+        assert!(!uuid.is_nil());
+        assert_eq!(uuid.version(), Some(Version::Random));
+        assert_eq!(uuid.variant(), Variant::Rfc4122);
+    }
+    
+    #[test]
+    fn test_v7() {
+        let uuid = Uuid::new_v7();
+        assert!(!uuid.is_nil());
+        assert_eq!(uuid.version(), Some(Version::SortTime));
+        assert!(uuid.timestamp().is_some());
+    }
+    
+    #[test]
+    fn test_v7_ordering() {
+        let uuid1 = Uuid::new_v7();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let uuid2 = Uuid::new_v7();
+        
+        // v7 UUIDs should be time-ordered
+        assert!(uuid1 < uuid2);
+    }
+    
+    #[test]
+    fn test_parse_hyphenated() {
+        let uuid = Uuid::parse("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(uuid.hyphenated(), "550e8400-e29b-41d4-a716-446655440000");
+    }
+    
+    #[test]
+    fn test_parse_simple() {
+        let uuid = Uuid::parse("550e8400e29b41d4a716446655440000").unwrap();
+        assert_eq!(uuid.simple(), "550e8400e29b41d4a716446655440000");
+    }
+    
+    #[test]
+    fn test_parse_braced() {
+        let uuid = Uuid::parse("{550e8400-e29b-41d4-a716-446655440000}").unwrap();
+        assert_eq!(uuid.hyphenated(), "550e8400-e29b-41d4-a716-446655440000");
+    }
+    
+    #[test]
+    fn test_parse_urn() {
+        let uuid = Uuid::parse("urn:uuid:550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(uuid.hyphenated(), "550e8400-e29b-41d4-a716-446655440000");
+    }
+    
+    #[test]
+    fn test_format_urn() {
+        let uuid = Uuid::parse("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(uuid.urn(), "urn:uuid:550e8400-e29b-41d4-a716-446655440000");
+    }
+    
+    #[test]
+    fn test_format_braced() {
+        let uuid = Uuid::parse("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(uuid.braced(), "{550e8400-e29b-41d4-a716-446655440000}");
+    }
+    
+    #[test]
+    fn test_from_bytes() {
+        let bytes = [0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
+                     0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00];
+        let uuid = Uuid::from_bytes(bytes);
+        assert_eq!(uuid.hyphenated(), "550e8400-e29b-41d4-a716-446655440000");
+    }
+    
+    #[test]
+    fn test_from_u128() {
+        let uuid = Uuid::from_u128(0x550e8400e29b41d4a716446655440000);
+        assert_eq!(uuid.hyphenated(), "550e8400-e29b-41d4-a716-446655440000");
+    }
+    
+    #[test]
+    fn test_as_u64_pair() {
+        let uuid = Uuid::parse("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let (high, low) = uuid.as_u64_pair();
+        assert_eq!(high, 0x550e8400e29b41d4);
+        assert_eq!(low, 0xa716446655440000);
+    }
+    
+    #[test]
+    fn test_parse_error() {
+        assert!(Uuid::parse("not-a-uuid").is_err());
+        assert!(Uuid::parse("550e8400-e29b-41d4-a716").is_err());
+        assert!(Uuid::parse("550e8400-e29b-41d4-a716-44665544000g").is_err());
+    }
+    
+    #[test]
+    fn test_v5_namespace() {
+        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"example.com");
+        assert_eq!(uuid.version(), Some(Version::Sha1));
+        
+        // Same input should produce same UUID
+        let uuid2 = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"example.com");
+        assert_eq!(uuid, uuid2);
+    }
+    
+    #[test]
+    fn test_uniqueness() {
+        let mut uuids = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            uuids.insert(Uuid::new_v4());
+        }
+        assert_eq!(uuids.len(), 1000);
+    }
+}

@@ -1,0 +1,1542 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ BENCHMARK — Statistical Analysis
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Rigorous statistical analysis for benchmarking with:
+// - Bootstrap resampling for confidence intervals
+// - Hypothesis testing (t-test, Mann-Whitney U)
+// - Regression detection with effect size analysis
+// - Outlier classification (mild, severe)
+// - Distribution analysis (skewness, kurtosis)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::bench::statistics
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use std::time::Duration;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CORE STATISTICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Comprehensive statistics computed from benchmark samples
+#[derive(Debug, Clone)]
+pub struct SampleStatistics {
+    /// Number of samples
+    pub n: usize,
+    
+    /// Arithmetic mean
+    pub mean: f64,
+    
+    /// Sample standard deviation
+    pub std_dev: f64,
+    
+    /// Standard error of the mean
+    pub std_error: f64,
+    
+    /// Median (50th percentile)
+    pub median: f64,
+    
+    /// Median absolute deviation
+    pub mad: f64,
+    
+    /// Minimum value
+    pub min: f64,
+    
+    /// Maximum value
+    pub max: f64,
+    
+    /// First quartile (25th percentile)
+    pub q1: f64,
+    
+    /// Third quartile (75th percentile)
+    pub q3: f64,
+    
+    /// Interquartile range
+    pub iqr: f64,
+    
+    /// Coefficient of variation (std_dev / mean)
+    pub cv: f64,
+    
+    /// Skewness (distribution asymmetry)
+    pub skewness: f64,
+    
+    /// Kurtosis (tail heaviness)
+    pub kurtosis: f64,
+    
+    /// Confidence interval lower bound
+    pub ci_lower: f64,
+    
+    /// Confidence interval upper bound
+    pub ci_upper: f64,
+    
+    /// Confidence level used
+    pub confidence_level: f64,
+    
+    /// Outlier classification
+    pub outliers: OutlierStats,
+    
+    /// Per-iteration time (mean / iterations)
+    pub per_iter: f64,
+    
+    /// Iterations per sample
+    pub iterations: u64,
+}
+
+impl SampleStatistics {
+    /// Compute statistics from duration samples
+    pub fn from_durations(samples: &[Duration], iterations: u64, confidence: f64) -> Self {
+        let values: Vec<f64> = samples.iter()
+            .map(|d| d.as_nanos() as f64)
+            .collect();
+        
+        Self::from_values(&values, iterations, confidence)
+    }
+    
+    /// Compute statistics from f64 values
+    pub fn from_values(values: &[f64], iterations: u64, confidence: f64) -> Self {
+        let n = values.len();
+        if n == 0 {
+            return Self::empty(iterations, confidence);
+        }
+        
+        // Sort for percentile calculations
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        
+        // Basic statistics
+        let sum: f64 = values.iter().sum();
+        let mean = sum / n as f64;
+        
+        let variance: f64 = values.iter()
+            .map(|x| (x - mean).powi(2))
+            .sum::<f64>() / (n - 1).max(1) as f64;
+        let std_dev = variance.sqrt();
+        let std_error = std_dev / (n as f64).sqrt();
+        
+        // Percentiles
+        let min = sorted[0];
+        let max = sorted[n - 1];
+        let median = percentile(&sorted, 50.0);
+        let q1 = percentile(&sorted, 25.0);
+        let q3 = percentile(&sorted, 75.0);
+        let iqr = q3 - q1;
+        
+        // MAD (median absolute deviation)
+        let mut deviations: Vec<f64> = sorted.iter()
+            .map(|x| (x - median).abs())
+            .collect();
+        deviations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mad = percentile(&deviations, 50.0) * 1.4826; // Scale to std dev
+        
+        // Coefficient of variation
+        let cv = if mean.abs() > f64::EPSILON {
+            std_dev / mean
+        } else {
+            0.0
+        };
+        
+        // Higher moments
+        let skewness = compute_skewness(values, mean, std_dev);
+        let kurtosis = compute_kurtosis(values, mean, std_dev);
+        
+        // Confidence interval
+        let z = z_score(confidence);
+        let ci_lower = mean - z * std_error;
+        let ci_upper = mean + z * std_error;
+        
+        // Outliers
+        let outliers = OutlierStats::classify(values, q1, q3, iqr);
+        
+        // Per-iteration
+        let per_iter = mean / iterations as f64;
+        
+        SampleStatistics {
+            n,
+            mean,
+            std_dev,
+            std_error,
+            median,
+            mad,
+            min,
+            max,
+            q1,
+            q3,
+            iqr,
+            cv,
+            skewness,
+            kurtosis,
+            ci_lower,
+            ci_upper,
+            confidence_level: confidence,
+            outliers,
+            per_iter,
+            iterations,
+        }
+    }
+    
+    fn empty(iterations: u64, confidence: f64) -> Self {
+        SampleStatistics {
+            n: 0,
+            mean: 0.0,
+            std_dev: 0.0,
+            std_error: 0.0,
+            median: 0.0,
+            mad: 0.0,
+            min: 0.0,
+            max: 0.0,
+            q1: 0.0,
+            q3: 0.0,
+            iqr: 0.0,
+            cv: 0.0,
+            skewness: 0.0,
+            kurtosis: 0.0,
+            ci_lower: 0.0,
+            ci_upper: 0.0,
+            confidence_level: confidence,
+            outliers: OutlierStats::default(),
+            per_iter: 0.0,
+            iterations,
+        }
+    }
+    
+    /// Check if distribution is approximately normal
+    pub fn is_normal(&self) -> bool {
+        // Jarque-Bera test approximation
+        // Normal: skewness ≈ 0, kurtosis ≈ 3 (excess = 0)
+        self.skewness.abs() < 2.0 && self.kurtosis.abs() < 7.0
+    }
+    
+    /// Get the relative uncertainty (margin of error / mean)
+    pub fn relative_uncertainty(&self) -> f64 {
+        if self.mean.abs() > f64::EPSILON {
+            (self.ci_upper - self.ci_lower) / (2.0 * self.mean)
+        } else {
+            f64::INFINITY
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OUTLIER CLASSIFICATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Outlier classification using Tukey's fences
+#[derive(Debug, Clone, Default)]
+pub struct OutlierStats {
+    /// Number of low mild outliers (< Q1 - 1.5*IQR)
+    pub low_mild: usize,
+    
+    /// Number of high mild outliers (> Q3 + 1.5*IQR)
+    pub high_mild: usize,
+    
+    /// Number of low severe outliers (< Q1 - 3*IQR)
+    pub low_severe: usize,
+    
+    /// Number of high severe outliers (> Q3 + 3*IQR)
+    pub high_severe: usize,
+    
+    /// Total outlier count
+    pub total: usize,
+    
+    /// Outlier ratio
+    pub ratio: f64,
+    
+    /// Classification
+    pub classification: OutlierClassification,
+}
+
+impl OutlierStats {
+    pub fn classify(values: &[f64], q1: f64, q3: f64, iqr: f64) -> Self {
+        let n = values.len();
+        if n == 0 || iqr == 0.0 {
+            return Self::default();
+        }
+        
+        let mild_low = q1 - 1.5 * iqr;
+        let mild_high = q3 + 1.5 * iqr;
+        let severe_low = q1 - 3.0 * iqr;
+        let severe_high = q3 + 3.0 * iqr;
+        
+        let mut low_mild = 0;
+        let mut high_mild = 0;
+        let mut low_severe = 0;
+        let mut high_severe = 0;
+        
+        for &v in values {
+            if v < severe_low {
+                low_severe += 1;
+            } else if v < mild_low {
+                low_mild += 1;
+            } else if v > severe_high {
+                high_severe += 1;
+            } else if v > mild_high {
+                high_mild += 1;
+            }
+        }
+        
+        let total = low_mild + high_mild + low_severe + high_severe;
+        let ratio = total as f64 / n as f64;
+        
+        let classification = match ratio {
+            r if r < 0.01 => OutlierClassification::None,
+            r if r < 0.05 => OutlierClassification::Few,
+            r if r < 0.10 => OutlierClassification::Some,
+            r if r < 0.25 => OutlierClassification::Many,
+            _ => OutlierClassification::Severe,
+        };
+        
+        OutlierStats {
+            low_mild,
+            high_mild,
+            low_severe,
+            high_severe,
+            total,
+            ratio,
+            classification,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutlierClassification {
+    #[default]
+    None,
+    Few,
+    Some,
+    Many,
+    Severe,
+}
+
+impl OutlierClassification {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Few => "few",
+            Self::Some => "some",
+            Self::Many => "many",
+            Self::Severe => "severe",
+        }
+    }
+    
+    pub fn color_code(&self) -> &'static str {
+        match self {
+            Self::None => "green",
+            Self::Few => "green",
+            Self::Some => "yellow",
+            Self::Many => "orange",
+            Self::Severe => "red",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BOOTSTRAP RESAMPLING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Bootstrap confidence interval estimation
+#[derive(Debug, Clone)]
+pub struct BootstrapEstimate {
+    /// Point estimate
+    pub point: f64,
+    
+    /// Bootstrap standard error
+    pub std_error: f64,
+    
+    /// Lower confidence bound
+    pub ci_lower: f64,
+    
+    /// Upper confidence bound
+    pub ci_upper: f64,
+    
+    /// Confidence level
+    pub confidence: f64,
+    
+    /// Number of bootstrap samples
+    pub n_resamples: usize,
+}
+
+/// Bootstrap resampler for robust confidence intervals
+pub struct Bootstrap {
+    /// Number of resamples
+    n_resamples: usize,
+    
+    /// Confidence level
+    confidence: f64,
+    
+    /// Random seed
+    seed: u64,
+}
+
+impl Bootstrap {
+    pub fn new(n_resamples: usize, confidence: f64) -> Self {
+        Bootstrap {
+            n_resamples,
+            confidence,
+            seed: 0x5DEECE66D, // Default LCG seed
+        }
+    }
+    
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+    
+    /// Estimate mean with bootstrap confidence interval
+    pub fn estimate_mean(&self, samples: &[f64]) -> BootstrapEstimate {
+        self.estimate(samples, |s| {
+            s.iter().sum::<f64>() / s.len() as f64
+        })
+    }
+    
+    /// Estimate median with bootstrap confidence interval
+    pub fn estimate_median(&self, samples: &[f64]) -> BootstrapEstimate {
+        self.estimate(samples, |s| {
+            let mut sorted = s.to_vec();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            percentile(&sorted, 50.0)
+        })
+    }
+    
+    /// Estimate standard deviation with bootstrap confidence interval
+    pub fn estimate_std_dev(&self, samples: &[f64]) -> BootstrapEstimate {
+        self.estimate(samples, |s| {
+            let mean = s.iter().sum::<f64>() / s.len() as f64;
+            let var = s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (s.len() - 1) as f64;
+            var.sqrt()
+        })
+    }
+    
+    /// Generic bootstrap estimation
+    pub fn estimate<F>(&self, samples: &[f64], statistic: F) -> BootstrapEstimate
+    where
+        F: Fn(&[f64]) -> f64,
+    {
+        let n = samples.len();
+        if n == 0 {
+            return BootstrapEstimate {
+                point: 0.0,
+                std_error: 0.0,
+                ci_lower: 0.0,
+                ci_upper: 0.0,
+                confidence: self.confidence,
+                n_resamples: 0,
+            };
+        }
+        
+        let point = statistic(samples);
+        
+        // Generate bootstrap samples
+        let mut rng = LcgRng::new(self.seed);
+        let mut estimates: Vec<f64> = Vec::with_capacity(self.n_resamples);
+        
+        for _ in 0..self.n_resamples {
+            let resample: Vec<f64> = (0..n)
+                .map(|_| samples[rng.next_usize() % n])
+                .collect();
+            estimates.push(statistic(&resample));
+        }
+        
+        estimates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        
+        // BCa (bias-corrected and accelerated) would be better, but percentile is simpler
+        let alpha = (1.0 - self.confidence) / 2.0;
+        let lower_idx = (alpha * self.n_resamples as f64) as usize;
+        let upper_idx = ((1.0 - alpha) * self.n_resamples as f64) as usize;
+        
+        let ci_lower = estimates.get(lower_idx).copied().unwrap_or(point);
+        let ci_upper = estimates.get(upper_idx.min(estimates.len() - 1)).copied().unwrap_or(point);
+        
+        // Bootstrap standard error
+        let mean_est = estimates.iter().sum::<f64>() / estimates.len() as f64;
+        let variance = estimates.iter()
+            .map(|x| (x - mean_est).powi(2))
+            .sum::<f64>() / (estimates.len() - 1) as f64;
+        let std_error = variance.sqrt();
+        
+        BootstrapEstimate {
+            point,
+            std_error,
+            ci_lower,
+            ci_upper,
+            confidence: self.confidence,
+            n_resamples: self.n_resamples,
+        }
+    }
+    
+    /// Compare two samples using bootstrap
+    pub fn compare(&self, baseline: &[f64], current: &[f64]) -> BootstrapComparison {
+        let diff_mean = self.estimate_difference(baseline, current, |s| {
+            s.iter().sum::<f64>() / s.len() as f64
+        });
+        
+        let ratio_mean = self.estimate_ratio(baseline, current, |s| {
+            s.iter().sum::<f64>() / s.len() as f64
+        });
+        
+        BootstrapComparison {
+            difference: diff_mean,
+            ratio: ratio_mean,
+        }
+    }
+    
+    fn estimate_difference<F>(&self, baseline: &[f64], current: &[f64], statistic: F) -> BootstrapEstimate
+    where
+        F: Fn(&[f64]) -> f64,
+    {
+        let baseline_stat = statistic(baseline);
+        let current_stat = statistic(current);
+        let point = current_stat - baseline_stat;
+        
+        let mut rng = LcgRng::new(self.seed);
+        let mut estimates: Vec<f64> = Vec::with_capacity(self.n_resamples);
+        
+        for _ in 0..self.n_resamples {
+            let b_resample: Vec<f64> = (0..baseline.len())
+                .map(|_| baseline[rng.next_usize() % baseline.len()])
+                .collect();
+            let c_resample: Vec<f64> = (0..current.len())
+                .map(|_| current[rng.next_usize() % current.len()])
+                .collect();
+            estimates.push(statistic(&c_resample) - statistic(&b_resample));
+        }
+        
+        estimates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        
+        let alpha = (1.0 - self.confidence) / 2.0;
+        let lower_idx = (alpha * self.n_resamples as f64) as usize;
+        let upper_idx = ((1.0 - alpha) * self.n_resamples as f64) as usize;
+        
+        BootstrapEstimate {
+            point,
+            std_error: 0.0, // Computed differently for differences
+            ci_lower: estimates.get(lower_idx).copied().unwrap_or(point),
+            ci_upper: estimates.get(upper_idx.min(estimates.len() - 1)).copied().unwrap_or(point),
+            confidence: self.confidence,
+            n_resamples: self.n_resamples,
+        }
+    }
+    
+    fn estimate_ratio<F>(&self, baseline: &[f64], current: &[f64], statistic: F) -> BootstrapEstimate
+    where
+        F: Fn(&[f64]) -> f64,
+    {
+        let baseline_stat = statistic(baseline);
+        let current_stat = statistic(current);
+        let point = if baseline_stat.abs() > f64::EPSILON {
+            current_stat / baseline_stat
+        } else {
+            1.0
+        };
+        
+        let mut rng = LcgRng::new(self.seed.wrapping_add(1));
+        let mut estimates: Vec<f64> = Vec::with_capacity(self.n_resamples);
+        
+        for _ in 0..self.n_resamples {
+            let b_resample: Vec<f64> = (0..baseline.len())
+                .map(|_| baseline[rng.next_usize() % baseline.len()])
+                .collect();
+            let c_resample: Vec<f64> = (0..current.len())
+                .map(|_| current[rng.next_usize() % current.len()])
+                .collect();
+            let b_stat = statistic(&b_resample);
+            let c_stat = statistic(&c_resample);
+            if b_stat.abs() > f64::EPSILON {
+                estimates.push(c_stat / b_stat);
+            }
+        }
+        
+        if estimates.is_empty() {
+            return BootstrapEstimate {
+                point,
+                std_error: 0.0,
+                ci_lower: point,
+                ci_upper: point,
+                confidence: self.confidence,
+                n_resamples: 0,
+            };
+        }
+        
+        estimates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        
+        let alpha = (1.0 - self.confidence) / 2.0;
+        let lower_idx = (alpha * estimates.len() as f64) as usize;
+        let upper_idx = ((1.0 - alpha) * estimates.len() as f64) as usize;
+        
+        BootstrapEstimate {
+            point,
+            std_error: 0.0,
+            ci_lower: estimates.get(lower_idx).copied().unwrap_or(point),
+            ci_upper: estimates.get(upper_idx.min(estimates.len() - 1)).copied().unwrap_or(point),
+            confidence: self.confidence,
+            n_resamples: estimates.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BootstrapComparison {
+    pub difference: BootstrapEstimate,
+    pub ratio: BootstrapEstimate,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HYPOTHESIS TESTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Result of a hypothesis test
+#[derive(Debug, Clone)]
+pub struct HypothesisTest {
+    /// Test name
+    pub test_name: String,
+    
+    /// Test statistic
+    pub statistic: f64,
+    
+    /// P-value
+    pub p_value: f64,
+    
+    /// Significance level
+    pub alpha: f64,
+    
+    /// Whether null hypothesis is rejected
+    pub significant: bool,
+    
+    /// Effect size (Cohen's d, etc.)
+    pub effect_size: f64,
+    
+    /// Effect size interpretation
+    pub effect_interpretation: EffectSize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectSize {
+    Negligible,
+    Small,
+    Medium,
+    Large,
+    VeryLarge,
+}
+
+impl EffectSize {
+    pub fn from_cohens_d(d: f64) -> Self {
+        let abs_d = d.abs();
+        match abs_d {
+            d if d < 0.2 => Self::Negligible,
+            d if d < 0.5 => Self::Small,
+            d if d < 0.8 => Self::Medium,
+            d if d < 1.2 => Self::Large,
+            _ => Self::VeryLarge,
+        }
+    }
+    
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Negligible => "negligible",
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+            Self::VeryLarge => "very large",
+        }
+    }
+}
+
+/// Welch's t-test for comparing two sample means
+pub fn welch_t_test(sample1: &[f64], sample2: &[f64], alpha: f64) -> HypothesisTest {
+    let n1 = sample1.len() as f64;
+    let n2 = sample2.len() as f64;
+    
+    if n1 < 2.0 || n2 < 2.0 {
+        return HypothesisTest {
+            test_name: "Welch's t-test".to_string(),
+            statistic: 0.0,
+            p_value: 1.0,
+            alpha,
+            significant: false,
+            effect_size: 0.0,
+            effect_interpretation: EffectSize::Negligible,
+        };
+    }
+    
+    let mean1 = sample1.iter().sum::<f64>() / n1;
+    let mean2 = sample2.iter().sum::<f64>() / n2;
+    
+    let var1 = sample1.iter().map(|x| (x - mean1).powi(2)).sum::<f64>() / (n1 - 1.0);
+    let var2 = sample2.iter().map(|x| (x - mean2).powi(2)).sum::<f64>() / (n2 - 1.0);
+    
+    let se = (var1 / n1 + var2 / n2).sqrt();
+    
+    if se < f64::EPSILON {
+        return HypothesisTest {
+            test_name: "Welch's t-test".to_string(),
+            statistic: 0.0,
+            p_value: 1.0,
+            alpha,
+            significant: false,
+            effect_size: 0.0,
+            effect_interpretation: EffectSize::Negligible,
+        };
+    }
+    
+    let t = (mean1 - mean2) / se;
+    
+    // Welch-Satterthwaite degrees of freedom
+    let v1 = var1 / n1;
+    let v2 = var2 / n2;
+    let df = (v1 + v2).powi(2) / (v1.powi(2) / (n1 - 1.0) + v2.powi(2) / (n2 - 1.0));
+    
+    // Two-tailed p-value (using normal approximation for large df)
+    let p_value = 2.0 * (1.0 - normal_cdf(t.abs()));
+    
+    // Cohen's d (pooled standard deviation)
+    let pooled_var = ((n1 - 1.0) * var1 + (n2 - 1.0) * var2) / (n1 + n2 - 2.0);
+    let pooled_sd = pooled_var.sqrt();
+    let effect_size = if pooled_sd > f64::EPSILON {
+        (mean1 - mean2) / pooled_sd
+    } else {
+        0.0
+    };
+    
+    HypothesisTest {
+        test_name: "Welch's t-test".to_string(),
+        statistic: t,
+        p_value,
+        alpha,
+        significant: p_value < alpha,
+        effect_size,
+        effect_interpretation: EffectSize::from_cohens_d(effect_size),
+    }
+}
+
+/// Mann-Whitney U test (non-parametric alternative to t-test)
+pub fn mann_whitney_u_test(sample1: &[f64], sample2: &[f64], alpha: f64) -> HypothesisTest {
+    let n1 = sample1.len();
+    let n2 = sample2.len();
+    
+    if n1 == 0 || n2 == 0 {
+        return HypothesisTest {
+            test_name: "Mann-Whitney U test".to_string(),
+            statistic: 0.0,
+            p_value: 1.0,
+            alpha,
+            significant: false,
+            effect_size: 0.0,
+            effect_interpretation: EffectSize::Negligible,
+        };
+    }
+    
+    // Rank all values
+    let mut combined: Vec<(f64, usize)> = Vec::with_capacity(n1 + n2);
+    for &v in sample1 {
+        combined.push((v, 0)); // Group 0 = sample1
+    }
+    for &v in sample2 {
+        combined.push((v, 1)); // Group 1 = sample2
+    }
+    combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    
+    // Assign ranks (handling ties with average rank)
+    let mut ranks: Vec<f64> = vec![0.0; combined.len()];
+    let mut i = 0;
+    while i < combined.len() {
+        let mut j = i;
+        while j < combined.len() && (combined[j].0 - combined[i].0).abs() < f64::EPSILON {
+            j += 1;
+        }
+        let avg_rank = (i + j + 1) as f64 / 2.0;
+        for k in i..j {
+            ranks[k] = avg_rank;
+        }
+        i = j;
+    }
+    
+    // Sum of ranks for sample1
+    let r1: f64 = combined.iter()
+        .enumerate()
+        .filter(|(_, (_, group))| *group == 0)
+        .map(|(idx, _)| ranks[idx])
+        .sum();
+    
+    // U statistic
+    let u1 = r1 - (n1 * (n1 + 1)) as f64 / 2.0;
+    let u2 = (n1 * n2) as f64 - u1;
+    let u = u1.min(u2);
+    
+    // Normal approximation (valid for n1, n2 >= 8)
+    let mu = (n1 * n2) as f64 / 2.0;
+    let sigma = ((n1 * n2 * (n1 + n2 + 1)) as f64 / 12.0).sqrt();
+    
+    let z = if sigma > f64::EPSILON {
+        (u - mu) / sigma
+    } else {
+        0.0
+    };
+    
+    let p_value = 2.0 * normal_cdf(-z.abs());
+    
+    // Effect size: r = Z / sqrt(N)
+    let effect_size = z / ((n1 + n2) as f64).sqrt();
+    
+    HypothesisTest {
+        test_name: "Mann-Whitney U test".to_string(),
+        statistic: u,
+        p_value,
+        alpha,
+        significant: p_value < alpha,
+        effect_size,
+        effect_interpretation: EffectSize::from_cohens_d(effect_size * 2.0), // Approximate conversion
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGRESSION DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Regression analysis result
+#[derive(Debug, Clone)]
+pub struct RegressionAnalysis {
+    /// Change in mean
+    pub mean_change: f64,
+    
+    /// Percent change in mean
+    pub mean_change_pct: f64,
+    
+    /// Change in median
+    pub median_change: f64,
+    
+    /// Percent change in median  
+    pub median_change_pct: f64,
+    
+    /// Whether change is statistically significant
+    pub is_significant: bool,
+    
+    /// P-value from hypothesis test
+    pub p_value: f64,
+    
+    /// Effect size
+    pub effect_size: f64,
+    
+    /// Classification
+    pub classification: RegressionClass,
+    
+    /// Confidence interval for change
+    pub change_ci_lower: f64,
+    pub change_ci_upper: f64,
+    
+    /// Bootstrap comparison
+    pub bootstrap: Option<BootstrapComparison>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegressionClass {
+    /// Performance improved significantly
+    Improved,
+    /// Performance improved but not significantly
+    ProbablyImproved,
+    /// No significant change
+    NoChange,
+    /// Performance degraded but not significantly
+    ProbablyRegressed,
+    /// Performance degraded significantly
+    Regressed,
+}
+
+impl RegressionClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Improved => "improved",
+            Self::ProbablyImproved => "probably improved",
+            Self::NoChange => "no change",
+            Self::ProbablyRegressed => "probably regressed",
+            Self::Regressed => "regressed",
+        }
+    }
+    
+    pub fn color(&self) -> &'static str {
+        match self {
+            Self::Improved => "green",
+            Self::ProbablyImproved => "light_green",
+            Self::NoChange => "white",
+            Self::ProbablyRegressed => "yellow",
+            Self::Regressed => "red",
+        }
+    }
+    
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            Self::Improved => "✓",
+            Self::ProbablyImproved => "↓",
+            Self::NoChange => "≈",
+            Self::ProbablyRegressed => "↑",
+            Self::Regressed => "✗",
+        }
+    }
+}
+
+/// Detect performance regressions between baseline and current measurements
+pub fn detect_regression(
+    baseline: &[f64],
+    current: &[f64],
+    significance_threshold: f64,
+    noise_threshold: f64,
+) -> RegressionAnalysis {
+    // Compute statistics
+    let baseline_mean = baseline.iter().sum::<f64>() / baseline.len().max(1) as f64;
+    let current_mean = current.iter().sum::<f64>() / current.len().max(1) as f64;
+    
+    let mut baseline_sorted = baseline.to_vec();
+    let mut current_sorted = current.to_vec();
+    baseline_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    current_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    
+    let baseline_median = percentile(&baseline_sorted, 50.0);
+    let current_median = percentile(&current_sorted, 50.0);
+    
+    let mean_change = current_mean - baseline_mean;
+    let mean_change_pct = if baseline_mean.abs() > f64::EPSILON {
+        (mean_change / baseline_mean) * 100.0
+    } else {
+        0.0
+    };
+    
+    let median_change = current_median - baseline_median;
+    let median_change_pct = if baseline_median.abs() > f64::EPSILON {
+        (median_change / baseline_median) * 100.0
+    } else {
+        0.0
+    };
+    
+    // Statistical test
+    let test = welch_t_test(baseline, current, significance_threshold);
+    
+    // Bootstrap comparison
+    let bootstrap = Bootstrap::new(10000, 0.95);
+    let boot_compare = bootstrap.compare(baseline, current);
+    
+    // Classification
+    let classification = classify_regression(
+        mean_change_pct,
+        test.significant,
+        test.effect_size,
+        noise_threshold,
+    );
+    
+    RegressionAnalysis {
+        mean_change,
+        mean_change_pct,
+        median_change,
+        median_change_pct,
+        is_significant: test.significant,
+        p_value: test.p_value,
+        effect_size: test.effect_size,
+        classification,
+        change_ci_lower: boot_compare.difference.ci_lower,
+        change_ci_upper: boot_compare.difference.ci_upper,
+        bootstrap: Some(boot_compare),
+    }
+}
+
+fn classify_regression(
+    change_pct: f64,
+    significant: bool,
+    effect_size: f64,
+    noise_threshold: f64,
+) -> RegressionClass {
+    // Consider it noise if change is very small
+    if change_pct.abs() < noise_threshold {
+        return RegressionClass::NoChange;
+    }
+    
+    let is_improvement = change_pct < 0.0; // Lower is better for timing
+    
+    if significant && effect_size.abs() >= 0.5 {
+        // Significant with at least medium effect
+        if is_improvement {
+            RegressionClass::Improved
+        } else {
+            RegressionClass::Regressed
+        }
+    } else if significant || effect_size.abs() >= 0.2 {
+        // Either significant or small effect
+        if is_improvement {
+            RegressionClass::ProbablyImproved
+        } else {
+            RegressionClass::ProbablyRegressed
+        }
+    } else {
+        RegressionClass::NoChange
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINEAR REGRESSION (for throughput analysis)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Simple linear regression result
+#[derive(Debug, Clone)]
+pub struct LinearRegression {
+    /// Slope (rate of change)
+    pub slope: f64,
+    
+    /// Y-intercept
+    pub intercept: f64,
+    
+    /// R-squared (coefficient of determination)
+    pub r_squared: f64,
+    
+    /// Standard error of slope
+    pub slope_std_error: f64,
+    
+    /// Standard error of intercept
+    pub intercept_std_error: f64,
+    
+    /// Residual standard error
+    pub residual_std_error: f64,
+}
+
+impl LinearRegression {
+    /// Fit linear regression y = slope * x + intercept
+    pub fn fit(x: &[f64], y: &[f64]) -> Self {
+        let n = x.len();
+        if n < 2 || n != y.len() {
+            return Self::empty();
+        }
+        
+        let n_f = n as f64;
+        let sum_x: f64 = x.iter().sum();
+        let sum_y: f64 = y.iter().sum();
+        let sum_xy: f64 = x.iter().zip(y.iter()).map(|(xi, yi)| xi * yi).sum();
+        let sum_x2: f64 = x.iter().map(|xi| xi * xi).sum();
+        
+        let mean_x = sum_x / n_f;
+        let mean_y = sum_y / n_f;
+        
+        let ss_xx = sum_x2 - sum_x * sum_x / n_f;
+        let ss_xy = sum_xy - sum_x * sum_y / n_f;
+        
+        if ss_xx.abs() < f64::EPSILON {
+            return Self::empty();
+        }
+        
+        let slope = ss_xy / ss_xx;
+        let intercept = mean_y - slope * mean_x;
+        
+        // Calculate R-squared
+        let ss_tot: f64 = y.iter().map(|yi| (yi - mean_y).powi(2)).sum();
+        let ss_res: f64 = x.iter().zip(y.iter())
+            .map(|(xi, yi)| {
+                let pred = slope * xi + intercept;
+                (yi - pred).powi(2)
+            })
+            .sum();
+        
+        let r_squared = if ss_tot.abs() > f64::EPSILON {
+            1.0 - ss_res / ss_tot
+        } else {
+            0.0
+        };
+        
+        // Standard errors
+        let mse = ss_res / (n_f - 2.0).max(1.0);
+        let residual_std_error = mse.sqrt();
+        let slope_std_error = (mse / ss_xx).sqrt();
+        let intercept_std_error = (mse * (1.0 / n_f + mean_x * mean_x / ss_xx)).sqrt();
+        
+        LinearRegression {
+            slope,
+            intercept,
+            r_squared,
+            slope_std_error,
+            intercept_std_error,
+            residual_std_error,
+        }
+    }
+    
+    fn empty() -> Self {
+        LinearRegression {
+            slope: 0.0,
+            intercept: 0.0,
+            r_squared: 0.0,
+            slope_std_error: 0.0,
+            intercept_std_error: 0.0,
+            residual_std_error: 0.0,
+        }
+    }
+    
+    /// Predict y for given x
+    pub fn predict(&self, x: f64) -> f64 {
+        self.slope * x + self.intercept
+    }
+    
+    /// Is the regression a good fit?
+    pub fn is_good_fit(&self) -> bool {
+        self.r_squared >= 0.9
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THROUGHPUT ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Throughput analysis for varying input sizes
+#[derive(Debug, Clone)]
+pub struct ThroughputAnalysis {
+    /// Input sizes
+    pub sizes: Vec<f64>,
+    
+    /// Throughput at each size (elements per second)
+    pub throughput: Vec<f64>,
+    
+    /// Linear regression fit
+    pub regression: LinearRegression,
+    
+    /// Estimated complexity class
+    pub complexity: ComplexityClass,
+    
+    /// Peak throughput
+    pub peak_throughput: f64,
+    
+    /// Size at peak throughput
+    pub peak_size: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComplexityClass {
+    O1,        // Constant
+    OLogN,     // Logarithmic
+    ON,        // Linear
+    ONLogN,    // Linearithmic
+    ON2,       // Quadratic
+    ON3,       // Cubic
+    O2N,       // Exponential
+    Unknown,
+}
+
+impl ComplexityClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::O1 => "O(1)",
+            Self::OLogN => "O(log n)",
+            Self::ON => "O(n)",
+            Self::ONLogN => "O(n log n)",
+            Self::ON2 => "O(n²)",
+            Self::ON3 => "O(n³)",
+            Self::O2N => "O(2ⁿ)",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl ThroughputAnalysis {
+    /// Analyze throughput from (size, time) measurements
+    pub fn from_measurements(sizes: &[f64], times: &[f64]) -> Self {
+        let throughput: Vec<f64> = sizes.iter()
+            .zip(times.iter())
+            .map(|(s, t)| if *t > f64::EPSILON { s / t } else { 0.0 })
+            .collect();
+        
+        let regression = LinearRegression::fit(sizes, &throughput);
+        
+        let (peak_throughput, peak_size) = throughput.iter()
+            .zip(sizes.iter())
+            .max_by(|a, b| a.0.partial_cmp(b.0).unwrap())
+            .map(|(t, s)| (*t, *s))
+            .unwrap_or((0.0, 0.0));
+        
+        let complexity = estimate_complexity(sizes, times);
+        
+        ThroughputAnalysis {
+            sizes: sizes.to_vec(),
+            throughput,
+            regression,
+            complexity,
+            peak_throughput,
+            peak_size,
+        }
+    }
+}
+
+fn estimate_complexity(sizes: &[f64], times: &[f64]) -> ComplexityClass {
+    if sizes.len() < 3 {
+        return ComplexityClass::Unknown;
+    }
+    
+    // Try fitting various complexity models
+    let models = [
+        ("O1", |n: f64| 1.0),
+        ("OLogN", |n: f64| n.ln().max(1.0)),
+        ("ON", |n: f64| n),
+        ("ONLogN", |n: f64| n * n.ln().max(1.0)),
+        ("ON2", |n: f64| n * n),
+        ("ON3", |n: f64| n * n * n),
+    ];
+    
+    let mut best_r2 = 0.0;
+    let mut best_class = ComplexityClass::Unknown;
+    
+    for (name, model) in &models {
+        let transformed: Vec<f64> = sizes.iter().map(|&n| model(n)).collect();
+        let reg = LinearRegression::fit(&transformed, times);
+        
+        if reg.r_squared > best_r2 && reg.slope > 0.0 {
+            best_r2 = reg.r_squared;
+            best_class = match *name {
+                "O1" => ComplexityClass::O1,
+                "OLogN" => ComplexityClass::OLogN,
+                "ON" => ComplexityClass::ON,
+                "ONLogN" => ComplexityClass::ONLogN,
+                "ON2" => ComplexityClass::ON2,
+                "ON3" => ComplexityClass::ON3,
+                _ => ComplexityClass::Unknown,
+            };
+        }
+    }
+    
+    if best_r2 < 0.9 {
+        ComplexityClass::Unknown
+    } else {
+        best_class
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NOISE ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// System noise analysis
+#[derive(Debug, Clone)]
+pub struct NoiseAnalysis {
+    /// Estimated noise floor (minimum achievable variance)
+    pub noise_floor: f64,
+    
+    /// Noise ratio (noise variance / signal variance)
+    pub noise_ratio: f64,
+    
+    /// Whether measurements are noisy
+    pub is_noisy: bool,
+    
+    /// Recommended minimum samples for reliable measurement
+    pub recommended_samples: usize,
+    
+    /// Assessment
+    pub assessment: NoiseAssessment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoiseAssessment {
+    Excellent,   // < 1% noise
+    Good,        // 1-5% noise
+    Acceptable,  // 5-10% noise
+    Poor,        // 10-20% noise
+    Unreliable,  // > 20% noise
+}
+
+impl NoiseAssessment {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Excellent => "excellent",
+            Self::Good => "good",
+            Self::Acceptable => "acceptable",
+            Self::Poor => "poor",
+            Self::Unreliable => "unreliable",
+        }
+    }
+}
+
+impl NoiseAnalysis {
+    pub fn analyze(samples: &[f64]) -> Self {
+        let stats = SampleStatistics::from_values(samples, 1, 0.95);
+        
+        // Use coefficient of variation as noise measure
+        let noise_ratio = stats.cv;
+        
+        let assessment = match noise_ratio {
+            r if r < 0.01 => NoiseAssessment::Excellent,
+            r if r < 0.05 => NoiseAssessment::Good,
+            r if r < 0.10 => NoiseAssessment::Acceptable,
+            r if r < 0.20 => NoiseAssessment::Poor,
+            _ => NoiseAssessment::Unreliable,
+        };
+        
+        // Estimate required samples for target precision
+        let target_precision = 0.01; // 1% relative uncertainty
+        let z = 1.96; // 95% confidence
+        let recommended_samples = ((z * noise_ratio / target_precision).powi(2) as usize).max(10);
+        
+        NoiseAnalysis {
+            noise_floor: stats.mad,
+            noise_ratio,
+            is_noisy: noise_ratio > 0.10,
+            recommended_samples,
+            assessment,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Calculate percentile from sorted values
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    
+    let idx = (p / 100.0) * (sorted.len() - 1) as f64;
+    let lower = idx.floor() as usize;
+    let upper = idx.ceil() as usize;
+    let frac = idx - lower as f64;
+    
+    if upper >= sorted.len() {
+        sorted[sorted.len() - 1]
+    } else {
+        sorted[lower] * (1.0 - frac) + sorted[upper] * frac
+    }
+}
+
+/// Compute skewness (Fisher's)
+fn compute_skewness(values: &[f64], mean: f64, std_dev: f64) -> f64 {
+    if values.len() < 3 || std_dev < f64::EPSILON {
+        return 0.0;
+    }
+    
+    let n = values.len() as f64;
+    let m3: f64 = values.iter()
+        .map(|x| ((x - mean) / std_dev).powi(3))
+        .sum::<f64>() / n;
+    
+    // Bias correction
+    let correction = (n * (n - 1.0)).sqrt() / (n - 2.0);
+    m3 * correction
+}
+
+/// Compute excess kurtosis (Fisher's)
+fn compute_kurtosis(values: &[f64], mean: f64, std_dev: f64) -> f64 {
+    if values.len() < 4 || std_dev < f64::EPSILON {
+        return 0.0;
+    }
+    
+    let n = values.len() as f64;
+    let m4: f64 = values.iter()
+        .map(|x| ((x - mean) / std_dev).powi(4))
+        .sum::<f64>() / n;
+    
+    // Excess kurtosis (subtract 3 for normal reference)
+    m4 - 3.0
+}
+
+/// Z-score for given confidence level
+fn z_score(confidence: f64) -> f64 {
+    // Common values
+    match confidence {
+        c if (c - 0.90).abs() < 0.001 => 1.645,
+        c if (c - 0.95).abs() < 0.001 => 1.960,
+        c if (c - 0.99).abs() < 0.001 => 2.576,
+        c if (c - 0.999).abs() < 0.001 => 3.291,
+        _ => {
+            // Approximation using inverse error function
+            let p = (1.0 + confidence) / 2.0;
+            inverse_normal_cdf(p)
+        }
+    }
+}
+
+/// Standard normal CDF approximation
+fn normal_cdf(x: f64) -> f64 {
+    // Abramowitz and Stegun approximation
+    let a1 = 0.254829592;
+    let a2 = -0.284496736;
+    let a3 = 1.421413741;
+    let a4 = -1.453152027;
+    let a5 = 1.061405429;
+    let p = 0.3275911;
+    
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    
+    let t = 1.0 / (1.0 + p * x);
+    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x / 2.0).exp();
+    
+    0.5 * (1.0 + sign * y)
+}
+
+/// Inverse standard normal CDF (quantile function)
+fn inverse_normal_cdf(p: f64) -> f64 {
+    // Rational approximation
+    if p <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if p >= 1.0 {
+        return f64::INFINITY;
+    }
+    
+    let p = if p > 0.5 { 1.0 - p } else { p };
+    let t = (-2.0 * p.ln()).sqrt();
+    
+    let c0 = 2.515517;
+    let c1 = 0.802853;
+    let c2 = 0.010328;
+    let d1 = 1.432788;
+    let d2 = 0.189269;
+    let d3 = 0.001308;
+    
+    let result = t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t);
+    
+    if p > 0.5 { -result } else { result }
+}
+
+/// Simple LCG random number generator
+struct LcgRng {
+    state: u64,
+}
+
+impl LcgRng {
+    fn new(seed: u64) -> Self {
+        LcgRng { state: seed }
+    }
+    
+    fn next_u64(&mut self) -> u64 {
+        // LCG parameters from Numerical Recipes
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.state
+    }
+    
+    fn next_usize(&mut self) -> usize {
+        self.next_u64() as usize
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_sample_statistics_basic() {
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let stats = SampleStatistics::from_values(&values, 1, 0.95);
+        
+        assert_eq!(stats.n, 5);
+        assert!((stats.mean - 3.0).abs() < 0.001);
+        assert!((stats.median - 3.0).abs() < 0.001);
+        assert_eq!(stats.min, 1.0);
+        assert_eq!(stats.max, 5.0);
+    }
+    
+    #[test]
+    fn test_outlier_detection() {
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 100.0]; // 100 is an outlier
+        let stats = SampleStatistics::from_values(&values, 1, 0.95);
+        
+        assert!(stats.outliers.total > 0);
+    }
+    
+    #[test]
+    fn test_bootstrap_mean() {
+        let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
+        let bootstrap = Bootstrap::new(1000, 0.95);
+        let estimate = bootstrap.estimate_mean(&values);
+        
+        // Mean should be around 49.5
+        assert!((estimate.point - 49.5).abs() < 1.0);
+        assert!(estimate.ci_lower < estimate.point);
+        assert!(estimate.ci_upper > estimate.point);
+    }
+    
+    #[test]
+    fn test_welch_t_test() {
+        let sample1 = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let sample2 = vec![10.0, 11.0, 12.0, 13.0, 14.0];
+        
+        let result = welch_t_test(&sample1, &sample2, 0.05);
+        
+        assert!(result.significant); // Should detect difference
+        assert!(result.p_value < 0.05);
+    }
+    
+    #[test]
+    fn test_regression_detection_no_change() {
+        let baseline = vec![1.0, 1.1, 0.9, 1.0, 1.05];
+        let current = vec![1.0, 1.0, 1.1, 0.95, 1.0];
+        
+        let result = detect_regression(&baseline, &current, 0.05, 5.0);
+        
+        assert_eq!(result.classification, RegressionClass::NoChange);
+    }
+    
+    #[test]
+    fn test_regression_detection_regressed() {
+        let baseline = vec![1.0, 1.1, 0.9, 1.0, 1.05];
+        let current = vec![2.0, 2.1, 1.9, 2.0, 2.05]; // 2x slower
+        
+        let result = detect_regression(&baseline, &current, 0.05, 5.0);
+        
+        assert!(matches!(
+            result.classification,
+            RegressionClass::Regressed | RegressionClass::ProbablyRegressed
+        ));
+    }
+    
+    #[test]
+    fn test_linear_regression() {
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let y = vec![2.0, 4.0, 6.0, 8.0, 10.0]; // y = 2x
+        
+        let reg = LinearRegression::fit(&x, &y);
+        
+        assert!((reg.slope - 2.0).abs() < 0.001);
+        assert!(reg.intercept.abs() < 0.001);
+        assert!(reg.r_squared > 0.999);
+    }
+    
+    #[test]
+    fn test_noise_analysis() {
+        let stable = vec![1.0, 1.001, 0.999, 1.0, 1.002];
+        let noise = NoiseAnalysis::analyze(&stable);
+        
+        assert!(matches!(noise.assessment, NoiseAssessment::Excellent | NoiseAssessment::Good));
+    }
+    
+    #[test]
+    fn test_percentile() {
+        let sorted = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        
+        assert_eq!(percentile(&sorted, 0.0), 1.0);
+        assert_eq!(percentile(&sorted, 50.0), 3.0);
+        assert_eq!(percentile(&sorted, 100.0), 5.0);
+    }
+    
+    #[test]
+    fn test_normal_cdf() {
+        // Check standard values
+        assert!((normal_cdf(0.0) - 0.5).abs() < 0.001);
+        assert!((normal_cdf(1.96) - 0.975).abs() < 0.01);
+    }
+    
+    #[test]
+    fn test_z_score() {
+        assert!((z_score(0.95) - 1.96).abs() < 0.01);
+        assert!((z_score(0.99) - 2.576).abs() < 0.01);
+    }
+    
+    #[test]
+    fn test_effect_size() {
+        assert_eq!(EffectSize::from_cohens_d(0.1), EffectSize::Negligible);
+        assert_eq!(EffectSize::from_cohens_d(0.3), EffectSize::Small);
+        assert_eq!(EffectSize::from_cohens_d(0.6), EffectSize::Medium);
+        assert_eq!(EffectSize::from_cohens_d(1.0), EffectSize::Large);
+        assert_eq!(EffectSize::from_cohens_d(1.5), EffectSize::VeryLarge);
+    }
+}

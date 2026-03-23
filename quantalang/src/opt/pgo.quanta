@@ -1,0 +1,974 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Profile-Guided Optimization (PGO)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Profile-guided optimization infrastructure:
+//   - Instrumentation insertion
+//   - Profile data collection
+//   - Profile-guided code generation
+//   - Hot/cold path analysis
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::pgo
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use std::sync::Arc;
+use std::io::{Read, Write};
+use std::fs::File;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROFILE DATA FORMAT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Profile data magic number
+const PROFILE_MAGIC: u64 = 0x514E5441_50524F46; // "QNTAPROF"
+
+/// Profile data version
+const PROFILE_VERSION: u32 = 1;
+
+/// Function profile data
+#[derive(Debug, Clone)]
+pub struct FunctionProfile {
+    /// Function name (mangled)
+    pub name: String,
+    /// Function hash (for validation)
+    pub hash: u64,
+    /// Total entry count
+    pub entry_count: u64,
+    /// Block execution counts
+    pub block_counts: Vec<BlockCount>,
+    /// Edge execution counts
+    pub edge_counts: Vec<EdgeCount>,
+    /// Value profiles
+    pub value_profiles: Vec<ValueProfile>,
+    /// Indirect call targets
+    pub indirect_targets: Vec<IndirectCallProfile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockCount {
+    pub block_id: u32,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct EdgeCount {
+    pub from_block: u32,
+    pub to_block: u32,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValueProfile {
+    pub site_id: u32,
+    pub kind: ValueProfileKind,
+    pub entries: Vec<ValueProfileEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueProfileKind {
+    /// Indirect call target
+    IndirectCallTarget,
+    /// Memory intrinsic size
+    MemIntrinsicSize,
+    /// Division operand
+    DivisionOperand,
+    /// Loop trip count
+    LoopTripCount,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValueProfileEntry {
+    pub value: u64,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndirectCallProfile {
+    pub site_id: u32,
+    pub targets: Vec<(String, u64)>, // (target_name, count)
+}
+
+/// Complete profile data for a module
+#[derive(Debug, Clone)]
+pub struct ProfileData {
+    /// Version
+    pub version: u32,
+    /// Source file hash
+    pub source_hash: u64,
+    /// Profile timestamp
+    pub timestamp: u64,
+    /// Function profiles
+    pub functions: Vec<FunctionProfile>,
+    /// Global metadata
+    pub metadata: ProfileMetadata,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProfileMetadata {
+    /// Total runs merged
+    pub runs_merged: u32,
+    /// Target triple
+    pub target_triple: Option<String>,
+    /// Compiler version
+    pub compiler_version: Option<String>,
+    /// Custom key-value pairs
+    pub custom: BTreeMap<String, String>,
+}
+
+impl ProfileData {
+    pub fn new() -> Self {
+        ProfileData {
+            version: PROFILE_VERSION,
+            source_hash: 0,
+            timestamp: 0,
+            functions: Vec::new(),
+            metadata: ProfileMetadata::default(),
+        }
+    }
+    
+    /// Merge another profile into this one
+    pub fn merge(&mut self, other: &ProfileData) {
+        // Merge function profiles
+        for other_func in &other.functions {
+            if let Some(func) = self.functions.iter_mut().find(|f| f.name == other_func.name) {
+                // Merge counts
+                func.entry_count += other_func.entry_count;
+                
+                for other_block in &other_func.block_counts {
+                    if let Some(block) = func.block_counts.iter_mut()
+                        .find(|b| b.block_id == other_block.block_id)
+                    {
+                        block.count += other_block.count;
+                    } else {
+                        func.block_counts.push(other_block.clone());
+                    }
+                }
+                
+                for other_edge in &other_func.edge_counts {
+                    if let Some(edge) = func.edge_counts.iter_mut()
+                        .find(|e| e.from_block == other_edge.from_block && e.to_block == other_edge.to_block)
+                    {
+                        edge.count += other_edge.count;
+                    } else {
+                        func.edge_counts.push(other_edge.clone());
+                    }
+                }
+            } else {
+                self.functions.push(other_func.clone());
+            }
+        }
+        
+        self.metadata.runs_merged += other.metadata.runs_merged.max(1);
+    }
+    
+    /// Write profile to binary format
+    pub fn write<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        // Magic
+        writer.write_all(&PROFILE_MAGIC.to_le_bytes())?;
+        
+        // Version
+        writer.write_all(&self.version.to_le_bytes())?;
+        
+        // Source hash
+        writer.write_all(&self.source_hash.to_le_bytes())?;
+        
+        // Timestamp
+        writer.write_all(&self.timestamp.to_le_bytes())?;
+        
+        // Function count
+        writer.write_all(&(self.functions.len() as u32).to_le_bytes())?;
+        
+        // Write each function
+        for func in &self.functions {
+            // Name length and name
+            writer.write_all(&(func.name.len() as u32).to_le_bytes())?;
+            writer.write_all(func.name.as_bytes())?;
+            
+            // Hash
+            writer.write_all(&func.hash.to_le_bytes())?;
+            
+            // Entry count
+            writer.write_all(&func.entry_count.to_le_bytes())?;
+            
+            // Block counts
+            writer.write_all(&(func.block_counts.len() as u32).to_le_bytes())?;
+            for block in &func.block_counts {
+                writer.write_all(&block.block_id.to_le_bytes())?;
+                writer.write_all(&block.count.to_le_bytes())?;
+            }
+            
+            // Edge counts
+            writer.write_all(&(func.edge_counts.len() as u32).to_le_bytes())?;
+            for edge in &func.edge_counts {
+                writer.write_all(&edge.from_block.to_le_bytes())?;
+                writer.write_all(&edge.to_block.to_le_bytes())?;
+                writer.write_all(&edge.count.to_le_bytes())?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Read profile from binary format
+    pub fn read<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let mut buf8 = [0u8; 8];
+        let mut buf4 = [0u8; 4];
+        
+        // Magic
+        reader.read_exact(&mut buf8)?;
+        let magic = u64::from_le_bytes(buf8);
+        if magic != PROFILE_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid profile magic number"
+            ));
+        }
+        
+        // Version
+        reader.read_exact(&mut buf4)?;
+        let version = u32::from_le_bytes(buf4);
+        
+        // Source hash
+        reader.read_exact(&mut buf8)?;
+        let source_hash = u64::from_le_bytes(buf8);
+        
+        // Timestamp
+        reader.read_exact(&mut buf8)?;
+        let timestamp = u64::from_le_bytes(buf8);
+        
+        // Function count
+        reader.read_exact(&mut buf4)?;
+        let func_count = u32::from_le_bytes(buf4);
+        
+        let mut functions = Vec::with_capacity(func_count as usize);
+        
+        for _ in 0..func_count {
+            // Name
+            reader.read_exact(&mut buf4)?;
+            let name_len = u32::from_le_bytes(buf4) as usize;
+            let mut name_buf = vec![0u8; name_len];
+            reader.read_exact(&mut name_buf)?;
+            let name = String::from_utf8_lossy(&name_buf).to_string();
+            
+            // Hash
+            reader.read_exact(&mut buf8)?;
+            let hash = u64::from_le_bytes(buf8);
+            
+            // Entry count
+            reader.read_exact(&mut buf8)?;
+            let entry_count = u64::from_le_bytes(buf8);
+            
+            // Block counts
+            reader.read_exact(&mut buf4)?;
+            let block_count = u32::from_le_bytes(buf4);
+            let mut block_counts = Vec::with_capacity(block_count as usize);
+            
+            for _ in 0..block_count {
+                reader.read_exact(&mut buf4)?;
+                let block_id = u32::from_le_bytes(buf4);
+                reader.read_exact(&mut buf8)?;
+                let count = u64::from_le_bytes(buf8);
+                block_counts.push(BlockCount { block_id, count });
+            }
+            
+            // Edge counts
+            reader.read_exact(&mut buf4)?;
+            let edge_count = u32::from_le_bytes(buf4);
+            let mut edge_counts = Vec::with_capacity(edge_count as usize);
+            
+            for _ in 0..edge_count {
+                reader.read_exact(&mut buf4)?;
+                let from_block = u32::from_le_bytes(buf4);
+                reader.read_exact(&mut buf4)?;
+                let to_block = u32::from_le_bytes(buf4);
+                reader.read_exact(&mut buf8)?;
+                let count = u64::from_le_bytes(buf8);
+                edge_counts.push(EdgeCount { from_block, to_block, count });
+            }
+            
+            functions.push(FunctionProfile {
+                name,
+                hash,
+                entry_count,
+                block_counts,
+                edge_counts,
+                value_profiles: Vec::new(),
+                indirect_targets: Vec::new(),
+            });
+        }
+        
+        Ok(ProfileData {
+            version,
+            source_hash,
+            timestamp,
+            functions,
+            metadata: ProfileMetadata::default(),
+        })
+    }
+    
+    /// Load from file
+    pub fn load_from_file(path: &str) -> std::io::Result<Self> {
+        let mut file = File::open(path)?;
+        Self::read(&mut file)
+    }
+    
+    /// Save to file
+    pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
+        let mut file = File::create(path)?;
+        self.write(&mut file)
+    }
+}
+
+impl Default for ProfileData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSTRUMENTATION PASS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Instrumentation mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstrumentationMode {
+    /// Insert counter increments
+    FunctionEntry,
+    /// Edge profiling
+    EdgeProfiling,
+    /// Context-sensitive profiling
+    ContextSensitive,
+    /// Full value profiling
+    ValueProfiling,
+}
+
+/// Instrumentation configuration
+#[derive(Debug, Clone)]
+pub struct InstrumentationConfig {
+    pub mode: InstrumentationMode,
+    pub instrument_indirect_calls: bool,
+    pub instrument_memory_intrinsics: bool,
+    pub instrument_selects: bool,
+    pub atomic_counters: bool,
+    pub runtime_library: String,
+}
+
+impl Default for InstrumentationConfig {
+    fn default() -> Self {
+        InstrumentationConfig {
+            mode: InstrumentationMode::EdgeProfiling,
+            instrument_indirect_calls: true,
+            instrument_memory_intrinsics: true,
+            instrument_selects: false,
+            atomic_counters: true,
+            runtime_library: "quantaprof_rt".to_string(),
+        }
+    }
+}
+
+/// Instrumentation pass for MIR
+pub struct InstrumentationPass {
+    config: InstrumentationConfig,
+    counters: Vec<CounterInfo>,
+    next_counter_id: u32,
+}
+
+#[derive(Debug, Clone)]
+struct CounterInfo {
+    id: u32,
+    kind: CounterKind,
+    function: String,
+    location: Option<(u32, u32)>, // (block_id, index)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CounterKind {
+    FunctionEntry,
+    BlockEntry,
+    Edge(u32, u32),
+    IndirectCall,
+    MemoryIntrinsic,
+}
+
+impl InstrumentationPass {
+    pub fn new(config: InstrumentationConfig) -> Self {
+        InstrumentationPass {
+            config,
+            counters: Vec::new(),
+            next_counter_id: 0,
+        }
+    }
+    
+    /// Generate instrumented MIR
+    pub fn instrument(&mut self, mir: &mut MirModule) {
+        for func in &mut mir.functions {
+            self.instrument_function(func);
+        }
+        
+        // Add profiling runtime initialization
+        self.add_runtime_init(mir);
+    }
+    
+    fn instrument_function(&mut self, func: &mut MirFunction) {
+        // Add function entry counter
+        let entry_counter = self.new_counter(CounterKind::FunctionEntry, &func.name);
+        self.insert_counter_increment(func, 0, 0, entry_counter);
+        
+        match self.config.mode {
+            InstrumentationMode::FunctionEntry => {
+                // Already done
+            }
+            InstrumentationMode::EdgeProfiling => {
+                self.instrument_edges(func);
+            }
+            InstrumentationMode::ContextSensitive => {
+                self.instrument_edges(func);
+                self.instrument_call_sites(func);
+            }
+            InstrumentationMode::ValueProfiling => {
+                self.instrument_edges(func);
+                self.instrument_values(func);
+            }
+        }
+        
+        if self.config.instrument_indirect_calls {
+            self.instrument_indirect_calls(func);
+        }
+    }
+    
+    fn instrument_edges(&mut self, func: &mut MirFunction) {
+        // Collect edges
+        let mut edges: Vec<(u32, u32)> = Vec::new();
+        
+        for (block_idx, block) in func.blocks.iter().enumerate() {
+            let successors = self.get_block_successors(&block.terminator);
+            for succ in successors {
+                edges.push((block_idx as u32, succ));
+            }
+        }
+        
+        // Instrument each edge
+        for (from, to) in edges {
+            let counter = self.new_counter(CounterKind::Edge(from, to), &func.name);
+            // Insert at edge (typically at start of target block or split edge)
+            self.insert_counter_increment(func, to as usize, 0, counter);
+        }
+    }
+    
+    fn instrument_call_sites(&mut self, func: &mut MirFunction) {
+        // Find call instructions and add context markers
+        for block in &mut func.blocks {
+            for stmt in &mut block.statements {
+                if let MirStatement::Call { callee, .. } = stmt {
+                    // Add context push before call
+                    // Add context pop after call
+                }
+            }
+        }
+    }
+    
+    fn instrument_values(&mut self, func: &mut MirFunction) {
+        // Instrument memory intrinsics, divisions, etc.
+        for block in &mut func.blocks {
+            for (idx, stmt) in block.statements.iter_mut().enumerate() {
+                if self.is_division(stmt) || self.is_memory_intrinsic(stmt) {
+                    let counter = self.new_counter(CounterKind::MemoryIntrinsic, &func.name);
+                    // Add value profiling call
+                }
+            }
+        }
+    }
+    
+    fn instrument_indirect_calls(&mut self, func: &mut MirFunction) {
+        for block in &mut func.blocks {
+            for stmt in &mut block.statements {
+                if let MirStatement::CallIndirect { target, .. } = stmt {
+                    let counter = self.new_counter(CounterKind::IndirectCall, &func.name);
+                    // Add indirect call profiling
+                }
+            }
+        }
+    }
+    
+    fn new_counter(&mut self, kind: CounterKind, function: &str) -> u32 {
+        let id = self.next_counter_id;
+        self.next_counter_id += 1;
+        
+        self.counters.push(CounterInfo {
+            id,
+            kind,
+            function: function.to_string(),
+            location: None,
+        });
+        
+        id
+    }
+    
+    fn insert_counter_increment(&mut self, func: &mut MirFunction, block_idx: usize, stmt_idx: usize, counter: u32) {
+        // Insert counter increment instruction
+        if block_idx < func.blocks.len() {
+            let block = &mut func.blocks[block_idx];
+            let increment = MirStatement::InstrumentCounter {
+                counter_id: counter,
+                atomic: self.config.atomic_counters,
+            };
+            block.statements.insert(stmt_idx, increment);
+        }
+    }
+    
+    fn get_block_successors(&self, terminator: &MirTerminator) -> Vec<u32> {
+        match terminator {
+            MirTerminator::Goto(target) => vec![*target],
+            MirTerminator::SwitchInt { targets, .. } => targets.clone(),
+            MirTerminator::Return | MirTerminator::Unreachable => vec![],
+            MirTerminator::Call { target, unwind, .. } => {
+                let mut succs = vec![];
+                if let Some(t) = target { succs.push(*t); }
+                if let Some(u) = unwind { succs.push(*u); }
+                succs
+            }
+        }
+    }
+    
+    fn is_division(&self, stmt: &MirStatement) -> bool {
+        matches!(stmt, MirStatement::Assign { rvalue: MirRvalue::BinaryOp(MirBinOp::Div | MirBinOp::Rem, _, _), .. })
+    }
+    
+    fn is_memory_intrinsic(&self, stmt: &MirStatement) -> bool {
+        matches!(stmt, MirStatement::Call { callee, .. } if 
+            callee.starts_with("memcpy") || callee.starts_with("memmove") || callee.starts_with("memset"))
+    }
+    
+    fn add_runtime_init(&self, mir: &mut MirModule) {
+        // Add profiling runtime initialization function
+        // This sets up counters and atexit handler for writing profile
+    }
+    
+    /// Get counter metadata for profile generation
+    pub fn get_counter_metadata(&self) -> Vec<CounterInfo> {
+        self.counters.clone()
+    }
+}
+
+// MIR types for instrumentation
+#[derive(Debug, Clone)]
+pub struct MirModule {
+    pub functions: Vec<MirFunction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { place: String, rvalue: MirRvalue },
+    Call { callee: String, args: Vec<String>, dest: Option<String> },
+    CallIndirect { target: String, args: Vec<String>, dest: Option<String> },
+    InstrumentCounter { counter_id: u32, atomic: bool },
+    Nop,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirRvalue {
+    Use(String),
+    BinaryOp(MirBinOp, String, String),
+    UnaryOp(MirUnaryOp, String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MirBinOp {
+    Add, Sub, Mul, Div, Rem, And, Or, Xor, Shl, Shr,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MirUnaryOp {
+    Neg, Not,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Return,
+    Goto(u32),
+    SwitchInt { discr: String, targets: Vec<u32> },
+    Call { callee: String, args: Vec<String>, target: Option<u32>, unwind: Option<u32> },
+    Unreachable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROFILE-GUIDED OPTIMIZATION PASS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// PGO optimization pass
+pub struct PgoOptimizationPass {
+    profile: ProfileData,
+    config: PgoConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct PgoConfig {
+    /// Hot function threshold (percentage of max)
+    pub hot_threshold: f64,
+    /// Cold function threshold
+    pub cold_threshold: f64,
+    /// Enable function layout optimization
+    pub optimize_layout: bool,
+    /// Enable indirect call promotion
+    pub promote_indirect_calls: bool,
+    /// Minimum count for indirect call promotion
+    pub indirect_call_threshold: u64,
+    /// Enable branch weight annotation
+    pub annotate_branches: bool,
+}
+
+impl Default for PgoConfig {
+    fn default() -> Self {
+        PgoConfig {
+            hot_threshold: 0.9,
+            cold_threshold: 0.1,
+            optimize_layout: true,
+            promote_indirect_calls: true,
+            indirect_call_threshold: 100,
+            annotate_branches: true,
+        }
+    }
+}
+
+impl PgoOptimizationPass {
+    pub fn new(profile: ProfileData, config: PgoConfig) -> Self {
+        PgoOptimizationPass { profile, config }
+    }
+    
+    /// Apply PGO optimizations to MIR module
+    pub fn optimize(&self, mir: &mut MirModule) {
+        // Calculate hotness metrics
+        let metrics = self.calculate_metrics();
+        
+        for func in &mut mir.functions {
+            if let Some(func_profile) = self.profile.functions.iter().find(|f| f.name == func.name) {
+                // Annotate branches with weights
+                if self.config.annotate_branches {
+                    self.annotate_branches(func, func_profile);
+                }
+                
+                // Promote indirect calls
+                if self.config.promote_indirect_calls {
+                    self.promote_indirect_calls(func, func_profile);
+                }
+                
+                // Mark hot/cold functions
+                let hotness = self.get_function_hotness(&func.name, &metrics);
+                func.set_hotness(hotness);
+            }
+        }
+        
+        // Optimize function layout
+        if self.config.optimize_layout {
+            self.optimize_function_layout(mir, &metrics);
+        }
+    }
+    
+    fn calculate_metrics(&self) -> ProfileMetrics {
+        let mut max_count = 0u64;
+        let mut total_count = 0u64;
+        
+        for func in &self.profile.functions {
+            max_count = max_count.max(func.entry_count);
+            total_count += func.entry_count;
+        }
+        
+        ProfileMetrics {
+            max_function_count: max_count,
+            total_function_count: total_count,
+            function_count: self.profile.functions.len(),
+        }
+    }
+    
+    fn get_function_hotness(&self, name: &str, metrics: &ProfileMetrics) -> FunctionHotness {
+        let func = self.profile.functions.iter().find(|f| f.name == name);
+        
+        match func {
+            Some(f) => {
+                let ratio = f.entry_count as f64 / metrics.max_function_count.max(1) as f64;
+                
+                if ratio >= self.config.hot_threshold {
+                    FunctionHotness::Hot
+                } else if ratio <= self.config.cold_threshold {
+                    FunctionHotness::Cold
+                } else {
+                    FunctionHotness::Normal
+                }
+            }
+            None => FunctionHotness::Unknown,
+        }
+    }
+    
+    fn annotate_branches(&self, func: &mut MirFunction, profile: &FunctionProfile) {
+        for block in &mut func.blocks {
+            if let MirTerminator::SwitchInt { targets, .. } = &mut block.terminator {
+                // Find edge counts for this block's successors
+                let mut weights: Vec<u64> = Vec::new();
+                
+                for target in targets.iter() {
+                    let count = profile.edge_counts.iter()
+                        .find(|e| e.from_block == block.id && e.to_block == *target)
+                        .map(|e| e.count)
+                        .unwrap_or(0);
+                    weights.push(count);
+                }
+                
+                // Store weights for codegen
+                block.branch_weights = Some(weights);
+            }
+        }
+    }
+    
+    fn promote_indirect_calls(&self, func: &mut MirFunction, profile: &FunctionProfile) {
+        // Find indirect calls with known targets
+        for target_profile in &profile.indirect_targets {
+            // Find the most common target
+            if let Some((top_target, count)) = target_profile.targets.first() {
+                if *count >= self.config.indirect_call_threshold {
+                    // Convert indirect call to guarded direct call
+                    // if (target == known_target) { direct_call() } else { indirect_call() }
+                }
+            }
+        }
+    }
+    
+    fn optimize_function_layout(&self, mir: &mut MirModule, metrics: &ProfileMetrics) {
+        // Sort functions by hotness (hot functions first)
+        mir.functions.sort_by(|a, b| {
+            let a_count = self.profile.functions.iter()
+                .find(|f| f.name == a.name)
+                .map(|f| f.entry_count)
+                .unwrap_or(0);
+            let b_count = self.profile.functions.iter()
+                .find(|f| f.name == b.name)
+                .map(|f| f.entry_count)
+                .unwrap_or(0);
+            
+            b_count.cmp(&a_count) // Descending
+        });
+    }
+}
+
+struct ProfileMetrics {
+    max_function_count: u64,
+    total_function_count: u64,
+    function_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionHotness {
+    Hot,
+    Normal,
+    Cold,
+    Unknown,
+}
+
+impl MirFunction {
+    fn set_hotness(&mut self, _hotness: FunctionHotness) {
+        // Store hotness attribute
+    }
+}
+
+impl MirBlock {
+    branch_weights: Option<Vec<u64>>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROFILE RUNTIME LIBRARY INTERFACE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Runtime library function signatures
+pub mod runtime {
+    /// Initialize profiling runtime
+    pub const INIT_FN: &str = "__quantaprof_init";
+    
+    /// Increment counter (atomic)
+    pub const INC_COUNTER_FN: &str = "__quantaprof_inc";
+    
+    /// Profile value
+    pub const PROFILE_VALUE_FN: &str = "__quantaprof_value";
+    
+    /// Profile indirect call target
+    pub const PROFILE_INDIRECT_FN: &str = "__quantaprof_indirect";
+    
+    /// Flush profile data
+    pub const FLUSH_FN: &str = "__quantaprof_flush";
+    
+    /// Set output file
+    pub const SET_OUTPUT_FN: &str = "__quantaprof_set_output";
+    
+    /// Generate runtime library code
+    pub fn generate_runtime() -> String {
+        r#"
+// QuantaProf Runtime Library
+// Auto-generated profiling runtime
+
+static mut COUNTERS: [u64; 65536] = [0; 65536];
+static mut VALUE_DATA: Vec<(u32, u64, u64)> = Vec::new();
+static mut OUTPUT_FILE: &str = "default.profdata";
+
+#[no_mangle]
+pub unsafe extern "C" fn __quantaprof_init() {
+    // Register atexit handler
+    std::atexit(__quantaprof_flush);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __quantaprof_inc(counter_id: u32) {
+    if (counter_id as usize) < COUNTERS.len() {
+        // Atomic increment
+        std::intrinsics::atomic_add(&mut COUNTERS[counter_id as usize], 1);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __quantaprof_value(site_id: u32, value: u64) {
+    VALUE_DATA.push((site_id, value, 1));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __quantaprof_indirect(site_id: u32, target: *const u8) {
+    // Record indirect call target
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __quantaprof_flush() {
+    // Write profile data to file
+    let file = std::fs::File::create(OUTPUT_FILE).unwrap();
+    // ... serialize counters and value data
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __quantaprof_set_output(path: *const u8, len: usize) {
+    OUTPUT_FILE = std::str::from_utf8_unchecked(std::slice::from_raw_parts(path, len));
+}
+"#.to_string()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_profile_data_roundtrip() {
+        let mut profile = ProfileData::new();
+        profile.functions.push(FunctionProfile {
+            name: "test_func".to_string(),
+            hash: 12345,
+            entry_count: 100,
+            block_counts: vec![
+                BlockCount { block_id: 0, count: 100 },
+                BlockCount { block_id: 1, count: 50 },
+            ],
+            edge_counts: vec![
+                EdgeCount { from_block: 0, to_block: 1, count: 50 },
+            ],
+            value_profiles: vec![],
+            indirect_targets: vec![],
+        });
+        
+        let mut buffer = Vec::new();
+        profile.write(&mut buffer).unwrap();
+        
+        let mut cursor = std::io::Cursor::new(buffer);
+        let loaded = ProfileData::read(&mut cursor).unwrap();
+        
+        assert_eq!(loaded.functions.len(), 1);
+        assert_eq!(loaded.functions[0].name, "test_func");
+        assert_eq!(loaded.functions[0].entry_count, 100);
+    }
+    
+    #[test]
+    fn test_profile_merge() {
+        let mut profile1 = ProfileData::new();
+        profile1.functions.push(FunctionProfile {
+            name: "func".to_string(),
+            hash: 0,
+            entry_count: 100,
+            block_counts: vec![BlockCount { block_id: 0, count: 100 }],
+            edge_counts: vec![],
+            value_profiles: vec![],
+            indirect_targets: vec![],
+        });
+        
+        let mut profile2 = ProfileData::new();
+        profile2.functions.push(FunctionProfile {
+            name: "func".to_string(),
+            hash: 0,
+            entry_count: 50,
+            block_counts: vec![BlockCount { block_id: 0, count: 50 }],
+            edge_counts: vec![],
+            value_profiles: vec![],
+            indirect_targets: vec![],
+        });
+        
+        profile1.merge(&profile2);
+        
+        assert_eq!(profile1.functions[0].entry_count, 150);
+        assert_eq!(profile1.functions[0].block_counts[0].count, 150);
+    }
+    
+    #[test]
+    fn test_instrumentation_config() {
+        let config = InstrumentationConfig::default();
+        
+        assert_eq!(config.mode, InstrumentationMode::EdgeProfiling);
+        assert!(config.atomic_counters);
+    }
+    
+    #[test]
+    fn test_function_hotness() {
+        let mut profile = ProfileData::new();
+        profile.functions.push(FunctionProfile {
+            name: "hot".to_string(),
+            hash: 0,
+            entry_count: 1000,
+            block_counts: vec![],
+            edge_counts: vec![],
+            value_profiles: vec![],
+            indirect_targets: vec![],
+        });
+        profile.functions.push(FunctionProfile {
+            name: "cold".to_string(),
+            hash: 0,
+            entry_count: 1,
+            block_counts: vec![],
+            edge_counts: vec![],
+            value_profiles: vec![],
+            indirect_targets: vec![],
+        });
+        
+        let pass = PgoOptimizationPass::new(profile, PgoConfig::default());
+        let metrics = pass.calculate_metrics();
+        
+        assert_eq!(pass.get_function_hotness("hot", &metrics), FunctionHotness::Hot);
+        assert_eq!(pass.get_function_hotness("cold", &metrics), FunctionHotness::Cold);
+    }
+}

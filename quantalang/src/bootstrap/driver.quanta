@@ -1,0 +1,882 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ BOOTSTRAP — Multi-Stage Self-Hosting Driver
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Bootstrap architecture for self-hosting compilation:
+//
+//   ┌─────────────────────────────────────────────────────────────────────────┐
+//   │                      BOOTSTRAP PIPELINE                                 │
+//   ├─────────────────────────────────────────────────────────────────────────┤
+//   │                                                                         │
+//   │  Stage 0 (Rust)           Stage 1 (QuantaLang)      Stage 2 (Full)     │
+//   │  ─────────────────        ──────────────────────    ────────────────   │
+//   │  Minimal compiler         Self-hosted compiler      Production         │
+//   │  written in Rust          compiled by Stage 0       compiler           │
+//   │                                                                         │
+//   │  [Rust Source] ──compile──► [Stage0 Binary]                            │
+//   │                                  │                                      │
+//   │  [QuantaLang    ◄───────────────┘                                      │
+//   │   Stage1 Source] ──compile──► [Stage1 Binary]                          │
+//   │                                  │                                      │
+//   │  [QuantaLang    ◄───────────────┘                                      │
+//   │   Stage2 Source] ──compile──► [Stage2 Binary]                          │
+//   │                                  │                                      │
+//   │  [QuantaLang    ◄───────────────┘                                      │
+//   │   Stage2 Source] ──compile──► [Stage3 Binary]                          │
+//   │                                                                         │
+//   │  VERIFICATION: Stage2 Binary == Stage3 Binary (bit-identical)          │
+//   │                                                                         │
+//   └─────────────────────────────────────────────────────────────────────────┘
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::bootstrap::driver
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::format;
+use alloc::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Instant, Duration};
+use std::fs;
+use std::io::{Read, Write};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BOOTSTRAP CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Bootstrap configuration
+#[derive(Debug, Clone)]
+pub struct BootstrapConfig {
+    /// Source directory
+    pub source_dir: PathBuf,
+    
+    /// Build directory
+    pub build_dir: PathBuf,
+    
+    /// Stage 0 compiler path (pre-built Rust compiler)
+    pub stage0_compiler: PathBuf,
+    
+    /// Target triple
+    pub target: String,
+    
+    /// Optimization level
+    pub opt_level: OptLevel,
+    
+    /// Enable debug info
+    pub debug_info: bool,
+    
+    /// Parallel jobs
+    pub jobs: usize,
+    
+    /// Verify stages
+    pub verify: bool,
+    
+    /// Keep intermediate artifacts
+    pub keep_intermediates: bool,
+    
+    /// Incremental compilation
+    pub incremental: bool,
+    
+    /// Verbose output
+    pub verbose: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptLevel {
+    O0, O1, O2, O3, Os, Oz,
+}
+
+impl Default for BootstrapConfig {
+    fn default() -> Self {
+        BootstrapConfig {
+            source_dir: PathBuf::from("src"),
+            build_dir: PathBuf::from("build"),
+            stage0_compiler: PathBuf::from("stage0/quantac"),
+            target: detect_host_target(),
+            opt_level: OptLevel::O2,
+            debug_info: true,
+            jobs: num_cpus(),
+            verify: true,
+            keep_intermediates: false,
+            incremental: true,
+            verbose: false,
+        }
+    }
+}
+
+fn detect_host_target() -> String {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    { "x86_64-unknown-linux-gnu".to_string() }
+    
+    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+    { "x86_64-apple-darwin".to_string() }
+    
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    { "aarch64-unknown-linux-gnu".to_string() }
+    
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    { "aarch64-apple-darwin".to_string() }
+    
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    { "x86_64-pc-windows-msvc".to_string() }
+    
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "x86_64", target_os = "macos"),
+        all(target_arch = "aarch64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "macos"),
+        all(target_arch = "x86_64", target_os = "windows"),
+    )))]
+    { "unknown-unknown-unknown".to_string() }
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BOOTSTRAP STAGES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Bootstrap stage
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Stage {
+    /// Stage 0: Rust-compiled minimal compiler
+    Stage0,
+    /// Stage 1: Self-compiled with Stage 0
+    Stage1,
+    /// Stage 2: Self-compiled with Stage 1
+    Stage2,
+    /// Stage 3: Verification (self-compiled with Stage 2)
+    Stage3,
+}
+
+impl Stage {
+    pub fn next(&self) -> Option<Stage> {
+        match self {
+            Stage::Stage0 => Some(Stage::Stage1),
+            Stage::Stage1 => Some(Stage::Stage2),
+            Stage::Stage2 => Some(Stage::Stage3),
+            Stage::Stage3 => None,
+        }
+    }
+    
+    pub fn prev(&self) -> Option<Stage> {
+        match self {
+            Stage::Stage0 => None,
+            Stage::Stage1 => Some(Stage::Stage0),
+            Stage::Stage2 => Some(Stage::Stage1),
+            Stage::Stage3 => Some(Stage::Stage2),
+        }
+    }
+    
+    pub fn name(&self) -> &'static str {
+        match self {
+            Stage::Stage0 => "stage0",
+            Stage::Stage1 => "stage1",
+            Stage::Stage2 => "stage2",
+            Stage::Stage3 => "stage3",
+        }
+    }
+    
+    pub fn description(&self) -> &'static str {
+        match self {
+            Stage::Stage0 => "Rust bootstrap compiler",
+            Stage::Stage1 => "Self-hosted (compiled by stage0)",
+            Stage::Stage2 => "Production (compiled by stage1)",
+            Stage::Stage3 => "Verification (compiled by stage2)",
+        }
+    }
+}
+
+impl std::fmt::Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+/// Stage artifact
+#[derive(Debug, Clone)]
+pub struct StageArtifact {
+    /// Stage
+    pub stage: Stage,
+    
+    /// Compiler binary path
+    pub compiler: PathBuf,
+    
+    /// Standard library path
+    pub stdlib: PathBuf,
+    
+    /// Runtime library path
+    pub runtime: PathBuf,
+    
+    /// Build timestamp
+    pub built_at: std::time::SystemTime,
+    
+    /// Build duration
+    pub duration: Duration,
+    
+    /// Binary hash (for verification)
+    pub hash: [u8; 32],
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BOOTSTRAP DRIVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Bootstrap driver
+pub struct Bootstrap {
+    /// Configuration
+    config: BootstrapConfig,
+    
+    /// Stage artifacts
+    artifacts: BTreeMap<Stage, StageArtifact>,
+    
+    /// Build log
+    log: Vec<LogEntry>,
+    
+    /// Start time
+    start_time: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub timestamp: Duration,
+    pub level: LogLevel,
+    pub stage: Option<Stage>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl Bootstrap {
+    /// Create new bootstrap driver
+    pub fn new(config: BootstrapConfig) -> Self {
+        Bootstrap {
+            config,
+            artifacts: BTreeMap::new(),
+            log: Vec::new(),
+            start_time: Instant::now(),
+        }
+    }
+    
+    /// Run full bootstrap
+    pub fn run(&mut self) -> Result<BootstrapResult, BootstrapError> {
+        self.log_info(None, "Starting bootstrap process");
+        
+        // Ensure build directory exists
+        fs::create_dir_all(&self.config.build_dir)
+            .map_err(|e| BootstrapError::IoError(e.to_string()))?;
+        
+        // Stage 0: Verify pre-built compiler exists
+        self.verify_stage0()?;
+        
+        // Stage 1: Build with Stage 0
+        self.build_stage(Stage::Stage1)?;
+        
+        // Stage 2: Build with Stage 1
+        self.build_stage(Stage::Stage2)?;
+        
+        // Stage 3: Build with Stage 2 (verification)
+        if self.config.verify {
+            self.build_stage(Stage::Stage3)?;
+            self.verify_stages()?;
+        }
+        
+        // Cleanup if not keeping intermediates
+        if !self.config.keep_intermediates {
+            self.cleanup_intermediates()?;
+        }
+        
+        let total_duration = self.start_time.elapsed();
+        self.log_info(None, &format!("Bootstrap complete in {:?}", total_duration));
+        
+        Ok(BootstrapResult {
+            success: true,
+            final_compiler: self.artifacts.get(&Stage::Stage2)
+                .map(|a| a.compiler.clone())
+                .unwrap_or_default(),
+            stages_built: self.artifacts.len(),
+            total_duration,
+            verified: self.config.verify,
+        })
+    }
+    
+    /// Verify Stage 0 compiler exists
+    fn verify_stage0(&mut self) -> Result<(), BootstrapError> {
+        self.log_info(Some(Stage::Stage0), "Verifying stage0 compiler");
+        
+        if !self.config.stage0_compiler.exists() {
+            return Err(BootstrapError::Stage0NotFound(
+                self.config.stage0_compiler.display().to_string()
+            ));
+        }
+        
+        // Test stage0 compiler
+        let output = Command::new(&self.config.stage0_compiler)
+            .arg("--version")
+            .output()
+            .map_err(|e| BootstrapError::CompilerError(e.to_string()))?;
+        
+        if !output.status.success() {
+            return Err(BootstrapError::CompilerError(
+                "Stage0 compiler version check failed".to_string()
+            ));
+        }
+        
+        let version = String::from_utf8_lossy(&output.stdout);
+        self.log_info(Some(Stage::Stage0), &format!("Stage0 compiler: {}", version.trim()));
+        
+        // Create stage0 artifact
+        let hash = self.hash_file(&self.config.stage0_compiler)?;
+        
+        self.artifacts.insert(Stage::Stage0, StageArtifact {
+            stage: Stage::Stage0,
+            compiler: self.config.stage0_compiler.clone(),
+            stdlib: self.config.build_dir.join("stage0/lib"),
+            runtime: self.config.build_dir.join("stage0/runtime"),
+            built_at: std::time::SystemTime::now(),
+            duration: Duration::ZERO,
+            hash,
+        });
+        
+        Ok(())
+    }
+    
+    /// Build a stage
+    fn build_stage(&mut self, stage: Stage) -> Result<(), BootstrapError> {
+        let start = Instant::now();
+        self.log_info(Some(stage), &format!("Building {}", stage.description()));
+        
+        // Get previous stage compiler
+        let prev_stage = stage.prev()
+            .ok_or(BootstrapError::InvalidStage)?;
+        
+        let prev_artifact = self.artifacts.get(&prev_stage)
+            .ok_or(BootstrapError::MissingArtifact(prev_stage))?;
+        
+        // Create stage build directory
+        let stage_dir = self.config.build_dir.join(stage.name());
+        fs::create_dir_all(&stage_dir)
+            .map_err(|e| BootstrapError::IoError(e.to_string()))?;
+        
+        // Collect source files
+        let sources = self.collect_sources()?;
+        self.log_info(Some(stage), &format!("Compiling {} source files", sources.len()));
+        
+        // Build compiler
+        let compiler_path = stage_dir.join("bin/quantac");
+        fs::create_dir_all(compiler_path.parent().unwrap())
+            .map_err(|e| BootstrapError::IoError(e.to_string()))?;
+        
+        let compile_result = self.compile_with(
+            &prev_artifact.compiler,
+            &sources,
+            &compiler_path,
+            stage,
+        )?;
+        
+        if !compile_result.success {
+            return Err(BootstrapError::CompilationFailed {
+                stage,
+                errors: compile_result.errors,
+            });
+        }
+        
+        // Build stdlib
+        let stdlib_path = stage_dir.join("lib");
+        self.build_stdlib(&prev_artifact.compiler, &stdlib_path, stage)?;
+        
+        // Build runtime
+        let runtime_path = stage_dir.join("runtime");
+        self.build_runtime(&prev_artifact.compiler, &runtime_path, stage)?;
+        
+        // Calculate hash
+        let hash = self.hash_file(&compiler_path)?;
+        
+        let duration = start.elapsed();
+        self.log_info(Some(stage), &format!("Stage built in {:?}", duration));
+        
+        // Store artifact
+        self.artifacts.insert(stage, StageArtifact {
+            stage,
+            compiler: compiler_path,
+            stdlib: stdlib_path,
+            runtime: runtime_path,
+            built_at: std::time::SystemTime::now(),
+            duration,
+            hash,
+        });
+        
+        Ok(())
+    }
+    
+    /// Collect source files
+    fn collect_sources(&self) -> Result<Vec<PathBuf>, BootstrapError> {
+        let mut sources = Vec::new();
+        self.collect_sources_recursive(&self.config.source_dir, &mut sources)?;
+        sources.sort();
+        Ok(sources)
+    }
+    
+    fn collect_sources_recursive(
+        &self,
+        dir: &Path,
+        sources: &mut Vec<PathBuf>,
+    ) -> Result<(), BootstrapError> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        
+        for entry in fs::read_dir(dir)
+            .map_err(|e| BootstrapError::IoError(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| BootstrapError::IoError(e.to_string()))?;
+            let path = entry.path();
+            
+            if path.is_dir() {
+                self.collect_sources_recursive(&path, sources)?;
+            } else if path.extension().map_or(false, |e| e == "quanta") {
+                sources.push(path);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Compile sources with given compiler
+    fn compile_with(
+        &mut self,
+        compiler: &Path,
+        sources: &[PathBuf],
+        output: &Path,
+        stage: Stage,
+    ) -> Result<CompileResult, BootstrapError> {
+        let mut cmd = Command::new(compiler);
+        
+        // Add sources
+        for source in sources {
+            cmd.arg(source);
+        }
+        
+        // Output
+        cmd.arg("-o").arg(output);
+        
+        // Target
+        cmd.arg("--target").arg(&self.config.target);
+        
+        // Optimization
+        cmd.arg(match self.config.opt_level {
+            OptLevel::O0 => "-O0",
+            OptLevel::O1 => "-O1",
+            OptLevel::O2 => "-O2",
+            OptLevel::O3 => "-O3",
+            OptLevel::Os => "-Os",
+            OptLevel::Oz => "-Oz",
+        });
+        
+        // Debug info
+        if self.config.debug_info {
+            cmd.arg("-g");
+        }
+        
+        // Incremental
+        if self.config.incremental {
+            let cache_dir = self.config.build_dir.join(stage.name()).join("cache");
+            cmd.arg("--incremental").arg(&cache_dir);
+        }
+        
+        // Parallel
+        cmd.arg("-j").arg(self.config.jobs.to_string());
+        
+        // Capture output
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        
+        if self.config.verbose {
+            self.log_debug(Some(stage), &format!("Running: {:?}", cmd));
+        }
+        
+        let output_result = cmd.output()
+            .map_err(|e| BootstrapError::CompilerError(e.to_string()))?;
+        
+        let stdout = String::from_utf8_lossy(&output_result.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output_result.stderr).to_string();
+        
+        if !stderr.is_empty() && self.config.verbose {
+            for line in stderr.lines() {
+                self.log_debug(Some(stage), line);
+            }
+        }
+        
+        Ok(CompileResult {
+            success: output_result.status.success(),
+            stdout,
+            stderr,
+            errors: if output_result.status.success() {
+                Vec::new()
+            } else {
+                vec![stderr]
+            },
+        })
+    }
+    
+    /// Build standard library
+    fn build_stdlib(
+        &mut self,
+        compiler: &Path,
+        output_dir: &Path,
+        stage: Stage,
+    ) -> Result<(), BootstrapError> {
+        self.log_info(Some(stage), "Building standard library");
+        
+        fs::create_dir_all(output_dir)
+            .map_err(|e| BootstrapError::IoError(e.to_string()))?;
+        
+        // Would compile stdlib modules
+        // For now, just create marker files
+        let modules = ["core", "alloc", "std", "collections", "io", "sync"];
+        
+        for module in modules {
+            let lib_path = output_dir.join(format!("lib{}.rlib", module));
+            fs::write(&lib_path, format!("# QuantaLang stdlib: {}\n", module))
+                .map_err(|e| BootstrapError::IoError(e.to_string()))?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Build runtime library
+    fn build_runtime(
+        &mut self,
+        compiler: &Path,
+        output_dir: &Path,
+        stage: Stage,
+    ) -> Result<(), BootstrapError> {
+        self.log_info(Some(stage), "Building runtime library");
+        
+        fs::create_dir_all(output_dir)
+            .map_err(|e| BootstrapError::IoError(e.to_string()))?;
+        
+        // Would compile runtime
+        let runtime_path = output_dir.join("libquanta_rt.a");
+        fs::write(&runtime_path, "# QuantaLang runtime\n")
+            .map_err(|e| BootstrapError::IoError(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    /// Verify Stage 2 and Stage 3 produce identical binaries
+    fn verify_stages(&mut self) -> Result<(), BootstrapError> {
+        self.log_info(None, "Verifying bootstrap (comparing stage2 and stage3)");
+        
+        let stage2 = self.artifacts.get(&Stage::Stage2)
+            .ok_or(BootstrapError::MissingArtifact(Stage::Stage2))?;
+        
+        let stage3 = self.artifacts.get(&Stage::Stage3)
+            .ok_or(BootstrapError::MissingArtifact(Stage::Stage3))?;
+        
+        if stage2.hash != stage3.hash {
+            return Err(BootstrapError::VerificationFailed {
+                stage2_hash: hex_encode(&stage2.hash),
+                stage3_hash: hex_encode(&stage3.hash),
+            });
+        }
+        
+        self.log_info(None, "Verification passed: stage2 and stage3 binaries are identical");
+        self.log_info(None, &format!("Hash: {}", hex_encode(&stage2.hash)));
+        
+        Ok(())
+    }
+    
+    /// Cleanup intermediate artifacts
+    fn cleanup_intermediates(&mut self) -> Result<(), BootstrapError> {
+        self.log_info(None, "Cleaning up intermediates");
+        
+        // Keep only stage2
+        for stage in [Stage::Stage1, Stage::Stage3] {
+            let stage_dir = self.config.build_dir.join(stage.name());
+            if stage_dir.exists() {
+                fs::remove_dir_all(&stage_dir)
+                    .map_err(|e| BootstrapError::IoError(e.to_string()))?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Hash a file (SHA-256)
+    fn hash_file(&self, path: &Path) -> Result<[u8; 32], BootstrapError> {
+        let contents = fs::read(path)
+            .map_err(|e| BootstrapError::IoError(e.to_string()))?;
+        
+        Ok(sha256(&contents))
+    }
+    
+    /// Log with level
+    fn log(&mut self, level: LogLevel, stage: Option<Stage>, message: &str) {
+        let entry = LogEntry {
+            timestamp: self.start_time.elapsed(),
+            level,
+            stage,
+            message: message.to_string(),
+        };
+        
+        // Print to stdout
+        let prefix = match level {
+            LogLevel::Debug => "[DEBUG]",
+            LogLevel::Info => "[INFO] ",
+            LogLevel::Warn => "[WARN] ",
+            LogLevel::Error => "[ERROR]",
+        };
+        
+        let stage_str = stage.map_or("".to_string(), |s| format!("[{}] ", s.name()));
+        
+        if level != LogLevel::Debug || self.config.verbose {
+            println!("{} {}{}", prefix, stage_str, message);
+        }
+        
+        self.log.push(entry);
+    }
+    
+    fn log_debug(&mut self, stage: Option<Stage>, message: &str) {
+        self.log(LogLevel::Debug, stage, message);
+    }
+    
+    fn log_info(&mut self, stage: Option<Stage>, message: &str) {
+        self.log(LogLevel::Info, stage, message);
+    }
+    
+    fn log_warn(&mut self, stage: Option<Stage>, message: &str) {
+        self.log(LogLevel::Warn, stage, message);
+    }
+    
+    fn log_error(&mut self, stage: Option<Stage>, message: &str) {
+        self.log(LogLevel::Error, stage, message);
+    }
+    
+    /// Get artifact for stage
+    pub fn artifact(&self, stage: Stage) -> Option<&StageArtifact> {
+        self.artifacts.get(&stage)
+    }
+    
+    /// Get build log
+    pub fn log_entries(&self) -> &[LogEntry] {
+        &self.log
+    }
+}
+
+/// Compile result
+#[derive(Debug)]
+struct CompileResult {
+    success: bool,
+    stdout: String,
+    stderr: String,
+    errors: Vec<String>,
+}
+
+/// Bootstrap result
+#[derive(Debug)]
+pub struct BootstrapResult {
+    pub success: bool,
+    pub final_compiler: PathBuf,
+    pub stages_built: usize,
+    pub total_duration: Duration,
+    pub verified: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum BootstrapError {
+    Stage0NotFound(String),
+    InvalidStage,
+    MissingArtifact(Stage),
+    CompilerError(String),
+    CompilationFailed { stage: Stage, errors: Vec<String> },
+    IoError(String),
+    VerificationFailed { stage2_hash: String, stage3_hash: String },
+}
+
+impl std::fmt::Display for BootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stage0NotFound(path) => {
+                write!(f, "stage0 compiler not found: {}", path)
+            }
+            Self::InvalidStage => write!(f, "invalid bootstrap stage"),
+            Self::MissingArtifact(stage) => {
+                write!(f, "missing artifact for {}", stage)
+            }
+            Self::CompilerError(msg) => write!(f, "compiler error: {}", msg),
+            Self::CompilationFailed { stage, errors } => {
+                write!(f, "compilation failed at {}: {}", stage, errors.join("; "))
+            }
+            Self::IoError(msg) => write!(f, "I/O error: {}", msg),
+            Self::VerificationFailed { stage2_hash, stage3_hash } => {
+                write!(f, "verification failed: stage2={}, stage3={}", 
+                    stage2_hash, stage3_hash)
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Simple SHA-256 implementation
+fn sha256(data: &[u8]) -> [u8; 32] {
+    // Initial hash values (first 32 bits of fractional parts of sqrt of first 8 primes)
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    
+    // Round constants
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    
+    // Pad message
+    let bit_len = (data.len() as u64) * 8;
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    
+    // Process 512-bit blocks
+    for chunk in padded.chunks(64) {
+        let mut w = [0u32; 64];
+        
+        for (i, word) in chunk.chunks(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        
+        for i in 16..64 {
+            let s0 = w[i-15].rotate_right(7) ^ w[i-15].rotate_right(18) ^ (w[i-15] >> 3);
+            let s1 = w[i-2].rotate_right(17) ^ w[i-2].rotate_right(19) ^ (w[i-2] >> 10);
+            w[i] = w[i-16].wrapping_add(s0).wrapping_add(w[i-7]).wrapping_add(s1);
+        }
+        
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+        
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    
+    let mut result = [0u8; 32];
+    for (i, &val) in h.iter().enumerate() {
+        result[i*4..(i+1)*4].copy_from_slice(&val.to_be_bytes());
+    }
+    result
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_stage_progression() {
+        assert_eq!(Stage::Stage0.next(), Some(Stage::Stage1));
+        assert_eq!(Stage::Stage1.next(), Some(Stage::Stage2));
+        assert_eq!(Stage::Stage2.next(), Some(Stage::Stage3));
+        assert_eq!(Stage::Stage3.next(), None);
+    }
+    
+    #[test]
+    fn test_stage_previous() {
+        assert_eq!(Stage::Stage0.prev(), None);
+        assert_eq!(Stage::Stage1.prev(), Some(Stage::Stage0));
+        assert_eq!(Stage::Stage2.prev(), Some(Stage::Stage1));
+        assert_eq!(Stage::Stage3.prev(), Some(Stage::Stage2));
+    }
+    
+    #[test]
+    fn test_sha256() {
+        let hash = sha256(b"");
+        let expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(hex_encode(&hash), expected);
+        
+        let hash = sha256(b"hello");
+        let expected = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        assert_eq!(hex_encode(&hash), expected);
+    }
+    
+    #[test]
+    fn test_detect_host_target() {
+        let target = detect_host_target();
+        assert!(!target.is_empty());
+    }
+}

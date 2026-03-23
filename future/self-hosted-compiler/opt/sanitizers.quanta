@@ -1,0 +1,1076 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Sanitizer Infrastructure
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Runtime sanitizer infrastructure:
+//   - AddressSanitizer (ASan) - memory errors
+//   - MemorySanitizer (MSan) - uninitialized reads
+//   - ThreadSanitizer (TSan) - data races
+//   - UndefinedBehaviorSanitizer (UBSan) - undefined behavior
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::sanitizers
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SANITIZER CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Available sanitizers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SanitizerKind {
+    Address,
+    HwAddress,
+    Memory,
+    Thread,
+    UndefinedBehavior,
+    Leak,
+    DataFlow,
+}
+
+impl SanitizerKind {
+    pub fn flag_name(&self) -> &'static str {
+        match self {
+            SanitizerKind::Address => "address",
+            SanitizerKind::HwAddress => "hwaddress",
+            SanitizerKind::Memory => "memory",
+            SanitizerKind::Thread => "thread",
+            SanitizerKind::UndefinedBehavior => "undefined",
+            SanitizerKind::Leak => "leak",
+            SanitizerKind::DataFlow => "dataflow",
+        }
+    }
+    
+    pub fn runtime_library(&self) -> &'static str {
+        match self {
+            SanitizerKind::Address | SanitizerKind::Leak => "quanta_asan_rt",
+            SanitizerKind::HwAddress => "quanta_hwasan_rt",
+            SanitizerKind::Memory => "quanta_msan_rt",
+            SanitizerKind::Thread => "quanta_tsan_rt",
+            SanitizerKind::UndefinedBehavior => "quanta_ubsan_rt",
+            SanitizerKind::DataFlow => "quanta_dfsan_rt",
+        }
+    }
+    
+    /// Check if two sanitizers are compatible
+    pub fn compatible_with(&self, other: SanitizerKind) -> bool {
+        // Most sanitizers are mutually exclusive
+        match (self, other) {
+            (SanitizerKind::Address, SanitizerKind::Leak) => true,
+            (SanitizerKind::Leak, SanitizerKind::Address) => true,
+            (SanitizerKind::UndefinedBehavior, _) => true,
+            (_, SanitizerKind::UndefinedBehavior) => true,
+            (a, b) if a == b => true,
+            _ => false,
+        }
+    }
+}
+
+/// Sanitizer configuration
+#[derive(Debug, Clone)]
+pub struct SanitizerConfig {
+    pub enabled: BTreeSet<SanitizerKind>,
+    pub asan_config: AsanConfig,
+    pub msan_config: MsanConfig,
+    pub tsan_config: TsanConfig,
+    pub ubsan_config: UbsanConfig,
+    /// Recover from errors instead of aborting
+    pub recover: bool,
+    /// Generate minimal runtime
+    pub minimal_runtime: bool,
+}
+
+impl Default for SanitizerConfig {
+    fn default() -> Self {
+        SanitizerConfig {
+            enabled: BTreeSet::new(),
+            asan_config: AsanConfig::default(),
+            msan_config: MsanConfig::default(),
+            tsan_config: TsanConfig::default(),
+            ubsan_config: UbsanConfig::default(),
+            recover: false,
+            minimal_runtime: false,
+        }
+    }
+}
+
+impl SanitizerConfig {
+    pub fn enable(&mut self, kind: SanitizerKind) -> Result<(), String> {
+        // Check compatibility
+        for existing in &self.enabled {
+            if !kind.compatible_with(*existing) {
+                return Err(format!(
+                    "Sanitizer {} is not compatible with {}",
+                    kind.flag_name(),
+                    existing.flag_name()
+                ));
+            }
+        }
+        self.enabled.insert(kind);
+        Ok(())
+    }
+    
+    pub fn is_enabled(&self, kind: SanitizerKind) -> bool {
+        self.enabled.contains(&kind)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADDRESS SANITIZER (ASAN)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// AddressSanitizer configuration
+#[derive(Debug, Clone)]
+pub struct AsanConfig {
+    /// Check for use-after-return
+    pub detect_use_after_return: bool,
+    /// Check for use-after-scope
+    pub detect_use_after_scope: bool,
+    /// Check for stack buffer overflow
+    pub detect_stack_buffer_overflow: bool,
+    /// Check for global buffer overflow
+    pub detect_global_buffer_overflow: bool,
+    /// Check for heap buffer overflow
+    pub detect_heap_buffer_overflow: bool,
+    /// Check for double-free
+    pub detect_double_free: bool,
+    /// Check for invalid-free
+    pub detect_invalid_free: bool,
+    /// Check for memory leaks
+    pub detect_leaks: bool,
+    /// Quarantine size in bytes
+    pub quarantine_size: usize,
+    /// Redzone size in bytes
+    pub redzone_size: usize,
+    /// Maximum allocation size to check
+    pub max_malloc_size: usize,
+}
+
+impl Default for AsanConfig {
+    fn default() -> Self {
+        AsanConfig {
+            detect_use_after_return: true,
+            detect_use_after_scope: true,
+            detect_stack_buffer_overflow: true,
+            detect_global_buffer_overflow: true,
+            detect_heap_buffer_overflow: true,
+            detect_double_free: true,
+            detect_invalid_free: true,
+            detect_leaks: true,
+            quarantine_size: 256 * 1024 * 1024, // 256MB
+            redzone_size: 32,
+            max_malloc_size: 1 << 40, // 1TB
+        }
+    }
+}
+
+/// ASan instrumentation pass
+pub struct AsanInstrumentationPass {
+    config: AsanConfig,
+}
+
+impl AsanInstrumentationPass {
+    pub fn new(config: AsanConfig) -> Self {
+        AsanInstrumentationPass { config }
+    }
+    
+    /// Instrument a function for ASan
+    pub fn instrument_function(&self, func: &mut MirFunction) {
+        // Instrument stack allocations
+        if self.config.detect_stack_buffer_overflow || self.config.detect_use_after_scope {
+            self.instrument_stack(func);
+        }
+        
+        // Instrument memory accesses
+        for block in &mut func.blocks {
+            let mut new_stmts = Vec::new();
+            
+            for stmt in &block.statements {
+                match stmt {
+                    MirStatement::Load { ptr, size, .. } => {
+                        // Insert check before load
+                        new_stmts.push(self.create_memory_check(ptr, *size, false));
+                        new_stmts.push(stmt.clone());
+                    }
+                    MirStatement::Store { ptr, size, .. } => {
+                        // Insert check before store
+                        new_stmts.push(self.create_memory_check(ptr, *size, true));
+                        new_stmts.push(stmt.clone());
+                    }
+                    MirStatement::Call { callee, args, .. } if self.is_allocator_call(callee) => {
+                        // Replace allocator calls with ASan versions
+                        new_stmts.push(self.replace_allocator_call(stmt));
+                    }
+                    _ => {
+                        new_stmts.push(stmt.clone());
+                    }
+                }
+            }
+            
+            block.statements = new_stmts;
+        }
+    }
+    
+    fn instrument_stack(&self, func: &mut MirFunction) {
+        // Create fake stack frame with redzones
+        let mut stack_vars: Vec<StackVariable> = Vec::new();
+        
+        // Collect stack variables
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let MirStatement::Alloca { name, size, .. } = stmt {
+                    stack_vars.push(StackVariable {
+                        name: name.clone(),
+                        size: *size,
+                        has_dynamic_size: false,
+                    });
+                }
+            }
+        }
+        
+        // Generate fake stack with redzones
+        if !stack_vars.is_empty() {
+            let fake_stack = self.create_fake_stack(&stack_vars);
+            // Insert fake stack setup at function entry
+            // Insert fake stack teardown at function exit
+        }
+    }
+    
+    fn create_fake_stack(&self, vars: &[StackVariable]) -> FakeStack {
+        let mut total_size = 32; // Left redzone
+        let mut var_offsets = Vec::new();
+        
+        for var in vars {
+            var_offsets.push(total_size);
+            total_size += var.size;
+            total_size += self.config.redzone_size; // Right redzone per variable
+        }
+        
+        FakeStack {
+            total_size,
+            var_offsets,
+            redzone_size: self.config.redzone_size,
+        }
+    }
+    
+    fn create_memory_check(&self, ptr: &MirOperand, size: usize, is_write: bool) -> MirStatement {
+        // Generate call to ASan check function
+        let check_fn = if is_write {
+            "__asan_store_n"
+        } else {
+            "__asan_load_n"
+        };
+        
+        MirStatement::Call {
+            callee: check_fn.to_string(),
+            args: vec![ptr.clone(), MirOperand::Constant(size as i64)],
+            dest: None,
+        }
+    }
+    
+    fn is_allocator_call(&self, callee: &str) -> bool {
+        matches!(callee, "malloc" | "calloc" | "realloc" | "free" | 
+                        "memalign" | "posix_memalign" | "valloc" | "pvalloc" |
+                        "aligned_alloc" | "_Znwm" | "_ZnwmRKSt9nothrow_t" |
+                        "_Znam" | "_ZnamRKSt9nothrow_t" | "_ZdlPv" | "_ZdaPv")
+    }
+    
+    fn replace_allocator_call(&self, stmt: &MirStatement) -> MirStatement {
+        if let MirStatement::Call { callee, args, dest } = stmt {
+            let new_callee = match callee.as_str() {
+                "malloc" => "__asan_malloc",
+                "calloc" => "__asan_calloc",
+                "realloc" => "__asan_realloc",
+                "free" => "__asan_free",
+                "memalign" => "__asan_memalign",
+                _ => callee,
+            };
+            
+            MirStatement::Call {
+                callee: new_callee.to_string(),
+                args: args.clone(),
+                dest: dest.clone(),
+            }
+        } else {
+            stmt.clone()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StackVariable {
+    name: String,
+    size: usize,
+    has_dynamic_size: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FakeStack {
+    total_size: usize,
+    var_offsets: Vec<usize>,
+    redzone_size: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY SANITIZER (MSAN)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// MemorySanitizer configuration
+#[derive(Debug, Clone)]
+pub struct MsanConfig {
+    /// Track origins of uninitialized memory
+    pub track_origins: bool,
+    /// Origin tracking depth
+    pub origin_depth: u32,
+    /// Poison stack on function entry
+    pub poison_stack_with_call: bool,
+    /// Poison stack pattern
+    pub poison_stack_pattern: i8,
+}
+
+impl Default for MsanConfig {
+    fn default() -> Self {
+        MsanConfig {
+            track_origins: true,
+            origin_depth: 2,
+            poison_stack_with_call: false,
+            poison_stack_pattern: -1,
+        }
+    }
+}
+
+/// MSan instrumentation pass
+pub struct MsanInstrumentationPass {
+    config: MsanConfig,
+}
+
+impl MsanInstrumentationPass {
+    pub fn new(config: MsanConfig) -> Self {
+        MsanInstrumentationPass { config }
+    }
+    
+    /// Instrument a function for MSan
+    pub fn instrument_function(&self, func: &mut MirFunction) {
+        // Insert shadow memory propagation
+        for block in &mut func.blocks {
+            let mut new_stmts = Vec::new();
+            
+            for stmt in &block.statements {
+                match stmt {
+                    MirStatement::Load { ptr, dest, size, .. } => {
+                        // Load shadow for the memory location
+                        new_stmts.push(self.create_shadow_load(ptr, dest, *size));
+                        new_stmts.push(stmt.clone());
+                    }
+                    MirStatement::Store { ptr, value, size, .. } => {
+                        // Store shadow for the value
+                        new_stmts.push(stmt.clone());
+                        new_stmts.push(self.create_shadow_store(ptr, value, *size));
+                    }
+                    MirStatement::BinaryOp { dest, op, lhs, rhs, .. } => {
+                        // Propagate shadow through operation
+                        new_stmts.push(stmt.clone());
+                        new_stmts.push(self.propagate_shadow_binop(dest, lhs, rhs));
+                    }
+                    _ => {
+                        new_stmts.push(stmt.clone());
+                    }
+                }
+            }
+            
+            // Check shadow before branches
+            if let Some(check) = self.create_branch_check(&block.terminator) {
+                new_stmts.push(check);
+            }
+            
+            block.statements = new_stmts;
+        }
+        
+        // Poison local variables on function entry
+        if self.config.poison_stack_with_call {
+            self.insert_stack_poisoning(func);
+        }
+    }
+    
+    fn create_shadow_load(&self, ptr: &MirOperand, dest: &str, size: usize) -> MirStatement {
+        MirStatement::Call {
+            callee: "__msan_load_shadow".to_string(),
+            args: vec![
+                ptr.clone(),
+                MirOperand::Constant(size as i64),
+            ],
+            dest: Some(format!("{}_shadow", dest)),
+        }
+    }
+    
+    fn create_shadow_store(&self, ptr: &MirOperand, value: &MirOperand, size: usize) -> MirStatement {
+        MirStatement::Call {
+            callee: "__msan_store_shadow".to_string(),
+            args: vec![
+                ptr.clone(),
+                value.clone(),
+                MirOperand::Constant(size as i64),
+            ],
+            dest: None,
+        }
+    }
+    
+    fn propagate_shadow_binop(&self, dest: &str, lhs: &MirOperand, rhs: &MirOperand) -> MirStatement {
+        // Shadow is OR of operand shadows
+        MirStatement::Call {
+            callee: "__msan_or_shadow".to_string(),
+            args: vec![
+                MirOperand::Variable(format!("{}_shadow", lhs.name())),
+                MirOperand::Variable(format!("{}_shadow", rhs.name())),
+            ],
+            dest: Some(format!("{}_shadow", dest)),
+        }
+    }
+    
+    fn create_branch_check(&self, terminator: &MirTerminator) -> Option<MirStatement> {
+        match terminator {
+            MirTerminator::SwitchInt { discr, .. } | 
+            MirTerminator::If { cond: discr, .. } => {
+                Some(MirStatement::Call {
+                    callee: "__msan_check_branch".to_string(),
+                    args: vec![
+                        MirOperand::Variable(format!("{}_shadow", discr.name())),
+                    ],
+                    dest: None,
+                })
+            }
+            _ => None,
+        }
+    }
+    
+    fn insert_stack_poisoning(&self, func: &mut MirFunction) {
+        // Insert __msan_poison_stack at function entry
+        if !func.blocks.is_empty() {
+            let entry = &mut func.blocks[0];
+            entry.statements.insert(0, MirStatement::Call {
+                callee: "__msan_poison_stack".to_string(),
+                args: vec![],
+                dest: None,
+            });
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THREAD SANITIZER (TSAN)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// ThreadSanitizer configuration
+#[derive(Debug, Clone)]
+pub struct TsanConfig {
+    /// History size for race detection
+    pub history_size: u32,
+    /// Enable second race report
+    pub report_second_race: bool,
+    /// Flush memory on thread creation
+    pub flush_memory_on_fork: bool,
+}
+
+impl Default for TsanConfig {
+    fn default() -> Self {
+        TsanConfig {
+            history_size: 7, // 2^7 = 128 entries
+            report_second_race: false,
+            flush_memory_on_fork: true,
+        }
+    }
+}
+
+/// TSan instrumentation pass
+pub struct TsanInstrumentationPass {
+    config: TsanConfig,
+}
+
+impl TsanInstrumentationPass {
+    pub fn new(config: TsanConfig) -> Self {
+        TsanInstrumentationPass { config }
+    }
+    
+    /// Instrument a function for TSan
+    pub fn instrument_function(&self, func: &mut MirFunction) {
+        // Instrument memory accesses
+        for block in &mut func.blocks {
+            let mut new_stmts = Vec::new();
+            
+            for stmt in &block.statements {
+                match stmt {
+                    MirStatement::Load { ptr, size, .. } => {
+                        new_stmts.push(self.create_read_instrumentation(ptr, *size));
+                        new_stmts.push(stmt.clone());
+                    }
+                    MirStatement::Store { ptr, size, .. } => {
+                        new_stmts.push(self.create_write_instrumentation(ptr, *size));
+                        new_stmts.push(stmt.clone());
+                    }
+                    MirStatement::AtomicLoad { ptr, order, .. } => {
+                        new_stmts.push(self.create_atomic_read(ptr, order));
+                        new_stmts.push(stmt.clone());
+                    }
+                    MirStatement::AtomicStore { ptr, order, .. } => {
+                        new_stmts.push(self.create_atomic_write(ptr, order));
+                        new_stmts.push(stmt.clone());
+                    }
+                    MirStatement::Call { callee, .. } if self.is_sync_call(callee) => {
+                        // Instrument synchronization primitives
+                        let (pre, post) = self.instrument_sync_call(stmt);
+                        if let Some(p) = pre { new_stmts.push(p); }
+                        new_stmts.push(stmt.clone());
+                        if let Some(p) = post { new_stmts.push(p); }
+                    }
+                    _ => {
+                        new_stmts.push(stmt.clone());
+                    }
+                }
+            }
+            
+            block.statements = new_stmts;
+        }
+        
+        // Add function entry/exit instrumentation
+        self.add_func_entry_exit(func);
+    }
+    
+    fn create_read_instrumentation(&self, ptr: &MirOperand, size: usize) -> MirStatement {
+        let func = match size {
+            1 => "__tsan_read1",
+            2 => "__tsan_read2",
+            4 => "__tsan_read4",
+            8 => "__tsan_read8",
+            16 => "__tsan_read16",
+            _ => "__tsan_read_range",
+        };
+        
+        if size <= 16 {
+            MirStatement::Call {
+                callee: func.to_string(),
+                args: vec![ptr.clone()],
+                dest: None,
+            }
+        } else {
+            MirStatement::Call {
+                callee: func.to_string(),
+                args: vec![ptr.clone(), MirOperand::Constant(size as i64)],
+                dest: None,
+            }
+        }
+    }
+    
+    fn create_write_instrumentation(&self, ptr: &MirOperand, size: usize) -> MirStatement {
+        let func = match size {
+            1 => "__tsan_write1",
+            2 => "__tsan_write2",
+            4 => "__tsan_write4",
+            8 => "__tsan_write8",
+            16 => "__tsan_write16",
+            _ => "__tsan_write_range",
+        };
+        
+        if size <= 16 {
+            MirStatement::Call {
+                callee: func.to_string(),
+                args: vec![ptr.clone()],
+                dest: None,
+            }
+        } else {
+            MirStatement::Call {
+                callee: func.to_string(),
+                args: vec![ptr.clone(), MirOperand::Constant(size as i64)],
+                dest: None,
+            }
+        }
+    }
+    
+    fn create_atomic_read(&self, ptr: &MirOperand, order: &MemoryOrder) -> MirStatement {
+        MirStatement::Call {
+            callee: format!("__tsan_atomic64_load_{}", order.to_string()),
+            args: vec![ptr.clone()],
+            dest: None,
+        }
+    }
+    
+    fn create_atomic_write(&self, ptr: &MirOperand, order: &MemoryOrder) -> MirStatement {
+        MirStatement::Call {
+            callee: format!("__tsan_atomic64_store_{}", order.to_string()),
+            args: vec![ptr.clone()],
+            dest: None,
+        }
+    }
+    
+    fn is_sync_call(&self, callee: &str) -> bool {
+        callee.starts_with("pthread_") || 
+        callee.starts_with("mutex_") ||
+        callee.starts_with("cond_") ||
+        callee.starts_with("rwlock_") ||
+        callee.starts_with("sem_")
+    }
+    
+    fn instrument_sync_call(&self, stmt: &MirStatement) -> (Option<MirStatement>, Option<MirStatement>) {
+        if let MirStatement::Call { callee, args, .. } = stmt {
+            match callee.as_str() {
+                "pthread_mutex_lock" => {
+                    let pre = MirStatement::Call {
+                        callee: "__tsan_mutex_pre_lock".to_string(),
+                        args: args.clone(),
+                        dest: None,
+                    };
+                    let post = MirStatement::Call {
+                        callee: "__tsan_mutex_post_lock".to_string(),
+                        args: args.clone(),
+                        dest: None,
+                    };
+                    (Some(pre), Some(post))
+                }
+                "pthread_mutex_unlock" => {
+                    let pre = MirStatement::Call {
+                        callee: "__tsan_mutex_pre_unlock".to_string(),
+                        args: args.clone(),
+                        dest: None,
+                    };
+                    (Some(pre), None)
+                }
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
+        }
+    }
+    
+    fn add_func_entry_exit(&self, func: &mut MirFunction) {
+        // Add __tsan_func_entry at start
+        if !func.blocks.is_empty() {
+            func.blocks[0].statements.insert(0, MirStatement::Call {
+                callee: "__tsan_func_entry".to_string(),
+                args: vec![MirOperand::ReturnAddress],
+                dest: None,
+            });
+        }
+        
+        // Add __tsan_func_exit before returns
+        for block in &mut func.blocks {
+            if let MirTerminator::Return = &block.terminator {
+                block.statements.push(MirStatement::Call {
+                    callee: "__tsan_func_exit".to_string(),
+                    args: vec![],
+                    dest: None,
+                });
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MemoryOrder {
+    Relaxed,
+    Consume,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}
+
+impl MemoryOrder {
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            MemoryOrder::Relaxed => "relaxed",
+            MemoryOrder::Consume => "consume",
+            MemoryOrder::Acquire => "acquire",
+            MemoryOrder::Release => "release",
+            MemoryOrder::AcqRel => "acq_rel",
+            MemoryOrder::SeqCst => "seq_cst",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UNDEFINED BEHAVIOR SANITIZER (UBSAN)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// UndefinedBehaviorSanitizer configuration
+#[derive(Debug, Clone)]
+pub struct UbsanConfig {
+    /// Check signed integer overflow
+    pub check_signed_overflow: bool,
+    /// Check unsigned integer overflow
+    pub check_unsigned_overflow: bool,
+    /// Check division by zero
+    pub check_div_by_zero: bool,
+    /// Check shift overflow
+    pub check_shift_overflow: bool,
+    /// Check null pointer dereference
+    pub check_null_deref: bool,
+    /// Check array bounds
+    pub check_bounds: bool,
+    /// Check alignment
+    pub check_alignment: bool,
+    /// Check float cast overflow
+    pub check_float_cast_overflow: bool,
+    /// Check unreachable code
+    pub check_unreachable: bool,
+    /// Check returns from void functions
+    pub check_return: bool,
+    /// Check vptr validity
+    pub check_vptr: bool,
+    /// Trap on error instead of reporting
+    pub trap_on_error: bool,
+}
+
+impl Default for UbsanConfig {
+    fn default() -> Self {
+        UbsanConfig {
+            check_signed_overflow: true,
+            check_unsigned_overflow: false,
+            check_div_by_zero: true,
+            check_shift_overflow: true,
+            check_null_deref: true,
+            check_bounds: true,
+            check_alignment: true,
+            check_float_cast_overflow: true,
+            check_unreachable: true,
+            check_return: true,
+            check_vptr: true,
+            trap_on_error: false,
+        }
+    }
+}
+
+/// UBSan instrumentation pass
+pub struct UbsanInstrumentationPass {
+    config: UbsanConfig,
+    next_check_id: u32,
+}
+
+impl UbsanInstrumentationPass {
+    pub fn new(config: UbsanConfig) -> Self {
+        UbsanInstrumentationPass {
+            config,
+            next_check_id: 0,
+        }
+    }
+    
+    /// Instrument a function for UBSan
+    pub fn instrument_function(&self, func: &mut MirFunction) {
+        for block in &mut func.blocks {
+            let mut new_stmts = Vec::new();
+            
+            for stmt in &block.statements {
+                match stmt {
+                    MirStatement::BinaryOp { dest, op, lhs, rhs, ty } => {
+                        // Check for overflow
+                        if let Some(check) = self.create_overflow_check(op, lhs, rhs, ty) {
+                            new_stmts.push(check);
+                        }
+                        new_stmts.push(stmt.clone());
+                    }
+                    MirStatement::Load { ptr, .. } => {
+                        // Check for null and alignment
+                        if self.config.check_null_deref {
+                            new_stmts.push(self.create_null_check(ptr));
+                        }
+                        if self.config.check_alignment {
+                            new_stmts.push(self.create_alignment_check(ptr, 8));
+                        }
+                        new_stmts.push(stmt.clone());
+                    }
+                    MirStatement::Store { ptr, .. } => {
+                        if self.config.check_null_deref {
+                            new_stmts.push(self.create_null_check(ptr));
+                        }
+                        new_stmts.push(stmt.clone());
+                    }
+                    MirStatement::ArrayIndex { base, index, .. } => {
+                        if self.config.check_bounds {
+                            new_stmts.push(self.create_bounds_check(base, index));
+                        }
+                        new_stmts.push(stmt.clone());
+                    }
+                    MirStatement::Cast { dest, value, from_ty, to_ty } => {
+                        if self.config.check_float_cast_overflow {
+                            if let Some(check) = self.create_float_cast_check(value, from_ty, to_ty) {
+                                new_stmts.push(check);
+                            }
+                        }
+                        new_stmts.push(stmt.clone());
+                    }
+                    _ => {
+                        new_stmts.push(stmt.clone());
+                    }
+                }
+            }
+            
+            // Check unreachable
+            if self.config.check_unreachable {
+                if let MirTerminator::Unreachable = &block.terminator {
+                    new_stmts.push(self.create_unreachable_check());
+                }
+            }
+            
+            block.statements = new_stmts;
+        }
+    }
+    
+    fn create_overflow_check(&self, op: &BinOp, lhs: &MirOperand, rhs: &MirOperand, ty: &MirType) -> Option<MirStatement> {
+        let is_signed = ty.is_signed();
+        
+        if !self.config.check_signed_overflow && is_signed {
+            return None;
+        }
+        if !self.config.check_unsigned_overflow && !is_signed {
+            return None;
+        }
+        
+        let check_fn = match op {
+            BinOp::Add => {
+                if is_signed { "__ubsan_handle_add_overflow" }
+                else { "__ubsan_handle_add_overflow_unsigned" }
+            }
+            BinOp::Sub => {
+                if is_signed { "__ubsan_handle_sub_overflow" }
+                else { "__ubsan_handle_sub_overflow_unsigned" }
+            }
+            BinOp::Mul => {
+                if is_signed { "__ubsan_handle_mul_overflow" }
+                else { "__ubsan_handle_mul_overflow_unsigned" }
+            }
+            BinOp::Div if self.config.check_div_by_zero => {
+                return Some(self.create_div_check(rhs, is_signed));
+            }
+            BinOp::Shl | BinOp::Shr if self.config.check_shift_overflow => {
+                return Some(self.create_shift_check(lhs, rhs, ty));
+            }
+            _ => return None,
+        };
+        
+        Some(MirStatement::Call {
+            callee: check_fn.to_string(),
+            args: vec![lhs.clone(), rhs.clone()],
+            dest: None,
+        })
+    }
+    
+    fn create_div_check(&self, divisor: &MirOperand, is_signed: bool) -> MirStatement {
+        let check_fn = if is_signed {
+            "__ubsan_handle_divrem_overflow"
+        } else {
+            "__ubsan_handle_divrem_overflow_unsigned"
+        };
+        
+        MirStatement::Call {
+            callee: check_fn.to_string(),
+            args: vec![divisor.clone()],
+            dest: None,
+        }
+    }
+    
+    fn create_shift_check(&self, value: &MirOperand, shift: &MirOperand, ty: &MirType) -> MirStatement {
+        MirStatement::Call {
+            callee: "__ubsan_handle_shift_out_of_bounds".to_string(),
+            args: vec![
+                value.clone(),
+                shift.clone(),
+                MirOperand::Constant(ty.bit_width() as i64),
+            ],
+            dest: None,
+        }
+    }
+    
+    fn create_null_check(&self, ptr: &MirOperand) -> MirStatement {
+        MirStatement::Call {
+            callee: "__ubsan_handle_null_ptr".to_string(),
+            args: vec![ptr.clone()],
+            dest: None,
+        }
+    }
+    
+    fn create_alignment_check(&self, ptr: &MirOperand, required: usize) -> MirStatement {
+        MirStatement::Call {
+            callee: "__ubsan_handle_type_mismatch".to_string(),
+            args: vec![
+                ptr.clone(),
+                MirOperand::Constant(required as i64),
+            ],
+            dest: None,
+        }
+    }
+    
+    fn create_bounds_check(&self, base: &MirOperand, index: &MirOperand) -> MirStatement {
+        MirStatement::Call {
+            callee: "__ubsan_handle_out_of_bounds".to_string(),
+            args: vec![base.clone(), index.clone()],
+            dest: None,
+        }
+    }
+    
+    fn create_float_cast_check(&self, value: &MirOperand, from_ty: &MirType, to_ty: &MirType) -> Option<MirStatement> {
+        if !from_ty.is_float() || to_ty.is_float() {
+            return None;
+        }
+        
+        Some(MirStatement::Call {
+            callee: "__ubsan_handle_float_cast_overflow".to_string(),
+            args: vec![value.clone()],
+            dest: None,
+        })
+    }
+    
+    fn create_unreachable_check(&self) -> MirStatement {
+        if self.config.trap_on_error {
+            MirStatement::Trap
+        } else {
+            MirStatement::Call {
+                callee: "__ubsan_handle_builtin_unreachable".to_string(),
+                args: vec![],
+                dest: None,
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES FOR SANITIZERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Load { ptr: MirOperand, dest: String, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    AtomicLoad { ptr: MirOperand, dest: String, order: MemoryOrder },
+    AtomicStore { ptr: MirOperand, value: MirOperand, order: MemoryOrder },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand, ty: MirType },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Alloca { name: String, size: usize },
+    ArrayIndex { base: MirOperand, index: MirOperand, elem_size: usize },
+    Cast { dest: String, value: MirOperand, from_ty: MirType, to_ty: MirType },
+    Trap,
+    Nop,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+    ReturnAddress,
+}
+
+impl MirOperand {
+    pub fn name(&self) -> String {
+        match self {
+            MirOperand::Variable(n) => n.clone(),
+            MirOperand::Constant(c) => format!("const_{}", c),
+            MirOperand::ReturnAddress => "ret_addr".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Return,
+    Goto(u32),
+    SwitchInt { discr: MirOperand, targets: Vec<u32> },
+    If { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Unreachable,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem, Shl, Shr, And, Or, Xor,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirType {
+    kind: MirTypeKind,
+}
+
+#[derive(Debug, Clone)]
+enum MirTypeKind {
+    Int { width: u32, signed: bool },
+    Float { width: u32 },
+    Ptr,
+}
+
+impl MirType {
+    pub fn is_signed(&self) -> bool {
+        matches!(&self.kind, MirTypeKind::Int { signed: true, .. })
+    }
+    
+    pub fn is_float(&self) -> bool {
+        matches!(&self.kind, MirTypeKind::Float { .. })
+    }
+    
+    pub fn bit_width(&self) -> u32 {
+        match &self.kind {
+            MirTypeKind::Int { width, .. } => *width,
+            MirTypeKind::Float { width } => *width,
+            MirTypeKind::Ptr => 64,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_sanitizer_compatibility() {
+        assert!(SanitizerKind::Address.compatible_with(SanitizerKind::Leak));
+        assert!(SanitizerKind::UndefinedBehavior.compatible_with(SanitizerKind::Address));
+        assert!(!SanitizerKind::Address.compatible_with(SanitizerKind::Memory));
+        assert!(!SanitizerKind::Thread.compatible_with(SanitizerKind::Address));
+    }
+    
+    #[test]
+    fn test_sanitizer_config() {
+        let mut config = SanitizerConfig::default();
+        
+        assert!(config.enable(SanitizerKind::Address).is_ok());
+        assert!(config.enable(SanitizerKind::UndefinedBehavior).is_ok());
+        assert!(config.enable(SanitizerKind::Thread).is_err());
+    }
+    
+    #[test]
+    fn test_asan_config_default() {
+        let config = AsanConfig::default();
+        
+        assert!(config.detect_use_after_return);
+        assert!(config.detect_heap_buffer_overflow);
+        assert_eq!(config.redzone_size, 32);
+    }
+    
+    #[test]
+    fn test_ubsan_config_default() {
+        let config = UbsanConfig::default();
+        
+        assert!(config.check_signed_overflow);
+        assert!(config.check_div_by_zero);
+        assert!(!config.trap_on_error);
+    }
+}

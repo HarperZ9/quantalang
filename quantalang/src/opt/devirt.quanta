@@ -1,0 +1,681 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Devirtualization Optimization
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Devirtualization optimization:
+//   - Type hierarchy analysis
+//   - Virtual call resolution
+//   - Speculative devirtualization
+//   - Class hierarchy analysis (CHA)
+//   - Profile-guided devirtualization
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::devirt
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE HIERARCHY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type in the hierarchy
+#[derive(Debug, Clone)]
+pub struct TypeInfo {
+    /// Type name
+    pub name: String,
+    /// Parent type (if any)
+    pub parent: Option<String>,
+    /// Implemented interfaces
+    pub interfaces: Vec<String>,
+    /// Virtual methods
+    pub virtual_methods: BTreeMap<String, MethodInfo>,
+    /// Is this type abstract?
+    pub is_abstract: bool,
+    /// Is this type final (cannot be subclassed)?
+    pub is_final: bool,
+}
+
+/// Method information
+#[derive(Debug, Clone)]
+pub struct MethodInfo {
+    /// Method name
+    pub name: String,
+    /// Containing type
+    pub declaring_type: String,
+    /// Is this method final?
+    pub is_final: bool,
+    /// Is this method virtual?
+    pub is_virtual: bool,
+    /// VTable slot (if virtual)
+    pub vtable_slot: Option<u32>,
+}
+
+/// Type hierarchy for class hierarchy analysis
+pub struct TypeHierarchy {
+    /// All types
+    types: BTreeMap<String, TypeInfo>,
+    /// Subclass relationships
+    subclasses: BTreeMap<String, BTreeSet<String>>,
+    /// Interface implementors
+    implementors: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl TypeHierarchy {
+    pub fn new() -> Self {
+        TypeHierarchy {
+            types: BTreeMap::new(),
+            subclasses: BTreeMap::new(),
+            implementors: BTreeMap::new(),
+        }
+    }
+    
+    /// Add a type to the hierarchy
+    pub fn add_type(&mut self, type_info: TypeInfo) {
+        // Track subclass relationship
+        if let Some(ref parent) = type_info.parent {
+            self.subclasses.entry(parent.clone())
+                .or_insert_with(BTreeSet::new)
+                .insert(type_info.name.clone());
+        }
+        
+        // Track interface implementations
+        for iface in &type_info.interfaces {
+            self.implementors.entry(iface.clone())
+                .or_insert_with(BTreeSet::new)
+                .insert(type_info.name.clone());
+        }
+        
+        self.types.insert(type_info.name.clone(), type_info);
+    }
+    
+    /// Get type info
+    pub fn get_type(&self, name: &str) -> Option<&TypeInfo> {
+        self.types.get(name)
+    }
+    
+    /// Get all subclasses of a type
+    pub fn get_subclasses(&self, name: &str) -> Vec<&String> {
+        let mut result = Vec::new();
+        let mut worklist = vec![name.to_string()];
+        
+        while let Some(current) = worklist.pop() {
+            if let Some(subs) = self.subclasses.get(&current) {
+                for sub in subs {
+                    result.push(sub);
+                    worklist.push(sub.clone());
+                }
+            }
+        }
+        
+        result
+    }
+    
+    /// Check if type is a subclass of another
+    pub fn is_subclass(&self, child: &str, parent: &str) -> bool {
+        if child == parent {
+            return true;
+        }
+        
+        let mut current = child;
+        while let Some(type_info) = self.types.get(current) {
+            if let Some(ref p) = type_info.parent {
+                if p == parent {
+                    return true;
+                }
+                current = p;
+            } else {
+                break;
+            }
+        }
+        
+        false
+    }
+    
+    /// Get concrete types that could be at a virtual call site
+    pub fn get_possible_types(&self, declared_type: &str) -> Vec<&String> {
+        let mut types = Vec::new();
+        
+        // Include declared type if concrete
+        if let Some(type_info) = self.types.get(declared_type) {
+            if !type_info.is_abstract {
+                types.push(&type_info.name);
+            }
+        }
+        
+        // Include all concrete subclasses
+        for sub in self.get_subclasses(declared_type) {
+            if let Some(type_info) = self.types.get(sub.as_str()) {
+                if !type_info.is_abstract {
+                    types.push(sub);
+                }
+            }
+        }
+        
+        types
+    }
+    
+    /// Resolve virtual method to concrete implementation
+    pub fn resolve_virtual_call(
+        &self,
+        receiver_type: &str,
+        method_name: &str,
+    ) -> Option<&MethodInfo> {
+        let mut current = receiver_type;
+        
+        while let Some(type_info) = self.types.get(current) {
+            if let Some(method) = type_info.virtual_methods.get(method_name) {
+                return Some(method);
+            }
+            
+            if let Some(ref parent) = type_info.parent {
+                current = parent;
+            } else {
+                break;
+            }
+        }
+        
+        None
+    }
+    
+    /// Check if method can be devirtualized
+    pub fn can_devirtualize(
+        &self,
+        declared_type: &str,
+        method_name: &str,
+    ) -> DevirtualizationResult {
+        let possible_types = self.get_possible_types(declared_type);
+        
+        if possible_types.is_empty() {
+            return DevirtualizationResult::NoConcreteTypes;
+        }
+        
+        if possible_types.len() == 1 {
+            // Only one possible type
+            let type_name = possible_types[0];
+            if let Some(method) = self.resolve_virtual_call(type_name, method_name) {
+                return DevirtualizationResult::Single(method.clone());
+            }
+        }
+        
+        // Check if all implementations are the same
+        let mut implementations: BTreeSet<String> = BTreeSet::new();
+        
+        for type_name in &possible_types {
+            if let Some(method) = self.resolve_virtual_call(type_name, method_name) {
+                implementations.insert(method.declaring_type.clone());
+            }
+        }
+        
+        if implementations.len() == 1 {
+            let impl_type = implementations.into_iter().next().unwrap();
+            if let Some(method) = self.resolve_virtual_call(&impl_type, method_name) {
+                return DevirtualizationResult::Single(method.clone());
+            }
+        }
+        
+        // Multiple implementations - could speculate
+        if possible_types.len() <= 4 {
+            let methods: Vec<_> = possible_types.iter()
+                .filter_map(|t| self.resolve_virtual_call(t, method_name))
+                .cloned()
+                .collect();
+            
+            return DevirtualizationResult::Speculative(methods);
+        }
+        
+        DevirtualizationResult::TooManyTargets
+    }
+}
+
+impl Default for TypeHierarchy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result of devirtualization analysis
+#[derive(Debug, Clone)]
+pub enum DevirtualizationResult {
+    /// Single target - can fully devirtualize
+    Single(MethodInfo),
+    /// Multiple targets - can speculate with guards
+    Speculative(Vec<MethodInfo>),
+    /// No concrete types found
+    NoConcreteTypes,
+    /// Too many targets to speculate
+    TooManyTargets,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEVIRTUALIZATION PASS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Devirtualization pass
+pub struct Devirtualization {
+    /// Type hierarchy
+    hierarchy: TypeHierarchy,
+    /// Enable speculative devirtualization
+    enable_speculation: bool,
+    /// Maximum speculation targets
+    max_speculation_targets: usize,
+    /// Statistics
+    stats: DevirtualizationStats,
+}
+
+/// Statistics for devirtualization
+#[derive(Debug, Clone, Default)]
+pub struct DevirtualizationStats {
+    /// Virtual calls analyzed
+    pub calls_analyzed: usize,
+    /// Calls fully devirtualized
+    pub fully_devirtualized: usize,
+    /// Calls speculatively devirtualized
+    pub speculatively_devirtualized: usize,
+    /// Calls that couldn't be devirtualized
+    pub not_devirtualized: usize,
+}
+
+impl Devirtualization {
+    pub fn new(hierarchy: TypeHierarchy) -> Self {
+        Devirtualization {
+            hierarchy,
+            enable_speculation: true,
+            max_speculation_targets: 3,
+            stats: DevirtualizationStats::default(),
+        }
+    }
+    
+    /// Run devirtualization on a function
+    pub fn run(&mut self, func: &mut MirFunction) -> &DevirtualizationStats {
+        self.stats = DevirtualizationStats::default();
+        
+        for block in &mut func.blocks {
+            self.process_block(block);
+        }
+        
+        &self.stats
+    }
+    
+    fn process_block(&mut self, block: &mut MirBlock) {
+        let mut new_statements = Vec::new();
+        
+        for stmt in &block.statements {
+            match stmt {
+                MirStatement::VirtualCall { dest, receiver, method, args, receiver_type } => {
+                    self.stats.calls_analyzed += 1;
+                    
+                    match self.hierarchy.can_devirtualize(receiver_type, method) {
+                        DevirtualizationResult::Single(method_info) => {
+                            // Fully devirtualize
+                            new_statements.push(MirStatement::DirectCall {
+                                dest: dest.clone(),
+                                target: format!("{}::{}", method_info.declaring_type, method),
+                                args: {
+                                    let mut a = vec![receiver.clone()];
+                                    a.extend(args.clone());
+                                    a
+                                },
+                            });
+                            self.stats.fully_devirtualized += 1;
+                        }
+                        DevirtualizationResult::Speculative(methods) if self.enable_speculation => {
+                            // Generate speculative call
+                            if methods.len() <= self.max_speculation_targets {
+                                new_statements.push(MirStatement::SpeculativeCall {
+                                    dest: dest.clone(),
+                                    receiver: receiver.clone(),
+                                    targets: methods.iter()
+                                        .map(|m| format!("{}::{}", m.declaring_type, m.name))
+                                        .collect(),
+                                    args: args.clone(),
+                                    fallback_method: method.clone(),
+                                });
+                                self.stats.speculatively_devirtualized += 1;
+                            } else {
+                                new_statements.push(stmt.clone());
+                                self.stats.not_devirtualized += 1;
+                            }
+                        }
+                        _ => {
+                            new_statements.push(stmt.clone());
+                            self.stats.not_devirtualized += 1;
+                        }
+                    }
+                }
+                _ => {
+                    new_statements.push(stmt.clone());
+                }
+            }
+        }
+        
+        block.statements = new_statements;
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &DevirtualizationStats {
+        &self.stats
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROFILE-GUIDED DEVIRTUALIZATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Profile data for virtual call sites
+#[derive(Debug, Clone)]
+pub struct VirtualCallProfile {
+    /// Call site identifier
+    pub site_id: u64,
+    /// Type to frequency mapping
+    pub type_frequencies: BTreeMap<String, u64>,
+    /// Total call count
+    pub total_calls: u64,
+}
+
+impl VirtualCallProfile {
+    pub fn new(site_id: u64) -> Self {
+        VirtualCallProfile {
+            site_id,
+            type_frequencies: BTreeMap::new(),
+            total_calls: 0,
+        }
+    }
+    
+    /// Record a call with given receiver type
+    pub fn record(&mut self, receiver_type: &str) {
+        *self.type_frequencies.entry(receiver_type.to_string()).or_insert(0) += 1;
+        self.total_calls += 1;
+    }
+    
+    /// Get most common types
+    pub fn most_common(&self, n: usize) -> Vec<(&String, u64)> {
+        let mut types: Vec<_> = self.type_frequencies.iter()
+            .map(|(t, &c)| (t, c))
+            .collect();
+        
+        types.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        types.truncate(n);
+        types
+    }
+    
+    /// Get percentage for a type
+    pub fn percentage(&self, type_name: &str) -> f64 {
+        if self.total_calls == 0 {
+            return 0.0;
+        }
+        
+        let count = self.type_frequencies.get(type_name).copied().unwrap_or(0);
+        (count as f64) / (self.total_calls as f64) * 100.0
+    }
+}
+
+/// Profile-guided devirtualization
+pub struct ProfileGuidedDevirtualization {
+    /// Type hierarchy
+    hierarchy: TypeHierarchy,
+    /// Profile data
+    profiles: BTreeMap<u64, VirtualCallProfile>,
+    /// Minimum percentage for speculation
+    min_speculation_pct: f64,
+    /// Statistics
+    stats: PGDStats,
+}
+
+/// Statistics for PGD
+#[derive(Debug, Clone, Default)]
+pub struct PGDStats {
+    /// Calls with profile data
+    pub calls_with_profile: usize,
+    /// Hot devirtualizations
+    pub hot_devirtualized: usize,
+    /// Cold calls left virtual
+    pub cold_virtual: usize,
+}
+
+impl ProfileGuidedDevirtualization {
+    pub fn new(hierarchy: TypeHierarchy) -> Self {
+        ProfileGuidedDevirtualization {
+            hierarchy,
+            profiles: BTreeMap::new(),
+            min_speculation_pct: 90.0,
+            stats: PGDStats::default(),
+        }
+    }
+    
+    /// Add profile data for a call site
+    pub fn add_profile(&mut self, profile: VirtualCallProfile) {
+        self.profiles.insert(profile.site_id, profile);
+    }
+    
+    /// Run profile-guided devirtualization
+    pub fn run(&mut self, func: &mut MirFunction) -> &PGDStats {
+        self.stats = PGDStats::default();
+        
+        for block in &mut func.blocks {
+            let mut new_statements = Vec::new();
+            
+            for stmt in &block.statements {
+                if let MirStatement::VirtualCallWithSite { site_id, dest, receiver, method, args, .. } = stmt {
+                    if let Some(profile) = self.profiles.get(site_id) {
+                        self.stats.calls_with_profile += 1;
+                        
+                        // Get hottest type
+                        let common = profile.most_common(1);
+                        
+                        if let Some((hot_type, _)) = common.first() {
+                            let pct = profile.percentage(hot_type);
+                            
+                            if pct >= self.min_speculation_pct {
+                                // Generate type guard + direct call
+                                if let Some(method_info) = self.hierarchy.resolve_virtual_call(hot_type, method) {
+                                    new_statements.push(MirStatement::GuardedCall {
+                                        dest: dest.clone(),
+                                        receiver: receiver.clone(),
+                                        expected_type: (*hot_type).clone(),
+                                        target: format!("{}::{}", method_info.declaring_type, method),
+                                        args: args.clone(),
+                                        fallback_method: method.clone(),
+                                    });
+                                    self.stats.hot_devirtualized += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    
+                    self.stats.cold_virtual += 1;
+                }
+                
+                new_statements.push(stmt.clone());
+            }
+            
+            block.statements = new_statements;
+        }
+        
+        &self.stats
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &PGDStats {
+        &self.stats
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    VirtualCall {
+        dest: Option<String>,
+        receiver: MirOperand,
+        method: String,
+        args: Vec<MirOperand>,
+        receiver_type: String,
+    },
+    VirtualCallWithSite {
+        site_id: u64,
+        dest: Option<String>,
+        receiver: MirOperand,
+        method: String,
+        args: Vec<MirOperand>,
+        receiver_type: String,
+    },
+    DirectCall {
+        dest: Option<String>,
+        target: String,
+        args: Vec<MirOperand>,
+    },
+    SpeculativeCall {
+        dest: Option<String>,
+        receiver: MirOperand,
+        targets: Vec<String>,
+        args: Vec<MirOperand>,
+        fallback_method: String,
+    },
+    GuardedCall {
+        dest: Option<String>,
+        receiver: MirOperand,
+        expected_type: String,
+        target: String,
+        args: Vec<MirOperand>,
+        fallback_method: String,
+    },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Return { value: Option<MirOperand> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn create_hierarchy() -> TypeHierarchy {
+        let mut hierarchy = TypeHierarchy::new();
+        
+        // Base class
+        let mut base_methods = BTreeMap::new();
+        base_methods.insert("foo".to_string(), MethodInfo {
+            name: "foo".to_string(),
+            declaring_type: "Base".to_string(),
+            is_final: false,
+            is_virtual: true,
+            vtable_slot: Some(0),
+        });
+        
+        hierarchy.add_type(TypeInfo {
+            name: "Base".to_string(),
+            parent: None,
+            interfaces: vec![],
+            virtual_methods: base_methods,
+            is_abstract: true,
+            is_final: false,
+        });
+        
+        // Derived class (final)
+        let mut derived_methods = BTreeMap::new();
+        derived_methods.insert("foo".to_string(), MethodInfo {
+            name: "foo".to_string(),
+            declaring_type: "Derived".to_string(),
+            is_final: false,
+            is_virtual: true,
+            vtable_slot: Some(0),
+        });
+        
+        hierarchy.add_type(TypeInfo {
+            name: "Derived".to_string(),
+            parent: Some("Base".to_string()),
+            interfaces: vec![],
+            virtual_methods: derived_methods,
+            is_abstract: false,
+            is_final: true,
+        });
+        
+        hierarchy
+    }
+    
+    #[test]
+    fn test_type_hierarchy() {
+        let hierarchy = create_hierarchy();
+        
+        assert!(hierarchy.is_subclass("Derived", "Base"));
+        assert!(!hierarchy.is_subclass("Base", "Derived"));
+    }
+    
+    #[test]
+    fn test_devirtualization() {
+        let hierarchy = create_hierarchy();
+        
+        // With only one concrete type (Derived), should devirtualize
+        let result = hierarchy.can_devirtualize("Base", "foo");
+        
+        match result {
+            DevirtualizationResult::Single(method) => {
+                assert_eq!(method.declaring_type, "Derived");
+            }
+            _ => panic!("Expected single target devirtualization"),
+        }
+    }
+    
+    #[test]
+    fn test_profile_guided() {
+        let mut profile = VirtualCallProfile::new(1);
+        
+        // Record mostly Derived
+        for _ in 0..95 {
+            profile.record("Derived");
+        }
+        for _ in 0..5 {
+            profile.record("Other");
+        }
+        
+        let pct = profile.percentage("Derived");
+        assert!(pct >= 90.0);
+        
+        let common = profile.most_common(1);
+        assert_eq!(common[0].0, "Derived");
+    }
+}

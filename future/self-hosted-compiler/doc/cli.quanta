@@ -1,0 +1,835 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DOCUMENTATION GENERATOR — CLI Driver
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Command-line interface for generating documentation.
+//
+// Usage:
+//   quantadoc [OPTIONS] [SOURCE]
+//
+// Examples:
+//   quantadoc                     # Generate docs for current crate
+//   quantadoc --output docs       # Output to custom directory
+//   quantadoc --format md         # Generate Markdown
+//   quantadoc --private           # Include private items
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::doc::cli
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::format;
+use alloc::collections::BTreeMap;
+
+use crate::doc::parser::{DocParser, DocContentParser, merge_doc_comments};
+use crate::doc::model::*;
+use crate::doc::html::{HtmlRenderer, HtmlConfig, Theme};
+use crate::doc::markdown::{MarkdownRenderer, MarkdownConfig, LinkStyle};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLI OPTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Command-line options
+#[derive(Debug, Clone)]
+pub struct DocOptions {
+    /// Source directory or file
+    pub source: String,
+    /// Output directory
+    pub output: String,
+    /// Output format
+    pub format: OutputFormat,
+    /// Include private items
+    pub document_private: bool,
+    /// Include source code
+    pub include_source: bool,
+    /// Generate single file
+    pub single_file: bool,
+    /// Enable search
+    pub enable_search: bool,
+    /// Theme for HTML output
+    pub theme: Theme,
+    /// Crate name override
+    pub crate_name: Option<String>,
+    /// Crate version override
+    pub crate_version: Option<String>,
+    /// Custom CSS path
+    pub custom_css: Option<String>,
+    /// Logo path
+    pub logo: Option<String>,
+    /// Verbose output
+    pub verbose: bool,
+    /// Quiet mode
+    pub quiet: bool,
+    /// Open in browser after generation
+    pub open: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Html,
+    Markdown,
+    Json,
+}
+
+impl Default for DocOptions {
+    fn default() -> Self {
+        DocOptions {
+            source: ".".to_string(),
+            output: "target/doc".to_string(),
+            format: OutputFormat::Html,
+            document_private: false,
+            include_source: true,
+            single_file: false,
+            enable_search: true,
+            theme: Theme::Auto,
+            crate_name: None,
+            crate_version: None,
+            custom_css: None,
+            logo: None,
+            verbose: false,
+            quiet: false,
+            open: false,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLI PARSER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parse command-line arguments
+pub fn parse_args(args: &[String]) -> Result<DocOptions, String> {
+    let mut opts = DocOptions::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                print_version();
+                std::process::exit(0);
+            }
+            "-o" | "--output" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--output requires an argument".to_string());
+                }
+                opts.output = args[i].clone();
+            }
+            "-f" | "--format" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--format requires an argument".to_string());
+                }
+                opts.format = match args[i].as_str() {
+                    "html" => OutputFormat::Html,
+                    "md" | "markdown" => OutputFormat::Markdown,
+                    "json" => OutputFormat::Json,
+                    _ => return Err(format!("unknown format: {}", args[i])),
+                };
+            }
+            "--private" | "--document-private-items" => {
+                opts.document_private = true;
+            }
+            "--no-source" => {
+                opts.include_source = false;
+            }
+            "--single-file" => {
+                opts.single_file = true;
+            }
+            "--no-search" => {
+                opts.enable_search = false;
+            }
+            "--theme" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--theme requires an argument".to_string());
+                }
+                opts.theme = match args[i].as_str() {
+                    "light" => Theme::Light,
+                    "dark" => Theme::Dark,
+                    "auto" => Theme::Auto,
+                    _ => return Err(format!("unknown theme: {}", args[i])),
+                };
+            }
+            "--crate-name" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--crate-name requires an argument".to_string());
+                }
+                opts.crate_name = Some(args[i].clone());
+            }
+            "--crate-version" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--crate-version requires an argument".to_string());
+                }
+                opts.crate_version = Some(args[i].clone());
+            }
+            "--css" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--css requires an argument".to_string());
+                }
+                opts.custom_css = Some(args[i].clone());
+            }
+            "--logo" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--logo requires an argument".to_string());
+                }
+                opts.logo = Some(args[i].clone());
+            }
+            "-v" | "--verbose" => {
+                opts.verbose = true;
+            }
+            "-q" | "--quiet" => {
+                opts.quiet = true;
+            }
+            "--open" => {
+                opts.open = true;
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("unknown option: {}", arg));
+            }
+            _ => {
+                opts.source = arg.clone();
+            }
+        }
+        
+        i += 1;
+    }
+    
+    Ok(opts)
+}
+
+fn print_help() {
+    println!(r#"quantadoc - QuantaLang Documentation Generator
+
+USAGE:
+    quantadoc [OPTIONS] [SOURCE]
+
+ARGS:
+    <SOURCE>    Source directory or file (default: current directory)
+
+OPTIONS:
+    -h, --help                      Print help information
+    -V, --version                   Print version information
+    -o, --output <DIR>              Output directory (default: target/doc)
+    -f, --format <FORMAT>           Output format: html, md, json (default: html)
+    --private                       Include private items
+    --no-source                     Don't include source code
+    --single-file                   Generate single output file
+    --no-search                     Disable search functionality
+    --theme <THEME>                 Theme: light, dark, auto (default: auto)
+    --crate-name <NAME>             Override crate name
+    --crate-version <VERSION>       Override crate version
+    --css <PATH>                    Custom CSS file
+    --logo <PATH>                   Custom logo image
+    -v, --verbose                   Verbose output
+    -q, --quiet                     Suppress output
+    --open                          Open docs in browser after generation
+
+EXAMPLES:
+    quantadoc                       Generate HTML docs for current crate
+    quantadoc --format md           Generate Markdown documentation
+    quantadoc --private -o docs     Generate with private items to 'docs/'
+    quantadoc src/lib.quanta        Generate docs for specific file
+"#);
+}
+
+fn print_version() {
+    println!("quantadoc {}", VERSION);
+}
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOC GENERATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Documentation generator
+pub struct DocGenerator {
+    options: DocOptions,
+}
+
+impl DocGenerator {
+    pub fn new(options: DocOptions) -> Self {
+        DocGenerator { options }
+    }
+    
+    /// Generate documentation
+    pub fn generate(&self) -> Result<GenerationResult, String> {
+        if !self.options.quiet {
+            println!("Generating documentation...");
+        }
+        
+        // Parse source files
+        let krate = self.parse_crate()?;
+        
+        if self.options.verbose {
+            println!("Parsed crate: {} v{}", krate.name, krate.version);
+            println!("  Modules: {}", self.count_modules(&krate.root_module));
+            println!("  Items: {}", krate.index.len());
+        }
+        
+        // Generate output
+        let files = match self.options.format {
+            OutputFormat::Html => self.generate_html(&krate)?,
+            OutputFormat::Markdown => self.generate_markdown(&krate)?,
+            OutputFormat::Json => self.generate_json(&krate)?,
+        };
+        
+        // Write files
+        let written = self.write_files(&files)?;
+        
+        if !self.options.quiet {
+            println!("Generated {} files in {}", written, self.options.output);
+        }
+        
+        // Open in browser
+        if self.options.open && self.options.format == OutputFormat::Html {
+            self.open_browser()?;
+        }
+        
+        Ok(GenerationResult {
+            files_generated: written,
+            output_directory: self.options.output.clone(),
+        })
+    }
+    
+    /// Parse crate from source
+    fn parse_crate(&self) -> Result<DocCrate, String> {
+        // Determine crate name and version
+        let crate_name = self.options.crate_name.clone()
+            .unwrap_or_else(|| self.detect_crate_name());
+        let crate_version = self.options.crate_version.clone()
+            .unwrap_or_else(|| "0.1.0".to_string());
+        
+        let mut krate = DocCrate::new(crate_name, crate_version);
+        
+        // Find source files
+        let source_files = self.find_source_files()?;
+        
+        if self.options.verbose {
+            println!("Found {} source files", source_files.len());
+        }
+        
+        // Parse each file
+        for file in &source_files {
+            if self.options.verbose {
+                println!("  Parsing: {}", file);
+            }
+            
+            let source = self.read_file(file)?;
+            let items = self.parse_file(&source, file)?;
+            
+            // Add items to crate
+            self.add_items_to_crate(&mut krate, items, file)?;
+        }
+        
+        // Build index
+        self.build_index(&mut krate);
+        
+        Ok(krate)
+    }
+    
+    fn detect_crate_name(&self) -> String {
+        // Try to read from Quanta.toml
+        // For now, use directory name
+        std::path::Path::new(&self.options.source)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    }
+    
+    fn find_source_files(&self) -> Result<Vec<String>, String> {
+        let mut files = Vec::new();
+        let path = std::path::Path::new(&self.options.source);
+        
+        if path.is_file() {
+            files.push(self.options.source.clone());
+        } else if path.is_dir() {
+            self.collect_source_files(path, &mut files)?;
+        } else {
+            return Err(format!("source not found: {}", self.options.source));
+        }
+        
+        Ok(files)
+    }
+    
+    fn collect_source_files(&self, dir: &std::path::Path, files: &mut Vec<String>) -> Result<(), String> {
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| format!("failed to read directory: {}", e))?;
+        
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("failed to read entry: {}", e))?;
+            let path = entry.path();
+            
+            if path.is_dir() {
+                // Skip target directory
+                if path.file_name().map(|n| n == "target").unwrap_or(false) {
+                    continue;
+                }
+                self.collect_source_files(&path, files)?;
+            } else if path.extension().map(|e| e == "quanta").unwrap_or(false) {
+                files.push(path.to_string_lossy().to_string());
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn read_file(&self, path: &str) -> Result<String, String> {
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read file {}: {}", path, e))
+    }
+    
+    fn parse_file(&self, source: &str, _file: &str) -> Result<Vec<ParsedItem>, String> {
+        let mut items = Vec::new();
+        
+        // Parse doc comments
+        let mut parser = DocParser::new(source);
+        let comments = parser.parse_all();
+        
+        // Parse source structure (simplified - would integrate with real parser)
+        // For now, we'll do basic pattern matching
+        
+        let lines: Vec<&str> = source.lines().collect();
+        let mut current_doc: Vec<&crate::doc::parser::DocComment> = Vec::new();
+        
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            
+            // Collect doc comments for this item
+            for comment in &comments {
+                if comment.line as usize == i + 1 && comment.is_outer() {
+                    // This is simplified - real impl would be more sophisticated
+                }
+            }
+            
+            // Detect item declarations
+            if let Some(item) = self.parse_item_declaration(trimmed, &current_doc) {
+                items.push(item);
+                current_doc.clear();
+            }
+        }
+        
+        Ok(items)
+    }
+    
+    fn parse_item_declaration(&self, line: &str, _doc_comments: &[&crate::doc::parser::DocComment]) -> Option<ParsedItem> {
+        // Extract visibility
+        let (vis, rest) = if line.starts_with("pub ") {
+            (Visibility::Public, &line[4..])
+        } else {
+            (Visibility::Private, line)
+        };
+        
+        let rest = rest.trim();
+        
+        // Match item type
+        if rest.starts_with("fn ") {
+            let name = self.extract_name(&rest[3..]);
+            return Some(ParsedItem::Function { name, visibility: vis });
+        }
+        
+        if rest.starts_with("struct ") {
+            let name = self.extract_name(&rest[7..]);
+            return Some(ParsedItem::Struct { name, visibility: vis });
+        }
+        
+        if rest.starts_with("enum ") {
+            let name = self.extract_name(&rest[5..]);
+            return Some(ParsedItem::Enum { name, visibility: vis });
+        }
+        
+        if rest.starts_with("trait ") {
+            let name = self.extract_name(&rest[6..]);
+            return Some(ParsedItem::Trait { name, visibility: vis });
+        }
+        
+        if rest.starts_with("type ") {
+            let name = self.extract_name(&rest[5..]);
+            return Some(ParsedItem::TypeAlias { name, visibility: vis });
+        }
+        
+        if rest.starts_with("const ") {
+            let name = self.extract_name(&rest[6..]);
+            return Some(ParsedItem::Constant { name, visibility: vis });
+        }
+        
+        if rest.starts_with("static ") {
+            let name = self.extract_name(&rest[7..]);
+            return Some(ParsedItem::Static { name, visibility: vis });
+        }
+        
+        if rest.starts_with("mod ") {
+            let name = self.extract_name(&rest[4..]);
+            return Some(ParsedItem::Module { name, visibility: vis });
+        }
+        
+        if rest.starts_with("macro_rules! ") {
+            let name = self.extract_name(&rest[13..]);
+            return Some(ParsedItem::Macro { name, visibility: vis });
+        }
+        
+        None
+    }
+    
+    fn extract_name(&self, s: &str) -> String {
+        s.chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect()
+    }
+    
+    fn add_items_to_crate(&self, krate: &mut DocCrate, items: Vec<ParsedItem>, file: &str) -> Result<(), String> {
+        for item in items {
+            match item {
+                ParsedItem::Function { name, visibility } => {
+                    let func = DocFunction {
+                        name: name.clone(),
+                        visibility,
+                        doc: ParsedDoc::new(),
+                        path: ItemPath::from_str(&name),
+                        location: Some(SourceLocation::new(file.to_string(), 0, 0)),
+                        signature: FunctionSignature {
+                            self_param: None,
+                            params: Vec::new(),
+                            return_type: None,
+                            where_clause: None,
+                        },
+                        generics: Generics::default(),
+                        is_async: false,
+                        is_const: false,
+                        is_unsafe: false,
+                        abi: None,
+                    };
+                    krate.root_module.functions.push(func);
+                }
+                ParsedItem::Struct { name, visibility } => {
+                    let struc = DocStruct {
+                        name: name.clone(),
+                        visibility,
+                        doc: ParsedDoc::new(),
+                        path: ItemPath::from_str(&name),
+                        location: Some(SourceLocation::new(file.to_string(), 0, 0)),
+                        generics: Generics::default(),
+                        kind: StructKind::Regular,
+                        fields: Vec::new(),
+                        impls: Vec::new(),
+                        derives: Vec::new(),
+                    };
+                    krate.root_module.structs.push(struc);
+                }
+                ParsedItem::Enum { name, visibility } => {
+                    let enm = DocEnum {
+                        name: name.clone(),
+                        visibility,
+                        doc: ParsedDoc::new(),
+                        path: ItemPath::from_str(&name),
+                        location: Some(SourceLocation::new(file.to_string(), 0, 0)),
+                        generics: Generics::default(),
+                        variants: Vec::new(),
+                        impls: Vec::new(),
+                        derives: Vec::new(),
+                    };
+                    krate.root_module.enums.push(enm);
+                }
+                ParsedItem::Trait { name, visibility } => {
+                    let trt = DocTrait {
+                        name: name.clone(),
+                        visibility,
+                        doc: ParsedDoc::new(),
+                        path: ItemPath::from_str(&name),
+                        location: Some(SourceLocation::new(file.to_string(), 0, 0)),
+                        generics: Generics::default(),
+                        super_traits: Vec::new(),
+                        assoc_types: Vec::new(),
+                        assoc_consts: Vec::new(),
+                        required_methods: Vec::new(),
+                        provided_methods: Vec::new(),
+                        is_auto: false,
+                        is_unsafe: false,
+                        implementors: Vec::new(),
+                    };
+                    krate.root_module.traits.push(trt);
+                }
+                ParsedItem::Module { name, visibility } => {
+                    let module = DocModule {
+                        name: name.clone(),
+                        visibility,
+                        doc: ParsedDoc::new(),
+                        path: ItemPath::from_str(&name),
+                        location: Some(SourceLocation::new(file.to_string(), 0, 0)),
+                        modules: Vec::new(),
+                        functions: Vec::new(),
+                        structs: Vec::new(),
+                        enums: Vec::new(),
+                        traits: Vec::new(),
+                        type_aliases: Vec::new(),
+                        constants: Vec::new(),
+                        statics: Vec::new(),
+                        macros: Vec::new(),
+                        impls: Vec::new(),
+                        imports: Vec::new(),
+                    };
+                    krate.root_module.modules.push(module);
+                }
+                _ => {}
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn build_index(&self, krate: &mut DocCrate) {
+        self.index_module(&mut krate.index, &krate.root_module, &ItemPath::root());
+    }
+    
+    fn index_module(&self, index: &mut BTreeMap<String, ItemKind>, module: &DocModule, parent: &ItemPath) {
+        let module_path = parent.join(&module.name);
+        
+        // Index this module
+        index.insert(module_path.to_string(), ItemKind::Module(module.clone()));
+        
+        // Index items
+        for func in &module.functions {
+            let path = module_path.join(&func.name);
+            index.insert(path.to_string(), ItemKind::Function(func.clone()));
+        }
+        
+        for struc in &module.structs {
+            let path = module_path.join(&struc.name);
+            index.insert(path.to_string(), ItemKind::Struct(struc.clone()));
+        }
+        
+        for enm in &module.enums {
+            let path = module_path.join(&enm.name);
+            index.insert(path.to_string(), ItemKind::Enum(enm.clone()));
+        }
+        
+        for trt in &module.traits {
+            let path = module_path.join(&trt.name);
+            index.insert(path.to_string(), ItemKind::Trait(trt.clone()));
+        }
+        
+        // Recurse
+        for submodule in &module.modules {
+            self.index_module(index, submodule, &module_path);
+        }
+    }
+    
+    fn count_modules(&self, module: &DocModule) -> usize {
+        1 + module.modules.iter().map(|m| self.count_modules(m)).sum::<usize>()
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // OUTPUT GENERATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn generate_html(&self, krate: &DocCrate) -> Result<BTreeMap<String, String>, String> {
+        let config = HtmlConfig {
+            output_dir: self.options.output.clone(),
+            crate_name: krate.name.clone(),
+            crate_version: krate.version.clone(),
+            include_source: self.options.include_source,
+            document_private: self.options.document_private,
+            custom_css: self.options.custom_css.clone(),
+            custom_js: None,
+            theme: self.options.theme,
+            logo: self.options.logo.clone(),
+            favicon: None,
+            enable_search: self.options.enable_search,
+            single_page: self.options.single_file,
+        };
+        
+        let mut renderer = HtmlRenderer::new(config);
+        renderer.render_crate(krate)?;
+        
+        Ok(renderer.files().clone())
+    }
+    
+    fn generate_markdown(&self, krate: &DocCrate) -> Result<BTreeMap<String, String>, String> {
+        let config = MarkdownConfig {
+            output_dir: self.options.output.clone(),
+            single_file: self.options.single_file,
+            document_private: self.options.document_private,
+            include_toc: true,
+            heading_offset: 0,
+            link_style: LinkStyle::Inline,
+            code_lang: "quanta".to_string(),
+            include_source_refs: self.options.include_source,
+        };
+        
+        let mut renderer = MarkdownRenderer::new(config);
+        renderer.render_crate(krate)?;
+        
+        Ok(renderer.files().clone())
+    }
+    
+    fn generate_json(&self, krate: &DocCrate) -> Result<BTreeMap<String, String>, String> {
+        // Generate JSON representation of the documentation model
+        let mut files = BTreeMap::new();
+        
+        let json = self.serialize_crate_to_json(krate)?;
+        files.insert("doc.json".to_string(), json);
+        
+        Ok(files)
+    }
+    
+    fn serialize_crate_to_json(&self, krate: &DocCrate) -> Result<String, String> {
+        // Simplified JSON serialization
+        let mut json = String::from("{\n");
+        json.push_str(&format!("  \"name\": \"{}\",\n", krate.name));
+        json.push_str(&format!("  \"version\": \"{}\",\n", krate.version));
+        json.push_str(&format!("  \"items\": {}\n", krate.index.len()));
+        json.push_str("}");
+        Ok(json)
+    }
+    
+    fn write_files(&self, files: &BTreeMap<String, String>) -> Result<usize, String> {
+        // Create output directory
+        std::fs::create_dir_all(&self.options.output)
+            .map_err(|e| format!("failed to create output directory: {}", e))?;
+        
+        let mut count = 0;
+        
+        for (path, content) in files {
+            let full_path = format!("{}/{}", self.options.output, path);
+            
+            // Create parent directories
+            if let Some(parent) = std::path::Path::new(&full_path).parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create directory: {}", e))?;
+            }
+            
+            // Write file
+            std::fs::write(&full_path, content)
+                .map_err(|e| format!("failed to write file {}: {}", full_path, e))?;
+            
+            if self.options.verbose {
+                println!("  Wrote: {}", full_path);
+            }
+            
+            count += 1;
+        }
+        
+        Ok(count)
+    }
+    
+    fn open_browser(&self) -> Result<(), String> {
+        let index_path = format!("{}/index.html", self.options.output);
+        
+        #[cfg(target_os = "macos")]
+        let cmd = "open";
+        #[cfg(target_os = "linux")]
+        let cmd = "xdg-open";
+        #[cfg(target_os = "windows")]
+        let cmd = "start";
+        
+        std::process::Command::new(cmd)
+            .arg(&index_path)
+            .spawn()
+            .map_err(|e| format!("failed to open browser: {}", e))?;
+        
+        Ok(())
+    }
+}
+
+/// Parsed item from source
+#[derive(Debug)]
+enum ParsedItem {
+    Function { name: String, visibility: Visibility },
+    Struct { name: String, visibility: Visibility },
+    Enum { name: String, visibility: Visibility },
+    Trait { name: String, visibility: Visibility },
+    TypeAlias { name: String, visibility: Visibility },
+    Constant { name: String, visibility: Visibility },
+    Static { name: String, visibility: Visibility },
+    Module { name: String, visibility: Visibility },
+    Macro { name: String, visibility: Visibility },
+}
+
+/// Result of documentation generation
+#[derive(Debug)]
+pub struct GenerationResult {
+    pub files_generated: usize,
+    pub output_directory: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Main entry point for quantadoc
+pub fn main() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    
+    // Skip program name
+    let opts = parse_args(&args[1..])?;
+    
+    let generator = DocGenerator::new(opts);
+    let result = generator.generate()?;
+    
+    println!("Documentation generated successfully!");
+    println!("  Files: {}", result.files_generated);
+    println!("  Output: {}", result.output_directory);
+    
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_parse_args_default() {
+        let args: Vec<String> = Vec::new();
+        let opts = parse_args(&args).unwrap();
+        
+        assert_eq!(opts.source, ".");
+        assert_eq!(opts.format, OutputFormat::Html);
+        assert!(!opts.document_private);
+    }
+    
+    #[test]
+    fn test_parse_args_custom() {
+        let args = vec![
+            "--output".to_string(), "docs".to_string(),
+            "--format".to_string(), "md".to_string(),
+            "--private".to_string(),
+            "src".to_string(),
+        ];
+        
+        let opts = parse_args(&args).unwrap();
+        
+        assert_eq!(opts.output, "docs");
+        assert_eq!(opts.format, OutputFormat::Markdown);
+        assert!(opts.document_private);
+        assert_eq!(opts.source, "src");
+    }
+    
+    #[test]
+    fn test_parse_args_theme() {
+        let args = vec!["--theme".to_string(), "dark".to_string()];
+        let opts = parse_args(&args).unwrap();
+        
+        assert_eq!(opts.theme, Theme::Dark);
+    }
+}

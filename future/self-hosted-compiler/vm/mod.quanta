@@ -1,0 +1,1378 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// HARPER™ VIRTUAL MACHINE - Bytecode Execution Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Quanta. All Rights Reserved.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quanta::vm
+
+use std::collections::HashMap
+use super::codegen::{OpCode, Chunk, Function, CompiledModule}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OPCODES (50+ instructions)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[repr(u8)]
+pub enum OpCode {
+    // Constants & Literals
+    Const       = 0x00,  // Push constant from pool
+    ConstLong   = 0x01,  // Push constant (24-bit index)
+    Nil         = 0x02,  // Push nil
+    True        = 0x03,  // Push true
+    False       = 0x04,  // Push false
+    
+    // Stack Operations
+    Pop         = 0x10,  // Pop top of stack
+    Dup         = 0x11,  // Duplicate top
+    Swap        = 0x12,  // Swap top two
+    Rot         = 0x13,  // Rotate top three
+    
+    // Local Variables
+    GetLocal    = 0x20,  // Get local variable
+    SetLocal    = 0x21,  // Set local variable
+    GetUpvalue  = 0x22,  // Get captured variable
+    SetUpvalue  = 0x23,  // Set captured variable
+    CloseUpvalue = 0x24, // Close upvalue
+    
+    // Global Variables
+    GetGlobal   = 0x30,  // Get global by name
+    SetGlobal   = 0x31,  // Set global by name
+    DefGlobal   = 0x32,  // Define global
+    
+    // Arithmetic
+    Add         = 0x40,  // a + b
+    Sub         = 0x41,  // a - b
+    Mul         = 0x42,  // a * b
+    Div         = 0x43,  // a / b
+    Mod         = 0x44,  // a % b
+    Pow         = 0x45,  // a ** b
+    Neg         = 0x46,  // -a
+    
+    // Bitwise
+    BitAnd      = 0x50,  // a & b
+    BitOr       = 0x51,  // a | b
+    BitXor      = 0x52,  // a ^ b
+    BitNot      = 0x53,  // ~a
+    Shl         = 0x54,  // a << b
+    Shr         = 0x55,  // a >> b
+    
+    // Comparison
+    Eq          = 0x60,  // a == b
+    Ne          = 0x61,  // a != b
+    Lt          = 0x62,  // a < b
+    Le          = 0x63,  // a <= b
+    Gt          = 0x64,  // a > b
+    Ge          = 0x65,  // a >= b
+    
+    // Logical
+    Not         = 0x70,  // !a
+    And         = 0x71,  // a && b (short-circuit)
+    Or          = 0x72,  // a || b (short-circuit)
+    
+    // Control Flow
+    Jump        = 0x80,  // Unconditional jump
+    JumpIf      = 0x81,  // Jump if true
+    JumpIfNot   = 0x82,  // Jump if false
+    Loop        = 0x83,  // Loop back
+    
+    // Functions
+    Call        = 0x90,  // Call function
+    TailCall    = 0x91,  // Tail call optimization
+    Return      = 0x92,  // Return from function
+    Closure     = 0x93,  // Create closure
+    
+    // Objects & Collections
+    Array       = 0xA0,  // Create array
+    Map         = 0xA1,  // Create map
+    Index       = 0xA2,  // a[b]
+    IndexSet    = 0xA3,  // a[b] = c
+    GetField    = 0xA4,  // a.field
+    SetField    = 0xA5,  // a.field = b
+    
+    // Classes
+    Class       = 0xB0,  // Define class
+    Method      = 0xB1,  // Define method
+    Inherit     = 0xB2,  // Inherit from superclass
+    GetSuper    = 0xB3,  // Get super method
+    Invoke      = 0xB4,  // Optimized method call
+    SuperInvoke = 0xB5,  // Optimized super call
+    
+    // Memory
+    Box         = 0xC0,  // Box value on heap
+    Unbox       = 0xC1,  // Unbox value
+    Ref         = 0xC2,  // Create reference
+    Deref       = 0xC3,  // Dereference
+    
+    // Effects & Async
+    Effect      = 0xD0,  // Perform effect
+    Handle      = 0xD1,  // Handle effect
+    Resume      = 0xD2,  // Resume continuation
+    Await       = 0xD3,  // Await async value
+    Yield       = 0xD4,  // Yield from generator
+    
+    // AI Operations (Quanta-specific)
+    AIQuery     = 0xE0,  // Query AI model
+    AIInfer     = 0xE1,  // Run inference
+    AIEmbed     = 0xE2,  // Create embedding
+    
+    // Debug & Meta
+    Print       = 0xF0,  // Debug print
+    Assert      = 0xF1,  // Assert condition
+    Breakpoint  = 0xF2,  // Debugger breakpoint
+    Nop         = 0xFF,  // No operation
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VALUE TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Runtime value representation
+pub enum Value {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(Rc<String>),
+    Array(Rc<RefCell<Vec<Value>>>),
+    Map(Rc<RefCell<HashMap<String, Value>>>),
+    Function(Rc<Function>),
+    Closure(Rc<Closure>),
+    NativeFunction(NativeFunction),
+    Class(Rc<Class>),
+    Instance(Rc<RefCell<Instance>>),
+    BoundMethod(Rc<BoundMethod>),
+    Upvalue(Rc<RefCell<Upvalue>>),
+    Continuation(Rc<Continuation>),
+}
+
+impl Value {
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            Value::Nil => false,
+            Value::Bool(b) => *b,
+            Value::Int(n) => *n != 0,
+            Value::Float(f) => *f != 0.0,
+            Value::String(s) => !s.is_empty(),
+            Value::Array(a) => !a.borrow().is_empty(),
+            _ => true,
+        }
+    }
+    
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Nil => "nil",
+            Value::Bool(_) => "bool",
+            Value::Int(_) => "int",
+            Value::Float(_) => "float",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Map(_) => "map",
+            Value::Function(_) => "function",
+            Value::Closure(_) => "closure",
+            Value::NativeFunction(_) => "native_function",
+            Value::Class(_) => "class",
+            Value::Instance(_) => "instance",
+            Value::BoundMethod(_) => "bound_method",
+            Value::Upvalue(_) => "upvalue",
+            Value::Continuation(_) => "continuation",
+        }
+    }
+}
+
+impl Clone for Value {
+    fn clone(&self) -> Self {
+        match self {
+            Value::Nil => Value::Nil,
+            Value::Bool(b) => Value::Bool(*b),
+            Value::Int(n) => Value::Int(*n),
+            Value::Float(f) => Value::Float(*f),
+            Value::String(s) => Value::String(Rc::clone(s)),
+            Value::Array(a) => Value::Array(Rc::clone(a)),
+            Value::Map(m) => Value::Map(Rc::clone(m)),
+            Value::Function(f) => Value::Function(Rc::clone(f)),
+            Value::Closure(c) => Value::Closure(Rc::clone(c)),
+            Value::NativeFunction(n) => Value::NativeFunction(n.clone()),
+            Value::Class(c) => Value::Class(Rc::clone(c)),
+            Value::Instance(i) => Value::Instance(Rc::clone(i)),
+            Value::BoundMethod(b) => Value::BoundMethod(Rc::clone(b)),
+            Value::Upvalue(u) => Value::Upvalue(Rc::clone(u)),
+            Value::Continuation(c) => Value::Continuation(Rc::clone(c)),
+        }
+    }
+}
+
+/// Closure with captured upvalues
+pub struct Closure {
+    pub function: Rc<Function>,
+    pub upvalues: Vec<Rc<RefCell<Upvalue>>>,
+}
+
+/// Captured variable (open or closed)
+pub enum Upvalue {
+    Open(usize),          // Stack index
+    Closed(Value),        // Closed over value
+}
+
+/// Native function type
+pub type NativeFn = fn(&mut VM, &[Value]) -> Result<Value, RuntimeError>;
+
+#[derive(Clone)]
+pub struct NativeFunction {
+    pub name: String,
+    pub arity: usize,
+    pub function: NativeFn,
+}
+
+/// Class definition
+pub struct Class {
+    pub name: String,
+    pub superclass: Option<Rc<Class>>,
+    pub methods: HashMap<String, Rc<Closure>>,
+}
+
+/// Class instance
+pub struct Instance {
+    pub class: Rc<Class>,
+    pub fields: HashMap<String, Value>,
+}
+
+/// Bound method
+pub struct BoundMethod {
+    pub receiver: Value,
+    pub method: Rc<Closure>,
+}
+
+/// Continuation for effect handling
+pub struct Continuation {
+    pub stack: Vec<Value>,
+    pub frames: Vec<CallFrame>,
+    pub ip: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CALL FRAME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Call frame for function invocation
+pub struct CallFrame {
+    pub closure: Rc<Closure>,
+    pub ip: usize,
+    pub slot: usize,  // First stack slot for this frame
+}
+
+impl CallFrame {
+    pub fn new(closure: Rc<Closure>, slot: usize) -> Self {
+        CallFrame { closure, ip: 0, slot }
+    }
+    
+    pub fn chunk(&self) -> &Chunk {
+        &self.closure.function.chunk
+    }
+    
+    pub fn read_byte(&mut self) -> u8 {
+        let byte = self.chunk().code[self.ip];
+        self.ip += 1;
+        byte
+    }
+    
+    pub fn read_u16(&mut self) -> u16 {
+        let hi = self.chunk().code[self.ip] as u16;
+        let lo = self.chunk().code[self.ip + 1] as u16;
+        self.ip += 2;
+        (hi << 8) | lo
+    }
+    
+    pub fn read_constant(&mut self) -> &Value {
+        let index = self.read_byte() as usize;
+        &self.chunk().constants[index]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VIRTUAL MACHINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct VM {
+    stack: Vec<Value>,
+    frames: Vec<CallFrame>,
+    globals: HashMap<String, Value>,
+    open_upvalues: Vec<Rc<RefCell<Upvalue>>>,
+    
+    // GC fields
+    bytes_allocated: usize,
+    next_gc: usize,
+    
+    // Debug
+    debug_trace: bool,
+}
+
+impl VM {
+    pub fn new() -> Self {
+        let mut vm = VM {
+            stack: Vec::with_capacity(256),
+            frames: Vec::with_capacity(64),
+            globals: HashMap::new(),
+            open_upvalues: Vec::new(),
+            bytes_allocated: 0,
+            next_gc: 1024 * 1024,
+            debug_trace: false,
+        };
+        
+        // Register native functions
+        vm.define_natives();
+        vm
+    }
+    
+    /// Execute a compiled module
+    pub fn run(&mut self, module: &CompiledModule) -> Result<Value, RuntimeError> {
+        // Create top-level closure
+        let closure = Rc::new(Closure {
+            function: Rc::clone(&module.main),
+            upvalues: Vec::new(),
+        });
+        
+        // Push initial frame
+        self.stack.push(Value::Closure(Rc::clone(&closure)));
+        self.frames.push(CallFrame::new(closure, 0));
+        
+        // Execute
+        self.execute()
+    }
+    
+    /// Main execution loop
+    fn execute(&mut self) -> Result<Value, RuntimeError> {
+        loop {
+            // Check for stack overflow
+            if self.frames.len() > 1000 {
+                return Err(RuntimeError::StackOverflow);
+            }
+            
+            let frame = self.frames.last_mut().unwrap();
+            
+            // Debug tracing
+            if self.debug_trace {
+                self.trace_instruction(frame);
+            }
+            
+            let instruction = frame.read_byte();
+            
+            match OpCode::from(instruction) {
+                // ═══════════════════════════════════════════════════════════════
+                // Constants & Literals
+                // ═══════════════════════════════════════════════════════════════
+                OpCode::Const => {
+                    let value = frame.read_constant().clone();
+                    self.push(value);
+                }
+                
+                OpCode::Nil => self.push(Value::Nil),
+                OpCode::True => self.push(Value::Bool(true)),
+                OpCode::False => self.push(Value::Bool(false)),
+                
+                // ═══════════════════════════════════════════════════════════════
+                // Stack Operations
+                // ═══════════════════════════════════════════════════════════════
+                OpCode::Pop => { self.pop(); }
+                
+                OpCode::Dup => {
+                    let value = self.peek(0).clone();
+                    self.push(value);
+                }
+                
+                OpCode::Swap => {
+                    let len = self.stack.len();
+                    self.stack.swap(len - 1, len - 2);
+                }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // Local Variables
+                // ═══════════════════════════════════════════════════════════════
+                OpCode::GetLocal => {
+                    let slot = frame.read_byte() as usize;
+                    let base = frame.slot;
+                    let value = self.stack[base + slot].clone();
+                    self.push(value);
+                }
+                
+                OpCode::SetLocal => {
+                    let slot = frame.read_byte() as usize;
+                    let base = frame.slot;
+                    let value = self.peek(0).clone();
+                    self.stack[base + slot] = value;
+                }
+                
+                OpCode::GetUpvalue => {
+                    let slot = frame.read_byte() as usize;
+                    let upvalue = &frame.closure.upvalues[slot];
+                    let value = match &*upvalue.borrow() {
+                        Upvalue::Open(idx) => self.stack[*idx].clone(),
+                        Upvalue::Closed(v) => v.clone(),
+                    };
+                    self.push(value);
+                }
+                
+                OpCode::SetUpvalue => {
+                    let slot = frame.read_byte() as usize;
+                    let value = self.peek(0).clone();
+                    let upvalue = &frame.closure.upvalues[slot];
+                    match &mut *upvalue.borrow_mut() {
+                        Upvalue::Open(idx) => self.stack[*idx] = value,
+                        Upvalue::Closed(v) => *v = value,
+                    }
+                }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // Global Variables
+                // ═══════════════════════════════════════════════════════════════
+                OpCode::GetGlobal => {
+                    let name = frame.read_constant();
+                    if let Value::String(s) = name {
+                        let name = s.as_ref().clone();
+                        match self.globals.get(&name) {
+                            Some(value) => self.push(value.clone()),
+                            None => return Err(RuntimeError::UndefinedVariable(name)),
+                        }
+                    }
+                }
+                
+                OpCode::SetGlobal => {
+                    let name = frame.read_constant();
+                    if let Value::String(s) = name {
+                        let name = s.as_ref().clone();
+                        if self.globals.contains_key(&name) {
+                            let value = self.peek(0).clone();
+                            self.globals.insert(name, value);
+                        } else {
+                            return Err(RuntimeError::UndefinedVariable(name));
+                        }
+                    }
+                }
+                
+                OpCode::DefGlobal => {
+                    let name = frame.read_constant();
+                    if let Value::String(s) = name {
+                        let name = s.as_ref().clone();
+                        let value = self.pop();
+                        self.globals.insert(name, value);
+                    }
+                }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // Arithmetic
+                // ═══════════════════════════════════════════════════════════════
+                OpCode::Add => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let result = self.binary_add(a, b)?;
+                    self.push(result);
+                }
+                
+                OpCode::Sub => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let result = self.binary_sub(a, b)?;
+                    self.push(result);
+                }
+                
+                OpCode::Mul => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let result = self.binary_mul(a, b)?;
+                    self.push(result);
+                }
+                
+                OpCode::Div => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let result = self.binary_div(a, b)?;
+                    self.push(result);
+                }
+                
+                OpCode::Mod => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let result = self.binary_mod(a, b)?;
+                    self.push(result);
+                }
+                
+                OpCode::Neg => {
+                    let a = self.pop();
+                    let result = self.unary_neg(a)?;
+                    self.push(result);
+                }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // Comparison
+                // ═══════════════════════════════════════════════════════════════
+                OpCode::Eq => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    self.push(Value::Bool(self.values_equal(&a, &b)));
+                }
+                
+                OpCode::Ne => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    self.push(Value::Bool(!self.values_equal(&a, &b)));
+                }
+                
+                OpCode::Lt => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let result = self.compare_lt(a, b)?;
+                    self.push(Value::Bool(result));
+                }
+                
+                OpCode::Le => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let result = self.compare_le(a, b)?;
+                    self.push(Value::Bool(result));
+                }
+                
+                OpCode::Gt => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let result = self.compare_gt(a, b)?;
+                    self.push(Value::Bool(result));
+                }
+                
+                OpCode::Ge => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    let result = self.compare_ge(a, b)?;
+                    self.push(Value::Bool(result));
+                }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // Logical
+                // ═══════════════════════════════════════════════════════════════
+                OpCode::Not => {
+                    let a = self.pop();
+                    self.push(Value::Bool(!a.is_truthy()));
+                }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // Control Flow
+                // ═══════════════════════════════════════════════════════════════
+                OpCode::Jump => {
+                    let offset = frame.read_u16() as usize;
+                    frame.ip += offset;
+                }
+                
+                OpCode::JumpIf => {
+                    let offset = frame.read_u16() as usize;
+                    if self.peek(0).is_truthy() {
+                        frame.ip += offset;
+                    }
+                }
+                
+                OpCode::JumpIfNot => {
+                    let offset = frame.read_u16() as usize;
+                    if !self.peek(0).is_truthy() {
+                        frame.ip += offset;
+                    }
+                }
+                
+                OpCode::Loop => {
+                    let offset = frame.read_u16() as usize;
+                    frame.ip -= offset;
+                }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // Functions
+                // ═══════════════════════════════════════════════════════════════
+                OpCode::Call => {
+                    let arg_count = frame.read_byte() as usize;
+                    self.call_value(arg_count)?;
+                }
+                
+                OpCode::Return => {
+                    let result = self.pop();
+                    
+                    // Close upvalues
+                    let slot = self.frames.last().unwrap().slot;
+                    self.close_upvalues(slot);
+                    
+                    // Pop frame
+                    self.frames.pop();
+                    
+                    if self.frames.is_empty() {
+                        // End of program
+                        self.pop(); // Remove script function
+                        return Ok(result);
+                    }
+                    
+                    // Remove function and args from stack
+                    self.stack.truncate(slot);
+                    self.push(result);
+                }
+                
+                OpCode::Closure => {
+                    let func_idx = frame.read_byte() as usize;
+                    let function = if let Value::Function(f) = &frame.chunk().constants[func_idx] {
+                        Rc::clone(f)
+                    } else {
+                        return Err(RuntimeError::TypeError("Expected function".to_string()));
+                    };
+                    
+                    let upvalue_count = frame.read_byte() as usize;
+                    let mut upvalues = Vec::with_capacity(upvalue_count);
+                    
+                    for _ in 0..upvalue_count {
+                        let is_local = frame.read_byte() == 1;
+                        let index = frame.read_byte() as usize;
+                        
+                        if is_local {
+                            let slot = frame.slot + index;
+                            upvalues.push(self.capture_upvalue(slot));
+                        } else {
+                            upvalues.push(Rc::clone(&frame.closure.upvalues[index]));
+                        }
+                    }
+                    
+                    let closure = Rc::new(Closure { function, upvalues });
+                    self.push(Value::Closure(closure));
+                }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // Collections
+                // ═══════════════════════════════════════════════════════════════
+                OpCode::Array => {
+                    let count = frame.read_byte() as usize;
+                    let mut elements = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        elements.push(self.pop());
+                    }
+                    elements.reverse();
+                    self.push(Value::Array(Rc::new(RefCell::new(elements))));
+                }
+                
+                OpCode::Map => {
+                    let count = frame.read_byte() as usize;
+                    let mut map = HashMap::new();
+                    for _ in 0..count {
+                        let value = self.pop();
+                        let key = self.pop();
+                        if let Value::String(s) = key {
+                            map.insert(s.as_ref().clone(), value);
+                        }
+                    }
+                    self.push(Value::Map(Rc::new(RefCell::new(map))));
+                }
+                
+                OpCode::Index => {
+                    let index = self.pop();
+                    let collection = self.pop();
+                    let result = self.index_get(collection, index)?;
+                    self.push(result);
+                }
+                
+                OpCode::IndexSet => {
+                    let value = self.pop();
+                    let index = self.pop();
+                    let collection = self.pop();
+                    self.index_set(collection, index, value)?;
+                }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // Objects
+                // ═══════════════════════════════════════════════════════════════
+                OpCode::GetField => {
+                    let name = frame.read_constant();
+                    if let Value::String(field_name) = name {
+                        let instance = self.pop();
+                        let value = self.get_field(instance, field_name.as_ref())?;
+                        self.push(value);
+                    }
+                }
+                
+                OpCode::SetField => {
+                    let name = frame.read_constant();
+                    if let Value::String(field_name) = name {
+                        let value = self.pop();
+                        let instance = self.pop();
+                        self.set_field(instance, field_name.as_ref(), value)?;
+                    }
+                }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // Classes
+                // ═══════════════════════════════════════════════════════════════
+                OpCode::Class => {
+                    let name = frame.read_constant();
+                    if let Value::String(class_name) = name {
+                        let class = Rc::new(Class {
+                            name: class_name.as_ref().clone(),
+                            superclass: None,
+                            methods: HashMap::new(),
+                        });
+                        self.push(Value::Class(class));
+                    }
+                }
+                
+                OpCode::Method => {
+                    let name = frame.read_constant();
+                    if let Value::String(method_name) = name {
+                        self.define_method(method_name.as_ref())?;
+                    }
+                }
+                
+                OpCode::Invoke => {
+                    let name = frame.read_constant();
+                    let arg_count = frame.read_byte() as usize;
+                    if let Value::String(method_name) = name {
+                        self.invoke(method_name.as_ref(), arg_count)?;
+                    }
+                }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // Debug
+                // ═══════════════════════════════════════════════════════════════
+                OpCode::Print => {
+                    let value = self.pop();
+                    println!("{}", self.stringify(&value));
+                }
+                
+                OpCode::Assert => {
+                    let value = self.pop();
+                    if !value.is_truthy() {
+                        return Err(RuntimeError::AssertionFailed);
+                    }
+                }
+                
+                OpCode::Nop => {}
+                
+                _ => return Err(RuntimeError::UnknownOpcode(instruction)),
+            }
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STACK OPERATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn push(&mut self, value: Value) {
+        self.stack.push(value);
+    }
+    
+    fn pop(&mut self) -> Value {
+        self.stack.pop().unwrap_or(Value::Nil)
+    }
+    
+    fn peek(&self, distance: usize) -> &Value {
+        &self.stack[self.stack.len() - 1 - distance]
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ARITHMETIC OPERATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn binary_add(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x + y)),
+            (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x + y)),
+            (Value::Int(x), Value::Float(y)) => Ok(Value::Float(x as f64 + y)),
+            (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x + y as f64)),
+            (Value::String(x), Value::String(y)) => {
+                Ok(Value::String(Rc::new(format!("{}{}", x, y))))
+            }
+            _ => Err(RuntimeError::TypeError("Cannot add values".to_string())),
+        }
+    }
+    
+    fn binary_sub(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x - y)),
+            (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x - y)),
+            (Value::Int(x), Value::Float(y)) => Ok(Value::Float(x as f64 - y)),
+            (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x - y as f64)),
+            _ => Err(RuntimeError::TypeError("Cannot subtract values".to_string())),
+        }
+    }
+    
+    fn binary_mul(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x * y)),
+            (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x * y)),
+            (Value::Int(x), Value::Float(y)) => Ok(Value::Float(x as f64 * y)),
+            (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x * y as f64)),
+            _ => Err(RuntimeError::TypeError("Cannot multiply values".to_string())),
+        }
+    }
+    
+    fn binary_div(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => {
+                if y == 0 { return Err(RuntimeError::DivisionByZero); }
+                Ok(Value::Int(x / y))
+            }
+            (Value::Float(x), Value::Float(y)) => {
+                if y == 0.0 { return Err(RuntimeError::DivisionByZero); }
+                Ok(Value::Float(x / y))
+            }
+            (Value::Int(x), Value::Float(y)) => {
+                if y == 0.0 { return Err(RuntimeError::DivisionByZero); }
+                Ok(Value::Float(x as f64 / y))
+            }
+            (Value::Float(x), Value::Int(y)) => {
+                if y == 0 { return Err(RuntimeError::DivisionByZero); }
+                Ok(Value::Float(x / y as f64))
+            }
+            _ => Err(RuntimeError::TypeError("Cannot divide values".to_string())),
+        }
+    }
+    
+    fn binary_mod(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => {
+                if y == 0 { return Err(RuntimeError::DivisionByZero); }
+                Ok(Value::Int(x % y))
+            }
+            _ => Err(RuntimeError::TypeError("Cannot modulo values".to_string())),
+        }
+    }
+    
+    fn unary_neg(&self, a: Value) -> Result<Value, RuntimeError> {
+        match a {
+            Value::Int(x) => Ok(Value::Int(-x)),
+            Value::Float(x) => Ok(Value::Float(-x)),
+            _ => Err(RuntimeError::TypeError("Cannot negate value".to_string())),
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMPARISON OPERATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn values_equal(&self, a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Nil, Value::Nil) => true,
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            (Value::Int(x), Value::Int(y)) => x == y,
+            (Value::Float(x), Value::Float(y)) => x == y,
+            (Value::String(x), Value::String(y)) => x == y,
+            _ => false,
+        }
+    }
+    
+    fn compare_lt(&self, a: Value, b: Value) -> Result<bool, RuntimeError> {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => Ok(x < y),
+            (Value::Float(x), Value::Float(y)) => Ok(x < y),
+            _ => Err(RuntimeError::TypeError("Cannot compare values".to_string())),
+        }
+    }
+    
+    fn compare_le(&self, a: Value, b: Value) -> Result<bool, RuntimeError> {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => Ok(x <= y),
+            (Value::Float(x), Value::Float(y)) => Ok(x <= y),
+            _ => Err(RuntimeError::TypeError("Cannot compare values".to_string())),
+        }
+    }
+    
+    fn compare_gt(&self, a: Value, b: Value) -> Result<bool, RuntimeError> {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => Ok(x > y),
+            (Value::Float(x), Value::Float(y)) => Ok(x > y),
+            _ => Err(RuntimeError::TypeError("Cannot compare values".to_string())),
+        }
+    }
+    
+    fn compare_ge(&self, a: Value, b: Value) -> Result<bool, RuntimeError> {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => Ok(x >= y),
+            (Value::Float(x), Value::Float(y)) => Ok(x >= y),
+            _ => Err(RuntimeError::TypeError("Cannot compare values".to_string())),
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FUNCTION CALLS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn call_value(&mut self, arg_count: usize) -> Result<(), RuntimeError> {
+        let callee = self.peek(arg_count).clone();
+        
+        match callee {
+            Value::Closure(closure) => {
+                self.call_closure(closure, arg_count)
+            }
+            Value::NativeFunction(native) => {
+                self.call_native(native, arg_count)
+            }
+            Value::Class(class) => {
+                self.call_class(class, arg_count)
+            }
+            Value::BoundMethod(bound) => {
+                self.call_bound_method(bound, arg_count)
+            }
+            _ => Err(RuntimeError::NotCallable),
+        }
+    }
+    
+    fn call_closure(&mut self, closure: Rc<Closure>, arg_count: usize) -> Result<(), RuntimeError> {
+        let arity = closure.function.arity;
+        if arg_count != arity {
+            return Err(RuntimeError::ArityMismatch { expected: arity, got: arg_count });
+        }
+        
+        let slot = self.stack.len() - arg_count - 1;
+        self.frames.push(CallFrame::new(closure, slot));
+        Ok(())
+    }
+    
+    fn call_native(&mut self, native: NativeFunction, arg_count: usize) -> Result<(), RuntimeError> {
+        if arg_count != native.arity {
+            return Err(RuntimeError::ArityMismatch { 
+                expected: native.arity, 
+                got: arg_count 
+            });
+        }
+        
+        let start = self.stack.len() - arg_count;
+        let args: Vec<Value> = self.stack[start..].to_vec();
+        
+        // Remove args and function from stack
+        self.stack.truncate(start - 1);
+        
+        // Call native function
+        let result = (native.function)(self, &args)?;
+        self.push(result);
+        
+        Ok(())
+    }
+    
+    fn call_class(&mut self, class: Rc<Class>, arg_count: usize) -> Result<(), RuntimeError> {
+        // Create instance
+        let instance = Rc::new(RefCell::new(Instance {
+            class: Rc::clone(&class),
+            fields: HashMap::new(),
+        }));
+        
+        // Replace class on stack with instance
+        let slot = self.stack.len() - arg_count - 1;
+        self.stack[slot] = Value::Instance(Rc::clone(&instance));
+        
+        // Call init if it exists
+        if let Some(init) = class.methods.get("init") {
+            self.call_closure(Rc::clone(init), arg_count)?;
+        } else if arg_count != 0 {
+            return Err(RuntimeError::ArityMismatch { expected: 0, got: arg_count });
+        }
+        
+        Ok(())
+    }
+    
+    fn call_bound_method(&mut self, bound: Rc<BoundMethod>, arg_count: usize) -> Result<(), RuntimeError> {
+        let slot = self.stack.len() - arg_count - 1;
+        self.stack[slot] = bound.receiver.clone();
+        self.call_closure(Rc::clone(&bound.method), arg_count)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // UPVALUES
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn capture_upvalue(&mut self, slot: usize) -> Rc<RefCell<Upvalue>> {
+        // Check for existing upvalue
+        for upvalue in &self.open_upvalues {
+            if let Upvalue::Open(idx) = &*upvalue.borrow() {
+                if *idx == slot {
+                    return Rc::clone(upvalue);
+                }
+            }
+        }
+        
+        // Create new upvalue
+        let upvalue = Rc::new(RefCell::new(Upvalue::Open(slot)));
+        self.open_upvalues.push(Rc::clone(&upvalue));
+        upvalue
+    }
+    
+    fn close_upvalues(&mut self, slot: usize) {
+        self.open_upvalues.retain(|upvalue| {
+            let should_close = if let Upvalue::Open(idx) = &*upvalue.borrow() {
+                *idx >= slot
+            } else {
+                false
+            };
+            
+            if should_close {
+                if let Upvalue::Open(idx) = &*upvalue.borrow() {
+                    let value = self.stack[*idx].clone();
+                    *upvalue.borrow_mut() = Upvalue::Closed(value);
+                }
+            }
+            
+            !should_close
+        });
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // NATIVE FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn define_natives(&mut self) {
+        self.define_native("clock", 0, native_clock);
+        self.define_native("print", 1, native_print);
+        self.define_native("len", 1, native_len);
+        self.define_native("type", 1, native_type);
+        self.define_native("str", 1, native_str);
+        self.define_native("int", 1, native_int);
+        self.define_native("float", 1, native_float);
+        self.define_native("sqrt", 1, native_sqrt);
+        self.define_native("abs", 1, native_abs);
+        self.define_native("floor", 1, native_floor);
+        self.define_native("ceil", 1, native_ceil);
+        self.define_native("round", 1, native_round);
+        self.define_native("min", 2, native_min);
+        self.define_native("max", 2, native_max);
+        self.define_native("push", 2, native_push);
+        self.define_native("pop", 1, native_pop);
+        self.define_native("keys", 1, native_keys);
+        self.define_native("values", 1, native_values);
+    }
+    
+    fn define_native(&mut self, name: &str, arity: usize, function: NativeFn) {
+        let native = NativeFunction {
+            name: name.to_string(),
+            arity,
+            function,
+        };
+        self.globals.insert(name.to_string(), Value::NativeFunction(native));
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HELPER METHODS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn stringify(&self, value: &Value) -> String {
+        match value {
+            Value::Nil => "nil".to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Int(n) => n.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::String(s) => s.as_ref().clone(),
+            Value::Array(a) => {
+                let items: Vec<String> = a.borrow().iter()
+                    .map(|v| self.stringify(v))
+                    .collect();
+                format!("[{}]", items.join(", "))
+            }
+            Value::Map(m) => {
+                let items: Vec<String> = m.borrow().iter()
+                    .map(|(k, v)| format!("{}: {}", k, self.stringify(v)))
+                    .collect();
+                format!("{{{}}}", items.join(", "))
+            }
+            Value::Function(f) => format!("<fn {}>", f.name),
+            Value::Closure(c) => format!("<closure {}>", c.function.name),
+            Value::NativeFunction(n) => format!("<native {}>", n.name),
+            Value::Class(c) => format!("<class {}>", c.name),
+            Value::Instance(i) => format!("<instance {}>", i.borrow().class.name),
+            Value::BoundMethod(b) => format!("<bound method>"),
+            _ => "<value>".to_string(),
+        }
+    }
+    
+    fn trace_instruction(&self, frame: &CallFrame) {
+        print!("          ");
+        for value in &self.stack {
+            print!("[ {} ]", self.stringify(value));
+        }
+        println!();
+        // Print instruction (simplified)
+        println!("{:04}  {:?}", frame.ip, frame.chunk().code[frame.ip]);
+    }
+    
+    fn index_get(&self, collection: Value, index: Value) -> Result<Value, RuntimeError> {
+        match (collection, index) {
+            (Value::Array(arr), Value::Int(i)) => {
+                let arr = arr.borrow();
+                let idx = if i < 0 { arr.len() as i64 + i } else { i } as usize;
+                arr.get(idx).cloned().ok_or(RuntimeError::IndexOutOfBounds)
+            }
+            (Value::Map(map), Value::String(key)) => {
+                map.borrow().get(key.as_ref()).cloned().ok_or(RuntimeError::KeyNotFound)
+            }
+            (Value::String(s), Value::Int(i)) => {
+                let idx = if i < 0 { s.len() as i64 + i } else { i } as usize;
+                s.chars().nth(idx)
+                    .map(|c| Value::String(Rc::new(c.to_string())))
+                    .ok_or(RuntimeError::IndexOutOfBounds)
+            }
+            _ => Err(RuntimeError::TypeError("Cannot index value".to_string())),
+        }
+    }
+    
+    fn index_set(&mut self, collection: Value, index: Value, value: Value) -> Result<(), RuntimeError> {
+        match (collection, index) {
+            (Value::Array(arr), Value::Int(i)) => {
+                let mut arr = arr.borrow_mut();
+                let idx = if i < 0 { arr.len() as i64 + i } else { i } as usize;
+                if idx < arr.len() {
+                    arr[idx] = value;
+                    Ok(())
+                } else {
+                    Err(RuntimeError::IndexOutOfBounds)
+                }
+            }
+            (Value::Map(map), Value::String(key)) => {
+                map.borrow_mut().insert(key.as_ref().clone(), value);
+                Ok(())
+            }
+            _ => Err(RuntimeError::TypeError("Cannot index value".to_string())),
+        }
+    }
+    
+    fn get_field(&self, instance: Value, name: &str) -> Result<Value, RuntimeError> {
+        if let Value::Instance(inst) = instance {
+            let inst = inst.borrow();
+            if let Some(value) = inst.fields.get(name) {
+                return Ok(value.clone());
+            }
+            if let Some(method) = inst.class.methods.get(name) {
+                let bound = BoundMethod {
+                    receiver: Value::Instance(Rc::clone(&inst) as Rc<RefCell<Instance>>),
+                    method: Rc::clone(method),
+                };
+                return Ok(Value::BoundMethod(Rc::new(bound)));
+            }
+            Err(RuntimeError::UndefinedProperty(name.to_string()))
+        } else {
+            Err(RuntimeError::TypeError("Not an instance".to_string()))
+        }
+    }
+    
+    fn set_field(&mut self, instance: Value, name: &str, value: Value) -> Result<(), RuntimeError> {
+        if let Value::Instance(inst) = instance {
+            inst.borrow_mut().fields.insert(name.to_string(), value);
+            Ok(())
+        } else {
+            Err(RuntimeError::TypeError("Not an instance".to_string()))
+        }
+    }
+    
+    fn define_method(&mut self, name: &str) -> Result<(), RuntimeError> {
+        let method = self.pop();
+        let class = self.peek(0);
+        
+        if let (Value::Closure(closure), Value::Class(class)) = (method, class) {
+            // This is a simplified version - in practice we'd need Rc<RefCell<Class>>
+            // to modify the class methods
+        }
+        Ok(())
+    }
+    
+    fn invoke(&mut self, name: &str, arg_count: usize) -> Result<(), RuntimeError> {
+        let receiver = self.peek(arg_count).clone();
+        
+        if let Value::Instance(inst) = receiver {
+            // Check for field
+            if let Some(value) = inst.borrow().fields.get(name) {
+                self.stack[self.stack.len() - arg_count - 1] = value.clone();
+                return self.call_value(arg_count);
+            }
+            
+            // Check for method
+            if let Some(method) = inst.borrow().class.methods.get(name) {
+                return self.call_closure(Rc::clone(method), arg_count);
+            }
+            
+            Err(RuntimeError::UndefinedProperty(name.to_string()))
+        } else {
+            Err(RuntimeError::TypeError("Not an instance".to_string()))
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NATIVE FUNCTION IMPLEMENTATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn native_clock(_vm: &mut VM, _args: &[Value]) -> Result<Value, RuntimeError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    Ok(Value::Float(duration.as_secs_f64()))
+}
+
+fn native_print(vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    println!("{}", vm.stringify(&args[0]));
+    Ok(Value::Nil)
+}
+
+fn native_len(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    match &args[0] {
+        Value::String(s) => Ok(Value::Int(s.len() as i64)),
+        Value::Array(a) => Ok(Value::Int(a.borrow().len() as i64)),
+        Value::Map(m) => Ok(Value::Int(m.borrow().len() as i64)),
+        _ => Err(RuntimeError::TypeError("Cannot get length".to_string())),
+    }
+}
+
+fn native_type(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::String(Rc::new(args[0].type_name().to_string())))
+}
+
+fn native_str(vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::String(Rc::new(vm.stringify(&args[0]))))
+}
+
+fn native_int(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    match &args[0] {
+        Value::Int(n) => Ok(Value::Int(*n)),
+        Value::Float(f) => Ok(Value::Int(*f as i64)),
+        Value::String(s) => s.parse::<i64>()
+            .map(Value::Int)
+            .map_err(|_| RuntimeError::TypeError("Cannot convert to int".to_string())),
+        _ => Err(RuntimeError::TypeError("Cannot convert to int".to_string())),
+    }
+}
+
+fn native_float(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    match &args[0] {
+        Value::Int(n) => Ok(Value::Float(*n as f64)),
+        Value::Float(f) => Ok(Value::Float(*f)),
+        Value::String(s) => s.parse::<f64>()
+            .map(Value::Float)
+            .map_err(|_| RuntimeError::TypeError("Cannot convert to float".to_string())),
+        _ => Err(RuntimeError::TypeError("Cannot convert to float".to_string())),
+    }
+}
+
+fn native_sqrt(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    match &args[0] {
+        Value::Int(n) => Ok(Value::Float((*n as f64).sqrt())),
+        Value::Float(f) => Ok(Value::Float(f.sqrt())),
+        _ => Err(RuntimeError::TypeError("Cannot sqrt".to_string())),
+    }
+}
+
+fn native_abs(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    match &args[0] {
+        Value::Int(n) => Ok(Value::Int(n.abs())),
+        Value::Float(f) => Ok(Value::Float(f.abs())),
+        _ => Err(RuntimeError::TypeError("Cannot abs".to_string())),
+    }
+}
+
+fn native_floor(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    match &args[0] {
+        Value::Float(f) => Ok(Value::Int(f.floor() as i64)),
+        Value::Int(n) => Ok(Value::Int(*n)),
+        _ => Err(RuntimeError::TypeError("Cannot floor".to_string())),
+    }
+}
+
+fn native_ceil(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    match &args[0] {
+        Value::Float(f) => Ok(Value::Int(f.ceil() as i64)),
+        Value::Int(n) => Ok(Value::Int(*n)),
+        _ => Err(RuntimeError::TypeError("Cannot ceil".to_string())),
+    }
+}
+
+fn native_round(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    match &args[0] {
+        Value::Float(f) => Ok(Value::Int(f.round() as i64)),
+        Value::Int(n) => Ok(Value::Int(*n)),
+        _ => Err(RuntimeError::TypeError("Cannot round".to_string())),
+    }
+}
+
+fn native_min(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    match (&args[0], &args[1]) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.min(b))),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
+        _ => Err(RuntimeError::TypeError("Cannot compare".to_string())),
+    }
+}
+
+fn native_max(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    match (&args[0], &args[1]) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.max(b))),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.max(*b))),
+        _ => Err(RuntimeError::TypeError("Cannot compare".to_string())),
+    }
+}
+
+fn native_push(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    if let Value::Array(arr) = &args[0] {
+        arr.borrow_mut().push(args[1].clone());
+        Ok(Value::Nil)
+    } else {
+        Err(RuntimeError::TypeError("Not an array".to_string()))
+    }
+}
+
+fn native_pop(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    if let Value::Array(arr) = &args[0] {
+        arr.borrow_mut().pop().ok_or(RuntimeError::IndexOutOfBounds)
+    } else {
+        Err(RuntimeError::TypeError("Not an array".to_string()))
+    }
+}
+
+fn native_keys(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    if let Value::Map(map) = &args[0] {
+        let keys: Vec<Value> = map.borrow().keys()
+            .map(|k| Value::String(Rc::new(k.clone())))
+            .collect();
+        Ok(Value::Array(Rc::new(RefCell::new(keys))))
+    } else {
+        Err(RuntimeError::TypeError("Not a map".to_string()))
+    }
+}
+
+fn native_values(_vm: &mut VM, args: &[Value]) -> Result<Value, RuntimeError> {
+    if let Value::Map(map) = &args[0] {
+        let values: Vec<Value> = map.borrow().values().cloned().collect();
+        Ok(Value::Array(Rc::new(RefCell::new(values))))
+    } else {
+        Err(RuntimeError::TypeError("Not a map".to_string()))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum RuntimeError {
+    StackOverflow,
+    TypeError(String),
+    DivisionByZero,
+    UndefinedVariable(String),
+    UndefinedProperty(String),
+    NotCallable,
+    ArityMismatch { expected: usize, got: usize },
+    IndexOutOfBounds,
+    KeyNotFound,
+    AssertionFailed,
+    UnknownOpcode(u8),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_arithmetic() {
+        let mut vm = VM::new();
+        // Test would require compiled bytecode
+    }
+    
+    #[test]
+    fn test_stack_operations() {
+        let mut vm = VM::new();
+        vm.push(Value::Int(42));
+        assert!(matches!(vm.pop(), Value::Int(42)));
+    }
+}

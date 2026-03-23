@@ -1,0 +1,907 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ ALLOC — String Type
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// String is a UTF-8 encoded, growable, heap-allocated string type.
+// It is the owned counterpart to the borrowed `str` type.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#![no_std]
+
+module alloc::string
+
+use core::ptr;
+use core::mem;
+use core::str;
+use core::fmt::{self, Write};
+use core::ops::{Deref, DerefMut, Index, IndexMut, Add, AddAssign, RangeBounds};
+use core::slice::SliceIndex;
+use core::iter::{Iterator, FromIterator, Extend, DoubleEndedIterator, FusedIterator};
+use core::cmp::{PartialEq, Eq, PartialOrd, Ord, Ordering};
+use core::hash::{Hash, Hasher};
+use core::borrow::{Borrow, BorrowMut};
+use core::convert::From;
+
+use crate::alloc::{Allocator, Global};
+use crate::vec::Vec;
+use crate::boxed::Box;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRING TYPE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A UTF-8 encoded, growable string.
+/// 
+/// `String` is the most common string type that has ownership over the
+/// contents of the string. It has a close relationship with `&str`.
+/// 
+/// # UTF-8
+/// 
+/// `String` is always valid UTF-8. Methods that could produce invalid UTF-8
+/// either validate input or operate on bytes directly via `unsafe`.
+/// 
+/// # Examples
+/// 
+/// ```
+/// let mut s = String::from("hello");
+/// s.push(' ');
+/// s.push_str("world");
+/// assert_eq!(s, "hello world");
+/// ```
+pub struct String<A: Allocator = Global> {
+    vec: Vec<u8, A>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONSTRUCTORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl String {
+    /// Creates a new empty `String`.
+    /// 
+    /// No allocation is performed until content is added.
+    #[inline]
+    pub const fn new() -> String {
+        String { vec: Vec::new() }
+    }
+    
+    /// Creates a new empty `String` with the specified capacity.
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> String {
+        String { vec: Vec::with_capacity(capacity) }
+    }
+    
+    /// Converts a vector of bytes to a `String`.
+    /// 
+    /// Returns `Err` if the bytes are not valid UTF-8.
+    pub fn from_utf8(vec: Vec<u8>) -> Result<String, FromUtf8Error> {
+        match str::from_utf8(&vec) {
+            Ok(_) => Ok(String { vec }),
+            Err(e) => Err(FromUtf8Error { bytes: vec, error: e }),
+        }
+    }
+    
+    /// Converts a vector of bytes to a `String`, without checking UTF-8.
+    /// 
+    /// # Safety
+    /// The bytes must be valid UTF-8.
+    #[inline]
+    pub unsafe fn from_utf8_unchecked(vec: Vec<u8>) -> String {
+        String { vec }
+    }
+    
+    /// Converts a `&str` to a `String`.
+    #[inline]
+    pub fn from_str(s: &str) -> String {
+        let mut string = String::with_capacity(s.len());
+        string.push_str(s);
+        string
+    }
+    
+    /// Creates a new `String` from a UTF-8 encoded raw pointer and length.
+    /// 
+    /// # Safety
+    /// - The pointer must be valid for `len` bytes
+    /// - The bytes must be valid UTF-8
+    /// - The memory must have been allocated by the global allocator
+    #[inline]
+    pub unsafe fn from_raw_parts(buf: *mut u8, length: usize, capacity: usize) -> String {
+        String { vec: Vec::from_raw_parts(buf, length, capacity) }
+    }
+}
+
+impl<A: Allocator> String<A> {
+    /// Creates a new empty `String` with the specified allocator.
+    #[inline]
+    pub const fn new_in(alloc: A) -> String<A> {
+        String { vec: Vec::new_in(alloc) }
+    }
+    
+    /// Creates a new empty `String` with capacity in the specified allocator.
+    #[inline]
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> String<A> {
+        String { vec: Vec::with_capacity_in(capacity, alloc) }
+    }
+    
+    /// Converts a vector of bytes to a `String` with allocator.
+    pub fn from_utf8_in(vec: Vec<u8, A>) -> Result<String<A>, FromUtf8Error<A>> {
+        match str::from_utf8(&vec) {
+            Ok(_) => Ok(String { vec }),
+            Err(e) => Err(FromUtf8Error { bytes: vec, error: e }),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CAPACITY AND LENGTH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl<A: Allocator> String<A> {
+    /// Returns the length of the string in bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.vec.len()
+    }
+    
+    /// Returns `true` if the string has a length of zero.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.vec.is_empty()
+    }
+    
+    /// Returns the capacity in bytes.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.vec.capacity()
+    }
+    
+    /// Returns a reference to the allocator.
+    #[inline]
+    pub fn allocator(&self) -> &A {
+        self.vec.allocator()
+    }
+    
+    /// Reserves capacity for at least `additional` more bytes.
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        self.vec.reserve(additional);
+    }
+    
+    /// Reserves exactly `additional` more bytes.
+    #[inline]
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.vec.reserve_exact(additional);
+    }
+    
+    /// Shrinks the capacity to match the length.
+    #[inline]
+    pub fn shrink_to_fit(&mut self) {
+        self.vec.shrink_to_fit();
+    }
+    
+    /// Shrinks the capacity to the specified amount.
+    #[inline]
+    pub fn shrink_to(&mut self, min_capacity: usize) {
+        self.vec.shrink_to(min_capacity);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MUTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl<A: Allocator> String<A> {
+    /// Appends a character to the end of the string.
+    #[inline]
+    pub fn push(&mut self, ch: char) {
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        self.push_str(s);
+    }
+    
+    /// Appends a string slice to the end of the string.
+    #[inline]
+    pub fn push_str(&mut self, string: &str) {
+        self.vec.extend_from_slice(string.as_bytes());
+    }
+    
+    /// Removes the last character from the string and returns it.
+    /// 
+    /// Returns `None` if the string is empty.
+    pub fn pop(&mut self) -> Option<char> {
+        let ch = self.chars().last()?;
+        let new_len = self.len() - ch.len_utf8();
+        unsafe { self.vec.set_len(new_len); }
+        Some(ch)
+    }
+    
+    /// Removes a character at the specified byte index.
+    /// 
+    /// # Panics
+    /// Panics if `idx` is not on a UTF-8 character boundary.
+    pub fn remove(&mut self, idx: usize) -> char {
+        let ch = match self[idx..].chars().next() {
+            Some(ch) => ch,
+            None => panic!("cannot remove past end of string"),
+        };
+        let next = idx + ch.len_utf8();
+        let len = self.len();
+        
+        unsafe {
+            ptr::copy(
+                self.vec.as_ptr().add(next),
+                self.vec.as_mut_ptr().add(idx),
+                len - next,
+            );
+            self.vec.set_len(len - (next - idx));
+        }
+        ch
+    }
+    
+    /// Inserts a character at the specified byte index.
+    /// 
+    /// # Panics
+    /// Panics if `idx` is not on a UTF-8 character boundary or > len.
+    pub fn insert(&mut self, idx: usize, ch: char) {
+        assert!(self.is_char_boundary(idx));
+        
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        self.insert_str(idx, s);
+    }
+    
+    /// Inserts a string slice at the specified byte index.
+    pub fn insert_str(&mut self, idx: usize, string: &str) {
+        assert!(self.is_char_boundary(idx));
+        
+        let len = self.len();
+        let amt = string.len();
+        self.vec.reserve(amt);
+        
+        unsafe {
+            ptr::copy(
+                self.vec.as_ptr().add(idx),
+                self.vec.as_mut_ptr().add(idx + amt),
+                len - idx,
+            );
+            ptr::copy_nonoverlapping(
+                string.as_ptr(),
+                self.vec.as_mut_ptr().add(idx),
+                amt,
+            );
+            self.vec.set_len(len + amt);
+        }
+    }
+    
+    /// Truncates the string to the specified length.
+    /// 
+    /// # Panics
+    /// Panics if `new_len` is not on a UTF-8 character boundary.
+    pub fn truncate(&mut self, new_len: usize) {
+        if new_len <= self.len() {
+            assert!(self.is_char_boundary(new_len));
+            self.vec.truncate(new_len);
+        }
+    }
+    
+    /// Clears the string, removing all content.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.vec.clear();
+    }
+    
+    /// Removes a range from the string, returning it as a new string.
+    pub fn drain<R>(&mut self, range: R) -> Drain<'_, A>
+    where
+        R: RangeBounds<usize>,
+    {
+        let Range { start, end } = self.range_bounds_to_range(range);
+        assert!(self.is_char_boundary(start));
+        assert!(self.is_char_boundary(end));
+        
+        let self_ptr = self as *mut _;
+        
+        unsafe {
+            let chars_iter = self.get_unchecked(start..end).chars();
+            
+            Drain {
+                string: self_ptr,
+                start,
+                end,
+                iter: chars_iter,
+            }
+        }
+    }
+    
+    fn range_bounds_to_range<R: RangeBounds<usize>>(&self, range: R) -> Range<usize> {
+        use core::ops::Bound;
+        let start = match range.start_bound() {
+            Bound::Included(&n) => n,
+            Bound::Excluded(&n) => n + 1,
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(&n) => n + 1,
+            Bound::Excluded(&n) => n,
+            Bound::Unbounded => self.len(),
+        };
+        Range { start, end }
+    }
+    
+    /// Replaces a range with the given string.
+    pub fn replace_range<R>(&mut self, range: R, replace_with: &str)
+    where
+        R: RangeBounds<usize>,
+    {
+        let Range { start, end } = self.range_bounds_to_range(range);
+        assert!(self.is_char_boundary(start));
+        assert!(self.is_char_boundary(end));
+        
+        let len = self.len();
+        let old_len = end - start;
+        let new_len = replace_with.len();
+        
+        if new_len >= old_len {
+            self.vec.reserve(new_len - old_len);
+        }
+        
+        unsafe {
+            ptr::copy(
+                self.vec.as_ptr().add(end),
+                self.vec.as_mut_ptr().add(start + new_len),
+                len - end,
+            );
+            ptr::copy_nonoverlapping(
+                replace_with.as_ptr(),
+                self.vec.as_mut_ptr().add(start),
+                new_len,
+            );
+            self.vec.set_len(len - old_len + new_len);
+        }
+    }
+    
+    /// Retains only the characters specified by the predicate.
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(char) -> bool,
+    {
+        let len = self.len();
+        let mut del_bytes = 0;
+        let mut idx = 0;
+        
+        unsafe {
+            self.vec.set_len(0);
+        }
+        
+        while idx < len {
+            let ch = unsafe {
+                self.get_unchecked(idx..len).chars().next().unwrap_unchecked()
+            };
+            let ch_len = ch.len_utf8();
+            
+            if !f(ch) {
+                del_bytes += ch_len;
+            } else if del_bytes > 0 {
+                unsafe {
+                    ptr::copy(
+                        self.vec.as_ptr().add(idx),
+                        self.vec.as_mut_ptr().add(idx - del_bytes),
+                        ch_len,
+                    );
+                }
+            }
+            
+            idx += ch_len;
+        }
+        
+        unsafe {
+            self.vec.set_len(len - del_bytes);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONVERSIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl<A: Allocator> String<A> {
+    /// Converts the string to a byte vector.
+    #[inline]
+    pub fn into_bytes(self) -> Vec<u8, A> {
+        self.vec
+    }
+    
+    /// Returns a byte slice of the string contents.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.vec
+    }
+    
+    /// Returns a mutable byte slice of the string contents.
+    /// 
+    /// # Safety
+    /// The caller must ensure the bytes remain valid UTF-8.
+    #[inline]
+    pub unsafe fn as_mut_vec(&mut self) -> &mut Vec<u8, A> {
+        &mut self.vec
+    }
+    
+    /// Returns the string as a string slice.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        self
+    }
+    
+    /// Returns the string as a mutable string slice.
+    #[inline]
+    pub fn as_mut_str(&mut self) -> &mut str {
+        self
+    }
+    
+    /// Converts the string into a boxed string slice.
+    pub fn into_boxed_str(self) -> Box<str, A>
+    where
+        A: Clone,
+    {
+        let boxed = self.vec.into_boxed_slice();
+        unsafe { Box::from_raw_in(Box::into_raw(boxed) as *mut str, self.vec.allocator().clone()) }
+    }
+    
+    /// Decomposes the string into its raw parts.
+    pub fn into_raw_parts(self) -> (*mut u8, usize, usize) {
+        self.vec.into_raw_parts()
+    }
+}
+
+impl String {
+    /// Creates a `String` by repeating a string `n` times.
+    pub fn repeat(s: &str, n: usize) -> String {
+        if n == 0 || s.is_empty() {
+            return String::new();
+        }
+        
+        let mut result = String::with_capacity(s.len() * n);
+        for _ in 0..n {
+            result.push_str(s);
+        }
+        result
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRAIT IMPLEMENTATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl<A: Allocator> Deref for String<A> {
+    type Target = str;
+    
+    #[inline]
+    fn deref(&self) -> &str {
+        unsafe { str::from_utf8_unchecked(&self.vec) }
+    }
+}
+
+impl<A: Allocator> DerefMut for String<A> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut str {
+        unsafe { str::from_utf8_unchecked_mut(&mut self.vec) }
+    }
+}
+
+impl<A: Allocator + Default> Default for String<A> {
+    fn default() -> Self {
+        String::new_in(A::default())
+    }
+}
+
+impl<A: Allocator + Clone> Clone for String<A> {
+    fn clone(&self) -> Self {
+        String { vec: self.vec.clone() }
+    }
+    
+    fn clone_from(&mut self, source: &Self) {
+        self.vec.clone_from(&source.vec);
+    }
+}
+
+impl<A: Allocator> PartialEq for String<A> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        PartialEq::eq(&self[..], &other[..])
+    }
+}
+
+impl<A: Allocator> PartialEq<str> for String<A> {
+    #[inline]
+    fn eq(&self, other: &str) -> bool {
+        &self[..] == other
+    }
+}
+
+impl<A: Allocator> PartialEq<String<A>> for str {
+    #[inline]
+    fn eq(&self, other: &String<A>) -> bool {
+        self == &other[..]
+    }
+}
+
+impl<A: Allocator> PartialEq<&str> for String<A> {
+    #[inline]
+    fn eq(&self, other: &&str) -> bool {
+        &self[..] == *other
+    }
+}
+
+impl<A: Allocator> Eq for String<A> {}
+
+impl<A: Allocator> PartialOrd for String<A> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<A: Allocator> Ord for String<A> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        Ord::cmp(&self[..], &other[..])
+    }
+}
+
+impl<A: Allocator> Hash for String<A> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (&self[..]).hash(state);
+    }
+}
+
+impl<A: Allocator> AsRef<str> for String<A> {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self
+    }
+}
+
+impl<A: Allocator> AsRef<[u8]> for String<A> {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl<A: Allocator> Borrow<str> for String<A> {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self
+    }
+}
+
+impl<A: Allocator> BorrowMut<str> for String<A> {
+    #[inline]
+    fn borrow_mut(&mut self) -> &mut str {
+        self
+    }
+}
+
+impl<I: SliceIndex<str>, A: Allocator> Index<I> for String<A> {
+    type Output = I::Output;
+    
+    #[inline]
+    fn index(&self, index: I) -> &I::Output {
+        Index::index(&**self, index)
+    }
+}
+
+impl<I: SliceIndex<str>, A: Allocator> IndexMut<I> for String<A> {
+    #[inline]
+    fn index_mut(&mut self, index: I) -> &mut I::Output {
+        IndexMut::index_mut(&mut **self, index)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OPERATOR IMPLEMENTATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl<A: Allocator> Add<&str> for String<A> {
+    type Output = String<A>;
+    
+    fn add(mut self, other: &str) -> String<A> {
+        self.push_str(other);
+        self
+    }
+}
+
+impl<A: Allocator> AddAssign<&str> for String<A> {
+    fn add_assign(&mut self, other: &str) {
+        self.push_str(other);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FROM IMPLEMENTATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl From<&str> for String {
+    fn from(s: &str) -> String {
+        String::from_str(s)
+    }
+}
+
+impl From<&mut str> for String {
+    fn from(s: &mut str) -> String {
+        String::from_str(s)
+    }
+}
+
+impl From<char> for String {
+    fn from(c: char) -> String {
+        let mut s = String::with_capacity(4);
+        s.push(c);
+        s
+    }
+}
+
+impl<A: Allocator> From<Box<str, A>> for String<A> {
+    fn from(boxed: Box<str, A>) -> String<A> {
+        let (ptr, alloc) = Box::into_raw_with_allocator(boxed);
+        unsafe {
+            let len = (*ptr).len();
+            let cap = len;
+            String::from_raw_parts_in(ptr as *mut u8, len, cap, alloc)
+        }
+    }
+}
+
+impl<A: Allocator + Default> FromIterator<char> for String<A> {
+    fn from_iter<I: IntoIterator<Item = char>>(iter: I) -> String<A> {
+        let mut s = String::new_in(A::default());
+        s.extend(iter);
+        s
+    }
+}
+
+impl<'a, A: Allocator + Default> FromIterator<&'a str> for String<A> {
+    fn from_iter<I: IntoIterator<Item = &'a str>>(iter: I) -> String<A> {
+        let mut s = String::new_in(A::default());
+        s.extend(iter);
+        s
+    }
+}
+
+impl<A: Allocator> Extend<char> for String<A> {
+    fn extend<I: IntoIterator<Item = char>>(&mut self, iter: I) {
+        let iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        self.reserve(lower);
+        for c in iter {
+            self.push(c);
+        }
+    }
+}
+
+impl<'a, A: Allocator> Extend<&'a str> for String<A> {
+    fn extend<I: IntoIterator<Item = &'a str>>(&mut self, iter: I) {
+        for s in iter {
+            self.push_str(s);
+        }
+    }
+}
+
+impl<A: Allocator> fmt::Write for String<A> {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.push_str(s);
+        Ok(())
+    }
+    
+    #[inline]
+    fn write_char(&mut self, c: char) -> fmt::Result {
+        self.push(c);
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR TYPE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Error returned when parsing UTF-8 fails.
+pub struct FromUtf8Error<A: Allocator = Global> {
+    bytes: Vec<u8, A>,
+    error: str::Utf8Error,
+}
+
+impl<A: Allocator> FromUtf8Error<A> {
+    /// Returns the bytes that could not be converted.
+    pub fn into_bytes(self) -> Vec<u8, A> {
+        self.bytes
+    }
+    
+    /// Returns the underlying UTF-8 error.
+    pub fn utf8_error(&self) -> str::Utf8Error {
+        self.error
+    }
+    
+    /// Returns a reference to the bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DRAIN ITERATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use core::ops::Range;
+
+/// A draining iterator for `String`.
+pub struct Drain<'a, A: Allocator = Global> {
+    string: *mut String<A>,
+    start: usize,
+    end: usize,
+    iter: str::Chars<'a>,
+}
+
+impl<A: Allocator> Iterator for Drain<'_, A> {
+    type Item = char;
+    
+    #[inline]
+    fn next(&mut self) -> Option<char> {
+        self.iter.next()
+    }
+    
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+impl<A: Allocator> DoubleEndedIterator for Drain<'_, A> {
+    #[inline]
+    fn next_back(&mut self) -> Option<char> {
+        self.iter.next_back()
+    }
+}
+
+impl<A: Allocator> FusedIterator for Drain<'_, A> {}
+
+impl<A: Allocator> Drop for Drain<'_, A> {
+    fn drop(&mut self) {
+        unsafe {
+            let string = &mut *self.string;
+            let len = string.len();
+            let start = self.start;
+            let end = self.end;
+            
+            ptr::copy(
+                string.vec.as_ptr().add(end),
+                string.vec.as_mut_ptr().add(start),
+                len - end,
+            );
+            string.vec.set_len(len - (end - start));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPER TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl<A: Allocator> String<A> {
+    /// Returns `true` if the given byte index is on a UTF-8 boundary.
+    #[inline]
+    pub fn is_char_boundary(&self, index: usize) -> bool {
+        self.deref().is_char_boundary(index)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_string_new() {
+        let s = String::new();
+        assert!(s.is_empty());
+    }
+    
+    #[test]
+    fn test_string_from_str() {
+        let s = String::from("hello");
+        assert_eq!(s, "hello");
+        assert_eq!(s.len(), 5);
+    }
+    
+    #[test]
+    fn test_string_push() {
+        let mut s = String::from("hello");
+        s.push(' ');
+        s.push_str("world");
+        assert_eq!(s, "hello world");
+    }
+    
+    #[test]
+    fn test_string_pop() {
+        let mut s = String::from("abc");
+        assert_eq!(s.pop(), Some('c'));
+        assert_eq!(s.pop(), Some('b'));
+        assert_eq!(s.pop(), Some('a'));
+        assert_eq!(s.pop(), None);
+    }
+    
+    #[test]
+    fn test_string_insert() {
+        let mut s = String::from("ac");
+        s.insert(1, 'b');
+        assert_eq!(s, "abc");
+    }
+    
+    #[test]
+    fn test_string_remove() {
+        let mut s = String::from("abc");
+        assert_eq!(s.remove(1), 'b');
+        assert_eq!(s, "ac");
+    }
+    
+    #[test]
+    fn test_string_truncate() {
+        let mut s = String::from("hello");
+        s.truncate(2);
+        assert_eq!(s, "he");
+    }
+    
+    #[test]
+    fn test_string_clear() {
+        let mut s = String::from("hello");
+        s.clear();
+        assert!(s.is_empty());
+    }
+    
+    #[test]
+    fn test_string_retain() {
+        let mut s = String::from("a1b2c3");
+        s.retain(|c| c.is_alphabetic());
+        assert_eq!(s, "abc");
+    }
+    
+    #[test]
+    fn test_string_add() {
+        let s1 = String::from("hello");
+        let s2 = s1 + " world";
+        assert_eq!(s2, "hello world");
+    }
+    
+    #[test]
+    fn test_string_from_iter() {
+        let s: String = ['a', 'b', 'c'].iter().collect();
+        assert_eq!(s, "abc");
+    }
+    
+    #[test]
+    fn test_string_utf8() {
+        let s = String::from("日本語");
+        assert_eq!(s.len(), 9);  // 3 characters, 3 bytes each
+        assert_eq!(s.chars().count(), 3);
+    }
+    
+    #[test]
+    fn test_string_from_utf8() {
+        let bytes = vec![104, 101, 108, 108, 111];
+        let s = String::from_utf8(bytes).unwrap();
+        assert_eq!(s, "hello");
+    }
+    
+    #[test]
+    fn test_string_from_utf8_invalid() {
+        let bytes = vec![0xFF, 0xFE];
+        assert!(String::from_utf8(bytes).is_err());
+    }
+}

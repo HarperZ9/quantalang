@@ -1,0 +1,847 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ PROFILER — Core Types & Sampling
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// CPU sampling profiler with stack trace collection and call graph generation.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::profile::sampler
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
+use std::thread;
+use std::path::PathBuf;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROFILER CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Profiler configuration
+#[derive(Debug, Clone)]
+pub struct ProfilerConfig {
+    /// Sampling frequency in Hz (samples per second)
+    pub sample_frequency: u32,
+    
+    /// Maximum stack depth to capture
+    pub max_stack_depth: usize,
+    
+    /// CPU profiling enabled
+    pub cpu_profiling: bool,
+    
+    /// Memory profiling enabled
+    pub memory_profiling: bool,
+    
+    /// Allocation tracking enabled
+    pub allocation_tracking: bool,
+    
+    /// Include kernel frames
+    pub include_kernel: bool,
+    
+    /// Include idle samples
+    pub include_idle: bool,
+    
+    /// Output format
+    pub output_format: OutputFormat,
+    
+    /// Output file path
+    pub output_path: Option<PathBuf>,
+    
+    /// Profile duration limit (None = until stopped)
+    pub duration: Option<Duration>,
+    
+    /// Threads to profile (empty = all)
+    pub thread_filter: Vec<u64>,
+    
+    /// Functions to exclude
+    pub exclude_functions: Vec<String>,
+    
+    /// Minimum sample count threshold for reporting
+    pub min_samples: u64,
+}
+
+impl Default for ProfilerConfig {
+    fn default() -> Self {
+        ProfilerConfig {
+            sample_frequency: 99, // Avoid aliasing with 100Hz timers
+            max_stack_depth: 128,
+            cpu_profiling: true,
+            memory_profiling: false,
+            allocation_tracking: false,
+            include_kernel: false,
+            include_idle: false,
+            output_format: OutputFormat::Text,
+            output_path: None,
+            duration: None,
+            thread_filter: Vec::new(),
+            exclude_functions: Vec::new(),
+            min_samples: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Text,
+    Json,
+    Flamegraph,
+    Callgrind,
+    Pprof,
+    Chrome, // Chrome tracing format
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SAMPLE DATA
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A single sample capture
+#[derive(Debug, Clone)]
+pub struct Sample {
+    /// Timestamp when sample was taken
+    pub timestamp: Instant,
+    
+    /// Thread ID
+    pub thread_id: u64,
+    
+    /// Thread name
+    pub thread_name: Option<String>,
+    
+    /// Stack frames (bottom to top)
+    pub stack: Vec<StackFrame>,
+    
+    /// CPU state
+    pub cpu_state: CpuState,
+    
+    /// Memory usage at sample time
+    pub memory_usage: Option<MemoryUsage>,
+}
+
+/// Stack frame information
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct StackFrame {
+    /// Instruction pointer / program counter
+    pub ip: u64,
+    
+    /// Symbol name (demangled)
+    pub symbol: Option<String>,
+    
+    /// Module/binary name
+    pub module: Option<String>,
+    
+    /// Source file
+    pub file: Option<String>,
+    
+    /// Line number
+    pub line: Option<u32>,
+    
+    /// Column number  
+    pub column: Option<u32>,
+    
+    /// Inline frame index (0 = not inlined)
+    pub inline_index: u32,
+}
+
+impl StackFrame {
+    pub fn new(ip: u64) -> Self {
+        StackFrame {
+            ip,
+            symbol: None,
+            module: None,
+            file: None,
+            line: None,
+            column: None,
+            inline_index: 0,
+        }
+    }
+    
+    pub fn with_symbol(mut self, symbol: &str) -> Self {
+        self.symbol = Some(symbol.to_string());
+        self
+    }
+    
+    pub fn with_location(mut self, file: &str, line: u32) -> Self {
+        self.file = Some(file.to_string());
+        self.line = Some(line);
+        self
+    }
+    
+    pub fn display_name(&self) -> String {
+        self.symbol.clone().unwrap_or_else(|| format!("0x{:x}", self.ip))
+    }
+    
+    pub fn full_location(&self) -> String {
+        let name = self.display_name();
+        
+        if let (Some(file), Some(line)) = (&self.file, self.line) {
+            format!("{} ({}:{})", name, file, line)
+        } else if let Some(module) = &self.module {
+            format!("{} [{}]", name, module)
+        } else {
+            name
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuState {
+    Running,
+    Idle,
+    Kernel,
+    Syscall,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryUsage {
+    pub heap_used: u64,
+    pub heap_total: u64,
+    pub stack_used: u64,
+    pub rss: u64, // Resident set size
+    pub vms: u64, // Virtual memory size
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SAMPLER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// CPU sampling profiler
+pub struct Sampler {
+    config: ProfilerConfig,
+    samples: Mutex<Vec<Sample>>,
+    running: AtomicBool,
+    sample_count: AtomicU64,
+    start_time: Mutex<Option<Instant>>,
+    end_time: Mutex<Option<Instant>>,
+    target_pid: Option<u32>,
+}
+
+impl Sampler {
+    pub fn new(config: ProfilerConfig) -> Self {
+        Sampler {
+            config,
+            samples: Mutex::new(Vec::new()),
+            running: AtomicBool::new(false),
+            sample_count: AtomicU64::new(0),
+            start_time: Mutex::new(None),
+            end_time: Mutex::new(None),
+            target_pid: None,
+        }
+    }
+    
+    /// Set target process ID (for external profiling)
+    pub fn set_target_pid(&mut self, pid: u32) {
+        self.target_pid = Some(pid);
+    }
+    
+    /// Start sampling
+    pub fn start(&self) -> Result<(), String> {
+        if self.running.swap(true, Ordering::SeqCst) {
+            return Err("sampler already running".to_string());
+        }
+        
+        *self.start_time.lock().unwrap() = Some(Instant::now());
+        
+        // Calculate sample interval
+        let interval = Duration::from_micros(1_000_000 / self.config.sample_frequency as u64);
+        
+        // Spawn sampling thread
+        let running = &self.running;
+        let samples = &self.samples;
+        let sample_count = &self.sample_count;
+        let config = self.config.clone();
+        let duration = self.config.duration;
+        let start = Instant::now();
+        
+        // In a real implementation, we'd use platform-specific APIs:
+        // - Linux: perf_event_open or setitimer + signal handler
+        // - macOS: task_sample_thread or DTrace
+        // - Windows: ETW or suspending threads
+        
+        // Simplified sampling loop
+        loop {
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+            
+            if let Some(max_duration) = duration {
+                if start.elapsed() >= max_duration {
+                    running.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
+            
+            // Capture sample
+            if let Some(sample) = self.capture_sample() {
+                samples.lock().unwrap().push(sample);
+                sample_count.fetch_add(1, Ordering::SeqCst);
+            }
+            
+            thread::sleep(interval);
+        }
+        
+        Ok(())
+    }
+    
+    /// Stop sampling
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        *self.end_time.lock().unwrap() = Some(Instant::now());
+    }
+    
+    /// Check if running
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+    
+    /// Get sample count
+    pub fn sample_count(&self) -> u64 {
+        self.sample_count.load(Ordering::SeqCst)
+    }
+    
+    /// Get all samples
+    pub fn samples(&self) -> Vec<Sample> {
+        self.samples.lock().unwrap().clone()
+    }
+    
+    /// Get profiling duration
+    pub fn duration(&self) -> Option<Duration> {
+        let start = (*self.start_time.lock().unwrap())?;
+        let end = self.end_time.lock().unwrap().unwrap_or_else(Instant::now);
+        Some(end.duration_since(start))
+    }
+    
+    /// Capture a single sample
+    fn capture_sample(&self) -> Option<Sample> {
+        let timestamp = Instant::now();
+        
+        // Get current thread info
+        let thread_id = get_current_thread_id();
+        let thread_name = get_thread_name(thread_id);
+        
+        // Apply thread filter
+        if !self.config.thread_filter.is_empty() {
+            if !self.config.thread_filter.contains(&thread_id) {
+                return None;
+            }
+        }
+        
+        // Capture stack trace
+        let stack = self.capture_stack();
+        
+        // Check for excluded functions
+        for frame in &stack {
+            if let Some(ref sym) = frame.symbol {
+                for exclude in &self.config.exclude_functions {
+                    if sym.contains(exclude) {
+                        return None;
+                    }
+                }
+            }
+        }
+        
+        // Determine CPU state
+        let cpu_state = CpuState::Running; // Simplified
+        
+        // Skip idle samples if configured
+        if !self.config.include_idle && cpu_state == CpuState::Idle {
+            return None;
+        }
+        
+        // Capture memory usage if enabled
+        let memory_usage = if self.config.memory_profiling {
+            Some(get_memory_usage())
+        } else {
+            None
+        };
+        
+        Some(Sample {
+            timestamp,
+            thread_id,
+            thread_name,
+            stack,
+            cpu_state,
+            memory_usage,
+        })
+    }
+    
+    /// Capture current stack trace
+    fn capture_stack(&self) -> Vec<StackFrame> {
+        let mut frames = Vec::new();
+        
+        // In a real implementation, use:
+        // - backtrace crate
+        // - Platform-specific unwinding (libunwind, Windows API)
+        // - Frame pointer walking
+        // - DWARF-based unwinding
+        
+        #[cfg(feature = "backtrace")]
+        {
+            backtrace::trace(|frame| {
+                if frames.len() >= self.config.max_stack_depth {
+                    return false;
+                }
+                
+                let ip = frame.ip() as u64;
+                let mut stack_frame = StackFrame::new(ip);
+                
+                backtrace::resolve(frame.ip(), |symbol| {
+                    if let Some(name) = symbol.name() {
+                        stack_frame.symbol = Some(name.to_string());
+                    }
+                    if let Some(file) = symbol.filename() {
+                        stack_frame.file = Some(file.to_string_lossy().to_string());
+                    }
+                    if let Some(line) = symbol.lineno() {
+                        stack_frame.line = Some(line);
+                    }
+                });
+                
+                frames.push(stack_frame);
+                true
+            });
+        }
+        
+        // Mock implementation for demonstration
+        #[cfg(not(feature = "backtrace"))]
+        {
+            frames.push(StackFrame::new(0x1000).with_symbol("main"));
+            frames.push(StackFrame::new(0x2000).with_symbol("run_loop"));
+            frames.push(StackFrame::new(0x3000).with_symbol("process_item"));
+        }
+        
+        frames
+    }
+    
+    /// Clear collected samples
+    pub fn clear(&self) {
+        self.samples.lock().unwrap().clear();
+        self.sample_count.store(0, Ordering::SeqCst);
+        *self.start_time.lock().unwrap() = None;
+        *self.end_time.lock().unwrap() = None;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSTRUMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Instrumentation-based profiler for precise timing
+pub struct Instrumenter {
+    /// Function entry/exit timestamps
+    spans: Mutex<Vec<Span>>,
+    
+    /// Span stack per thread
+    span_stacks: RwLock<BTreeMap<u64, Vec<SpanStart>>>,
+    
+    /// Running flag
+    enabled: AtomicBool,
+    
+    /// Total recorded spans
+    span_count: AtomicU64,
+}
+
+impl Instrumenter {
+    pub fn new() -> Self {
+        Instrumenter {
+            spans: Mutex::new(Vec::new()),
+            span_stacks: RwLock::new(BTreeMap::new()),
+            enabled: AtomicBool::new(true),
+            span_count: AtomicU64::new(0),
+        }
+    }
+    
+    /// Enable instrumentation
+    pub fn enable(&self) {
+        self.enabled.store(true, Ordering::SeqCst);
+    }
+    
+    /// Disable instrumentation
+    pub fn disable(&self) {
+        self.enabled.store(false, Ordering::SeqCst);
+    }
+    
+    /// Record function entry
+    pub fn enter(&self, name: &str) -> Option<SpanGuard> {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return None;
+        }
+        
+        let thread_id = get_current_thread_id();
+        let start = Instant::now();
+        
+        let span_start = SpanStart {
+            name: name.to_string(),
+            start,
+            thread_id,
+        };
+        
+        {
+            let mut stacks = self.span_stacks.write().unwrap();
+            stacks.entry(thread_id).or_default().push(span_start);
+        }
+        
+        Some(SpanGuard {
+            instrumenter: self,
+            name: name.to_string(),
+        })
+    }
+    
+    /// Record function exit
+    pub fn exit(&self, name: &str) {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return;
+        }
+        
+        let thread_id = get_current_thread_id();
+        let end = Instant::now();
+        
+        let span_start = {
+            let mut stacks = self.span_stacks.write().unwrap();
+            if let Some(stack) = stacks.get_mut(&thread_id) {
+                stack.pop()
+            } else {
+                None
+            }
+        };
+        
+        if let Some(start) = span_start {
+            let span = Span {
+                name: start.name,
+                thread_id,
+                start: start.start,
+                end,
+                duration: end.duration_since(start.start),
+            };
+            
+            self.spans.lock().unwrap().push(span);
+            self.span_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    
+    /// Get all recorded spans
+    pub fn spans(&self) -> Vec<Span> {
+        self.spans.lock().unwrap().clone()
+    }
+    
+    /// Get span count
+    pub fn span_count(&self) -> u64 {
+        self.span_count.load(Ordering::SeqCst)
+    }
+    
+    /// Clear recorded spans
+    pub fn clear(&self) {
+        self.spans.lock().unwrap().clear();
+        self.span_stacks.write().unwrap().clear();
+        self.span_count.store(0, Ordering::SeqCst);
+    }
+}
+
+impl Default for Instrumenter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Recorded span
+#[derive(Debug, Clone)]
+pub struct Span {
+    pub name: String,
+    pub thread_id: u64,
+    pub start: Instant,
+    pub end: Instant,
+    pub duration: Duration,
+}
+
+#[derive(Debug)]
+struct SpanStart {
+    name: String,
+    start: Instant,
+    thread_id: u64,
+}
+
+/// RAII guard for automatic span exit
+pub struct SpanGuard<'a> {
+    instrumenter: &'a Instrumenter,
+    name: String,
+}
+
+impl<'a> Drop for SpanGuard<'a> {
+    fn drop(&mut self) {
+        self.instrumenter.exit(&self.name);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALLOCATION TRACKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Memory allocation tracker
+pub struct AllocationTracker {
+    allocations: Mutex<Vec<Allocation>>,
+    active_allocations: RwLock<BTreeMap<u64, AllocationInfo>>,
+    enabled: AtomicBool,
+    total_allocated: AtomicU64,
+    total_freed: AtomicU64,
+    peak_memory: AtomicU64,
+    allocation_count: AtomicU64,
+}
+
+impl AllocationTracker {
+    pub fn new() -> Self {
+        AllocationTracker {
+            allocations: Mutex::new(Vec::new()),
+            active_allocations: RwLock::new(BTreeMap::new()),
+            enabled: AtomicBool::new(true),
+            total_allocated: AtomicU64::new(0),
+            total_freed: AtomicU64::new(0),
+            peak_memory: AtomicU64::new(0),
+            allocation_count: AtomicU64::new(0),
+        }
+    }
+    
+    /// Record allocation
+    pub fn record_alloc(&self, ptr: u64, size: u64) {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return;
+        }
+        
+        let stack = capture_allocation_stack();
+        let timestamp = Instant::now();
+        
+        let info = AllocationInfo {
+            size,
+            timestamp,
+            stack: stack.clone(),
+            thread_id: get_current_thread_id(),
+        };
+        
+        self.active_allocations.write().unwrap().insert(ptr, info);
+        
+        let old_total = self.total_allocated.fetch_add(size, Ordering::SeqCst);
+        let new_total = old_total + size;
+        
+        // Update peak
+        loop {
+            let current_peak = self.peak_memory.load(Ordering::SeqCst);
+            if new_total <= current_peak {
+                break;
+            }
+            if self.peak_memory.compare_exchange(
+                current_peak, new_total, Ordering::SeqCst, Ordering::SeqCst
+            ).is_ok() {
+                break;
+            }
+        }
+        
+        self.allocation_count.fetch_add(1, Ordering::SeqCst);
+        
+        self.allocations.lock().unwrap().push(Allocation {
+            kind: AllocKind::Alloc,
+            ptr,
+            size,
+            timestamp,
+            stack,
+            thread_id: get_current_thread_id(),
+        });
+    }
+    
+    /// Record deallocation
+    pub fn record_free(&self, ptr: u64) {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return;
+        }
+        
+        let info = self.active_allocations.write().unwrap().remove(&ptr);
+        
+        if let Some(info) = info {
+            self.total_freed.fetch_add(info.size, Ordering::SeqCst);
+            
+            self.allocations.lock().unwrap().push(Allocation {
+                kind: AllocKind::Free,
+                ptr,
+                size: info.size,
+                timestamp: Instant::now(),
+                stack: Vec::new(),
+                thread_id: get_current_thread_id(),
+            });
+        }
+    }
+    
+    /// Record reallocation
+    pub fn record_realloc(&self, old_ptr: u64, new_ptr: u64, new_size: u64) {
+        self.record_free(old_ptr);
+        self.record_alloc(new_ptr, new_size);
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> AllocationStats {
+        let active = self.active_allocations.read().unwrap();
+        
+        AllocationStats {
+            total_allocated: self.total_allocated.load(Ordering::SeqCst),
+            total_freed: self.total_freed.load(Ordering::SeqCst),
+            current_usage: self.total_allocated.load(Ordering::SeqCst) 
+                - self.total_freed.load(Ordering::SeqCst),
+            peak_memory: self.peak_memory.load(Ordering::SeqCst),
+            allocation_count: self.allocation_count.load(Ordering::SeqCst),
+            active_allocations: active.len() as u64,
+        }
+    }
+    
+    /// Get active allocations (potential leaks)
+    pub fn active_allocations(&self) -> Vec<(u64, AllocationInfo)> {
+        self.active_allocations.read().unwrap()
+            .iter()
+            .map(|(&k, v)| (k, v.clone()))
+            .collect()
+    }
+    
+    /// Clear tracking data
+    pub fn clear(&self) {
+        self.allocations.lock().unwrap().clear();
+        self.active_allocations.write().unwrap().clear();
+        self.total_allocated.store(0, Ordering::SeqCst);
+        self.total_freed.store(0, Ordering::SeqCst);
+        self.peak_memory.store(0, Ordering::SeqCst);
+        self.allocation_count.store(0, Ordering::SeqCst);
+    }
+}
+
+impl Default for AllocationTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Allocation {
+    pub kind: AllocKind,
+    pub ptr: u64,
+    pub size: u64,
+    pub timestamp: Instant,
+    pub stack: Vec<StackFrame>,
+    pub thread_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocKind {
+    Alloc,
+    Free,
+    Realloc,
+}
+
+#[derive(Debug, Clone)]
+pub struct AllocationInfo {
+    pub size: u64,
+    pub timestamp: Instant,
+    pub stack: Vec<StackFrame>,
+    pub thread_id: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AllocationStats {
+    pub total_allocated: u64,
+    pub total_freed: u64,
+    pub current_usage: u64,
+    pub peak_memory: u64,
+    pub allocation_count: u64,
+    pub active_allocations: u64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn get_current_thread_id() -> u64 {
+    #[cfg(unix)]
+    unsafe {
+        libc::pthread_self() as u64
+    }
+    
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn get_thread_name(thread_id: u64) -> Option<String> {
+    // Platform-specific thread name retrieval
+    None
+}
+
+fn get_memory_usage() -> MemoryUsage {
+    // Platform-specific memory usage
+    MemoryUsage {
+        heap_used: 0,
+        heap_total: 0,
+        stack_used: 0,
+        rss: 0,
+        vms: 0,
+    }
+}
+
+fn capture_allocation_stack() -> Vec<StackFrame> {
+    // Capture stack at allocation site
+    Vec::new()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_stack_frame() {
+        let frame = StackFrame::new(0x1000)
+            .with_symbol("test_function")
+            .with_location("test.rs", 42);
+        
+        assert_eq!(frame.ip, 0x1000);
+        assert_eq!(frame.symbol, Some("test_function".to_string()));
+        assert_eq!(frame.line, Some(42));
+    }
+    
+    #[test]
+    fn test_instrumenter() {
+        let inst = Instrumenter::new();
+        
+        {
+            let _guard = inst.enter("test_fn");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        
+        let spans = inst.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "test_fn");
+        assert!(spans[0].duration >= Duration::from_millis(10));
+    }
+    
+    #[test]
+    fn test_allocation_tracker() {
+        let tracker = AllocationTracker::new();
+        
+        tracker.record_alloc(0x1000, 1024);
+        tracker.record_alloc(0x2000, 2048);
+        
+        let stats = tracker.stats();
+        assert_eq!(stats.total_allocated, 3072);
+        assert_eq!(stats.active_allocations, 2);
+        
+        tracker.record_free(0x1000);
+        
+        let stats = tracker.stats();
+        assert_eq!(stats.total_freed, 1024);
+        assert_eq!(stats.active_allocations, 1);
+    }
+}

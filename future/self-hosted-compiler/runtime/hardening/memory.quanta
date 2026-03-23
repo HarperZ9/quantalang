@@ -1,0 +1,861 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ RUNTIME HARDENING — Memory Safety
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Memory safety hardening mechanisms:
+// - Stack canaries and guard pages
+// - ASLR support
+// - Use-after-free detection
+// - Buffer overflow protection
+// - Safe memory allocator integration
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::runtime::hardening::memory
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use core::sync::atomic::{AtomicU64, AtomicBool, AtomicUsize, Ordering};
+use core::ptr::NonNull;
+use core::alloc::{Layout, GlobalAlloc, AllocError};
+use core::cell::UnsafeCell;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STACK CANARY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Stack canary value (randomized at startup)
+static STACK_CANARY: AtomicU64 = AtomicU64::new(0);
+
+/// Initialize stack canary with random value
+pub fn init_stack_canary() {
+    let canary = generate_random_u64();
+    STACK_CANARY.store(canary, Ordering::SeqCst);
+}
+
+/// Get current stack canary value
+#[inline(always)]
+pub fn get_stack_canary() -> u64 {
+    STACK_CANARY.load(Ordering::Relaxed)
+}
+
+/// Check stack canary (called at function epilogue)
+#[inline(always)]
+pub fn check_stack_canary(expected: u64) {
+    let current = get_stack_canary();
+    if current != expected {
+        stack_smash_detected();
+    }
+}
+
+/// Handler for stack smashing detection
+#[cold]
+#[inline(never)]
+fn stack_smash_detected() -> ! {
+    // Log the violation
+    #[cfg(feature = "std")]
+    eprintln!("*** STACK SMASHING DETECTED ***");
+    
+    // Report to security monitor
+    if let Some(monitor) = SECURITY_MONITOR.get() {
+        monitor.report_violation(SecurityViolation::StackSmash);
+    }
+    
+    // Abort immediately - don't return to compromised stack
+    core::intrinsics::abort()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GUARD PAGES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Guard page configuration
+#[derive(Debug, Clone, Copy)]
+pub struct GuardPageConfig {
+    /// Enable guard pages
+    pub enabled: bool,
+    
+    /// Size of guard region (default: 1 page)
+    pub size: usize,
+    
+    /// Place guard at top of stack
+    pub stack_top: bool,
+    
+    /// Place guard at bottom of stack
+    pub stack_bottom: bool,
+    
+    /// Guard heap allocations
+    pub heap_guard: bool,
+}
+
+impl Default for GuardPageConfig {
+    fn default() -> Self {
+        GuardPageConfig {
+            enabled: true,
+            size: 4096, // One page
+            stack_top: true,
+            stack_bottom: true,
+            heap_guard: false, // Expensive, opt-in
+        }
+    }
+}
+
+/// Guard page manager
+pub struct GuardPageManager {
+    config: GuardPageConfig,
+    page_size: usize,
+    guards_allocated: AtomicUsize,
+}
+
+impl GuardPageManager {
+    pub fn new(config: GuardPageConfig) -> Self {
+        let page_size = get_page_size();
+        GuardPageManager {
+            config,
+            page_size,
+            guards_allocated: AtomicUsize::new(0),
+        }
+    }
+    
+    /// Allocate memory with guard pages
+    pub fn allocate_guarded(&self, size: usize) -> Result<*mut u8, AllocError> {
+        if !self.config.enabled {
+            return self.allocate_unguarded(size);
+        }
+        
+        let guard_size = self.config.size.max(self.page_size);
+        let total_size = size + guard_size * 2; // Guard on both sides
+        
+        // Allocate with extra space for guards
+        let ptr = self.allocate_pages(total_size)?;
+        
+        // Protect guard pages
+        unsafe {
+            // Lower guard
+            self.protect_page(ptr, guard_size);
+            
+            // Upper guard
+            let upper_guard = ptr.add(guard_size + size);
+            self.protect_page(upper_guard, guard_size);
+        }
+        
+        self.guards_allocated.fetch_add(2, Ordering::Relaxed);
+        
+        // Return pointer to usable region (after lower guard)
+        unsafe { Ok(ptr.add(guard_size)) }
+    }
+    
+    /// Deallocate guarded memory
+    pub fn deallocate_guarded(&self, ptr: *mut u8, size: usize) {
+        if !self.config.enabled {
+            return self.deallocate_unguarded(ptr, size);
+        }
+        
+        let guard_size = self.config.size.max(self.page_size);
+        
+        // Unprotect and free including guards
+        unsafe {
+            let base = ptr.sub(guard_size);
+            let total_size = size + guard_size * 2;
+            
+            self.unprotect_page(base, guard_size);
+            self.unprotect_page(ptr.add(size), guard_size);
+            
+            self.deallocate_pages(base, total_size);
+        }
+        
+        self.guards_allocated.fetch_sub(2, Ordering::Relaxed);
+    }
+    
+    /// Protect a page (make inaccessible)
+    #[cfg(target_os = "linux")]
+    unsafe fn protect_page(&self, ptr: *mut u8, size: usize) {
+        libc::mprotect(ptr as *mut _, size, libc::PROT_NONE);
+    }
+    
+    #[cfg(target_os = "macos")]
+    unsafe fn protect_page(&self, ptr: *mut u8, size: usize) {
+        libc::mprotect(ptr as *mut _, size, libc::PROT_NONE);
+    }
+    
+    #[cfg(target_os = "windows")]
+    unsafe fn protect_page(&self, ptr: *mut u8, size: usize) {
+        let mut old_protect = 0u32;
+        windows::Win32::System::Memory::VirtualProtect(
+            ptr as *mut _,
+            size,
+            windows::Win32::System::Memory::PAGE_NOACCESS,
+            &mut old_protect,
+        );
+    }
+    
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    unsafe fn protect_page(&self, _ptr: *mut u8, _size: usize) {
+        // No-op on unsupported platforms
+    }
+    
+    /// Unprotect a page
+    #[cfg(unix)]
+    unsafe fn unprotect_page(&self, ptr: *mut u8, size: usize) {
+        libc::mprotect(
+            ptr as *mut _,
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+        );
+    }
+    
+    #[cfg(windows)]
+    unsafe fn unprotect_page(&self, ptr: *mut u8, size: usize) {
+        let mut old_protect = 0u32;
+        windows::Win32::System::Memory::VirtualProtect(
+            ptr as *mut _,
+            size,
+            windows::Win32::System::Memory::PAGE_READWRITE,
+            &mut old_protect,
+        );
+    }
+    
+    #[cfg(not(any(unix, windows)))]
+    unsafe fn unprotect_page(&self, _ptr: *mut u8, _size: usize) {}
+    
+    /// Allocate pages
+    #[cfg(unix)]
+    fn allocate_pages(&self, size: usize) -> Result<*mut u8, AllocError> {
+        unsafe {
+            let ptr = libc::mmap(
+                core::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            
+            if ptr == libc::MAP_FAILED {
+                Err(AllocError)
+            } else {
+                Ok(ptr as *mut u8)
+            }
+        }
+    }
+    
+    #[cfg(windows)]
+    fn allocate_pages(&self, size: usize) -> Result<*mut u8, AllocError> {
+        unsafe {
+            let ptr = windows::Win32::System::Memory::VirtualAlloc(
+                None,
+                size,
+                windows::Win32::System::Memory::MEM_COMMIT 
+                    | windows::Win32::System::Memory::MEM_RESERVE,
+                windows::Win32::System::Memory::PAGE_READWRITE,
+            );
+            
+            if ptr.is_null() {
+                Err(AllocError)
+            } else {
+                Ok(ptr as *mut u8)
+            }
+        }
+    }
+    
+    #[cfg(not(any(unix, windows)))]
+    fn allocate_pages(&self, size: usize) -> Result<*mut u8, AllocError> {
+        // Fallback to standard allocation
+        self.allocate_unguarded(size)
+    }
+    
+    /// Deallocate pages
+    #[cfg(unix)]
+    unsafe fn deallocate_pages(&self, ptr: *mut u8, size: usize) {
+        libc::munmap(ptr as *mut _, size);
+    }
+    
+    #[cfg(windows)]
+    unsafe fn deallocate_pages(&self, ptr: *mut u8, _size: usize) {
+        windows::Win32::System::Memory::VirtualFree(
+            ptr as *mut _,
+            0,
+            windows::Win32::System::Memory::MEM_RELEASE,
+        );
+    }
+    
+    #[cfg(not(any(unix, windows)))]
+    unsafe fn deallocate_pages(&self, ptr: *mut u8, size: usize) {
+        self.deallocate_unguarded(ptr, size);
+    }
+    
+    fn allocate_unguarded(&self, size: usize) -> Result<*mut u8, AllocError> {
+        let layout = Layout::from_size_align(size, self.page_size)
+            .map_err(|_| AllocError)?;
+        unsafe {
+            let ptr = alloc::alloc::alloc(layout);
+            if ptr.is_null() {
+                Err(AllocError)
+            } else {
+                Ok(ptr)
+            }
+        }
+    }
+    
+    fn deallocate_unguarded(&self, ptr: *mut u8, size: usize) {
+        if let Ok(layout) = Layout::from_size_align(size, self.page_size) {
+            unsafe {
+                alloc::alloc::dealloc(ptr, layout);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// USE-AFTER-FREE DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Poison pattern for freed memory
+const POISON_PATTERN: u8 = 0xAA;
+const FREED_PATTERN: u8 = 0xDD;
+const UNINIT_PATTERN: u8 = 0xCD;
+
+/// Memory state tracking for UAF detection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MemoryState {
+    Unallocated = 0,
+    Allocated = 1,
+    Freed = 2,
+    Quarantined = 3,
+}
+
+/// Use-after-free detector configuration
+#[derive(Debug, Clone)]
+pub struct UafDetectorConfig {
+    /// Enable UAF detection
+    pub enabled: bool,
+    
+    /// Quarantine freed allocations (delay reuse)
+    pub quarantine_enabled: bool,
+    
+    /// Quarantine size in bytes
+    pub quarantine_size: usize,
+    
+    /// Poison freed memory
+    pub poison_on_free: bool,
+    
+    /// Check poison on reallocation
+    pub check_poison_on_realloc: bool,
+}
+
+impl Default for UafDetectorConfig {
+    fn default() -> Self {
+        UafDetectorConfig {
+            enabled: true,
+            quarantine_enabled: true,
+            quarantine_size: 16 * 1024 * 1024, // 16MB
+            poison_on_free: true,
+            check_poison_on_realloc: true,
+        }
+    }
+}
+
+/// Quarantine entry
+struct QuarantineEntry {
+    ptr: *mut u8,
+    size: usize,
+    layout: Layout,
+}
+
+/// Use-after-free detector
+pub struct UafDetector {
+    config: UafDetectorConfig,
+    quarantine: std::sync::Mutex<Vec<QuarantineEntry>>,
+    quarantine_bytes: AtomicUsize,
+    detections: AtomicUsize,
+}
+
+impl UafDetector {
+    pub fn new(config: UafDetectorConfig) -> Self {
+        UafDetector {
+            config,
+            quarantine: std::sync::Mutex::new(Vec::new()),
+            quarantine_bytes: AtomicUsize::new(0),
+            detections: AtomicUsize::new(0),
+        }
+    }
+    
+    /// Mark memory as freed and optionally quarantine
+    pub unsafe fn on_free(&self, ptr: *mut u8, layout: Layout) {
+        if !self.config.enabled {
+            return;
+        }
+        
+        // Poison the memory
+        if self.config.poison_on_free {
+            core::ptr::write_bytes(ptr, FREED_PATTERN, layout.size());
+        }
+        
+        if self.config.quarantine_enabled {
+            self.quarantine_allocation(ptr, layout);
+        }
+    }
+    
+    /// Check if memory was used after free
+    pub unsafe fn check_access(&self, ptr: *const u8, size: usize) -> bool {
+        if !self.config.enabled {
+            return true;
+        }
+        
+        // Check for poison pattern
+        for i in 0..size {
+            let byte = *ptr.add(i);
+            if byte == FREED_PATTERN {
+                self.detections.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+        
+        true
+    }
+    
+    /// Add allocation to quarantine
+    fn quarantine_allocation(&self, ptr: *mut u8, layout: Layout) {
+        let entry = QuarantineEntry {
+            ptr,
+            size: layout.size(),
+            layout,
+        };
+        
+        let mut quarantine = self.quarantine.lock().unwrap();
+        quarantine.push(entry);
+        self.quarantine_bytes.fetch_add(layout.size(), Ordering::Relaxed);
+        
+        // Drain quarantine if too large
+        while self.quarantine_bytes.load(Ordering::Relaxed) > self.config.quarantine_size {
+            if let Some(old) = quarantine.first() {
+                let old_size = old.size;
+                let old_ptr = old.ptr;
+                let old_layout = old.layout;
+                
+                // Verify poison before releasing
+                if self.config.check_poison_on_realloc {
+                    unsafe {
+                        for i in 0..old_size {
+                            if *old_ptr.add(i) != FREED_PATTERN {
+                                // Memory was modified after free!
+                                self.report_uaf(old_ptr);
+                            }
+                        }
+                    }
+                }
+                
+                // Actually free the memory
+                unsafe {
+                    alloc::alloc::dealloc(old_ptr, old_layout);
+                }
+                
+                self.quarantine_bytes.fetch_sub(old_size, Ordering::Relaxed);
+                quarantine.remove(0);
+            } else {
+                break;
+            }
+        }
+    }
+    
+    /// Report UAF detection
+    fn report_uaf(&self, ptr: *mut u8) {
+        self.detections.fetch_add(1, Ordering::Relaxed);
+        
+        if let Some(monitor) = SECURITY_MONITOR.get() {
+            monitor.report_violation(SecurityViolation::UseAfterFree { ptr: ptr as usize });
+        }
+        
+        #[cfg(feature = "std")]
+        eprintln!("*** USE-AFTER-FREE DETECTED at {:p} ***", ptr);
+    }
+    
+    /// Get detection count
+    pub fn detection_count(&self) -> usize {
+        self.detections.load(Ordering::Relaxed)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUFFER OVERFLOW PROTECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Buffer with bounds checking
+#[repr(C)]
+pub struct SafeBuffer<T> {
+    /// Underlying data
+    data: Vec<T>,
+    
+    /// Bounds checking enabled
+    bounds_check: bool,
+    
+    /// Read redzone
+    read_redzone: usize,
+    
+    /// Write redzone  
+    write_redzone: usize,
+}
+
+impl<T: Clone + Default> SafeBuffer<T> {
+    /// Create new safe buffer
+    pub fn new(size: usize) -> Self {
+        SafeBuffer {
+            data: vec![T::default(); size],
+            bounds_check: true,
+            read_redzone: 0,
+            write_redzone: 0,
+        }
+    }
+    
+    /// Create with redzones
+    pub fn with_redzones(size: usize, redzone: usize) -> Self {
+        let total_size = size + redzone * 2;
+        SafeBuffer {
+            data: vec![T::default(); total_size],
+            bounds_check: true,
+            read_redzone: redzone,
+            write_redzone: redzone,
+        }
+    }
+    
+    /// Get usable length (excluding redzones)
+    pub fn len(&self) -> usize {
+        self.data.len() - self.read_redzone - self.write_redzone
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    
+    /// Bounds-checked read
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if self.bounds_check && index >= self.len() {
+            if let Some(monitor) = SECURITY_MONITOR.get() {
+                monitor.report_violation(SecurityViolation::BufferOverflow {
+                    index,
+                    size: self.len(),
+                });
+            }
+            return None;
+        }
+        self.data.get(self.read_redzone + index)
+    }
+    
+    /// Bounds-checked write
+    #[inline]
+    pub fn set(&mut self, index: usize, value: T) -> bool {
+        if self.bounds_check && index >= self.len() {
+            if let Some(monitor) = SECURITY_MONITOR.get() {
+                monitor.report_violation(SecurityViolation::BufferOverflow {
+                    index,
+                    size: self.len(),
+                });
+            }
+            return false;
+        }
+        if let Some(elem) = self.data.get_mut(self.read_redzone + index) {
+            *elem = value;
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Get mutable reference with bounds check
+    #[inline]
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if self.bounds_check && index >= self.len() {
+            return None;
+        }
+        self.data.get_mut(self.read_redzone + index)
+    }
+    
+    /// Slice with bounds checking
+    pub fn slice(&self, start: usize, end: usize) -> Option<&[T]> {
+        if self.bounds_check && (start > end || end > self.len()) {
+            return None;
+        }
+        let actual_start = self.read_redzone + start;
+        let actual_end = self.read_redzone + end;
+        self.data.get(actual_start..actual_end)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ASLR SUPPORT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// ASLR configuration
+#[derive(Debug, Clone)]
+pub struct AslrConfig {
+    /// Enable stack randomization
+    pub stack_randomization: bool,
+    
+    /// Enable heap randomization
+    pub heap_randomization: bool,
+    
+    /// Entropy bits for stack (default: 30)
+    pub stack_entropy_bits: u8,
+    
+    /// Entropy bits for heap (default: 28)
+    pub heap_entropy_bits: u8,
+}
+
+impl Default for AslrConfig {
+    fn default() -> Self {
+        AslrConfig {
+            stack_randomization: true,
+            heap_randomization: true,
+            stack_entropy_bits: 30,
+            heap_entropy_bits: 28,
+        }
+    }
+}
+
+/// Get random stack offset for ASLR
+pub fn random_stack_offset(entropy_bits: u8) -> usize {
+    let random = generate_random_u64();
+    let mask = (1usize << entropy_bits) - 1;
+    
+    // Align to 16 bytes
+    (random as usize & mask) & !0xF
+}
+
+/// Get random heap offset for ASLR
+pub fn random_heap_offset(entropy_bits: u8) -> usize {
+    let random = generate_random_u64();
+    let mask = (1usize << entropy_bits) - 1;
+    
+    // Align to page size
+    let page_size = get_page_size();
+    (random as usize & mask) & !(page_size - 1)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECURITY MONITOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Security violation types
+#[derive(Debug, Clone)]
+pub enum SecurityViolation {
+    StackSmash,
+    HeapOverflow,
+    BufferOverflow { index: usize, size: usize },
+    UseAfterFree { ptr: usize },
+    DoubleFree { ptr: usize },
+    InvalidFree { ptr: usize },
+    IntegerOverflow,
+    NullDereference,
+    UninitializedMemory { ptr: usize },
+}
+
+/// Security violation handler
+pub trait SecurityHandler: Send + Sync {
+    fn handle_violation(&self, violation: &SecurityViolation);
+}
+
+/// Security monitor
+pub struct SecurityMonitor {
+    handlers: Vec<Box<dyn SecurityHandler>>,
+    violation_count: AtomicUsize,
+    abort_on_violation: AtomicBool,
+}
+
+impl SecurityMonitor {
+    pub fn new() -> Self {
+        SecurityMonitor {
+            handlers: Vec::new(),
+            violation_count: AtomicUsize::new(0),
+            abort_on_violation: AtomicBool::new(true),
+        }
+    }
+    
+    /// Add violation handler
+    pub fn add_handler(&mut self, handler: Box<dyn SecurityHandler>) {
+        self.handlers.push(handler);
+    }
+    
+    /// Set abort behavior
+    pub fn set_abort_on_violation(&self, abort: bool) {
+        self.abort_on_violation.store(abort, Ordering::Relaxed);
+    }
+    
+    /// Report a security violation
+    pub fn report_violation(&self, violation: SecurityViolation) {
+        self.violation_count.fetch_add(1, Ordering::Relaxed);
+        
+        // Notify all handlers
+        for handler in &self.handlers {
+            handler.handle_violation(&violation);
+        }
+        
+        // Abort if configured
+        if self.abort_on_violation.load(Ordering::Relaxed) {
+            #[cfg(feature = "std")]
+            eprintln!("Security violation: {:?}", violation);
+            
+            core::intrinsics::abort();
+        }
+    }
+    
+    /// Get violation count
+    pub fn violation_count(&self) -> usize {
+        self.violation_count.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for SecurityMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global security monitor
+static SECURITY_MONITOR: std::sync::OnceLock<SecurityMonitor> = std::sync::OnceLock::new();
+
+/// Initialize global security monitor
+pub fn init_security_monitor(monitor: SecurityMonitor) {
+    let _ = SECURITY_MONITOR.set(monitor);
+}
+
+/// Get global security monitor
+pub fn security_monitor() -> Option<&'static SecurityMonitor> {
+    SECURITY_MONITOR.get()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Generate random u64 (uses OS facilities)
+fn generate_random_u64() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 8];
+        unsafe {
+            let fd = libc::open(b"/dev/urandom\0".as_ptr() as *const _, libc::O_RDONLY);
+            if fd >= 0 {
+                libc::read(fd, buf.as_mut_ptr() as *mut _, 8);
+                libc::close(fd);
+            }
+        }
+        u64::from_ne_bytes(buf)
+    }
+    
+    #[cfg(windows)]
+    {
+        let mut buf = [0u8; 8];
+        unsafe {
+            windows::Win32::Security::Cryptography::BCryptGenRandom(
+                None,
+                &mut buf,
+                0,
+            );
+        }
+        u64::from_ne_bytes(buf)
+    }
+    
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Fallback: Use address of local variable + timestamp
+        let local = 0u64;
+        let addr = &local as *const _ as u64;
+        addr.wrapping_mul(0x5DEECE66D).wrapping_add(0xB)
+    }
+}
+
+/// Get system page size
+fn get_page_size() -> usize {
+    #[cfg(unix)]
+    {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+    
+    #[cfg(windows)]
+    {
+        unsafe {
+            let mut info = core::mem::zeroed();
+            windows::Win32::System::SystemInformation::GetSystemInfo(&mut info);
+            info.dwPageSize as usize
+        }
+    }
+    
+    #[cfg(not(any(unix, windows)))]
+    {
+        4096 // Default page size
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_stack_canary() {
+        init_stack_canary();
+        let canary = get_stack_canary();
+        assert_ne!(canary, 0);
+        
+        // Canary should be stable
+        assert_eq!(canary, get_stack_canary());
+    }
+    
+    #[test]
+    fn test_safe_buffer_bounds() {
+        let mut buf = SafeBuffer::<u32>::new(10);
+        
+        assert!(buf.get(0).is_some());
+        assert!(buf.get(9).is_some());
+        assert!(buf.get(10).is_none());
+        
+        assert!(buf.set(5, 42));
+        assert_eq!(*buf.get(5).unwrap(), 42);
+        assert!(!buf.set(100, 1));
+    }
+    
+    #[test]
+    fn test_safe_buffer_slice() {
+        let buf = SafeBuffer::<u8>::new(20);
+        
+        assert!(buf.slice(0, 10).is_some());
+        assert!(buf.slice(5, 15).is_some());
+        assert!(buf.slice(15, 25).is_none()); // Out of bounds
+        assert!(buf.slice(10, 5).is_none());  // Invalid range
+    }
+    
+    #[test]
+    fn test_random_generation() {
+        let a = generate_random_u64();
+        let b = generate_random_u64();
+        // Should be different (with extremely high probability)
+        assert_ne!(a, b);
+    }
+    
+    #[test]
+    fn test_aslr_offsets() {
+        let offset1 = random_stack_offset(20);
+        let offset2 = random_stack_offset(20);
+        
+        // Should be aligned
+        assert_eq!(offset1 & 0xF, 0);
+        assert_eq!(offset2 & 0xF, 0);
+    }
+    
+    #[test]
+    fn test_page_size() {
+        let page_size = get_page_size();
+        assert!(page_size >= 4096);
+        assert!(page_size.is_power_of_two());
+    }
+}

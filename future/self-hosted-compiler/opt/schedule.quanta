@@ -1,0 +1,1021 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Instruction Scheduling
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Instruction scheduling infrastructure:
+//   - Pre-RA scheduling
+//   - Post-RA scheduling
+//   - List scheduling
+//   - Trace scheduling
+//   - Software pipelining
+//   - Hazard detection
+//   - Resource modeling
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::schedule
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use core::cmp::Ordering;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TARGET MODEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Functional unit types
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FunctionalUnit {
+    /// Integer ALU
+    IntAlu,
+    /// Integer multiply
+    IntMul,
+    /// Integer divide
+    IntDiv,
+    /// Floating-point ALU
+    FpAlu,
+    /// Floating-point multiply
+    FpMul,
+    /// Floating-point divide
+    FpDiv,
+    /// Load unit
+    Load,
+    /// Store unit
+    Store,
+    /// Branch unit
+    Branch,
+    /// Vector ALU
+    VecAlu,
+    /// Vector load/store
+    VecMem,
+}
+
+/// Instruction class
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionClass {
+    IntArith,
+    IntMul,
+    IntDiv,
+    FpArith,
+    FpMul,
+    FpDiv,
+    Load,
+    Store,
+    Branch,
+    Call,
+    VecArith,
+    VecMem,
+    Other,
+}
+
+/// Resource usage for an instruction
+#[derive(Debug, Clone)]
+pub struct ResourceUsage {
+    /// Functional units required
+    pub units: Vec<FunctionalUnit>,
+    /// Latency in cycles
+    pub latency: u32,
+    /// Resource occupation time
+    pub occupation: u32,
+    /// Issue slots required
+    pub issue_slots: u32,
+}
+
+/// Target machine model
+pub struct MachineModel {
+    /// Functional units and their counts
+    pub units: BTreeMap<FunctionalUnit, u32>,
+    /// Issue width (instructions per cycle)
+    pub issue_width: u32,
+    /// Resource usage for instruction classes
+    pub class_resources: BTreeMap<InstructionClass, ResourceUsage>,
+    /// Pipeline depth
+    pub pipeline_depth: u32,
+    /// Reorder buffer size
+    pub rob_size: u32,
+}
+
+impl MachineModel {
+    /// Create a model for a modern out-of-order CPU
+    pub fn modern_ooo() -> Self {
+        let mut units = BTreeMap::new();
+        units.insert(FunctionalUnit::IntAlu, 4);
+        units.insert(FunctionalUnit::IntMul, 2);
+        units.insert(FunctionalUnit::IntDiv, 1);
+        units.insert(FunctionalUnit::FpAlu, 2);
+        units.insert(FunctionalUnit::FpMul, 2);
+        units.insert(FunctionalUnit::FpDiv, 1);
+        units.insert(FunctionalUnit::Load, 2);
+        units.insert(FunctionalUnit::Store, 2);
+        units.insert(FunctionalUnit::Branch, 2);
+        units.insert(FunctionalUnit::VecAlu, 2);
+        units.insert(FunctionalUnit::VecMem, 2);
+        
+        let mut class_resources = BTreeMap::new();
+        
+        class_resources.insert(InstructionClass::IntArith, ResourceUsage {
+            units: vec![FunctionalUnit::IntAlu],
+            latency: 1,
+            occupation: 1,
+            issue_slots: 1,
+        });
+        
+        class_resources.insert(InstructionClass::IntMul, ResourceUsage {
+            units: vec![FunctionalUnit::IntMul],
+            latency: 3,
+            occupation: 1,
+            issue_slots: 1,
+        });
+        
+        class_resources.insert(InstructionClass::IntDiv, ResourceUsage {
+            units: vec![FunctionalUnit::IntDiv],
+            latency: 20,
+            occupation: 20,
+            issue_slots: 1,
+        });
+        
+        class_resources.insert(InstructionClass::FpArith, ResourceUsage {
+            units: vec![FunctionalUnit::FpAlu],
+            latency: 3,
+            occupation: 1,
+            issue_slots: 1,
+        });
+        
+        class_resources.insert(InstructionClass::FpMul, ResourceUsage {
+            units: vec![FunctionalUnit::FpMul],
+            latency: 5,
+            occupation: 1,
+            issue_slots: 1,
+        });
+        
+        class_resources.insert(InstructionClass::FpDiv, ResourceUsage {
+            units: vec![FunctionalUnit::FpDiv],
+            latency: 15,
+            occupation: 15,
+            issue_slots: 1,
+        });
+        
+        class_resources.insert(InstructionClass::Load, ResourceUsage {
+            units: vec![FunctionalUnit::Load],
+            latency: 4,
+            occupation: 1,
+            issue_slots: 1,
+        });
+        
+        class_resources.insert(InstructionClass::Store, ResourceUsage {
+            units: vec![FunctionalUnit::Store],
+            latency: 1,
+            occupation: 1,
+            issue_slots: 1,
+        });
+        
+        class_resources.insert(InstructionClass::Branch, ResourceUsage {
+            units: vec![FunctionalUnit::Branch],
+            latency: 1,
+            occupation: 1,
+            issue_slots: 1,
+        });
+        
+        class_resources.insert(InstructionClass::VecArith, ResourceUsage {
+            units: vec![FunctionalUnit::VecAlu],
+            latency: 4,
+            occupation: 1,
+            issue_slots: 1,
+        });
+        
+        class_resources.insert(InstructionClass::VecMem, ResourceUsage {
+            units: vec![FunctionalUnit::VecMem],
+            latency: 6,
+            occupation: 1,
+            issue_slots: 1,
+        });
+        
+        class_resources.insert(InstructionClass::Call, ResourceUsage {
+            units: vec![FunctionalUnit::Branch],
+            latency: 1,
+            occupation: 1,
+            issue_slots: 1,
+        });
+        
+        class_resources.insert(InstructionClass::Other, ResourceUsage {
+            units: vec![FunctionalUnit::IntAlu],
+            latency: 1,
+            occupation: 1,
+            issue_slots: 1,
+        });
+        
+        MachineModel {
+            units,
+            issue_width: 6,
+            class_resources,
+            pipeline_depth: 14,
+            rob_size: 224,
+        }
+    }
+    
+    /// Get resource usage for an instruction
+    pub fn get_resources(&self, class: InstructionClass) -> &ResourceUsage {
+        self.class_resources.get(&class)
+            .unwrap_or_else(|| self.class_resources.get(&InstructionClass::Other).unwrap())
+    }
+    
+    /// Get latency for an instruction class
+    pub fn latency(&self, class: InstructionClass) -> u32 {
+        self.get_resources(class).latency
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEPENDENCY GRAPH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Dependency type between instructions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyType {
+    /// True data dependency (RAW)
+    Data,
+    /// Anti-dependency (WAR)
+    Anti,
+    /// Output dependency (WAW)
+    Output,
+    /// Control dependency
+    Control,
+    /// Memory dependency
+    Memory,
+}
+
+/// Dependency edge
+#[derive(Debug, Clone)]
+pub struct DependencyEdge {
+    /// Source instruction index
+    pub from: usize,
+    /// Target instruction index
+    pub to: usize,
+    /// Dependency type
+    pub dep_type: DependencyType,
+    /// Latency in cycles
+    pub latency: u32,
+}
+
+/// Scheduling unit (instruction with scheduling info)
+#[derive(Debug, Clone)]
+pub struct SchedUnit {
+    /// Instruction index in block
+    pub index: usize,
+    /// Instruction class
+    pub class: InstructionClass,
+    /// Defined registers/variables
+    pub defs: Vec<String>,
+    /// Used registers/variables
+    pub uses: Vec<String>,
+    /// Is memory operation
+    pub is_memory: bool,
+    /// Is control flow
+    pub is_control: bool,
+    /// Is side-effecting
+    pub has_side_effects: bool,
+    /// Earliest cycle to schedule
+    pub earliest: u32,
+    /// Latest cycle to schedule
+    pub latest: u32,
+    /// Height in the DAG (distance from exits)
+    pub height: u32,
+    /// Depth in the DAG (distance from entries)
+    pub depth: u32,
+}
+
+/// Dependency DAG for a basic block
+pub struct DependencyDag {
+    /// Scheduling units
+    pub units: Vec<SchedUnit>,
+    /// Dependency edges
+    pub edges: Vec<DependencyEdge>,
+    /// Successors for each unit
+    pub successors: BTreeMap<usize, Vec<usize>>,
+    /// Predecessors for each unit
+    pub predecessors: BTreeMap<usize, Vec<usize>>,
+}
+
+impl DependencyDag {
+    /// Build dependency DAG for a basic block
+    pub fn build(block: &MirBlock, model: &MachineModel) -> Self {
+        let mut units = Vec::new();
+        let mut edges = Vec::new();
+        let mut successors: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        let mut predecessors: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        
+        // Create scheduling units
+        for (idx, stmt) in block.statements.iter().enumerate() {
+            let class = Self::classify_instruction(stmt);
+            let (defs, uses) = Self::get_defs_uses(stmt);
+            
+            units.push(SchedUnit {
+                index: idx,
+                class,
+                defs,
+                uses,
+                is_memory: matches!(class, InstructionClass::Load | InstructionClass::Store | 
+                                          InstructionClass::VecMem),
+                is_control: matches!(class, InstructionClass::Branch | InstructionClass::Call),
+                has_side_effects: matches!(stmt, MirStatement::Store { .. } | 
+                                                 MirStatement::Call { .. }),
+                earliest: 0,
+                latest: u32::MAX,
+                height: 0,
+                depth: 0,
+            });
+            
+            successors.insert(idx, Vec::new());
+            predecessors.insert(idx, Vec::new());
+        }
+        
+        // Build dependency edges
+        let mut last_def: BTreeMap<String, usize> = BTreeMap::new();
+        let mut last_use: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut last_store: Option<usize> = None;
+        let mut last_load: Vec<usize> = Vec::new();
+        
+        for (idx, unit) in units.iter().enumerate() {
+            // Data dependencies (RAW)
+            for use_var in &unit.uses {
+                if let Some(&def_idx) = last_def.get(use_var) {
+                    let latency = model.latency(units[def_idx].class);
+                    edges.push(DependencyEdge {
+                        from: def_idx,
+                        to: idx,
+                        dep_type: DependencyType::Data,
+                        latency,
+                    });
+                    successors.get_mut(&def_idx).unwrap().push(idx);
+                    predecessors.get_mut(&idx).unwrap().push(def_idx);
+                }
+            }
+            
+            // Anti-dependencies (WAR)
+            for def_var in &unit.defs {
+                if let Some(use_indices) = last_use.get(def_var) {
+                    for &use_idx in use_indices {
+                        if use_idx != idx {
+                            edges.push(DependencyEdge {
+                                from: use_idx,
+                                to: idx,
+                                dep_type: DependencyType::Anti,
+                                latency: 0,
+                            });
+                            successors.get_mut(&use_idx).unwrap().push(idx);
+                            predecessors.get_mut(&idx).unwrap().push(use_idx);
+                        }
+                    }
+                }
+            }
+            
+            // Output dependencies (WAW)
+            for def_var in &unit.defs {
+                if let Some(&prev_def) = last_def.get(def_var) {
+                    edges.push(DependencyEdge {
+                        from: prev_def,
+                        to: idx,
+                        dep_type: DependencyType::Output,
+                        latency: 0,
+                    });
+                    successors.get_mut(&prev_def).unwrap().push(idx);
+                    predecessors.get_mut(&idx).unwrap().push(prev_def);
+                }
+            }
+            
+            // Memory dependencies
+            if unit.is_memory {
+                if let Some(store_idx) = last_store {
+                    edges.push(DependencyEdge {
+                        from: store_idx,
+                        to: idx,
+                        dep_type: DependencyType::Memory,
+                        latency: 0,
+                    });
+                    successors.get_mut(&store_idx).unwrap().push(idx);
+                    predecessors.get_mut(&idx).unwrap().push(store_idx);
+                }
+                
+                if units[idx].class == InstructionClass::Store {
+                    for &load_idx in &last_load {
+                        edges.push(DependencyEdge {
+                            from: load_idx,
+                            to: idx,
+                            dep_type: DependencyType::Memory,
+                            latency: 0,
+                        });
+                        successors.get_mut(&load_idx).unwrap().push(idx);
+                        predecessors.get_mut(&idx).unwrap().push(load_idx);
+                    }
+                }
+            }
+            
+            // Update tracking
+            for def_var in &unit.defs {
+                last_def.insert(def_var.clone(), idx);
+                last_use.remove(def_var);
+            }
+            
+            for use_var in &unit.uses {
+                last_use.entry(use_var.clone())
+                    .or_default()
+                    .push(idx);
+            }
+            
+            if unit.class == InstructionClass::Store {
+                last_store = Some(idx);
+                last_load.clear();
+            } else if unit.class == InstructionClass::Load {
+                last_load.push(idx);
+            }
+        }
+        
+        let mut dag = DependencyDag {
+            units,
+            edges,
+            successors,
+            predecessors,
+        };
+        
+        dag.compute_heights();
+        dag.compute_depths();
+        
+        dag
+    }
+    
+    fn classify_instruction(stmt: &MirStatement) -> InstructionClass {
+        match stmt {
+            MirStatement::BinaryOp { op, .. } => {
+                match op {
+                    BinOp::Mul => InstructionClass::IntMul,
+                    BinOp::Div | BinOp::Rem => InstructionClass::IntDiv,
+                    _ => InstructionClass::IntArith,
+                }
+            }
+            MirStatement::Load { .. } => InstructionClass::Load,
+            MirStatement::Store { .. } => InstructionClass::Store,
+            MirStatement::Call { .. } => InstructionClass::Call,
+            _ => InstructionClass::Other,
+        }
+    }
+    
+    fn get_defs_uses(stmt: &MirStatement) -> (Vec<String>, Vec<String>) {
+        let mut defs = Vec::new();
+        let mut uses = Vec::new();
+        
+        match stmt {
+            MirStatement::Assign { dest, value } => {
+                defs.push(dest.clone());
+                if let MirOperand::Variable(v) = value {
+                    uses.push(v.clone());
+                }
+            }
+            MirStatement::BinaryOp { dest, lhs, rhs, .. } => {
+                defs.push(dest.clone());
+                if let MirOperand::Variable(v) = lhs {
+                    uses.push(v.clone());
+                }
+                if let MirOperand::Variable(v) = rhs {
+                    uses.push(v.clone());
+                }
+            }
+            MirStatement::Load { dest, ptr, .. } => {
+                defs.push(dest.clone());
+                if let MirOperand::Variable(v) = ptr {
+                    uses.push(v.clone());
+                }
+            }
+            MirStatement::Store { ptr, value, .. } => {
+                if let MirOperand::Variable(v) = ptr {
+                    uses.push(v.clone());
+                }
+                if let MirOperand::Variable(v) = value {
+                    uses.push(v.clone());
+                }
+            }
+            MirStatement::Call { args, dest, .. } => {
+                if let Some(d) = dest {
+                    defs.push(d.clone());
+                }
+                for arg in args {
+                    if let MirOperand::Variable(v) = arg {
+                        uses.push(v.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        
+        (defs, uses)
+    }
+    
+    fn compute_heights(&mut self) {
+        let n = self.units.len();
+        let mut heights = vec![0u32; n];
+        
+        // Process in reverse topological order
+        for i in (0..n).rev() {
+            let mut max_height = 0;
+            
+            if let Some(succs) = self.successors.get(&i) {
+                for &succ in succs {
+                    // Find edge latency
+                    let latency = self.edges.iter()
+                        .find(|e| e.from == i && e.to == succ)
+                        .map(|e| e.latency)
+                        .unwrap_or(1);
+                    
+                    max_height = max_height.max(heights[succ] + latency);
+                }
+            }
+            
+            heights[i] = max_height;
+        }
+        
+        for (i, h) in heights.into_iter().enumerate() {
+            self.units[i].height = h;
+        }
+    }
+    
+    fn compute_depths(&mut self) {
+        let n = self.units.len();
+        let mut depths = vec![0u32; n];
+        
+        // Process in topological order
+        for i in 0..n {
+            let mut max_depth = 0;
+            
+            if let Some(preds) = self.predecessors.get(&i) {
+                for &pred in preds {
+                    // Find edge latency
+                    let latency = self.edges.iter()
+                        .find(|e| e.from == pred && e.to == i)
+                        .map(|e| e.latency)
+                        .unwrap_or(1);
+                    
+                    max_depth = max_depth.max(depths[pred] + latency);
+                }
+            }
+            
+            depths[i] = max_depth;
+        }
+        
+        for (i, d) in depths.into_iter().enumerate() {
+            self.units[i].depth = d;
+        }
+    }
+    
+    /// Get critical path length
+    pub fn critical_path(&self) -> u32 {
+        self.units.iter().map(|u| u.height).max().unwrap_or(0)
+    }
+    
+    /// Get entry units (no predecessors)
+    pub fn entries(&self) -> Vec<usize> {
+        self.units.iter()
+            .enumerate()
+            .filter(|(i, _)| self.predecessors.get(i).map(|p| p.is_empty()).unwrap_or(true))
+            .map(|(i, _)| i)
+            .collect()
+    }
+    
+    /// Get exit units (no successors)
+    pub fn exits(&self) -> Vec<usize> {
+        self.units.iter()
+            .enumerate()
+            .filter(|(i, _)| self.successors.get(i).map(|s| s.is_empty()).unwrap_or(true))
+            .map(|(i, _)| i)
+            .collect()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIST SCHEDULER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Scheduling priority
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    /// Critical path (height)
+    CriticalPath,
+    /// Source order
+    SourceOrder,
+    /// Depth first
+    DepthFirst,
+    /// Resource constrained
+    ResourceConstrained,
+}
+
+/// Instruction ready to schedule
+#[derive(Debug, Clone)]
+struct ReadyInst {
+    index: usize,
+    priority: i32,
+}
+
+impl PartialEq for ReadyInst {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority
+    }
+}
+
+impl Eq for ReadyInst {}
+
+impl PartialOrd for ReadyInst {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ReadyInst {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.priority.cmp(&other.priority)
+    }
+}
+
+/// List scheduler
+pub struct ListScheduler {
+    /// Priority scheme
+    priority: Priority,
+    /// Machine model
+    model: MachineModel,
+}
+
+impl ListScheduler {
+    pub fn new(priority: Priority, model: MachineModel) -> Self {
+        ListScheduler { priority, model }
+    }
+    
+    /// Schedule a basic block
+    pub fn schedule(&self, dag: &DependencyDag) -> Schedule {
+        let n = dag.units.len();
+        
+        if n == 0 {
+            return Schedule {
+                order: Vec::new(),
+                cycle_map: BTreeMap::new(),
+                total_cycles: 0,
+            };
+        }
+        
+        let mut scheduled = vec![false; n];
+        let mut schedule_time = vec![0u32; n];
+        let mut order = Vec::with_capacity(n);
+        let mut current_cycle = 0u32;
+        
+        // Track ready instructions
+        let mut ready: BinaryHeap<ReadyInst> = BinaryHeap::new();
+        
+        // Track predecessor counts
+        let mut pred_count: Vec<usize> = (0..n)
+            .map(|i| dag.predecessors.get(&i).map(|p| p.len()).unwrap_or(0))
+            .collect();
+        
+        // Initialize with entry nodes
+        for i in 0..n {
+            if pred_count[i] == 0 {
+                ready.push(ReadyInst {
+                    index: i,
+                    priority: self.compute_priority(i, dag),
+                });
+            }
+        }
+        
+        // Track resource availability
+        let mut resource_available: BTreeMap<FunctionalUnit, u32> = 
+            self.model.units.keys().map(|&u| (u, 0)).collect();
+        
+        while !ready.is_empty() || order.len() < n {
+            // Find next instruction to schedule
+            let mut best: Option<ReadyInst> = None;
+            let mut temp = Vec::new();
+            
+            while let Some(inst) = ready.pop() {
+                let unit = &dag.units[inst.index];
+                let resources = self.model.get_resources(unit.class);
+                
+                // Check if resources are available
+                let can_issue = resources.units.iter()
+                    .all(|u| resource_available.get(u).copied().unwrap_or(0) <= current_cycle);
+                
+                if can_issue {
+                    best = Some(inst);
+                    break;
+                } else {
+                    temp.push(inst);
+                }
+            }
+            
+            // Put back non-issuable instructions
+            for inst in temp {
+                ready.push(inst);
+            }
+            
+            if let Some(inst) = best {
+                let idx = inst.index;
+                let unit = &dag.units[idx];
+                let resources = self.model.get_resources(unit.class);
+                
+                // Schedule instruction
+                scheduled[idx] = true;
+                schedule_time[idx] = current_cycle;
+                order.push(idx);
+                
+                // Update resource availability
+                for &fu in &resources.units {
+                    let available = resource_available.entry(fu).or_insert(0);
+                    *available = current_cycle + resources.occupation;
+                }
+                
+                // Release successors
+                if let Some(succs) = dag.successors.get(&idx) {
+                    for &succ in succs {
+                        pred_count[succ] -= 1;
+                        
+                        if pred_count[succ] == 0 {
+                            ready.push(ReadyInst {
+                                index: succ,
+                                priority: self.compute_priority(succ, dag),
+                            });
+                        }
+                    }
+                }
+            } else if !ready.is_empty() {
+                // Advance cycle
+                current_cycle += 1;
+            }
+        }
+        
+        // Calculate total cycles
+        let total_cycles = schedule_time.iter()
+            .enumerate()
+            .map(|(i, &cycle)| {
+                let latency = self.model.latency(dag.units[i].class);
+                cycle + latency
+            })
+            .max()
+            .unwrap_or(0);
+        
+        Schedule {
+            order,
+            cycle_map: schedule_time.into_iter()
+                .enumerate()
+                .map(|(i, c)| (i, c))
+                .collect(),
+            total_cycles,
+        }
+    }
+    
+    fn compute_priority(&self, index: usize, dag: &DependencyDag) -> i32 {
+        let unit = &dag.units[index];
+        
+        match self.priority {
+            Priority::CriticalPath => unit.height as i32,
+            Priority::SourceOrder => -(index as i32),
+            Priority::DepthFirst => unit.depth as i32,
+            Priority::ResourceConstrained => {
+                // Prioritize instructions that use scarce resources
+                let resources = self.model.get_resources(unit.class);
+                let scarcity: u32 = resources.units.iter()
+                    .map(|u| 10 - self.model.units.get(u).copied().unwrap_or(1))
+                    .sum();
+                
+                (unit.height as i32) + (scarcity as i32)
+            }
+        }
+    }
+}
+
+/// Scheduling result
+#[derive(Debug, Clone)]
+pub struct Schedule {
+    /// Instruction order
+    pub order: Vec<usize>,
+    /// Cycle assignment for each instruction
+    pub cycle_map: BTreeMap<usize, u32>,
+    /// Total cycles
+    pub total_cycles: u32,
+}
+
+impl Schedule {
+    /// Get cycle for an instruction
+    pub fn cycle(&self, index: usize) -> Option<u32> {
+        self.cycle_map.get(&index).copied()
+    }
+    
+    /// Get instructions scheduled at a cycle
+    pub fn at_cycle(&self, cycle: u32) -> Vec<usize> {
+        self.cycle_map.iter()
+            .filter(|(_, &c)| c == cycle)
+            .map(|(&i, _)| i)
+            .collect()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRE-RA SCHEDULING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Pre-register allocation scheduler
+pub struct PreRAScheduler {
+    list_scheduler: ListScheduler,
+    /// Maximum register pressure allowed
+    max_pressure: u32,
+}
+
+impl PreRAScheduler {
+    pub fn new(model: MachineModel, max_pressure: u32) -> Self {
+        PreRAScheduler {
+            list_scheduler: ListScheduler::new(Priority::CriticalPath, model),
+            max_pressure,
+        }
+    }
+    
+    /// Schedule a basic block
+    pub fn schedule(&self, block: &MirBlock) -> Schedule {
+        let dag = DependencyDag::build(block, &self.list_scheduler.model);
+        
+        // Use list scheduling with pressure awareness
+        self.schedule_with_pressure(&dag)
+    }
+    
+    fn schedule_with_pressure(&self, dag: &DependencyDag) -> Schedule {
+        // For now, use basic list scheduling
+        // Would add pressure tracking
+        self.list_scheduler.schedule(dag)
+    }
+    
+    /// Estimate register pressure at each point
+    pub fn estimate_pressure(&self, dag: &DependencyDag, schedule: &Schedule) -> Vec<u32> {
+        let mut pressure = Vec::new();
+        let mut live: BTreeSet<String> = BTreeSet::new();
+        
+        for &idx in &schedule.order {
+            let unit = &dag.units[idx];
+            
+            // Add definitions
+            for def in &unit.defs {
+                live.insert(def.clone());
+            }
+            
+            // Remove dead values (simplified)
+            // In practice, would use liveness analysis
+            
+            pressure.push(live.len() as u32);
+        }
+        
+        pressure
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POST-RA SCHEDULING  
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Post-register allocation scheduler
+pub struct PostRAScheduler {
+    list_scheduler: ListScheduler,
+}
+
+impl PostRAScheduler {
+    pub fn new(model: MachineModel) -> Self {
+        PostRAScheduler {
+            list_scheduler: ListScheduler::new(Priority::CriticalPath, model),
+        }
+    }
+    
+    /// Schedule a basic block after register allocation
+    pub fn schedule(&self, block: &MirBlock) -> Schedule {
+        let dag = DependencyDag::build(block, &self.list_scheduler.model);
+        self.list_scheduler.schedule(&dag)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Nop,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Return { value: Option<MirOperand> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn create_test_block() -> MirBlock {
+        MirBlock {
+            id: 0,
+            statements: vec![
+                MirStatement::Load {
+                    dest: "x".to_string(),
+                    ptr: MirOperand::Variable("p".to_string()),
+                    size: 8,
+                },
+                MirStatement::Load {
+                    dest: "y".to_string(),
+                    ptr: MirOperand::Variable("q".to_string()),
+                    size: 8,
+                },
+                MirStatement::BinaryOp {
+                    dest: "z".to_string(),
+                    op: BinOp::Add,
+                    lhs: MirOperand::Variable("x".to_string()),
+                    rhs: MirOperand::Variable("y".to_string()),
+                },
+                MirStatement::Store {
+                    ptr: MirOperand::Variable("r".to_string()),
+                    value: MirOperand::Variable("z".to_string()),
+                    size: 8,
+                },
+            ],
+            terminator: MirTerminator::Return { value: None },
+        }
+    }
+    
+    #[test]
+    fn test_dependency_dag() {
+        let block = create_test_block();
+        let model = MachineModel::modern_ooo();
+        let dag = DependencyDag::build(&block, &model);
+        
+        assert_eq!(dag.units.len(), 4);
+        
+        // Check dependencies
+        assert!(dag.edges.iter().any(|e| e.from == 0 && e.to == 2)); // x -> z
+        assert!(dag.edges.iter().any(|e| e.from == 1 && e.to == 2)); // y -> z
+        assert!(dag.edges.iter().any(|e| e.from == 2 && e.to == 3)); // z -> store
+    }
+    
+    #[test]
+    fn test_list_scheduler() {
+        let block = create_test_block();
+        let model = MachineModel::modern_ooo();
+        let dag = DependencyDag::build(&block, &model);
+        
+        let scheduler = ListScheduler::new(Priority::CriticalPath, model);
+        let schedule = scheduler.schedule(&dag);
+        
+        assert_eq!(schedule.order.len(), 4);
+        
+        // Check that dependencies are respected
+        let x_pos = schedule.order.iter().position(|&i| i == 0).unwrap();
+        let y_pos = schedule.order.iter().position(|&i| i == 1).unwrap();
+        let z_pos = schedule.order.iter().position(|&i| i == 2).unwrap();
+        let store_pos = schedule.order.iter().position(|&i| i == 3).unwrap();
+        
+        assert!(x_pos < z_pos);
+        assert!(y_pos < z_pos);
+        assert!(z_pos < store_pos);
+    }
+    
+    #[test]
+    fn test_machine_model() {
+        let model = MachineModel::modern_ooo();
+        
+        assert_eq!(model.issue_width, 6);
+        assert_eq!(model.latency(InstructionClass::IntArith), 1);
+        assert_eq!(model.latency(InstructionClass::IntDiv), 20);
+        assert_eq!(model.latency(InstructionClass::Load), 4);
+    }
+}

@@ -1,0 +1,905 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Runtime Type Information (RTTI)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Comprehensive RTTI system:
+//   - Type descriptors and metadata
+//   - Dynamic type identification
+//   - Type hierarchies and inheritance
+//   - Interface dispatch tables
+//   - Reflection support
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::runtime::rtti
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use core::any::TypeId;
+use core::ptr::NonNull;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE IDENTIFIERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unique type identifier (128-bit for collision resistance)
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TypeHandle {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+impl TypeHandle {
+    /// Null type handle
+    pub const NULL: TypeHandle = TypeHandle { lo: 0, hi: 0 };
+    
+    /// Create from type name hash
+    pub fn from_name(name: &str) -> Self {
+        let hash = fnv1a_128(name.as_bytes());
+        TypeHandle {
+            lo: hash as u64,
+            hi: (hash >> 64) as u64,
+        }
+    }
+    
+    /// Check if null
+    pub fn is_null(&self) -> bool {
+        self.lo == 0 && self.hi == 0
+    }
+}
+
+impl core::fmt::Debug for TypeHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "TypeHandle({:016x}{:016x})", self.hi, self.lo)
+    }
+}
+
+fn fnv1a_128(data: &[u8]) -> u128 {
+    const FNV_OFFSET: u128 = 0x6c62272e07bb0142_62b821756295c58d;
+    const FNV_PRIME: u128 = 0x0000000001000000_000000000000013b;
+    
+    let mut hash = FNV_OFFSET;
+    for &byte in data {
+        hash ^= byte as u128;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE DESCRIPTORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type kind enumeration
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TypeKind {
+    /// Primitive type (int, float, bool)
+    Primitive = 0,
+    /// Struct/class type
+    Struct = 1,
+    /// Enum type
+    Enum = 2,
+    /// Union type
+    Union = 3,
+    /// Trait/interface type
+    Trait = 4,
+    /// Array type
+    Array = 5,
+    /// Slice type
+    Slice = 6,
+    /// Pointer type
+    Pointer = 7,
+    /// Reference type
+    Reference = 8,
+    /// Function type
+    Function = 9,
+    /// Tuple type
+    Tuple = 10,
+    /// Optional type
+    Optional = 11,
+    /// Result type
+    Result = 12,
+    /// Generic type parameter
+    Generic = 13,
+    /// Opaque/foreign type
+    Opaque = 14,
+}
+
+/// Type descriptor - core metadata for any type
+#[repr(C)]
+pub struct TypeDescriptor {
+    /// Type handle
+    pub handle: TypeHandle,
+    /// Type kind
+    pub kind: TypeKind,
+    /// Type flags
+    pub flags: TypeFlags,
+    /// Size in bytes
+    pub size: usize,
+    /// Alignment in bytes
+    pub align: usize,
+    /// Type name (null-terminated)
+    pub name: *const u8,
+    /// Drop function
+    pub drop_fn: Option<fn(*mut u8)>,
+    /// Clone function
+    pub clone_fn: Option<fn(*const u8, *mut u8)>,
+    /// Debug format function
+    pub debug_fn: Option<fn(*const u8, &mut core::fmt::Formatter<'_>) -> core::fmt::Result>,
+    /// Kind-specific data
+    pub data: TypeData,
+}
+
+/// Type flags
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TypeFlags(pub u32);
+
+impl TypeFlags {
+    pub const NONE: TypeFlags = TypeFlags(0);
+    pub const COPY: TypeFlags = TypeFlags(1 << 0);
+    pub const CLONE: TypeFlags = TypeFlags(1 << 1);
+    pub const SEND: TypeFlags = TypeFlags(1 << 2);
+    pub const SYNC: TypeFlags = TypeFlags(1 << 3);
+    pub const SIZED: TypeFlags = TypeFlags(1 << 4);
+    pub const DROP: TypeFlags = TypeFlags(1 << 5);
+    pub const DEFAULT: TypeFlags = TypeFlags(1 << 6);
+    pub const EQ: TypeFlags = TypeFlags(1 << 7);
+    pub const ORD: TypeFlags = TypeFlags(1 << 8);
+    pub const HASH: TypeFlags = TypeFlags(1 << 9);
+    pub const SEALED: TypeFlags = TypeFlags(1 << 10);
+    pub const REPR_C: TypeFlags = TypeFlags(1 << 11);
+    pub const REPR_PACKED: TypeFlags = TypeFlags(1 << 12);
+    
+    pub fn contains(self, other: TypeFlags) -> bool {
+        (self.0 & other.0) == other.0
+    }
+    
+    pub fn is_copy(self) -> bool { self.contains(Self::COPY) }
+    pub fn is_clone(self) -> bool { self.contains(Self::CLONE) }
+    pub fn is_send(self) -> bool { self.contains(Self::SEND) }
+    pub fn is_sync(self) -> bool { self.contains(Self::SYNC) }
+    pub fn is_sized(self) -> bool { self.contains(Self::SIZED) }
+    pub fn has_drop(self) -> bool { self.contains(Self::DROP) }
+}
+
+impl core::ops::BitOr for TypeFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        TypeFlags(self.0 | rhs.0)
+    }
+}
+
+/// Kind-specific type data
+#[repr(C)]
+pub union TypeData {
+    pub primitive: PrimitiveData,
+    pub struct_: StructData,
+    pub enum_: EnumData,
+    pub array: ArrayData,
+    pub pointer: PointerData,
+    pub function: FunctionData,
+    pub trait_: TraitData,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRIMITIVE TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PrimitiveData {
+    /// Primitive kind
+    pub prim_kind: PrimitiveKind,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PrimitiveKind {
+    Bool = 0,
+    I8 = 1, I16 = 2, I32 = 3, I64 = 4, I128 = 5, Isize = 6,
+    U8 = 7, U16 = 8, U32 = 9, U64 = 10, U128 = 11, Usize = 12,
+    F16 = 13, F32 = 14, F64 = 15,
+    Char = 16,
+    Unit = 17,
+    Never = 18,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRUCT TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct StructData {
+    /// Number of fields
+    pub field_count: u32,
+    /// Pointer to field descriptors
+    pub fields: *const FieldDescriptor,
+    /// Number of base types
+    pub base_count: u32,
+    /// Pointer to base type handles
+    pub bases: *const TypeHandle,
+    /// VTable pointer (if any)
+    pub vtable: *const VTable,
+    /// Number of implemented traits
+    pub trait_count: u32,
+    /// Pointer to trait implementations
+    pub traits: *const TraitImpl,
+}
+
+/// Field descriptor
+#[repr(C)]
+pub struct FieldDescriptor {
+    /// Field name
+    pub name: *const u8,
+    /// Field type handle
+    pub type_handle: TypeHandle,
+    /// Offset within struct
+    pub offset: usize,
+    /// Field flags
+    pub flags: FieldFlags,
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct FieldFlags(pub u32);
+
+impl FieldFlags {
+    pub const NONE: FieldFlags = FieldFlags(0);
+    pub const PUBLIC: FieldFlags = FieldFlags(1 << 0);
+    pub const PRIVATE: FieldFlags = FieldFlags(1 << 1);
+    pub const PROTECTED: FieldFlags = FieldFlags(1 << 2);
+    pub const MUTABLE: FieldFlags = FieldFlags(1 << 3);
+    pub const READONLY: FieldFlags = FieldFlags(1 << 4);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENUM TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EnumData {
+    /// Discriminant type
+    pub discriminant_type: TypeHandle,
+    /// Discriminant offset
+    pub discriminant_offset: usize,
+    /// Number of variants
+    pub variant_count: u32,
+    /// Pointer to variant descriptors
+    pub variants: *const VariantDescriptor,
+}
+
+/// Variant descriptor
+#[repr(C)]
+pub struct VariantDescriptor {
+    /// Variant name
+    pub name: *const u8,
+    /// Discriminant value
+    pub discriminant: i64,
+    /// Payload type (null for unit variants)
+    pub payload: TypeHandle,
+    /// Payload offset
+    pub payload_offset: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ARRAY AND POINTER TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ArrayData {
+    /// Element type
+    pub element: TypeHandle,
+    /// Array length (0 for dynamic)
+    pub length: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PointerData {
+    /// Pointee type
+    pub pointee: TypeHandle,
+    /// Mutability
+    pub mutable: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUNCTION TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FunctionData {
+    /// Number of parameters
+    pub param_count: u32,
+    /// Parameter types
+    pub params: *const TypeHandle,
+    /// Return type
+    pub return_type: TypeHandle,
+    /// Calling convention
+    pub calling_conv: CallingConv,
+    /// Is variadic
+    pub variadic: bool,
+    /// Is unsafe
+    pub is_unsafe: bool,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CallingConv {
+    Quanta = 0,
+    C = 1,
+    Fastcall = 2,
+    Stdcall = 3,
+    Vectorcall = 4,
+    Win64 = 5,
+    SysV64 = 6,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRAIT TYPES AND VTABLES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TraitData {
+    /// Number of methods
+    pub method_count: u32,
+    /// Method descriptors
+    pub methods: *const MethodDescriptor,
+    /// Super traits
+    pub super_count: u32,
+    pub supers: *const TypeHandle,
+    /// Is object-safe
+    pub object_safe: bool,
+}
+
+/// Method descriptor
+#[repr(C)]
+pub struct MethodDescriptor {
+    /// Method name
+    pub name: *const u8,
+    /// Method signature type
+    pub signature: TypeHandle,
+    /// VTable slot index
+    pub vtable_slot: u32,
+    /// Method flags
+    pub flags: MethodFlags,
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct MethodFlags(pub u32);
+
+impl MethodFlags {
+    pub const NONE: MethodFlags = MethodFlags(0);
+    pub const VIRTUAL: MethodFlags = MethodFlags(1 << 0);
+    pub const ABSTRACT: MethodFlags = MethodFlags(1 << 1);
+    pub const FINAL: MethodFlags = MethodFlags(1 << 2);
+    pub const STATIC: MethodFlags = MethodFlags(1 << 3);
+    pub const DEFAULT: MethodFlags = MethodFlags(1 << 4);
+}
+
+/// Virtual function table
+#[repr(C)]
+pub struct VTable {
+    /// Type descriptor for concrete type
+    pub type_desc: *const TypeDescriptor,
+    /// Size of concrete type
+    pub size: usize,
+    /// Alignment of concrete type
+    pub align: usize,
+    /// Drop glue
+    pub drop: Option<fn(*mut u8)>,
+    /// Number of method slots
+    pub slot_count: u32,
+    /// Method function pointers (variable length)
+    pub slots: [*const (); 0],
+}
+
+impl VTable {
+    /// Get method at slot
+    pub unsafe fn get_method(&self, slot: u32) -> *const () {
+        if slot >= self.slot_count {
+            return core::ptr::null();
+        }
+        
+        let slots = self.slots.as_ptr();
+        *slots.add(slot as usize)
+    }
+}
+
+/// Trait implementation record
+#[repr(C)]
+pub struct TraitImpl {
+    /// Trait type handle
+    pub trait_handle: TypeHandle,
+    /// VTable for this trait impl
+    pub vtable: *const VTable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE REGISTRY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Global type registry
+pub struct TypeRegistry {
+    /// Type descriptors by handle
+    types: BTreeMap<TypeHandle, *const TypeDescriptor>,
+    /// Types by name
+    by_name: BTreeMap<String, TypeHandle>,
+}
+
+impl TypeRegistry {
+    /// Create new registry
+    pub const fn new() -> Self {
+        TypeRegistry {
+            types: BTreeMap::new(),
+            by_name: BTreeMap::new(),
+        }
+    }
+    
+    /// Register a type
+    pub fn register(&mut self, desc: *const TypeDescriptor) {
+        unsafe {
+            let d = &*desc;
+            self.types.insert(d.handle, desc);
+            
+            if !d.name.is_null() {
+                let name = core::ffi::CStr::from_ptr(d.name as *const i8)
+                    .to_string_lossy()
+                    .into_owned();
+                self.by_name.insert(name, d.handle);
+            }
+        }
+    }
+    
+    /// Look up type by handle
+    pub fn get(&self, handle: TypeHandle) -> Option<&TypeDescriptor> {
+        self.types.get(&handle).map(|&p| unsafe { &*p })
+    }
+    
+    /// Look up type by name
+    pub fn get_by_name(&self, name: &str) -> Option<&TypeDescriptor> {
+        self.by_name.get(name).and_then(|h| self.get(*h))
+    }
+    
+    /// Check if types are related (inheritance)
+    pub fn is_subtype_of(&self, sub: TypeHandle, super_: TypeHandle) -> bool {
+        if sub == super_ {
+            return true;
+        }
+        
+        let desc = match self.get(sub) {
+            Some(d) => d,
+            None => return false,
+        };
+        
+        if desc.kind != TypeKind::Struct {
+            return false;
+        }
+        
+        unsafe {
+            let data = &desc.data.struct_;
+            for i in 0..data.base_count as usize {
+                let base = *data.bases.add(i);
+                if self.is_subtype_of(base, super_) {
+                    return true;
+                }
+            }
+        }
+        
+        false
+    }
+    
+    /// Check if type implements trait
+    pub fn implements_trait(&self, type_: TypeHandle, trait_: TypeHandle) -> bool {
+        let desc = match self.get(type_) {
+            Some(d) => d,
+            None => return false,
+        };
+        
+        if desc.kind != TypeKind::Struct {
+            return false;
+        }
+        
+        unsafe {
+            let data = &desc.data.struct_;
+            for i in 0..data.trait_count as usize {
+                let impl_ = &*data.traits.add(i);
+                if impl_.trait_handle == trait_ {
+                    return true;
+                }
+            }
+        }
+        
+        false
+    }
+    
+    /// Get vtable for trait impl
+    pub fn get_trait_vtable(&self, type_: TypeHandle, trait_: TypeHandle) -> Option<&VTable> {
+        let desc = match self.get(type_) {
+            Some(d) => d,
+            None => return None,
+        };
+        
+        if desc.kind != TypeKind::Struct {
+            return None;
+        }
+        
+        unsafe {
+            let data = &desc.data.struct_;
+            for i in 0..data.trait_count as usize {
+                let impl_ = &*data.traits.add(i);
+                if impl_.trait_handle == trait_ && !impl_.vtable.is_null() {
+                    return Some(&*impl_.vtable);
+                }
+            }
+        }
+        
+        None
+    }
+}
+
+// Global registry
+static mut GLOBAL_REGISTRY: TypeRegistry = TypeRegistry::new();
+
+/// Get global type registry
+pub fn global_registry() -> &'static TypeRegistry {
+    unsafe { &GLOBAL_REGISTRY }
+}
+
+/// Get mutable global registry (unsafe, for initialization)
+pub unsafe fn global_registry_mut() -> &'static mut TypeRegistry {
+    &mut GLOBAL_REGISTRY
+}
+
+use alloc::collections::BTreeMap;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DYNAMIC CASTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Dynamic downcast result
+pub enum CastResult<T> {
+    Ok(T),
+    TypeMismatch,
+    NullPointer,
+}
+
+/// Dynamic cast for trait objects
+pub unsafe fn dynamic_cast<T>(
+    obj: *mut u8,
+    obj_type: TypeHandle,
+    target_type: TypeHandle,
+) -> CastResult<*mut T> {
+    if obj.is_null() {
+        return CastResult::NullPointer;
+    }
+    
+    let registry = global_registry();
+    
+    // Check if obj_type is subtype of target_type
+    if registry.is_subtype_of(obj_type, target_type) {
+        // Upcast - always safe, no adjustment needed for single inheritance
+        return CastResult::Ok(obj as *mut T);
+    }
+    
+    // Check if target_type is subtype of obj_type (downcast)
+    if registry.is_subtype_of(target_type, obj_type) {
+        // Need to verify at runtime that object is actually the target type
+        // This requires RTTI in the object itself
+        return CastResult::TypeMismatch; // Conservative
+    }
+    
+    CastResult::TypeMismatch
+}
+
+/// Cast trait object to concrete type
+pub unsafe fn trait_object_downcast<T>(
+    data: *mut u8,
+    vtable: *const VTable,
+    target_type: TypeHandle,
+) -> CastResult<*mut T> {
+    if data.is_null() || vtable.is_null() {
+        return CastResult::NullPointer;
+    }
+    
+    let vtable = &*vtable;
+    let obj_desc = &*vtable.type_desc;
+    
+    if obj_desc.handle == target_type {
+        return CastResult::Ok(data as *mut T);
+    }
+    
+    let registry = global_registry();
+    if registry.is_subtype_of(obj_desc.handle, target_type) {
+        return CastResult::Ok(data as *mut T);
+    }
+    
+    CastResult::TypeMismatch
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REFLECTION API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Reflection handle for runtime type introspection
+pub struct TypeReflection<'a> {
+    desc: &'a TypeDescriptor,
+}
+
+impl<'a> TypeReflection<'a> {
+    /// Create from type descriptor
+    pub fn new(desc: &'a TypeDescriptor) -> Self {
+        TypeReflection { desc }
+    }
+    
+    /// Get type name
+    pub fn name(&self) -> &str {
+        unsafe {
+            if self.desc.name.is_null() {
+                "<unknown>"
+            } else {
+                core::ffi::CStr::from_ptr(self.desc.name as *const i8)
+                    .to_str()
+                    .unwrap_or("<invalid>")
+            }
+        }
+    }
+    
+    /// Get type kind
+    pub fn kind(&self) -> TypeKind {
+        self.desc.kind
+    }
+    
+    /// Get size
+    pub fn size(&self) -> usize {
+        self.desc.size
+    }
+    
+    /// Get alignment
+    pub fn align(&self) -> usize {
+        self.desc.align
+    }
+    
+    /// Check if Copy
+    pub fn is_copy(&self) -> bool {
+        self.desc.flags.is_copy()
+    }
+    
+    /// Check if Send
+    pub fn is_send(&self) -> bool {
+        self.desc.flags.is_send()
+    }
+    
+    /// Check if Sync
+    pub fn is_sync(&self) -> bool {
+        self.desc.flags.is_sync()
+    }
+    
+    /// Get fields (for structs)
+    pub fn fields(&self) -> Option<FieldIterator<'a>> {
+        if self.desc.kind != TypeKind::Struct {
+            return None;
+        }
+        
+        unsafe {
+            let data = &self.desc.data.struct_;
+            Some(FieldIterator {
+                fields: data.fields,
+                count: data.field_count as usize,
+                index: 0,
+            })
+        }
+    }
+    
+    /// Get variants (for enums)
+    pub fn variants(&self) -> Option<VariantIterator<'a>> {
+        if self.desc.kind != TypeKind::Enum {
+            return None;
+        }
+        
+        unsafe {
+            let data = &self.desc.data.enum_;
+            Some(VariantIterator {
+                variants: data.variants,
+                count: data.variant_count as usize,
+                index: 0,
+            })
+        }
+    }
+}
+
+/// Iterator over struct fields
+pub struct FieldIterator<'a> {
+    fields: *const FieldDescriptor,
+    count: usize,
+    index: usize,
+    _marker: core::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> Iterator for FieldIterator<'a> {
+    type Item = FieldInfo<'a>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.count {
+            return None;
+        }
+        
+        unsafe {
+            let field = &*self.fields.add(self.index);
+            self.index += 1;
+            Some(FieldInfo { desc: field })
+        }
+    }
+}
+
+/// Field information
+pub struct FieldInfo<'a> {
+    desc: &'a FieldDescriptor,
+}
+
+impl<'a> FieldInfo<'a> {
+    pub fn name(&self) -> &str {
+        unsafe {
+            if self.desc.name.is_null() {
+                "<unnamed>"
+            } else {
+                core::ffi::CStr::from_ptr(self.desc.name as *const i8)
+                    .to_str()
+                    .unwrap_or("<invalid>")
+            }
+        }
+    }
+    
+    pub fn type_handle(&self) -> TypeHandle {
+        self.desc.type_handle
+    }
+    
+    pub fn offset(&self) -> usize {
+        self.desc.offset
+    }
+}
+
+/// Iterator over enum variants
+pub struct VariantIterator<'a> {
+    variants: *const VariantDescriptor,
+    count: usize,
+    index: usize,
+    _marker: core::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> Iterator for VariantIterator<'a> {
+    type Item = VariantInfo<'a>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.count {
+            return None;
+        }
+        
+        unsafe {
+            let variant = &*self.variants.add(self.index);
+            self.index += 1;
+            Some(VariantInfo { desc: variant })
+        }
+    }
+}
+
+/// Variant information
+pub struct VariantInfo<'a> {
+    desc: &'a VariantDescriptor,
+}
+
+impl<'a> VariantInfo<'a> {
+    pub fn name(&self) -> &str {
+        unsafe {
+            if self.desc.name.is_null() {
+                "<unnamed>"
+            } else {
+                core::ffi::CStr::from_ptr(self.desc.name as *const i8)
+                    .to_str()
+                    .unwrap_or("<invalid>")
+            }
+        }
+    }
+    
+    pub fn discriminant(&self) -> i64 {
+        self.desc.discriminant
+    }
+    
+    pub fn has_payload(&self) -> bool {
+        !self.desc.payload.is_null()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RUNTIME TYPE CHECKS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Check type equality at runtime
+#[inline]
+pub fn type_eq(a: TypeHandle, b: TypeHandle) -> bool {
+    a == b
+}
+
+/// Get type of value at runtime
+#[inline]
+pub fn type_of<T: 'static>() -> TypeHandle {
+    // Use Rust's TypeId as basis
+    let type_id = TypeId::of::<T>();
+    let bytes: [u8; 8] = unsafe { core::mem::transmute(type_id) };
+    TypeHandle {
+        lo: u64::from_le_bytes(bytes),
+        hi: 0, // TypeId is only 64-bit
+    }
+}
+
+/// Runtime type check
+#[no_mangle]
+pub extern "C" fn __quanta_type_check(
+    obj_type: TypeHandle,
+    expected_type: TypeHandle,
+) -> bool {
+    if obj_type == expected_type {
+        return true;
+    }
+    
+    global_registry().is_subtype_of(obj_type, expected_type)
+}
+
+/// Runtime trait check
+#[no_mangle]
+pub extern "C" fn __quanta_trait_check(
+    obj_type: TypeHandle,
+    trait_type: TypeHandle,
+) -> bool {
+    global_registry().implements_trait(obj_type, trait_type)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_type_handle_from_name() {
+        let h1 = TypeHandle::from_name("MyType");
+        let h2 = TypeHandle::from_name("MyType");
+        let h3 = TypeHandle::from_name("OtherType");
+        
+        assert_eq!(h1, h2);
+        assert_ne!(h1, h3);
+    }
+    
+    #[test]
+    fn test_type_flags() {
+        let flags = TypeFlags::COPY | TypeFlags::SEND | TypeFlags::SYNC;
+        assert!(flags.is_copy());
+        assert!(flags.is_send());
+        assert!(flags.is_sync());
+        assert!(!flags.is_clone());
+    }
+    
+    #[test]
+    fn test_type_eq() {
+        let h1 = TypeHandle { lo: 1, hi: 2 };
+        let h2 = TypeHandle { lo: 1, hi: 2 };
+        let h3 = TypeHandle { lo: 3, hi: 4 };
+        
+        assert!(type_eq(h1, h2));
+        assert!(!type_eq(h1, h3));
+    }
+}

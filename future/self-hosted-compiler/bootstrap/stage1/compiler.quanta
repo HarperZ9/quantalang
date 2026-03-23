@@ -1,0 +1,1146 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ BOOTSTRAP — Stage 1 Self-Hosted Compiler Core
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Stage 1: Self-hosted QuantaLang compiler written in QuantaLang
+//
+// This compiler is compiled by Stage 0 and can compile itself.
+// It implements the full language specification (excluding Stage 0 limitations).
+//
+// Architecture:
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │                        STAGE 1 COMPILER PIPELINE                            │
+// ├─────────────────────────────────────────────────────────────────────────────┤
+// │                                                                             │
+// │  Source Code                                                                │
+// │      │                                                                      │
+// │      ▼                                                                      │
+// │  ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐                  │
+// │  │  Lexer  │───►│ Parser  │───►│  HIR    │───►│  MIR    │                  │
+// │  │         │    │         │    │ Lower   │    │ Build   │                  │
+// │  └─────────┘    └─────────┘    └─────────┘    └─────────┘                  │
+// │                                                     │                       │
+// │                                                     ▼                       │
+// │                                              ┌─────────┐                    │
+// │                                              │ Codegen │                    │
+// │                                              │(LLVM/   │                    │
+// │                                              │ Native) │                    │
+// │                                              └─────────┘                    │
+// │                                                     │                       │
+// │                                                     ▼                       │
+// │                                               Object Files                  │
+// │                                                     │                       │
+// │                                                     ▼                       │
+// │                                              ┌─────────┐                    │
+// │                                              │ Linker  │                    │
+// │                                              └─────────┘                    │
+// │                                                     │                       │
+// │                                                     ▼                       │
+// │                                               Executable                    │
+// │                                                                             │
+// └─────────────────────────────────────────────────────────────────────────────┘
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::bootstrap::stage1::compiler
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::time::{Instant, Duration};
+use std::fs;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPILER SESSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compiler session - holds all compilation state
+pub struct Session {
+    /// Session ID
+    pub id: SessionId,
+    
+    /// Configuration
+    pub config: CompilerConfig,
+    
+    /// Source map
+    pub source_map: SourceMap,
+    
+    /// Diagnostic handler
+    pub diagnostics: DiagnosticHandler,
+    
+    /// Interner for strings/symbols
+    pub interner: Interner,
+    
+    /// Type context
+    pub type_ctx: TypeContext,
+    
+    /// Trait resolver
+    pub traits: TraitResolver,
+    
+    /// Crate graph
+    pub crate_graph: CrateGraph,
+    
+    /// Query system
+    pub queries: QueryEngine,
+    
+    /// Output directory
+    pub output_dir: PathBuf,
+    
+    /// Statistics
+    pub stats: CompilerStats,
+}
+
+/// Session identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionId(pub u64);
+
+/// Compiler configuration
+#[derive(Debug, Clone)]
+pub struct CompilerConfig {
+    /// Target triple
+    pub target: TargetSpec,
+    
+    /// Optimization level
+    pub opt_level: OptLevel,
+    
+    /// Debug info level
+    pub debug_info: DebugInfo,
+    
+    /// Output type
+    pub output_type: OutputType,
+    
+    /// Codegen units
+    pub codegen_units: usize,
+    
+    /// Parallel jobs
+    pub jobs: usize,
+    
+    /// Incremental compilation
+    pub incremental: bool,
+    
+    /// Incremental cache directory
+    pub incremental_dir: Option<PathBuf>,
+    
+    /// LTO mode
+    pub lto: LtoMode,
+    
+    /// Panic strategy
+    pub panic: PanicStrategy,
+    
+    /// Feature flags
+    pub features: BTreeSet<String>,
+    
+    /// Edition
+    pub edition: Edition,
+    
+    /// Emit options
+    pub emit: BTreeSet<EmitKind>,
+}
+
+/// Target specification
+#[derive(Debug, Clone)]
+pub struct TargetSpec {
+    pub triple: String,
+    pub arch: Arch,
+    pub os: Os,
+    pub env: Option<Env>,
+    pub vendor: Option<String>,
+    pub pointer_width: u32,
+    pub data_layout: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    X86_64,
+    Aarch64,
+    Riscv64,
+    Wasm32,
+    Wasm64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Os {
+    Linux,
+    Darwin,
+    Windows,
+    FreeBsd,
+    Wasi,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Env {
+    Gnu,
+    Musl,
+    Msvc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptLevel { O0, O1, O2, O3, Os, Oz }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugInfo { None, Limited, Full }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputType { Exe, Lib, DyLib, StaticLib, Obj }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LtoMode { None, Thin, Fat }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanicStrategy { Unwind, Abort }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edition { E2024, E2025 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EmitKind { Ast, Hir, Mir, Llvm, Asm, Obj, Link }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOURCE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Source map for file tracking
+pub struct SourceMap {
+    files: BTreeMap<FileId, SourceFile>,
+    next_id: u32,
+}
+
+/// File identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FileId(pub u32);
+
+/// Source file
+#[derive(Debug, Clone)]
+pub struct SourceFile {
+    pub id: FileId,
+    pub path: PathBuf,
+    pub name: String,
+    pub src: String,
+    pub lines: Vec<usize>,  // Byte offsets of line starts
+}
+
+impl SourceMap {
+    pub fn new() -> Self {
+        SourceMap {
+            files: BTreeMap::new(),
+            next_id: 0,
+        }
+    }
+    
+    /// Load source file
+    pub fn load_file(&mut self, path: &Path) -> Result<FileId, std::io::Error> {
+        let src = fs::read_to_string(path)?;
+        let id = FileId(self.next_id);
+        self.next_id += 1;
+        
+        let lines = compute_line_starts(&src);
+        
+        self.files.insert(id, SourceFile {
+            id,
+            path: path.to_owned(),
+            name: path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            src,
+            lines,
+        });
+        
+        Ok(id)
+    }
+    
+    /// Get source file
+    pub fn get(&self, id: FileId) -> Option<&SourceFile> {
+        self.files.get(&id)
+    }
+    
+    /// Lookup location from span
+    pub fn lookup_location(&self, span: Span) -> Option<Location> {
+        let file = self.files.get(&span.file)?;
+        let line = file.lines.partition_point(|&offset| offset <= span.start as usize);
+        let line_start = if line > 0 { file.lines[line - 1] } else { 0 };
+        let column = span.start as usize - line_start;
+        
+        Some(Location {
+            file: span.file,
+            line: line as u32,
+            column: column as u32,
+        })
+    }
+}
+
+fn compute_line_starts(src: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (i, c) in src.char_indices() {
+        if c == '\n' {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
+/// Source span
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Span {
+    pub file: FileId,
+    pub start: u32,
+    pub end: u32,
+}
+
+impl Span {
+    pub fn new(file: FileId, start: u32, end: u32) -> Self {
+        Span { file, start, end }
+    }
+    
+    pub fn merge(self, other: Span) -> Span {
+        assert_eq!(self.file, other.file);
+        Span {
+            file: self.file,
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+        }
+    }
+    
+    pub fn dummy() -> Self {
+        Span { file: FileId(0), start: 0, end: 0 }
+    }
+}
+
+/// Source location
+#[derive(Debug, Clone, Copy)]
+pub struct Location {
+    pub file: FileId,
+    pub line: u32,
+    pub column: u32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DIAGNOSTICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Diagnostic handler
+pub struct DiagnosticHandler {
+    diagnostics: Vec<Diagnostic>,
+    error_count: usize,
+    warning_count: usize,
+}
+
+/// Diagnostic message
+#[derive(Debug, Clone)]
+pub struct Diagnostic {
+    pub level: DiagLevel,
+    pub code: Option<String>,
+    pub message: String,
+    pub span: Option<Span>,
+    pub labels: Vec<Label>,
+    pub notes: Vec<String>,
+    pub suggestions: Vec<Suggestion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagLevel {
+    Error,
+    Warning,
+    Note,
+    Help,
+}
+
+/// Diagnostic label
+#[derive(Debug, Clone)]
+pub struct Label {
+    pub span: Span,
+    pub message: String,
+    pub primary: bool,
+}
+
+/// Fix suggestion
+#[derive(Debug, Clone)]
+pub struct Suggestion {
+    pub message: String,
+    pub span: Span,
+    pub replacement: String,
+    pub applicability: Applicability,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Applicability {
+    MachineApplicable,
+    MaybeIncorrect,
+    HasPlaceholders,
+    Unspecified,
+}
+
+impl DiagnosticHandler {
+    pub fn new() -> Self {
+        DiagnosticHandler {
+            diagnostics: Vec::new(),
+            error_count: 0,
+            warning_count: 0,
+        }
+    }
+    
+    pub fn emit(&mut self, diag: Diagnostic) {
+        match diag.level {
+            DiagLevel::Error => self.error_count += 1,
+            DiagLevel::Warning => self.warning_count += 1,
+            _ => {}
+        }
+        self.diagnostics.push(diag);
+    }
+    
+    pub fn error(&mut self, message: impl Into<String>, span: Option<Span>) {
+        self.emit(Diagnostic {
+            level: DiagLevel::Error,
+            code: None,
+            message: message.into(),
+            span,
+            labels: Vec::new(),
+            notes: Vec::new(),
+            suggestions: Vec::new(),
+        });
+    }
+    
+    pub fn warning(&mut self, message: impl Into<String>, span: Option<Span>) {
+        self.emit(Diagnostic {
+            level: DiagLevel::Warning,
+            code: None,
+            message: message.into(),
+            span,
+            labels: Vec::new(),
+            notes: Vec::new(),
+            suggestions: Vec::new(),
+        });
+    }
+    
+    pub fn has_errors(&self) -> bool {
+        self.error_count > 0
+    }
+    
+    pub fn error_count(&self) -> usize {
+        self.error_count
+    }
+    
+    pub fn warning_count(&self) -> usize {
+        self.warning_count
+    }
+    
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+}
+
+impl Default for DiagnosticHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SYMBOL INTERNING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Symbol interner
+pub struct Interner {
+    strings: Vec<String>,
+    map: BTreeMap<String, Symbol>,
+}
+
+/// Interned symbol
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Symbol(pub u32);
+
+impl Interner {
+    pub fn new() -> Self {
+        let mut interner = Interner {
+            strings: Vec::new(),
+            map: BTreeMap::new(),
+        };
+        
+        // Pre-intern common symbols
+        interner.intern("self");
+        interner.intern("Self");
+        interner.intern("super");
+        interner.intern("crate");
+        interner.intern("_");
+        
+        interner
+    }
+    
+    pub fn intern(&mut self, s: &str) -> Symbol {
+        if let Some(&sym) = self.map.get(s) {
+            return sym;
+        }
+        
+        let sym = Symbol(self.strings.len() as u32);
+        self.strings.push(s.to_string());
+        self.map.insert(s.to_string(), sym);
+        sym
+    }
+    
+    pub fn get(&self, sym: Symbol) -> &str {
+        &self.strings[sym.0 as usize]
+    }
+}
+
+impl Default for Interner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type context for type checking
+pub struct TypeContext {
+    /// All types
+    types: Vec<TyKind>,
+    
+    /// Type cache (interning)
+    cache: BTreeMap<TyKind, TyId>,
+    
+    /// Error type
+    pub error: TyId,
+    
+    /// Unit type
+    pub unit: TyId,
+    
+    /// Never type
+    pub never: TyId,
+    
+    /// Bool type
+    pub bool: TyId,
+}
+
+/// Type identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TyId(pub u32);
+
+/// Type kind
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TyKind {
+    /// Error type
+    Error,
+    /// Unit ()
+    Unit,
+    /// Never !
+    Never,
+    /// Bool
+    Bool,
+    /// Char
+    Char,
+    /// Integer
+    Int(IntTy),
+    /// Unsigned integer
+    UInt(UIntTy),
+    /// Float
+    Float(FloatTy),
+    /// String slice
+    Str,
+    /// Reference
+    Ref { lifetime: LifetimeId, mutable: bool, ty: TyId },
+    /// Pointer
+    Ptr { mutable: bool, ty: TyId },
+    /// Array
+    Array { element: TyId, size: u64 },
+    /// Slice
+    Slice(TyId),
+    /// Tuple
+    Tuple(Vec<TyId>),
+    /// Function
+    Fn { params: Vec<TyId>, ret: TyId },
+    /// ADT (struct/enum)
+    Adt { def_id: DefId, substs: Vec<TyId> },
+    /// Type parameter
+    Param(u32),
+    /// Projection (<T as Trait>::Assoc)
+    Projection { trait_ref: TraitRefId, item: Symbol },
+    /// Inference variable
+    Infer(InferVar),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum IntTy { I8, I16, I32, I64, I128, ISize }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum UIntTy { U8, U16, U32, U64, U128, USize }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FloatTy { F32, F64 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LifetimeId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DefId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TraitRefId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct InferVar(pub u32);
+
+impl TypeContext {
+    pub fn new() -> Self {
+        let mut ctx = TypeContext {
+            types: Vec::new(),
+            cache: BTreeMap::new(),
+            error: TyId(0),
+            unit: TyId(1),
+            never: TyId(2),
+            bool: TyId(3),
+        };
+        
+        // Pre-intern common types
+        ctx.error = ctx.intern(TyKind::Error);
+        ctx.unit = ctx.intern(TyKind::Unit);
+        ctx.never = ctx.intern(TyKind::Never);
+        ctx.bool = ctx.intern(TyKind::Bool);
+        
+        ctx
+    }
+    
+    pub fn intern(&mut self, kind: TyKind) -> TyId {
+        if let Some(&id) = self.cache.get(&kind) {
+            return id;
+        }
+        
+        let id = TyId(self.types.len() as u32);
+        self.types.push(kind.clone());
+        self.cache.insert(kind, id);
+        id
+    }
+    
+    pub fn get(&self, id: TyId) -> &TyKind {
+        &self.types[id.0 as usize]
+    }
+    
+    pub fn mk_int(&mut self, ty: IntTy) -> TyId {
+        self.intern(TyKind::Int(ty))
+    }
+    
+    pub fn mk_uint(&mut self, ty: UIntTy) -> TyId {
+        self.intern(TyKind::UInt(ty))
+    }
+    
+    pub fn mk_float(&mut self, ty: FloatTy) -> TyId {
+        self.intern(TyKind::Float(ty))
+    }
+    
+    pub fn mk_ref(&mut self, lifetime: LifetimeId, mutable: bool, ty: TyId) -> TyId {
+        self.intern(TyKind::Ref { lifetime, mutable, ty })
+    }
+    
+    pub fn mk_slice(&mut self, elem: TyId) -> TyId {
+        self.intern(TyKind::Slice(elem))
+    }
+    
+    pub fn mk_array(&mut self, element: TyId, size: u64) -> TyId {
+        self.intern(TyKind::Array { element, size })
+    }
+    
+    pub fn mk_tuple(&mut self, elems: Vec<TyId>) -> TyId {
+        if elems.is_empty() {
+            return self.unit;
+        }
+        self.intern(TyKind::Tuple(elems))
+    }
+    
+    pub fn mk_fn(&mut self, params: Vec<TyId>, ret: TyId) -> TyId {
+        self.intern(TyKind::Fn { params, ret })
+    }
+}
+
+impl Default for TypeContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRAIT RESOLVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Trait resolver
+pub struct TraitResolver {
+    /// Trait definitions
+    traits: BTreeMap<DefId, TraitDef>,
+    
+    /// Implementations
+    impls: Vec<ImplDef>,
+    
+    /// Resolution cache
+    cache: BTreeMap<(TyId, DefId), Option<ImplId>>,
+}
+
+/// Trait definition
+#[derive(Debug, Clone)]
+pub struct TraitDef {
+    pub def_id: DefId,
+    pub name: Symbol,
+    pub generics: Generics,
+    pub items: Vec<TraitItem>,
+}
+
+/// Generics
+#[derive(Debug, Clone, Default)]
+pub struct Generics {
+    pub params: Vec<GenericParam>,
+    pub where_clause: Vec<Predicate>,
+}
+
+/// Generic parameter
+#[derive(Debug, Clone)]
+pub enum GenericParam {
+    Type { name: Symbol, bounds: Vec<Predicate> },
+    Lifetime { name: Symbol },
+}
+
+/// Predicate (trait bound)
+#[derive(Debug, Clone)]
+pub enum Predicate {
+    Trait { ty: TyId, trait_def: DefId },
+    Lifetime { lifetime: LifetimeId, bound: LifetimeId },
+}
+
+/// Trait item
+#[derive(Debug, Clone)]
+pub enum TraitItem {
+    Type { name: Symbol, bounds: Vec<Predicate> },
+    Const { name: Symbol, ty: TyId },
+    Method { name: Symbol, sig: FnSig },
+}
+
+/// Function signature
+#[derive(Debug, Clone)]
+pub struct FnSig {
+    pub params: Vec<TyId>,
+    pub ret: TyId,
+}
+
+/// Implementation
+#[derive(Debug, Clone)]
+pub struct ImplDef {
+    pub impl_id: ImplId,
+    pub generics: Generics,
+    pub trait_ref: Option<(DefId, Vec<TyId>)>,
+    pub self_ty: TyId,
+    pub items: Vec<ImplItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ImplId(pub u32);
+
+/// Implementation item
+#[derive(Debug, Clone)]
+pub enum ImplItem {
+    Type { name: Symbol, ty: TyId },
+    Const { name: Symbol, ty: TyId },
+    Method { name: Symbol, def_id: DefId },
+}
+
+impl TraitResolver {
+    pub fn new() -> Self {
+        TraitResolver {
+            traits: BTreeMap::new(),
+            impls: Vec::new(),
+            cache: BTreeMap::new(),
+        }
+    }
+    
+    pub fn register_trait(&mut self, def: TraitDef) {
+        self.traits.insert(def.def_id, def);
+    }
+    
+    pub fn register_impl(&mut self, impl_def: ImplDef) {
+        self.impls.push(impl_def);
+    }
+    
+    pub fn resolve(&mut self, ty: TyId, trait_def: DefId) -> Option<ImplId> {
+        // Check cache
+        if let Some(&result) = self.cache.get(&(ty, trait_def)) {
+            return result;
+        }
+        
+        // Find matching impl
+        let result = self.impls.iter()
+            .find(|impl_| {
+                impl_.trait_ref.as_ref().map_or(false, |(t, _)| *t == trait_def)
+                    && impl_.self_ty == ty
+            })
+            .map(|impl_| impl_.impl_id);
+        
+        self.cache.insert((ty, trait_def), result);
+        result
+    }
+}
+
+impl Default for TraitResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CRATE GRAPH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Crate dependency graph
+pub struct CrateGraph {
+    crates: BTreeMap<CrateId, CrateData>,
+    next_id: u32,
+}
+
+/// Crate identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CrateId(pub u32);
+
+/// Crate data
+#[derive(Debug, Clone)]
+pub struct CrateData {
+    pub id: CrateId,
+    pub name: String,
+    pub root_module: FileId,
+    pub edition: Edition,
+    pub deps: Vec<CrateDep>,
+    pub cfg: BTreeSet<String>,
+}
+
+/// Crate dependency
+#[derive(Debug, Clone)]
+pub struct CrateDep {
+    pub name: String,
+    pub crate_id: CrateId,
+}
+
+impl CrateGraph {
+    pub fn new() -> Self {
+        CrateGraph {
+            crates: BTreeMap::new(),
+            next_id: 0,
+        }
+    }
+    
+    pub fn add_crate(&mut self, name: String, root: FileId, edition: Edition) -> CrateId {
+        let id = CrateId(self.next_id);
+        self.next_id += 1;
+        
+        self.crates.insert(id, CrateData {
+            id,
+            name,
+            root_module: root,
+            edition,
+            deps: Vec::new(),
+            cfg: BTreeSet::new(),
+        });
+        
+        id
+    }
+    
+    pub fn add_dep(&mut self, from: CrateId, name: String, to: CrateId) {
+        if let Some(crate_data) = self.crates.get_mut(&from) {
+            crate_data.deps.push(CrateDep {
+                name,
+                crate_id: to,
+            });
+        }
+    }
+    
+    pub fn get(&self, id: CrateId) -> Option<&CrateData> {
+        self.crates.get(&id)
+    }
+}
+
+impl Default for CrateGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUERY ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Query engine for incremental compilation
+pub struct QueryEngine {
+    /// Cached query results
+    cache: BTreeMap<QueryKey, QueryValue>,
+    
+    /// Query dependencies for invalidation
+    deps: BTreeMap<QueryKey, Vec<QueryKey>>,
+}
+
+/// Query key
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum QueryKey {
+    Parse(FileId),
+    Hir(DefId),
+    Mir(DefId),
+    TypeOf(DefId),
+    TraitImpls(DefId),
+    Codegen(DefId),
+}
+
+/// Query value (opaque)
+#[derive(Debug, Clone)]
+pub struct QueryValue {
+    pub data: Vec<u8>,
+    pub hash: u64,
+}
+
+impl QueryEngine {
+    pub fn new() -> Self {
+        QueryEngine {
+            cache: BTreeMap::new(),
+            deps: BTreeMap::new(),
+        }
+    }
+    
+    pub fn get(&self, key: &QueryKey) -> Option<&QueryValue> {
+        self.cache.get(key)
+    }
+    
+    pub fn set(&mut self, key: QueryKey, value: QueryValue, deps: Vec<QueryKey>) {
+        self.cache.insert(key.clone(), value);
+        self.deps.insert(key, deps);
+    }
+    
+    pub fn invalidate(&mut self, key: &QueryKey) {
+        self.cache.remove(key);
+        
+        // Invalidate dependents
+        let to_invalidate: Vec<_> = self.deps.iter()
+            .filter(|(_, deps)| deps.contains(key))
+            .map(|(k, _)| k.clone())
+            .collect();
+        
+        for k in to_invalidate {
+            self.invalidate(&k);
+        }
+    }
+}
+
+impl Default for QueryEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPILER STATISTICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compiler statistics
+#[derive(Debug, Clone, Default)]
+pub struct CompilerStats {
+    pub files_parsed: usize,
+    pub lines_of_code: usize,
+    pub functions_compiled: usize,
+    pub types_checked: usize,
+    pub parse_time: Duration,
+    pub type_check_time: Duration,
+    pub mir_time: Duration,
+    pub codegen_time: Duration,
+    pub link_time: Duration,
+    pub total_time: Duration,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPILER DRIVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compiler driver
+pub struct Compiler {
+    session: Session,
+}
+
+impl Compiler {
+    /// Create new compiler
+    pub fn new(config: CompilerConfig) -> Self {
+        let session = Session {
+            id: SessionId(0),
+            config,
+            source_map: SourceMap::new(),
+            diagnostics: DiagnosticHandler::new(),
+            interner: Interner::new(),
+            type_ctx: TypeContext::new(),
+            traits: TraitResolver::new(),
+            crate_graph: CrateGraph::new(),
+            queries: QueryEngine::new(),
+            output_dir: PathBuf::from("target"),
+            stats: CompilerStats::default(),
+        };
+        
+        Compiler { session }
+    }
+    
+    /// Compile sources
+    pub fn compile(&mut self, sources: &[PathBuf]) -> Result<CompileResult, CompileError> {
+        let start = Instant::now();
+        
+        // Parse all sources
+        let parse_start = Instant::now();
+        for source in sources {
+            self.parse_file(source)?;
+        }
+        self.session.stats.parse_time = parse_start.elapsed();
+        
+        if self.session.diagnostics.has_errors() {
+            return Err(CompileError::ParseError);
+        }
+        
+        // Type check
+        let tc_start = Instant::now();
+        self.type_check()?;
+        self.session.stats.type_check_time = tc_start.elapsed();
+        
+        if self.session.diagnostics.has_errors() {
+            return Err(CompileError::TypeError);
+        }
+        
+        // Lower to MIR
+        let mir_start = Instant::now();
+        self.lower_to_mir()?;
+        self.session.stats.mir_time = mir_start.elapsed();
+        
+        // Codegen
+        let codegen_start = Instant::now();
+        let objects = self.codegen()?;
+        self.session.stats.codegen_time = codegen_start.elapsed();
+        
+        // Link
+        let link_start = Instant::now();
+        let output = self.link(&objects)?;
+        self.session.stats.link_time = link_start.elapsed();
+        
+        self.session.stats.total_time = start.elapsed();
+        
+        Ok(CompileResult {
+            output,
+            stats: self.session.stats.clone(),
+        })
+    }
+    
+    fn parse_file(&mut self, path: &Path) -> Result<(), CompileError> {
+        let _file_id = self.session.source_map.load_file(path)
+            .map_err(|e| CompileError::IoError(e.to_string()))?;
+        
+        self.session.stats.files_parsed += 1;
+        
+        // Would invoke parser here
+        Ok(())
+    }
+    
+    fn type_check(&mut self) -> Result<(), CompileError> {
+        // Would invoke type checker here
+        Ok(())
+    }
+    
+    fn lower_to_mir(&mut self) -> Result<(), CompileError> {
+        // Would lower HIR to MIR here
+        Ok(())
+    }
+    
+    fn codegen(&mut self) -> Result<Vec<PathBuf>, CompileError> {
+        // Would generate object files here
+        Ok(Vec::new())
+    }
+    
+    fn link(&mut self, _objects: &[PathBuf]) -> Result<PathBuf, CompileError> {
+        // Would invoke linker here
+        Ok(self.session.output_dir.join("output"))
+    }
+    
+    /// Get session
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+    
+    /// Get mutable session
+    pub fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+}
+
+/// Compile result
+#[derive(Debug)]
+pub struct CompileResult {
+    pub output: PathBuf,
+    pub stats: CompilerStats,
+}
+
+/// Compile error
+#[derive(Debug)]
+pub enum CompileError {
+    IoError(String),
+    ParseError,
+    TypeError,
+    CodegenError(String),
+    LinkError(String),
+}
+
+impl std::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IoError(m) => write!(f, "I/O error: {}", m),
+            Self::ParseError => write!(f, "parse error"),
+            Self::TypeError => write!(f, "type error"),
+            Self::CodegenError(m) => write!(f, "codegen error: {}", m),
+            Self::LinkError(m) => write!(f, "link error: {}", m),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_source_map() {
+        let mut sm = SourceMap::new();
+        // Would test file loading
+    }
+    
+    #[test]
+    fn test_interner() {
+        let mut interner = Interner::new();
+        
+        let s1 = interner.intern("hello");
+        let s2 = interner.intern("world");
+        let s3 = interner.intern("hello");
+        
+        assert_eq!(s1, s3);
+        assert_ne!(s1, s2);
+        assert_eq!(interner.get(s1), "hello");
+    }
+    
+    #[test]
+    fn test_type_context() {
+        let mut ctx = TypeContext::new();
+        
+        let i32_ty = ctx.mk_int(IntTy::I32);
+        let i32_ty2 = ctx.mk_int(IntTy::I32);
+        
+        assert_eq!(i32_ty, i32_ty2);
+    }
+    
+    #[test]
+    fn test_diagnostics() {
+        let mut diag = DiagnosticHandler::new();
+        
+        diag.error("test error", None);
+        assert!(diag.has_errors());
+        assert_eq!(diag.error_count(), 1);
+    }
+}

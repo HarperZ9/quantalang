@@ -1,0 +1,1179 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ LANGUAGE SERVER PROTOCOL — Analysis Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Provides language intelligence: completions, hover, go-to-definition, etc.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::lsp::analysis
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use crate::lsp::types::*;
+use crate::lsp::documents::*;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ANALYSIS ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Language analysis engine
+pub struct AnalysisEngine {
+    /// Standard library types
+    stdlib: StdlibInfo,
+    /// Keyword completions
+    keywords: Vec<CompletionItem>,
+    /// Snippet completions
+    snippets: Vec<CompletionItem>,
+}
+
+impl AnalysisEngine {
+    pub fn new() -> Self {
+        let mut engine = AnalysisEngine {
+            stdlib: StdlibInfo::new(),
+            keywords: Vec::new(),
+            snippets: Vec::new(),
+        };
+        engine.init_keywords();
+        engine.init_snippets();
+        engine
+    }
+    
+    fn init_keywords(&mut self) {
+        let keywords = [
+            "fn", "let", "mut", "const", "static", "type", "struct", "enum",
+            "trait", "impl", "self", "Self", "pub", "use", "mod", "crate",
+            "super", "as", "where", "for", "loop", "while", "if", "else",
+            "match", "return", "break", "continue", "in", "ref", "move",
+            "async", "await", "dyn", "unsafe", "extern", "true", "false",
+        ];
+        
+        for kw in keywords {
+            self.keywords.push(
+                CompletionItem::keyword(kw)
+                    .with_sort_text(format!("0_{}", kw))
+            );
+        }
+    }
+    
+    fn init_snippets(&mut self) {
+        self.snippets.push(CompletionItem::snippet(
+            "fn",
+            "fn ${1:name}(${2:params}) ${3:-> ${4:ReturnType} }{\n\t$0\n}",
+            "Function definition",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "fnmain",
+            "fn main() {\n\t$0\n}",
+            "Main function",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "struct",
+            "struct ${1:Name} {\n\t${2:field}: ${3:Type},\n}",
+            "Struct definition",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "enum",
+            "enum ${1:Name} {\n\t${2:Variant},\n}",
+            "Enum definition",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "impl",
+            "impl ${1:Type} {\n\t$0\n}",
+            "Implementation block",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "trait",
+            "trait ${1:Name} {\n\t$0\n}",
+            "Trait definition",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "match",
+            "match ${1:expr} {\n\t${2:pattern} => ${3:expr},\n}",
+            "Match expression",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "if",
+            "if ${1:condition} {\n\t$0\n}",
+            "If statement",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "ifelse",
+            "if ${1:condition} {\n\t$2\n} else {\n\t$0\n}",
+            "If-else statement",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "for",
+            "for ${1:item} in ${2:iter} {\n\t$0\n}",
+            "For loop",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "while",
+            "while ${1:condition} {\n\t$0\n}",
+            "While loop",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "loop",
+            "loop {\n\t$0\n}",
+            "Infinite loop",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "test",
+            "#[test]\nfn ${1:test_name}() {\n\t$0\n}",
+            "Test function",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "derive",
+            "#[derive(${1:Debug, Clone})]",
+            "Derive macro",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "println",
+            "println!(\"${1:{}}\", ${2:expr});",
+            "Print with newline",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "vec",
+            "vec![${1:elements}]",
+            "Vector macro",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "Some",
+            "Some(${1:value})",
+            "Option::Some",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "Ok",
+            "Ok(${1:value})",
+            "Result::Ok",
+        ));
+        
+        self.snippets.push(CompletionItem::snippet(
+            "Err",
+            "Err(${1:error})",
+            "Result::Err",
+        ));
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMPLETION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Provide completions at a position
+    pub fn complete(
+        &self,
+        doc: &Document,
+        pos: Position,
+        type_info: Option<&TypeInfo>,
+    ) -> CompletionList {
+        let mut items = Vec::new();
+        
+        // Get context
+        let context = self.get_completion_context(doc, pos);
+        
+        match context {
+            CompletionContext::DotAccess { receiver_type } => {
+                // Method/field completions
+                items.extend(self.complete_dot_access(&receiver_type, type_info));
+            }
+            CompletionContext::DoubleColon { path } => {
+                // Module path completions
+                items.extend(self.complete_path(&path, type_info));
+            }
+            CompletionContext::Type => {
+                // Type completions
+                items.extend(self.complete_types(type_info));
+            }
+            CompletionContext::Use => {
+                // Import completions
+                items.extend(self.complete_use());
+            }
+            CompletionContext::Normal { prefix } => {
+                // General completions
+                items.extend(self.complete_normal(&prefix, doc, pos, type_info));
+            }
+        }
+        
+        CompletionList::new(items)
+    }
+    
+    fn get_completion_context(&self, doc: &Document, pos: Position) -> CompletionContext {
+        let line = match doc.line(pos.line as usize) {
+            Some(l) => l,
+            None => return CompletionContext::Normal { prefix: String::new() },
+        };
+        
+        let char_idx = pos.character as usize;
+        let before_cursor = if char_idx <= line.len() {
+            &line[..char_idx]
+        } else {
+            line
+        };
+        
+        // Check for dot access
+        if let Some(dot_pos) = before_cursor.rfind('.') {
+            let after_dot = &before_cursor[dot_pos + 1..];
+            if after_dot.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                // Get receiver
+                let before_dot = before_cursor[..dot_pos].trim_end();
+                return CompletionContext::DotAccess {
+                    receiver_type: self.infer_type_from_expr(before_dot),
+                };
+            }
+        }
+        
+        // Check for :: path
+        if let Some(colon_pos) = before_cursor.rfind("::") {
+            let path = before_cursor[..colon_pos].trim();
+            if !path.is_empty() {
+                return CompletionContext::DoubleColon {
+                    path: path.to_string(),
+                };
+            }
+        }
+        
+        // Check for type context
+        if before_cursor.contains(':') && !before_cursor.contains("::") {
+            let after_colon = before_cursor.rsplit(':').next().unwrap_or("").trim();
+            if after_colon.is_empty() || after_colon.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return CompletionContext::Type;
+            }
+        }
+        
+        // Check for use statement
+        if before_cursor.trim_start().starts_with("use ") {
+            return CompletionContext::Use;
+        }
+        
+        // Get prefix for normal completion
+        let prefix = before_cursor
+            .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        
+        CompletionContext::Normal { prefix }
+    }
+    
+    fn infer_type_from_expr(&self, expr: &str) -> String {
+        // Simple type inference from expression
+        let expr = expr.trim();
+        
+        // String literal
+        if expr.starts_with('"') || expr.starts_with("r\"") || expr.starts_with("r#") {
+            return "str".to_string();
+        }
+        
+        // Char literal
+        if expr.starts_with('\'') {
+            return "char".to_string();
+        }
+        
+        // Numeric literal
+        if expr.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            if expr.contains('.') {
+                return "f64".to_string();
+            }
+            return "i32".to_string();
+        }
+        
+        // Boolean
+        if expr == "true" || expr == "false" {
+            return "bool".to_string();
+        }
+        
+        // Array/slice
+        if expr.starts_with('[') {
+            return "slice".to_string();
+        }
+        
+        // Tuple
+        if expr.starts_with('(') {
+            return "tuple".to_string();
+        }
+        
+        // Function call
+        if expr.ends_with(')') {
+            if let Some(paren) = expr.rfind('(') {
+                let func = expr[..paren].trim();
+                // Check common functions
+                return match func {
+                    "Vec::new" => "Vec".to_string(),
+                    "String::new" | "String::from" => "String".to_string(),
+                    "Box::new" => "Box".to_string(),
+                    "Rc::new" => "Rc".to_string(),
+                    "Arc::new" => "Arc".to_string(),
+                    "Some" => "Option".to_string(),
+                    "Ok" | "Err" => "Result".to_string(),
+                    _ => "unknown".to_string(),
+                };
+            }
+        }
+        
+        "unknown".to_string()
+    }
+    
+    fn complete_dot_access(&self, receiver_type: &str, type_info: Option<&TypeInfo>) -> Vec<CompletionItem> {
+        let mut items = Vec::new();
+        
+        // Add methods based on receiver type
+        match receiver_type {
+            "str" | "String" => {
+                items.push(CompletionItem::method("len", "fn len(&self) -> usize"));
+                items.push(CompletionItem::method("is_empty", "fn is_empty(&self) -> bool"));
+                items.push(CompletionItem::method("chars", "fn chars(&self) -> Chars"));
+                items.push(CompletionItem::method("bytes", "fn bytes(&self) -> Bytes"));
+                items.push(CompletionItem::method("lines", "fn lines(&self) -> Lines"));
+                items.push(CompletionItem::method("trim", "fn trim(&self) -> &str"));
+                items.push(CompletionItem::method("to_lowercase", "fn to_lowercase(&self) -> String"));
+                items.push(CompletionItem::method("to_uppercase", "fn to_uppercase(&self) -> String"));
+                items.push(CompletionItem::method("contains", "fn contains(&self, pat: &str) -> bool"));
+                items.push(CompletionItem::method("starts_with", "fn starts_with(&self, pat: &str) -> bool"));
+                items.push(CompletionItem::method("ends_with", "fn ends_with(&self, pat: &str) -> bool"));
+                items.push(CompletionItem::method("split", "fn split(&self, pat: &str) -> Split"));
+                items.push(CompletionItem::method("replace", "fn replace(&self, from: &str, to: &str) -> String"));
+                if receiver_type == "String" {
+                    items.push(CompletionItem::method("push", "fn push(&mut self, c: char)"));
+                    items.push(CompletionItem::method("push_str", "fn push_str(&mut self, s: &str)"));
+                    items.push(CompletionItem::method("pop", "fn pop(&mut self) -> Option<char>"));
+                    items.push(CompletionItem::method("clear", "fn clear(&mut self)"));
+                    items.push(CompletionItem::method("as_str", "fn as_str(&self) -> &str"));
+                }
+            }
+            "Vec" | "slice" => {
+                items.push(CompletionItem::method("len", "fn len(&self) -> usize"));
+                items.push(CompletionItem::method("is_empty", "fn is_empty(&self) -> bool"));
+                items.push(CompletionItem::method("first", "fn first(&self) -> Option<&T>"));
+                items.push(CompletionItem::method("last", "fn last(&self) -> Option<&T>"));
+                items.push(CompletionItem::method("get", "fn get(&self, index: usize) -> Option<&T>"));
+                items.push(CompletionItem::method("iter", "fn iter(&self) -> Iter<T>"));
+                items.push(CompletionItem::method("iter_mut", "fn iter_mut(&mut self) -> IterMut<T>"));
+                items.push(CompletionItem::method("contains", "fn contains(&self, x: &T) -> bool"));
+                if receiver_type == "Vec" {
+                    items.push(CompletionItem::method("push", "fn push(&mut self, value: T)"));
+                    items.push(CompletionItem::method("pop", "fn pop(&mut self) -> Option<T>"));
+                    items.push(CompletionItem::method("insert", "fn insert(&mut self, index: usize, element: T)"));
+                    items.push(CompletionItem::method("remove", "fn remove(&mut self, index: usize) -> T"));
+                    items.push(CompletionItem::method("clear", "fn clear(&mut self)"));
+                    items.push(CompletionItem::method("extend", "fn extend<I: IntoIterator<Item=T>>(&mut self, iter: I)"));
+                    items.push(CompletionItem::method("sort", "fn sort(&mut self) where T: Ord"));
+                    items.push(CompletionItem::method("reverse", "fn reverse(&mut self)"));
+                    items.push(CompletionItem::method("dedup", "fn dedup(&mut self) where T: PartialEq"));
+                }
+            }
+            "Option" => {
+                items.push(CompletionItem::method("is_some", "fn is_some(&self) -> bool"));
+                items.push(CompletionItem::method("is_none", "fn is_none(&self) -> bool"));
+                items.push(CompletionItem::method("unwrap", "fn unwrap(self) -> T"));
+                items.push(CompletionItem::method("unwrap_or", "fn unwrap_or(self, default: T) -> T"));
+                items.push(CompletionItem::method("unwrap_or_else", "fn unwrap_or_else<F: FnOnce() -> T>(self, f: F) -> T"));
+                items.push(CompletionItem::method("unwrap_or_default", "fn unwrap_or_default(self) -> T where T: Default"));
+                items.push(CompletionItem::method("map", "fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Option<U>"));
+                items.push(CompletionItem::method("and_then", "fn and_then<U, F: FnOnce(T) -> Option<U>>(self, f: F) -> Option<U>"));
+                items.push(CompletionItem::method("or", "fn or(self, optb: Option<T>) -> Option<T>"));
+                items.push(CompletionItem::method("or_else", "fn or_else<F: FnOnce() -> Option<T>>(self, f: F) -> Option<T>"));
+                items.push(CompletionItem::method("take", "fn take(&mut self) -> Option<T>"));
+                items.push(CompletionItem::method("as_ref", "fn as_ref(&self) -> Option<&T>"));
+                items.push(CompletionItem::method("as_mut", "fn as_mut(&mut self) -> Option<&mut T>"));
+                items.push(CompletionItem::method("ok_or", "fn ok_or<E>(self, err: E) -> Result<T, E>"));
+            }
+            "Result" => {
+                items.push(CompletionItem::method("is_ok", "fn is_ok(&self) -> bool"));
+                items.push(CompletionItem::method("is_err", "fn is_err(&self) -> bool"));
+                items.push(CompletionItem::method("ok", "fn ok(self) -> Option<T>"));
+                items.push(CompletionItem::method("err", "fn err(self) -> Option<E>"));
+                items.push(CompletionItem::method("unwrap", "fn unwrap(self) -> T"));
+                items.push(CompletionItem::method("unwrap_err", "fn unwrap_err(self) -> E"));
+                items.push(CompletionItem::method("unwrap_or", "fn unwrap_or(self, default: T) -> T"));
+                items.push(CompletionItem::method("unwrap_or_else", "fn unwrap_or_else<F: FnOnce(E) -> T>(self, op: F) -> T"));
+                items.push(CompletionItem::method("map", "fn map<U, F: FnOnce(T) -> U>(self, op: F) -> Result<U, E>"));
+                items.push(CompletionItem::method("map_err", "fn map_err<F, O: FnOnce(E) -> F>(self, op: O) -> Result<T, F>"));
+                items.push(CompletionItem::method("and_then", "fn and_then<U, F: FnOnce(T) -> Result<U, E>>(self, op: F) -> Result<U, E>"));
+                items.push(CompletionItem::method("or_else", "fn or_else<F, O: FnOnce(E) -> Result<T, F>>(self, op: O) -> Result<T, F>"));
+            }
+            _ => {
+                // Check type_info for custom type methods
+                if let Some(info) = type_info {
+                    if let Some(struct_def) = info.structs.get(receiver_type) {
+                        for (name, ty) in &struct_def.fields {
+                            items.push(CompletionItem::field(name, ty));
+                        }
+                        for method in &struct_def.methods {
+                            items.push(CompletionItem::method(&method.name, &format_signature(method)));
+                        }
+                    }
+                    if let Some(enum_def) = info.enums.get(receiver_type) {
+                        for method in &enum_def.methods {
+                            items.push(CompletionItem::method(&method.name, &format_signature(method)));
+                        }
+                    }
+                }
+                
+                // Add common iterator methods
+                items.push(CompletionItem::method("map", "fn map<B, F: FnMut(T) -> B>(self, f: F) -> Map<Self, F>"));
+                items.push(CompletionItem::method("filter", "fn filter<P: FnMut(&T) -> bool>(self, predicate: P) -> Filter<Self, P>"));
+                items.push(CompletionItem::method("collect", "fn collect<B: FromIterator<T>>(self) -> B"));
+                items.push(CompletionItem::method("fold", "fn fold<B, F: FnMut(B, T) -> B>(self, init: B, f: F) -> B"));
+                items.push(CompletionItem::method("for_each", "fn for_each<F: FnMut(T)>(self, f: F)"));
+                items.push(CompletionItem::method("enumerate", "fn enumerate(self) -> Enumerate<Self>"));
+                items.push(CompletionItem::method("take", "fn take(self, n: usize) -> Take<Self>"));
+                items.push(CompletionItem::method("skip", "fn skip(self, n: usize) -> Skip<Self>"));
+                items.push(CompletionItem::method("any", "fn any<F: FnMut(T) -> bool>(&mut self, f: F) -> bool"));
+                items.push(CompletionItem::method("all", "fn all<F: FnMut(T) -> bool>(&mut self, f: F) -> bool"));
+                items.push(CompletionItem::method("find", "fn find<P: FnMut(&T) -> bool>(&mut self, predicate: P) -> Option<T>"));
+            }
+        }
+        
+        items
+    }
+    
+    fn complete_path(&self, path: &str, type_info: Option<&TypeInfo>) -> Vec<CompletionItem> {
+        let mut items = Vec::new();
+        
+        match path {
+            "std" => {
+                items.push(CompletionItem::new("collections".to_string()).with_kind(CompletionItemKind::Module));
+                items.push(CompletionItem::new("io".to_string()).with_kind(CompletionItemKind::Module));
+                items.push(CompletionItem::new("fs".to_string()).with_kind(CompletionItemKind::Module));
+                items.push(CompletionItem::new("path".to_string()).with_kind(CompletionItemKind::Module));
+                items.push(CompletionItem::new("sync".to_string()).with_kind(CompletionItemKind::Module));
+                items.push(CompletionItem::new("thread".to_string()).with_kind(CompletionItemKind::Module));
+                items.push(CompletionItem::new("time".to_string()).with_kind(CompletionItemKind::Module));
+                items.push(CompletionItem::new("env".to_string()).with_kind(CompletionItemKind::Module));
+                items.push(CompletionItem::new("fmt".to_string()).with_kind(CompletionItemKind::Module));
+                items.push(CompletionItem::new("mem".to_string()).with_kind(CompletionItemKind::Module));
+                items.push(CompletionItem::new("ptr".to_string()).with_kind(CompletionItemKind::Module));
+                items.push(CompletionItem::new("rc".to_string()).with_kind(CompletionItemKind::Module));
+                items.push(CompletionItem::new("cell".to_string()).with_kind(CompletionItemKind::Module));
+            }
+            "std::collections" => {
+                items.push(CompletionItem::struct_item("HashMap"));
+                items.push(CompletionItem::struct_item("HashSet"));
+                items.push(CompletionItem::struct_item("BTreeMap"));
+                items.push(CompletionItem::struct_item("BTreeSet"));
+                items.push(CompletionItem::struct_item("VecDeque"));
+                items.push(CompletionItem::struct_item("LinkedList"));
+                items.push(CompletionItem::struct_item("BinaryHeap"));
+            }
+            "std::sync" => {
+                items.push(CompletionItem::struct_item("Arc"));
+                items.push(CompletionItem::struct_item("Mutex"));
+                items.push(CompletionItem::struct_item("RwLock"));
+                items.push(CompletionItem::struct_item("Condvar"));
+                items.push(CompletionItem::struct_item("Barrier"));
+                items.push(CompletionItem::struct_item("Once"));
+            }
+            "std::rc" => {
+                items.push(CompletionItem::struct_item("Rc"));
+                items.push(CompletionItem::struct_item("Weak"));
+            }
+            "std::cell" => {
+                items.push(CompletionItem::struct_item("Cell"));
+                items.push(CompletionItem::struct_item("RefCell"));
+                items.push(CompletionItem::struct_item("Ref"));
+                items.push(CompletionItem::struct_item("RefMut"));
+            }
+            "Option" => {
+                items.push(CompletionItem::new("Some".to_string()).with_kind(CompletionItemKind::EnumMember));
+                items.push(CompletionItem::new("None".to_string()).with_kind(CompletionItemKind::EnumMember));
+            }
+            "Result" => {
+                items.push(CompletionItem::new("Ok".to_string()).with_kind(CompletionItemKind::EnumMember));
+                items.push(CompletionItem::new("Err".to_string()).with_kind(CompletionItemKind::EnumMember));
+            }
+            "String" => {
+                items.push(CompletionItem::function("new", "fn new() -> String"));
+                items.push(CompletionItem::function("from", "fn from(s: &str) -> String"));
+                items.push(CompletionItem::function("with_capacity", "fn with_capacity(capacity: usize) -> String"));
+            }
+            "Vec" => {
+                items.push(CompletionItem::function("new", "fn new() -> Vec<T>"));
+                items.push(CompletionItem::function("with_capacity", "fn with_capacity(capacity: usize) -> Vec<T>"));
+                items.push(CompletionItem::function("from", "fn from(s: impl Into<Vec<T>>) -> Vec<T>"));
+            }
+            "Box" => {
+                items.push(CompletionItem::function("new", "fn new(x: T) -> Box<T>"));
+                items.push(CompletionItem::function("pin", "fn pin(x: T) -> Pin<Box<T>>"));
+            }
+            _ => {
+                // Check for enum in type_info
+                if let Some(info) = type_info {
+                    if let Some(enum_def) = info.enums.get(path) {
+                        for variant in &enum_def.variants {
+                            items.push(
+                                CompletionItem::new(variant.name.clone())
+                                    .with_kind(CompletionItemKind::EnumMember)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        
+        items
+    }
+    
+    fn complete_types(&self, type_info: Option<&TypeInfo>) -> Vec<CompletionItem> {
+        let mut items = Vec::new();
+        
+        // Primitive types
+        for ty in ["i8", "i16", "i32", "i64", "i128", "isize",
+                   "u8", "u16", "u32", "u64", "u128", "usize",
+                   "f32", "f64", "bool", "char", "str"] {
+            items.push(
+                CompletionItem::new(ty.to_string())
+                    .with_kind(CompletionItemKind::Keyword)
+                    .with_sort_text(format!("0_{}", ty))
+            );
+        }
+        
+        // Common types
+        for ty in ["String", "Vec", "Box", "Option", "Result", "Rc", "Arc",
+                   "HashMap", "HashSet", "BTreeMap", "BTreeSet"] {
+            items.push(
+                CompletionItem::new(ty.to_string())
+                    .with_kind(CompletionItemKind::Struct)
+                    .with_sort_text(format!("1_{}", ty))
+            );
+        }
+        
+        // User-defined types
+        if let Some(info) = type_info {
+            for name in info.structs.keys() {
+                items.push(
+                    CompletionItem::struct_item(name)
+                        .with_sort_text(format!("2_{}", name))
+                );
+            }
+            for name in info.enums.keys() {
+                items.push(
+                    CompletionItem::enum_item(name)
+                        .with_sort_text(format!("2_{}", name))
+                );
+            }
+        }
+        
+        items
+    }
+    
+    fn complete_use(&self) -> Vec<CompletionItem> {
+        let mut items = Vec::new();
+        
+        items.push(CompletionItem::new("std".to_string()).with_kind(CompletionItemKind::Module));
+        items.push(CompletionItem::new("core".to_string()).with_kind(CompletionItemKind::Module));
+        items.push(CompletionItem::new("alloc".to_string()).with_kind(CompletionItemKind::Module));
+        items.push(CompletionItem::new("crate".to_string()).with_kind(CompletionItemKind::Keyword));
+        items.push(CompletionItem::new("self".to_string()).with_kind(CompletionItemKind::Keyword));
+        items.push(CompletionItem::new("super".to_string()).with_kind(CompletionItemKind::Keyword));
+        
+        items
+    }
+    
+    fn complete_normal(
+        &self,
+        prefix: &str,
+        doc: &Document,
+        pos: Position,
+        type_info: Option<&TypeInfo>,
+    ) -> Vec<CompletionItem> {
+        let mut items = Vec::new();
+        
+        // Keywords
+        items.extend(self.keywords.iter().filter(|k| {
+            prefix.is_empty() || k.label.starts_with(prefix)
+        }).cloned());
+        
+        // Snippets
+        items.extend(self.snippets.iter().filter(|s| {
+            prefix.is_empty() || s.label.starts_with(prefix)
+        }).cloned());
+        
+        // Local variables from type_info
+        if let Some(info) = type_info {
+            for entry in info.variables.values() {
+                if prefix.is_empty() || entry.name.starts_with(prefix) {
+                    items.push(
+                        CompletionItem::variable(&entry.name, &entry.ty)
+                            .with_sort_text(format!("1_{}", entry.name))
+                    );
+                }
+            }
+            
+            // Functions
+            for (name, sig) in &info.functions {
+                if prefix.is_empty() || name.starts_with(prefix) {
+                    items.push(
+                        CompletionItem::function(name, &format_signature(sig))
+                            .with_sort_text(format!("2_{}", name))
+                    );
+                }
+            }
+            
+            // Types
+            for name in info.structs.keys() {
+                if prefix.is_empty() || name.starts_with(prefix) {
+                    items.push(
+                        CompletionItem::struct_item(name)
+                            .with_sort_text(format!("3_{}", name))
+                    );
+                }
+            }
+            for name in info.enums.keys() {
+                if prefix.is_empty() || name.starts_with(prefix) {
+                    items.push(
+                        CompletionItem::enum_item(name)
+                            .with_sort_text(format!("3_{}", name))
+                    );
+                }
+            }
+        }
+        
+        // Built-in functions
+        let builtins = [
+            ("println", "fn println(args: impl Display)"),
+            ("print", "fn print(args: impl Display)"),
+            ("format", "fn format(args: Arguments) -> String"),
+            ("panic", "fn panic(msg: &str) -> !"),
+            ("assert", "fn assert(condition: bool)"),
+            ("assert_eq", "fn assert_eq(left: T, right: T)"),
+            ("dbg", "macro dbg!(expr)"),
+            ("todo", "macro todo!()"),
+            ("unreachable", "macro unreachable!()"),
+            ("drop", "fn drop<T>(value: T)"),
+            ("clone", "fn clone<T: Clone>(value: &T) -> T"),
+        ];
+        
+        for (name, sig) in builtins {
+            if prefix.is_empty() || name.starts_with(prefix) {
+                items.push(
+                    CompletionItem::function(name, sig)
+                        .with_sort_text(format!("4_{}", name))
+                );
+            }
+        }
+        
+        items
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HOVER
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Provide hover information at a position
+    pub fn hover(
+        &self,
+        doc: &Document,
+        pos: Position,
+        type_info: Option<&TypeInfo>,
+    ) -> Option<Hover> {
+        let (word, range) = doc.word_at(pos)?;
+        
+        // Check keywords
+        let keyword_info = self.get_keyword_hover(word);
+        if let Some(info) = keyword_info {
+            return Some(Hover::new(info).with_range(range));
+        }
+        
+        // Check type_info
+        if let Some(info) = type_info {
+            // Check variables
+            if let Some(entry) = info.variables.get(word) {
+                let hover_text = format!(
+                    "```quanta\n{}{}: {}\n```",
+                    if entry.mutable { "let mut " } else { "let " },
+                    entry.name,
+                    entry.ty
+                );
+                return Some(Hover::new(hover_text).with_range(range));
+            }
+            
+            // Check functions
+            if let Some(sig) = info.functions.get(word) {
+                let mut hover_text = format!("```quanta\n{}\n```", format_signature(sig));
+                if let Some(ref doc) = sig.doc {
+                    hover_text.push_str(&format!("\n\n{}", doc));
+                }
+                return Some(Hover::new(hover_text).with_range(range));
+            }
+            
+            // Check structs
+            if let Some(def) = info.structs.get(word) {
+                let mut hover_text = format!("```quanta\nstruct {} {{\n", def.name);
+                for (name, ty) in &def.fields {
+                    hover_text.push_str(&format!("    {}: {},\n", name, ty));
+                }
+                hover_text.push_str("}\n```");
+                if let Some(ref doc) = def.doc {
+                    hover_text.push_str(&format!("\n\n{}", doc));
+                }
+                return Some(Hover::new(hover_text).with_range(range));
+            }
+            
+            // Check enums
+            if let Some(def) = info.enums.get(word) {
+                let mut hover_text = format!("```quanta\nenum {} {{\n", def.name);
+                for variant in &def.variants {
+                    hover_text.push_str(&format!("    {},\n", variant.name));
+                }
+                hover_text.push_str("}\n```");
+                if let Some(ref doc) = def.doc {
+                    hover_text.push_str(&format!("\n\n{}", doc));
+                }
+                return Some(Hover::new(hover_text).with_range(range));
+            }
+        }
+        
+        // Check stdlib
+        if let Some(info) = self.stdlib.get_type_info(word) {
+            return Some(Hover::new(info).with_range(range));
+        }
+        
+        None
+    }
+    
+    fn get_keyword_hover(&self, word: &str) -> Option<String> {
+        let info = match word {
+            "fn" => "**fn** - Defines a function\n\n```quanta\nfn name(params) -> ReturnType { body }\n```",
+            "let" => "**let** - Declares a variable binding\n\n```quanta\nlet x = value;\nlet mut y = mutable_value;\n```",
+            "mut" => "**mut** - Makes a binding mutable\n\n```quanta\nlet mut x = 5;\nx = 10; // OK\n```",
+            "const" => "**const** - Defines a compile-time constant\n\n```quanta\nconst PI: f64 = 3.14159;\n```",
+            "static" => "**static** - Defines a static variable with 'static lifetime\n\n```quanta\nstatic GREETING: &str = \"Hello\";\n```",
+            "struct" => "**struct** - Defines a structure type\n\n```quanta\nstruct Point { x: i32, y: i32 }\n```",
+            "enum" => "**enum** - Defines an enumeration type\n\n```quanta\nenum Color { Red, Green, Blue }\n```",
+            "trait" => "**trait** - Defines a trait (interface)\n\n```quanta\ntrait Display { fn fmt(&self) -> String; }\n```",
+            "impl" => "**impl** - Implements methods or traits\n\n```quanta\nimpl Point { fn new() -> Self { ... } }\nimpl Display for Point { ... }\n```",
+            "pub" => "**pub** - Makes an item public\n\n```quanta\npub fn public_function() { }\npub struct PublicStruct { }\n```",
+            "use" => "**use** - Imports items into scope\n\n```quanta\nuse std::collections::HashMap;\nuse crate::module::Item;\n```",
+            "mod" => "**mod** - Declares a module\n\n```quanta\nmod submodule;\nmod inline { /* contents */ }\n```",
+            "if" => "**if** - Conditional expression\n\n```quanta\nif condition { then_branch } else { else_branch }\n```",
+            "else" => "**else** - Alternative branch for if/match\n\n```quanta\nif condition { ... } else { ... }\n```",
+            "match" => "**match** - Pattern matching expression\n\n```quanta\nmatch value {\n    pattern => expr,\n    _ => default,\n}\n```",
+            "for" => "**for** - Iterator loop\n\n```quanta\nfor item in iterator { body }\n```",
+            "while" => "**while** - Conditional loop\n\n```quanta\nwhile condition { body }\n```",
+            "loop" => "**loop** - Infinite loop (use break to exit)\n\n```quanta\nloop { if done { break value; } }\n```",
+            "return" => "**return** - Returns from a function\n\n```quanta\nreturn value;\n```",
+            "break" => "**break** - Exits a loop, optionally with a value\n\n```quanta\nbreak;\nbreak 'label value;\n```",
+            "continue" => "**continue** - Skips to next loop iteration\n\n```quanta\ncontinue;\ncontinue 'label;\n```",
+            "self" => "**self** - The current instance in methods\n\n```quanta\nfn method(&self) { self.field }\n```",
+            "Self" => "**Self** - The implementing type in impl blocks\n\n```quanta\nimpl Type { fn new() -> Self { ... } }\n```",
+            "async" => "**async** - Defines an asynchronous function\n\n```quanta\nasync fn fetch() -> Result<Data> { ... }\n```",
+            "await" => "**await** - Awaits an asynchronous operation\n\n```quanta\nlet result = future.await;\n```",
+            "unsafe" => "**unsafe** - Allows unsafe operations\n\n```quanta\nunsafe { /* raw pointer ops */ }\n```",
+            "where" => "**where** - Specifies trait bounds\n\n```quanta\nfn func<T>() where T: Display { }\n```",
+            _ => return None,
+        };
+        
+        Some(info.to_string())
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GO TO DEFINITION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Find definition of symbol at position
+    pub fn goto_definition(
+        &self,
+        doc: &Document,
+        pos: Position,
+        type_info: Option<&TypeInfo>,
+    ) -> Option<Location> {
+        let (word, _) = doc.word_at(pos)?;
+        
+        if let Some(info) = type_info {
+            // Check variables
+            if let Some(entry) = info.variables.get(word) {
+                return Some(Location::new(doc.uri.clone(), entry.range));
+            }
+            
+            // Check functions
+            if let Some(sig) = info.functions.get(word) {
+                return Some(Location::new(doc.uri.clone(), sig.range));
+            }
+            
+            // Check structs
+            if let Some(def) = info.structs.get(word) {
+                return Some(Location::new(doc.uri.clone(), def.range));
+            }
+            
+            // Check enums
+            if let Some(def) = info.enums.get(word) {
+                return Some(Location::new(doc.uri.clone(), def.range));
+            }
+            
+            // Check traits
+            if let Some(def) = info.traits.get(word) {
+                return Some(Location::new(doc.uri.clone(), def.range));
+            }
+        }
+        
+        None
+    }
+    
+    /// Find all references to symbol at position
+    pub fn find_references(
+        &self,
+        doc: &Document,
+        pos: Position,
+        type_info: Option<&TypeInfo>,
+        include_declaration: bool,
+    ) -> Vec<Location> {
+        let mut locations = Vec::new();
+        
+        let (word, _) = match doc.word_at(pos) {
+            Some(w) => w,
+            None => return locations,
+        };
+        
+        // Simple text search for references
+        for (line_num, line) in doc.text.lines().enumerate() {
+            let mut search_start = 0;
+            while let Some(col) = line[search_start..].find(word) {
+                let actual_col = search_start + col;
+                
+                // Check word boundaries
+                let before_ok = actual_col == 0 || 
+                    !line.chars().nth(actual_col - 1).map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false);
+                let after_ok = actual_col + word.len() >= line.len() ||
+                    !line.chars().nth(actual_col + word.len()).map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false);
+                
+                if before_ok && after_ok {
+                    let range = Range::new(
+                        Position::new(line_num as u32, actual_col as u32),
+                        Position::new(line_num as u32, (actual_col + word.len()) as u32),
+                    );
+                    locations.push(Location::new(doc.uri.clone(), range));
+                }
+                
+                search_start = actual_col + word.len();
+            }
+        }
+        
+        // Remove declaration if not included
+        if !include_declaration {
+            if let Some(info) = type_info {
+                if let Some(entry) = info.variables.get(word) {
+                    locations.retain(|loc| loc.range != entry.range);
+                }
+                if let Some(sig) = info.functions.get(word) {
+                    locations.retain(|loc| loc.range != sig.range);
+                }
+            }
+        }
+        
+        locations
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DOCUMENT SYMBOLS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Get document symbols (outline)
+    pub fn document_symbols(
+        &self,
+        doc: &Document,
+        type_info: Option<&TypeInfo>,
+    ) -> Vec<DocumentSymbol> {
+        let mut symbols = Vec::new();
+        
+        if let Some(info) = type_info {
+            // Functions
+            for (name, sig) in &info.functions {
+                let detail = format!(
+                    "({}) -> {}",
+                    sig.params.iter().map(|(n, t)| format!("{}: {}", n, t)).collect::<Vec<_>>().join(", "),
+                    sig.return_type
+                );
+                symbols.push(
+                    DocumentSymbol::new(
+                        name.clone(),
+                        SymbolKind::Function,
+                        sig.range,
+                        sig.range, // TODO: compute name range
+                    ).with_detail(detail)
+                );
+            }
+            
+            // Structs
+            for (name, def) in &info.structs {
+                let mut children = Vec::new();
+                for (field_name, field_type) in &def.fields {
+                    children.push(
+                        DocumentSymbol::new(
+                            field_name.clone(),
+                            SymbolKind::Field,
+                            def.range, // TODO: compute field range
+                            def.range,
+                        ).with_detail(field_type.clone())
+                    );
+                }
+                symbols.push(
+                    DocumentSymbol::new(
+                        name.clone(),
+                        SymbolKind::Struct,
+                        def.range,
+                        def.range,
+                    ).with_children(children)
+                );
+            }
+            
+            // Enums
+            for (name, def) in &info.enums {
+                let mut children = Vec::new();
+                for variant in &def.variants {
+                    children.push(
+                        DocumentSymbol::new(
+                            variant.name.clone(),
+                            SymbolKind::EnumMember,
+                            def.range, // TODO: compute variant range
+                            def.range,
+                        )
+                    );
+                }
+                symbols.push(
+                    DocumentSymbol::new(
+                        name.clone(),
+                        SymbolKind::Enum,
+                        def.range,
+                        def.range,
+                    ).with_children(children)
+                );
+            }
+            
+            // Traits
+            for (name, def) in &info.traits {
+                let mut children = Vec::new();
+                for method in &def.methods {
+                    children.push(
+                        DocumentSymbol::new(
+                            method.name.clone(),
+                            SymbolKind::Method,
+                            method.range,
+                            method.range,
+                        )
+                    );
+                }
+                symbols.push(
+                    DocumentSymbol::new(
+                        name.clone(),
+                        SymbolKind::Interface,
+                        def.range,
+                        def.range,
+                    ).with_children(children)
+                );
+            }
+        }
+        
+        symbols
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SIGNATURE HELP
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Provide signature help at a position
+    pub fn signature_help(
+        &self,
+        doc: &Document,
+        pos: Position,
+        type_info: Option<&TypeInfo>,
+    ) -> Option<SignatureHelp> {
+        let line = doc.line(pos.line as usize)?;
+        let before_cursor = &line[..pos.character as usize];
+        
+        // Find the function call
+        let (func_name, param_index) = self.find_call_context(before_cursor)?;
+        
+        // Look up function signature
+        let sig = if let Some(info) = type_info {
+            info.functions.get(&func_name).cloned()
+        } else {
+            None
+        };
+        
+        let sig = sig.or_else(|| self.stdlib.get_function(&func_name))?;
+        
+        let params: Vec<ParameterInformation> = sig.params.iter()
+            .map(|(name, ty)| ParameterInformation {
+                label: format!("{}: {}", name, ty),
+                documentation: None,
+            })
+            .collect();
+        
+        let signature = SignatureInformation {
+            label: format_signature(&sig),
+            documentation: sig.doc.clone(),
+            parameters: params,
+            active_parameter: Some(param_index),
+        };
+        
+        Some(SignatureHelp {
+            signatures: vec![signature],
+            active_signature: Some(0),
+            active_parameter: Some(param_index),
+        })
+    }
+    
+    fn find_call_context(&self, text: &str) -> Option<(String, u32)> {
+        let mut paren_depth = 0;
+        let mut comma_count = 0u32;
+        let mut func_end = None;
+        
+        for (i, c) in text.char_indices().rev() {
+            match c {
+                ')' => paren_depth += 1,
+                '(' => {
+                    if paren_depth == 0 {
+                        func_end = Some(i);
+                        break;
+                    }
+                    paren_depth -= 1;
+                }
+                ',' if paren_depth == 0 => comma_count += 1,
+                _ => {}
+            }
+        }
+        
+        let func_end = func_end?;
+        
+        // Extract function name
+        let before_paren = &text[..func_end];
+        let func_start = before_paren.rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        
+        let func_name = before_paren[func_start..].to_string();
+        
+        if func_name.is_empty() {
+            return None;
+        }
+        
+        Some((func_name, comma_count))
+    }
+}
+
+impl Default for AnalysisEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPLETION CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+enum CompletionContext {
+    /// After a dot (method/field access)
+    DotAccess { receiver_type: String },
+    /// After :: (path access)
+    DoubleColon { path: String },
+    /// In type position
+    Type,
+    /// In use statement
+    Use,
+    /// Normal context
+    Normal { prefix: String },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STDLIB INFO
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct StdlibInfo {
+    types: HashMap<String, String>,
+    functions: HashMap<String, FunctionSig>,
+}
+
+impl StdlibInfo {
+    fn new() -> Self {
+        let mut info = StdlibInfo {
+            types: HashMap::new(),
+            functions: HashMap::new(),
+        };
+        
+        // Add type documentation
+        info.types.insert("i32".to_string(), "**i32** - 32-bit signed integer\n\nRange: -2,147,483,648 to 2,147,483,647".to_string());
+        info.types.insert("i64".to_string(), "**i64** - 64-bit signed integer\n\nRange: -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807".to_string());
+        info.types.insert("u32".to_string(), "**u32** - 32-bit unsigned integer\n\nRange: 0 to 4,294,967,295".to_string());
+        info.types.insert("u64".to_string(), "**u64** - 64-bit unsigned integer\n\nRange: 0 to 18,446,744,073,709,551,615".to_string());
+        info.types.insert("f32".to_string(), "**f32** - 32-bit floating point number (IEEE 754)".to_string());
+        info.types.insert("f64".to_string(), "**f64** - 64-bit floating point number (IEEE 754)".to_string());
+        info.types.insert("bool".to_string(), "**bool** - Boolean type\n\nValues: `true` or `false`".to_string());
+        info.types.insert("char".to_string(), "**char** - Unicode scalar value (4 bytes)".to_string());
+        info.types.insert("str".to_string(), "**str** - String slice (UTF-8 encoded)".to_string());
+        info.types.insert("String".to_string(), "**String** - Owned, growable UTF-8 string\n\n```quanta\nlet s = String::from(\"hello\");\nlet s = \"hello\".to_string();\n```".to_string());
+        info.types.insert("Vec".to_string(), "**Vec<T>** - Growable array type\n\n```quanta\nlet v: Vec<i32> = Vec::new();\nlet v = vec![1, 2, 3];\n```".to_string());
+        info.types.insert("Option".to_string(), "**Option<T>** - Optional value\n\n```quanta\nenum Option<T> {\n    Some(T),\n    None,\n}\n```".to_string());
+        info.types.insert("Result".to_string(), "**Result<T, E>** - Result of a computation that may fail\n\n```quanta\nenum Result<T, E> {\n    Ok(T),\n    Err(E),\n}\n```".to_string());
+        info.types.insert("Box".to_string(), "**Box<T>** - Heap-allocated value\n\n```quanta\nlet b = Box::new(5);\n```".to_string());
+        info.types.insert("Rc".to_string(), "**Rc<T>** - Reference-counted pointer (single-threaded)\n\n```quanta\nuse std::rc::Rc;\nlet rc = Rc::new(5);\nlet rc2 = Rc::clone(&rc);\n```".to_string());
+        info.types.insert("Arc".to_string(), "**Arc<T>** - Atomically reference-counted pointer (thread-safe)\n\n```quanta\nuse std::sync::Arc;\nlet arc = Arc::new(5);\nlet arc2 = Arc::clone(&arc);\n```".to_string());
+        
+        // Add function signatures
+        info.functions.insert("println".to_string(), FunctionSig {
+            name: "println".to_string(),
+            params: vec![("args".to_string(), "impl Display".to_string())],
+            return_type: "()".to_string(),
+            doc: Some("Prints to standard output with a newline.".to_string()),
+            range: Range::default(),
+        });
+        
+        info.functions.insert("print".to_string(), FunctionSig {
+            name: "print".to_string(),
+            params: vec![("args".to_string(), "impl Display".to_string())],
+            return_type: "()".to_string(),
+            doc: Some("Prints to standard output without a newline.".to_string()),
+            range: Range::default(),
+        });
+        
+        info.functions.insert("format".to_string(), FunctionSig {
+            name: "format".to_string(),
+            params: vec![("args".to_string(), "Arguments".to_string())],
+            return_type: "String".to_string(),
+            doc: Some("Creates a String using interpolation of runtime expressions.".to_string()),
+            range: Range::default(),
+        });
+        
+        info
+    }
+    
+    fn get_type_info(&self, name: &str) -> Option<String> {
+        self.types.get(name).cloned()
+    }
+    
+    fn get_function(&self, name: &str) -> Option<FunctionSig> {
+        self.functions.get(name).cloned()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn format_signature(sig: &FunctionSig) -> String {
+    let params = sig.params.iter()
+        .map(|(name, ty)| format!("{}: {}", name, ty))
+        .collect::<Vec<_>>()
+        .join(", ");
+    
+    format!("fn {}({}) -> {}", sig.name, params, sig.return_type)
+}

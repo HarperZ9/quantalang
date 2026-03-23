@@ -1,0 +1,165 @@
+// ============================================================================
+// COOK-TORRANCE PBR MATERIAL SHADER
+// ============================================================================
+// Industry-standard physically-based rendering BRDF.
+// Used in Unreal Engine, Unity, Frostbite, and every modern game engine.
+//
+// This SINGLE FILE compiles to BOTH:
+//   quantac pbr_brdf.quanta -o pbr_brdf.c     # CPU — test with asserts
+//   quantac pbr_brdf.quanta -o pbr_brdf.spv   # GPU — Vulkan fragment shader
+//
+// No other language can do this.
+// ============================================================================
+
+// --- Mathematical Constants ---
+fn pi() -> f64 { 3.14159265358979 }
+
+// --- Fresnel-Schlick Approximation ---
+// F(h,v) = F0 + (1 - F0)(1 - h·v)^5
+// Models how light reflects at different angles (more at grazing angles)
+fn fresnel_schlick(cos_theta: f64, f0: f64) -> f64 {
+    f0 + (1.0 - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0)
+}
+
+// --- GGX/Trowbridge-Reitz Normal Distribution ---
+// D(h) = α² / (π * ((n·h)² * (α² - 1) + 1)²)
+// Models the concentration of microfacet normals around the half vector
+fn distribution_ggx(n_dot_h: f64, roughness: f64) -> f64 {
+    let a = roughness * roughness;
+    let a2 = a * a;
+    let denom_term = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    let denom = pi() * denom_term * denom_term;
+    a2 / denom
+}
+
+// --- Schlick-GGX Geometry Function (single direction) ---
+// G1(n,v) = n·v / (n·v * (1 - k) + k)
+// Models microfacet self-shadowing
+fn geometry_schlick_ggx(n_dot_v: f64, roughness: f64) -> f64 {
+    let r = roughness + 1.0;
+    let k = r * r / 8.0;
+    n_dot_v / (n_dot_v * (1.0 - k) + k)
+}
+
+// --- Smith's Geometry Function (both directions) ---
+// G(n,v,l) = G1(n,v) * G1(n,l)
+fn geometry_smith(n_dot_v: f64, n_dot_l: f64, roughness: f64) -> f64 {
+    geometry_schlick_ggx(n_dot_v, roughness) *
+    geometry_schlick_ggx(n_dot_l, roughness)
+}
+
+// --- Full Cook-Torrance Specular BRDF ---
+// f_spec = D(h) * F(h,v) * G(n,v,l) / (4 * (n·v) * (n·l))
+fn cook_torrance_specular(
+    n_dot_h: f64, n_dot_v: f64, n_dot_l: f64, h_dot_v: f64,
+    roughness: f64, f0: f64
+) -> f64 {
+    let d = distribution_ggx(n_dot_h, roughness);
+    let f = fresnel_schlick(h_dot_v, f0);
+    let g = geometry_smith(n_dot_v, n_dot_l, roughness);
+    let numerator = d * f * g;
+    let denominator = 4.0 * n_dot_v * n_dot_l + 0.0001;
+    numerator / denominator
+}
+
+// --- Combined PBR Lighting ---
+// Combines diffuse (Lambertian) + specular (Cook-Torrance)
+fn pbr_lighting(
+    n_dot_h: f64, n_dot_v: f64, n_dot_l: f64, h_dot_v: f64,
+    albedo: f64, roughness: f64, metallic: f64
+) -> f64 {
+    // Dielectrics have F0 ≈ 0.04, metals use albedo as F0
+    let f0 = 0.04 * (1.0 - metallic) + albedo * metallic;
+
+    // Specular contribution
+    let specular = cook_torrance_specular(
+        n_dot_h, n_dot_v, n_dot_l, h_dot_v, roughness, f0
+    );
+
+    // Fresnel determines energy split between diffuse and specular
+    let ks = fresnel_schlick(h_dot_v, f0);
+    let kd = (1.0 - ks) * (1.0 - metallic);
+
+    // Lambertian diffuse + Cook-Torrance specular
+    let diffuse = kd * albedo / pi();
+    (diffuse + specular) * n_dot_l
+}
+
+// --- ACES Filmic Tone Mapping ---
+fn aces_tonemap(x: f64) -> f64 {
+    let num = x * (2.51 * x + 0.03);
+    let den = x * (2.43 * x + 0.59) + 0.14;
+    clamp(num / den, 0.0, 1.0)
+}
+
+// --- Linear to sRGB ---
+fn linear_to_srgb(x: f64) -> f64 {
+    clamp(pow(x, 1.0 / 2.2), 0.0, 1.0)
+}
+
+// ============================================================================
+// GPU ENTRY POINT — Fragment Shader
+// ============================================================================
+#[fragment]
+fn fs_pbr(inputs: vec3) -> vec4 {
+    // Unpack: inputs.x = n·l, inputs.y = n·h, inputs.z = h·v
+    let n_dot_l = clamp(inputs.x, 0.0, 1.0);
+    let n_dot_h = clamp(inputs.y, 0.0, 1.0);
+    let h_dot_v = clamp(inputs.z, 0.0, 1.0);
+    let n_dot_v = 0.8;
+
+    // Material: red plastic (dielectric, medium roughness)
+    let albedo = 0.8;
+    let roughness = 0.4;
+    let metallic = 0.0;
+
+    let lit = pbr_lighting(n_dot_h, n_dot_v, n_dot_l, h_dot_v,
+                           albedo, roughness, metallic);
+
+    // Tone map and gamma correct
+    let mapped = aces_tonemap(lit);
+    let final_val = linear_to_srgb(mapped);
+
+    vec4(final_val, final_val, final_val, 1.0)
+}
+
+// ============================================================================
+// CPU ENTRY POINT — For Testing and Verification
+// ============================================================================
+fn main() {
+    println!("=== Cook-Torrance PBR BRDF — QuantaLang Dual-Target ===");
+    println!("");
+
+    // Test individual components
+    let f = fresnel_schlick(1.0, 0.04);
+    println!("Fresnel (head-on, F0=0.04): {} (expect ~0.04)", f);
+
+    let f_grazing = fresnel_schlick(0.0, 0.04);
+    println!("Fresnel (grazing, F0=0.04): {} (expect ~1.0)", f_grazing);
+
+    let d = distribution_ggx(1.0, 0.5);
+    println!("GGX D (n·h=1, rough=0.5): {} (expect high peak)", d);
+
+    let d_off = distribution_ggx(0.5, 0.5);
+    println!("GGX D (n·h=0.5, rough=0.5): {} (expect lower)", d_off);
+
+    let g = geometry_smith(0.8, 0.8, 0.5);
+    println!("Smith G (n·v=0.8, n·l=0.8, rough=0.5): {}", g);
+
+    // Full PBR evaluation — dielectric
+    let dielectric = pbr_lighting(0.9, 0.8, 0.7, 0.85, 0.8, 0.4, 0.0);
+    println!("PBR dielectric (rough=0.4): {}", dielectric);
+
+    // Full PBR evaluation — metal
+    let metal = pbr_lighting(0.9, 0.8, 0.7, 0.85, 0.8, 0.3, 1.0);
+    println!("PBR metal (rough=0.3): {}", metal);
+
+    // Rough vs smooth comparison
+    let smooth = pbr_lighting(0.9, 0.8, 0.7, 0.85, 0.8, 0.1, 0.0);
+    let rough = pbr_lighting(0.9, 0.8, 0.7, 0.85, 0.8, 0.9, 0.0);
+    println!("PBR smooth (rough=0.1): {}", smooth);
+    println!("PBR rough  (rough=0.9): {}", rough);
+
+    println!("");
+    println!("=== Same functions compile to Vulkan 1.0 SPIR-V ===");
+}

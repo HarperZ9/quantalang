@@ -1,0 +1,884 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ LSP — Folding, Selection & Inline Completions
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Folding Ranges: Collapsible code regions
+// Selection Ranges: Smart selection expansion
+// Inline Completions: AI-assisted code suggestions
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::lsp::folding
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMMON TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Position in document
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Position {
+    pub line: u32,
+    pub character: u32,
+}
+
+impl Position {
+    pub fn new(line: u32, character: u32) -> Self {
+        Position { line, character }
+    }
+}
+
+/// Range in document
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Range {
+    pub start: Position,
+    pub end: Position,
+}
+
+impl Range {
+    pub fn new(start: Position, end: Position) -> Self {
+        Range { start, end }
+    }
+    
+    pub fn contains(&self, pos: Position) -> bool {
+        pos >= self.start && pos <= self.end
+    }
+    
+    pub fn contains_range(&self, other: &Range) -> bool {
+        self.contains(other.start) && self.contains(other.end)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FOLDING RANGES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Folding range kind
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldingRangeKind {
+    /// Comment block
+    Comment,
+    /// Import statements
+    Imports,
+    /// Code region
+    Region,
+}
+
+/// Folding range
+#[derive(Debug, Clone)]
+pub struct FoldingRange {
+    /// Start line (0-indexed)
+    pub start_line: u32,
+    /// Start character (optional)
+    pub start_character: Option<u32>,
+    /// End line (0-indexed)
+    pub end_line: u32,
+    /// End character (optional)
+    pub end_character: Option<u32>,
+    /// Folding kind
+    pub kind: Option<FoldingRangeKind>,
+    /// Collapsed text (shown when folded)
+    pub collapsed_text: Option<String>,
+}
+
+impl FoldingRange {
+    pub fn new(start_line: u32, end_line: u32) -> Self {
+        FoldingRange {
+            start_line,
+            start_character: None,
+            end_line,
+            end_character: None,
+            kind: None,
+            collapsed_text: None,
+        }
+    }
+    
+    pub fn with_kind(mut self, kind: FoldingRangeKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+    
+    pub fn with_collapsed_text(mut self, text: impl Into<String>) -> Self {
+        self.collapsed_text = Some(text.into());
+        self
+    }
+    
+    pub fn comment(start_line: u32, end_line: u32) -> Self {
+        FoldingRange::new(start_line, end_line)
+            .with_kind(FoldingRangeKind::Comment)
+    }
+    
+    pub fn imports(start_line: u32, end_line: u32) -> Self {
+        FoldingRange::new(start_line, end_line)
+            .with_kind(FoldingRangeKind::Imports)
+            .with_collapsed_text("...")
+    }
+    
+    pub fn region(start_line: u32, end_line: u32, name: Option<String>) -> Self {
+        let mut range = FoldingRange::new(start_line, end_line)
+            .with_kind(FoldingRangeKind::Region);
+        
+        if let Some(n) = name {
+            range.collapsed_text = Some(format!("// {}", n));
+        }
+        
+        range
+    }
+}
+
+/// Folding range provider configuration
+#[derive(Debug, Clone)]
+pub struct FoldingConfig {
+    /// Fold braces (functions, structs, etc.)
+    pub fold_braces: bool,
+    /// Fold comments
+    pub fold_comments: bool,
+    /// Fold imports
+    pub fold_imports: bool,
+    /// Fold region markers
+    pub fold_regions: bool,
+    /// Minimum lines for folding
+    pub min_lines: u32,
+    /// Collapse all by default
+    pub collapse_all: bool,
+}
+
+impl Default for FoldingConfig {
+    fn default() -> Self {
+        FoldingConfig {
+            fold_braces: true,
+            fold_comments: true,
+            fold_imports: true,
+            fold_regions: true,
+            min_lines: 2,
+            collapse_all: false,
+        }
+    }
+}
+
+/// Folding range provider
+pub struct FoldingRangeProvider {
+    config: FoldingConfig,
+}
+
+impl FoldingRangeProvider {
+    pub fn new(config: FoldingConfig) -> Self {
+        FoldingRangeProvider { config }
+    }
+    
+    /// Get folding ranges for document
+    pub fn ranges(&self, analysis: &FoldingAnalysis) -> Vec<FoldingRange> {
+        let mut ranges = Vec::new();
+        
+        // Brace-based folding
+        if self.config.fold_braces {
+            for block in &analysis.blocks {
+                if block.end_line - block.start_line >= self.config.min_lines {
+                    let mut range = FoldingRange::new(block.start_line, block.end_line);
+                    
+                    if let Some(name) = &block.name {
+                        range.collapsed_text = Some(format!("{} {{ ... }}", name));
+                    }
+                    
+                    ranges.push(range);
+                }
+            }
+        }
+        
+        // Comment folding
+        if self.config.fold_comments {
+            for comment in &analysis.comments {
+                if comment.end_line - comment.start_line >= self.config.min_lines {
+                    ranges.push(FoldingRange::comment(comment.start_line, comment.end_line));
+                }
+            }
+        }
+        
+        // Import folding
+        if self.config.fold_imports {
+            if let Some(imports) = &analysis.import_range {
+                if imports.end_line - imports.start_line >= self.config.min_lines {
+                    ranges.push(FoldingRange::imports(imports.start_line, imports.end_line));
+                }
+            }
+        }
+        
+        // Region markers
+        if self.config.fold_regions {
+            for region in &analysis.regions {
+                ranges.push(FoldingRange::region(
+                    region.start_line,
+                    region.end_line,
+                    region.name.clone(),
+                ));
+            }
+        }
+        
+        // Sort by start line
+        ranges.sort_by_key(|r| r.start_line);
+        
+        ranges
+    }
+}
+
+impl Default for FoldingRangeProvider {
+    fn default() -> Self {
+        Self::new(FoldingConfig::default())
+    }
+}
+
+/// Analysis result for folding
+#[derive(Debug, Clone, Default)]
+pub struct FoldingAnalysis {
+    pub blocks: Vec<BlockInfo>,
+    pub comments: Vec<CommentRange>,
+    pub import_range: Option<LineRange>,
+    pub regions: Vec<RegionInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockInfo {
+    pub start_line: u32,
+    pub end_line: u32,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommentRange {
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct LineRange {
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegionInfo {
+    pub start_line: u32,
+    pub end_line: u32,
+    pub name: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SELECTION RANGES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Selection range (hierarchical)
+#[derive(Debug, Clone)]
+pub struct SelectionRange {
+    /// Range for this selection level
+    pub range: Range,
+    /// Parent selection (outer range)
+    pub parent: Option<Box<SelectionRange>>,
+}
+
+impl SelectionRange {
+    pub fn new(range: Range) -> Self {
+        SelectionRange {
+            range,
+            parent: None,
+        }
+    }
+    
+    pub fn with_parent(mut self, parent: SelectionRange) -> Self {
+        self.parent = Some(Box::new(parent));
+        self
+    }
+    
+    /// Build selection chain from innermost to outermost
+    pub fn from_chain(ranges: Vec<Range>) -> Option<Self> {
+        if ranges.is_empty() {
+            return None;
+        }
+        
+        let mut iter = ranges.into_iter().rev();
+        let mut current = SelectionRange::new(iter.next()?);
+        
+        for range in iter {
+            current = SelectionRange::new(range).with_parent(current);
+        }
+        
+        // Reverse so innermost is returned
+        Self::reverse(current)
+    }
+    
+    fn reverse(mut sel: SelectionRange) -> Option<SelectionRange> {
+        let mut stack = vec![];
+        
+        loop {
+            let parent = sel.parent.take();
+            stack.push(sel.range);
+            
+            match parent {
+                Some(p) => sel = *p,
+                None => break,
+            }
+        }
+        
+        Self::from_chain(stack)
+    }
+    
+    /// Get depth of selection hierarchy
+    pub fn depth(&self) -> usize {
+        1 + self.parent.as_ref().map(|p| p.depth()).unwrap_or(0)
+    }
+}
+
+/// Selection range provider
+pub struct SelectionRangeProvider {
+    /// Configuration
+    config: SelectionConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectionConfig {
+    /// Include whitespace
+    pub include_whitespace: bool,
+    /// Expand to line on single word
+    pub expand_to_line: bool,
+}
+
+impl Default for SelectionConfig {
+    fn default() -> Self {
+        SelectionConfig {
+            include_whitespace: false,
+            expand_to_line: true,
+        }
+    }
+}
+
+impl SelectionRangeProvider {
+    pub fn new(config: SelectionConfig) -> Self {
+        SelectionRangeProvider { config }
+    }
+    
+    /// Get selection range at position
+    pub fn selection_at(&self, pos: Position, analysis: &SelectionAnalysis) -> SelectionRange {
+        // Find all ranges containing position, from innermost to outermost
+        let mut containing: Vec<Range> = analysis.ranges.iter()
+            .filter(|r| r.contains(pos))
+            .cloned()
+            .collect();
+        
+        // Sort by size (smallest first = innermost)
+        containing.sort_by_key(|r| {
+            let lines = r.end.line - r.start.line;
+            let chars = if lines == 0 {
+                r.end.character - r.start.character
+            } else {
+                0
+            };
+            (lines, chars)
+        });
+        
+        // Build chain
+        SelectionRange::from_chain(containing).unwrap_or_else(|| {
+            // Fallback: word at position
+            SelectionRange::new(Range::new(pos, pos))
+        })
+    }
+    
+    /// Get selection ranges for multiple positions
+    pub fn selections_at(
+        &self,
+        positions: &[Position],
+        analysis: &SelectionAnalysis,
+    ) -> Vec<SelectionRange> {
+        positions.iter()
+            .map(|&pos| self.selection_at(pos, analysis))
+            .collect()
+    }
+}
+
+impl Default for SelectionRangeProvider {
+    fn default() -> Self {
+        Self::new(SelectionConfig::default())
+    }
+}
+
+/// Analysis for selection ranges
+#[derive(Debug, Clone, Default)]
+pub struct SelectionAnalysis {
+    /// All ranges (tokens, expressions, statements, blocks)
+    pub ranges: Vec<Range>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INLINE COMPLETIONS (AI-Assisted)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Inline completion item
+#[derive(Debug, Clone)]
+pub struct InlineCompletionItem {
+    /// Text to insert
+    pub insert_text: String,
+    /// Range to replace (None = insert at cursor)
+    pub range: Option<Range>,
+    /// Command to execute after insert
+    pub command: Option<InlineCommand>,
+    /// Filter text for matching
+    pub filter_text: Option<String>,
+}
+
+impl InlineCompletionItem {
+    pub fn new(insert_text: impl Into<String>) -> Self {
+        InlineCompletionItem {
+            insert_text: insert_text.into(),
+            range: None,
+            command: None,
+            filter_text: None,
+        }
+    }
+    
+    pub fn with_range(mut self, range: Range) -> Self {
+        self.range = Some(range);
+        self
+    }
+    
+    pub fn with_filter(mut self, filter: impl Into<String>) -> Self {
+        self.filter_text = Some(filter.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InlineCommand {
+    pub command: String,
+    pub arguments: Vec<String>,
+}
+
+/// Inline completion list
+#[derive(Debug, Clone)]
+pub struct InlineCompletionList {
+    pub items: Vec<InlineCompletionItem>,
+}
+
+/// Inline completion trigger kind
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineCompletionTriggerKind {
+    /// User explicitly requested
+    Invoked,
+    /// Triggered automatically
+    Automatic,
+}
+
+/// Inline completion context
+#[derive(Debug, Clone)]
+pub struct InlineCompletionContext {
+    /// How completion was triggered
+    pub trigger_kind: InlineCompletionTriggerKind,
+    /// Selected completion (for partial accept)
+    pub selected_completion_info: Option<SelectedCompletionInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedCompletionInfo {
+    pub range: Range,
+    pub text: String,
+}
+
+/// Inline completion provider (AI-assisted)
+pub struct InlineCompletionProvider {
+    /// Configuration
+    config: InlineCompletionConfig,
+    /// AI model interface
+    ai_model: Arc<dyn AiCompletionModel>,
+    /// Context window size
+    context_lines: usize,
+}
+
+/// AI completion model trait
+pub trait AiCompletionModel: Send + Sync {
+    /// Generate completion given context
+    fn complete(&self, context: &CompletionContext) -> Vec<String>;
+    
+    /// Get model name
+    fn name(&self) -> &str;
+}
+
+/// Completion context for AI
+#[derive(Debug, Clone)]
+pub struct CompletionContext {
+    /// Code before cursor
+    pub prefix: String,
+    /// Code after cursor
+    pub suffix: String,
+    /// Current file path
+    pub file_path: String,
+    /// Language
+    pub language: String,
+    /// Additional context (imports, types, etc.)
+    pub additional_context: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InlineCompletionConfig {
+    /// Enable AI completions
+    pub enabled: bool,
+    /// Maximum suggestions
+    pub max_suggestions: usize,
+    /// Minimum prefix length to trigger
+    pub min_prefix: usize,
+    /// Debounce delay (ms)
+    pub debounce_ms: u64,
+    /// Show ghost text
+    pub ghost_text: bool,
+    /// Include imports suggestions
+    pub suggest_imports: bool,
+}
+
+impl Default for InlineCompletionConfig {
+    fn default() -> Self {
+        InlineCompletionConfig {
+            enabled: true,
+            max_suggestions: 3,
+            min_prefix: 2,
+            debounce_ms: 200,
+            ghost_text: true,
+            suggest_imports: true,
+        }
+    }
+}
+
+impl InlineCompletionProvider {
+    pub fn new(config: InlineCompletionConfig, ai_model: Arc<dyn AiCompletionModel>) -> Self {
+        InlineCompletionProvider {
+            config,
+            ai_model,
+            context_lines: 50,
+        }
+    }
+    
+    /// Provide inline completions
+    pub fn completions(
+        &self,
+        position: Position,
+        context: &InlineCompletionContext,
+        document: &DocumentContent,
+    ) -> InlineCompletionList {
+        if !self.config.enabled {
+            return InlineCompletionList { items: vec![] };
+        }
+        
+        // Build context
+        let completion_context = self.build_context(position, document);
+        
+        // Check minimum prefix
+        let last_line = completion_context.prefix.lines().last().unwrap_or("");
+        if last_line.trim().len() < self.config.min_prefix {
+            return InlineCompletionList { items: vec![] };
+        }
+        
+        // Get AI completions
+        let suggestions = self.ai_model.complete(&completion_context);
+        
+        // Convert to items
+        let items: Vec<_> = suggestions.into_iter()
+            .take(self.config.max_suggestions)
+            .map(|text| InlineCompletionItem::new(text))
+            .collect();
+        
+        InlineCompletionList { items }
+    }
+    
+    fn build_context(&self, position: Position, document: &DocumentContent) -> CompletionContext {
+        let lines: Vec<&str> = document.content.lines().collect();
+        let line_idx = position.line as usize;
+        
+        // Get prefix (lines before + partial current line)
+        let prefix_start = line_idx.saturating_sub(self.context_lines);
+        let mut prefix = String::new();
+        
+        for i in prefix_start..line_idx {
+            if i < lines.len() {
+                prefix.push_str(lines[i]);
+                prefix.push('\n');
+            }
+        }
+        
+        // Add partial current line
+        if line_idx < lines.len() {
+            let line = lines[line_idx];
+            let char_idx = (position.character as usize).min(line.len());
+            prefix.push_str(&line[..char_idx]);
+        }
+        
+        // Get suffix (rest of current line + lines after)
+        let mut suffix = String::new();
+        
+        if line_idx < lines.len() {
+            let line = lines[line_idx];
+            let char_idx = (position.character as usize).min(line.len());
+            suffix.push_str(&line[char_idx..]);
+            suffix.push('\n');
+        }
+        
+        let suffix_end = (line_idx + self.context_lines).min(lines.len());
+        for i in (line_idx + 1)..suffix_end {
+            suffix.push_str(lines[i]);
+            suffix.push('\n');
+        }
+        
+        CompletionContext {
+            prefix,
+            suffix,
+            file_path: document.path.clone(),
+            language: "quanta".to_string(),
+            additional_context: vec![],
+        }
+    }
+}
+
+/// Document content
+#[derive(Debug, Clone)]
+pub struct DocumentContent {
+    pub path: String,
+    pub content: String,
+}
+
+/// Simple pattern-based completion model (fallback)
+pub struct PatternCompletionModel {
+    patterns: Vec<CompletionPattern>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionPattern {
+    trigger: String,
+    completion: String,
+}
+
+impl PatternCompletionModel {
+    pub fn new() -> Self {
+        let patterns = vec![
+            CompletionPattern {
+                trigger: "fn ".to_string(),
+                completion: "fn name() {\n    \n}".to_string(),
+            },
+            CompletionPattern {
+                trigger: "if ".to_string(),
+                completion: "if condition {\n    \n}".to_string(),
+            },
+            CompletionPattern {
+                trigger: "for ".to_string(),
+                completion: "for item in collection {\n    \n}".to_string(),
+            },
+            CompletionPattern {
+                trigger: "match ".to_string(),
+                completion: "match value {\n    _ => {},\n}".to_string(),
+            },
+            CompletionPattern {
+                trigger: "struct ".to_string(),
+                completion: "struct Name {\n    \n}".to_string(),
+            },
+            CompletionPattern {
+                trigger: "impl ".to_string(),
+                completion: "impl Type {\n    \n}".to_string(),
+            },
+            CompletionPattern {
+                trigger: "pub fn ".to_string(),
+                completion: "pub fn name() {\n    \n}".to_string(),
+            },
+            CompletionPattern {
+                trigger: "#[test]".to_string(),
+                completion: "#[test]\nfn test_name() {\n    \n}".to_string(),
+            },
+        ];
+        
+        PatternCompletionModel { patterns }
+    }
+}
+
+impl Default for PatternCompletionModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AiCompletionModel for PatternCompletionModel {
+    fn complete(&self, context: &CompletionContext) -> Vec<String> {
+        let last_line = context.prefix.lines().last().unwrap_or("");
+        let trimmed = last_line.trim();
+        
+        self.patterns.iter()
+            .filter(|p| p.trigger.starts_with(trimmed) && trimmed.len() > 0)
+            .map(|p| p.completion[trimmed.len()..].to_string())
+            .take(3)
+            .collect()
+    }
+    
+    fn name(&self) -> &str {
+        "pattern"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINKED EDITING RANGES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Linked editing ranges (for renaming)
+#[derive(Debug, Clone)]
+pub struct LinkedEditingRanges {
+    /// Linked ranges
+    pub ranges: Vec<Range>,
+    /// Word pattern regex
+    pub word_pattern: Option<String>,
+}
+
+/// Linked editing provider
+pub struct LinkedEditingProvider;
+
+impl LinkedEditingProvider {
+    pub fn new() -> Self {
+        LinkedEditingProvider
+    }
+    
+    /// Get linked editing ranges at position
+    pub fn ranges_at(&self, position: Position, analysis: &LinkedEditingAnalysis) -> Option<LinkedEditingRanges> {
+        // Find symbol at position
+        for symbol in &analysis.symbols {
+            if symbol.definition.contains(position) || 
+               symbol.references.iter().any(|r| r.contains(position)) 
+            {
+                let mut ranges = vec![symbol.definition];
+                ranges.extend(symbol.references.iter().cloned());
+                
+                return Some(LinkedEditingRanges {
+                    ranges,
+                    word_pattern: Some(r"\b\w+\b".to_string()),
+                });
+            }
+        }
+        
+        None
+    }
+}
+
+impl Default for LinkedEditingProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Analysis for linked editing
+#[derive(Debug, Clone, Default)]
+pub struct LinkedEditingAnalysis {
+    pub symbols: Vec<SymbolOccurrences>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SymbolOccurrences {
+    pub name: String,
+    pub definition: Range,
+    pub references: Vec<Range>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_folding_range() {
+        let range = FoldingRange::new(5, 20)
+            .with_kind(FoldingRangeKind::Region)
+            .with_collapsed_text("...");
+        
+        assert_eq!(range.start_line, 5);
+        assert_eq!(range.end_line, 20);
+        assert_eq!(range.kind, Some(FoldingRangeKind::Region));
+    }
+    
+    #[test]
+    fn test_selection_range_chain() {
+        let ranges = vec![
+            Range::new(Position::new(0, 0), Position::new(10, 0)),
+            Range::new(Position::new(2, 0), Position::new(8, 0)),
+            Range::new(Position::new(4, 5), Position::new(4, 15)),
+        ];
+        
+        let selection = SelectionRange::from_chain(ranges).unwrap();
+        
+        // Innermost first
+        assert_eq!(selection.range.start.line, 4);
+        assert!(selection.parent.is_some());
+        
+        let parent = selection.parent.unwrap();
+        assert_eq!(parent.range.start.line, 2);
+    }
+    
+    #[test]
+    fn test_selection_depth() {
+        let inner = SelectionRange::new(Range::new(
+            Position::new(5, 10),
+            Position::new(5, 20),
+        ));
+        
+        let outer = SelectionRange::new(Range::new(
+            Position::new(5, 0),
+            Position::new(5, 30),
+        )).with_parent(inner);
+        
+        assert_eq!(outer.depth(), 2);
+    }
+    
+    #[test]
+    fn test_inline_completion_item() {
+        let item = InlineCompletionItem::new("fn main() {}")
+            .with_filter("fn");
+        
+        assert_eq!(item.insert_text, "fn main() {}");
+        assert_eq!(item.filter_text, Some("fn".to_string()));
+    }
+    
+    #[test]
+    fn test_pattern_completion() {
+        let model = PatternCompletionModel::new();
+        
+        let context = CompletionContext {
+            prefix: "fn ".to_string(),
+            suffix: String::new(),
+            file_path: "test.qn".to_string(),
+            language: "quanta".to_string(),
+            additional_context: vec![],
+        };
+        
+        let completions = model.complete(&context);
+        // Should suggest function completion
+        assert!(!completions.is_empty());
+    }
+    
+    #[test]
+    fn test_linked_editing() {
+        let analysis = LinkedEditingAnalysis {
+            symbols: vec![SymbolOccurrences {
+                name: "foo".to_string(),
+                definition: Range::new(Position::new(0, 4), Position::new(0, 7)),
+                references: vec![
+                    Range::new(Position::new(5, 8), Position::new(5, 11)),
+                    Range::new(Position::new(10, 12), Position::new(10, 15)),
+                ],
+            }],
+        };
+        
+        let provider = LinkedEditingProvider::new();
+        let ranges = provider.ranges_at(Position::new(0, 5), &analysis);
+        
+        assert!(ranges.is_some());
+        let ranges = ranges.unwrap();
+        assert_eq!(ranges.ranges.len(), 3); // 1 def + 2 refs
+    }
+}

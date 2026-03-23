@@ -1,0 +1,1060 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ REGISTRY — Package Index
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Package registry index management:
+// - Package metadata and versioning
+// - Dependency resolution
+// - Index synchronization
+// - Search and discovery
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::registry::index
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+use std::time::{SystemTime, Duration};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PACKAGE NAME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Validated package name
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PackageName {
+    /// Full name (may include scope)
+    full: String,
+    
+    /// Scope (if any)
+    scope: Option<String>,
+    
+    /// Base name
+    name: String,
+}
+
+impl PackageName {
+    /// Maximum name length
+    pub const MAX_LENGTH: usize = 64;
+    
+    /// Parse package name
+    pub fn parse(s: &str) -> Result<Self, NameError> {
+        if s.is_empty() {
+            return Err(NameError::Empty);
+        }
+        
+        if s.len() > Self::MAX_LENGTH {
+            return Err(NameError::TooLong(s.len()));
+        }
+        
+        // Check for scoped package (@scope/name)
+        if s.starts_with('@') {
+            let parts: Vec<&str> = s[1..].splitn(2, '/').collect();
+            if parts.len() != 2 {
+                return Err(NameError::InvalidScope);
+            }
+            
+            let scope = parts[0];
+            let name = parts[1];
+            
+            Self::validate_identifier(scope)?;
+            Self::validate_identifier(name)?;
+            
+            Ok(PackageName {
+                full: s.to_string(),
+                scope: Some(scope.to_string()),
+                name: name.to_string(),
+            })
+        } else {
+            Self::validate_identifier(s)?;
+            
+            Ok(PackageName {
+                full: s.to_string(),
+                scope: None,
+                name: s.to_string(),
+            })
+        }
+    }
+    
+    /// Validate identifier (name or scope)
+    fn validate_identifier(s: &str) -> Result<(), NameError> {
+        if s.is_empty() {
+            return Err(NameError::Empty);
+        }
+        
+        let first = s.chars().next().unwrap();
+        if !first.is_ascii_lowercase() && first != '_' {
+            return Err(NameError::InvalidStart(first));
+        }
+        
+        for c in s.chars() {
+            if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '_' && c != '-' {
+                return Err(NameError::InvalidChar(c));
+            }
+        }
+        
+        // Check for reserved names
+        if RESERVED_NAMES.contains(&s) {
+            return Err(NameError::Reserved(s.to_string()));
+        }
+        
+        Ok(())
+    }
+    
+    /// Get full name
+    pub fn as_str(&self) -> &str {
+        &self.full
+    }
+    
+    /// Get scope if present
+    pub fn scope(&self) -> Option<&str> {
+        self.scope.as_deref()
+    }
+    
+    /// Get base name
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    
+    /// Check if scoped
+    pub fn is_scoped(&self) -> bool {
+        self.scope.is_some()
+    }
+}
+
+impl std::fmt::Display for PackageName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.full)
+    }
+}
+
+/// Reserved package names
+const RESERVED_NAMES: &[&str] = &[
+    "std", "core", "alloc", "test", "bench",
+    "self", "super", "crate", "pub", "priv",
+    "mod", "use", "fn", "struct", "enum",
+    "trait", "impl", "type", "const", "static",
+    "let", "mut", "ref", "if", "else", "match",
+    "for", "while", "loop", "break", "continue",
+    "return", "async", "await", "unsafe", "extern",
+];
+
+/// Name validation error
+#[derive(Debug)]
+pub enum NameError {
+    Empty,
+    TooLong(usize),
+    InvalidStart(char),
+    InvalidChar(char),
+    InvalidScope,
+    Reserved(String),
+}
+
+impl std::fmt::Display for NameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "package name cannot be empty"),
+            Self::TooLong(len) => write!(f, "package name too long ({} > {})", len, PackageName::MAX_LENGTH),
+            Self::InvalidStart(c) => write!(f, "package name must start with lowercase letter or underscore, not '{}'", c),
+            Self::InvalidChar(c) => write!(f, "invalid character '{}' in package name", c),
+            Self::InvalidScope => write!(f, "invalid scoped package format, expected @scope/name"),
+            Self::Reserved(name) => write!(f, "'{}' is a reserved name", name),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Semantic version
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Version {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+    pub pre: Option<Prerelease>,
+    pub build: Option<String>,
+}
+
+impl Version {
+    /// Create new version
+    pub fn new(major: u64, minor: u64, patch: u64) -> Self {
+        Version {
+            major,
+            minor,
+            patch,
+            pre: None,
+            build: None,
+        }
+    }
+    
+    /// Parse version string
+    pub fn parse(s: &str) -> Result<Self, VersionError> {
+        let s = s.trim_start_matches('v');
+        
+        // Split off build metadata
+        let (version_pre, build) = if let Some(pos) = s.find('+') {
+            (&s[..pos], Some(s[pos + 1..].to_string()))
+        } else {
+            (s, None)
+        };
+        
+        // Split off prerelease
+        let (version, pre) = if let Some(pos) = version_pre.find('-') {
+            let pre_str = &version_pre[pos + 1..];
+            (&version_pre[..pos], Some(Prerelease::parse(pre_str)?))
+        } else {
+            (version_pre, None)
+        };
+        
+        // Parse major.minor.patch
+        let parts: Vec<&str> = version.split('.').collect();
+        
+        if parts.len() != 3 {
+            return Err(VersionError::InvalidFormat(s.to_string()));
+        }
+        
+        let major = parts[0].parse()
+            .map_err(|_| VersionError::InvalidNumber(parts[0].to_string()))?;
+        let minor = parts[1].parse()
+            .map_err(|_| VersionError::InvalidNumber(parts[1].to_string()))?;
+        let patch = parts[2].parse()
+            .map_err(|_| VersionError::InvalidNumber(parts[2].to_string()))?;
+        
+        Ok(Version {
+            major,
+            minor,
+            patch,
+            pre,
+            build,
+        })
+    }
+    
+    /// With prerelease
+    pub fn with_pre(mut self, pre: Prerelease) -> Self {
+        self.pre = Some(pre);
+        self
+    }
+    
+    /// With build metadata
+    pub fn with_build(mut self, build: impl Into<String>) -> Self {
+        self.build = Some(build.into());
+        self
+    }
+    
+    /// Check if stable (no prerelease)
+    pub fn is_stable(&self) -> bool {
+        self.pre.is_none()
+    }
+    
+    /// Check if prerelease
+    pub fn is_prerelease(&self) -> bool {
+        self.pre.is_some()
+    }
+    
+    /// Check compatibility (same major version, unless 0.x)
+    pub fn is_compatible(&self, other: &Version) -> bool {
+        if self.major == 0 && other.major == 0 {
+            self.minor == other.minor
+        } else {
+            self.major == other.major
+        }
+    }
+}
+
+impl std::cmp::Ord for Version {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+        
+        match self.major.cmp(&other.major) {
+            Equal => {}
+            ord => return ord,
+        }
+        
+        match self.minor.cmp(&other.minor) {
+            Equal => {}
+            ord => return ord,
+        }
+        
+        match self.patch.cmp(&other.patch) {
+            Equal => {}
+            ord => return ord,
+        }
+        
+        // Prerelease versions have lower precedence
+        match (&self.pre, &other.pre) {
+            (None, None) => Equal,
+            (None, Some(_)) => Greater, // Stable > prerelease
+            (Some(_), None) => Less,
+            (Some(a), Some(b)) => a.cmp(b),
+        }
+    }
+}
+
+impl std::cmp::PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if let Some(ref pre) = self.pre {
+            write!(f, "-{}", pre)?;
+        }
+        if let Some(ref build) = self.build {
+            write!(f, "+{}", build)?;
+        }
+        Ok(())
+    }
+}
+
+/// Prerelease identifier
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Prerelease {
+    pub identifiers: Vec<PrereleaseId>,
+}
+
+impl Prerelease {
+    pub fn parse(s: &str) -> Result<Self, VersionError> {
+        let identifiers: Result<Vec<_>, _> = s
+            .split('.')
+            .map(PrereleaseId::parse)
+            .collect();
+        
+        Ok(Prerelease {
+            identifiers: identifiers?,
+        })
+    }
+    
+    pub fn alpha(n: u64) -> Self {
+        Prerelease {
+            identifiers: vec![
+                PrereleaseId::AlphaNumeric("alpha".to_string()),
+                PrereleaseId::Numeric(n),
+            ],
+        }
+    }
+    
+    pub fn beta(n: u64) -> Self {
+        Prerelease {
+            identifiers: vec![
+                PrereleaseId::AlphaNumeric("beta".to_string()),
+                PrereleaseId::Numeric(n),
+            ],
+        }
+    }
+    
+    pub fn rc(n: u64) -> Self {
+        Prerelease {
+            identifiers: vec![
+                PrereleaseId::AlphaNumeric("rc".to_string()),
+                PrereleaseId::Numeric(n),
+            ],
+        }
+    }
+}
+
+impl std::cmp::Ord for Prerelease {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.identifiers.cmp(&other.identifiers)
+    }
+}
+
+impl std::cmp::PartialOrd for Prerelease {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for Prerelease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s: Vec<String> = self.identifiers.iter().map(|i| i.to_string()).collect();
+        write!(f, "{}", s.join("."))
+    }
+}
+
+/// Prerelease identifier component
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PrereleaseId {
+    Numeric(u64),
+    AlphaNumeric(String),
+}
+
+impl PrereleaseId {
+    fn parse(s: &str) -> Result<Self, VersionError> {
+        if s.is_empty() {
+            return Err(VersionError::EmptyIdentifier);
+        }
+        
+        if let Ok(n) = s.parse::<u64>() {
+            Ok(PrereleaseId::Numeric(n))
+        } else {
+            Ok(PrereleaseId::AlphaNumeric(s.to_string()))
+        }
+    }
+}
+
+impl std::cmp::Ord for PrereleaseId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use PrereleaseId::*;
+        match (self, other) {
+            (Numeric(a), Numeric(b)) => a.cmp(b),
+            (Numeric(_), AlphaNumeric(_)) => std::cmp::Ordering::Less,
+            (AlphaNumeric(_), Numeric(_)) => std::cmp::Ordering::Greater,
+            (AlphaNumeric(a), AlphaNumeric(b)) => a.cmp(b),
+        }
+    }
+}
+
+impl std::cmp::PartialOrd for PrereleaseId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for PrereleaseId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrereleaseId::Numeric(n) => write!(f, "{}", n),
+            PrereleaseId::AlphaNumeric(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+/// Version error
+#[derive(Debug)]
+pub enum VersionError {
+    InvalidFormat(String),
+    InvalidNumber(String),
+    EmptyIdentifier,
+}
+
+impl std::fmt::Display for VersionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidFormat(s) => write!(f, "invalid version format: '{}'", s),
+            Self::InvalidNumber(s) => write!(f, "invalid version number: '{}'", s),
+            Self::EmptyIdentifier => write!(f, "empty prerelease identifier"),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION REQUIREMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Version requirement (e.g., "^1.2.3", ">=1.0, <2.0")
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionReq {
+    pub comparators: Vec<Comparator>,
+}
+
+impl VersionReq {
+    /// Any version
+    pub fn any() -> Self {
+        VersionReq {
+            comparators: vec![],
+        }
+    }
+    
+    /// Exact version
+    pub fn exact(version: Version) -> Self {
+        VersionReq {
+            comparators: vec![Comparator {
+                op: Op::Exact,
+                version,
+            }],
+        }
+    }
+    
+    /// Parse requirement string
+    pub fn parse(s: &str) -> Result<Self, VersionError> {
+        let s = s.trim();
+        
+        if s == "*" || s.is_empty() {
+            return Ok(Self::any());
+        }
+        
+        let comparators: Result<Vec<_>, _> = s
+            .split(',')
+            .map(|c| Comparator::parse(c.trim()))
+            .collect();
+        
+        Ok(VersionReq {
+            comparators: comparators?,
+        })
+    }
+    
+    /// Check if version matches requirement
+    pub fn matches(&self, version: &Version) -> bool {
+        if self.comparators.is_empty() {
+            return true;
+        }
+        
+        self.comparators.iter().all(|c| c.matches(version))
+    }
+}
+
+impl std::fmt::Display for VersionReq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.comparators.is_empty() {
+            return write!(f, "*");
+        }
+        
+        let s: Vec<String> = self.comparators.iter().map(|c| c.to_string()).collect();
+        write!(f, "{}", s.join(", "))
+    }
+}
+
+/// Version comparator
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Comparator {
+    pub op: Op,
+    pub version: Version,
+}
+
+impl Comparator {
+    fn parse(s: &str) -> Result<Self, VersionError> {
+        let (op, version_str) = if s.starts_with(">=") {
+            (Op::GreaterEq, &s[2..])
+        } else if s.starts_with("<=") {
+            (Op::LessEq, &s[2..])
+        } else if s.starts_with('>') {
+            (Op::Greater, &s[1..])
+        } else if s.starts_with('<') {
+            (Op::Less, &s[1..])
+        } else if s.starts_with('=') {
+            (Op::Exact, &s[1..])
+        } else if s.starts_with('^') {
+            (Op::Caret, &s[1..])
+        } else if s.starts_with('~') {
+            (Op::Tilde, &s[1..])
+        } else {
+            // Default to caret
+            (Op::Caret, s)
+        };
+        
+        let version = Version::parse(version_str.trim())?;
+        
+        Ok(Comparator { op, version })
+    }
+    
+    fn matches(&self, ver: &Version) -> bool {
+        match self.op {
+            Op::Exact => *ver == self.version,
+            Op::Greater => *ver > self.version,
+            Op::GreaterEq => *ver >= self.version,
+            Op::Less => *ver < self.version,
+            Op::LessEq => *ver <= self.version,
+            Op::Caret => {
+                // ^X.Y.Z allows changes that do not modify left-most non-zero
+                if self.version.major == 0 {
+                    if self.version.minor == 0 {
+                        // ^0.0.Z = exactly 0.0.Z
+                        *ver == self.version
+                    } else {
+                        // ^0.Y.Z = >=0.Y.Z <0.(Y+1).0
+                        ver.major == 0 
+                            && ver.minor == self.version.minor 
+                            && ver.patch >= self.version.patch
+                    }
+                } else {
+                    // ^X.Y.Z = >=X.Y.Z <(X+1).0.0
+                    ver.major == self.version.major && *ver >= self.version
+                }
+            }
+            Op::Tilde => {
+                // ~X.Y.Z = >=X.Y.Z <X.(Y+1).0
+                ver.major == self.version.major 
+                    && ver.minor == self.version.minor 
+                    && ver.patch >= self.version.patch
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Comparator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.op, self.version)
+    }
+}
+
+/// Comparison operator
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Exact,    // =X.Y.Z
+    Greater,  // >X.Y.Z
+    GreaterEq, // >=X.Y.Z
+    Less,     // <X.Y.Z
+    LessEq,   // <=X.Y.Z
+    Caret,    // ^X.Y.Z (default)
+    Tilde,    // ~X.Y.Z
+}
+
+impl std::fmt::Display for Op {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Op::Exact => write!(f, "="),
+            Op::Greater => write!(f, ">"),
+            Op::GreaterEq => write!(f, ">="),
+            Op::Less => write!(f, "<"),
+            Op::LessEq => write!(f, "<="),
+            Op::Caret => write!(f, "^"),
+            Op::Tilde => write!(f, "~"),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PACKAGE METADATA
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Package metadata
+#[derive(Debug, Clone)]
+pub struct PackageMetadata {
+    /// Package name
+    pub name: PackageName,
+    
+    /// Version
+    pub version: Version,
+    
+    /// Description
+    pub description: Option<String>,
+    
+    /// Authors
+    pub authors: Vec<String>,
+    
+    /// License (SPDX identifier)
+    pub license: Option<String>,
+    
+    /// Repository URL
+    pub repository: Option<String>,
+    
+    /// Homepage URL
+    pub homepage: Option<String>,
+    
+    /// Documentation URL
+    pub documentation: Option<String>,
+    
+    /// Keywords for search
+    pub keywords: Vec<String>,
+    
+    /// Categories
+    pub categories: Vec<String>,
+    
+    /// Readme content or path
+    pub readme: Option<String>,
+    
+    /// Dependencies
+    pub dependencies: Vec<Dependency>,
+    
+    /// Dev dependencies
+    pub dev_dependencies: Vec<Dependency>,
+    
+    /// Build dependencies
+    pub build_dependencies: Vec<Dependency>,
+    
+    /// Features
+    pub features: BTreeMap<String, Vec<String>>,
+    
+    /// Default features
+    pub default_features: Vec<String>,
+    
+    /// Minimum QuantaLang version
+    pub quanta_version: Option<VersionReq>,
+    
+    /// Package checksum
+    pub checksum: Option<String>,
+    
+    /// Publication timestamp
+    pub published_at: Option<SystemTime>,
+    
+    /// Yanked flag
+    pub yanked: bool,
+    
+    /// Yank reason
+    pub yank_reason: Option<String>,
+}
+
+impl PackageMetadata {
+    /// Create new metadata
+    pub fn new(name: PackageName, version: Version) -> Self {
+        PackageMetadata {
+            name,
+            version,
+            description: None,
+            authors: Vec::new(),
+            license: None,
+            repository: None,
+            homepage: None,
+            documentation: None,
+            keywords: Vec::new(),
+            categories: Vec::new(),
+            readme: None,
+            dependencies: Vec::new(),
+            dev_dependencies: Vec::new(),
+            build_dependencies: Vec::new(),
+            features: BTreeMap::new(),
+            default_features: Vec::new(),
+            quanta_version: None,
+            checksum: None,
+            published_at: None,
+            yanked: false,
+            yank_reason: None,
+        }
+    }
+    
+    /// Package ID (name@version)
+    pub fn id(&self) -> String {
+        format!("{}@{}", self.name, self.version)
+    }
+    
+    /// Check if this is a dev release
+    pub fn is_prerelease(&self) -> bool {
+        self.version.is_prerelease()
+    }
+}
+
+/// Dependency specification
+#[derive(Debug, Clone)]
+pub struct Dependency {
+    /// Package name
+    pub name: PackageName,
+    
+    /// Version requirement
+    pub version_req: VersionReq,
+    
+    /// Optional dependency
+    pub optional: bool,
+    
+    /// Features to enable
+    pub features: Vec<String>,
+    
+    /// Use default features
+    pub default_features: bool,
+    
+    /// Git repository URL
+    pub git: Option<String>,
+    
+    /// Git branch
+    pub branch: Option<String>,
+    
+    /// Git tag
+    pub tag: Option<String>,
+    
+    /// Git revision
+    pub rev: Option<String>,
+    
+    /// Local path
+    pub path: Option<PathBuf>,
+    
+    /// Registry URL (if not default)
+    pub registry: Option<String>,
+}
+
+impl Dependency {
+    /// Simple dependency from name and version
+    pub fn simple(name: PackageName, version_req: VersionReq) -> Self {
+        Dependency {
+            name,
+            version_req,
+            optional: false,
+            features: Vec::new(),
+            default_features: true,
+            git: None,
+            branch: None,
+            tag: None,
+            rev: None,
+            path: None,
+            registry: None,
+        }
+    }
+    
+    /// Git dependency
+    pub fn git(name: PackageName, url: impl Into<String>) -> Self {
+        Dependency {
+            name,
+            version_req: VersionReq::any(),
+            optional: false,
+            features: Vec::new(),
+            default_features: true,
+            git: Some(url.into()),
+            branch: None,
+            tag: None,
+            rev: None,
+            path: None,
+            registry: None,
+        }
+    }
+    
+    /// Path dependency
+    pub fn path(name: PackageName, path: impl Into<PathBuf>) -> Self {
+        Dependency {
+            name,
+            version_req: VersionReq::any(),
+            optional: false,
+            features: Vec::new(),
+            default_features: true,
+            git: None,
+            branch: None,
+            tag: None,
+            rev: None,
+            path: Some(path.into()),
+            registry: None,
+        }
+    }
+    
+    /// Check if this is a registry dependency
+    pub fn is_registry(&self) -> bool {
+        self.git.is_none() && self.path.is_none()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PACKAGE INDEX
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Package index entry (all versions of a package)
+#[derive(Debug, Clone)]
+pub struct IndexEntry {
+    pub name: PackageName,
+    pub versions: Vec<PackageMetadata>,
+}
+
+impl IndexEntry {
+    /// Create new entry
+    pub fn new(name: PackageName) -> Self {
+        IndexEntry {
+            name,
+            versions: Vec::new(),
+        }
+    }
+    
+    /// Add version
+    pub fn add_version(&mut self, metadata: PackageMetadata) {
+        // Insert in sorted order
+        let pos = self.versions
+            .binary_search_by(|v| v.version.cmp(&metadata.version))
+            .unwrap_or_else(|e| e);
+        self.versions.insert(pos, metadata);
+    }
+    
+    /// Get latest stable version
+    pub fn latest_stable(&self) -> Option<&PackageMetadata> {
+        self.versions.iter()
+            .rev()
+            .find(|v| v.version.is_stable() && !v.yanked)
+    }
+    
+    /// Get latest version (including prereleases)
+    pub fn latest(&self) -> Option<&PackageMetadata> {
+        self.versions.iter()
+            .rev()
+            .find(|v| !v.yanked)
+    }
+    
+    /// Get specific version
+    pub fn get_version(&self, version: &Version) -> Option<&PackageMetadata> {
+        self.versions.iter().find(|v| &v.version == version)
+    }
+    
+    /// Get versions matching requirement
+    pub fn matching_versions(&self, req: &VersionReq) -> Vec<&PackageMetadata> {
+        self.versions.iter()
+            .filter(|v| !v.yanked && req.matches(&v.version))
+            .collect()
+    }
+    
+    /// Get best matching version
+    pub fn best_match(&self, req: &VersionReq) -> Option<&PackageMetadata> {
+        self.matching_versions(req)
+            .into_iter()
+            .max_by(|a, b| a.version.cmp(&b.version))
+    }
+}
+
+/// Package index (in-memory)
+pub struct PackageIndex {
+    /// Packages by name
+    packages: RwLock<BTreeMap<String, IndexEntry>>,
+    
+    /// Last sync time
+    last_sync: RwLock<Option<SystemTime>>,
+}
+
+impl PackageIndex {
+    /// Create empty index
+    pub fn new() -> Self {
+        PackageIndex {
+            packages: RwLock::new(BTreeMap::new()),
+            last_sync: RwLock::new(None),
+        }
+    }
+    
+    /// Add or update package
+    pub fn upsert(&self, metadata: PackageMetadata) {
+        let mut packages = self.packages.write().unwrap();
+        let name_str = metadata.name.as_str().to_string();
+        
+        let entry = packages.entry(name_str)
+            .or_insert_with(|| IndexEntry::new(metadata.name.clone()));
+        
+        entry.add_version(metadata);
+    }
+    
+    /// Get package entry
+    pub fn get(&self, name: &str) -> Option<IndexEntry> {
+        self.packages.read().unwrap().get(name).cloned()
+    }
+    
+    /// Check if package exists
+    pub fn contains(&self, name: &str) -> bool {
+        self.packages.read().unwrap().contains_key(name)
+    }
+    
+    /// Search packages
+    pub fn search(&self, query: &str) -> Vec<IndexEntry> {
+        let packages = self.packages.read().unwrap();
+        let query_lower = query.to_lowercase();
+        
+        packages.values()
+            .filter(|entry| {
+                entry.name.as_str().to_lowercase().contains(&query_lower) ||
+                entry.latest().map(|m| {
+                    m.description.as_ref()
+                        .map(|d| d.to_lowercase().contains(&query_lower))
+                        .unwrap_or(false) ||
+                    m.keywords.iter().any(|k| k.to_lowercase().contains(&query_lower))
+                }).unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+    
+    /// Get all package names
+    pub fn all_names(&self) -> Vec<String> {
+        self.packages.read().unwrap().keys().cloned().collect()
+    }
+    
+    /// Get package count
+    pub fn len(&self) -> usize {
+        self.packages.read().unwrap().len()
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.packages.read().unwrap().is_empty()
+    }
+    
+    /// Set last sync time
+    pub fn set_synced(&self) {
+        *self.last_sync.write().unwrap() = Some(SystemTime::now());
+    }
+    
+    /// Get last sync time
+    pub fn last_synced(&self) -> Option<SystemTime> {
+        *self.last_sync.read().unwrap()
+    }
+}
+
+impl Default for PackageIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_package_name() {
+        assert!(PackageName::parse("my-package").is_ok());
+        assert!(PackageName::parse("my_package").is_ok());
+        assert!(PackageName::parse("@scope/package").is_ok());
+        
+        assert!(PackageName::parse("").is_err());
+        assert!(PackageName::parse("MyPackage").is_err());
+        assert!(PackageName::parse("std").is_err());
+    }
+    
+    #[test]
+    fn test_version_parse() {
+        let v = Version::parse("1.2.3").unwrap();
+        assert_eq!(v.major, 1);
+        assert_eq!(v.minor, 2);
+        assert_eq!(v.patch, 3);
+        assert!(v.is_stable());
+        
+        let v = Version::parse("1.0.0-alpha.1").unwrap();
+        assert!(v.is_prerelease());
+        
+        let v = Version::parse("1.0.0+build.123").unwrap();
+        assert_eq!(v.build, Some("build.123".to_string()));
+    }
+    
+    #[test]
+    fn test_version_ordering() {
+        let v1 = Version::parse("1.0.0").unwrap();
+        let v2 = Version::parse("1.0.1").unwrap();
+        let v3 = Version::parse("1.1.0").unwrap();
+        let v4 = Version::parse("2.0.0").unwrap();
+        let v5 = Version::parse("1.0.0-alpha").unwrap();
+        
+        assert!(v1 < v2);
+        assert!(v2 < v3);
+        assert!(v3 < v4);
+        assert!(v5 < v1); // Prerelease < stable
+    }
+    
+    #[test]
+    fn test_version_req() {
+        let req = VersionReq::parse("^1.2.3").unwrap();
+        
+        assert!(req.matches(&Version::parse("1.2.3").unwrap()));
+        assert!(req.matches(&Version::parse("1.2.4").unwrap()));
+        assert!(req.matches(&Version::parse("1.9.0").unwrap()));
+        assert!(!req.matches(&Version::parse("2.0.0").unwrap()));
+        assert!(!req.matches(&Version::parse("1.2.2").unwrap()));
+    }
+    
+    #[test]
+    fn test_tilde_req() {
+        let req = VersionReq::parse("~1.2.3").unwrap();
+        
+        assert!(req.matches(&Version::parse("1.2.3").unwrap()));
+        assert!(req.matches(&Version::parse("1.2.9").unwrap()));
+        assert!(!req.matches(&Version::parse("1.3.0").unwrap()));
+    }
+    
+    #[test]
+    fn test_package_index() {
+        let index = PackageIndex::new();
+        
+        let name = PackageName::parse("test-pkg").unwrap();
+        let meta1 = PackageMetadata::new(name.clone(), Version::new(1, 0, 0));
+        let meta2 = PackageMetadata::new(name.clone(), Version::new(1, 1, 0));
+        
+        index.upsert(meta1);
+        index.upsert(meta2);
+        
+        let entry = index.get("test-pkg").unwrap();
+        assert_eq!(entry.versions.len(), 2);
+        assert_eq!(entry.latest().unwrap().version, Version::new(1, 1, 0));
+    }
+}

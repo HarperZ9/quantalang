@@ -1,0 +1,1112 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Data Flow Analysis Framework
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Data flow analysis infrastructure:
+//   - Forward/Backward analysis
+//   - May/Must analysis
+//   - Reaching definitions
+//   - Live variables
+//   - Available expressions
+//   - Very busy expressions
+//   - Def-use chains
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::dataflow
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DATA FLOW FRAMEWORK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Direction of data flow analysis
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Forward,
+    Backward,
+}
+
+/// Meet operator type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetType {
+    /// May analysis (union)
+    May,
+    /// Must analysis (intersection)
+    Must,
+}
+
+/// Data flow lattice trait
+pub trait Lattice: Clone + PartialEq {
+    /// Top element (identity for meet)
+    fn top() -> Self;
+    
+    /// Bottom element
+    fn bottom() -> Self;
+    
+    /// Meet operation (join in lattice)
+    fn meet(&self, other: &Self) -> Self;
+    
+    /// Check if this <= other in the lattice
+    fn leq(&self, other: &Self) -> bool {
+        self.meet(other) == *self
+    }
+}
+
+/// Bit vector lattice (set representation)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitVectorLattice {
+    bits: BTreeSet<u32>,
+    meet_type: MeetType,
+    universe_size: u32,
+}
+
+impl BitVectorLattice {
+    pub fn new(meet_type: MeetType, universe_size: u32) -> Self {
+        BitVectorLattice {
+            bits: BTreeSet::new(),
+            meet_type,
+            universe_size,
+        }
+    }
+    
+    pub fn from_set(bits: BTreeSet<u32>, meet_type: MeetType, universe_size: u32) -> Self {
+        BitVectorLattice { bits, meet_type, universe_size }
+    }
+    
+    pub fn insert(&mut self, bit: u32) {
+        self.bits.insert(bit);
+    }
+    
+    pub fn remove(&mut self, bit: u32) {
+        self.bits.remove(&bit);
+    }
+    
+    pub fn contains(&self, bit: u32) -> bool {
+        self.bits.contains(&bit)
+    }
+    
+    pub fn iter(&self) -> impl Iterator<Item = &u32> {
+        self.bits.iter()
+    }
+    
+    pub fn union(&self, other: &Self) -> Self {
+        let bits: BTreeSet<_> = self.bits.union(&other.bits).copied().collect();
+        BitVectorLattice::from_set(bits, self.meet_type, self.universe_size)
+    }
+    
+    pub fn intersection(&self, other: &Self) -> Self {
+        let bits: BTreeSet<_> = self.bits.intersection(&other.bits).copied().collect();
+        BitVectorLattice::from_set(bits, self.meet_type, self.universe_size)
+    }
+    
+    pub fn difference(&self, other: &Self) -> Self {
+        let bits: BTreeSet<_> = self.bits.difference(&other.bits).copied().collect();
+        BitVectorLattice::from_set(bits, self.meet_type, self.universe_size)
+    }
+}
+
+impl Lattice for BitVectorLattice {
+    fn top() -> Self {
+        BitVectorLattice::new(MeetType::May, 0)
+    }
+    
+    fn bottom() -> Self {
+        BitVectorLattice::new(MeetType::May, 0)
+    }
+    
+    fn meet(&self, other: &Self) -> Self {
+        match self.meet_type {
+            MeetType::May => self.union(other),
+            MeetType::Must => self.intersection(other),
+        }
+    }
+}
+
+/// Data flow analysis trait
+pub trait DataFlowAnalysis {
+    type Lattice: Lattice;
+    
+    /// Analysis direction
+    fn direction(&self) -> Direction;
+    
+    /// Initial value for entry/exit
+    fn boundary(&self) -> Self::Lattice;
+    
+    /// Initial value for interior nodes
+    fn init(&self) -> Self::Lattice;
+    
+    /// Transfer function for a block
+    fn transfer(&self, block: &MirBlock, input: &Self::Lattice) -> Self::Lattice;
+}
+
+/// Data flow solver
+pub struct DataFlowSolver<A: DataFlowAnalysis> {
+    analysis: A,
+    /// In sets for each block
+    pub in_sets: BTreeMap<u32, A::Lattice>,
+    /// Out sets for each block
+    pub out_sets: BTreeMap<u32, A::Lattice>,
+}
+
+impl<A: DataFlowAnalysis> DataFlowSolver<A> {
+    pub fn new(analysis: A) -> Self {
+        DataFlowSolver {
+            analysis,
+            in_sets: BTreeMap::new(),
+            out_sets: BTreeMap::new(),
+        }
+    }
+    
+    /// Solve the data flow equations
+    pub fn solve(&mut self, func: &MirFunction) {
+        // Initialize
+        for block in &func.blocks {
+            self.in_sets.insert(block.id, self.analysis.init());
+            self.out_sets.insert(block.id, self.analysis.init());
+        }
+        
+        // Set boundary condition
+        match self.analysis.direction() {
+            Direction::Forward => {
+                if let Some(entry) = func.blocks.first() {
+                    self.in_sets.insert(entry.id, self.analysis.boundary());
+                }
+            }
+            Direction::Backward => {
+                // Find exit blocks
+                for block in &func.blocks {
+                    if self.is_exit_block(block) {
+                        self.out_sets.insert(block.id, self.analysis.boundary());
+                    }
+                }
+            }
+        }
+        
+        // Iterate until fixed point
+        let mut changed = true;
+        while changed {
+            changed = false;
+            
+            let order = self.get_iteration_order(func);
+            
+            for block_id in order {
+                let block = func.blocks.iter().find(|b| b.id == block_id).unwrap();
+                
+                match self.analysis.direction() {
+                    Direction::Forward => {
+                        // in[B] = meet of out[P] for all predecessors P
+                        let new_in = self.meet_predecessors(func, block_id);
+                        
+                        if new_in != *self.in_sets.get(&block_id).unwrap() {
+                            self.in_sets.insert(block_id, new_in.clone());
+                            
+                            // out[B] = transfer(in[B])
+                            let new_out = self.analysis.transfer(block, &new_in);
+                            self.out_sets.insert(block_id, new_out);
+                            
+                            changed = true;
+                        }
+                    }
+                    Direction::Backward => {
+                        // out[B] = meet of in[S] for all successors S
+                        let new_out = self.meet_successors(func, block_id);
+                        
+                        if new_out != *self.out_sets.get(&block_id).unwrap() {
+                            self.out_sets.insert(block_id, new_out.clone());
+                            
+                            // in[B] = transfer(out[B])
+                            let new_in = self.analysis.transfer(block, &new_out);
+                            self.in_sets.insert(block_id, new_in);
+                            
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    fn get_iteration_order(&self, func: &MirFunction) -> Vec<u32> {
+        match self.analysis.direction() {
+            Direction::Forward => {
+                // RPO for forward analysis
+                self.compute_rpo(func)
+            }
+            Direction::Backward => {
+                // Reverse RPO for backward analysis
+                let mut order = self.compute_rpo(func);
+                order.reverse();
+                order
+            }
+        }
+    }
+    
+    fn compute_rpo(&self, func: &MirFunction) -> Vec<u32> {
+        let mut visited = BTreeSet::new();
+        let mut post_order = Vec::new();
+        
+        if let Some(entry) = func.blocks.first() {
+            self.dfs_post_order(entry.id, func, &mut visited, &mut post_order);
+        }
+        
+        post_order.reverse();
+        post_order
+    }
+    
+    fn dfs_post_order(
+        &self,
+        block_id: u32,
+        func: &MirFunction,
+        visited: &mut BTreeSet<u32>,
+        post_order: &mut Vec<u32>,
+    ) {
+        if visited.contains(&block_id) {
+            return;
+        }
+        
+        visited.insert(block_id);
+        
+        if let Some(block) = func.blocks.iter().find(|b| b.id == block_id) {
+            for succ in self.get_successors(block) {
+                self.dfs_post_order(succ, func, visited, post_order);
+            }
+            
+            post_order.push(block_id);
+        }
+    }
+    
+    fn meet_predecessors(&self, func: &MirFunction, block_id: u32) -> A::Lattice {
+        let preds = self.get_predecessors(func, block_id);
+        
+        if preds.is_empty() {
+            return self.analysis.boundary();
+        }
+        
+        let mut result = self.out_sets.get(&preds[0]).unwrap().clone();
+        
+        for pred in &preds[1..] {
+            let pred_out = self.out_sets.get(pred).unwrap();
+            result = result.meet(pred_out);
+        }
+        
+        result
+    }
+    
+    fn meet_successors(&self, func: &MirFunction, block_id: u32) -> A::Lattice {
+        let block = func.blocks.iter().find(|b| b.id == block_id).unwrap();
+        let succs = self.get_successors(block);
+        
+        if succs.is_empty() {
+            return self.analysis.boundary();
+        }
+        
+        let mut result = self.in_sets.get(&succs[0]).unwrap().clone();
+        
+        for succ in &succs[1..] {
+            let succ_in = self.in_sets.get(succ).unwrap();
+            result = result.meet(succ_in);
+        }
+        
+        result
+    }
+    
+    fn get_predecessors(&self, func: &MirFunction, block_id: u32) -> Vec<u32> {
+        let mut preds = Vec::new();
+        
+        for block in &func.blocks {
+            if self.get_successors(block).contains(&block_id) {
+                preds.push(block.id);
+            }
+        }
+        
+        preds
+    }
+    
+    fn get_successors(&self, block: &MirBlock) -> Vec<u32> {
+        match &block.terminator {
+            MirTerminator::Goto(t) => vec![*t],
+            MirTerminator::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+            MirTerminator::Switch { targets, default, .. } => {
+                let mut succs: Vec<_> = targets.iter().map(|(_, t)| *t).collect();
+                succs.push(*default);
+                succs
+            }
+            _ => vec![],
+        }
+    }
+    
+    fn is_exit_block(&self, block: &MirBlock) -> bool {
+        matches!(block.terminator, MirTerminator::Return { .. } | MirTerminator::Unreachable)
+    }
+    
+    /// Get in set for a block
+    pub fn in_set(&self, block_id: u32) -> Option<&A::Lattice> {
+        self.in_sets.get(&block_id)
+    }
+    
+    /// Get out set for a block
+    pub fn out_set(&self, block_id: u32) -> Option<&A::Lattice> {
+        self.out_sets.get(&block_id)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REACHING DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Definition identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DefId {
+    pub block: u32,
+    pub index: u32,
+}
+
+/// Reaching definitions analysis
+pub struct ReachingDefinitions {
+    /// All definitions in the function
+    pub definitions: Vec<DefId>,
+    /// Variable to definition mapping
+    pub var_defs: BTreeMap<String, Vec<u32>>,
+    /// Definition ID to index mapping
+    def_to_idx: BTreeMap<DefId, u32>,
+}
+
+impl ReachingDefinitions {
+    pub fn new(func: &MirFunction) -> Self {
+        let mut definitions = Vec::new();
+        let mut var_defs: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        let mut def_to_idx = BTreeMap::new();
+        
+        for block in &func.blocks {
+            for (idx, stmt) in block.statements.iter().enumerate() {
+                if let Some(var) = Self::get_definition(stmt) {
+                    let def_id = DefId {
+                        block: block.id,
+                        index: idx as u32,
+                    };
+                    
+                    let def_idx = definitions.len() as u32;
+                    definitions.push(def_id);
+                    def_to_idx.insert(def_id, def_idx);
+                    
+                    var_defs.entry(var.to_string())
+                        .or_default()
+                        .push(def_idx);
+                }
+            }
+        }
+        
+        ReachingDefinitions {
+            definitions,
+            var_defs,
+            def_to_idx,
+        }
+    }
+    
+    fn get_definition(stmt: &MirStatement) -> Option<&str> {
+        match stmt {
+            MirStatement::Assign { dest, .. } |
+            MirStatement::BinaryOp { dest, .. } |
+            MirStatement::Load { dest, .. } |
+            MirStatement::Phi { dest, .. } => Some(dest.as_str()),
+            MirStatement::Call { dest: Some(d), .. } => Some(d.as_str()),
+            _ => None,
+        }
+    }
+    
+    /// Get gen set for a block
+    pub fn gen(&self, block: &MirBlock) -> BitVectorLattice {
+        let mut gen = BitVectorLattice::new(MeetType::May, self.definitions.len() as u32);
+        
+        for (idx, stmt) in block.statements.iter().enumerate() {
+            if let Some(_) = Self::get_definition(stmt) {
+                let def_id = DefId {
+                    block: block.id,
+                    index: idx as u32,
+                };
+                
+                if let Some(&def_idx) = self.def_to_idx.get(&def_id) {
+                    gen.insert(def_idx);
+                }
+            }
+        }
+        
+        gen
+    }
+    
+    /// Get kill set for a block
+    pub fn kill(&self, block: &MirBlock) -> BitVectorLattice {
+        let mut kill = BitVectorLattice::new(MeetType::May, self.definitions.len() as u32);
+        
+        for stmt in &block.statements {
+            if let Some(var) = Self::get_definition(stmt) {
+                // Kill all other definitions of this variable
+                if let Some(defs) = self.var_defs.get(var) {
+                    for &def_idx in defs {
+                        let def_id = self.definitions[def_idx as usize];
+                        if def_id.block != block.id {
+                            kill.insert(def_idx);
+                        }
+                    }
+                }
+            }
+        }
+        
+        kill
+    }
+}
+
+impl DataFlowAnalysis for ReachingDefinitions {
+    type Lattice = BitVectorLattice;
+    
+    fn direction(&self) -> Direction {
+        Direction::Forward
+    }
+    
+    fn boundary(&self) -> Self::Lattice {
+        BitVectorLattice::new(MeetType::May, self.definitions.len() as u32)
+    }
+    
+    fn init(&self) -> Self::Lattice {
+        BitVectorLattice::new(MeetType::May, self.definitions.len() as u32)
+    }
+    
+    fn transfer(&self, block: &MirBlock, input: &Self::Lattice) -> Self::Lattice {
+        // out = gen ∪ (in - kill)
+        let gen = self.gen(block);
+        let kill = self.kill(block);
+        
+        gen.union(&input.difference(&kill))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIVE VARIABLES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Live variables analysis
+pub struct LiveVariables {
+    /// All variables in the function
+    pub variables: Vec<String>,
+    /// Variable to index mapping
+    var_to_idx: BTreeMap<String, u32>,
+}
+
+impl LiveVariables {
+    pub fn new(func: &MirFunction) -> Self {
+        let mut variables = Vec::new();
+        let mut var_to_idx = BTreeMap::new();
+        
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                // Collect all defined and used variables
+                for var in Self::get_defined(stmt) {
+                    if !var_to_idx.contains_key(var) {
+                        let idx = variables.len() as u32;
+                        variables.push(var.to_string());
+                        var_to_idx.insert(var.to_string(), idx);
+                    }
+                }
+                
+                for var in Self::get_used(stmt) {
+                    if !var_to_idx.contains_key(var) {
+                        let idx = variables.len() as u32;
+                        variables.push(var.to_string());
+                        var_to_idx.insert(var.to_string(), idx);
+                    }
+                }
+            }
+        }
+        
+        LiveVariables { variables, var_to_idx }
+    }
+    
+    fn get_defined(stmt: &MirStatement) -> Vec<&str> {
+        match stmt {
+            MirStatement::Assign { dest, .. } |
+            MirStatement::BinaryOp { dest, .. } |
+            MirStatement::Load { dest, .. } |
+            MirStatement::Phi { dest, .. } => vec![dest.as_str()],
+            MirStatement::Call { dest: Some(d), .. } => vec![d.as_str()],
+            _ => vec![],
+        }
+    }
+    
+    fn get_used(stmt: &MirStatement) -> Vec<&str> {
+        match stmt {
+            MirStatement::Assign { value, .. } => {
+                Self::operand_vars(value)
+            }
+            MirStatement::BinaryOp { lhs, rhs, .. } => {
+                let mut vars = Self::operand_vars(lhs);
+                vars.extend(Self::operand_vars(rhs));
+                vars
+            }
+            MirStatement::Load { ptr, .. } => Self::operand_vars(ptr),
+            MirStatement::Store { ptr, value, .. } => {
+                let mut vars = Self::operand_vars(ptr);
+                vars.extend(Self::operand_vars(value));
+                vars
+            }
+            MirStatement::Call { args, .. } => {
+                args.iter().flat_map(Self::operand_vars).collect()
+            }
+            MirStatement::Phi { incoming, .. } => {
+                incoming.iter()
+                    .flat_map(|(_, v)| Self::operand_vars(v))
+                    .collect()
+            }
+            _ => vec![],
+        }
+    }
+    
+    fn operand_vars(operand: &MirOperand) -> Vec<&str> {
+        match operand {
+            MirOperand::Variable(name) => vec![name.as_str()],
+            _ => vec![],
+        }
+    }
+    
+    /// Get use set for a block (upward exposed uses)
+    pub fn use_set(&self, block: &MirBlock) -> BitVectorLattice {
+        let mut use_set = BitVectorLattice::new(MeetType::May, self.variables.len() as u32);
+        let mut defined = BTreeSet::new();
+        
+        // Process statements in reverse order
+        for stmt in block.statements.iter().rev() {
+            // Remove defined variables (they're not upward exposed)
+            for var in Self::get_defined(stmt) {
+                defined.insert(var.to_string());
+            }
+            
+            // Add used variables (if not defined before this point)
+            for var in Self::get_used(stmt) {
+                if !defined.contains(var) {
+                    if let Some(&idx) = self.var_to_idx.get(var) {
+                        use_set.insert(idx);
+                    }
+                }
+            }
+        }
+        
+        use_set
+    }
+    
+    /// Get def set for a block
+    pub fn def_set(&self, block: &MirBlock) -> BitVectorLattice {
+        let mut def_set = BitVectorLattice::new(MeetType::May, self.variables.len() as u32);
+        
+        for stmt in &block.statements {
+            for var in Self::get_defined(stmt) {
+                if let Some(&idx) = self.var_to_idx.get(var) {
+                    def_set.insert(idx);
+                }
+            }
+        }
+        
+        def_set
+    }
+    
+    /// Check if a variable is live at a point
+    pub fn is_live(&self, var: &str, solver: &DataFlowSolver<LiveVariables>, block_id: u32) -> bool {
+        if let Some(&idx) = self.var_to_idx.get(var) {
+            if let Some(live_out) = solver.out_set(block_id) {
+                return live_out.contains(idx);
+            }
+        }
+        false
+    }
+}
+
+impl DataFlowAnalysis for LiveVariables {
+    type Lattice = BitVectorLattice;
+    
+    fn direction(&self) -> Direction {
+        Direction::Backward
+    }
+    
+    fn boundary(&self) -> Self::Lattice {
+        BitVectorLattice::new(MeetType::May, self.variables.len() as u32)
+    }
+    
+    fn init(&self) -> Self::Lattice {
+        BitVectorLattice::new(MeetType::May, self.variables.len() as u32)
+    }
+    
+    fn transfer(&self, block: &MirBlock, input: &Self::Lattice) -> Self::Lattice {
+        // in = use ∪ (out - def)
+        let use_set = self.use_set(block);
+        let def_set = self.def_set(block);
+        
+        use_set.union(&input.difference(&def_set))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AVAILABLE EXPRESSIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Expression representation
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Expression {
+    pub op: BinOp,
+    pub lhs: String,
+    pub rhs: String,
+}
+
+/// Available expressions analysis
+pub struct AvailableExpressions {
+    /// All expressions in the function
+    pub expressions: Vec<Expression>,
+    /// Expression to index mapping
+    expr_to_idx: BTreeMap<Expression, u32>,
+    /// Variable to expressions that use it
+    var_to_exprs: BTreeMap<String, Vec<u32>>,
+}
+
+impl AvailableExpressions {
+    pub fn new(func: &MirFunction) -> Self {
+        let mut expressions = Vec::new();
+        let mut expr_to_idx = BTreeMap::new();
+        let mut var_to_exprs: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let MirStatement::BinaryOp { op, lhs, rhs, .. } = stmt {
+                    if let (MirOperand::Variable(l), MirOperand::Variable(r)) = (lhs, rhs) {
+                        let expr = Expression {
+                            op: *op,
+                            lhs: l.clone(),
+                            rhs: r.clone(),
+                        };
+                        
+                        if !expr_to_idx.contains_key(&expr) {
+                            let idx = expressions.len() as u32;
+                            expressions.push(expr.clone());
+                            expr_to_idx.insert(expr.clone(), idx);
+                            
+                            var_to_exprs.entry(l.clone()).or_default().push(idx);
+                            var_to_exprs.entry(r.clone()).or_default().push(idx);
+                        }
+                    }
+                }
+            }
+        }
+        
+        AvailableExpressions {
+            expressions,
+            expr_to_idx,
+            var_to_exprs,
+        }
+    }
+    
+    /// Get e_gen set for a block
+    pub fn e_gen(&self, block: &MirBlock) -> BitVectorLattice {
+        let mut gen = BitVectorLattice::new(MeetType::Must, self.expressions.len() as u32);
+        let mut killed = BTreeSet::new();
+        
+        for stmt in &block.statements {
+            // First check for kills
+            if let Some(def) = Self::get_definition(stmt) {
+                if let Some(exprs) = self.var_to_exprs.get(def) {
+                    for &idx in exprs {
+                        killed.insert(idx);
+                        gen.remove(idx);
+                    }
+                }
+            }
+            
+            // Then add generated expression
+            if let MirStatement::BinaryOp { op, lhs, rhs, .. } = stmt {
+                if let (MirOperand::Variable(l), MirOperand::Variable(r)) = (lhs, rhs) {
+                    let expr = Expression {
+                        op: *op,
+                        lhs: l.clone(),
+                        rhs: r.clone(),
+                    };
+                    
+                    if let Some(&idx) = self.expr_to_idx.get(&expr) {
+                        if !killed.contains(&idx) {
+                            gen.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+        
+        gen
+    }
+    
+    /// Get e_kill set for a block
+    pub fn e_kill(&self, block: &MirBlock) -> BitVectorLattice {
+        let mut kill = BitVectorLattice::new(MeetType::Must, self.expressions.len() as u32);
+        
+        for stmt in &block.statements {
+            if let Some(def) = Self::get_definition(stmt) {
+                if let Some(exprs) = self.var_to_exprs.get(def) {
+                    for &idx in exprs {
+                        kill.insert(idx);
+                    }
+                }
+            }
+        }
+        
+        kill
+    }
+    
+    fn get_definition(stmt: &MirStatement) -> Option<&str> {
+        match stmt {
+            MirStatement::Assign { dest, .. } |
+            MirStatement::BinaryOp { dest, .. } |
+            MirStatement::Load { dest, .. } |
+            MirStatement::Phi { dest, .. } => Some(dest.as_str()),
+            MirStatement::Call { dest: Some(d), .. } => Some(d.as_str()),
+            _ => None,
+        }
+    }
+}
+
+impl DataFlowAnalysis for AvailableExpressions {
+    type Lattice = BitVectorLattice;
+    
+    fn direction(&self) -> Direction {
+        Direction::Forward
+    }
+    
+    fn boundary(&self) -> Self::Lattice {
+        // Empty set at entry
+        BitVectorLattice::new(MeetType::Must, self.expressions.len() as u32)
+    }
+    
+    fn init(&self) -> Self::Lattice {
+        // Universal set for must analysis
+        let mut all = BitVectorLattice::new(MeetType::Must, self.expressions.len() as u32);
+        for i in 0..self.expressions.len() as u32 {
+            all.insert(i);
+        }
+        all
+    }
+    
+    fn transfer(&self, block: &MirBlock, input: &Self::Lattice) -> Self::Lattice {
+        // out = e_gen ∪ (in - e_kill)
+        let e_gen = self.e_gen(block);
+        let e_kill = self.e_kill(block);
+        
+        e_gen.union(&input.difference(&e_kill))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEF-USE CHAINS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Def-use chain information
+#[derive(Debug, Clone)]
+pub struct DefUseChain {
+    /// Definition point
+    pub def: DefId,
+    /// Use points
+    pub uses: Vec<DefId>,
+}
+
+/// Use-def chain information
+#[derive(Debug, Clone)]
+pub struct UseDefChain {
+    /// Use point
+    pub use_point: DefId,
+    /// Definition points that reach this use
+    pub defs: Vec<DefId>,
+}
+
+/// Def-use analysis
+pub struct DefUseAnalysis {
+    /// Def-use chains
+    pub du_chains: BTreeMap<DefId, DefUseChain>,
+    /// Use-def chains
+    pub ud_chains: BTreeMap<DefId, UseDefChain>,
+}
+
+impl DefUseAnalysis {
+    pub fn analyze(func: &MirFunction) -> Self {
+        let reaching_defs = ReachingDefinitions::new(func);
+        let mut solver = DataFlowSolver::new(reaching_defs);
+        solver.solve(func);
+        
+        let mut du_chains: BTreeMap<DefId, DefUseChain> = BTreeMap::new();
+        let mut ud_chains: BTreeMap<DefId, UseDefChain> = BTreeMap::new();
+        
+        // Build chains from reaching definitions
+        for block in &func.blocks {
+            let in_set = solver.in_set(block.id).cloned()
+                .unwrap_or_else(|| BitVectorLattice::new(MeetType::May, 0));
+            
+            let mut current = in_set;
+            
+            for (idx, stmt) in block.statements.iter().enumerate() {
+                let use_point = DefId {
+                    block: block.id,
+                    index: idx as u32,
+                };
+                
+                // Get used variables
+                let used_vars = Self::get_used_vars(stmt);
+                
+                for var in used_vars {
+                    // Find reaching definitions for this variable
+                    let mut reaching = Vec::new();
+                    
+                    if let Some(defs) = solver.analysis.var_defs.get(&var) {
+                        for &def_idx in defs {
+                            if current.contains(def_idx) {
+                                let def_id = solver.analysis.definitions[def_idx as usize];
+                                reaching.push(def_id);
+                                
+                                // Add to def-use chain
+                                du_chains.entry(def_id)
+                                    .or_insert_with(|| DefUseChain {
+                                        def: def_id,
+                                        uses: Vec::new(),
+                                    })
+                                    .uses.push(use_point);
+                            }
+                        }
+                    }
+                    
+                    // Add to use-def chain
+                    if !reaching.is_empty() {
+                        ud_chains.insert(use_point, UseDefChain {
+                            use_point,
+                            defs: reaching,
+                        });
+                    }
+                }
+                
+                // Update current reaching definitions after this statement
+                if let Some(def_var) = Self::get_def_var(stmt) {
+                    // Kill previous definitions
+                    if let Some(defs) = solver.analysis.var_defs.get(&def_var) {
+                        for &def_idx in defs {
+                            current.remove(def_idx);
+                        }
+                    }
+                    
+                    // Add new definition
+                    if let Some(&def_idx) = solver.analysis.def_to_idx.get(&use_point) {
+                        current.insert(def_idx);
+                    }
+                }
+            }
+        }
+        
+        DefUseAnalysis { du_chains, ud_chains }
+    }
+    
+    fn get_used_vars(stmt: &MirStatement) -> Vec<String> {
+        match stmt {
+            MirStatement::Assign { value, .. } => {
+                Self::operand_var(value).into_iter().collect()
+            }
+            MirStatement::BinaryOp { lhs, rhs, .. } => {
+                let mut vars = Vec::new();
+                if let Some(v) = Self::operand_var(lhs) {
+                    vars.push(v);
+                }
+                if let Some(v) = Self::operand_var(rhs) {
+                    vars.push(v);
+                }
+                vars
+            }
+            MirStatement::Load { ptr, .. } => {
+                Self::operand_var(ptr).into_iter().collect()
+            }
+            MirStatement::Store { ptr, value, .. } => {
+                let mut vars = Vec::new();
+                if let Some(v) = Self::operand_var(ptr) {
+                    vars.push(v);
+                }
+                if let Some(v) = Self::operand_var(value) {
+                    vars.push(v);
+                }
+                vars
+            }
+            MirStatement::Call { args, .. } => {
+                args.iter().filter_map(Self::operand_var).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+    
+    fn operand_var(operand: &MirOperand) -> Option<String> {
+        match operand {
+            MirOperand::Variable(name) => Some(name.clone()),
+            _ => None,
+        }
+    }
+    
+    fn get_def_var(stmt: &MirStatement) -> Option<String> {
+        match stmt {
+            MirStatement::Assign { dest, .. } |
+            MirStatement::BinaryOp { dest, .. } |
+            MirStatement::Load { dest, .. } |
+            MirStatement::Phi { dest, .. } => Some(dest.clone()),
+            MirStatement::Call { dest: Some(d), .. } => Some(d.clone()),
+            _ => None,
+        }
+    }
+    
+    /// Get all uses of a definition
+    pub fn get_uses(&self, def: DefId) -> Option<&[DefId]> {
+        self.du_chains.get(&def).map(|c| c.uses.as_slice())
+    }
+    
+    /// Get all definitions that reach a use
+    pub fn get_defs(&self, use_point: DefId) -> Option<&[DefId]> {
+        self.ud_chains.get(&use_point).map(|c| c.defs.as_slice())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Shl, Shr,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Switch { value: MirOperand, targets: Vec<(i64, u32)>, default: u32 },
+    Return { value: Option<MirOperand> },
+    Unreachable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn create_test_function() -> MirFunction {
+        MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::Assign {
+                            dest: "x".to_string(),
+                            value: MirOperand::Constant(1),
+                        },
+                        MirStatement::Assign {
+                            dest: "y".to_string(),
+                            value: MirOperand::Constant(2),
+                        },
+                    ],
+                    terminator: MirTerminator::Goto(1),
+                },
+                MirBlock {
+                    id: 1,
+                    statements: vec![
+                        MirStatement::BinaryOp {
+                            dest: "z".to_string(),
+                            op: BinOp::Add,
+                            lhs: MirOperand::Variable("x".to_string()),
+                            rhs: MirOperand::Variable("y".to_string()),
+                        },
+                    ],
+                    terminator: MirTerminator::Return {
+                        value: Some(MirOperand::Variable("z".to_string())),
+                    },
+                },
+            ],
+        }
+    }
+    
+    #[test]
+    fn test_reaching_definitions() {
+        let func = create_test_function();
+        let analysis = ReachingDefinitions::new(&func);
+        
+        assert_eq!(analysis.definitions.len(), 3);
+        assert!(analysis.var_defs.contains_key("x"));
+        assert!(analysis.var_defs.contains_key("y"));
+        assert!(analysis.var_defs.contains_key("z"));
+    }
+    
+    #[test]
+    fn test_live_variables() {
+        let func = create_test_function();
+        let analysis = LiveVariables::new(&func);
+        let mut solver = DataFlowSolver::new(analysis);
+        solver.solve(&func);
+        
+        // x and y should be live out of block 0
+        let live_out_0 = solver.out_set(0).unwrap();
+        assert!(live_out_0.contains(0) || live_out_0.contains(1));
+    }
+    
+    #[test]
+    fn test_bit_vector_lattice() {
+        let mut a = BitVectorLattice::new(MeetType::May, 10);
+        a.insert(1);
+        a.insert(2);
+        
+        let mut b = BitVectorLattice::new(MeetType::May, 10);
+        b.insert(2);
+        b.insert(3);
+        
+        let union = a.union(&b);
+        assert!(union.contains(1));
+        assert!(union.contains(2));
+        assert!(union.contains(3));
+        
+        let intersection = a.intersection(&b);
+        assert!(!intersection.contains(1));
+        assert!(intersection.contains(2));
+        assert!(!intersection.contains(3));
+    }
+}

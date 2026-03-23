@@ -1,0 +1,645 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ SANDBOX — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Secure sandbox execution environment for QuantaLang.
+//
+// Features:
+// - Capability-based security policies
+// - Process isolation (Linux namespaces)
+// - Syscall filtering (seccomp-bpf)
+// - Resource limits and monitoring
+// - Fine-grained filesystem and network access control
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang Sandbox
+//!
+//! A secure execution environment for running untrusted code.
+//!
+//! ## Quick Start
+//!
+//! ```quanta
+//! use quantalang::sandbox::{Sandbox, SecurityPolicy};
+//!
+//! // Create a sandbox with standard policy
+//! let mut sandbox = Sandbox::standard()?;
+//!
+//! // Execute code in the sandbox
+//! let result = sandbox.execute(|| {
+//!     // This code runs with restricted permissions
+//!     compute_something()
+//! })?;
+//! ```
+//!
+//! ## Custom Policies
+//!
+//! ```quanta
+//! use quantalang::sandbox::{SecurityPolicy, Sandbox};
+//!
+//! // Build a custom policy
+//! let policy = SecurityPolicy::builder()
+//!     .id("my-policy")
+//!     .allow_read("/tmp")
+//!     .allow_network("api.example.com", 443)
+//!     .max_memory(64 * 1024 * 1024)
+//!     .max_cpu_time(Duration::from_secs(30))
+//!     .build()?;
+//!
+//! let sandbox = Sandbox::new(SandboxConfig {
+//!     policy,
+//!     ..Default::default()
+//! })?;
+//! ```
+//!
+//! ## Process Isolation
+//!
+//! ```quanta
+//! use quantalang::sandbox::{SandboxBuilder, NamespaceConfig};
+//!
+//! let sandbox = SandboxBuilder::new()
+//!     .all_namespaces()  // Full isolation
+//!     .root_fs("/sandbox/rootfs")
+//!     .build()?;
+//!
+//! let process = sandbox.spawn_process("/bin/myapp", &["--config", "app.conf"])?;
+//! let status = process.wait()?;
+//! ```
+
+module quantalang::sandbox
+
+// Submodules
+pub mod policy;
+pub mod runtime;
+pub mod seccomp;
+
+// Re-exports from policy
+pub use policy::{
+    // Core policy types
+    SecurityPolicy, PolicyBuilder, PolicyError,
+    
+    // Filesystem policy
+    FilesystemPolicy, PathRule, PathAction, FileAccess, FilePermissions,
+    
+    // Network policy
+    NetworkPolicy, NetworkRule, NetworkAction, PortSpec, Protocol, ProtocolSet, RateLimit,
+    
+    // Process policy
+    ProcessPolicy,
+    
+    // Resource limits
+    ResourceLimits,
+    
+    // Syscall policy
+    SyscallPolicy, SyscallRule, SyscallAction, ArgFilter, FilterOp,
+    
+    // IPC policy
+    IpcPolicy,
+    
+    // Capabilities
+    CapabilitySet,
+    
+    // Audit
+    AuditPolicy, AuditDestination,
+    
+    // Decision result
+    Decision,
+};
+
+// Re-exports from runtime
+pub use runtime::{
+    // Core sandbox types
+    Sandbox, SandboxBuilder, SandboxConfig, SandboxError,
+    
+    // Sandboxed process
+    SandboxedProcess, ExitStatus,
+    
+    // Configuration types
+    StdioConfig, StdioMode, UserMapping, IdMap,
+    NamespaceConfig, CgroupConfig, TimeoutConfig,
+    
+    // Status and stats
+    SandboxStatus, TerminationReason, ExecutionStats,
+};
+
+// Re-exports from seccomp
+pub use seccomp::{
+    // Seccomp filter
+    SeccompFilter, SeccompAction, SeccompError,
+    
+    // BPF types
+    BpfProgram, BpfProgramBuilder, BpfInsn,
+    
+    // Architecture
+    Arch,
+    
+    // Predefined filters
+    minimal_filter, standard_filter, permissive_filter,
+};
+
+use alloc::string::String;
+use core::time::Duration;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIGH-LEVEL API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Execute a function in a minimal sandbox
+pub fn execute_minimal<F, R>(f: F) -> Result<R, SandboxError>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let mut sandbox = Sandbox::minimal()?;
+    sandbox.execute(f)
+}
+
+/// Execute a function in a standard sandbox
+pub fn execute_sandboxed<F, R>(f: F) -> Result<R, SandboxError>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let mut sandbox = Sandbox::standard()?;
+    sandbox.execute(f)
+}
+
+/// Execute a function with timeout
+pub fn execute_with_timeout<F, R>(f: F, timeout: Duration) -> Result<R, SandboxError>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let mut sandbox = Sandbox::standard()?;
+    sandbox.execute_with_timeout(f, timeout)
+}
+
+/// Execute with custom policy
+pub fn execute_with_policy<F, R>(f: F, policy: SecurityPolicy) -> Result<R, SandboxError>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let config = SandboxConfig {
+        policy,
+        ..Default::default()
+    };
+    let mut sandbox = Sandbox::new(config)?;
+    sandbox.execute(f)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SANDBOX PRESETS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Preset sandbox configurations
+pub struct Presets;
+
+impl Presets {
+    /// Sandbox for compute-only workloads (no I/O)
+    pub fn compute_only() -> SandboxConfig {
+        SandboxConfig {
+            policy: SecurityPolicy::builder()
+                .id("compute-only")
+                .name("Compute Only")
+                .build()
+                .unwrap(),
+            ..Default::default()
+        }
+    }
+    
+    /// Sandbox for file processing
+    pub fn file_processor(read_paths: &[&str], write_path: &str) -> SandboxConfig {
+        let mut builder = SecurityPolicy::builder()
+            .id("file-processor")
+            .name("File Processor");
+        
+        for path in read_paths {
+            builder = builder.allow_read(*path);
+        }
+        builder = builder.allow_write(write_path);
+        
+        SandboxConfig {
+            policy: builder.build().unwrap(),
+            ..Default::default()
+        }
+    }
+    
+    /// Sandbox for web requests (outbound HTTP/HTTPS only)
+    pub fn web_client() -> SandboxConfig {
+        let policy = SecurityPolicy::builder()
+            .id("web-client")
+            .name("Web Client")
+            .network(NetworkPolicy {
+                allow_outbound: true,
+                allow_inbound: false,
+                allowed_protocols: ProtocolSet::TCP,
+                rules: vec![
+                    NetworkRule::allow_range("*", 80, 80),
+                    NetworkRule::allow_range("*", 443, 443),
+                ],
+                allow_dns: true,
+                max_connections: Some(10),
+                rate_limit: None,
+            })
+            .build()
+            .unwrap();
+        
+        SandboxConfig {
+            policy,
+            ..Default::default()
+        }
+    }
+    
+    /// Sandbox for data science workloads
+    pub fn data_science() -> SandboxConfig {
+        let policy = SecurityPolicy::builder()
+            .id("data-science")
+            .name("Data Science")
+            .allow_read("/usr/share")
+            .allow_read("/tmp")
+            .allow_write("/tmp")
+            .max_memory(4 * 1024 * 1024 * 1024) // 4GB
+            .build()
+            .unwrap();
+        
+        SandboxConfig {
+            policy,
+            namespaces: NamespaceConfig {
+                net: false, // Allow network for data fetching
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+    
+    /// Sandbox for build tools
+    pub fn build_environment(workspace: &str) -> SandboxConfig {
+        let policy = SecurityPolicy::builder()
+            .id("build-env")
+            .name("Build Environment")
+            .allow_read("/usr")
+            .allow_read("/lib")
+            .allow_read("/lib64")
+            .allow_read("/etc/alternatives")
+            .allow_read(workspace)
+            .allow_write(workspace)
+            .process(ProcessPolicy {
+                allow_spawn: true,
+                allowed_executables: vec![
+                    "/usr/bin/cc".into(),
+                    "/usr/bin/gcc".into(),
+                    "/usr/bin/clang".into(),
+                    "/usr/bin/make".into(),
+                    "/usr/bin/cmake".into(),
+                ],
+                max_threads: Some(256),
+                allow_fork: true,
+                allow_exec: true,
+                allow_ptrace: false,
+                allow_signals: true,
+            })
+            .build()
+            .unwrap();
+        
+        SandboxConfig {
+            policy,
+            working_dir: workspace.into(),
+            ..Default::default()
+        }
+    }
+    
+    /// Maximum security sandbox
+    pub fn maximum_security() -> SandboxConfig {
+        SandboxConfig {
+            policy: SecurityPolicy::minimal(),
+            namespaces: NamespaceConfig::all(),
+            timeout: TimeoutConfig {
+                cpu_time: Some(Duration::from_secs(5)),
+                wall_time: Some(Duration::from_secs(10)),
+                idle_time: Some(Duration::from_secs(2)),
+            },
+            ..Default::default()
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SANDBOX POOL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use alloc::vec::Vec;
+use alloc::sync::Arc;
+use std::sync::Mutex;
+
+/// Pool of reusable sandboxes
+pub struct SandboxPool {
+    config: SandboxConfig,
+    available: Mutex<Vec<Sandbox>>,
+    max_size: usize,
+}
+
+impl SandboxPool {
+    /// Create a new pool
+    pub fn new(config: SandboxConfig, max_size: usize) -> Self {
+        SandboxPool {
+            config,
+            available: Mutex::new(Vec::with_capacity(max_size)),
+            max_size,
+        }
+    }
+    
+    /// Acquire a sandbox from the pool
+    pub fn acquire(&self) -> Result<PooledSandbox, SandboxError> {
+        let sandbox = {
+            let mut available = self.available.lock().unwrap();
+            available.pop()
+        };
+        
+        let sandbox = match sandbox {
+            Some(s) => s,
+            None => Sandbox::new(self.config.clone())?,
+        };
+        
+        Ok(PooledSandbox {
+            sandbox: Some(sandbox),
+            pool: self,
+        })
+    }
+    
+    /// Execute a function using a pooled sandbox
+    pub fn execute<F, R>(&self, f: F) -> Result<R, SandboxError>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let mut pooled = self.acquire()?;
+        pooled.execute(f)
+    }
+    
+    fn release(&self, sandbox: Sandbox) {
+        let mut available = self.available.lock().unwrap();
+        if available.len() < self.max_size {
+            available.push(sandbox);
+        }
+    }
+}
+
+/// Sandbox borrowed from pool
+pub struct PooledSandbox<'a> {
+    sandbox: Option<Sandbox>,
+    pool: &'a SandboxPool,
+}
+
+impl<'a> PooledSandbox<'a> {
+    /// Execute in this sandbox
+    pub fn execute<F, R>(&mut self, f: F) -> Result<R, SandboxError>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.sandbox.as_mut().unwrap().execute(f)
+    }
+}
+
+impl<'a> Drop for PooledSandbox<'a> {
+    fn drop(&mut self) {
+        if let Some(sandbox) = self.sandbox.take() {
+            self.pool.release(sandbox);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VIOLATION HANDLING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Security violation event
+#[derive(Debug, Clone)]
+pub struct SecurityViolation {
+    /// Type of violation
+    pub kind: ViolationKind,
+    
+    /// Description
+    pub description: String,
+    
+    /// Timestamp
+    pub timestamp: std::time::SystemTime,
+    
+    /// Additional context
+    pub context: ViolationContext,
+}
+
+/// Violation type
+#[derive(Debug, Clone)]
+pub enum ViolationKind {
+    FileAccess(String),
+    NetworkAccess(String, u16),
+    SyscallBlocked(u32),
+    ResourceExceeded(String),
+    CapabilityDenied(String),
+    ProcessSpawn(String),
+}
+
+/// Additional violation context
+#[derive(Debug, Clone)]
+pub struct ViolationContext {
+    pub pid: Option<u32>,
+    pub tid: Option<u32>,
+    pub syscall_args: Option<[u64; 6]>,
+}
+
+impl Default for ViolationContext {
+    fn default() -> Self {
+        ViolationContext {
+            pid: None,
+            tid: None,
+            syscall_args: None,
+        }
+    }
+}
+
+/// Violation handler trait
+pub trait ViolationHandler: Send + Sync {
+    fn handle(&self, violation: &SecurityViolation);
+}
+
+/// Logging violation handler
+pub struct LoggingHandler;
+
+impl ViolationHandler for LoggingHandler {
+    fn handle(&self, violation: &SecurityViolation) {
+        eprintln!(
+            "[SECURITY] {:?}: {}",
+            violation.kind,
+            violation.description
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Check if current process can use sandboxing
+pub fn is_sandbox_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // Check for user namespace support
+        std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false)
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Check if seccomp is available
+pub fn is_seccomp_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            // PR_GET_SECCOMP returns 0 if seccomp is disabled
+            libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) >= 0
+        }
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Get sandbox capabilities on current system
+pub fn capabilities() -> SandboxCapabilities {
+    SandboxCapabilities {
+        user_namespaces: check_user_namespaces(),
+        seccomp: is_seccomp_available(),
+        cgroups_v2: check_cgroups_v2(),
+        landlock: check_landlock(),
+    }
+}
+
+/// Available sandbox capabilities
+#[derive(Debug, Clone)]
+pub struct SandboxCapabilities {
+    pub user_namespaces: bool,
+    pub seccomp: bool,
+    pub cgroups_v2: bool,
+    pub landlock: bool,
+}
+
+fn check_user_namespaces() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { false }
+}
+
+fn check_cgroups_v2() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    { false }
+}
+
+fn check_landlock() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // Check kernel version >= 5.13
+        std::fs::read_to_string("/proc/version")
+            .map(|v| {
+                v.split_whitespace()
+                    .nth(2)
+                    .and_then(|ver| ver.split('.').next())
+                    .and_then(|major| major.parse::<u32>().ok())
+                    .map(|major| major >= 5)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { false }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Common sandbox types
+pub mod prelude {
+    pub use super::{
+        Sandbox, SandboxBuilder, SandboxConfig, SandboxError,
+        SecurityPolicy, PolicyBuilder,
+        execute_sandboxed, execute_with_timeout, execute_with_policy,
+        Presets,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_version() {
+        assert_eq!(VERSION, "1.0.0");
+    }
+    
+    #[test]
+    fn test_presets() {
+        let _compute = Presets::compute_only();
+        let _web = Presets::web_client();
+        let _max = Presets::maximum_security();
+    }
+    
+    #[test]
+    fn test_capabilities() {
+        let caps = capabilities();
+        // Just ensure it runs without panic
+        let _ = caps.seccomp;
+    }
+    
+    #[test]
+    fn test_sandbox_pool() {
+        let pool = SandboxPool::new(SandboxConfig::default(), 4);
+        
+        let result = pool.execute(|| 42);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
+    }
+    
+    #[test]
+    fn test_violation_handler() {
+        let handler = LoggingHandler;
+        let violation = SecurityViolation {
+            kind: ViolationKind::FileAccess("/etc/passwd".into()),
+            description: "Access denied".into(),
+            timestamp: std::time::SystemTime::now(),
+            context: ViolationContext::default(),
+        };
+        
+        handler.handle(&violation);
+    }
+}

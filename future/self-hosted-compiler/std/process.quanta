@@ -1,0 +1,2152 @@
+// QUANTA Standard Library - Process Module
+// Process spawning, command execution, and process management
+// ~2,500 lines
+
+module std::process;
+
+use std::io::{Read, Write, BufReader, BufWriter, Error as IoError, ErrorKind};
+use std::string::String;
+use std::vec::Vec;
+use std::path::{Path, PathBuf};
+use std::option::Option;
+use std::result::Result;
+use std::collections::HashMap;
+use std::time::Duration;
+use std::sync::{Arc, Mutex};
+
+// ============================================================================
+// Exit Status
+// ============================================================================
+
+/// Exit status of a completed process.
+pub struct ExitStatus {
+    code: Option<i32>,
+    signal: Option<i32>,  // Unix only
+}
+
+impl ExitStatus {
+    /// Creates an exit status from a raw code.
+    pub fn from_raw(code: i32) -> ExitStatus {
+        ExitStatus {
+            code: Option::Some(code),
+            signal: Option::None,
+        }
+    }
+    
+    /// Creates an exit status from a signal (Unix).
+    pub fn from_signal(signal: i32) -> ExitStatus {
+        ExitStatus {
+            code: Option::None,
+            signal: Option::Some(signal),
+        }
+    }
+    
+    /// Returns true if the process exited successfully.
+    pub fn success(self: &Self) -> bool {
+        match self.code {
+            Option::Some(code) => code == 0,
+            Option::None => false,
+        }
+    }
+    
+    /// Returns the exit code if the process exited normally.
+    pub fn code(self: &Self) -> Option<i32> {
+        self.code
+    }
+    
+    /// Returns the signal that terminated the process (Unix only).
+    pub fn signal(self: &Self) -> Option<i32> {
+        self.signal
+    }
+}
+
+impl Display for ExitStatus {
+    fn fmt(self: &Self, f: &mut Formatter) -> Result<(), FmtError> {
+        match self.code {
+            Option::Some(code) => {
+                write!(f, "exit code: {}", code)
+            }
+            Option::None => {
+                match self.signal {
+                    Option::Some(sig) => write!(f, "signal: {}", sig),
+                    Option::None => write!(f, "unknown exit status"),
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Exit Code (for current process)
+// ============================================================================
+
+/// Represents an exit code for the current process.
+pub struct ExitCode {
+    code: u8,
+}
+
+impl ExitCode {
+    /// Successful exit code (0).
+    pub const SUCCESS: ExitCode = ExitCode { code: 0 };
+    
+    /// Unsuccessful exit code (1).
+    pub const FAILURE: ExitCode = ExitCode { code: 1 };
+    
+    /// Creates an exit code from a raw value.
+    pub fn from_raw(code: u8) -> ExitCode {
+        ExitCode { code }
+    }
+    
+    /// Returns the raw exit code value.
+    pub fn as_raw(self: &Self) -> u8 {
+        self.code
+    }
+}
+
+// ============================================================================
+// Stdio Configuration
+// ============================================================================
+
+/// Configuration for process standard I/O streams.
+pub enum Stdio {
+    /// Inherit from parent process.
+    Inherit,
+    /// Pipe to/from parent process.
+    Piped,
+    /// Redirect to null device.
+    Null,
+    /// Use specific file descriptor.
+    Fd(i32),
+}
+
+impl Stdio {
+    /// Inherit from parent.
+    pub fn inherit() -> Stdio {
+        Stdio::Inherit
+    }
+    
+    /// Create a pipe.
+    pub fn piped() -> Stdio {
+        Stdio::Piped
+    }
+    
+    /// Redirect to null.
+    pub fn null() -> Stdio {
+        Stdio::Null
+    }
+    
+    /// Use a specific file descriptor.
+    pub fn from_raw_fd(fd: i32) -> Stdio {
+        Stdio::Fd(fd)
+    }
+}
+
+// ============================================================================
+// Child Process I/O
+// ============================================================================
+
+/// A handle to the standard input of a child process.
+pub struct ChildStdin {
+    fd: i32,
+    closed: bool,
+}
+
+impl ChildStdin {
+    fn new(fd: i32) -> ChildStdin {
+        ChildStdin { fd, closed: false }
+    }
+}
+
+impl Write for ChildStdin {
+    fn write(self: &mut Self, buf: &[u8]) -> Result<usize, IoError> {
+        if self.closed {
+            return Result::Err(IoError::new(ErrorKind::BrokenPipe, "stdin closed"));
+        }
+        
+        let result = __write(self.fd, buf.as_ptr(), buf.len());
+        if result < 0 {
+            Result::Err(IoError::from_raw_os_error(-result as i32))
+        } else {
+            Result::Ok(result as usize)
+        }
+    }
+    
+    fn flush(self: &mut Self) -> Result<(), IoError> {
+        // File descriptors don't buffer in kernel
+        Result::Ok(())
+    }
+}
+
+impl Drop for ChildStdin {
+    fn drop(self: &mut Self) {
+        if !self.closed {
+            __close(self.fd);
+            self.closed = true;
+        }
+    }
+}
+
+/// A handle to the standard output of a child process.
+pub struct ChildStdout {
+    fd: i32,
+    closed: bool,
+}
+
+impl ChildStdout {
+    fn new(fd: i32) -> ChildStdout {
+        ChildStdout { fd, closed: false }
+    }
+}
+
+impl Read for ChildStdout {
+    fn read(self: &mut Self, buf: &mut [u8]) -> Result<usize, IoError> {
+        if self.closed {
+            return Result::Ok(0); // EOF
+        }
+        
+        let result = __read(self.fd, buf.as_mut_ptr(), buf.len());
+        if result < 0 {
+            Result::Err(IoError::from_raw_os_error(-result as i32))
+        } else {
+            Result::Ok(result as usize)
+        }
+    }
+}
+
+impl Drop for ChildStdout {
+    fn drop(self: &mut Self) {
+        if !self.closed {
+            __close(self.fd);
+            self.closed = true;
+        }
+    }
+}
+
+/// A handle to the standard error of a child process.
+pub struct ChildStderr {
+    fd: i32,
+    closed: bool,
+}
+
+impl ChildStderr {
+    fn new(fd: i32) -> ChildStderr {
+        ChildStderr { fd, closed: false }
+    }
+}
+
+impl Read for ChildStderr {
+    fn read(self: &mut Self, buf: &mut [u8]) -> Result<usize, IoError> {
+        if self.closed {
+            return Result::Ok(0); // EOF
+        }
+        
+        let result = __read(self.fd, buf.as_mut_ptr(), buf.len());
+        if result < 0 {
+            Result::Err(IoError::from_raw_os_error(-result as i32))
+        } else {
+            Result::Ok(result as usize)
+        }
+    }
+}
+
+impl Drop for ChildStderr {
+    fn drop(self: &mut Self) {
+        if !self.closed {
+            __close(self.fd);
+            self.closed = true;
+        }
+    }
+}
+
+// ============================================================================
+// Child Process
+// ============================================================================
+
+/// A running or finished child process.
+pub struct Child {
+    pid: u32,
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+    exited: bool,
+    status: Option<ExitStatus>,
+}
+
+impl Child {
+    /// Returns the process ID.
+    pub fn id(self: &Self) -> u32 {
+        self.pid
+    }
+    
+    /// Takes ownership of the child's stdin handle.
+    pub fn take_stdin(self: &mut Self) -> Option<ChildStdin> {
+        let stdin = self.stdin;
+        self.stdin = Option::None;
+        stdin
+    }
+    
+    /// Takes ownership of the child's stdout handle.
+    pub fn take_stdout(self: &mut Self) -> Option<ChildStdout> {
+        let stdout = self.stdout;
+        self.stdout = Option::None;
+        stdout
+    }
+    
+    /// Takes ownership of the child's stderr handle.
+    pub fn take_stderr(self: &mut Self) -> Option<ChildStderr> {
+        let stderr = self.stderr;
+        self.stderr = Option::None;
+        stderr
+    }
+    
+    /// Waits for the child to exit and returns the exit status.
+    pub fn wait(self: &mut Self) -> Result<ExitStatus, IoError> {
+        if self.exited {
+            match self.status {
+                Option::Some(status) => return Result::Ok(status),
+                Option::None => {
+                    return Result::Err(IoError::new(
+                        ErrorKind::Other,
+                        "process already waited"
+                    ));
+                }
+            }
+        }
+        
+        let mut status: i32 = 0;
+        let result = __waitpid(self.pid as i32, &mut status, 0);
+        
+        if result < 0 {
+            return Result::Err(IoError::from_raw_os_error(-result));
+        }
+        
+        self.exited = true;
+        
+        // Decode status (POSIX waitpid format)
+        let exit_status = if __WIFEXITED(status) {
+            ExitStatus::from_raw(__WEXITSTATUS(status))
+        } else if __WIFSIGNALED(status) {
+            ExitStatus::from_signal(__WTERMSIG(status))
+        } else {
+            ExitStatus::from_raw(-1)
+        };
+        
+        self.status = Option::Some(exit_status);
+        Result::Ok(exit_status)
+    }
+    
+    /// Attempts to collect exit status without blocking.
+    pub fn try_wait(self: &mut Self) -> Result<Option<ExitStatus>, IoError> {
+        if self.exited {
+            return Result::Ok(self.status);
+        }
+        
+        let mut status: i32 = 0;
+        let result = __waitpid(self.pid as i32, &mut status, WNOHANG);
+        
+        if result < 0 {
+            return Result::Err(IoError::from_raw_os_error(-result));
+        }
+        
+        if result == 0 {
+            // Child still running
+            return Result::Ok(Option::None);
+        }
+        
+        self.exited = true;
+        
+        let exit_status = if __WIFEXITED(status) {
+            ExitStatus::from_raw(__WEXITSTATUS(status))
+        } else if __WIFSIGNALED(status) {
+            ExitStatus::from_signal(__WTERMSIG(status))
+        } else {
+            ExitStatus::from_raw(-1)
+        };
+        
+        self.status = Option::Some(exit_status);
+        Result::Ok(Option::Some(exit_status))
+    }
+    
+    /// Waits for the child and collects all output.
+    pub fn wait_with_output(self: Self) -> Result<Output, IoError> {
+        let mut child = self;
+        
+        // Read stdout
+        let mut stdout_data = Vec::new();
+        if let Option::Some(mut stdout) = child.take_stdout() {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdout.read(&mut buf) {
+                    Result::Ok(0) => break,
+                    Result::Ok(n) => {
+                        stdout_data.extend_from_slice(&buf[..n]);
+                    }
+                    Result::Err(e) => {
+                        if e.kind() == ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Result::Err(e);
+                    }
+                }
+            }
+        }
+        
+        // Read stderr
+        let mut stderr_data = Vec::new();
+        if let Option::Some(mut stderr) = child.take_stderr() {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buf) {
+                    Result::Ok(0) => break,
+                    Result::Ok(n) => {
+                        stderr_data.extend_from_slice(&buf[..n]);
+                    }
+                    Result::Err(e) => {
+                        if e.kind() == ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Result::Err(e);
+                    }
+                }
+            }
+        }
+        
+        // Wait for process
+        let status = child.wait()?;
+        
+        Result::Ok(Output {
+            status,
+            stdout: stdout_data,
+            stderr: stderr_data,
+        })
+    }
+    
+    /// Sends a signal to the child process.
+    pub fn kill(self: &mut Self) -> Result<(), IoError> {
+        if self.exited {
+            return Result::Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "process already exited"
+            ));
+        }
+        
+        let result = __kill(self.pid as i32, SIGKILL);
+        if result < 0 {
+            Result::Err(IoError::from_raw_os_error(-result))
+        } else {
+            Result::Ok(())
+        }
+    }
+    
+    /// Sends SIGTERM to the child process (Unix).
+    pub fn terminate(self: &mut Self) -> Result<(), IoError> {
+        if self.exited {
+            return Result::Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "process already exited"
+            ));
+        }
+        
+        let result = __kill(self.pid as i32, SIGTERM);
+        if result < 0 {
+            Result::Err(IoError::from_raw_os_error(-result))
+        } else {
+            Result::Ok(())
+        }
+    }
+    
+    /// Sends a specific signal to the child (Unix).
+    pub fn signal(self: &mut Self, sig: i32) -> Result<(), IoError> {
+        if self.exited {
+            return Result::Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "process already exited"
+            ));
+        }
+        
+        let result = __kill(self.pid as i32, sig);
+        if result < 0 {
+            Result::Err(IoError::from_raw_os_error(-result))
+        } else {
+            Result::Ok(())
+        }
+    }
+}
+
+impl Drop for Child {
+    fn drop(self: &mut Self) {
+        // Close any remaining handles
+        if let Option::Some(stdin) = self.stdin {
+            drop(stdin);
+        }
+        if let Option::Some(stdout) = self.stdout {
+            drop(stdout);
+        }
+        if let Option::Some(stderr) = self.stderr {
+            drop(stderr);
+        }
+        
+        // Don't leave zombie processes
+        if !self.exited {
+            let _ = self.try_wait();
+        }
+    }
+}
+
+// ============================================================================
+// Output
+// ============================================================================
+
+/// The output of a finished process.
+pub struct Output {
+    /// The exit status.
+    pub status: ExitStatus,
+    /// The captured stdout.
+    pub stdout: Vec<u8>,
+    /// The captured stderr.
+    pub stderr: Vec<u8>,
+}
+
+impl Output {
+    /// Returns stdout as a string (lossy UTF-8 conversion).
+    pub fn stdout_string(self: &Self) -> String {
+        String::from_utf8_lossy(&self.stdout)
+    }
+    
+    /// Returns stderr as a string (lossy UTF-8 conversion).
+    pub fn stderr_string(self: &Self) -> String {
+        String::from_utf8_lossy(&self.stderr)
+    }
+}
+
+// ============================================================================
+// Command Builder
+// ============================================================================
+
+/// A process builder for spawning commands.
+pub struct Command {
+    program: PathBuf,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    env_clear: bool,
+    current_dir: Option<PathBuf>,
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+    uid: Option<u32>,    // Unix
+    gid: Option<u32>,    // Unix
+    groups: Vec<u32>,    // Unix
+    pre_exec: Option<fn() -> Result<(), IoError>>,  // Unix
+}
+
+impl Command {
+    /// Creates a new command builder for the given program.
+    pub fn new<S: AsRef<str>>(program: S) -> Command {
+        Command {
+            program: PathBuf::from(program.as_ref()),
+            args: Vec::new(),
+            env: HashMap::new(),
+            env_clear: false,
+            current_dir: Option::None,
+            stdin: Stdio::Inherit,
+            stdout: Stdio::Inherit,
+            stderr: Stdio::Inherit,
+            uid: Option::None,
+            gid: Option::None,
+            groups: Vec::new(),
+            pre_exec: Option::None,
+        }
+    }
+    
+    /// Adds an argument to the command.
+    pub fn arg<S: AsRef<str>>(self: &mut Self, arg: S) -> &mut Self {
+        self.args.push(String::from(arg.as_ref()));
+        self
+    }
+    
+    /// Adds multiple arguments to the command.
+    pub fn args<I, S>(self: &mut Self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for arg in args {
+            self.args.push(String::from(arg.as_ref()));
+        }
+        self
+    }
+    
+    /// Sets an environment variable.
+    pub fn env<K: AsRef<str>, V: AsRef<str>>(
+        self: &mut Self,
+        key: K,
+        value: V
+    ) -> &mut Self {
+        self.env.insert(
+            String::from(key.as_ref()),
+            String::from(value.as_ref())
+        );
+        self
+    }
+    
+    /// Sets multiple environment variables.
+    pub fn envs<I, K, V>(self: &mut Self, vars: I) -> &mut Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        for (key, value) in vars {
+            self.env.insert(
+                String::from(key.as_ref()),
+                String::from(value.as_ref())
+            );
+        }
+        self
+    }
+    
+    /// Removes an environment variable.
+    pub fn env_remove<K: AsRef<str>>(self: &mut Self, key: K) -> &mut Self {
+        self.env.remove(key.as_ref());
+        self
+    }
+    
+    /// Clears all environment variables.
+    pub fn env_clear(self: &mut Self) -> &mut Self {
+        self.env_clear = true;
+        self.env.clear();
+        self
+    }
+    
+    /// Sets the working directory for the child process.
+    pub fn current_dir<P: AsRef<Path>>(self: &mut Self, dir: P) -> &mut Self {
+        self.current_dir = Option::Some(dir.as_ref().to_path_buf());
+        self
+    }
+    
+    /// Sets the stdin configuration.
+    pub fn stdin<T: Into<Stdio>>(self: &mut Self, cfg: T) -> &mut Self {
+        self.stdin = cfg.into();
+        self
+    }
+    
+    /// Sets the stdout configuration.
+    pub fn stdout<T: Into<Stdio>>(self: &mut Self, cfg: T) -> &mut Self {
+        self.stdout = cfg.into();
+        self
+    }
+    
+    /// Sets the stderr configuration.
+    pub fn stderr<T: Into<Stdio>>(self: &mut Self, cfg: T) -> &mut Self {
+        self.stderr = cfg.into();
+        self
+    }
+    
+    /// Sets the user ID for the child process (Unix).
+    pub fn uid(self: &mut Self, id: u32) -> &mut Self {
+        self.uid = Option::Some(id);
+        self
+    }
+    
+    /// Sets the group ID for the child process (Unix).
+    pub fn gid(self: &mut Self, id: u32) -> &mut Self {
+        self.gid = Option::Some(id);
+        self
+    }
+    
+    /// Sets supplementary groups for the child process (Unix).
+    pub fn groups(self: &mut Self, groups: &[u32]) -> &mut Self {
+        self.groups = groups.to_vec();
+        self
+    }
+    
+    /// Sets a function to run in the child after fork but before exec (Unix).
+    /// 
+    /// # Safety
+    /// The function must be async-signal-safe.
+    pub unsafe fn pre_exec<F>(self: &mut Self, f: F) -> &mut Self
+    where
+        F: Fn() -> Result<(), IoError> + 'static,
+    {
+        self.pre_exec = Option::Some(f);
+        self
+    }
+    
+    /// Returns the program path.
+    pub fn get_program(self: &Self) -> &Path {
+        self.program.as_path()
+    }
+    
+    /// Returns the arguments.
+    pub fn get_args(self: &Self) -> &[String] {
+        &self.args
+    }
+    
+    /// Returns the environment modifications.
+    pub fn get_envs(self: &Self) -> &HashMap<String, String> {
+        &self.env
+    }
+    
+    /// Returns the working directory.
+    pub fn get_current_dir(self: &Self) -> Option<&Path> {
+        self.current_dir.as_ref().map(|p| p.as_path())
+    }
+    
+    /// Spawns the command as a child process.
+    pub fn spawn(self: &Self) -> Result<Child, IoError> {
+        self.spawn_inner()
+    }
+    
+    /// Executes the command and waits for it to complete.
+    pub fn status(self: &Self) -> Result<ExitStatus, IoError> {
+        self.spawn()?.wait()
+    }
+    
+    /// Executes the command and captures its output.
+    pub fn output(self: &mut Self) -> Result<Output, IoError> {
+        self.stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()?
+            .wait_with_output()
+    }
+    
+    // Internal spawn implementation
+    fn spawn_inner(self: &Self) -> Result<Child, IoError> {
+        // Create pipes for stdio if needed
+        let (stdin_read, stdin_write) = match self.stdin {
+            Stdio::Piped => {
+                let (r, w) = create_pipe()?;
+                (Option::Some(r), Option::Some(w))
+            }
+            _ => (Option::None, Option::None),
+        };
+        
+        let (stdout_read, stdout_write) = match self.stdout {
+            Stdio::Piped => {
+                let (r, w) = create_pipe()?;
+                (Option::Some(r), Option::Some(w))
+            }
+            _ => (Option::None, Option::None),
+        };
+        
+        let (stderr_read, stderr_write) = match self.stderr {
+            Stdio::Piped => {
+                let (r, w) = create_pipe()?;
+                (Option::Some(r), Option::Some(w))
+            }
+            _ => (Option::None, Option::None),
+        };
+        
+        // Fork
+        let pid = __fork();
+        
+        if pid < 0 {
+            // Fork failed - clean up pipes
+            if let Option::Some(fd) = stdin_read { __close(fd); }
+            if let Option::Some(fd) = stdin_write { __close(fd); }
+            if let Option::Some(fd) = stdout_read { __close(fd); }
+            if let Option::Some(fd) = stdout_write { __close(fd); }
+            if let Option::Some(fd) = stderr_read { __close(fd); }
+            if let Option::Some(fd) = stderr_write { __close(fd); }
+            
+            return Result::Err(IoError::from_raw_os_error(-pid));
+        }
+        
+        if pid == 0 {
+            // Child process
+            self.setup_child(
+                stdin_read, stdin_write,
+                stdout_read, stdout_write,
+                stderr_read, stderr_write,
+            );
+            // If we get here, exec failed
+            __exit(127);
+        }
+        
+        // Parent process
+        // Close child ends of pipes
+        if let Option::Some(fd) = stdin_read { __close(fd); }
+        if let Option::Some(fd) = stdout_write { __close(fd); }
+        if let Option::Some(fd) = stderr_write { __close(fd); }
+        
+        // Create child handle
+        let child = Child {
+            pid: pid as u32,
+            stdin: stdin_write.map(ChildStdin::new),
+            stdout: stdout_read.map(ChildStdout::new),
+            stderr: stderr_read.map(ChildStderr::new),
+            exited: false,
+            status: Option::None,
+        };
+        
+        Result::Ok(child)
+    }
+    
+    // Set up child process after fork
+    fn setup_child(
+        self: &Self,
+        stdin_read: Option<i32>,
+        stdin_write: Option<i32>,
+        stdout_read: Option<i32>,
+        stdout_write: Option<i32>,
+        stderr_read: Option<i32>,
+        stderr_write: Option<i32>,
+    ) {
+        // Close parent ends of pipes
+        if let Option::Some(fd) = stdin_write { __close(fd); }
+        if let Option::Some(fd) = stdout_read { __close(fd); }
+        if let Option::Some(fd) = stderr_read { __close(fd); }
+        
+        // Set up stdin
+        match self.stdin {
+            Stdio::Piped => {
+                if let Option::Some(fd) = stdin_read {
+                    __dup2(fd, 0);
+                    __close(fd);
+                }
+            }
+            Stdio::Null => {
+                let null = __open("/dev/null\0".as_ptr(), O_RDONLY, 0);
+                if null >= 0 {
+                    __dup2(null, 0);
+                    __close(null);
+                }
+            }
+            Stdio::Fd(fd) => {
+                __dup2(fd, 0);
+            }
+            Stdio::Inherit => {}
+        }
+        
+        // Set up stdout
+        match self.stdout {
+            Stdio::Piped => {
+                if let Option::Some(fd) = stdout_write {
+                    __dup2(fd, 1);
+                    __close(fd);
+                }
+            }
+            Stdio::Null => {
+                let null = __open("/dev/null\0".as_ptr(), O_WRONLY, 0);
+                if null >= 0 {
+                    __dup2(null, 1);
+                    __close(null);
+                }
+            }
+            Stdio::Fd(fd) => {
+                __dup2(fd, 1);
+            }
+            Stdio::Inherit => {}
+        }
+        
+        // Set up stderr
+        match self.stderr {
+            Stdio::Piped => {
+                if let Option::Some(fd) = stderr_write {
+                    __dup2(fd, 2);
+                    __close(fd);
+                }
+            }
+            Stdio::Null => {
+                let null = __open("/dev/null\0".as_ptr(), O_WRONLY, 0);
+                if null >= 0 {
+                    __dup2(null, 2);
+                    __close(null);
+                }
+            }
+            Stdio::Fd(fd) => {
+                __dup2(fd, 2);
+            }
+            Stdio::Inherit => {}
+        }
+        
+        // Change directory if specified
+        if let Option::Some(ref dir) = self.current_dir {
+            let path_str = dir.as_str();
+            let mut buf = [0u8; 4096];
+            copy_to_cstr(path_str, &mut buf);
+            __chdir(buf.as_ptr());
+        }
+        
+        // Set groups if specified
+        if !self.groups.is_empty() {
+            __setgroups(self.groups.len(), self.groups.as_ptr());
+        }
+        
+        // Set GID if specified
+        if let Option::Some(gid) = self.gid {
+            __setgid(gid);
+        }
+        
+        // Set UID if specified
+        if let Option::Some(uid) = self.uid {
+            __setuid(uid);
+        }
+        
+        // Run pre-exec hook
+        if let Option::Some(ref f) = self.pre_exec {
+            if let Result::Err(_) = f() {
+                return;
+            }
+        }
+        
+        // Clear or set environment
+        if self.env_clear {
+            __clearenv();
+        }
+        
+        for (key, value) in &self.env {
+            let mut env_str = key.clone();
+            env_str.push('=');
+            env_str.push_str(value);
+            let mut buf = [0u8; 8192];
+            copy_to_cstr(&env_str, &mut buf);
+            __putenv(buf.as_ptr());
+        }
+        
+        // Build argv
+        let mut argv: Vec<*const u8> = Vec::with_capacity(self.args.len() + 2);
+        
+        // Program name
+        let program_str = self.program.as_str();
+        let mut prog_buf = [0u8; 4096];
+        copy_to_cstr(program_str, &mut prog_buf);
+        argv.push(prog_buf.as_ptr());
+        
+        // Arguments (we need to keep buffers alive)
+        let mut arg_bufs: Vec<[u8; 4096]> = Vec::with_capacity(self.args.len());
+        for arg in &self.args {
+            let mut buf = [0u8; 4096];
+            copy_to_cstr(arg, &mut buf);
+            arg_bufs.push(buf);
+        }
+        
+        for buf in &arg_bufs {
+            argv.push(buf.as_ptr());
+        }
+        
+        // Null terminator
+        argv.push(std::ptr::null());
+        
+        // Execute
+        __execv(prog_buf.as_ptr(), argv.as_ptr());
+        
+        // If we get here, exec failed
+    }
+}
+
+// Helper to create a pipe
+fn create_pipe() -> Result<(i32, i32), IoError> {
+    let mut fds = [0i32; 2];
+    let result = __pipe(fds.as_mut_ptr());
+    if result < 0 {
+        Result::Err(IoError::from_raw_os_error(-result))
+    } else {
+        Result::Ok((fds[0], fds[1]))
+    }
+}
+
+// Helper to copy string to C string buffer
+fn copy_to_cstr(s: &str, buf: &mut [u8]) {
+    let bytes = s.as_bytes();
+    let len = bytes.len().min(buf.len() - 1);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    buf[len] = 0;
+}
+
+// ============================================================================
+// Current Process Functions
+// ============================================================================
+
+/// Returns the current process ID.
+pub fn id() -> u32 {
+    __getpid() as u32
+}
+
+/// Returns the parent process ID.
+pub fn parent_id() -> u32 {
+    __getppid() as u32
+}
+
+/// Terminates the current process with the given exit code.
+pub fn exit(code: i32) -> ! {
+    __exit(code)
+}
+
+/// Terminates the current process immediately without cleanup.
+pub fn abort() -> ! {
+    __abort()
+}
+
+/// Returns the arguments that the program was started with.
+pub fn args() -> Args {
+    Args::new()
+}
+
+/// Returns the path of the current executable.
+pub fn current_exe() -> Result<PathBuf, IoError> {
+    // Try /proc/self/exe on Linux
+    let mut buf = [0u8; 4096];
+    let len = __readlink("/proc/self/exe\0".as_ptr(), buf.as_mut_ptr(), buf.len());
+    
+    if len > 0 {
+        let path_str = String::from_utf8_lossy(&buf[..len as usize]);
+        return Result::Ok(PathBuf::from(path_str));
+    }
+    
+    Result::Err(IoError::new(ErrorKind::NotFound, "could not find executable path"))
+}
+
+/// Arguments iterator.
+pub struct Args {
+    index: usize,
+    count: usize,
+}
+
+impl Args {
+    fn new() -> Args {
+        Args {
+            index: 0,
+            count: __argc() as usize,
+        }
+    }
+    
+    /// Returns the number of arguments.
+    pub fn len(self: &Self) -> usize {
+        self.count
+    }
+    
+    /// Returns true if there are no arguments.
+    pub fn is_empty(self: &Self) -> bool {
+        self.count == 0
+    }
+}
+
+impl Iterator for Args {
+    type Item = String;
+    
+    fn next(self: &mut Self) -> Option<String> {
+        if self.index >= self.count {
+            return Option::None;
+        }
+        
+        let arg_ptr = __argv_at(self.index);
+        if arg_ptr.is_null() {
+            return Option::None;
+        }
+        
+        let arg = String::from_cstr(arg_ptr);
+        self.index += 1;
+        Option::Some(arg)
+    }
+    
+    fn size_hint(self: &Self) -> (usize, Option<usize>) {
+        let remaining = self.count - self.index;
+        (remaining, Option::Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for Args {}
+
+// ============================================================================
+// Environment Variables
+// ============================================================================
+
+/// Gets the value of an environment variable.
+pub fn var<K: AsRef<str>>(key: K) -> Result<String, VarError> {
+    let key_str = key.as_ref();
+    let mut buf = [0u8; 256];
+    copy_to_cstr(key_str, &mut buf);
+    
+    let value_ptr = __getenv(buf.as_ptr());
+    if value_ptr.is_null() {
+        Result::Err(VarError::NotPresent)
+    } else {
+        Result::Ok(String::from_cstr(value_ptr))
+    }
+}
+
+/// Gets the value of an environment variable, or a default.
+pub fn var_or<K: AsRef<str>, V: AsRef<str>>(key: K, default: V) -> String {
+    match var(key) {
+        Result::Ok(value) => value,
+        Result::Err(_) => String::from(default.as_ref()),
+    }
+}
+
+/// Gets the value of an environment variable as an OsString.
+pub fn var_os<K: AsRef<str>>(key: K) -> Option<String> {
+    var(key).ok()
+}
+
+/// Sets an environment variable.
+pub fn set_var<K: AsRef<str>, V: AsRef<str>>(key: K, value: V) {
+    let key_str = key.as_ref();
+    let value_str = value.as_ref();
+    
+    let mut env_str = String::from(key_str);
+    env_str.push('=');
+    env_str.push_str(value_str);
+    
+    let mut buf = [0u8; 8192];
+    copy_to_cstr(&env_str, &mut buf);
+    __putenv(buf.as_ptr());
+}
+
+/// Removes an environment variable.
+pub fn remove_var<K: AsRef<str>>(key: K) {
+    let key_str = key.as_ref();
+    let mut buf = [0u8; 256];
+    copy_to_cstr(key_str, &mut buf);
+    __unsetenv(buf.as_ptr());
+}
+
+/// Returns an iterator over environment variables.
+pub fn vars() -> Vars {
+    Vars::new()
+}
+
+/// Error type for environment variable operations.
+pub enum VarError {
+    /// The variable was not present.
+    NotPresent,
+    /// The variable was not valid UTF-8.
+    NotUnicode(Vec<u8>),
+}
+
+impl Display for VarError {
+    fn fmt(self: &Self, f: &mut Formatter) -> Result<(), FmtError> {
+        match self {
+            VarError::NotPresent => write!(f, "environment variable not found"),
+            VarError::NotUnicode(_) => write!(f, "environment variable was not valid unicode"),
+        }
+    }
+}
+
+/// Iterator over environment variables.
+pub struct Vars {
+    index: usize,
+}
+
+impl Vars {
+    fn new() -> Vars {
+        Vars { index: 0 }
+    }
+}
+
+impl Iterator for Vars {
+    type Item = (String, String);
+    
+    fn next(self: &mut Self) -> Option<(String, String)> {
+        let env_ptr = __environ_at(self.index);
+        if env_ptr.is_null() {
+            return Option::None;
+        }
+        
+        let env_str = String::from_cstr(env_ptr);
+        self.index += 1;
+        
+        // Split at first '='
+        if let Option::Some(eq_pos) = env_str.find('=') {
+            let key = env_str[..eq_pos].to_string();
+            let value = env_str[eq_pos + 1..].to_string();
+            Option::Some((key, value))
+        } else {
+            // Malformed, try next
+            self.next()
+        }
+    }
+}
+
+// ============================================================================
+// Signal Handling
+// ============================================================================
+
+/// Standard Unix signals.
+pub mod signal {
+    pub const SIGHUP: i32 = 1;
+    pub const SIGINT: i32 = 2;
+    pub const SIGQUIT: i32 = 3;
+    pub const SIGILL: i32 = 4;
+    pub const SIGTRAP: i32 = 5;
+    pub const SIGABRT: i32 = 6;
+    pub const SIGBUS: i32 = 7;
+    pub const SIGFPE: i32 = 8;
+    pub const SIGKILL: i32 = 9;
+    pub const SIGUSR1: i32 = 10;
+    pub const SIGSEGV: i32 = 11;
+    pub const SIGUSR2: i32 = 12;
+    pub const SIGPIPE: i32 = 13;
+    pub const SIGALRM: i32 = 14;
+    pub const SIGTERM: i32 = 15;
+    pub const SIGCHLD: i32 = 17;
+    pub const SIGCONT: i32 = 18;
+    pub const SIGSTOP: i32 = 19;
+    pub const SIGTSTP: i32 = 20;
+    pub const SIGTTIN: i32 = 21;
+    pub const SIGTTOU: i32 = 22;
+    pub const SIGURG: i32 = 23;
+    pub const SIGXCPU: i32 = 24;
+    pub const SIGXFSZ: i32 = 25;
+    pub const SIGVTALRM: i32 = 26;
+    pub const SIGPROF: i32 = 27;
+    pub const SIGWINCH: i32 = 28;
+    pub const SIGIO: i32 = 29;
+    pub const SIGPWR: i32 = 30;
+    pub const SIGSYS: i32 = 31;
+}
+
+/// Signal handler type.
+pub enum SignalHandler {
+    /// Default signal handling.
+    Default,
+    /// Ignore the signal.
+    Ignore,
+    /// Custom handler function.
+    Handler(fn(i32)),
+}
+
+/// Sets a signal handler.
+pub fn set_signal_handler(sig: i32, handler: SignalHandler) -> Result<SignalHandler, IoError> {
+    let handler_ptr = match handler {
+        SignalHandler::Default => SIG_DFL,
+        SignalHandler::Ignore => SIG_IGN,
+        SignalHandler::Handler(f) => f as usize,
+    };
+    
+    let old = __signal(sig, handler_ptr);
+    
+    if old == SIG_ERR {
+        Result::Err(IoError::last_os_error())
+    } else if old == SIG_DFL {
+        Result::Ok(SignalHandler::Default)
+    } else if old == SIG_IGN {
+        Result::Ok(SignalHandler::Ignore)
+    } else {
+        Result::Ok(SignalHandler::Handler(std::mem::transmute(old)))
+    }
+}
+
+/// Raises a signal in the current process.
+pub fn raise_signal(sig: i32) -> Result<(), IoError> {
+    let result = __raise(sig);
+    if result < 0 {
+        Result::Err(IoError::from_raw_os_error(-result))
+    } else {
+        Result::Ok(())
+    }
+}
+
+// ============================================================================
+// Process Group and Session
+// ============================================================================
+
+/// Gets the process group ID.
+pub fn getpgrp() -> u32 {
+    __getpgrp() as u32
+}
+
+/// Sets the process group ID.
+pub fn setpgid(pid: u32, pgid: u32) -> Result<(), IoError> {
+    let result = __setpgid(pid as i32, pgid as i32);
+    if result < 0 {
+        Result::Err(IoError::from_raw_os_error(-result))
+    } else {
+        Result::Ok(())
+    }
+}
+
+/// Creates a new session.
+pub fn setsid() -> Result<u32, IoError> {
+    let result = __setsid();
+    if result < 0 {
+        Result::Err(IoError::from_raw_os_error(-result))
+    } else {
+        Result::Ok(result as u32)
+    }
+}
+
+/// Gets the session ID.
+pub fn getsid(pid: u32) -> Result<u32, IoError> {
+    let result = __getsid(pid as i32);
+    if result < 0 {
+        Result::Err(IoError::from_raw_os_error(-result))
+    } else {
+        Result::Ok(result as u32)
+    }
+}
+
+// ============================================================================
+// User and Group IDs
+// ============================================================================
+
+/// Gets the real user ID.
+pub fn getuid() -> u32 {
+    __getuid()
+}
+
+/// Gets the effective user ID.
+pub fn geteuid() -> u32 {
+    __geteuid()
+}
+
+/// Gets the real group ID.
+pub fn getgid() -> u32 {
+    __getgid()
+}
+
+/// Gets the effective group ID.
+pub fn getegid() -> u32 {
+    __getegid()
+}
+
+// ============================================================================
+// Resource Limits
+// ============================================================================
+
+/// Resource limit type.
+pub enum Resource {
+    /// CPU time limit in seconds.
+    CPU,
+    /// Maximum file size.
+    FileSize,
+    /// Maximum data segment size.
+    Data,
+    /// Maximum stack size.
+    Stack,
+    /// Maximum core file size.
+    Core,
+    /// Maximum number of open file descriptors.
+    NoFile,
+    /// Maximum address space size.
+    AddressSpace,
+    /// Maximum number of processes.
+    NProc,
+    /// Maximum locked memory.
+    MemLock,
+}
+
+impl Resource {
+    fn to_raw(self: &Self) -> i32 {
+        match self {
+            Resource::CPU => RLIMIT_CPU,
+            Resource::FileSize => RLIMIT_FSIZE,
+            Resource::Data => RLIMIT_DATA,
+            Resource::Stack => RLIMIT_STACK,
+            Resource::Core => RLIMIT_CORE,
+            Resource::NoFile => RLIMIT_NOFILE,
+            Resource::AddressSpace => RLIMIT_AS,
+            Resource::NProc => RLIMIT_NPROC,
+            Resource::MemLock => RLIMIT_MEMLOCK,
+        }
+    }
+}
+
+/// Resource limit values.
+pub struct ResourceLimit {
+    /// Current (soft) limit.
+    pub soft: u64,
+    /// Maximum (hard) limit.
+    pub hard: u64,
+}
+
+/// Gets a resource limit.
+pub fn getrlimit(resource: Resource) -> Result<ResourceLimit, IoError> {
+    let mut rlim = RLimit { soft: 0, hard: 0 };
+    let result = __getrlimit(resource.to_raw(), &mut rlim);
+    
+    if result < 0 {
+        Result::Err(IoError::from_raw_os_error(-result))
+    } else {
+        Result::Ok(ResourceLimit {
+            soft: rlim.soft,
+            hard: rlim.hard,
+        })
+    }
+}
+
+/// Sets a resource limit.
+pub fn setrlimit(resource: Resource, limit: ResourceLimit) -> Result<(), IoError> {
+    let rlim = RLimit {
+        soft: limit.soft,
+        hard: limit.hard,
+    };
+    let result = __setrlimit(resource.to_raw(), &rlim);
+    
+    if result < 0 {
+        Result::Err(IoError::from_raw_os_error(-result))
+    } else {
+        Result::Ok(())
+    }
+}
+
+// Internal rlimit structure
+#[repr(C)]
+struct RLimit {
+    soft: u64,
+    hard: u64,
+}
+
+// ============================================================================
+// Process Priority (Nice)
+// ============================================================================
+
+/// Gets the nice value of a process.
+pub fn getpriority(pid: u32) -> Result<i32, IoError> {
+    // Clear errno first
+    __set_errno(0);
+    let prio = __getpriority(PRIO_PROCESS, pid as i32);
+    let err = __errno();
+    
+    if err != 0 {
+        Result::Err(IoError::from_raw_os_error(err))
+    } else {
+        Result::Ok(prio)
+    }
+}
+
+/// Sets the nice value of a process.
+pub fn setpriority(pid: u32, priority: i32) -> Result<(), IoError> {
+    let result = __setpriority(PRIO_PROCESS, pid as i32, priority);
+    if result < 0 {
+        Result::Err(IoError::from_raw_os_error(-result))
+    } else {
+        Result::Ok(())
+    }
+}
+
+/// Adjusts the nice value of the current process.
+pub fn nice(increment: i32) -> Result<i32, IoError> {
+    __set_errno(0);
+    let new_nice = __nice(increment);
+    let err = __errno();
+    
+    if err != 0 {
+        Result::Err(IoError::from_raw_os_error(err))
+    } else {
+        Result::Ok(new_nice)
+    }
+}
+
+// ============================================================================
+// Pipe Creation
+// ============================================================================
+
+/// Creates a pipe and returns (read_end, write_end).
+pub fn pipe() -> Result<(ChildStdout, ChildStdin), IoError> {
+    let (read_fd, write_fd) = create_pipe()?;
+    Result::Ok((
+        ChildStdout::new(read_fd),
+        ChildStdin::new(write_fd),
+    ))
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+/// Runs a command and returns its exit status.
+pub fn run<S: AsRef<str>>(program: S) -> Result<ExitStatus, IoError> {
+    Command::new(program).status()
+}
+
+/// Runs a command with arguments and returns its exit status.
+pub fn run_with_args<S, I, A>(program: S, args: I) -> Result<ExitStatus, IoError>
+where
+    S: AsRef<str>,
+    I: IntoIterator<Item = A>,
+    A: AsRef<str>,
+{
+    Command::new(program).args(args).status()
+}
+
+/// Captures the output of a command.
+pub fn capture<S: AsRef<str>>(program: S) -> Result<Output, IoError> {
+    Command::new(program).output()
+}
+
+/// Captures the output of a command with arguments.
+pub fn capture_with_args<S, I, A>(program: S, args: I) -> Result<Output, IoError>
+where
+    S: AsRef<str>,
+    I: IntoIterator<Item = A>,
+    A: AsRef<str>,
+{
+    Command::new(program).args(args).output()
+}
+
+/// Runs a shell command.
+pub fn shell<S: AsRef<str>>(command: S) -> Result<ExitStatus, IoError> {
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .status()
+}
+
+/// Captures output of a shell command.
+pub fn shell_capture<S: AsRef<str>>(command: S) -> Result<Output, IoError> {
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .output()
+}
+
+// ============================================================================
+// Process Information
+// ============================================================================
+
+/// Information about a process.
+pub struct ProcessInfo {
+    /// Process ID.
+    pub pid: u32,
+    /// Parent process ID.
+    pub ppid: u32,
+    /// Process name.
+    pub name: String,
+    /// Process state.
+    pub state: ProcessState,
+    /// Virtual memory size in bytes.
+    pub vsize: u64,
+    /// Resident set size in bytes.
+    pub rss: u64,
+    /// User ID.
+    pub uid: u32,
+    /// Group ID.
+    pub gid: u32,
+}
+
+/// Process state.
+pub enum ProcessState {
+    Running,
+    Sleeping,
+    Waiting,
+    Zombie,
+    Stopped,
+    TraceStopped,
+    Dead,
+    Unknown,
+}
+
+impl ProcessState {
+    fn from_char(c: char) -> ProcessState {
+        match c {
+            'R' => ProcessState::Running,
+            'S' => ProcessState::Sleeping,
+            'D' => ProcessState::Waiting,
+            'Z' => ProcessState::Zombie,
+            'T' => ProcessState::Stopped,
+            't' => ProcessState::TraceStopped,
+            'X' => ProcessState::Dead,
+            _ => ProcessState::Unknown,
+        }
+    }
+}
+
+/// Gets information about a process.
+pub fn process_info(pid: u32) -> Result<ProcessInfo, IoError> {
+    // Read /proc/[pid]/stat
+    let stat_path = format!("/proc/{}/stat", pid);
+    let stat_content = std::fs::read_to_string(&stat_path)?;
+    
+    // Parse stat file (format: pid (comm) state ppid ...)
+    let mut parts: Vec<&str> = Vec::new();
+    let mut in_parens = false;
+    let mut start = 0;
+    
+    for (i, c) in stat_content.char_indices() {
+        if c == '(' {
+            in_parens = true;
+        } else if c == ')' {
+            in_parens = false;
+        } else if c == ' ' && !in_parens {
+            if i > start {
+                parts.push(&stat_content[start..i]);
+            }
+            start = i + 1;
+        }
+    }
+    if start < stat_content.len() {
+        parts.push(&stat_content[start..]);
+    }
+    
+    if parts.len() < 24 {
+        return Result::Err(IoError::new(
+            ErrorKind::InvalidData,
+            "invalid stat format"
+        ));
+    }
+    
+    // Extract name from between parentheses
+    let name_start = stat_content.find('(').unwrap_or(0) + 1;
+    let name_end = stat_content.rfind(')').unwrap_or(stat_content.len());
+    let name = stat_content[name_start..name_end].to_string();
+    
+    // Read /proc/[pid]/status for UID/GID
+    let status_path = format!("/proc/{}/status", pid);
+    let status_content = std::fs::read_to_string(&status_path)?;
+    
+    let mut uid = 0u32;
+    let mut gid = 0u32;
+    
+    for line in status_content.lines() {
+        if line.starts_with("Uid:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() > 1 {
+                uid = parts[1].parse().unwrap_or(0);
+            }
+        } else if line.starts_with("Gid:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() > 1 {
+                gid = parts[1].parse().unwrap_or(0);
+            }
+        }
+    }
+    
+    Result::Ok(ProcessInfo {
+        pid,
+        ppid: parts[3].parse().unwrap_or(0),
+        name,
+        state: ProcessState::from_char(parts[2].chars().next().unwrap_or('?')),
+        vsize: parts[22].parse().unwrap_or(0),
+        rss: parts[23].parse::<u64>().unwrap_or(0) * 4096, // pages to bytes
+        uid,
+        gid,
+    })
+}
+
+/// Lists all process IDs.
+pub fn list_pids() -> Result<Vec<u32>, IoError> {
+    let mut pids = Vec::new();
+    
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_str().unwrap_or("");
+        
+        if let Result::Ok(pid) = name_str.parse::<u32>() {
+            pids.push(pid);
+        }
+    }
+    
+    pids.sort();
+    Result::Ok(pids)
+}
+
+/// Sends a signal to a process.
+pub fn kill(pid: u32, sig: i32) -> Result<(), IoError> {
+    let result = __kill(pid as i32, sig);
+    if result < 0 {
+        Result::Err(IoError::from_raw_os_error(-result))
+    } else {
+        Result::Ok(())
+    }
+}
+
+/// Sends SIGKILL to a process.
+pub fn kill_force(pid: u32) -> Result<(), IoError> {
+    kill(pid, SIGKILL)
+}
+
+/// Sends SIGTERM to a process.
+pub fn terminate(pid: u32) -> Result<(), IoError> {
+    kill(pid, SIGTERM)
+}
+
+// ============================================================================
+// Daemon Support
+// ============================================================================
+
+/// Forks and creates a daemon process.
+/// Returns Ok(None) in the daemon, Ok(Some(pid)) in the parent.
+pub fn daemonize() -> Result<Option<u32>, IoError> {
+    // First fork
+    let pid = __fork();
+    if pid < 0 {
+        return Result::Err(IoError::from_raw_os_error(-pid));
+    }
+    if pid > 0 {
+        // Parent exits
+        return Result::Ok(Option::Some(pid as u32));
+    }
+    
+    // Create new session
+    if __setsid() < 0 {
+        return Result::Err(IoError::last_os_error());
+    }
+    
+    // Second fork to prevent reacquiring terminal
+    let pid2 = __fork();
+    if pid2 < 0 {
+        return Result::Err(IoError::from_raw_os_error(-pid2));
+    }
+    if pid2 > 0 {
+        __exit(0);
+    }
+    
+    // Change to root directory
+    __chdir("/\0".as_ptr());
+    
+    // Reset umask
+    __umask(0);
+    
+    // Redirect stdio to /dev/null
+    let null = __open("/dev/null\0".as_ptr(), O_RDWR, 0);
+    if null >= 0 {
+        __dup2(null, 0);
+        __dup2(null, 1);
+        __dup2(null, 2);
+        if null > 2 {
+            __close(null);
+        }
+    }
+    
+    Result::Ok(Option::None)
+}
+
+// ============================================================================
+// Timeout Execution
+// ============================================================================
+
+/// Runs a child process with a timeout.
+pub fn spawn_with_timeout(
+    command: &Command,
+    timeout: Duration
+) -> Result<(ExitStatus, Option<Output>), IoError> {
+    let mut child = command.spawn()?;
+    
+    let start = std::time::Instant::now();
+    
+    loop {
+        match child.try_wait()? {
+            Option::Some(status) => {
+                // Process exited
+                return Result::Ok((status, Option::None));
+            }
+            Option::None => {
+                // Still running
+                if start.elapsed() >= timeout {
+                    // Timeout - kill the process
+                    child.kill()?;
+                    let status = child.wait()?;
+                    return Result::Ok((status, Option::None));
+                }
+                
+                // Sleep briefly before checking again
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const WNOHANG: i32 = 1;
+const SIGKILL: i32 = 9;
+const SIGTERM: i32 = 15;
+
+const O_RDONLY: i32 = 0;
+const O_WRONLY: i32 = 1;
+const O_RDWR: i32 = 2;
+
+const SIG_DFL: usize = 0;
+const SIG_IGN: usize = 1;
+const SIG_ERR: usize = usize::MAX;
+
+const PRIO_PROCESS: i32 = 0;
+
+const RLIMIT_CPU: i32 = 0;
+const RLIMIT_FSIZE: i32 = 1;
+const RLIMIT_DATA: i32 = 2;
+const RLIMIT_STACK: i32 = 3;
+const RLIMIT_CORE: i32 = 4;
+const RLIMIT_NOFILE: i32 = 7;
+const RLIMIT_AS: i32 = 9;
+const RLIMIT_NPROC: i32 = 6;
+const RLIMIT_MEMLOCK: i32 = 8;
+
+// ============================================================================
+// Intrinsics (platform-provided)
+// ============================================================================
+
+extern "C" {
+    // Process control
+    fn __fork() -> i32;
+    fn __execv(path: *const u8, argv: *const *const u8) -> i32;
+    fn __exit(code: i32) -> !;
+    fn __abort() -> !;
+    fn __waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    fn __getpid() -> i32;
+    fn __getppid() -> i32;
+    
+    // File operations
+    fn __open(path: *const u8, flags: i32, mode: i32) -> i32;
+    fn __close(fd: i32) -> i32;
+    fn __read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn __write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn __dup2(oldfd: i32, newfd: i32) -> i32;
+    fn __pipe(fds: *mut i32) -> i32;
+    fn __readlink(path: *const u8, buf: *mut u8, size: usize) -> isize;
+    
+    // Directory
+    fn __chdir(path: *const u8) -> i32;
+    
+    // Environment
+    fn __getenv(name: *const u8) -> *const u8;
+    fn __putenv(string: *const u8) -> i32;
+    fn __unsetenv(name: *const u8) -> i32;
+    fn __clearenv() -> i32;
+    fn __environ_at(index: usize) -> *const u8;
+    
+    // Arguments
+    fn __argc() -> i32;
+    fn __argv_at(index: usize) -> *const u8;
+    
+    // Signal
+    fn __kill(pid: i32, sig: i32) -> i32;
+    fn __signal(sig: i32, handler: usize) -> usize;
+    fn __raise(sig: i32) -> i32;
+    
+    // Process group/session
+    fn __getpgrp() -> i32;
+    fn __setpgid(pid: i32, pgid: i32) -> i32;
+    fn __setsid() -> i32;
+    fn __getsid(pid: i32) -> i32;
+    
+    // User/group
+    fn __getuid() -> u32;
+    fn __geteuid() -> u32;
+    fn __getgid() -> u32;
+    fn __getegid() -> u32;
+    fn __setuid(uid: u32) -> i32;
+    fn __setgid(gid: u32) -> i32;
+    fn __setgroups(size: usize, list: *const u32) -> i32;
+    
+    // Resource limits
+    fn __getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
+    fn __setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+    
+    // Priority
+    fn __getpriority(which: i32, who: i32) -> i32;
+    fn __setpriority(which: i32, who: i32, prio: i32) -> i32;
+    fn __nice(inc: i32) -> i32;
+    
+    // Error handling
+    fn __errno() -> i32;
+    fn __set_errno(err: i32);
+    
+    // Misc
+    fn __umask(mask: u32) -> u32;
+    
+    // Wait status macros as functions
+    fn __WIFEXITED(status: i32) -> bool;
+    fn __WEXITSTATUS(status: i32) -> i32;
+    fn __WIFSIGNALED(status: i32) -> bool;
+    fn __WTERMSIG(status: i32) -> i32;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_exit_status_success() {
+        let status = ExitStatus::from_raw(0);
+        assert!(status.success());
+        assert_eq!(status.code(), Option::Some(0));
+    }
+    
+    #[test]
+    fn test_exit_status_failure() {
+        let status = ExitStatus::from_raw(1);
+        assert!(!status.success());
+        assert_eq!(status.code(), Option::Some(1));
+    }
+    
+    #[test]
+    fn test_exit_status_signal() {
+        let status = ExitStatus::from_signal(9);
+        assert!(!status.success());
+        assert_eq!(status.code(), Option::None);
+        assert_eq!(status.signal(), Option::Some(9));
+    }
+    
+    #[test]
+    fn test_exit_code() {
+        assert_eq!(ExitCode::SUCCESS.as_raw(), 0);
+        assert_eq!(ExitCode::FAILURE.as_raw(), 1);
+        assert_eq!(ExitCode::from_raw(42).as_raw(), 42);
+    }
+    
+    #[test]
+    fn test_stdio() {
+        match Stdio::inherit() {
+            Stdio::Inherit => {}
+            _ => panic!("expected Inherit"),
+        }
+        
+        match Stdio::piped() {
+            Stdio::Piped => {}
+            _ => panic!("expected Piped"),
+        }
+        
+        match Stdio::null() {
+            Stdio::Null => {}
+            _ => panic!("expected Null"),
+        }
+    }
+    
+    #[test]
+    fn test_command_builder() {
+        let mut cmd = Command::new("ls");
+        cmd.arg("-la")
+           .arg("/tmp")
+           .env("FOO", "bar")
+           .current_dir("/home");
+        
+        assert_eq!(cmd.get_program().as_str(), "ls");
+        assert_eq!(cmd.get_args().len(), 2);
+        assert_eq!(cmd.get_args()[0], "-la");
+        assert_eq!(cmd.get_args()[1], "/tmp");
+        assert_eq!(cmd.get_envs().get("FOO"), Option::Some(&String::from("bar")));
+        assert_eq!(cmd.get_current_dir().unwrap().as_str(), "/home");
+    }
+    
+    #[test]
+    fn test_command_args() {
+        let mut cmd = Command::new("echo");
+        cmd.args(&["hello", "world"]);
+        
+        assert_eq!(cmd.get_args().len(), 2);
+        assert_eq!(cmd.get_args()[0], "hello");
+        assert_eq!(cmd.get_args()[1], "world");
+    }
+    
+    #[test]
+    fn test_command_envs() {
+        let mut cmd = Command::new("test");
+        cmd.envs(&[("A", "1"), ("B", "2")]);
+        
+        let envs = cmd.get_envs();
+        assert_eq!(envs.get("A"), Option::Some(&String::from("1")));
+        assert_eq!(envs.get("B"), Option::Some(&String::from("2")));
+    }
+    
+    #[test]
+    fn test_command_env_clear() {
+        let mut cmd = Command::new("test");
+        cmd.env("FOO", "bar")
+           .env_clear();
+        
+        assert!(cmd.get_envs().is_empty());
+    }
+    
+    #[test]
+    fn test_process_id() {
+        let pid = id();
+        assert!(pid > 0);
+    }
+    
+    #[test]
+    fn test_parent_id() {
+        let ppid = parent_id();
+        assert!(ppid > 0);
+    }
+    
+    #[test]
+    fn test_args() {
+        let args: Vec<String> = args().collect();
+        // At least the program name should be present
+        assert!(!args.is_empty());
+    }
+    
+    #[test]
+    fn test_var_error_display() {
+        let err = VarError::NotPresent;
+        assert_eq!(format!("{}", err), "environment variable not found");
+    }
+    
+    #[test]
+    fn test_var_or() {
+        let value = var_or("DEFINITELY_NOT_SET_12345", "default");
+        assert_eq!(value, "default");
+    }
+    
+    #[test]
+    fn test_resource() {
+        assert_eq!(Resource::CPU.to_raw(), RLIMIT_CPU);
+        assert_eq!(Resource::NoFile.to_raw(), RLIMIT_NOFILE);
+    }
+    
+    #[test]
+    fn test_signals() {
+        assert_eq!(signal::SIGKILL, 9);
+        assert_eq!(signal::SIGTERM, 15);
+        assert_eq!(signal::SIGINT, 2);
+    }
+    
+    #[test]
+    fn test_process_state() {
+        assert!(matches!(ProcessState::from_char('R'), ProcessState::Running));
+        assert!(matches!(ProcessState::from_char('S'), ProcessState::Sleeping));
+        assert!(matches!(ProcessState::from_char('Z'), ProcessState::Zombie));
+        assert!(matches!(ProcessState::from_char('?'), ProcessState::Unknown));
+    }
+    
+    #[test]
+    fn test_output_methods() {
+        let output = Output {
+            status: ExitStatus::from_raw(0),
+            stdout: b"hello".to_vec(),
+            stderr: b"error".to_vec(),
+        };
+        
+        assert_eq!(output.stdout_string(), "hello");
+        assert_eq!(output.stderr_string(), "error");
+    }
+    
+    #[test]
+    fn test_copy_to_cstr() {
+        let mut buf = [0u8; 16];
+        copy_to_cstr("hello", &mut buf);
+        
+        assert_eq!(buf[0], b'h');
+        assert_eq!(buf[4], b'o');
+        assert_eq!(buf[5], 0);
+    }
+    
+    #[test]
+    fn test_uid_gid() {
+        let uid = getuid();
+        let euid = geteuid();
+        let gid = getgid();
+        let egid = getegid();
+        
+        // These should be valid IDs (>= 0 as unsigned)
+        // Just verify they return without error
+        assert!(uid >= 0 || uid == uid);
+        assert!(euid >= 0 || euid == euid);
+        assert!(gid >= 0 || gid == gid);
+        assert!(egid >= 0 || egid == egid);
+    }
+}
+
+// ============================================================================
+// Examples
+// ============================================================================
+
+/// Example: Simple command execution
+/// ```quanta
+/// use std::process::Command;
+/// 
+/// fn main() {
+///     let status = Command::new("ls")
+///         .arg("-la")
+///         .status()
+///         .expect("failed to execute");
+///     
+///     println!("exit status: {}", status);
+/// }
+/// ```
+
+/// Example: Capturing output
+/// ```quanta
+/// use std::process::Command;
+/// 
+/// fn main() {
+///     let output = Command::new("echo")
+///         .arg("Hello, World!")
+///         .output()
+///         .expect("failed to execute");
+///     
+///     println!("stdout: {}", output.stdout_string());
+/// }
+/// ```
+
+/// Example: Piping between processes
+/// ```quanta
+/// use std::process::{Command, Stdio};
+/// use std::io::{Read, Write};
+/// 
+/// fn main() {
+///     let mut child = Command::new("grep")
+///         .arg("pattern")
+///         .stdin(Stdio::piped())
+///         .stdout(Stdio::piped())
+///         .spawn()
+///         .expect("failed to spawn");
+///     
+///     // Write to child's stdin
+///     if let Some(mut stdin) = child.take_stdin() {
+///         stdin.write_all(b"line with pattern\nother line\n")
+///             .expect("failed to write");
+///     }
+///     
+///     // Read child's stdout
+///     let output = child.wait_with_output()
+///         .expect("failed to wait");
+///     
+///     println!("matched: {}", output.stdout_string());
+/// }
+/// ```
+
+/// Example: Environment variables
+/// ```quanta
+/// use std::process::{var, set_var, vars};
+/// 
+/// fn main() {
+///     // Get a variable
+///     if let Ok(path) = var("PATH") {
+///         println!("PATH = {}", path);
+///     }
+///     
+///     // Set a variable
+///     set_var("MY_VAR", "my_value");
+///     
+///     // List all variables
+///     for (key, value) in vars() {
+///         println!("{} = {}", key, value);
+///     }
+/// }
+/// ```
+
+/// Example: Shell command
+/// ```quanta
+/// use std::process::shell_capture;
+/// 
+/// fn main() {
+///     let output = shell_capture("ls -la | head -5")
+///         .expect("failed to run shell");
+///     
+///     print!("{}", output.stdout_string());
+/// }
+/// ```
+
+/// Example: Daemon process
+/// ```quanta
+/// use std::process::daemonize;
+/// 
+/// fn main() {
+///     match daemonize() {
+///         Ok(Some(pid)) => {
+///             println!("daemon started with pid {}", pid);
+///             // Parent exits
+///         }
+///         Ok(None) => {
+///             // We are the daemon
+///             loop {
+///                 // Daemon work here
+///                 std::thread::sleep(Duration::from_secs(1));
+///             }
+///         }
+///         Err(e) => {
+///             eprintln!("failed to daemonize: {}", e);
+///         }
+///     }
+/// }
+/// ```

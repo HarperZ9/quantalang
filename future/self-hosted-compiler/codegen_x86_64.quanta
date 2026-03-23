@@ -1,0 +1,2159 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ CODEGEN — x86_64 Backend
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending (P096-P110)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Code generation pipeline:
+// 1. MIR → LIR (Low-level IR with virtual registers)
+// 2. Instruction Selection (MIR operations → x86_64 instructions)
+// 3. Register Allocation (Linear Scan with live range splitting)
+// 4. Prologue/Epilogue insertion
+// 5. Machine code emission (ELF object file)
+//
+// Target: x86_64-unknown-none (freestanding, no libc)
+// ABI: System V AMD64 (Linux/BSD calling convention)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::codegen::x86_64
+
+use std::collections::{HashMap, HashSet, BTreeMap, VecDeque}
+use crate::mir::{
+    MirBody, BasicBlock, BasicBlockId, Statement, StatementKind,
+    Terminator, TerminatorKind, Place, PlaceElem, Local, Operand,
+    Rvalue, BinOp, UnOp, Constant, ConstValue, Scalar, AggregateKind,
+    SwitchTargets, BorrowKind, CastKind,
+}
+use crate::types::{Ty, IntTy, FloatTy, AdtId, Mutability}
+use crate::hir::DefId
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// x86_64 REGISTERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Reg {
+    // General purpose (64-bit)
+    RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP,
+    R8, R9, R10, R11, R12, R13, R14, R15,
+    
+    // SSE/AVX (128-bit, 256-bit, 512-bit)
+    XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
+    XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14, XMM15,
+    
+    // Instruction pointer (not allocatable)
+    RIP,
+    
+    // Flags (not directly allocatable)
+    RFLAGS,
+}
+
+impl Reg {
+    /// System V AMD64 argument registers (integer)
+    pub const ARG_REGS: [Reg; 6] = [Reg::RDI, Reg::RSI, Reg::RDX, Reg::RCX, Reg::R8, Reg::R9];
+    
+    /// System V AMD64 argument registers (floating point)
+    pub const FP_ARG_REGS: [Reg; 8] = [
+        Reg::XMM0, Reg::XMM1, Reg::XMM2, Reg::XMM3,
+        Reg::XMM4, Reg::XMM5, Reg::XMM6, Reg::XMM7,
+    ];
+    
+    /// Callee-saved registers (must be preserved across calls)
+    pub const CALLEE_SAVED: [Reg; 6] = [Reg::RBX, Reg::RBP, Reg::R12, Reg::R13, Reg::R14, Reg::R15];
+    
+    /// Caller-saved registers (may be clobbered by calls)
+    pub const CALLER_SAVED: [Reg; 9] = [
+        Reg::RAX, Reg::RCX, Reg::RDX, Reg::RSI, Reg::RDI,
+        Reg::R8, Reg::R9, Reg::R10, Reg::R11,
+    ];
+    
+    /// Allocatable general-purpose registers
+    pub const ALLOCATABLE_GP: [Reg; 14] = [
+        Reg::RAX, Reg::RBX, Reg::RCX, Reg::RDX, Reg::RSI, Reg::RDI,
+        Reg::R8, Reg::R9, Reg::R10, Reg::R11, Reg::R12, Reg::R13, Reg::R14, Reg::R15,
+    ];
+    
+    pub fn encoding(self) -> u8 {
+        match self {
+            Reg::RAX => 0, Reg::RCX => 1, Reg::RDX => 2, Reg::RBX => 3,
+            Reg::RSP => 4, Reg::RBP => 5, Reg::RSI => 6, Reg::RDI => 7,
+            Reg::R8 => 8, Reg::R9 => 9, Reg::R10 => 10, Reg::R11 => 11,
+            Reg::R12 => 12, Reg::R13 => 13, Reg::R14 => 14, Reg::R15 => 15,
+            Reg::XMM0 => 0, Reg::XMM1 => 1, Reg::XMM2 => 2, Reg::XMM3 => 3,
+            Reg::XMM4 => 4, Reg::XMM5 => 5, Reg::XMM6 => 6, Reg::XMM7 => 7,
+            Reg::XMM8 => 8, Reg::XMM9 => 9, Reg::XMM10 => 10, Reg::XMM11 => 11,
+            Reg::XMM12 => 12, Reg::XMM13 => 13, Reg::XMM14 => 14, Reg::XMM15 => 15,
+            Reg::RIP => 0, Reg::RFLAGS => 0,
+        }
+    }
+    
+    pub fn requires_rex(self) -> bool {
+        matches!(self, Reg::R8 | Reg::R9 | Reg::R10 | Reg::R11 |
+                       Reg::R12 | Reg::R13 | Reg::R14 | Reg::R15 |
+                       Reg::XMM8 | Reg::XMM9 | Reg::XMM10 | Reg::XMM11 |
+                       Reg::XMM12 | Reg::XMM13 | Reg::XMM14 | Reg::XMM15)
+    }
+    
+    pub fn is_gp(self) -> bool {
+        matches!(self, Reg::RAX | Reg::RBX | Reg::RCX | Reg::RDX |
+                       Reg::RSI | Reg::RDI | Reg::RBP | Reg::RSP |
+                       Reg::R8 | Reg::R9 | Reg::R10 | Reg::R11 |
+                       Reg::R12 | Reg::R13 | Reg::R14 | Reg::R15)
+    }
+    
+    pub fn is_xmm(self) -> bool {
+        matches!(self, Reg::XMM0 | Reg::XMM1 | Reg::XMM2 | Reg::XMM3 |
+                       Reg::XMM4 | Reg::XMM5 | Reg::XMM6 | Reg::XMM7 |
+                       Reg::XMM8 | Reg::XMM9 | Reg::XMM10 | Reg::XMM11 |
+                       Reg::XMM12 | Reg::XMM13 | Reg::XMM14 | Reg::XMM15)
+    }
+    
+    /// Sub-register for smaller operand sizes
+    pub fn sub_reg(self, size: RegSize) -> SubReg {
+        SubReg { reg: self, size }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegSize {
+    Byte,   // 8-bit (AL, CL, etc.)
+    Word,   // 16-bit (AX, CX, etc.)
+    DWord,  // 32-bit (EAX, ECX, etc.)
+    QWord,  // 64-bit (RAX, RCX, etc.)
+    XMM,    // 128-bit
+    YMM,    // 256-bit
+    ZMM,    // 512-bit
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubReg {
+    pub reg: Reg,
+    pub size: RegSize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VIRTUAL REGISTERS (Before allocation)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VReg(pub u32);
+
+impl VReg {
+    pub fn new(id: u32) -> Self { VReg(id) }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegClass {
+    GP,     // General purpose
+    FP,     // Floating point (XMM)
+    Flags,  // RFLAGS
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY OPERANDS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub enum MemOperand {
+    /// [base]
+    Base(Reg),
+    
+    /// [base + disp]
+    BaseDisp(Reg, i32),
+    
+    /// [base + index * scale]
+    BaseIndex { base: Reg, index: Reg, scale: u8 },
+    
+    /// [base + index * scale + disp]
+    BaseIndexDisp { base: Reg, index: Reg, scale: u8, disp: i32 },
+    
+    /// [RIP + disp] (for PIC)
+    RipRelative(i32),
+    
+    /// [disp] (absolute address, only in kernel mode)
+    Absolute(u64),
+    
+    /// Stack slot
+    Stack(i32),
+}
+
+impl MemOperand {
+    pub fn stack_slot(offset: i32) -> Self {
+        MemOperand::BaseDisp(Reg::RBP, offset)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIR INSTRUCTIONS (Low-level IR)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LirInstId(pub u32);
+
+#[derive(Debug, Clone)]
+pub struct LirInst {
+    pub id: LirInstId,
+    pub kind: LirInstKind,
+    pub defs: Vec<VReg>,    // Registers defined by this instruction
+    pub uses: Vec<VReg>,    // Registers used by this instruction
+}
+
+#[derive(Debug, Clone)]
+pub enum LirInstKind {
+    // ─────────────────────────────────────────────────────────────────────────
+    // Data movement
+    // ─────────────────────────────────────────────────────────────────────────
+    Mov { dst: LirOperand, src: LirOperand, size: RegSize },
+    MovZX { dst: LirOperand, src: LirOperand, src_size: RegSize, dst_size: RegSize },
+    MovSX { dst: LirOperand, src: LirOperand, src_size: RegSize, dst_size: RegSize },
+    Lea { dst: VReg, src: MemOperand },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Arithmetic
+    // ─────────────────────────────────────────────────────────────────────────
+    Add { dst: LirOperand, src: LirOperand, size: RegSize },
+    Sub { dst: LirOperand, src: LirOperand, size: RegSize },
+    IMul { dst: LirOperand, src: LirOperand, size: RegSize },
+    IMul3 { dst: VReg, src: LirOperand, imm: i32, size: RegSize },
+    IDiv { dividend_hi: VReg, dividend_lo: VReg, divisor: LirOperand, size: RegSize },
+    UDiv { dividend_hi: VReg, dividend_lo: VReg, divisor: LirOperand, size: RegSize },
+    Neg { dst: LirOperand, size: RegSize },
+    Inc { dst: LirOperand, size: RegSize },
+    Dec { dst: LirOperand, size: RegSize },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Bitwise
+    // ─────────────────────────────────────────────────────────────────────────
+    And { dst: LirOperand, src: LirOperand, size: RegSize },
+    Or { dst: LirOperand, src: LirOperand, size: RegSize },
+    Xor { dst: LirOperand, src: LirOperand, size: RegSize },
+    Not { dst: LirOperand, size: RegSize },
+    Shl { dst: LirOperand, count: LirOperand, size: RegSize },
+    Shr { dst: LirOperand, count: LirOperand, size: RegSize },
+    Sar { dst: LirOperand, count: LirOperand, size: RegSize },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Comparison and flags
+    // ─────────────────────────────────────────────────────────────────────────
+    Cmp { lhs: LirOperand, rhs: LirOperand, size: RegSize },
+    Test { lhs: LirOperand, rhs: LirOperand, size: RegSize },
+    SetCC { dst: LirOperand, cc: CondCode },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Control flow
+    // ─────────────────────────────────────────────────────────────────────────
+    Jmp { target: LirLabel },
+    JmpCC { cc: CondCode, target: LirLabel },
+    Call { target: LirCallTarget, args: Vec<LirOperand> },
+    Ret,
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Stack operations
+    // ─────────────────────────────────────────────────────────────────────────
+    Push { src: LirOperand, size: RegSize },
+    Pop { dst: LirOperand, size: RegSize },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Floating point (SSE/AVX)
+    // ─────────────────────────────────────────────────────────────────────────
+    MovSS { dst: LirOperand, src: LirOperand },  // 32-bit float
+    MovSD { dst: LirOperand, src: LirOperand },  // 64-bit float
+    AddSS { dst: LirOperand, src: LirOperand },
+    AddSD { dst: LirOperand, src: LirOperand },
+    SubSS { dst: LirOperand, src: LirOperand },
+    SubSD { dst: LirOperand, src: LirOperand },
+    MulSS { dst: LirOperand, src: LirOperand },
+    MulSD { dst: LirOperand, src: LirOperand },
+    DivSS { dst: LirOperand, src: LirOperand },
+    DivSD { dst: LirOperand, src: LirOperand },
+    CvtSI2SS { dst: VReg, src: LirOperand },  // int → f32
+    CvtSI2SD { dst: VReg, src: LirOperand },  // int → f64
+    CvtSS2SI { dst: VReg, src: LirOperand },  // f32 → int
+    CvtSD2SI { dst: VReg, src: LirOperand },  // f64 → int
+    CvtSS2SD { dst: VReg, src: LirOperand },  // f32 → f64
+    CvtSD2SS { dst: VReg, src: LirOperand },  // f64 → f32
+    ComISS { lhs: LirOperand, rhs: LirOperand },  // Ordered comparison
+    ComISD { lhs: LirOperand, rhs: LirOperand },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Special
+    // ─────────────────────────────────────────────────────────────────────────
+    Nop,
+    Int { vector: u8 },      // Software interrupt
+    Syscall,                 // System call
+    Ud2,                     // Undefined instruction (trap)
+    Hlt,                     // Halt
+    Cli,                     // Clear interrupts
+    Sti,                     // Set interrupts
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Memory barriers
+    // ─────────────────────────────────────────────────────────────────────────
+    Mfence,
+    Lfence,
+    Sfence,
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Privileged (kernel mode)
+    // ─────────────────────────────────────────────────────────────────────────
+    Lgdt { src: MemOperand },
+    Lidt { src: MemOperand },
+    Lldt { selector: LirOperand },
+    Ltr { selector: LirOperand },
+    InvlPg { addr: LirOperand },
+    WrMsr { msr: u32 },
+    RdMsr { msr: u32 },
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Pseudo-instructions (resolved later)
+    // ─────────────────────────────────────────────────────────────────────────
+    Label(LirLabel),
+    Comment(String),
+    FrameSetup { stack_size: u32 },
+    FrameDestroy,
+    Spill { vreg: VReg, slot: i32 },
+    Reload { vreg: VReg, slot: i32 },
+}
+
+#[derive(Debug, Clone)]
+pub enum LirOperand {
+    Reg(VReg),
+    PhysReg(Reg),
+    Imm(i64),
+    Mem(MemOperand),
+    Label(LirLabel),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LirLabel(pub u32);
+
+#[derive(Debug, Clone)]
+pub enum LirCallTarget {
+    Direct(DefId),
+    Indirect(VReg),
+    Symbol(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CondCode {
+    E,   // Equal (ZF=1)
+    NE,  // Not equal (ZF=0)
+    L,   // Less (SF≠OF)
+    LE,  // Less or equal (ZF=1 or SF≠OF)
+    G,   // Greater (ZF=0 and SF=OF)
+    GE,  // Greater or equal (SF=OF)
+    B,   // Below (unsigned) (CF=1)
+    BE,  // Below or equal (unsigned) (CF=1 or ZF=1)
+    A,   // Above (unsigned) (CF=0 and ZF=0)
+    AE,  // Above or equal (unsigned) (CF=0)
+    S,   // Sign (SF=1)
+    NS,  // Not sign (SF=0)
+    O,   // Overflow (OF=1)
+    NO,  // Not overflow (OF=0)
+    P,   // Parity (PF=1)
+    NP,  // Not parity (PF=0)
+}
+
+impl CondCode {
+    pub fn from_binop(op: BinOp, signed: bool) -> Self {
+        match (op, signed) {
+            (BinOp::Eq, _) => CondCode::E,
+            (BinOp::Ne, _) => CondCode::NE,
+            (BinOp::Lt, true) => CondCode::L,
+            (BinOp::Lt, false) => CondCode::B,
+            (BinOp::Le, true) => CondCode::LE,
+            (BinOp::Le, false) => CondCode::BE,
+            (BinOp::Gt, true) => CondCode::G,
+            (BinOp::Gt, false) => CondCode::A,
+            (BinOp::Ge, true) => CondCode::GE,
+            (BinOp::Ge, false) => CondCode::AE,
+            _ => CondCode::E,
+        }
+    }
+    
+    pub fn invert(self) -> Self {
+        match self {
+            CondCode::E => CondCode::NE,
+            CondCode::NE => CondCode::E,
+            CondCode::L => CondCode::GE,
+            CondCode::LE => CondCode::G,
+            CondCode::G => CondCode::LE,
+            CondCode::GE => CondCode::L,
+            CondCode::B => CondCode::AE,
+            CondCode::BE => CondCode::A,
+            CondCode::A => CondCode::BE,
+            CondCode::AE => CondCode::B,
+            CondCode::S => CondCode::NS,
+            CondCode::NS => CondCode::S,
+            CondCode::O => CondCode::NO,
+            CondCode::NO => CondCode::O,
+            CondCode::P => CondCode::NP,
+            CondCode::NP => CondCode::P,
+        }
+    }
+    
+    pub fn encoding(self) -> u8 {
+        match self {
+            CondCode::O => 0x0,
+            CondCode::NO => 0x1,
+            CondCode::B => 0x2,
+            CondCode::AE => 0x3,
+            CondCode::E => 0x4,
+            CondCode::NE => 0x5,
+            CondCode::BE => 0x6,
+            CondCode::A => 0x7,
+            CondCode::S => 0x8,
+            CondCode::NS => 0x9,
+            CondCode::P => 0xA,
+            CondCode::NP => 0xB,
+            CondCode::L => 0xC,
+            CondCode::GE => 0xD,
+            CondCode::LE => 0xE,
+            CondCode::G => 0xF,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIR FUNCTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct LirFunction {
+    pub def_id: DefId,
+    pub name: String,
+    pub blocks: Vec<LirBlock>,
+    pub stack_size: u32,
+    pub used_callee_saved: Vec<Reg>,
+    pub vreg_count: u32,
+}
+
+#[derive(Debug)]
+pub struct LirBlock {
+    pub label: LirLabel,
+    pub instructions: Vec<LirInst>,
+    pub successors: Vec<LirLabel>,
+    pub predecessors: Vec<LirLabel>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSTRUCTION SELECTOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct InstructionSelector {
+    /// Virtual register counter
+    next_vreg: u32,
+    
+    /// Label counter
+    next_label: u32,
+    
+    /// Instruction counter
+    next_inst: u32,
+    
+    /// MIR local → VReg mapping
+    local_to_vreg: HashMap<Local, VReg>,
+    
+    /// MIR BasicBlock → LirLabel mapping
+    block_labels: HashMap<BasicBlockId, LirLabel>,
+    
+    /// Current stack frame size
+    stack_size: u32,
+    
+    /// Stack slot allocations
+    stack_slots: HashMap<Local, i32>,
+}
+
+impl InstructionSelector {
+    pub fn new() -> Self {
+        InstructionSelector {
+            next_vreg: 0,
+            next_label: 0,
+            next_inst: 0,
+            local_to_vreg: HashMap::new(),
+            block_labels: HashMap::new(),
+            stack_size: 0,
+            stack_slots: HashMap::new(),
+        }
+    }
+    
+    pub fn fresh_vreg(&mut self) -> VReg {
+        let vreg = VReg(self.next_vreg);
+        self.next_vreg += 1;
+        vreg
+    }
+    
+    pub fn fresh_label(&mut self) -> LirLabel {
+        let label = LirLabel(self.next_label);
+        self.next_label += 1;
+        label
+    }
+    
+    pub fn fresh_inst(&mut self) -> LirInstId {
+        let id = LirInstId(self.next_inst);
+        self.next_inst += 1;
+        id
+    }
+    
+    /// Lower MIR body to LIR function
+    pub fn select(&mut self, body: &MirBody, name: String) -> LirFunction {
+        // Allocate labels for each basic block
+        for bb in &body.basic_blocks {
+            let label = self.fresh_label();
+            self.block_labels.insert(bb.id, label);
+        }
+        
+        // Allocate vregs for locals
+        for (idx, local) in body.locals.iter().enumerate() {
+            let vreg = self.fresh_vreg();
+            self.local_to_vreg.insert(Local(idx as u32), vreg);
+            
+            // Allocate stack slot for aggregates and spilled values
+            if self.needs_stack_slot(&local.ty) {
+                let size = self.type_size(&local.ty);
+                self.stack_size = align_up(self.stack_size, 8);
+                self.stack_size += size;
+                self.stack_slots.insert(Local(idx as u32), -(self.stack_size as i32));
+            }
+        }
+        
+        // Lower each basic block
+        let mut blocks = Vec::new();
+        for bb in &body.basic_blocks {
+            let lir_block = self.lower_block(bb);
+            blocks.push(lir_block);
+        }
+        
+        // Compute predecessors
+        self.compute_predecessors(&mut blocks);
+        
+        LirFunction {
+            def_id: body.def_id,
+            name,
+            blocks,
+            stack_size: align_up(self.stack_size, 16),
+            used_callee_saved: Vec::new(),
+            vreg_count: self.next_vreg,
+        }
+    }
+    
+    fn lower_block(&mut self, bb: &BasicBlock) -> LirBlock {
+        let label = self.block_labels[&bb.id];
+        let mut instructions = Vec::new();
+        
+        // Label
+        instructions.push(LirInst {
+            id: self.fresh_inst(),
+            kind: LirInstKind::Label(label),
+            defs: Vec::new(),
+            uses: Vec::new(),
+        });
+        
+        // Statements
+        for stmt in &bb.statements {
+            self.lower_statement(stmt, &mut instructions);
+        }
+        
+        // Terminator
+        let successors = self.lower_terminator(&bb.terminator, &mut instructions);
+        
+        LirBlock {
+            label,
+            instructions,
+            successors,
+            predecessors: Vec::new(),
+        }
+    }
+    
+    fn lower_statement(&mut self, stmt: &Statement, insts: &mut Vec<LirInst>) {
+        match &stmt.kind {
+            StatementKind::Assign(place, rvalue) => {
+                let dst_vreg = self.place_to_vreg(place);
+                self.lower_rvalue(rvalue, dst_vreg, insts);
+            }
+            
+            StatementKind::StorageLive(local) => {
+                // No code needed, just marks liveness
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Comment(format!("StorageLive(_{:?})", local.0)),
+                    defs: Vec::new(),
+                    uses: Vec::new(),
+                });
+            }
+            
+            StatementKind::StorageDead(local) => {
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Comment(format!("StorageDead(_{:?})", local.0)),
+                    defs: Vec::new(),
+                    uses: Vec::new(),
+                });
+            }
+            
+            StatementKind::Nop => {}
+            
+            _ => {}
+        }
+    }
+    
+    fn lower_rvalue(&mut self, rvalue: &Rvalue, dst: VReg, insts: &mut Vec<LirInst>) {
+        match rvalue {
+            Rvalue::Use(operand) => {
+                let src = self.lower_operand(operand);
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Mov {
+                        dst: LirOperand::Reg(dst),
+                        src,
+                        size: RegSize::QWord,
+                    },
+                    defs: vec![dst],
+                    uses: self.operand_uses(operand),
+                });
+            }
+            
+            Rvalue::BinaryOp(op, lhs, rhs) => {
+                self.lower_binop(*op, lhs, rhs, dst, insts);
+            }
+            
+            Rvalue::CheckedBinaryOp(op, lhs, rhs) => {
+                // For now, same as unchecked (TODO: add overflow checking)
+                self.lower_binop(*op, lhs, rhs, dst, insts);
+            }
+            
+            Rvalue::UnaryOp(op, operand) => {
+                let src = self.lower_operand(operand);
+                
+                // Move to dst first
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Mov {
+                        dst: LirOperand::Reg(dst),
+                        src: src.clone(),
+                        size: RegSize::QWord,
+                    },
+                    defs: vec![dst],
+                    uses: self.operand_uses(operand),
+                });
+                
+                match op {
+                    UnOp::Not => {
+                        insts.push(LirInst {
+                            id: self.fresh_inst(),
+                            kind: LirInstKind::Not {
+                                dst: LirOperand::Reg(dst),
+                                size: RegSize::QWord,
+                            },
+                            defs: vec![dst],
+                            uses: vec![dst],
+                        });
+                    }
+                    UnOp::Neg => {
+                        insts.push(LirInst {
+                            id: self.fresh_inst(),
+                            kind: LirInstKind::Neg {
+                                dst: LirOperand::Reg(dst),
+                                size: RegSize::QWord,
+                            },
+                            defs: vec![dst],
+                            uses: vec![dst],
+                        });
+                    }
+                }
+            }
+            
+            Rvalue::Ref(_, _, place) => {
+                // LEA instruction for address-of
+                let mem = self.place_to_mem(place);
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Lea { dst, src: mem },
+                    defs: vec![dst],
+                    uses: self.place_uses(place),
+                });
+            }
+            
+            Rvalue::AddressOf(_, place) => {
+                let mem = self.place_to_mem(place);
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Lea { dst, src: mem },
+                    defs: vec![dst],
+                    uses: self.place_uses(place),
+                });
+            }
+            
+            Rvalue::Cast(kind, operand, ty) => {
+                self.lower_cast(*kind, operand, ty, dst, insts);
+            }
+            
+            Rvalue::Aggregate(kind, operands) => {
+                // For now, just handle tuples and arrays by storing to stack
+                // More complex aggregates need proper lowering
+                if let Some(slot) = self.stack_slots.get(&Local(dst.0)) {
+                    for (i, op) in operands.iter().enumerate() {
+                        let src = self.lower_operand(op);
+                        let offset = *slot + (i * 8) as i32;
+                        insts.push(LirInst {
+                            id: self.fresh_inst(),
+                            kind: LirInstKind::Mov {
+                                dst: LirOperand::Mem(MemOperand::BaseDisp(Reg::RBP, offset)),
+                                src,
+                                size: RegSize::QWord,
+                            },
+                            defs: Vec::new(),
+                            uses: self.operand_uses(op),
+                        });
+                    }
+                }
+            }
+            
+            Rvalue::Len(place) => {
+                // For slices, load the length field
+                // For arrays, emit constant
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Mov {
+                        dst: LirOperand::Reg(dst),
+                        src: LirOperand::Imm(0),  // TODO: proper length
+                        size: RegSize::QWord,
+                    },
+                    defs: vec![dst],
+                    uses: Vec::new(),
+                });
+            }
+            
+            Rvalue::Discriminant(place) => {
+                // Load discriminant from enum
+                let vreg = self.place_to_vreg(place);
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Mov {
+                        dst: LirOperand::Reg(dst),
+                        src: LirOperand::Reg(vreg),
+                        size: RegSize::QWord,
+                    },
+                    defs: vec![dst],
+                    uses: vec![vreg],
+                });
+            }
+            
+            _ => {
+                // Unsupported rvalue, emit nop
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Nop,
+                    defs: Vec::new(),
+                    uses: Vec::new(),
+                });
+            }
+        }
+    }
+    
+    fn lower_binop(&mut self, op: BinOp, lhs: &Operand, rhs: &Operand, dst: VReg, insts: &mut Vec<LirInst>) {
+        let lhs_op = self.lower_operand(lhs);
+        let rhs_op = self.lower_operand(rhs);
+        
+        // Move LHS to dst
+        insts.push(LirInst {
+            id: self.fresh_inst(),
+            kind: LirInstKind::Mov {
+                dst: LirOperand::Reg(dst),
+                src: lhs_op,
+                size: RegSize::QWord,
+            },
+            defs: vec![dst],
+            uses: self.operand_uses(lhs),
+        });
+        
+        let inst_kind = match op {
+            BinOp::Add => LirInstKind::Add {
+                dst: LirOperand::Reg(dst),
+                src: rhs_op,
+                size: RegSize::QWord,
+            },
+            BinOp::Sub => LirInstKind::Sub {
+                dst: LirOperand::Reg(dst),
+                src: rhs_op,
+                size: RegSize::QWord,
+            },
+            BinOp::Mul => LirInstKind::IMul {
+                dst: LirOperand::Reg(dst),
+                src: rhs_op,
+                size: RegSize::QWord,
+            },
+            BinOp::BitAnd => LirInstKind::And {
+                dst: LirOperand::Reg(dst),
+                src: rhs_op,
+                size: RegSize::QWord,
+            },
+            BinOp::BitOr => LirInstKind::Or {
+                dst: LirOperand::Reg(dst),
+                src: rhs_op,
+                size: RegSize::QWord,
+            },
+            BinOp::BitXor => LirInstKind::Xor {
+                dst: LirOperand::Reg(dst),
+                src: rhs_op,
+                size: RegSize::QWord,
+            },
+            BinOp::Shl => LirInstKind::Shl {
+                dst: LirOperand::Reg(dst),
+                count: rhs_op,
+                size: RegSize::QWord,
+            },
+            BinOp::Shr => LirInstKind::Shr {
+                dst: LirOperand::Reg(dst),
+                count: rhs_op,
+                size: RegSize::QWord,
+            },
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                // Comparison: CMP + SETCC
+                let cc = CondCode::from_binop(op, true);
+                
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Cmp {
+                        lhs: LirOperand::Reg(dst),
+                        rhs: rhs_op,
+                        size: RegSize::QWord,
+                    },
+                    defs: Vec::new(),
+                    uses: vec![dst],
+                });
+                
+                LirInstKind::SetCC {
+                    dst: LirOperand::Reg(dst),
+                    cc,
+                }
+            }
+            _ => LirInstKind::Nop,
+        };
+        
+        let mut uses = self.operand_uses(rhs);
+        uses.push(dst);
+        
+        insts.push(LirInst {
+            id: self.fresh_inst(),
+            kind: inst_kind,
+            defs: vec![dst],
+            uses,
+        });
+    }
+    
+    fn lower_cast(&mut self, kind: CastKind, operand: &Operand, ty: &Ty, dst: VReg, insts: &mut Vec<LirInst>) {
+        let src = self.lower_operand(operand);
+        
+        match kind {
+            CastKind::IntToInt => {
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Mov {
+                        dst: LirOperand::Reg(dst),
+                        src,
+                        size: RegSize::QWord,
+                    },
+                    defs: vec![dst],
+                    uses: self.operand_uses(operand),
+                });
+            }
+            CastKind::IntToFloat => {
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::CvtSI2SD { dst, src },
+                    defs: vec![dst],
+                    uses: self.operand_uses(operand),
+                });
+            }
+            CastKind::FloatToInt => {
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::CvtSD2SI { dst, src },
+                    defs: vec![dst],
+                    uses: self.operand_uses(operand),
+                });
+            }
+            CastKind::PtrToPtr | CastKind::Transmute => {
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Mov {
+                        dst: LirOperand::Reg(dst),
+                        src,
+                        size: RegSize::QWord,
+                    },
+                    defs: vec![dst],
+                    uses: self.operand_uses(operand),
+                });
+            }
+            _ => {
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Mov {
+                        dst: LirOperand::Reg(dst),
+                        src,
+                        size: RegSize::QWord,
+                    },
+                    defs: vec![dst],
+                    uses: self.operand_uses(operand),
+                });
+            }
+        }
+    }
+    
+    fn lower_terminator(&mut self, term: &Terminator, insts: &mut Vec<LirInst>) -> Vec<LirLabel> {
+        match &term.kind {
+            TerminatorKind::Goto { target } => {
+                let label = self.block_labels[target];
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Jmp { target: label },
+                    defs: Vec::new(),
+                    uses: Vec::new(),
+                });
+                vec![label]
+            }
+            
+            TerminatorKind::Return => {
+                // Move return value to RAX (already there for local 0)
+                let ret_vreg = self.local_to_vreg[&Local::RETURN_PLACE];
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Ret,
+                    defs: Vec::new(),
+                    uses: vec![ret_vreg],
+                });
+                Vec::new()
+            }
+            
+            TerminatorKind::SwitchInt { discr, targets } => {
+                let discr_op = self.lower_operand(discr);
+                let mut successors = Vec::new();
+                
+                // Generate cascading comparisons
+                for (value, target) in &targets.values {
+                    let label = self.block_labels[target];
+                    successors.push(label);
+                    
+                    insts.push(LirInst {
+                        id: self.fresh_inst(),
+                        kind: LirInstKind::Cmp {
+                            lhs: discr_op.clone(),
+                            rhs: LirOperand::Imm(*value as i64),
+                            size: RegSize::QWord,
+                        },
+                        defs: Vec::new(),
+                        uses: self.operand_uses(discr),
+                    });
+                    
+                    insts.push(LirInst {
+                        id: self.fresh_inst(),
+                        kind: LirInstKind::JmpCC {
+                            cc: CondCode::E,
+                            target: label,
+                        },
+                        defs: Vec::new(),
+                        uses: Vec::new(),
+                    });
+                }
+                
+                // Default case
+                let default_label = self.block_labels[&targets.otherwise];
+                successors.push(default_label);
+                
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Jmp { target: default_label },
+                    defs: Vec::new(),
+                    uses: Vec::new(),
+                });
+                
+                successors
+            }
+            
+            TerminatorKind::Call { func, args, destination, target, .. } => {
+                // Lower arguments (System V AMD64 calling convention)
+                for (i, arg) in args.iter().enumerate() {
+                    let arg_op = self.lower_operand(arg);
+                    
+                    if i < 6 {
+                        // First 6 args in registers
+                        insts.push(LirInst {
+                            id: self.fresh_inst(),
+                            kind: LirInstKind::Mov {
+                                dst: LirOperand::PhysReg(Reg::ARG_REGS[i]),
+                                src: arg_op,
+                                size: RegSize::QWord,
+                            },
+                            defs: Vec::new(),
+                            uses: self.operand_uses(arg),
+                        });
+                    } else {
+                        // Stack arguments
+                        insts.push(LirInst {
+                            id: self.fresh_inst(),
+                            kind: LirInstKind::Push {
+                                src: arg_op,
+                                size: RegSize::QWord,
+                            },
+                            defs: Vec::new(),
+                            uses: self.operand_uses(arg),
+                        });
+                    }
+                }
+                
+                // Call instruction
+                let call_target = match func {
+                    Operand::Constant(c) => {
+                        if let ConstValue::Unevaluated { def, .. } = &c.value {
+                            LirCallTarget::Direct(*def)
+                        } else {
+                            LirCallTarget::Symbol("unknown".to_string())
+                        }
+                    }
+                    Operand::Copy(place) | Operand::Move(place) => {
+                        let vreg = self.place_to_vreg(place);
+                        LirCallTarget::Indirect(vreg)
+                    }
+                };
+                
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Call {
+                        target: call_target,
+                        args: Vec::new(),
+                    },
+                    defs: Vec::new(),
+                    uses: Vec::new(),
+                });
+                
+                // Move result to destination
+                let dst_vreg = self.place_to_vreg(destination);
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Mov {
+                        dst: LirOperand::Reg(dst_vreg),
+                        src: LirOperand::PhysReg(Reg::RAX),
+                        size: RegSize::QWord,
+                    },
+                    defs: vec![dst_vreg],
+                    uses: Vec::new(),
+                });
+                
+                if let Some(target) = target {
+                    let label = self.block_labels[target];
+                    insts.push(LirInst {
+                        id: self.fresh_inst(),
+                        kind: LirInstKind::Jmp { target: label },
+                        defs: Vec::new(),
+                        uses: Vec::new(),
+                    });
+                    vec![label]
+                } else {
+                    Vec::new()
+                }
+            }
+            
+            TerminatorKind::Unreachable => {
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Ud2,
+                    defs: Vec::new(),
+                    uses: Vec::new(),
+                });
+                Vec::new()
+            }
+            
+            TerminatorKind::Drop { target, .. } => {
+                // TODO: Emit drop glue call
+                let label = self.block_labels[target];
+                insts.push(LirInst {
+                    id: self.fresh_inst(),
+                    kind: LirInstKind::Jmp { target: label },
+                    defs: Vec::new(),
+                    uses: Vec::new(),
+                });
+                vec![label]
+            }
+            
+            _ => Vec::new(),
+        }
+    }
+    
+    fn lower_operand(&self, operand: &Operand) -> LirOperand {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                let vreg = self.place_to_vreg(place);
+                LirOperand::Reg(vreg)
+            }
+            Operand::Constant(c) => {
+                match &c.value {
+                    ConstValue::Scalar(s) => {
+                        let imm = match s {
+                            Scalar::Int(v, _) => *v as i64,
+                            Scalar::Bool(b) => if *b { 1 } else { 0 },
+                            Scalar::Char(c) => *c as i64,
+                            Scalar::Float(f, _) => f.to_bits() as i64,
+                            Scalar::Ptr(p) => *p as i64,
+                        };
+                        LirOperand::Imm(imm)
+                    }
+                    ConstValue::ZeroSized => LirOperand::Imm(0),
+                    _ => LirOperand::Imm(0),
+                }
+            }
+        }
+    }
+    
+    fn place_to_vreg(&self, place: &Place) -> VReg {
+        self.local_to_vreg[&place.local]
+    }
+    
+    fn place_to_mem(&self, place: &Place) -> MemOperand {
+        if let Some(&offset) = self.stack_slots.get(&place.local) {
+            MemOperand::stack_slot(offset)
+        } else {
+            // Generate from vreg
+            MemOperand::Base(Reg::RBP)
+        }
+    }
+    
+    fn operand_uses(&self, operand: &Operand) -> Vec<VReg> {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                vec![self.place_to_vreg(place)]
+            }
+            Operand::Constant(_) => Vec::new(),
+        }
+    }
+    
+    fn place_uses(&self, place: &Place) -> Vec<VReg> {
+        vec![self.place_to_vreg(place)]
+    }
+    
+    fn needs_stack_slot(&self, ty: &Ty) -> bool {
+        matches!(ty, Ty::Tuple(_) | Ty::Array(_, _) | Ty::Adt(_, _))
+    }
+    
+    fn type_size(&self, ty: &Ty) -> u32 {
+        match ty {
+            Ty::Unit | Ty::Never => 0,
+            Ty::Bool => 1,
+            Ty::Char => 4,
+            Ty::Int(IntTy::U8) | Ty::Int(IntTy::I8) => 1,
+            Ty::Int(IntTy::U16) | Ty::Int(IntTy::I16) => 2,
+            Ty::Int(IntTy::U32) | Ty::Int(IntTy::I32) | Ty::Float(FloatTy::F32) => 4,
+            Ty::Int(IntTy::U64) | Ty::Int(IntTy::I64) | 
+            Ty::Int(IntTy::Usize) | Ty::Int(IntTy::Isize) |
+            Ty::Float(FloatTy::F64) => 8,
+            Ty::Int(IntTy::U128) | Ty::Int(IntTy::I128) => 16,
+            Ty::Ref(_, _, _) | Ty::Ptr(_, _) => 8,
+            Ty::PhysAddr | Ty::VirtAddr | Ty::Bytes | Ty::Pages => 8,
+            Ty::Tuple(ts) => ts.iter().map(|t| self.type_size(t)).sum(),
+            Ty::Array(elem, n) => self.type_size(elem) * (*n as u32),
+            _ => 8,  // Default pointer size
+        }
+    }
+    
+    fn compute_predecessors(&self, blocks: &mut [LirBlock]) {
+        // Build predecessor list from successors
+        let mut preds: HashMap<LirLabel, Vec<LirLabel>> = HashMap::new();
+        
+        for block in blocks.iter() {
+            for succ in &block.successors {
+                preds.entry(*succ).or_default().push(block.label);
+            }
+        }
+        
+        for block in blocks.iter_mut() {
+            if let Some(p) = preds.get(&block.label) {
+                block.predecessors = p.clone();
+            }
+        }
+    }
+}
+
+fn align_up(value: u32, align: u32) -> u32 {
+    (value + align - 1) & !(align - 1)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTER ALLOCATOR (Linear Scan)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct RegisterAllocator {
+    /// Live intervals for each virtual register
+    intervals: HashMap<VReg, LiveInterval>,
+    
+    /// Active intervals (sorted by end point)
+    active: Vec<VReg>,
+    
+    /// Available physical registers
+    free_regs: Vec<Reg>,
+    
+    /// VReg → PhysReg assignment
+    allocation: HashMap<VReg, Reg>,
+    
+    /// Spilled registers
+    spilled: HashSet<VReg>,
+    
+    /// Stack slot assignments for spilled vregs
+    spill_slots: HashMap<VReg, i32>,
+    
+    /// Next spill slot offset
+    next_spill_slot: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveInterval {
+    pub vreg: VReg,
+    pub start: u32,
+    pub end: u32,
+    pub uses: Vec<u32>,
+    pub defs: Vec<u32>,
+    pub reg_class: RegClass,
+}
+
+impl RegisterAllocator {
+    pub fn new() -> Self {
+        RegisterAllocator {
+            intervals: HashMap::new(),
+            active: Vec::new(),
+            free_regs: Reg::ALLOCATABLE_GP.to_vec(),
+            allocation: HashMap::new(),
+            spilled: HashSet::new(),
+            spill_slots: HashMap::new(),
+            next_spill_slot: -8,
+        }
+    }
+    
+    /// Compute live intervals from LIR function
+    pub fn compute_intervals(&mut self, func: &LirFunction) {
+        let mut inst_num: u32 = 0;
+        
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                // Record definitions
+                for def in &inst.defs {
+                    let interval = self.intervals.entry(*def).or_insert_with(|| {
+                        LiveInterval {
+                            vreg: *def,
+                            start: inst_num,
+                            end: inst_num,
+                            uses: Vec::new(),
+                            defs: Vec::new(),
+                            reg_class: RegClass::GP,
+                        }
+                    });
+                    interval.defs.push(inst_num);
+                    interval.end = inst_num.max(interval.end);
+                }
+                
+                // Record uses
+                for use_ in &inst.uses {
+                    let interval = self.intervals.entry(*use_).or_insert_with(|| {
+                        LiveInterval {
+                            vreg: *use_,
+                            start: inst_num,
+                            end: inst_num,
+                            uses: Vec::new(),
+                            defs: Vec::new(),
+                            reg_class: RegClass::GP,
+                        }
+                    });
+                    interval.uses.push(inst_num);
+                    interval.end = inst_num.max(interval.end);
+                }
+                
+                inst_num += 1;
+            }
+        }
+    }
+    
+    /// Linear scan register allocation
+    pub fn allocate(&mut self) {
+        // Sort intervals by start point
+        let mut intervals: Vec<_> = self.intervals.values().cloned().collect();
+        intervals.sort_by_key(|i| i.start);
+        
+        for interval in intervals {
+            // Expire old intervals
+            self.expire_old_intervals(interval.start);
+            
+            if self.free_regs.is_empty() {
+                // Need to spill
+                self.spill_at_interval(&interval);
+            } else {
+                // Allocate a free register
+                let reg = self.free_regs.pop().unwrap();
+                self.allocation.insert(interval.vreg, reg);
+                
+                // Add to active list (sorted by end point)
+                let pos = self.active.iter()
+                    .position(|v| self.intervals[v].end > interval.end)
+                    .unwrap_or(self.active.len());
+                self.active.insert(pos, interval.vreg);
+            }
+        }
+    }
+    
+    fn expire_old_intervals(&mut self, current_pos: u32) {
+        // Remove intervals that have ended
+        let mut i = 0;
+        while i < self.active.len() {
+            let vreg = self.active[i];
+            let interval = &self.intervals[&vreg];
+            
+            if interval.end < current_pos {
+                // Interval has ended, free the register
+                if let Some(reg) = self.allocation.get(&vreg) {
+                    self.free_regs.push(*reg);
+                }
+                self.active.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    
+    fn spill_at_interval(&mut self, interval: &LiveInterval) {
+        // Find the active interval with the latest end point
+        if let Some(&spill_vreg) = self.active.last() {
+            let spill_interval = &self.intervals[&spill_vreg];
+            
+            if spill_interval.end > interval.end {
+                // Spill the active interval, use its register
+                let reg = self.allocation.remove(&spill_vreg).unwrap();
+                self.allocation.insert(interval.vreg, reg);
+                self.spilled.insert(spill_vreg);
+                self.spill_slots.insert(spill_vreg, self.next_spill_slot);
+                self.next_spill_slot -= 8;
+                
+                self.active.pop();
+                
+                // Insert new interval in sorted position
+                let pos = self.active.iter()
+                    .position(|v| self.intervals[v].end > interval.end)
+                    .unwrap_or(self.active.len());
+                self.active.insert(pos, interval.vreg);
+            } else {
+                // Spill the new interval
+                self.spilled.insert(interval.vreg);
+                self.spill_slots.insert(interval.vreg, self.next_spill_slot);
+                self.next_spill_slot -= 8;
+            }
+        } else {
+            // No active intervals, spill this one
+            self.spilled.insert(interval.vreg);
+            self.spill_slots.insert(interval.vreg, self.next_spill_slot);
+            self.next_spill_slot -= 8;
+        }
+    }
+    
+    /// Get allocated register for a VReg
+    pub fn get_allocation(&self, vreg: VReg) -> Option<Reg> {
+        self.allocation.get(&vreg).copied()
+    }
+    
+    /// Check if VReg was spilled
+    pub fn is_spilled(&self, vreg: VReg) -> bool {
+        self.spilled.contains(&vreg)
+    }
+    
+    /// Get spill slot for VReg
+    pub fn get_spill_slot(&self, vreg: VReg) -> Option<i32> {
+        self.spill_slots.get(&vreg).copied()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MACHINE CODE EMITTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct CodeEmitter {
+    /// Output buffer
+    code: Vec<u8>,
+    
+    /// Label positions
+    labels: HashMap<LirLabel, u32>,
+    
+    /// Pending label fixups
+    fixups: Vec<LabelFixup>,
+    
+    /// Register allocation
+    regalloc: RegisterAllocator,
+}
+
+struct LabelFixup {
+    offset: u32,
+    label: LirLabel,
+    kind: FixupKind,
+}
+
+enum FixupKind {
+    Rel32,  // 32-bit relative
+    Rel8,   // 8-bit relative (short jump)
+}
+
+impl CodeEmitter {
+    pub fn new(regalloc: RegisterAllocator) -> Self {
+        CodeEmitter {
+            code: Vec::new(),
+            labels: HashMap::new(),
+            fixups: Vec::new(),
+            regalloc,
+        }
+    }
+    
+    pub fn emit_function(&mut self, func: &LirFunction) {
+        // Emit prologue
+        self.emit_prologue(func);
+        
+        // Emit each block
+        for block in &func.blocks {
+            self.emit_block(block);
+        }
+        
+        // Apply fixups
+        self.apply_fixups();
+    }
+    
+    fn emit_prologue(&mut self, func: &LirFunction) {
+        // push rbp
+        self.emit_byte(0x55);
+        
+        // mov rbp, rsp
+        self.emit_bytes(&[0x48, 0x89, 0xE5]);
+        
+        // sub rsp, stack_size
+        if func.stack_size > 0 {
+            if func.stack_size <= 127 {
+                self.emit_bytes(&[0x48, 0x83, 0xEC, func.stack_size as u8]);
+            } else {
+                self.emit_bytes(&[0x48, 0x81, 0xEC]);
+                self.emit_u32(func.stack_size);
+            }
+        }
+        
+        // Save callee-saved registers
+        for reg in &func.used_callee_saved {
+            self.emit_push(*reg);
+        }
+    }
+    
+    fn emit_epilogue(&mut self, func: &LirFunction) {
+        // Restore callee-saved registers
+        for reg in func.used_callee_saved.iter().rev() {
+            self.emit_pop(*reg);
+        }
+        
+        // mov rsp, rbp
+        self.emit_bytes(&[0x48, 0x89, 0xEC]);
+        
+        // pop rbp
+        self.emit_byte(0x5D);
+        
+        // ret
+        self.emit_byte(0xC3);
+    }
+    
+    fn emit_block(&mut self, block: &LirBlock) {
+        // Record label position
+        self.labels.insert(block.label, self.code.len() as u32);
+        
+        for inst in &block.instructions {
+            self.emit_instruction(inst);
+        }
+    }
+    
+    fn emit_instruction(&mut self, inst: &LirInst) {
+        match &inst.kind {
+            LirInstKind::Mov { dst, src, size } => {
+                self.emit_mov(dst, src, *size);
+            }
+            
+            LirInstKind::Add { dst, src, size } => {
+                self.emit_alu_rr(0x01, dst, src, *size);  // ADD opcode
+            }
+            
+            LirInstKind::Sub { dst, src, size } => {
+                self.emit_alu_rr(0x29, dst, src, *size);  // SUB opcode
+            }
+            
+            LirInstKind::And { dst, src, size } => {
+                self.emit_alu_rr(0x21, dst, src, *size);  // AND opcode
+            }
+            
+            LirInstKind::Or { dst, src, size } => {
+                self.emit_alu_rr(0x09, dst, src, *size);  // OR opcode
+            }
+            
+            LirInstKind::Xor { dst, src, size } => {
+                self.emit_alu_rr(0x31, dst, src, *size);  // XOR opcode
+            }
+            
+            LirInstKind::Cmp { lhs, rhs, size } => {
+                self.emit_alu_rr(0x39, lhs, rhs, *size);  // CMP opcode
+            }
+            
+            LirInstKind::Jmp { target } => {
+                self.emit_jmp(*target);
+            }
+            
+            LirInstKind::JmpCC { cc, target } => {
+                self.emit_jcc(*cc, *target);
+            }
+            
+            LirInstKind::Ret => {
+                self.emit_byte(0xC3);
+            }
+            
+            LirInstKind::Push { src, .. } => {
+                if let LirOperand::PhysReg(reg) = src {
+                    self.emit_push(*reg);
+                }
+            }
+            
+            LirInstKind::Pop { dst, .. } => {
+                if let LirOperand::PhysReg(reg) = dst {
+                    self.emit_pop(*reg);
+                }
+            }
+            
+            LirInstKind::Call { target, .. } => {
+                match target {
+                    LirCallTarget::Symbol(name) => {
+                        // Near call with symbol relocation (placeholder)
+                        self.emit_byte(0xE8);
+                        self.emit_u32(0);  // Will be relocated
+                    }
+                    LirCallTarget::Indirect(vreg) => {
+                        if let Some(reg) = self.regalloc.get_allocation(*vreg) {
+                            // call reg
+                            let rex = if reg.requires_rex() { 0x41 } else { 0x40 };
+                            if rex != 0x40 {
+                                self.emit_byte(rex);
+                            }
+                            self.emit_bytes(&[0xFF, 0xD0 | (reg.encoding() & 0x7)]);
+                        }
+                    }
+                    LirCallTarget::Direct(_) => {
+                        self.emit_byte(0xE8);
+                        self.emit_u32(0);
+                    }
+                }
+            }
+            
+            LirInstKind::Nop => {
+                self.emit_byte(0x90);
+            }
+            
+            LirInstKind::Ud2 => {
+                self.emit_bytes(&[0x0F, 0x0B]);
+            }
+            
+            LirInstKind::Syscall => {
+                self.emit_bytes(&[0x0F, 0x05]);
+            }
+            
+            LirInstKind::Cli => {
+                self.emit_byte(0xFA);
+            }
+            
+            LirInstKind::Sti => {
+                self.emit_byte(0xFB);
+            }
+            
+            LirInstKind::Hlt => {
+                self.emit_byte(0xF4);
+            }
+            
+            LirInstKind::Mfence => {
+                self.emit_bytes(&[0x0F, 0xAE, 0xF0]);
+            }
+            
+            LirInstKind::Label(_) | LirInstKind::Comment(_) => {
+                // No code emitted
+            }
+            
+            _ => {
+                // Unhandled instruction, emit NOP
+                self.emit_byte(0x90);
+            }
+        }
+    }
+    
+    fn emit_mov(&mut self, dst: &LirOperand, src: &LirOperand, size: RegSize) {
+        match (dst, src) {
+            (LirOperand::Reg(dst_vreg), LirOperand::Reg(src_vreg)) => {
+                let dst_reg = self.regalloc.get_allocation(*dst_vreg)
+                    .unwrap_or(Reg::RAX);
+                let src_reg = self.regalloc.get_allocation(*src_vreg)
+                    .unwrap_or(Reg::RAX);
+                self.emit_mov_rr(dst_reg, src_reg, size);
+            }
+            (LirOperand::Reg(vreg), LirOperand::Imm(imm)) => {
+                let reg = self.regalloc.get_allocation(*vreg)
+                    .unwrap_or(Reg::RAX);
+                self.emit_mov_ri(reg, *imm, size);
+            }
+            (LirOperand::PhysReg(dst_reg), LirOperand::Reg(src_vreg)) => {
+                let src_reg = self.regalloc.get_allocation(*src_vreg)
+                    .unwrap_or(Reg::RAX);
+                self.emit_mov_rr(*dst_reg, src_reg, size);
+            }
+            (LirOperand::Reg(dst_vreg), LirOperand::PhysReg(src_reg)) => {
+                let dst_reg = self.regalloc.get_allocation(*dst_vreg)
+                    .unwrap_or(Reg::RAX);
+                self.emit_mov_rr(dst_reg, *src_reg, size);
+            }
+            (LirOperand::PhysReg(dst), LirOperand::PhysReg(src)) => {
+                self.emit_mov_rr(*dst, *src, size);
+            }
+            (LirOperand::PhysReg(dst), LirOperand::Imm(imm)) => {
+                self.emit_mov_ri(*dst, *imm, size);
+            }
+            _ => {}
+        }
+    }
+    
+    fn emit_mov_rr(&mut self, dst: Reg, src: Reg, size: RegSize) {
+        let rex = self.compute_rex(size, dst, src);
+        if rex != 0 {
+            self.emit_byte(rex);
+        }
+        
+        let opcode = match size {
+            RegSize::Byte => 0x88,
+            _ => 0x89,
+        };
+        
+        self.emit_byte(opcode);
+        self.emit_modrm(0b11, src.encoding() & 0x7, dst.encoding() & 0x7);
+    }
+    
+    fn emit_mov_ri(&mut self, dst: Reg, imm: i64, size: RegSize) {
+        match size {
+            RegSize::QWord => {
+                if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
+                    // MOV r64, imm32 (sign-extended)
+                    let rex = 0x48 | if dst.requires_rex() { 0x01 } else { 0 };
+                    self.emit_byte(rex);
+                    self.emit_byte(0xC7);
+                    self.emit_modrm(0b11, 0, dst.encoding() & 0x7);
+                    self.emit_u32(imm as u32);
+                } else {
+                    // MOV r64, imm64
+                    let rex = 0x48 | if dst.requires_rex() { 0x01 } else { 0 };
+                    self.emit_byte(rex);
+                    self.emit_byte(0xB8 | (dst.encoding() & 0x7));
+                    self.emit_u64(imm as u64);
+                }
+            }
+            RegSize::DWord => {
+                if dst.requires_rex() {
+                    self.emit_byte(0x41);
+                }
+                self.emit_byte(0xB8 | (dst.encoding() & 0x7));
+                self.emit_u32(imm as u32);
+            }
+            _ => {
+                // Simplified for other sizes
+                self.emit_byte(0xB8 | (dst.encoding() & 0x7));
+                self.emit_u32(imm as u32);
+            }
+        }
+    }
+    
+    fn emit_alu_rr(&mut self, opcode: u8, dst: &LirOperand, src: &LirOperand, size: RegSize) {
+        let dst_reg = match dst {
+            LirOperand::Reg(vreg) => self.regalloc.get_allocation(*vreg).unwrap_or(Reg::RAX),
+            LirOperand::PhysReg(reg) => *reg,
+            _ => return,
+        };
+        
+        match src {
+            LirOperand::Reg(vreg) => {
+                let src_reg = self.regalloc.get_allocation(*vreg).unwrap_or(Reg::RAX);
+                let rex = self.compute_rex(size, src_reg, dst_reg);
+                if rex != 0 {
+                    self.emit_byte(rex);
+                }
+                self.emit_byte(opcode);
+                self.emit_modrm(0b11, src_reg.encoding() & 0x7, dst_reg.encoding() & 0x7);
+            }
+            LirOperand::PhysReg(src_reg) => {
+                let rex = self.compute_rex(size, *src_reg, dst_reg);
+                if rex != 0 {
+                    self.emit_byte(rex);
+                }
+                self.emit_byte(opcode);
+                self.emit_modrm(0b11, src_reg.encoding() & 0x7, dst_reg.encoding() & 0x7);
+            }
+            LirOperand::Imm(imm) => {
+                // ALU r/m, imm
+                let rex = self.compute_rex_single(size, dst_reg);
+                if rex != 0 {
+                    self.emit_byte(rex);
+                }
+                
+                let op_ext = (opcode >> 3) & 0x7;  // Extract operation from opcode
+                
+                if *imm >= -128 && *imm <= 127 {
+                    self.emit_byte(0x83);
+                    self.emit_modrm(0b11, op_ext, dst_reg.encoding() & 0x7);
+                    self.emit_byte(*imm as u8);
+                } else {
+                    self.emit_byte(0x81);
+                    self.emit_modrm(0b11, op_ext, dst_reg.encoding() & 0x7);
+                    self.emit_u32(*imm as u32);
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    fn emit_jmp(&mut self, target: LirLabel) {
+        // JMP rel32
+        self.emit_byte(0xE9);
+        self.fixups.push(LabelFixup {
+            offset: self.code.len() as u32,
+            label: target,
+            kind: FixupKind::Rel32,
+        });
+        self.emit_u32(0);  // Placeholder
+    }
+    
+    fn emit_jcc(&mut self, cc: CondCode, target: LirLabel) {
+        // Jcc rel32 (0x0F 0x8x)
+        self.emit_bytes(&[0x0F, 0x80 | cc.encoding()]);
+        self.fixups.push(LabelFixup {
+            offset: self.code.len() as u32,
+            label: target,
+            kind: FixupKind::Rel32,
+        });
+        self.emit_u32(0);  // Placeholder
+    }
+    
+    fn emit_push(&mut self, reg: Reg) {
+        if reg.requires_rex() {
+            self.emit_byte(0x41);
+        }
+        self.emit_byte(0x50 | (reg.encoding() & 0x7));
+    }
+    
+    fn emit_pop(&mut self, reg: Reg) {
+        if reg.requires_rex() {
+            self.emit_byte(0x41);
+        }
+        self.emit_byte(0x58 | (reg.encoding() & 0x7));
+    }
+    
+    fn compute_rex(&self, size: RegSize, reg: Reg, rm: Reg) -> u8 {
+        let mut rex = 0u8;
+        
+        if matches!(size, RegSize::QWord) {
+            rex |= 0x48;  // REX.W
+        }
+        
+        if reg.requires_rex() {
+            rex |= 0x44;  // REX.R
+        }
+        
+        if rm.requires_rex() {
+            rex |= 0x41;  // REX.B
+        }
+        
+        if rex != 0 && (rex & 0x40) == 0 {
+            rex |= 0x40;  // Ensure REX prefix is valid
+        }
+        
+        rex
+    }
+    
+    fn compute_rex_single(&self, size: RegSize, rm: Reg) -> u8 {
+        let mut rex = 0u8;
+        
+        if matches!(size, RegSize::QWord) {
+            rex |= 0x48;
+        }
+        
+        if rm.requires_rex() {
+            rex |= 0x41;
+        }
+        
+        if rex != 0 && (rex & 0x40) == 0 {
+            rex |= 0x40;
+        }
+        
+        rex
+    }
+    
+    fn emit_modrm(&mut self, mod_: u8, reg: u8, rm: u8) {
+        self.emit_byte((mod_ << 6) | ((reg & 0x7) << 3) | (rm & 0x7));
+    }
+    
+    fn emit_byte(&mut self, b: u8) {
+        self.code.push(b);
+    }
+    
+    fn emit_bytes(&mut self, bytes: &[u8]) {
+        self.code.extend_from_slice(bytes);
+    }
+    
+    fn emit_u32(&mut self, v: u32) {
+        self.code.extend_from_slice(&v.to_le_bytes());
+    }
+    
+    fn emit_u64(&mut self, v: u64) {
+        self.code.extend_from_slice(&v.to_le_bytes());
+    }
+    
+    fn apply_fixups(&mut self) {
+        for fixup in &self.fixups {
+            if let Some(&target_offset) = self.labels.get(&fixup.label) {
+                let rel = (target_offset as i32) - (fixup.offset as i32) - 4;
+                let offset = fixup.offset as usize;
+                
+                match fixup.kind {
+                    FixupKind::Rel32 => {
+                        self.code[offset..offset + 4].copy_from_slice(&rel.to_le_bytes());
+                    }
+                    FixupKind::Rel8 => {
+                        self.code[offset] = rel as u8;
+                    }
+                }
+            }
+        }
+    }
+    
+    pub fn code(&self) -> &[u8] {
+        &self.code
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ELF OBJECT FILE WRITER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct ElfWriter {
+    /// Output buffer
+    output: Vec<u8>,
+    
+    /// Symbol table
+    symbols: Vec<ElfSymbol>,
+    
+    /// Section headers
+    sections: Vec<ElfSection>,
+    
+    /// String table
+    strtab: Vec<u8>,
+    
+    /// Section header string table
+    shstrtab: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ElfSymbol {
+    name: String,
+    value: u64,
+    size: u64,
+    info: u8,
+    other: u8,
+    shndx: u16,
+}
+
+#[derive(Debug)]
+struct ElfSection {
+    name: String,
+    sh_type: u32,
+    sh_flags: u64,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_info: u32,
+    sh_addralign: u64,
+    sh_entsize: u64,
+    data: Vec<u8>,
+}
+
+impl ElfWriter {
+    pub fn new() -> Self {
+        ElfWriter {
+            output: Vec::new(),
+            symbols: Vec::new(),
+            sections: Vec::new(),
+            strtab: vec![0],  // Start with null byte
+            shstrtab: vec![0],
+        }
+    }
+    
+    /// Add a text section with machine code
+    pub fn add_text_section(&mut self, name: &str, code: &[u8]) {
+        let name_offset = self.add_shstring(name);
+        
+        self.sections.push(ElfSection {
+            name: name.to_string(),
+            sh_type: 1,  // SHT_PROGBITS
+            sh_flags: 0x6,  // SHF_ALLOC | SHF_EXECINSTR
+            sh_addr: 0,
+            sh_offset: 0,  // Set during write
+            sh_size: code.len() as u64,
+            sh_link: 0,
+            sh_info: 0,
+            sh_addralign: 16,
+            sh_entsize: 0,
+            data: code.to_vec(),
+        });
+    }
+    
+    /// Add a data section
+    pub fn add_data_section(&mut self, name: &str, data: &[u8], writable: bool) {
+        let flags = if writable { 0x3 } else { 0x2 };  // SHF_ALLOC | SHF_WRITE
+        
+        self.sections.push(ElfSection {
+            name: name.to_string(),
+            sh_type: 1,  // SHT_PROGBITS
+            sh_flags: flags,
+            sh_addr: 0,
+            sh_offset: 0,
+            sh_size: data.len() as u64,
+            sh_link: 0,
+            sh_info: 0,
+            sh_addralign: 8,
+            sh_entsize: 0,
+            data: data.to_vec(),
+        });
+    }
+    
+    /// Add a global symbol
+    pub fn add_symbol(&mut self, name: &str, section_idx: u16, value: u64, size: u64, is_func: bool) {
+        let name_offset = self.add_string(name);
+        let info = if is_func { 0x12 } else { 0x11 };  // STB_GLOBAL | STT_FUNC/STT_OBJECT
+        
+        self.symbols.push(ElfSymbol {
+            name: name.to_string(),
+            value,
+            size,
+            info,
+            other: 0,
+            shndx: section_idx,
+        });
+    }
+    
+    fn add_string(&mut self, s: &str) -> u32 {
+        let offset = self.strtab.len() as u32;
+        self.strtab.extend_from_slice(s.as_bytes());
+        self.strtab.push(0);
+        offset
+    }
+    
+    fn add_shstring(&mut self, s: &str) -> u32 {
+        let offset = self.shstrtab.len() as u32;
+        self.shstrtab.extend_from_slice(s.as_bytes());
+        self.shstrtab.push(0);
+        offset
+    }
+    
+    /// Write the ELF file
+    pub fn write(&mut self) -> Vec<u8> {
+        self.output.clear();
+        
+        // ELF header
+        self.write_elf_header();
+        
+        // Calculate offsets
+        let mut offset = 64u64;  // After ELF header
+        
+        // Write section data
+        for section in &mut self.sections {
+            offset = align_up64(offset, section.sh_addralign);
+            section.sh_offset = offset;
+            offset += section.sh_size;
+        }
+        
+        // Add null section
+        let sh_start = align_up64(offset, 8);
+        
+        // Write section data
+        self.output.resize(64, 0);
+        for section in &self.sections {
+            self.output.resize(section.sh_offset as usize, 0);
+            self.output.extend_from_slice(&section.data);
+        }
+        
+        // Pad to section header offset
+        self.output.resize(sh_start as usize, 0);
+        
+        // Write section headers
+        self.write_section_headers(sh_start);
+        
+        // Update ELF header with section header info
+        let shnum = self.sections.len() as u16 + 1;  // +1 for null section
+        self.output[48..56].copy_from_slice(&sh_start.to_le_bytes());
+        self.output[60..62].copy_from_slice(&shnum.to_le_bytes());
+        
+        self.output.clone()
+    }
+    
+    fn write_elf_header(&mut self) {
+        // e_ident
+        self.output.extend_from_slice(&[
+            0x7F, b'E', b'L', b'F',  // Magic
+            2,    // ELFCLASS64
+            1,    // ELFDATA2LSB
+            1,    // EV_CURRENT
+            0,    // ELFOSABI_NONE
+            0, 0, 0, 0, 0, 0, 0, 0,  // Padding
+        ]);
+        
+        // e_type: ET_REL (relocatable)
+        self.output.extend_from_slice(&1u16.to_le_bytes());
+        
+        // e_machine: EM_X86_64
+        self.output.extend_from_slice(&0x3Eu16.to_le_bytes());
+        
+        // e_version
+        self.output.extend_from_slice(&1u32.to_le_bytes());
+        
+        // e_entry
+        self.output.extend_from_slice(&0u64.to_le_bytes());
+        
+        // e_phoff (no program headers for .o files)
+        self.output.extend_from_slice(&0u64.to_le_bytes());
+        
+        // e_shoff (filled in later)
+        self.output.extend_from_slice(&0u64.to_le_bytes());
+        
+        // e_flags
+        self.output.extend_from_slice(&0u32.to_le_bytes());
+        
+        // e_ehsize
+        self.output.extend_from_slice(&64u16.to_le_bytes());
+        
+        // e_phentsize, e_phnum
+        self.output.extend_from_slice(&0u16.to_le_bytes());
+        self.output.extend_from_slice(&0u16.to_le_bytes());
+        
+        // e_shentsize
+        self.output.extend_from_slice(&64u16.to_le_bytes());
+        
+        // e_shnum (filled in later)
+        self.output.extend_from_slice(&0u16.to_le_bytes());
+        
+        // e_shstrndx (filled in later)
+        self.output.extend_from_slice(&0u16.to_le_bytes());
+    }
+    
+    fn write_section_headers(&mut self, _start: u64) {
+        // Null section header
+        self.output.extend_from_slice(&[0u8; 64]);
+        
+        // Section headers for each section
+        for section in &self.sections {
+            // sh_name
+            self.output.extend_from_slice(&0u32.to_le_bytes());
+            // sh_type
+            self.output.extend_from_slice(&section.sh_type.to_le_bytes());
+            // sh_flags
+            self.output.extend_from_slice(&section.sh_flags.to_le_bytes());
+            // sh_addr
+            self.output.extend_from_slice(&section.sh_addr.to_le_bytes());
+            // sh_offset
+            self.output.extend_from_slice(&section.sh_offset.to_le_bytes());
+            // sh_size
+            self.output.extend_from_slice(&section.sh_size.to_le_bytes());
+            // sh_link
+            self.output.extend_from_slice(&section.sh_link.to_le_bytes());
+            // sh_info
+            self.output.extend_from_slice(&section.sh_info.to_le_bytes());
+            // sh_addralign
+            self.output.extend_from_slice(&section.sh_addralign.to_le_bytes());
+            // sh_entsize
+            self.output.extend_from_slice(&section.sh_entsize.to_le_bytes());
+        }
+    }
+}
+
+fn align_up64(value: u64, align: u64) -> u64 {
+    (value + align - 1) & !(align - 1)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_reg_encoding() {
+        assert_eq!(Reg::RAX.encoding(), 0);
+        assert_eq!(Reg::RCX.encoding(), 1);
+        assert_eq!(Reg::R8.encoding(), 8);
+        assert!(Reg::R8.requires_rex());
+        assert!(!Reg::RAX.requires_rex());
+    }
+    
+    #[test]
+    fn test_cond_code() {
+        assert_eq!(CondCode::E.encoding(), 0x4);
+        assert_eq!(CondCode::NE.encoding(), 0x5);
+        assert_eq!(CondCode::E.invert(), CondCode::NE);
+    }
+    
+    #[test]
+    fn test_linear_scan() {
+        let mut alloc = RegisterAllocator::new();
+        
+        alloc.intervals.insert(VReg(0), LiveInterval {
+            vreg: VReg(0),
+            start: 0,
+            end: 10,
+            uses: vec![5],
+            defs: vec![0],
+            reg_class: RegClass::GP,
+        });
+        
+        alloc.intervals.insert(VReg(1), LiveInterval {
+            vreg: VReg(1),
+            start: 2,
+            end: 8,
+            uses: vec![6],
+            defs: vec![2],
+            reg_class: RegClass::GP,
+        });
+        
+        alloc.allocate();
+        
+        assert!(alloc.get_allocation(VReg(0)).is_some());
+        assert!(alloc.get_allocation(VReg(1)).is_some());
+    }
+    
+    #[test]
+    fn test_mov_encoding() {
+        let regalloc = RegisterAllocator::new();
+        let mut emitter = CodeEmitter::new(regalloc);
+        
+        // mov rax, rbx (REX.W + opcode + ModRM)
+        emitter.emit_mov_rr(Reg::RAX, Reg::RBX, RegSize::QWord);
+        assert_eq!(emitter.code(), &[0x48, 0x89, 0xD8]);
+    }
+    
+    #[test]
+    fn test_elf_header() {
+        let mut writer = ElfWriter::new();
+        writer.add_text_section(".text", &[0x90, 0x90]);
+        let output = writer.write();
+        
+        // Check magic
+        assert_eq!(&output[0..4], &[0x7F, b'E', b'L', b'F']);
+        // Check class (64-bit)
+        assert_eq!(output[4], 2);
+        // Check machine (x86_64)
+        assert_eq!(&output[18..20], &[0x3E, 0x00]);
+    }
+}

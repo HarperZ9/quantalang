@@ -1,0 +1,850 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DOCUMENTATION GENERATOR — Markdown Renderer
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Generates Markdown documentation from the documentation model.
+// Useful for:
+// - GitHub/GitLab README generation
+// - mdBook integration
+// - Static site generators
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::doc::markdown
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::format;
+use alloc::collections::BTreeMap;
+use crate::doc::model::*;
+use crate::doc::parser::{ParsedDoc, StandardSection};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARKDOWN CONFIG
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Configuration for Markdown generation
+#[derive(Debug, Clone)]
+pub struct MarkdownConfig {
+    /// Output directory
+    pub output_dir: String,
+    /// Generate single file or directory structure
+    pub single_file: bool,
+    /// Include private items
+    pub document_private: bool,
+    /// Include table of contents
+    pub include_toc: bool,
+    /// Heading level offset (0 = start with #, 1 = start with ##)
+    pub heading_offset: u8,
+    /// Link style
+    pub link_style: LinkStyle,
+    /// Code fence language
+    pub code_lang: String,
+    /// Include source file references
+    pub include_source_refs: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkStyle {
+    /// [text](url)
+    Inline,
+    /// [text][ref] with [ref]: url at bottom
+    Reference,
+    /// [[wiki-style]]
+    Wiki,
+}
+
+impl Default for MarkdownConfig {
+    fn default() -> Self {
+        MarkdownConfig {
+            output_dir: "docs".to_string(),
+            single_file: false,
+            document_private: false,
+            include_toc: true,
+            heading_offset: 0,
+            link_style: LinkStyle::Inline,
+            code_lang: "quanta".to_string(),
+            include_source_refs: true,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARKDOWN RENDERER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Markdown documentation renderer
+pub struct MarkdownRenderer {
+    config: MarkdownConfig,
+    /// Generated files
+    files: BTreeMap<String, String>,
+    /// Reference links (for Reference link style)
+    refs: Vec<(String, String)>,
+}
+
+impl MarkdownRenderer {
+    pub fn new(config: MarkdownConfig) -> Self {
+        MarkdownRenderer {
+            config,
+            files: BTreeMap::new(),
+            refs: Vec::new(),
+        }
+    }
+    
+    /// Render a complete crate
+    pub fn render_crate(&mut self, krate: &DocCrate) -> Result<(), String> {
+        if self.config.single_file {
+            self.render_single_file(krate)
+        } else {
+            self.render_multi_file(krate)
+        }
+    }
+    
+    /// Get all generated files
+    pub fn files(&self) -> &BTreeMap<String, String> {
+        &self.files
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SINGLE FILE MODE
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn render_single_file(&mut self, krate: &DocCrate) -> Result<(), String> {
+        let mut md = String::new();
+        
+        // Title
+        md.push_str(&self.heading(1, &format!("{} v{}", krate.name, krate.version)));
+        md.push('\n');
+        
+        // Crate documentation
+        md.push_str(&self.render_doc(&krate.doc));
+        md.push('\n');
+        
+        // Table of contents
+        if self.config.include_toc {
+            md.push_str(&self.render_toc(krate));
+            md.push('\n');
+        }
+        
+        // Render all modules
+        self.render_module_content(&mut md, &krate.root_module, 2);
+        
+        // Reference links
+        if !self.refs.is_empty() {
+            md.push_str("\n---\n\n");
+            for (name, url) in &self.refs {
+                md.push_str(&format!("[{}]: {}\n", name, url));
+            }
+        }
+        
+        self.files.insert("README.md".to_string(), md);
+        Ok(())
+    }
+    
+    fn render_toc(&self, krate: &DocCrate) -> String {
+        let mut toc = String::new();
+        toc.push_str(&self.heading(2, "Table of Contents"));
+        toc.push('\n');
+        
+        self.render_module_toc(&mut toc, &krate.root_module, 0);
+        
+        toc
+    }
+    
+    fn render_module_toc(&self, toc: &mut String, module: &DocModule, depth: usize) {
+        let indent = "  ".repeat(depth);
+        
+        // Submodules
+        for submod in &module.modules {
+            if submod.visibility.is_public() || self.config.document_private {
+                let anchor = self.make_anchor(&format!("module-{}", submod.name));
+                toc.push_str(&format!("{}- [{}](#{})\n", indent, submod.name, anchor));
+                self.render_module_toc(toc, submod, depth + 1);
+            }
+        }
+        
+        // Structs
+        for struc in &module.structs {
+            if struc.visibility.is_public() || self.config.document_private {
+                let anchor = self.make_anchor(&format!("struct-{}", struc.name));
+                toc.push_str(&format!("{}- [{}](#{})\n", indent, struc.name, anchor));
+            }
+        }
+        
+        // Enums
+        for enm in &module.enums {
+            if enm.visibility.is_public() || self.config.document_private {
+                let anchor = self.make_anchor(&format!("enum-{}", enm.name));
+                toc.push_str(&format!("{}- [{}](#{})\n", indent, enm.name, anchor));
+            }
+        }
+        
+        // Traits
+        for trt in &module.traits {
+            if trt.visibility.is_public() || self.config.document_private {
+                let anchor = self.make_anchor(&format!("trait-{}", trt.name));
+                toc.push_str(&format!("{}- [{}](#{})\n", indent, trt.name, anchor));
+            }
+        }
+        
+        // Functions
+        for func in &module.functions {
+            if func.visibility.is_public() || self.config.document_private {
+                let anchor = self.make_anchor(&format!("fn-{}", func.name));
+                toc.push_str(&format!("{}- [{}()](#{})\n", indent, func.name, anchor));
+            }
+        }
+    }
+    
+    fn render_module_content(&mut self, md: &mut String, module: &DocModule, level: u8) {
+        // Module header
+        if !module.path.is_root() {
+            md.push_str(&self.heading(level, &format!("Module `{}`", module.name)));
+            md.push('\n');
+            md.push_str(&self.render_doc(&module.doc));
+            md.push('\n');
+        }
+        
+        // Submodules
+        for submod in &module.modules {
+            if submod.visibility.is_public() || self.config.document_private {
+                self.render_module_content(md, submod, level + 1);
+            }
+        }
+        
+        // Structs
+        for struc in &module.structs {
+            if struc.visibility.is_public() || self.config.document_private {
+                self.render_struct(md, struc, level);
+            }
+        }
+        
+        // Enums
+        for enm in &module.enums {
+            if enm.visibility.is_public() || self.config.document_private {
+                self.render_enum(md, enm, level);
+            }
+        }
+        
+        // Traits
+        for trt in &module.traits {
+            if trt.visibility.is_public() || self.config.document_private {
+                self.render_trait(md, trt, level);
+            }
+        }
+        
+        // Functions
+        for func in &module.functions {
+            if func.visibility.is_public() || self.config.document_private {
+                self.render_function(md, func, level);
+            }
+        }
+        
+        // Type aliases
+        if !module.type_aliases.is_empty() {
+            md.push_str(&self.heading(level, "Type Aliases"));
+            md.push('\n');
+            for alias in &module.type_aliases {
+                if alias.visibility.is_public() || self.config.document_private {
+                    md.push_str(&format!("- `type {} = {}`\n", alias.name, alias.ty.to_string()));
+                    if let Some(brief) = alias.doc.brief() {
+                        md.push_str(&format!("  {}\n", brief));
+                    }
+                }
+            }
+            md.push('\n');
+        }
+        
+        // Constants
+        if !module.constants.is_empty() {
+            md.push_str(&self.heading(level, "Constants"));
+            md.push('\n');
+            for cnst in &module.constants {
+                if cnst.visibility.is_public() || self.config.document_private {
+                    md.push_str(&format!("- `{}: {}`", cnst.name, cnst.ty.to_string()));
+                    if let Some(ref val) = cnst.value {
+                        md.push_str(&format!(" = `{}`", val));
+                    }
+                    md.push('\n');
+                    if let Some(brief) = cnst.doc.brief() {
+                        md.push_str(&format!("  {}\n", brief));
+                    }
+                }
+            }
+            md.push('\n');
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MULTI FILE MODE
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn render_multi_file(&mut self, krate: &DocCrate) -> Result<(), String> {
+        // Generate index
+        self.render_index(krate)?;
+        
+        // Generate module files
+        self.render_module_files(&krate.root_module, "")?;
+        
+        Ok(())
+    }
+    
+    fn render_index(&mut self, krate: &DocCrate) -> Result<(), String> {
+        let mut md = String::new();
+        
+        md.push_str(&self.heading(1, &krate.name));
+        md.push('\n');
+        
+        if !krate.version.is_empty() {
+            md.push_str(&format!("**Version:** {}\n\n", krate.version));
+        }
+        
+        md.push_str(&self.render_doc(&krate.doc));
+        md.push('\n');
+        
+        // Modules
+        if !krate.root_module.modules.is_empty() {
+            md.push_str(&self.heading(2, "Modules"));
+            md.push('\n');
+            for module in &krate.root_module.modules {
+                if module.visibility.is_public() || self.config.document_private {
+                    md.push_str(&format!("- [{}]({}/README.md)", module.name, module.name));
+                    if let Some(brief) = module.doc.brief() {
+                        md.push_str(&format!(" — {}", brief));
+                    }
+                    md.push('\n');
+                }
+            }
+            md.push('\n');
+        }
+        
+        // Items in root
+        self.render_item_list(&mut md, &krate.root_module);
+        
+        self.files.insert("README.md".to_string(), md);
+        Ok(())
+    }
+    
+    fn render_module_files(&mut self, module: &DocModule, prefix: &str) -> Result<(), String> {
+        let path = if prefix.is_empty() {
+            module.name.clone()
+        } else {
+            format!("{}/{}", prefix, module.name)
+        };
+        
+        // Module README
+        let mut md = String::new();
+        md.push_str(&self.heading(1, &format!("Module `{}`", module.path)));
+        md.push('\n');
+        md.push_str(&self.render_doc(&module.doc));
+        md.push('\n');
+        
+        // Submodules
+        if !module.modules.is_empty() {
+            md.push_str(&self.heading(2, "Submodules"));
+            md.push('\n');
+            for submod in &module.modules {
+                if submod.visibility.is_public() || self.config.document_private {
+                    md.push_str(&format!("- [{}]({}/README.md)", submod.name, submod.name));
+                    if let Some(brief) = submod.doc.brief() {
+                        md.push_str(&format!(" — {}", brief));
+                    }
+                    md.push('\n');
+                }
+            }
+            md.push('\n');
+        }
+        
+        // Items
+        self.render_item_list(&mut md, module);
+        
+        self.files.insert(format!("{}/README.md", path), md);
+        
+        // Individual item files
+        for struc in &module.structs {
+            if struc.visibility.is_public() || self.config.document_private {
+                let mut item_md = String::new();
+                self.render_struct(&mut item_md, struc, 1);
+                self.files.insert(format!("{}/struct.{}.md", path, struc.name), item_md);
+            }
+        }
+        
+        for enm in &module.enums {
+            if enm.visibility.is_public() || self.config.document_private {
+                let mut item_md = String::new();
+                self.render_enum(&mut item_md, enm, 1);
+                self.files.insert(format!("{}/enum.{}.md", path, enm.name), item_md);
+            }
+        }
+        
+        for trt in &module.traits {
+            if trt.visibility.is_public() || self.config.document_private {
+                let mut item_md = String::new();
+                self.render_trait(&mut item_md, trt, 1);
+                self.files.insert(format!("{}/trait.{}.md", path, trt.name), item_md);
+            }
+        }
+        
+        for func in &module.functions {
+            if func.visibility.is_public() || self.config.document_private {
+                let mut item_md = String::new();
+                self.render_function(&mut item_md, func, 1);
+                self.files.insert(format!("{}/fn.{}.md", path, func.name), item_md);
+            }
+        }
+        
+        // Recurse into submodules
+        for submod in &module.modules {
+            if submod.visibility.is_public() || self.config.document_private {
+                self.render_module_files(submod, &path)?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn render_item_list(&self, md: &mut String, module: &DocModule) {
+        // Structs
+        if !module.structs.is_empty() {
+            md.push_str(&self.heading(2, "Structs"));
+            md.push('\n');
+            for struc in &module.structs {
+                if struc.visibility.is_public() || self.config.document_private {
+                    md.push_str(&format!("- [`{}`](struct.{}.md)", struc.name, struc.name));
+                    if let Some(brief) = struc.doc.brief() {
+                        md.push_str(&format!(" — {}", brief));
+                    }
+                    md.push('\n');
+                }
+            }
+            md.push('\n');
+        }
+        
+        // Enums
+        if !module.enums.is_empty() {
+            md.push_str(&self.heading(2, "Enums"));
+            md.push('\n');
+            for enm in &module.enums {
+                if enm.visibility.is_public() || self.config.document_private {
+                    md.push_str(&format!("- [`{}`](enum.{}.md)", enm.name, enm.name));
+                    if let Some(brief) = enm.doc.brief() {
+                        md.push_str(&format!(" — {}", brief));
+                    }
+                    md.push('\n');
+                }
+            }
+            md.push('\n');
+        }
+        
+        // Traits
+        if !module.traits.is_empty() {
+            md.push_str(&self.heading(2, "Traits"));
+            md.push('\n');
+            for trt in &module.traits {
+                if trt.visibility.is_public() || self.config.document_private {
+                    md.push_str(&format!("- [`{}`](trait.{}.md)", trt.name, trt.name));
+                    if let Some(brief) = trt.doc.brief() {
+                        md.push_str(&format!(" — {}", brief));
+                    }
+                    md.push('\n');
+                }
+            }
+            md.push('\n');
+        }
+        
+        // Functions
+        if !module.functions.is_empty() {
+            md.push_str(&self.heading(2, "Functions"));
+            md.push('\n');
+            for func in &module.functions {
+                if func.visibility.is_public() || self.config.document_private {
+                    md.push_str(&format!("- [`{}`](fn.{}.md)", func.name, func.name));
+                    if let Some(brief) = func.doc.brief() {
+                        md.push_str(&format!(" — {}", brief));
+                    }
+                    md.push('\n');
+                }
+            }
+            md.push('\n');
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ITEM RENDERERS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn render_struct(&self, md: &mut String, struc: &DocStruct, level: u8) {
+        md.push_str(&self.heading(level, &format!("Struct `{}`", struc.name)));
+        md.push('\n');
+        
+        // Definition
+        md.push_str("```");
+        md.push_str(&self.config.code_lang);
+        md.push('\n');
+        md.push_str(&self.struct_definition(struc));
+        md.push_str("\n```\n\n");
+        
+        // Documentation
+        md.push_str(&self.render_doc(&struc.doc));
+        md.push('\n');
+        
+        // Fields
+        if !struc.fields.is_empty() && struc.kind == StructKind::Regular {
+            md.push_str(&self.heading(level + 1, "Fields"));
+            md.push('\n');
+            for field in &struc.fields {
+                md.push_str(&format!(
+                    "- **`{}`**: `{}`\n",
+                    field.name.as_deref().unwrap_or("_"),
+                    field.ty.to_string()
+                ));
+                if let Some(brief) = field.doc.brief() {
+                    md.push_str(&format!("  {}\n", brief));
+                }
+            }
+            md.push('\n');
+        }
+        
+        // Implementations
+        if !struc.impls.is_empty() {
+            md.push_str(&self.heading(level + 1, "Implementations"));
+            md.push('\n');
+            for impl_ref in &struc.impls {
+                if let Some(ref trait_ref) = impl_ref.trait_ref {
+                    md.push_str(&format!("- `impl {} for {}`\n", trait_ref.path, struc.name));
+                }
+            }
+            md.push('\n');
+        }
+    }
+    
+    fn render_enum(&self, md: &mut String, enm: &DocEnum, level: u8) {
+        md.push_str(&self.heading(level, &format!("Enum `{}`", enm.name)));
+        md.push('\n');
+        
+        // Definition
+        md.push_str("```");
+        md.push_str(&self.config.code_lang);
+        md.push('\n');
+        md.push_str(&self.enum_definition(enm));
+        md.push_str("\n```\n\n");
+        
+        // Documentation
+        md.push_str(&self.render_doc(&enm.doc));
+        md.push('\n');
+        
+        // Variants
+        if !enm.variants.is_empty() {
+            md.push_str(&self.heading(level + 1, "Variants"));
+            md.push('\n');
+            for variant in &enm.variants {
+                md.push_str(&format!("- **`{}`**\n", variant.name));
+                if let Some(brief) = variant.doc.brief() {
+                    md.push_str(&format!("  {}\n", brief));
+                }
+            }
+            md.push('\n');
+        }
+    }
+    
+    fn render_trait(&self, md: &mut String, trt: &DocTrait, level: u8) {
+        md.push_str(&self.heading(level, &format!("Trait `{}`", trt.name)));
+        md.push('\n');
+        
+        // Definition
+        md.push_str("```");
+        md.push_str(&self.config.code_lang);
+        md.push('\n');
+        md.push_str(&self.trait_definition(trt));
+        md.push_str("\n```\n\n");
+        
+        // Documentation
+        md.push_str(&self.render_doc(&trt.doc));
+        md.push('\n');
+        
+        // Associated types
+        if !trt.assoc_types.is_empty() {
+            md.push_str(&self.heading(level + 1, "Associated Types"));
+            md.push('\n');
+            for assoc in &trt.assoc_types {
+                md.push_str(&format!("- `type {}`\n", assoc.name));
+                if let Some(brief) = assoc.doc.brief() {
+                    md.push_str(&format!("  {}\n", brief));
+                }
+            }
+            md.push('\n');
+        }
+        
+        // Required methods
+        if !trt.required_methods.is_empty() {
+            md.push_str(&self.heading(level + 1, "Required Methods"));
+            md.push('\n');
+            for method in &trt.required_methods {
+                md.push_str(&format!("#### `{}`\n\n", method.name));
+                md.push_str("```");
+                md.push_str(&self.config.code_lang);
+                md.push('\n');
+                md.push_str(&self.function_signature(method));
+                md.push_str("\n```\n\n");
+                md.push_str(&self.render_doc(&method.doc));
+                md.push('\n');
+            }
+        }
+        
+        // Provided methods
+        if !trt.provided_methods.is_empty() {
+            md.push_str(&self.heading(level + 1, "Provided Methods"));
+            md.push('\n');
+            for method in &trt.provided_methods {
+                md.push_str(&format!("#### `{}`\n\n", method.name));
+                md.push_str("```");
+                md.push_str(&self.config.code_lang);
+                md.push('\n');
+                md.push_str(&self.function_signature(method));
+                md.push_str("\n```\n\n");
+                md.push_str(&self.render_doc(&method.doc));
+                md.push('\n');
+            }
+        }
+        
+        // Implementors
+        if !trt.implementors.is_empty() {
+            md.push_str(&self.heading(level + 1, "Implementors"));
+            md.push('\n');
+            for impl_ty in &trt.implementors {
+                md.push_str(&format!("- `{}`\n", impl_ty));
+            }
+            md.push('\n');
+        }
+    }
+    
+    fn render_function(&self, md: &mut String, func: &DocFunction, level: u8) {
+        md.push_str(&self.heading(level, &format!("Function `{}`", func.name)));
+        md.push('\n');
+        
+        // Signature
+        md.push_str("```");
+        md.push_str(&self.config.code_lang);
+        md.push('\n');
+        md.push_str(&self.function_signature(func));
+        md.push_str("\n```\n\n");
+        
+        // Documentation
+        md.push_str(&self.render_doc(&func.doc));
+        md.push('\n');
+        
+        // Source reference
+        if self.config.include_source_refs {
+            if let Some(ref loc) = func.location {
+                md.push_str(&format!(
+                    "*Defined in [{}:{}]({}#L{})*\n\n",
+                    loc.file, loc.line, loc.file, loc.line
+                ));
+            }
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HELPERS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn heading(&self, level: u8, text: &str) -> String {
+        let actual_level = level + self.config.heading_offset;
+        let hashes = "#".repeat(actual_level as usize);
+        format!("{} {}\n", hashes, text)
+    }
+    
+    fn make_anchor(&self, text: &str) -> String {
+        text.to_lowercase()
+            .replace(' ', "-")
+            .replace(|c: char| !c.is_alphanumeric() && c != '-', "")
+    }
+    
+    fn render_doc(&self, doc: &ParsedDoc) -> String {
+        if doc.is_empty() {
+            return String::new();
+        }
+        
+        let mut md = String::new();
+        
+        // Brief
+        if let Some(ref brief) = doc.brief {
+            md.push_str(brief);
+            md.push_str("\n\n");
+        }
+        
+        // Description
+        if let Some(ref desc) = doc.description {
+            md.push_str(desc);
+            md.push_str("\n\n");
+        }
+        
+        // Sections
+        for (section, content) in &doc.sections {
+            md.push_str(&format!("### {}\n\n", section.heading()));
+            md.push_str(content);
+            md.push_str("\n\n");
+        }
+        
+        // Custom sections
+        for section in &doc.custom_sections {
+            md.push_str(&format!("### {}\n\n", section.heading));
+            md.push_str(&section.content);
+            md.push_str("\n\n");
+        }
+        
+        md
+    }
+    
+    fn function_signature(&self, func: &DocFunction) -> String {
+        let mut sig = String::new();
+        
+        if func.is_const { sig.push_str("const "); }
+        if func.is_async { sig.push_str("async "); }
+        if func.is_unsafe { sig.push_str("unsafe "); }
+        
+        if let Some(ref abi) = func.abi {
+            sig.push_str(&format!("extern \"{}\" ", abi));
+        }
+        
+        sig.push_str("fn ");
+        sig.push_str(&func.name);
+        sig.push_str(&func.generics.to_string());
+        sig.push('(');
+        
+        let mut params = Vec::new();
+        
+        if let Some(ref self_param) = func.signature.self_param {
+            let mut p = String::new();
+            if self_param.is_ref {
+                p.push('&');
+                if let Some(ref lt) = self_param.lifetime {
+                    p.push_str(lt);
+                    p.push(' ');
+                }
+                if self_param.is_mut {
+                    p.push_str("mut ");
+                }
+            }
+            p.push_str("self");
+            params.push(p);
+        }
+        
+        for param in &func.signature.params {
+            params.push(format!("{}: {}", param.name, param.ty.to_string()));
+        }
+        
+        sig.push_str(&params.join(", "));
+        sig.push(')');
+        
+        if let Some(ref ret) = func.signature.return_type {
+            sig.push_str(" -> ");
+            sig.push_str(&ret.to_string());
+        }
+        
+        sig
+    }
+    
+    fn struct_definition(&self, struc: &DocStruct) -> String {
+        let mut def = String::new();
+        
+        if !struc.derives.is_empty() {
+            def.push_str(&format!("#[derive({})]\n", struc.derives.join(", ")));
+        }
+        
+        def.push_str("pub struct ");
+        def.push_str(&struc.name);
+        def.push_str(&struc.generics.to_string());
+        
+        match struc.kind {
+            StructKind::Unit => def.push(';'),
+            StructKind::Tuple => {
+                def.push('(');
+                let fields: Vec<String> = struc.fields.iter()
+                    .map(|f| f.ty.to_string())
+                    .collect();
+                def.push_str(&fields.join(", "));
+                def.push_str(");");
+            }
+            StructKind::Regular => {
+                def.push_str(" {\n");
+                for field in &struc.fields {
+                    def.push_str("    ");
+                    if field.visibility.is_public() { def.push_str("pub "); }
+                    def.push_str(field.name.as_deref().unwrap_or("_"));
+                    def.push_str(": ");
+                    def.push_str(&field.ty.to_string());
+                    def.push_str(",\n");
+                }
+                def.push('}');
+            }
+        }
+        
+        def
+    }
+    
+    fn enum_definition(&self, enm: &DocEnum) -> String {
+        let mut def = String::new();
+        
+        if !enm.derives.is_empty() {
+            def.push_str(&format!("#[derive({})]\n", enm.derives.join(", ")));
+        }
+        
+        def.push_str("pub enum ");
+        def.push_str(&enm.name);
+        def.push_str(&enm.generics.to_string());
+        def.push_str(" {\n");
+        
+        for variant in &enm.variants {
+            def.push_str("    ");
+            def.push_str(&variant.name);
+            
+            match &variant.kind {
+                VariantKind::Unit => {}
+                VariantKind::Tuple(types) => {
+                    def.push('(');
+                    def.push_str(&types.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "));
+                    def.push(')');
+                }
+                VariantKind::Struct(fields) => {
+                    def.push_str(" { ");
+                    let field_strs: Vec<String> = fields.iter()
+                        .map(|f| format!("{}: {}", f.name.as_deref().unwrap_or("_"), f.ty.to_string()))
+                        .collect();
+                    def.push_str(&field_strs.join(", "));
+                    def.push_str(" }");
+                }
+            }
+            
+            def.push_str(",\n");
+        }
+        
+        def.push('}');
+        def
+    }
+    
+    fn trait_definition(&self, trt: &DocTrait) -> String {
+        let mut def = String::new();
+        
+        if trt.is_unsafe { def.push_str("unsafe "); }
+        if trt.is_auto { def.push_str("auto "); }
+        
+        def.push_str("pub trait ");
+        def.push_str(&trt.name);
+        def.push_str(&trt.generics.to_string());
+        
+        if !trt.super_traits.is_empty() {
+            def.push_str(": ");
+            def.push_str(&trt.super_traits.iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(" + "));
+        }
+        
+        def.push_str(" { ... }");
+        def
+    }
+}

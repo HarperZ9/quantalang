@@ -1,0 +1,566 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DEBUGGER — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// DAP-compatible debug adapter for QuantaLang programs.
+//
+// Features:
+// - Full Debug Adapter Protocol support
+// - Breakpoints (source, function, conditional)
+// - Step execution (in, over, out)
+// - Variable inspection
+// - Expression evaluation
+// - Stack trace navigation
+// - Multi-thread debugging
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang Debugger
+//!
+//! Debug Adapter Protocol (DAP) server for IDE integration.
+//!
+//! ## Quick Start
+//!
+//! ```bash
+//! # Start debug adapter (communicates via stdin/stdout)
+//! quanta-debug
+//!
+//! # Debug a program directly
+//! quanta-debug run program.quanta
+//!
+//! # Attach to running process
+//! quanta-debug attach --pid 12345
+//! ```
+//!
+//! ## VS Code Integration
+//!
+//! Add to `.vscode/launch.json`:
+//!
+//! ```json
+//! {
+//!   "type": "quantalang",
+//!   "request": "launch",
+//!   "name": "Debug Program",
+//!   "program": "${workspaceFolder}/src/main.quanta",
+//!   "stopOnEntry": true
+//! }
+//! ```
+//!
+//! ## Modules
+//!
+//! - [`protocol`] - DAP message types
+//! - [`state`] - Debug session state management
+//! - [`server`] - DAP server implementation
+
+module quantalang::debug
+
+// Submodules
+pub mod protocol;
+pub mod state;
+pub mod server;
+
+// Re-exports
+pub use protocol::*;
+pub use state::{
+    DebugSession, SessionState, ThreadState, ThreadExecutionState,
+    StepType, FrameInfo, DebuggedProcess, BreakpointManager,
+    VariableStore, VariableContainer, SourceManager, SourceContent,
+    DebugConfig,
+};
+pub use server::DebugAdapter;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+pub const DAP_VERSION: &str = "1.65.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIGH-LEVEL API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Start debug adapter server
+///
+/// Communicates via stdin/stdout using DAP protocol.
+pub fn run_adapter() -> Result<(), String> {
+    let adapter = DebugAdapter::new();
+    adapter.run()
+}
+
+/// Debug a program
+pub fn debug_program(program: &str, args: &[String], stop_on_entry: bool) -> Result<DebugSession, String> {
+    let session = DebugSession::new(1);
+    
+    session.launch(&LaunchRequestArguments {
+        no_debug: false,
+        restart: false,
+        program: program.to_string(),
+        args: args.to_vec(),
+        cwd: None,
+        env: std::collections::BTreeMap::new(),
+        stop_on_entry,
+        console: None,
+    })?;
+    
+    Ok(session)
+}
+
+/// Attach to running process
+pub fn attach_to_process(pid: u32) -> Result<DebugSession, String> {
+    let session = DebugSession::new(1);
+    
+    session.attach(&AttachRequestArguments {
+        restart: false,
+        process_id: Some(pid as i64),
+        port: None,
+        host: None,
+    })?;
+    
+    Ok(session)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLI
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct CliArgs {
+    pub command: DebugCommand,
+    pub verbose: bool,
+    pub help: bool,
+    pub version: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum DebugCommand {
+    /// Start DAP server (default)
+    Server,
+    /// Run and debug a program
+    Run {
+        program: String,
+        args: Vec<String>,
+        stop_on_entry: bool,
+    },
+    /// Attach to process
+    Attach {
+        pid: Option<u32>,
+        port: Option<u16>,
+        host: Option<String>,
+    },
+}
+
+impl Default for CliArgs {
+    fn default() -> Self {
+        CliArgs {
+            command: DebugCommand::Server,
+            verbose: false,
+            help: false,
+            version: false,
+        }
+    }
+}
+
+pub fn parse_args(args: &[String]) -> Result<CliArgs, String> {
+    let mut cli = CliArgs::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        
+        match arg.as_str() {
+            "-h" | "--help" => cli.help = true,
+            "-V" | "--version" => cli.version = true,
+            "-v" | "--verbose" => cli.verbose = true,
+            
+            "server" => cli.command = DebugCommand::Server,
+            
+            "run" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("run requires a program argument".to_string());
+                }
+                let program = args[i].clone();
+                let mut run_args = Vec::new();
+                let mut stop_on_entry = false;
+                
+                i += 1;
+                while i < args.len() {
+                    if args[i] == "--stop-on-entry" {
+                        stop_on_entry = true;
+                    } else if args[i] == "--" {
+                        i += 1;
+                        run_args.extend(args[i..].iter().cloned());
+                        break;
+                    } else if args[i].starts_with('-') {
+                        break;
+                    } else {
+                        run_args.push(args[i].clone());
+                    }
+                    i += 1;
+                }
+                
+                cli.command = DebugCommand::Run {
+                    program,
+                    args: run_args,
+                    stop_on_entry,
+                };
+                continue;
+            }
+            
+            "attach" => {
+                let mut pid = None;
+                let mut port = None;
+                let mut host = None;
+                
+                i += 1;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--pid" => {
+                            i += 1;
+                            pid = Some(args.get(i)
+                                .ok_or("--pid requires a value")?
+                                .parse()
+                                .map_err(|_| "invalid pid")?);
+                        }
+                        "--port" => {
+                            i += 1;
+                            port = Some(args.get(i)
+                                .ok_or("--port requires a value")?
+                                .parse()
+                                .map_err(|_| "invalid port")?);
+                        }
+                        "--host" => {
+                            i += 1;
+                            host = Some(args.get(i)
+                                .ok_or("--host requires a value")?
+                                .clone());
+                        }
+                        _ if !args[i].starts_with('-') => {
+                            // Assume it's a PID
+                            pid = Some(args[i].parse().map_err(|_| "invalid pid")?);
+                        }
+                        _ => break,
+                    }
+                    i += 1;
+                }
+                
+                cli.command = DebugCommand::Attach { pid, port, host };
+                continue;
+            }
+            
+            _ if arg.starts_with('-') => {
+                return Err(format!("unknown option: {}", arg));
+            }
+            
+            _ => {}
+        }
+        
+        i += 1;
+    }
+    
+    Ok(cli)
+}
+
+fn print_help() {
+    println!(r#"quanta-debug - QuantaLang Debugger
+
+USAGE:
+    quanta-debug [OPTIONS] [COMMAND]
+
+COMMANDS:
+    server              Start DAP server (default, for IDE integration)
+    run <program>       Run and debug a program
+    attach              Attach to a running process
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version
+    -v, --verbose       Verbose output
+
+RUN OPTIONS:
+    --stop-on-entry     Stop at program entry point
+    -- <args>...        Arguments to pass to program
+
+ATTACH OPTIONS:
+    --pid <PID>         Process ID to attach to
+    --port <PORT>       Debug server port (for remote debugging)
+    --host <HOST>       Debug server host
+
+EXAMPLES:
+    quanta-debug                          Start DAP server
+    quanta-debug run main.quanta          Debug program
+    quanta-debug run main.quanta -- arg1  Debug with arguments
+    quanta-debug attach --pid 12345       Attach to process
+
+VS CODE INTEGRATION:
+    Configure in .vscode/launch.json:
+    {{
+      "type": "quantalang",
+      "request": "launch",
+      "program": "${{workspaceFolder}}/main.quanta"
+    }}
+"#);
+}
+
+fn print_version() {
+    println!("quanta-debug {} (DAP {})", VERSION, DAP_VERSION);
+}
+
+/// Run interactive debug session (for CLI debugging)
+pub fn run_interactive(session: &DebugSession) -> Result<(), String> {
+    use std::io::{self, Write, BufRead};
+    
+    println!("QuantaLang Debugger v{}", VERSION);
+    println!("Type 'help' for commands.\n");
+    
+    let stdin = io::stdin();
+    
+    loop {
+        // Print prompt based on state
+        let prompt = match session.state() {
+            SessionState::Running => "(running) ",
+            SessionState::Stopped => "(stopped) ",
+            _ => "(debug) ",
+        };
+        
+        print!("{}", prompt);
+        io::stdout().flush().map_err(|e| e.to_string())?;
+        
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).is_err() {
+            break;
+        }
+        
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let cmd = parts[0];
+        let args = &parts[1..];
+        
+        match cmd {
+            "help" | "h" => print_debug_help(),
+            "quit" | "q" | "exit" => break,
+            
+            "continue" | "c" => {
+                session.continue_execution(1, false)?;
+                println!("Continuing...");
+            }
+            
+            "next" | "n" => {
+                session.step_next(1, SteppingGranularity::Line)?;
+                println!("Stepping over...");
+            }
+            
+            "step" | "s" => {
+                session.step_in(1, SteppingGranularity::Line)?;
+                println!("Stepping in...");
+            }
+            
+            "finish" | "f" => {
+                session.step_out(1, SteppingGranularity::Line)?;
+                println!("Stepping out...");
+            }
+            
+            "break" | "b" => {
+                if args.is_empty() {
+                    println!("Usage: break <file:line> or break <function>");
+                } else {
+                    let loc = args[0];
+                    if let Some(colon) = loc.find(':') {
+                        let file = &loc[..colon];
+                        let line: i64 = loc[colon+1..].parse().unwrap_or(1);
+                        
+                        let source = Source {
+                            name: Some(file.to_string()),
+                            path: Some(file.to_string()),
+                            source_reference: None,
+                            presentation_hint: None,
+                            origin: None,
+                            sources: Vec::new(),
+                            adapter_data: None,
+                            checksums: Vec::new(),
+                        };
+                        
+                        let bps = session.set_breakpoints(&source, &[
+                            SourceBreakpoint {
+                                line,
+                                column: None,
+                                condition: None,
+                                hit_condition: None,
+                                log_message: None,
+                            },
+                        ]);
+                        
+                        if let Some(bp) = bps.first() {
+                            println!("Breakpoint {} at {}:{}", bp.id.unwrap_or(0), file, line);
+                        }
+                    }
+                }
+            }
+            
+            "backtrace" | "bt" => {
+                match session.get_stack_trace(1, 0, 20) {
+                    Ok((frames, _)) => {
+                        for (i, frame) in frames.iter().enumerate() {
+                            let source = frame.source.as_ref()
+                                .and_then(|s| s.path.as_ref())
+                                .map(|s| s.as_str())
+                                .unwrap_or("<unknown>");
+                            println!("#{} {} at {}:{}", i, frame.name, source, frame.line);
+                        }
+                    }
+                    Err(e) => println!("Error: {}", e),
+                }
+            }
+            
+            "locals" | "l" => {
+                let scopes = session.get_scopes(1);
+                for scope in scopes {
+                    if scope.presentation_hint == Some(ScopePresentationHint::Locals) {
+                        let vars = session.get_variables(scope.variables_reference);
+                        for var in vars {
+                            let ty = var.ty.as_deref().unwrap_or("?");
+                            println!("  {}: {} = {}", var.name, ty, var.value);
+                        }
+                    }
+                }
+            }
+            
+            "print" | "p" => {
+                if args.is_empty() {
+                    println!("Usage: print <expression>");
+                } else {
+                    let expr = args.join(" ");
+                    match session.evaluate(&expr, Some(1), EvaluateContext::Repl) {
+                        Ok(result) => {
+                            let ty = result.ty.as_deref().unwrap_or("");
+                            println!("{}: {} = {}", expr, ty, result.result);
+                        }
+                        Err(e) => println!("Error: {}", e),
+                    }
+                }
+            }
+            
+            "threads" => {
+                let threads = session.get_threads();
+                for thread in threads {
+                    println!("Thread {}: {}", thread.id, thread.name);
+                }
+            }
+            
+            _ => println!("Unknown command: {}. Type 'help' for commands.", cmd),
+        }
+    }
+    
+    Ok(())
+}
+
+fn print_debug_help() {
+    println!(r#"Debug Commands:
+    help, h             Show this help
+    quit, q             Exit debugger
+    
+Execution:
+    continue, c         Continue execution
+    next, n             Step over
+    step, s             Step into
+    finish, f           Step out
+    
+Breakpoints:
+    break <loc>, b      Set breakpoint (file:line or function)
+    
+Inspection:
+    backtrace, bt       Show stack trace
+    locals, l           Show local variables
+    print <expr>, p     Evaluate expression
+    threads             Show threads
+"#);
+}
+
+/// Main entry point
+pub fn main() -> Result<i32, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = parse_args(&args)?;
+    
+    if cli.help {
+        print_help();
+        return Ok(0);
+    }
+    
+    if cli.version {
+        print_version();
+        return Ok(0);
+    }
+    
+    match cli.command {
+        DebugCommand::Server => {
+            run_adapter()?;
+            Ok(0)
+        }
+        
+        DebugCommand::Run { program, args, stop_on_entry } => {
+            let session = debug_program(&program, &args, stop_on_entry)?;
+            run_interactive(&session)?;
+            Ok(0)
+        }
+        
+        DebugCommand::Attach { pid, port, host } => {
+            let session = if let Some(pid) = pid {
+                attach_to_process(pid)?
+            } else {
+                return Err("must specify --pid or --port/--host".to_string());
+            };
+            run_interactive(&session)?;
+            Ok(0)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_parse_args_server() {
+        let args: Vec<String> = vec![];
+        let cli = parse_args(&args).unwrap();
+        assert!(matches!(cli.command, DebugCommand::Server));
+    }
+    
+    #[test]
+    fn test_parse_args_run() {
+        let args = vec!["run".to_string(), "main.quanta".to_string()];
+        let cli = parse_args(&args).unwrap();
+        
+        match cli.command {
+            DebugCommand::Run { program, .. } => {
+                assert_eq!(program, "main.quanta");
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+    
+    #[test]
+    fn test_parse_args_attach() {
+        let args = vec!["attach".to_string(), "--pid".to_string(), "12345".to_string()];
+        let cli = parse_args(&args).unwrap();
+        
+        match cli.command {
+            DebugCommand::Attach { pid, .. } => {
+                assert_eq!(pid, Some(12345));
+            }
+            _ => panic!("expected Attach command"),
+        }
+    }
+}

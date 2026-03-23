@@ -1,0 +1,1126 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Register Allocation
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Register allocation infrastructure:
+//   - Live interval analysis
+//   - Graph coloring allocator
+//   - Linear scan allocator
+//   - Spill code generation
+//   - Register coalescing
+//   - Register classes
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::regalloc
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTER CLASSES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Physical register
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PhysReg(pub u32);
+
+impl PhysReg {
+    pub fn new(id: u32) -> Self {
+        PhysReg(id)
+    }
+    
+    pub fn id(&self) -> u32 {
+        self.0
+    }
+}
+
+/// Virtual register
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VirtReg(pub u32);
+
+impl VirtReg {
+    pub fn new(id: u32) -> Self {
+        VirtReg(id)
+    }
+    
+    pub fn id(&self) -> u32 {
+        self.0
+    }
+}
+
+/// Register class
+#[derive(Debug, Clone)]
+pub struct RegisterClass {
+    /// Class name
+    pub name: String,
+    /// Registers in this class
+    pub registers: Vec<PhysReg>,
+    /// Callee-saved registers
+    pub callee_saved: BTreeSet<PhysReg>,
+    /// Allocatable registers (excludes reserved)
+    pub allocatable: Vec<PhysReg>,
+    /// Spill size in bytes
+    pub spill_size: u32,
+    /// Spill alignment
+    pub spill_alignment: u32,
+}
+
+impl RegisterClass {
+    pub fn new(name: impl Into<String>) -> Self {
+        RegisterClass {
+            name: name.into(),
+            registers: Vec::new(),
+            callee_saved: BTreeSet::new(),
+            allocatable: Vec::new(),
+            spill_size: 8,
+            spill_alignment: 8,
+        }
+    }
+    
+    pub fn add_register(&mut self, reg: PhysReg, callee_saved: bool, allocatable: bool) {
+        self.registers.push(reg);
+        
+        if callee_saved {
+            self.callee_saved.insert(reg);
+        }
+        
+        if allocatable {
+            self.allocatable.push(reg);
+        }
+    }
+    
+    pub fn num_allocatable(&self) -> usize {
+        self.allocatable.len()
+    }
+}
+
+/// Target register info
+pub struct RegisterInfo {
+    /// All register classes
+    pub classes: Vec<RegisterClass>,
+    /// Register names
+    pub names: BTreeMap<PhysReg, String>,
+    /// Stack pointer register
+    pub stack_pointer: PhysReg,
+    /// Frame pointer register
+    pub frame_pointer: PhysReg,
+    /// Return address register (if any)
+    pub return_address: Option<PhysReg>,
+}
+
+impl RegisterInfo {
+    /// Create x86-64 register info
+    pub fn x86_64() -> Self {
+        let mut info = RegisterInfo {
+            classes: Vec::new(),
+            names: BTreeMap::new(),
+            stack_pointer: PhysReg(4),  // RSP
+            frame_pointer: PhysReg(5),  // RBP
+            return_address: None,
+        };
+        
+        // GPR class
+        let mut gpr = RegisterClass::new("GPR64");
+        gpr.spill_size = 8;
+        gpr.spill_alignment = 8;
+        
+        // RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8-R15
+        let gpr_names = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                         "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
+        
+        for (i, name) in gpr_names.iter().enumerate() {
+            let reg = PhysReg(i as u32);
+            info.names.insert(reg, name.to_string());
+            
+            let callee_saved = matches!(i, 3 | 5 | 12 | 13 | 14 | 15); // RBX, RBP, R12-R15
+            let allocatable = !matches!(i, 4 | 5); // Not RSP, RBP
+            
+            gpr.add_register(reg, callee_saved, allocatable);
+        }
+        
+        info.classes.push(gpr);
+        
+        // XMM class
+        let mut xmm = RegisterClass::new("XMM");
+        xmm.spill_size = 16;
+        xmm.spill_alignment = 16;
+        
+        for i in 0..16 {
+            let reg = PhysReg(16 + i);
+            info.names.insert(reg, format!("xmm{}", i));
+            xmm.add_register(reg, false, true);
+        }
+        
+        info.classes.push(xmm);
+        
+        info
+    }
+    
+    /// Create AArch64 register info
+    pub fn aarch64() -> Self {
+        let mut info = RegisterInfo {
+            classes: Vec::new(),
+            names: BTreeMap::new(),
+            stack_pointer: PhysReg(31), // SP
+            frame_pointer: PhysReg(29), // X29/FP
+            return_address: Some(PhysReg(30)), // X30/LR
+        };
+        
+        // GPR class
+        let mut gpr = RegisterClass::new("GPR64");
+        gpr.spill_size = 8;
+        gpr.spill_alignment = 8;
+        
+        for i in 0..31 {
+            let reg = PhysReg(i);
+            info.names.insert(reg, format!("x{}", i));
+            
+            let callee_saved = (19..=28).contains(&i); // X19-X28
+            let allocatable = !matches!(i, 29 | 30 | 31); // Not FP, LR, SP
+            
+            gpr.add_register(reg, callee_saved, allocatable);
+        }
+        
+        info.classes.push(gpr);
+        
+        // Vector class
+        let mut vec = RegisterClass::new("FPR128");
+        vec.spill_size = 16;
+        vec.spill_alignment = 16;
+        
+        for i in 0..32 {
+            let reg = PhysReg(32 + i);
+            info.names.insert(reg, format!("v{}", i));
+            
+            let callee_saved = (8..=15).contains(&i); // V8-V15
+            vec.add_register(reg, callee_saved, true);
+        }
+        
+        info.classes.push(vec);
+        
+        info
+    }
+    
+    pub fn get_class(&self, name: &str) -> Option<&RegisterClass> {
+        self.classes.iter().find(|c| c.name == name)
+    }
+    
+    pub fn reg_name(&self, reg: PhysReg) -> &str {
+        self.names.get(&reg).map(|s| s.as_str()).unwrap_or("?")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIVE INTERVALS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Program point
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProgramPoint(pub u32);
+
+impl ProgramPoint {
+    pub fn new(idx: u32) -> Self {
+        ProgramPoint(idx)
+    }
+    
+    pub fn next(&self) -> Self {
+        ProgramPoint(self.0 + 1)
+    }
+}
+
+/// Live range
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRange {
+    /// Start point (inclusive)
+    pub start: ProgramPoint,
+    /// End point (exclusive)
+    pub end: ProgramPoint,
+}
+
+impl LiveRange {
+    pub fn new(start: ProgramPoint, end: ProgramPoint) -> Self {
+        LiveRange { start, end }
+    }
+    
+    pub fn contains(&self, point: ProgramPoint) -> bool {
+        point >= self.start && point < self.end
+    }
+    
+    pub fn overlaps(&self, other: &LiveRange) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
+/// Live interval for a virtual register
+#[derive(Debug, Clone)]
+pub struct LiveInterval {
+    /// Virtual register
+    pub vreg: VirtReg,
+    /// Live ranges
+    pub ranges: Vec<LiveRange>,
+    /// Use positions
+    pub uses: Vec<ProgramPoint>,
+    /// Def positions
+    pub defs: Vec<ProgramPoint>,
+    /// Assigned physical register (after allocation)
+    pub phys_reg: Option<PhysReg>,
+    /// Spill slot (if spilled)
+    pub spill_slot: Option<u32>,
+    /// Spill weight
+    pub spill_weight: f64,
+    /// Register class
+    pub reg_class: String,
+}
+
+impl LiveInterval {
+    pub fn new(vreg: VirtReg, reg_class: impl Into<String>) -> Self {
+        LiveInterval {
+            vreg,
+            ranges: Vec::new(),
+            uses: Vec::new(),
+            defs: Vec::new(),
+            phys_reg: None,
+            spill_slot: None,
+            spill_weight: 0.0,
+            reg_class: reg_class.into(),
+        }
+    }
+    
+    pub fn add_range(&mut self, start: ProgramPoint, end: ProgramPoint) {
+        let range = LiveRange::new(start, end);
+        
+        // Merge overlapping ranges
+        let mut merged = false;
+        for existing in &mut self.ranges {
+            if existing.overlaps(&range) || existing.end == range.start || range.end == existing.start {
+                existing.start = existing.start.min(range.start);
+                existing.end = existing.end.max(range.end);
+                merged = true;
+                break;
+            }
+        }
+        
+        if !merged {
+            self.ranges.push(range);
+        }
+        
+        // Sort ranges
+        self.ranges.sort_by_key(|r| r.start);
+    }
+    
+    pub fn start(&self) -> Option<ProgramPoint> {
+        self.ranges.first().map(|r| r.start)
+    }
+    
+    pub fn end(&self) -> Option<ProgramPoint> {
+        self.ranges.last().map(|r| r.end)
+    }
+    
+    pub fn overlaps(&self, other: &LiveInterval) -> bool {
+        for r1 in &self.ranges {
+            for r2 in &other.ranges {
+                if r1.overlaps(r2) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    
+    pub fn covers(&self, point: ProgramPoint) -> bool {
+        self.ranges.iter().any(|r| r.contains(point))
+    }
+    
+    /// Calculate spill weight
+    pub fn calculate_spill_weight(&mut self, loop_depths: &BTreeMap<u32, u32>) {
+        let mut weight = 0.0;
+        
+        for use_point in &self.uses {
+            // Weight increases with loop depth
+            let depth = loop_depths.get(&use_point.0).copied().unwrap_or(0);
+            weight += (10.0_f64).powi(depth as i32);
+        }
+        
+        for def_point in &self.defs {
+            let depth = loop_depths.get(&def_point.0).copied().unwrap_or(0);
+            weight += (10.0_f64).powi(depth as i32);
+        }
+        
+        // Normalize by interval length
+        if let (Some(start), Some(end)) = (self.start(), self.end()) {
+            let length = (end.0 - start.0) as f64;
+            if length > 0.0 {
+                weight /= length;
+            }
+        }
+        
+        self.spill_weight = weight;
+    }
+}
+
+/// Live interval analysis
+pub struct LiveIntervalAnalysis {
+    /// Intervals indexed by virtual register
+    intervals: BTreeMap<VirtReg, LiveInterval>,
+    /// Next program point
+    next_point: u32,
+}
+
+impl LiveIntervalAnalysis {
+    pub fn new() -> Self {
+        LiveIntervalAnalysis {
+            intervals: BTreeMap::new(),
+            next_point: 0,
+        }
+    }
+    
+    /// Analyze live intervals for a function
+    pub fn analyze(&mut self, func: &MirFunction) {
+        // Assign program points
+        let mut point_map: BTreeMap<(u32, usize), ProgramPoint> = BTreeMap::new();
+        let mut current_point = 0;
+        
+        for block in &func.blocks {
+            for (i, _stmt) in block.statements.iter().enumerate() {
+                point_map.insert((block.id, i), ProgramPoint(current_point));
+                current_point += 2; // Leave room for splits
+            }
+            // Point for terminator
+            point_map.insert((block.id, block.statements.len()), ProgramPoint(current_point));
+            current_point += 2;
+        }
+        
+        self.next_point = current_point;
+        
+        // Build live intervals using backward dataflow
+        let mut live_out: BTreeMap<u32, BTreeSet<VirtReg>> = BTreeMap::new();
+        
+        // Initialize with successors
+        for block in func.blocks.iter().rev() {
+            let mut live = BTreeSet::new();
+            
+            // Union of live-in of successors
+            for succ in self.get_successors(&block.terminator) {
+                if let Some(succ_live) = live_out.get(&succ) {
+                    live.extend(succ_live.iter().copied());
+                }
+            }
+            
+            // Process terminator
+            self.process_terminator(&block.terminator, &mut live, block.id, &point_map);
+            
+            // Process statements in reverse
+            for (i, stmt) in block.statements.iter().enumerate().rev() {
+                let point = point_map[&(block.id, i)];
+                self.process_statement(stmt, &mut live, point);
+            }
+            
+            live_out.insert(block.id, live);
+        }
+    }
+    
+    fn get_successors(&self, term: &MirTerminator) -> Vec<u32> {
+        match term {
+            MirTerminator::Goto(t) => vec![*t],
+            MirTerminator::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+            MirTerminator::Switch { targets, default, .. } => {
+                let mut succs: Vec<_> = targets.iter().map(|(_, t)| *t).collect();
+                succs.push(*default);
+                succs
+            }
+            _ => vec![],
+        }
+    }
+    
+    fn process_terminator(
+        &mut self,
+        term: &MirTerminator,
+        live: &mut BTreeSet<VirtReg>,
+        block_id: u32,
+        point_map: &BTreeMap<(u32, usize), ProgramPoint>,
+    ) {
+        match term {
+            MirTerminator::Branch { cond, .. } => {
+                if let MirOperand::Variable(name) = cond {
+                    if let Some(vreg) = self.name_to_vreg(name) {
+                        live.insert(vreg);
+                    }
+                }
+            }
+            MirTerminator::Return { value: Some(val) } => {
+                if let MirOperand::Variable(name) = val {
+                    if let Some(vreg) = self.name_to_vreg(name) {
+                        live.insert(vreg);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    fn process_statement(
+        &mut self,
+        stmt: &MirStatement,
+        live: &mut BTreeSet<VirtReg>,
+        point: ProgramPoint,
+    ) {
+        // Get def
+        let def = match stmt {
+            MirStatement::Assign { dest, .. } |
+            MirStatement::BinaryOp { dest, .. } |
+            MirStatement::Load { dest, .. } => Some(dest),
+            MirStatement::Call { dest: Some(d), .. } => Some(d),
+            _ => None,
+        };
+        
+        // Remove def from live set, record interval end
+        if let Some(def_name) = def {
+            if let Some(vreg) = self.name_to_vreg(def_name) {
+                live.remove(&vreg);
+                
+                let interval = self.intervals.entry(vreg).or_insert_with(|| {
+                    LiveInterval::new(vreg, "GPR64")
+                });
+                interval.defs.push(point);
+            }
+        }
+        
+        // Add uses to live set, record interval start
+        for operand in self.get_operands(stmt) {
+            if let MirOperand::Variable(name) = operand {
+                if let Some(vreg) = self.name_to_vreg(&name) {
+                    if !live.contains(&vreg) {
+                        // Start new live range
+                        let interval = self.intervals.entry(vreg).or_insert_with(|| {
+                            LiveInterval::new(vreg, "GPR64")
+                        });
+                        interval.uses.push(point);
+                    }
+                    live.insert(vreg);
+                }
+            }
+        }
+    }
+    
+    fn get_operands(&self, stmt: &MirStatement) -> Vec<MirOperand> {
+        match stmt {
+            MirStatement::Assign { value, .. } => vec![value.clone()],
+            MirStatement::BinaryOp { lhs, rhs, .. } => vec![lhs.clone(), rhs.clone()],
+            MirStatement::Load { ptr, .. } => vec![ptr.clone()],
+            MirStatement::Store { ptr, value, .. } => vec![ptr.clone(), value.clone()],
+            MirStatement::Call { args, .. } => args.clone(),
+            _ => vec![],
+        }
+    }
+    
+    fn name_to_vreg(&self, name: &str) -> Option<VirtReg> {
+        // Parse virtual register from name like "v0", "v1", etc.
+        if name.starts_with('v') {
+            name[1..].parse().ok().map(VirtReg)
+        } else {
+            None
+        }
+    }
+    
+    pub fn get_interval(&self, vreg: VirtReg) -> Option<&LiveInterval> {
+        self.intervals.get(&vreg)
+    }
+    
+    pub fn intervals(&self) -> impl Iterator<Item = &LiveInterval> {
+        self.intervals.values()
+    }
+}
+
+impl Default for LiveIntervalAnalysis {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINEAR SCAN ALLOCATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Linear scan register allocator
+pub struct LinearScanAllocator {
+    /// Register info
+    reg_info: RegisterInfo,
+    /// Active intervals (sorted by end point)
+    active: Vec<LiveInterval>,
+    /// Inactive intervals
+    inactive: Vec<LiveInterval>,
+    /// Handled intervals
+    handled: Vec<LiveInterval>,
+    /// Free registers per class
+    free_regs: BTreeMap<String, Vec<PhysReg>>,
+    /// Next spill slot
+    next_spill_slot: u32,
+}
+
+impl LinearScanAllocator {
+    pub fn new(reg_info: RegisterInfo) -> Self {
+        let mut free_regs = BTreeMap::new();
+        
+        for class in &reg_info.classes {
+            free_regs.insert(class.name.clone(), class.allocatable.clone());
+        }
+        
+        LinearScanAllocator {
+            reg_info,
+            active: Vec::new(),
+            inactive: Vec::new(),
+            handled: Vec::new(),
+            free_regs,
+            next_spill_slot: 0,
+        }
+    }
+    
+    /// Allocate registers for all intervals
+    pub fn allocate(&mut self, mut intervals: Vec<LiveInterval>) -> AllocationResult {
+        // Sort intervals by start point
+        intervals.sort_by_key(|i| i.start().unwrap_or(ProgramPoint(0)));
+        
+        for mut interval in intervals {
+            let position = interval.start().unwrap_or(ProgramPoint(0));
+            
+            // Expire old intervals
+            self.expire_old_intervals(position);
+            
+            // Try to allocate a register
+            if let Some(reg) = self.try_allocate_free(&interval) {
+                interval.phys_reg = Some(reg);
+                self.active.push(interval);
+                self.active.sort_by_key(|i| i.end().unwrap_or(ProgramPoint(u32::MAX)));
+            } else {
+                // Need to spill
+                self.allocate_blocked_reg(&mut interval);
+            }
+        }
+        
+        // Collect results
+        let mut assignments = BTreeMap::new();
+        let mut spills = Vec::new();
+        
+        for interval in self.active.drain(..).chain(self.handled.drain(..)) {
+            if let Some(reg) = interval.phys_reg {
+                assignments.insert(interval.vreg, reg);
+            }
+            if let Some(slot) = interval.spill_slot {
+                spills.push((interval.vreg, slot));
+            }
+        }
+        
+        AllocationResult {
+            assignments,
+            spills,
+            stack_size: self.next_spill_slot * 8,
+        }
+    }
+    
+    fn expire_old_intervals(&mut self, position: ProgramPoint) {
+        // Move expired intervals from active to handled
+        let (expired, remaining): (Vec<_>, Vec<_>) = self.active.drain(..)
+            .partition(|i| i.end().unwrap_or(ProgramPoint(u32::MAX)) <= position);
+        
+        for interval in expired {
+            if let Some(reg) = interval.phys_reg {
+                // Return register to free pool
+                if let Some(free) = self.free_regs.get_mut(&interval.reg_class) {
+                    free.push(reg);
+                }
+            }
+            self.handled.push(interval);
+        }
+        
+        self.active = remaining;
+    }
+    
+    fn try_allocate_free(&mut self, interval: &LiveInterval) -> Option<PhysReg> {
+        let free = self.free_regs.get_mut(&interval.reg_class)?;
+        
+        // Find a register that doesn't conflict
+        for i in 0..free.len() {
+            let reg = free[i];
+            
+            // Check against active intervals
+            let conflicts = self.active.iter().any(|a| {
+                a.phys_reg == Some(reg) && a.overlaps(interval)
+            });
+            
+            if !conflicts {
+                free.remove(i);
+                return Some(reg);
+            }
+        }
+        
+        None
+    }
+    
+    fn allocate_blocked_reg(&mut self, interval: &mut LiveInterval) {
+        // Find the interval with the lowest spill weight to spill
+        let mut best_spill_idx = None;
+        let mut best_spill_weight = f64::MAX;
+        
+        for (i, active) in self.active.iter().enumerate() {
+            if active.reg_class == interval.reg_class &&
+               active.spill_weight < best_spill_weight &&
+               active.spill_weight < interval.spill_weight {
+                best_spill_weight = active.spill_weight;
+                best_spill_idx = Some(i);
+            }
+        }
+        
+        if let Some(idx) = best_spill_idx {
+            // Spill the existing interval
+            let mut spilled = self.active.remove(idx);
+            let reg = spilled.phys_reg.take().unwrap();
+            
+            spilled.spill_slot = Some(self.next_spill_slot);
+            self.next_spill_slot += 1;
+            
+            self.handled.push(spilled);
+            
+            // Assign the register to the new interval
+            interval.phys_reg = Some(reg);
+            self.active.push(interval.clone());
+            self.active.sort_by_key(|i| i.end().unwrap_or(ProgramPoint(u32::MAX)));
+        } else {
+            // Spill the new interval
+            interval.spill_slot = Some(self.next_spill_slot);
+            self.next_spill_slot += 1;
+            
+            self.handled.push(interval.clone());
+        }
+    }
+}
+
+/// Allocation result
+#[derive(Debug, Clone)]
+pub struct AllocationResult {
+    /// Virtual to physical register assignments
+    pub assignments: BTreeMap<VirtReg, PhysReg>,
+    /// Spilled registers and their stack slots
+    pub spills: Vec<(VirtReg, u32)>,
+    /// Required stack size for spills
+    pub stack_size: u32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GRAPH COLORING ALLOCATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Interference graph node
+#[derive(Debug, Clone)]
+struct InterferenceNode {
+    vreg: VirtReg,
+    neighbors: BTreeSet<VirtReg>,
+    color: Option<PhysReg>,
+    spill_cost: f64,
+    degree: usize,
+}
+
+/// Graph coloring register allocator
+pub struct GraphColoringAllocator {
+    /// Register info
+    reg_info: RegisterInfo,
+    /// Interference graph
+    graph: BTreeMap<VirtReg, InterferenceNode>,
+    /// Simplify worklist
+    simplify_worklist: Vec<VirtReg>,
+    /// Spill worklist
+    spill_worklist: Vec<VirtReg>,
+    /// Stack for coloring
+    select_stack: Vec<VirtReg>,
+    /// Spilled nodes
+    spilled: BTreeSet<VirtReg>,
+    /// Number of colors (registers)
+    k: usize,
+}
+
+impl GraphColoringAllocator {
+    pub fn new(reg_info: RegisterInfo, reg_class: &str) -> Self {
+        let k = reg_info.get_class(reg_class)
+            .map(|c| c.num_allocatable())
+            .unwrap_or(0);
+        
+        GraphColoringAllocator {
+            reg_info,
+            graph: BTreeMap::new(),
+            simplify_worklist: Vec::new(),
+            spill_worklist: Vec::new(),
+            select_stack: Vec::new(),
+            spilled: BTreeSet::new(),
+            k,
+        }
+    }
+    
+    /// Build interference graph from live intervals
+    pub fn build_graph(&mut self, intervals: &[LiveInterval]) {
+        // Create nodes
+        for interval in intervals {
+            self.graph.insert(interval.vreg, InterferenceNode {
+                vreg: interval.vreg,
+                neighbors: BTreeSet::new(),
+                color: None,
+                spill_cost: interval.spill_weight,
+                degree: 0,
+            });
+        }
+        
+        // Add interference edges
+        for i in 0..intervals.len() {
+            for j in (i + 1)..intervals.len() {
+                if intervals[i].overlaps(&intervals[j]) {
+                    self.add_edge(intervals[i].vreg, intervals[j].vreg);
+                }
+            }
+        }
+        
+        // Initialize worklists
+        for (vreg, node) in &self.graph {
+            if node.degree < self.k {
+                self.simplify_worklist.push(*vreg);
+            } else {
+                self.spill_worklist.push(*vreg);
+            }
+        }
+    }
+    
+    fn add_edge(&mut self, u: VirtReg, v: VirtReg) {
+        if let Some(node_u) = self.graph.get_mut(&u) {
+            node_u.neighbors.insert(v);
+            node_u.degree += 1;
+        }
+        if let Some(node_v) = self.graph.get_mut(&v) {
+            node_v.neighbors.insert(u);
+            node_v.degree += 1;
+        }
+    }
+    
+    /// Allocate registers using graph coloring
+    pub fn allocate(&mut self) -> AllocationResult {
+        // Simplify: remove low-degree nodes
+        while !self.simplify_worklist.is_empty() || !self.spill_worklist.is_empty() {
+            if let Some(vreg) = self.simplify_worklist.pop() {
+                self.select_stack.push(vreg);
+                self.decrement_neighbors(vreg);
+            } else if let Some(vreg) = self.select_potential_spill() {
+                self.select_stack.push(vreg);
+                self.decrement_neighbors(vreg);
+            }
+        }
+        
+        // Select: color nodes from stack
+        let mut assignments = BTreeMap::new();
+        let mut spills = Vec::new();
+        let mut next_slot = 0;
+        
+        while let Some(vreg) = self.select_stack.pop() {
+            if let Some(color) = self.find_color(vreg) {
+                if let Some(node) = self.graph.get_mut(&vreg) {
+                    node.color = Some(color);
+                }
+                assignments.insert(vreg, color);
+            } else {
+                // Actual spill
+                spills.push((vreg, next_slot));
+                next_slot += 1;
+                self.spilled.insert(vreg);
+            }
+        }
+        
+        AllocationResult {
+            assignments,
+            spills,
+            stack_size: next_slot * 8,
+        }
+    }
+    
+    fn decrement_neighbors(&mut self, vreg: VirtReg) {
+        let neighbors: Vec<_> = self.graph.get(&vreg)
+            .map(|n| n.neighbors.iter().copied().collect())
+            .unwrap_or_default();
+        
+        for neighbor in neighbors {
+            if let Some(node) = self.graph.get_mut(&neighbor) {
+                if node.degree > 0 {
+                    node.degree -= 1;
+                    
+                    // Move to simplify worklist if now low-degree
+                    if node.degree == self.k - 1 {
+                        self.spill_worklist.retain(|&v| v != neighbor);
+                        self.simplify_worklist.push(neighbor);
+                    }
+                }
+            }
+        }
+    }
+    
+    fn select_potential_spill(&mut self) -> Option<VirtReg> {
+        // Select node with lowest spill cost / degree ratio
+        let mut best = None;
+        let mut best_ratio = f64::MAX;
+        
+        for (i, &vreg) in self.spill_worklist.iter().enumerate() {
+            if let Some(node) = self.graph.get(&vreg) {
+                let ratio = if node.degree > 0 {
+                    node.spill_cost / node.degree as f64
+                } else {
+                    0.0
+                };
+                
+                if ratio < best_ratio {
+                    best_ratio = ratio;
+                    best = Some(i);
+                }
+            }
+        }
+        
+        best.map(|i| self.spill_worklist.remove(i))
+    }
+    
+    fn find_color(&self, vreg: VirtReg) -> Option<PhysReg> {
+        let node = self.graph.get(&vreg)?;
+        
+        // Get available registers
+        let class = self.reg_info.get_class("GPR64")?;
+        let mut available: BTreeSet<_> = class.allocatable.iter().copied().collect();
+        
+        // Remove colors used by neighbors
+        for &neighbor in &node.neighbors {
+            if let Some(neighbor_node) = self.graph.get(&neighbor) {
+                if let Some(color) = neighbor_node.color {
+                    available.remove(&color);
+                }
+            }
+        }
+        
+        available.into_iter().next()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTER COALESCING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Register coalescing
+pub struct RegisterCoalescer {
+    /// Copy instructions to potentially coalesce
+    copies: Vec<CopyInst>,
+    /// Coalesced pairs
+    coalesced: Vec<(VirtReg, VirtReg)>,
+}
+
+#[derive(Debug, Clone)]
+struct CopyInst {
+    src: VirtReg,
+    dst: VirtReg,
+    position: ProgramPoint,
+}
+
+impl RegisterCoalescer {
+    pub fn new() -> Self {
+        RegisterCoalescer {
+            copies: Vec::new(),
+            coalesced: Vec::new(),
+        }
+    }
+    
+    /// Collect copy instructions
+    pub fn collect_copies(&mut self, func: &MirFunction) {
+        for block in &func.blocks {
+            for (i, stmt) in block.statements.iter().enumerate() {
+                if let MirStatement::Assign { dest, value: MirOperand::Variable(src) } = stmt {
+                    if let (Some(dst_vreg), Some(src_vreg)) = (
+                        self.name_to_vreg(dest),
+                        self.name_to_vreg(src),
+                    ) {
+                        self.copies.push(CopyInst {
+                            src: src_vreg,
+                            dst: dst_vreg,
+                            position: ProgramPoint(i as u32),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Coalesce copies that don't interfere
+    pub fn coalesce(&mut self, intervals: &mut [LiveInterval]) -> u32 {
+        let mut coalesced_count = 0;
+        
+        for copy in &self.copies {
+            let src_interval = intervals.iter().find(|i| i.vreg == copy.src);
+            let dst_interval = intervals.iter().find(|i| i.vreg == copy.dst);
+            
+            if let (Some(src), Some(dst)) = (src_interval, dst_interval) {
+                // Check if they interfere (excluding at the copy point)
+                if !self.interferes_excluding_copy(src, dst, copy.position) {
+                    // Can coalesce
+                    self.coalesced.push((copy.src, copy.dst));
+                    coalesced_count += 1;
+                }
+            }
+        }
+        
+        coalesced_count
+    }
+    
+    fn interferes_excluding_copy(&self, a: &LiveInterval, b: &LiveInterval, copy_point: ProgramPoint) -> bool {
+        for r1 in &a.ranges {
+            for r2 in &b.ranges {
+                if r1.overlaps(r2) {
+                    // Check if the only overlap is at the copy point
+                    let overlap_start = r1.start.max(r2.start);
+                    let overlap_end = r1.end.min(r2.end);
+                    
+                    if overlap_start != copy_point || overlap_end != copy_point.next() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    
+    fn name_to_vreg(&self, name: &str) -> Option<VirtReg> {
+        if name.starts_with('v') {
+            name[1..].parse().ok().map(VirtReg)
+        } else {
+            None
+        }
+    }
+    
+    pub fn get_coalesced(&self) -> &[(VirtReg, VirtReg)] {
+        &self.coalesced
+    }
+}
+
+impl Default for RegisterCoalescer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand },
+    Store { ptr: MirOperand, value: MirOperand },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Switch { value: MirOperand, targets: Vec<(i64, u32)>, default: u32 },
+    Return { value: Option<MirOperand> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_live_range_overlap() {
+        let r1 = LiveRange::new(ProgramPoint(0), ProgramPoint(10));
+        let r2 = LiveRange::new(ProgramPoint(5), ProgramPoint(15));
+        let r3 = LiveRange::new(ProgramPoint(10), ProgramPoint(20));
+        
+        assert!(r1.overlaps(&r2));
+        assert!(!r1.overlaps(&r3)); // Adjacent, not overlapping
+    }
+    
+    #[test]
+    fn test_live_interval() {
+        let mut interval = LiveInterval::new(VirtReg(0), "GPR64");
+        
+        interval.add_range(ProgramPoint(0), ProgramPoint(5));
+        interval.add_range(ProgramPoint(10), ProgramPoint(15));
+        
+        assert_eq!(interval.ranges.len(), 2);
+        assert!(interval.covers(ProgramPoint(2)));
+        assert!(!interval.covers(ProgramPoint(7)));
+    }
+    
+    #[test]
+    fn test_x86_64_reg_info() {
+        let info = RegisterInfo::x86_64();
+        
+        assert_eq!(info.reg_name(PhysReg(0)), "rax");
+        assert_eq!(info.reg_name(PhysReg(4)), "rsp");
+        
+        let gpr = info.get_class("GPR64").unwrap();
+        assert_eq!(gpr.num_allocatable(), 14); // 16 - RSP - RBP
+    }
+    
+    #[test]
+    fn test_linear_scan_simple() {
+        let reg_info = RegisterInfo::x86_64();
+        let mut allocator = LinearScanAllocator::new(reg_info);
+        
+        let intervals = vec![
+            {
+                let mut i = LiveInterval::new(VirtReg(0), "GPR64");
+                i.add_range(ProgramPoint(0), ProgramPoint(10));
+                i
+            },
+            {
+                let mut i = LiveInterval::new(VirtReg(1), "GPR64");
+                i.add_range(ProgramPoint(5), ProgramPoint(15));
+                i
+            },
+        ];
+        
+        let result = allocator.allocate(intervals);
+        
+        // Both should be allocated to different registers
+        assert!(result.assignments.contains_key(&VirtReg(0)));
+        assert!(result.assignments.contains_key(&VirtReg(1)));
+        assert_ne!(
+            result.assignments.get(&VirtReg(0)),
+            result.assignments.get(&VirtReg(1))
+        );
+    }
+}

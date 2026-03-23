@@ -1,0 +1,783 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ BUILD SYSTEM — Fingerprinting & Cache
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Content-addressable caching and fingerprinting for incremental compilation.
+// Uses SHA-256 hashes to detect changes and avoid unnecessary recompilation.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::build::cache
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::fs::{self, File};
+use std::io::{self, Read, Write, BufReader, BufWriter};
+use std::time::{SystemTime, UNIX_EPOCH};
+use core::hash::{Hash, Hasher};
+use crate::build::graph::{UnitId, Unit};
+use crate::build::config::{BuildConfig, Profile};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FINGERPRINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Fingerprint of a compilation unit (for cache invalidation)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fingerprint {
+    /// Hash of all inputs
+    pub hash: u64,
+    
+    /// Individual component hashes for debugging
+    pub components: FingerprintComponents,
+    
+    /// Timestamp of creation
+    pub timestamp: u64,
+    
+    /// Compiler version
+    pub compiler_version: String,
+}
+
+impl Fingerprint {
+    /// Create fingerprint for a unit
+    pub fn for_unit(unit: &Unit, config: &BuildConfig, dep_fingerprints: &[u64]) -> Self {
+        let mut components = FingerprintComponents::default();
+        
+        // Hash source files
+        for source in &unit.sources {
+            if let Ok(content_hash) = hash_file(&source.path) {
+                components.source_hashes.push((source.path.clone(), content_hash));
+            }
+        }
+        
+        // Hash configuration
+        components.profile_hash = hash_profile(&config.profile);
+        components.target_hash = hash_str(config.target.triple());
+        
+        // Hash features
+        let features_str: String = config.features.iter().cloned().collect();
+        components.features_hash = hash_str(&features_str);
+        
+        // Hash compiler flags
+        let flags_str = config.extra_flags.join(" ");
+        components.flags_hash = hash_str(&flags_str);
+        
+        // Hash dependency fingerprints
+        components.deps_hash = hash_slice(dep_fingerprints);
+        
+        // Compute overall hash
+        let hash = components.compute_hash();
+        
+        Fingerprint {
+            hash,
+            components,
+            timestamp: current_timestamp(),
+            compiler_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+    
+    /// Check if fingerprint matches
+    pub fn matches(&self, other: &Fingerprint) -> bool {
+        self.hash == other.hash && self.compiler_version == other.compiler_version
+    }
+    
+    /// Serialize to bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        
+        // Magic number
+        bytes.extend_from_slice(b"QFNG");
+        
+        // Version
+        bytes.push(1);
+        
+        // Hash
+        bytes.extend_from_slice(&self.hash.to_le_bytes());
+        
+        // Timestamp
+        bytes.extend_from_slice(&self.timestamp.to_le_bytes());
+        
+        // Compiler version length + data
+        let version_bytes = self.compiler_version.as_bytes();
+        bytes.extend_from_slice(&(version_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(version_bytes);
+        
+        // Component hashes
+        bytes.extend_from_slice(&self.components.profile_hash.to_le_bytes());
+        bytes.extend_from_slice(&self.components.target_hash.to_le_bytes());
+        bytes.extend_from_slice(&self.components.features_hash.to_le_bytes());
+        bytes.extend_from_slice(&self.components.flags_hash.to_le_bytes());
+        bytes.extend_from_slice(&self.components.deps_hash.to_le_bytes());
+        
+        // Source hashes
+        bytes.extend_from_slice(&(self.components.source_hashes.len() as u32).to_le_bytes());
+        for (path, hash) in &self.components.source_hashes {
+            let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+            bytes.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&path_bytes);
+            bytes.extend_from_slice(&hash.to_le_bytes());
+        }
+        
+        bytes
+    }
+    
+    /// Deserialize from bytes
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 13 || &bytes[0..4] != b"QFNG" {
+            return None;
+        }
+        
+        let version = bytes[4];
+        if version != 1 {
+            return None;
+        }
+        
+        let mut pos = 5;
+        
+        let hash = u64::from_le_bytes(bytes[pos..pos+8].try_into().ok()?);
+        pos += 8;
+        
+        let timestamp = u64::from_le_bytes(bytes[pos..pos+8].try_into().ok()?);
+        pos += 8;
+        
+        let version_len = u32::from_le_bytes(bytes[pos..pos+4].try_into().ok()?) as usize;
+        pos += 4;
+        
+        let compiler_version = String::from_utf8(bytes[pos..pos+version_len].to_vec()).ok()?;
+        pos += version_len;
+        
+        let profile_hash = u64::from_le_bytes(bytes[pos..pos+8].try_into().ok()?);
+        pos += 8;
+        
+        let target_hash = u64::from_le_bytes(bytes[pos..pos+8].try_into().ok()?);
+        pos += 8;
+        
+        let features_hash = u64::from_le_bytes(bytes[pos..pos+8].try_into().ok()?);
+        pos += 8;
+        
+        let flags_hash = u64::from_le_bytes(bytes[pos..pos+8].try_into().ok()?);
+        pos += 8;
+        
+        let deps_hash = u64::from_le_bytes(bytes[pos..pos+8].try_into().ok()?);
+        pos += 8;
+        
+        let source_count = u32::from_le_bytes(bytes[pos..pos+4].try_into().ok()?) as usize;
+        pos += 4;
+        
+        let mut source_hashes = Vec::new();
+        for _ in 0..source_count {
+            let path_len = u32::from_le_bytes(bytes[pos..pos+4].try_into().ok()?) as usize;
+            pos += 4;
+            
+            let path_str = String::from_utf8(bytes[pos..pos+path_len].to_vec()).ok()?;
+            pos += path_len;
+            
+            let source_hash = u64::from_le_bytes(bytes[pos..pos+8].try_into().ok()?);
+            pos += 8;
+            
+            source_hashes.push((PathBuf::from(path_str), source_hash));
+        }
+        
+        Some(Fingerprint {
+            hash,
+            timestamp,
+            compiler_version,
+            components: FingerprintComponents {
+                profile_hash,
+                target_hash,
+                features_hash,
+                flags_hash,
+                deps_hash,
+                source_hashes,
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FingerprintComponents {
+    pub profile_hash: u64,
+    pub target_hash: u64,
+    pub features_hash: u64,
+    pub flags_hash: u64,
+    pub deps_hash: u64,
+    pub source_hashes: Vec<(PathBuf, u64)>,
+}
+
+impl FingerprintComponents {
+    fn compute_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        let mut hasher = DefaultHasher::new();
+        
+        self.profile_hash.hash(&mut hasher);
+        self.target_hash.hash(&mut hasher);
+        self.features_hash.hash(&mut hasher);
+        self.flags_hash.hash(&mut hasher);
+        self.deps_hash.hash(&mut hasher);
+        
+        for (path, hash) in &self.source_hashes {
+            path.hash(&mut hasher);
+            hash.hash(&mut hasher);
+        }
+        
+        hasher.finish()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUILD CACHE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Build artifact cache
+pub struct BuildCache {
+    /// Cache directory
+    cache_dir: PathBuf,
+    
+    /// In-memory fingerprint cache
+    fingerprints: BTreeMap<UnitId, Fingerprint>,
+    
+    /// Cache statistics
+    stats: CacheStats,
+}
+
+impl BuildCache {
+    /// Create or open cache at directory
+    pub fn new(cache_dir: &Path) -> io::Result<Self> {
+        fs::create_dir_all(cache_dir)?;
+        
+        Ok(BuildCache {
+            cache_dir: cache_dir.to_path_buf(),
+            fingerprints: BTreeMap::new(),
+            stats: CacheStats::default(),
+        })
+    }
+    
+    /// Get fingerprint for unit
+    pub fn get_fingerprint(&mut self, id: &UnitId) -> Option<&Fingerprint> {
+        // Check in-memory cache first
+        if self.fingerprints.contains_key(id) {
+            self.stats.memory_hits += 1;
+            return self.fingerprints.get(id);
+        }
+        
+        // Try loading from disk
+        let path = self.fingerprint_path(id);
+        if path.exists() {
+            if let Ok(bytes) = fs::read(&path) {
+                if let Some(fp) = Fingerprint::from_bytes(&bytes) {
+                    self.fingerprints.insert(id.clone(), fp);
+                    self.stats.disk_hits += 1;
+                    return self.fingerprints.get(id);
+                }
+            }
+        }
+        
+        self.stats.misses += 1;
+        None
+    }
+    
+    /// Store fingerprint for unit
+    pub fn store_fingerprint(&mut self, id: &UnitId, fingerprint: Fingerprint) -> io::Result<()> {
+        // Write to disk
+        let path = self.fingerprint_path(id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        
+        let bytes = fingerprint.to_bytes();
+        fs::write(&path, &bytes)?;
+        
+        // Update in-memory cache
+        self.fingerprints.insert(id.clone(), fingerprint);
+        self.stats.writes += 1;
+        
+        Ok(())
+    }
+    
+    /// Check if unit is up-to-date
+    pub fn is_fresh(
+        &mut self,
+        unit: &Unit,
+        config: &BuildConfig,
+        dep_fingerprints: &[u64],
+    ) -> bool {
+        let current = Fingerprint::for_unit(unit, config, dep_fingerprints);
+        
+        if let Some(cached) = self.get_fingerprint(&unit.id) {
+            cached.matches(&current)
+        } else {
+            false
+        }
+    }
+    
+    /// Get cached artifact path
+    pub fn artifact_path(&self, id: &UnitId, name: &str) -> PathBuf {
+        let hash = id.fingerprint();
+        let hash_str = format!("{:016x}", hash);
+        
+        self.cache_dir
+            .join(&hash_str[0..2])
+            .join(&hash_str[2..4])
+            .join(format!("{}-{}", hash_str, name))
+    }
+    
+    /// Store artifact
+    pub fn store_artifact(&self, id: &UnitId, name: &str, data: &[u8]) -> io::Result<PathBuf> {
+        let path = self.artifact_path(id, name);
+        
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        
+        fs::write(&path, data)?;
+        Ok(path)
+    }
+    
+    /// Get artifact
+    pub fn get_artifact(&self, id: &UnitId, name: &str) -> io::Result<Vec<u8>> {
+        let path = self.artifact_path(id, name);
+        fs::read(&path)
+    }
+    
+    /// Check if artifact exists
+    pub fn has_artifact(&self, id: &UnitId, name: &str) -> bool {
+        self.artifact_path(id, name).exists()
+    }
+    
+    /// Clean cache (remove stale entries)
+    pub fn clean(&mut self, max_age_secs: u64) -> io::Result<CleanResult> {
+        let mut result = CleanResult::default();
+        let cutoff = current_timestamp().saturating_sub(max_age_secs);
+        
+        // Walk cache directory
+        for entry in walkdir(&self.cache_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.extension().map(|e| e == "fingerprint").unwrap_or(false) {
+                if let Ok(bytes) = fs::read(&path) {
+                    if let Some(fp) = Fingerprint::from_bytes(&bytes) {
+                        if fp.timestamp < cutoff {
+                            fs::remove_file(&path)?;
+                            result.removed_fingerprints += 1;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Remove empty directories
+        remove_empty_dirs(&self.cache_dir)?;
+        
+        Ok(result)
+    }
+    
+    /// Get cache statistics
+    pub fn stats(&self) -> &CacheStats {
+        &self.stats
+    }
+    
+    /// Clear all cache
+    pub fn clear(&mut self) -> io::Result<()> {
+        self.fingerprints.clear();
+        
+        if self.cache_dir.exists() {
+            fs::remove_dir_all(&self.cache_dir)?;
+            fs::create_dir_all(&self.cache_dir)?;
+        }
+        
+        Ok(())
+    }
+    
+    fn fingerprint_path(&self, id: &UnitId) -> PathBuf {
+        let hash = id.fingerprint();
+        let hash_str = format!("{:016x}", hash);
+        
+        self.cache_dir
+            .join("fingerprints")
+            .join(&hash_str[0..2])
+            .join(format!("{}.fingerprint", hash_str))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CacheStats {
+    pub memory_hits: usize,
+    pub disk_hits: usize,
+    pub misses: usize,
+    pub writes: usize,
+}
+
+impl CacheStats {
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.memory_hits + self.disk_hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            (self.memory_hits + self.disk_hits) as f64 / total as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CleanResult {
+    pub removed_fingerprints: usize,
+    pub removed_artifacts: usize,
+    pub bytes_freed: u64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FILE TIMESTAMPS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Timestamp-based change detection (faster but less accurate)
+#[derive(Debug, Clone)]
+pub struct MtimeCache {
+    entries: BTreeMap<PathBuf, u64>,
+}
+
+impl MtimeCache {
+    pub fn new() -> Self {
+        MtimeCache {
+            entries: BTreeMap::new(),
+        }
+    }
+    
+    /// Check if file has changed since last check
+    pub fn has_changed(&mut self, path: &Path) -> bool {
+        let mtime = get_mtime(path).unwrap_or(0);
+        
+        if let Some(&cached_mtime) = self.entries.get(path) {
+            if mtime != cached_mtime {
+                self.entries.insert(path.to_path_buf(), mtime);
+                true
+            } else {
+                false
+            }
+        } else {
+            self.entries.insert(path.to_path_buf(), mtime);
+            true
+        }
+    }
+    
+    /// Get cached mtime
+    pub fn get_mtime(&self, path: &Path) -> Option<u64> {
+        self.entries.get(path).copied()
+    }
+    
+    /// Update mtime
+    pub fn update(&mut self, path: &Path) {
+        if let Ok(mtime) = get_mtime(path) {
+            self.entries.insert(path.to_path_buf(), mtime);
+        }
+    }
+    
+    /// Clear cache
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+impl Default for MtimeCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEP INFO
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Dependency information file (.d file)
+#[derive(Debug, Clone)]
+pub struct DepInfo {
+    /// Output file
+    pub output: PathBuf,
+    
+    /// Input files (dependencies)
+    pub inputs: Vec<PathBuf>,
+    
+    /// Environment variables used
+    pub env_vars: Vec<(String, String)>,
+}
+
+impl DepInfo {
+    pub fn new(output: &Path) -> Self {
+        DepInfo {
+            output: output.to_path_buf(),
+            inputs: Vec::new(),
+            env_vars: Vec::new(),
+        }
+    }
+    
+    /// Add input dependency
+    pub fn add_input(&mut self, path: &Path) {
+        if !self.inputs.contains(&path.to_path_buf()) {
+            self.inputs.push(path.to_path_buf());
+        }
+    }
+    
+    /// Add environment variable
+    pub fn add_env(&mut self, key: &str, value: &str) {
+        self.env_vars.push((key.to_string(), value.to_string()));
+    }
+    
+    /// Write to .d file (Makefile format)
+    pub fn write(&self, path: &Path) -> io::Result<()> {
+        let mut file = BufWriter::new(File::create(path)?);
+        
+        // Output: input1 input2 ...
+        write!(file, "{}:", self.output.display())?;
+        
+        for input in &self.inputs {
+            write!(file, " {}", escape_dep_path(input))?;
+        }
+        
+        writeln!(file)?;
+        
+        // Phony targets for each input
+        for input in &self.inputs {
+            writeln!(file, "{}:", escape_dep_path(input))?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Parse from .d file
+    pub fn parse(path: &Path) -> io::Result<Self> {
+        let content = fs::read_to_string(path)?;
+        let mut lines = content.lines();
+        
+        let first_line = lines.next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "empty dep file")
+        })?;
+        
+        let colon_pos = first_line.find(':').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid dep file format")
+        })?;
+        
+        let output = PathBuf::from(first_line[..colon_pos].trim());
+        let deps_str = &first_line[colon_pos + 1..];
+        
+        let mut inputs = Vec::new();
+        for dep in deps_str.split_whitespace() {
+            let dep = unescape_dep_path(dep);
+            if !dep.is_empty() {
+                inputs.push(PathBuf::from(dep));
+            }
+        }
+        
+        // Handle continuation lines
+        for line in lines {
+            let line = line.trim();
+            if line.ends_with(':') {
+                // Phony target, skip
+                continue;
+            }
+            
+            for dep in line.split_whitespace() {
+                let dep = unescape_dep_path(dep);
+                if !dep.is_empty() {
+                    inputs.push(PathBuf::from(dep));
+                }
+            }
+        }
+        
+        Ok(DepInfo {
+            output,
+            inputs,
+            env_vars: Vec::new(),
+        })
+    }
+    
+    /// Check if any inputs are newer than output
+    pub fn needs_rebuild(&self) -> bool {
+        let output_mtime = get_mtime(&self.output).unwrap_or(0);
+        
+        for input in &self.inputs {
+            let input_mtime = get_mtime(input).unwrap_or(u64::MAX);
+            if input_mtime > output_mtime {
+                return true;
+            }
+        }
+        
+        false
+    }
+}
+
+fn escape_dep_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace(' ', "\\ ")
+        .replace('#', "\\#")
+}
+
+fn unescape_dep_path(s: &str) -> String {
+    s.replace("\\ ", " ")
+        .replace("\\#", "#")
+        .replace("\\\\", "\\")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn hash_file(path: &Path) -> io::Result<u64> {
+    use std::collections::hash_map::DefaultHasher;
+    
+    let mut file = File::open(path)?;
+    let mut hasher = DefaultHasher::new();
+    
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        buffer[..n].hash(&mut hasher);
+    }
+    
+    Ok(hasher.finish())
+}
+
+fn hash_str(s: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_slice(slice: &[u64]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    slice.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_profile(profile: &Profile) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    
+    profile.name.hash(&mut hasher);
+    (profile.opt_level as u8).hash(&mut hasher);
+    (profile.debug as u8).hash(&mut hasher);
+    profile.debug_assertions.hash(&mut hasher);
+    profile.overflow_checks.hash(&mut hasher);
+    (profile.lto as u8).hash(&mut hasher);
+    (profile.panic as u8).hash(&mut hasher);
+    profile.incremental.hash(&mut hasher);
+    profile.codegen_units.hash(&mut hasher);
+    
+    hasher.finish()
+}
+
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn get_mtime(path: &Path) -> io::Result<u64> {
+    let metadata = fs::metadata(path)?;
+    let mtime = metadata.modified()?;
+    Ok(mtime.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
+}
+
+fn walkdir(dir: &Path) -> io::Result<Vec<io::Result<fs::DirEntry>>> {
+    let mut entries = Vec::new();
+    
+    fn walk_recursive(dir: &Path, entries: &mut Vec<io::Result<fs::DirEntry>>) -> io::Result<()> {
+        if dir.is_dir() {
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                entries.push(Ok(entry));
+                if path.is_dir() {
+                    walk_recursive(&path, entries)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    walk_recursive(dir, &mut entries)?;
+    Ok(entries)
+}
+
+fn remove_empty_dirs(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                remove_empty_dirs(&path)?;
+            }
+        }
+        
+        // Try to remove (will fail if not empty)
+        let _ = fs::remove_dir(dir);
+    }
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_fingerprint_serialize() {
+        let fp = Fingerprint {
+            hash: 12345,
+            timestamp: 67890,
+            compiler_version: "1.0.0".to_string(),
+            components: FingerprintComponents {
+                profile_hash: 1,
+                target_hash: 2,
+                features_hash: 3,
+                flags_hash: 4,
+                deps_hash: 5,
+                source_hashes: vec![
+                    (PathBuf::from("test.quanta"), 100),
+                ],
+            },
+        };
+        
+        let bytes = fp.to_bytes();
+        let fp2 = Fingerprint::from_bytes(&bytes).unwrap();
+        
+        assert_eq!(fp.hash, fp2.hash);
+        assert_eq!(fp.timestamp, fp2.timestamp);
+        assert_eq!(fp.compiler_version, fp2.compiler_version);
+    }
+    
+    #[test]
+    fn test_mtime_cache() {
+        let mut cache = MtimeCache::new();
+        
+        // First access always returns true (changed)
+        let path = PathBuf::from("test.quanta");
+        assert!(cache.has_changed(&path));
+        
+        // Second access returns false (not changed)
+        assert!(!cache.has_changed(&path));
+    }
+    
+    #[test]
+    fn test_dep_info() {
+        let mut dep = DepInfo::new(Path::new("out.o"));
+        dep.add_input(Path::new("main.quanta"));
+        dep.add_input(Path::new("lib.quanta"));
+        
+        assert_eq!(dep.inputs.len(), 2);
+    }
+}

@@ -1,0 +1,437 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ ASYNC — Waker
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Task waking mechanism for async runtime.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::async::waker
+
+use alloc::sync::Arc;
+use core::task::{RawWaker, RawWakerVTable, Waker};
+
+use super::task::Task;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TASK WAKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Waker for async tasks
+pub struct TaskWaker {
+    task: Arc<Task>,
+    scheduler: Arc<dyn Scheduler>,
+}
+
+impl TaskWaker {
+    /// Create a new task waker
+    pub fn new<S: Scheduler + 'static>(task: Arc<Task>, scheduler: Arc<S>) -> Self {
+        TaskWaker {
+            task,
+            scheduler,
+        }
+    }
+    
+    /// Convert to a standard Waker
+    pub fn into_waker(self) -> Waker {
+        let ptr = Arc::into_raw(Arc::new(self)) as *const ();
+        let raw = RawWaker::new(ptr, &VTABLE);
+        unsafe { Waker::from_raw(raw) }
+    }
+    
+    /// Wake the task
+    pub fn wake(&self) {
+        if self.task.schedule() {
+            self.scheduler.schedule(Arc::clone(&self.task));
+        }
+    }
+    
+    /// Wake by reference
+    pub fn wake_by_ref(&self) {
+        self.wake();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RAW WAKER VTABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const VTABLE: RawWakerVTable = RawWakerVTable::new(
+    clone_waker,
+    wake,
+    wake_by_ref,
+    drop_waker,
+);
+
+unsafe fn clone_waker(ptr: *const ()) -> RawWaker {
+    let waker = &*(ptr as *const TaskWaker);
+    let cloned = TaskWaker {
+        task: Arc::clone(&waker.task),
+        scheduler: Arc::clone(&waker.scheduler),
+    };
+    let ptr = Arc::into_raw(Arc::new(cloned)) as *const ();
+    RawWaker::new(ptr, &VTABLE)
+}
+
+unsafe fn wake(ptr: *const ()) {
+    let waker = Arc::from_raw(ptr as *const TaskWaker);
+    waker.wake();
+}
+
+unsafe fn wake_by_ref(ptr: *const ()) {
+    let waker = &*(ptr as *const TaskWaker);
+    waker.wake_by_ref();
+}
+
+unsafe fn drop_waker(ptr: *const ()) {
+    drop(Arc::from_raw(ptr as *const TaskWaker));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCHEDULER TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Trait for task schedulers
+pub trait Scheduler: Send + Sync {
+    /// Schedule a task for execution
+    fn schedule(&self, task: Arc<Task>);
+    
+    /// Wake idle workers
+    fn wake_workers(&self);
+}
+
+// Implementation for Shared (from executor module)
+use std::sync::{Mutex, Condvar};
+use alloc::collections::VecDeque;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+
+/// Shared executor state that implements Scheduler
+pub struct SharedScheduler {
+    pub global_queue: Mutex<VecDeque<Arc<Task>>>,
+    pub condvar: Condvar,
+    pub shutdown: AtomicBool,
+}
+
+impl Scheduler for SharedScheduler {
+    fn schedule(&self, task: Arc<Task>) {
+        if self.shutdown.load(core::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        
+        {
+            let mut queue = self.global_queue.lock().unwrap();
+            queue.push_back(task);
+        }
+        
+        self.condvar.notify_one();
+    }
+    
+    fn wake_workers(&self) {
+        self.condvar.notify_all();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WAKER UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create a no-op waker (for testing/blocking)
+pub fn noop_waker() -> Waker {
+    const NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &NOOP_VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+    
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &NOOP_VTABLE)) }
+}
+
+/// Create a waker that calls a closure when woken
+pub fn waker_fn<F: Fn() + Send + Sync + 'static>(f: F) -> Waker {
+    struct FnWaker<F>(F);
+    
+    impl<F: Fn() + Send + Sync> FnWaker<F> {
+        fn wake(&self) {
+            (self.0)();
+        }
+    }
+    
+    fn clone_fn<F: Fn() + Send + Sync + 'static>(ptr: *const ()) -> RawWaker {
+        let arc = unsafe { Arc::from_raw(ptr as *const FnWaker<F>) };
+        let cloned = Arc::clone(&arc);
+        std::mem::forget(arc);
+        RawWaker::new(Arc::into_raw(cloned) as *const (), &get_vtable::<F>())
+    }
+    
+    fn wake_fn<F: Fn() + Send + Sync>(ptr: *const ()) {
+        let arc = unsafe { Arc::from_raw(ptr as *const FnWaker<F>) };
+        arc.wake();
+    }
+    
+    fn wake_by_ref_fn<F: Fn() + Send + Sync>(ptr: *const ()) {
+        let waker = unsafe { &*(ptr as *const FnWaker<F>) };
+        waker.wake();
+    }
+    
+    fn drop_fn<F>(ptr: *const ()) {
+        drop(unsafe { Arc::from_raw(ptr as *const FnWaker<F>) });
+    }
+    
+    fn get_vtable<F: Fn() + Send + Sync + 'static>() -> RawWakerVTable {
+        RawWakerVTable::new(
+            clone_fn::<F>,
+            wake_fn::<F>,
+            wake_by_ref_fn::<F>,
+            drop_fn::<F>,
+        )
+    }
+    
+    let waker = Arc::new(FnWaker(f));
+    let ptr = Arc::into_raw(waker) as *const ();
+    unsafe { Waker::from_raw(RawWaker::new(ptr, &get_vtable::<F>())) }
+}
+
+/// Check if two wakers will wake the same task
+pub fn will_wake(a: &Waker, b: &Waker) -> bool {
+    a.will_wake(b)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ATOMIC WAKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use core::cell::UnsafeCell;
+use core::sync::atomic::Ordering;
+
+/// Thread-safe waker storage
+pub struct AtomicWaker {
+    state: AtomicUsize,
+    waker: UnsafeCell<Option<Waker>>,
+}
+
+const WAITING: usize = 0;
+const REGISTERING: usize = 1;
+const WAKING: usize = 2;
+
+unsafe impl Send for AtomicWaker {}
+unsafe impl Sync for AtomicWaker {}
+
+impl AtomicWaker {
+    /// Create a new AtomicWaker
+    pub const fn new() -> Self {
+        AtomicWaker {
+            state: AtomicUsize::new(WAITING),
+            waker: UnsafeCell::new(None),
+        }
+    }
+    
+    /// Register a waker
+    pub fn register(&self, waker: &Waker) {
+        match self.state.compare_exchange(
+            WAITING,
+            REGISTERING,
+            Ordering::Acquire,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                unsafe {
+                    // Store the waker
+                    let slot = &mut *self.waker.get();
+                    
+                    // Check if we need to update
+                    match slot {
+                        Some(ref w) if w.will_wake(waker) => {
+                            // Same waker, no update needed
+                        }
+                        _ => {
+                            *slot = Some(waker.clone());
+                        }
+                    }
+                }
+                
+                // Release the lock
+                let state = self.state.swap(WAITING, Ordering::AcqRel);
+                
+                // If someone tried to wake while we were registering
+                if state == WAKING {
+                    if let Some(waker) = unsafe { (*self.waker.get()).take() } {
+                        waker.wake();
+                    }
+                }
+            }
+            Err(WAKING) => {
+                // Someone is waking, just wake directly
+                waker.wake_by_ref();
+            }
+            Err(_) => {
+                // Another thread is registering, spin
+                loop {
+                    match self.state.load(Ordering::Acquire) {
+                        WAITING => {
+                            // Try again
+                            return self.register(waker);
+                        }
+                        WAKING => {
+                            waker.wake_by_ref();
+                            return;
+                        }
+                        _ => {
+                            core::hint::spin_loop();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Wake the registered waker
+    pub fn wake(&self) {
+        match self.state.swap(WAKING, Ordering::AcqRel) {
+            WAITING => {
+                let waker = unsafe { (*self.waker.get()).take() };
+                
+                // Allow new registrations
+                self.state.store(WAITING, Ordering::Release);
+                
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }
+            REGISTERING => {
+                // Registering thread will handle the wake
+            }
+            WAKING => {
+                // Already waking
+            }
+            _ => unreachable!(),
+        }
+    }
+    
+    /// Take the waker without waking
+    pub fn take(&self) -> Option<Waker> {
+        match self.state.compare_exchange(
+            WAITING,
+            REGISTERING,
+            Ordering::Acquire,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                let waker = unsafe { (*self.waker.get()).take() };
+                self.state.store(WAITING, Ordering::Release);
+                waker
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+impl Default for AtomicWaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WAKER REF
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A borrowed waker reference
+pub struct WakerRef<'a> {
+    waker: &'a Waker,
+}
+
+impl<'a> WakerRef<'a> {
+    /// Create from a waker reference
+    pub fn new(waker: &'a Waker) -> Self {
+        WakerRef { waker }
+    }
+    
+    /// Wake by reference
+    pub fn wake_by_ref(&self) {
+        self.waker.wake_by_ref();
+    }
+}
+
+impl<'a> std::ops::Deref for WakerRef<'a> {
+    type Target = Waker;
+    
+    fn deref(&self) -> &Self::Target {
+        self.waker
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    
+    #[test]
+    fn test_noop_waker() {
+        let waker = noop_waker();
+        waker.wake_by_ref(); // Should not panic
+        drop(waker);
+    }
+    
+    #[test]
+    fn test_waker_fn() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = Arc::clone(&called);
+        
+        let waker = waker_fn(move || {
+            called_clone.store(true, Ordering::SeqCst);
+        });
+        
+        assert!(!called.load(Ordering::SeqCst));
+        waker.wake_by_ref();
+        assert!(called.load(Ordering::SeqCst));
+    }
+    
+    #[test]
+    fn test_atomic_waker() {
+        let atomic_waker = AtomicWaker::new();
+        
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = Arc::clone(&called);
+        
+        let waker = waker_fn(move || {
+            called_clone.store(true, Ordering::SeqCst);
+        });
+        
+        atomic_waker.register(&waker);
+        assert!(!called.load(Ordering::SeqCst));
+        
+        atomic_waker.wake();
+        assert!(called.load(Ordering::SeqCst));
+    }
+    
+    #[test]
+    fn test_atomic_waker_take() {
+        let atomic_waker = AtomicWaker::new();
+        
+        let waker = noop_waker();
+        atomic_waker.register(&waker);
+        
+        let taken = atomic_waker.take();
+        assert!(taken.is_some());
+        
+        let taken2 = atomic_waker.take();
+        assert!(taken2.is_none());
+    }
+    
+    #[test]
+    fn test_will_wake() {
+        let w1 = noop_waker();
+        let w2 = noop_waker();
+        
+        // Noop wakers point to the same vtable but null data
+        assert!(will_wake(&w1, &w2));
+    }
+}

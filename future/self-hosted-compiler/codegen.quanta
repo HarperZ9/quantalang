@@ -1,0 +1,1390 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ CODE GENERATOR — x86_64 / ARM64 / RISC-V
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::codegen
+
+use crate::ast::*
+use crate::types::*
+use std::collections::HashMap
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TARGET ARCHITECTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    X86_64,
+    Aarch64,
+    Riscv64,
+}
+
+impl Target {
+    pub fn pointer_size(&self) -> u32 { 8 }
+    pub fn page_size(&self) -> u32 { 4096 }
+    
+    pub fn calling_convention(&self) -> CallingConvention {
+        match self {
+            Target::X86_64 => CallingConvention::SysV64,
+            Target::Aarch64 => CallingConvention::Aapcs64,
+            Target::Riscv64 => CallingConvention::RiscvLp64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CallingConvention {
+    SysV64,      // Linux x86_64
+    Win64,       // Windows x86_64
+    Aapcs64,     // ARM64
+    RiscvLp64,   // RISC-V LP64
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTERMEDIATE REPRESENTATION (IR)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Low-level IR for code generation
+#[derive(Debug, Clone)]
+pub struct IrModule {
+    pub name: String,
+    pub target: Target,
+    pub functions: Vec<IrFunction>,
+    pub globals: Vec<IrGlobal>,
+    pub constants: Vec<IrConstant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IrFunction {
+    pub name: String,
+    pub params: Vec<IrParam>,
+    pub return_ty: IrType,
+    pub blocks: Vec<IrBlock>,
+    pub stack_size: u32,
+    pub is_kernel: bool,
+    pub effects: EffectSet,
+}
+
+#[derive(Debug, Clone)]
+pub struct IrParam {
+    pub name: String,
+    pub ty: IrType,
+    pub location: ParamLocation,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ParamLocation {
+    Register(PhysReg),
+    Stack(i32),  // Offset from frame pointer
+}
+
+#[derive(Debug, Clone)]
+pub struct IrBlock {
+    pub label: String,
+    pub instructions: Vec<IrInst>,
+    pub terminator: IrTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum IrInst {
+    // Memory
+    Load { dst: VReg, addr: Operand, ty: IrType },
+    Store { addr: Operand, value: Operand, ty: IrType },
+    StackAlloc { dst: VReg, size: u32, align: u32 },
+    
+    // Arithmetic
+    Add { dst: VReg, lhs: Operand, rhs: Operand, ty: IrType },
+    Sub { dst: VReg, lhs: Operand, rhs: Operand, ty: IrType },
+    Mul { dst: VReg, lhs: Operand, rhs: Operand, ty: IrType },
+    Div { dst: VReg, lhs: Operand, rhs: Operand, ty: IrType, signed: bool },
+    Rem { dst: VReg, lhs: Operand, rhs: Operand, ty: IrType, signed: bool },
+    Neg { dst: VReg, src: Operand, ty: IrType },
+    
+    // Bitwise
+    And { dst: VReg, lhs: Operand, rhs: Operand },
+    Or { dst: VReg, lhs: Operand, rhs: Operand },
+    Xor { dst: VReg, lhs: Operand, rhs: Operand },
+    Not { dst: VReg, src: Operand },
+    Shl { dst: VReg, lhs: Operand, rhs: Operand },
+    Shr { dst: VReg, lhs: Operand, rhs: Operand, arithmetic: bool },
+    
+    // Comparison
+    Cmp { dst: VReg, lhs: Operand, rhs: Operand, cond: Condition },
+    
+    // Conversion
+    Cast { dst: VReg, src: Operand, from: IrType, to: IrType },
+    ZeroExtend { dst: VReg, src: Operand, from: IrType, to: IrType },
+    SignExtend { dst: VReg, src: Operand, from: IrType, to: IrType },
+    Truncate { dst: VReg, src: Operand, from: IrType, to: IrType },
+    
+    // Move
+    Mov { dst: VReg, src: Operand },
+    
+    // Function call
+    Call { dst: Option<VReg>, func: Operand, args: Vec<Operand> },
+    
+    // Inline assembly
+    InlineAsm { template: String, outputs: Vec<AsmOperand>, inputs: Vec<AsmOperand>, clobbers: Vec<PhysReg> },
+    
+    // Volatile memory access (for MMIO)
+    VolatileLoad { dst: VReg, addr: Operand, ty: IrType },
+    VolatileStore { addr: Operand, value: Operand, ty: IrType },
+    
+    // Memory fence
+    Fence { ordering: MemoryOrdering },
+}
+
+#[derive(Debug, Clone)]
+pub enum IrTerminator {
+    Return(Option<Operand>),
+    Jump(String),
+    Branch { cond: Operand, true_block: String, false_block: String },
+    Switch { value: Operand, default: String, cases: Vec<(i64, String)> },
+    Unreachable,
+}
+
+#[derive(Debug, Clone)]
+pub enum Operand {
+    VReg(VReg),
+    Imm(i64),
+    Label(String),
+    Global(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VReg(pub u32);
+
+#[derive(Debug, Clone, Copy)]
+pub enum Condition {
+    Eq, Ne, Lt, Le, Gt, Ge,
+    Ult, Ule, Ugt, Uge,  // Unsigned
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MemoryOrdering {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}
+
+#[derive(Debug, Clone)]
+pub struct IrGlobal {
+    pub name: String,
+    pub ty: IrType,
+    pub init: Option<Vec<u8>>,
+    pub is_const: bool,
+    pub section: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IrConstant {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrType {
+    I8, I16, I32, I64, I128,
+    F32, F64,
+    Ptr,
+    Void,
+    Aggregate(u32),  // Size in bytes
+}
+
+impl IrType {
+    pub fn size(&self) -> u32 {
+        match self {
+            IrType::I8 => 1,
+            IrType::I16 => 2,
+            IrType::I32 => 4,
+            IrType::I64 | IrType::Ptr => 8,
+            IrType::I128 => 16,
+            IrType::F32 => 4,
+            IrType::F64 => 8,
+            IrType::Void => 0,
+            IrType::Aggregate(size) => *size,
+        }
+    }
+    
+    pub fn align(&self) -> u32 {
+        self.size().min(8)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHYSICAL REGISTERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PhysReg {
+    // x86_64
+    Rax, Rbx, Rcx, Rdx, Rsi, Rdi, Rbp, Rsp,
+    R8, R9, R10, R11, R12, R13, R14, R15,
+    Xmm0, Xmm1, Xmm2, Xmm3, Xmm4, Xmm5, Xmm6, Xmm7,
+    Xmm8, Xmm9, Xmm10, Xmm11, Xmm12, Xmm13, Xmm14, Xmm15,
+    
+    // ARM64
+    X0, X1, X2, X3, X4, X5, X6, X7,
+    X8, X9, X10, X11, X12, X13, X14, X15,
+    X16, X17, X18, X19, X20, X21, X22, X23,
+    X24, X25, X26, X27, X28, X29, X30, Sp,
+    V0, V1, V2, V3, V4, V5, V6, V7,
+    
+    // RISC-V
+    RvX0, RvX1, RvX2, RvX3, RvX4, RvX5, RvX6, RvX7,
+    RvX8, RvX9, RvX10, RvX11, RvX12, RvX13, RvX14, RvX15,
+    RvX16, RvX17, RvX18, RvX19, RvX20, RvX21, RvX22, RvX23,
+    RvX24, RvX25, RvX26, RvX27, RvX28, RvX29, RvX30, RvX31,
+}
+
+impl PhysReg {
+    pub fn x86_64_arg_regs() -> &'static [PhysReg] {
+        &[PhysReg::Rdi, PhysReg::Rsi, PhysReg::Rdx, PhysReg::Rcx, PhysReg::R8, PhysReg::R9]
+    }
+    
+    pub fn x86_64_callee_saved() -> &'static [PhysReg] {
+        &[PhysReg::Rbx, PhysReg::Rbp, PhysReg::R12, PhysReg::R13, PhysReg::R14, PhysReg::R15]
+    }
+    
+    pub fn arm64_arg_regs() -> &'static [PhysReg] {
+        &[PhysReg::X0, PhysReg::X1, PhysReg::X2, PhysReg::X3, 
+          PhysReg::X4, PhysReg::X5, PhysReg::X6, PhysReg::X7]
+    }
+    
+    pub fn arm64_callee_saved() -> &'static [PhysReg] {
+        &[PhysReg::X19, PhysReg::X20, PhysReg::X21, PhysReg::X22,
+          PhysReg::X23, PhysReg::X24, PhysReg::X25, PhysReg::X26,
+          PhysReg::X27, PhysReg::X28, PhysReg::X29, PhysReg::X30]
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AsmOperand {
+    pub constraint: String,
+    pub value: Operand,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// IR BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct IrBuilder {
+    target: Target,
+    next_vreg: u32,
+    next_label: u32,
+    current_block: Option<String>,
+    blocks: HashMap<String, IrBlock>,
+    current_insts: Vec<IrInst>,
+}
+
+impl IrBuilder {
+    pub fn new(target: Target) -> Self {
+        IrBuilder {
+            target,
+            next_vreg: 0,
+            next_label: 0,
+            current_block: None,
+            blocks: HashMap::new(),
+            current_insts: Vec::new(),
+        }
+    }
+    
+    pub fn fresh_vreg(&mut self) -> VReg {
+        let reg = VReg(self.next_vreg);
+        self.next_vreg += 1;
+        reg
+    }
+    
+    pub fn fresh_label(&mut self) -> String {
+        let label = format!(".L{}", self.next_label);
+        self.next_label += 1;
+        label
+    }
+    
+    pub fn start_block(&mut self, label: String) {
+        if let Some(current) = self.current_block.take() {
+            // Save current block (without terminator)
+            self.blocks.insert(current.clone(), IrBlock {
+                label: current,
+                instructions: std::mem::take(&mut self.current_insts),
+                terminator: IrTerminator::Unreachable,
+            });
+        }
+        self.current_block = Some(label);
+        self.current_insts.clear();
+    }
+    
+    pub fn emit(&mut self, inst: IrInst) {
+        self.current_insts.push(inst);
+    }
+    
+    pub fn terminate(&mut self, term: IrTerminator) {
+        if let Some(label) = self.current_block.take() {
+            self.blocks.insert(label.clone(), IrBlock {
+                label,
+                instructions: std::mem::take(&mut self.current_insts),
+                terminator: term,
+            });
+        }
+    }
+    
+    pub fn finish(self) -> Vec<IrBlock> {
+        let mut blocks: Vec<_> = self.blocks.into_values().collect();
+        blocks.sort_by(|a, b| a.label.cmp(&b.label));
+        blocks
+    }
+    
+    // Convenience methods
+    
+    pub fn load(&mut self, addr: Operand, ty: IrType) -> VReg {
+        let dst = self.fresh_vreg();
+        self.emit(IrInst::Load { dst, addr, ty });
+        dst
+    }
+    
+    pub fn store(&mut self, addr: Operand, value: Operand, ty: IrType) {
+        self.emit(IrInst::Store { addr, value, ty });
+    }
+    
+    pub fn add(&mut self, lhs: Operand, rhs: Operand, ty: IrType) -> VReg {
+        let dst = self.fresh_vreg();
+        self.emit(IrInst::Add { dst, lhs, rhs, ty });
+        dst
+    }
+    
+    pub fn sub(&mut self, lhs: Operand, rhs: Operand, ty: IrType) -> VReg {
+        let dst = self.fresh_vreg();
+        self.emit(IrInst::Sub { dst, lhs, rhs, ty });
+        dst
+    }
+    
+    pub fn cmp(&mut self, lhs: Operand, rhs: Operand, cond: Condition) -> VReg {
+        let dst = self.fresh_vreg();
+        self.emit(IrInst::Cmp { dst, lhs, rhs, cond });
+        dst
+    }
+    
+    pub fn call(&mut self, func: Operand, args: Vec<Operand>, has_return: bool) -> Option<VReg> {
+        let dst = if has_return { Some(self.fresh_vreg()) } else { None };
+        self.emit(IrInst::Call { dst, func, args });
+        dst
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTER ALLOCATOR (Linear Scan)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct RegisterAllocator {
+    target: Target,
+    vreg_to_phys: HashMap<VReg, PhysReg>,
+    vreg_to_stack: HashMap<VReg, i32>,
+    live_intervals: HashMap<VReg, (u32, u32)>,
+    stack_offset: i32,
+}
+
+impl RegisterAllocator {
+    pub fn new(target: Target) -> Self {
+        RegisterAllocator {
+            target,
+            vreg_to_phys: HashMap::new(),
+            vreg_to_stack: HashMap::new(),
+            live_intervals: HashMap::new(),
+            stack_offset: 0,
+        }
+    }
+    
+    pub fn allocate(&mut self, func: &IrFunction) -> AllocationResult {
+        // Build live intervals
+        self.compute_live_intervals(func);
+        
+        // Linear scan allocation
+        let available = self.get_allocatable_regs();
+        let mut active: Vec<(VReg, u32)> = Vec::new(); // (vreg, end)
+        let mut free_regs: Vec<PhysReg> = available.to_vec();
+        
+        let mut intervals: Vec<_> = self.live_intervals.iter()
+            .map(|(&vreg, &(start, end))| (start, end, vreg))
+            .collect();
+        intervals.sort_by_key(|(start, _, _)| *start);
+        
+        for (start, end, vreg) in intervals {
+            // Expire old intervals
+            active.retain(|(v, e)| {
+                if *e <= start {
+                    if let Some(reg) = self.vreg_to_phys.get(v) {
+                        free_regs.push(*reg);
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            
+            if let Some(reg) = free_regs.pop() {
+                self.vreg_to_phys.insert(vreg, reg);
+                active.push((vreg, end));
+                active.sort_by_key(|(_, e)| *e);
+            } else {
+                // Spill: find interval with furthest end point
+                if let Some(&(spill_vreg, spill_end)) = active.last() {
+                    if spill_end > end {
+                        // Spill the furthest
+                        if let Some(reg) = self.vreg_to_phys.remove(&spill_vreg) {
+                            self.spill(spill_vreg);
+                            self.vreg_to_phys.insert(vreg, reg);
+                            active.pop();
+                            active.push((vreg, end));
+                            active.sort_by_key(|(_, e)| *e);
+                        }
+                    } else {
+                        self.spill(vreg);
+                    }
+                } else {
+                    self.spill(vreg);
+                }
+            }
+        }
+        
+        AllocationResult {
+            vreg_to_phys: self.vreg_to_phys.clone(),
+            vreg_to_stack: self.vreg_to_stack.clone(),
+            stack_size: (-self.stack_offset) as u32,
+        }
+    }
+    
+    fn compute_live_intervals(&mut self, func: &IrFunction) {
+        let mut position = 0u32;
+        
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                self.update_interval_for_inst(inst, position);
+                position += 1;
+            }
+        }
+    }
+    
+    fn update_interval_for_inst(&mut self, inst: &IrInst, pos: u32) {
+        let (defs, uses) = Self::get_defs_uses(inst);
+        
+        for vreg in uses {
+            self.live_intervals.entry(vreg)
+                .and_modify(|(_, end)| *end = pos.max(*end))
+                .or_insert((pos, pos));
+        }
+        
+        for vreg in defs {
+            self.live_intervals.entry(vreg)
+                .and_modify(|(start, _)| *start = pos.min(*start))
+                .or_insert((pos, pos));
+        }
+    }
+    
+    fn get_defs_uses(inst: &IrInst) -> (Vec<VReg>, Vec<VReg>) {
+        let mut defs = Vec::new();
+        let mut uses = Vec::new();
+        
+        fn add_operand_uses(op: &Operand, uses: &mut Vec<VReg>) {
+            if let Operand::VReg(v) = op {
+                uses.push(*v);
+            }
+        }
+        
+        match inst {
+            IrInst::Load { dst, addr, .. } => {
+                defs.push(*dst);
+                add_operand_uses(addr, &mut uses);
+            }
+            IrInst::Store { addr, value, .. } => {
+                add_operand_uses(addr, &mut uses);
+                add_operand_uses(value, &mut uses);
+            }
+            IrInst::Add { dst, lhs, rhs, .. } |
+            IrInst::Sub { dst, lhs, rhs, .. } |
+            IrInst::Mul { dst, lhs, rhs, .. } |
+            IrInst::Div { dst, lhs, rhs, .. } |
+            IrInst::Rem { dst, lhs, rhs, .. } => {
+                defs.push(*dst);
+                add_operand_uses(lhs, &mut uses);
+                add_operand_uses(rhs, &mut uses);
+            }
+            IrInst::And { dst, lhs, rhs } |
+            IrInst::Or { dst, lhs, rhs } |
+            IrInst::Xor { dst, lhs, rhs } |
+            IrInst::Shl { dst, lhs, rhs } |
+            IrInst::Shr { dst, lhs, rhs, .. } => {
+                defs.push(*dst);
+                add_operand_uses(lhs, &mut uses);
+                add_operand_uses(rhs, &mut uses);
+            }
+            IrInst::Neg { dst, src, .. } |
+            IrInst::Not { dst, src } => {
+                defs.push(*dst);
+                add_operand_uses(src, &mut uses);
+            }
+            IrInst::Cmp { dst, lhs, rhs, .. } => {
+                defs.push(*dst);
+                add_operand_uses(lhs, &mut uses);
+                add_operand_uses(rhs, &mut uses);
+            }
+            IrInst::Mov { dst, src } => {
+                defs.push(*dst);
+                add_operand_uses(src, &mut uses);
+            }
+            IrInst::Call { dst, args, .. } => {
+                if let Some(d) = dst {
+                    defs.push(*d);
+                }
+                for arg in args {
+                    add_operand_uses(arg, &mut uses);
+                }
+            }
+            IrInst::Cast { dst, src, .. } |
+            IrInst::ZeroExtend { dst, src, .. } |
+            IrInst::SignExtend { dst, src, .. } |
+            IrInst::Truncate { dst, src, .. } => {
+                defs.push(*dst);
+                add_operand_uses(src, &mut uses);
+            }
+            IrInst::StackAlloc { dst, .. } => {
+                defs.push(*dst);
+            }
+            IrInst::VolatileLoad { dst, addr, .. } => {
+                defs.push(*dst);
+                add_operand_uses(addr, &mut uses);
+            }
+            IrInst::VolatileStore { addr, value, .. } => {
+                add_operand_uses(addr, &mut uses);
+                add_operand_uses(value, &mut uses);
+            }
+            IrInst::Fence { .. } => {}
+            IrInst::InlineAsm { outputs, inputs, .. } => {
+                for out in outputs {
+                    if let Operand::VReg(v) = &out.value {
+                        defs.push(*v);
+                    }
+                }
+                for inp in inputs {
+                    add_operand_uses(&inp.value, &mut uses);
+                }
+            }
+        }
+        
+        (defs, uses)
+    }
+    
+    fn spill(&mut self, vreg: VReg) {
+        self.stack_offset -= 8; // Align to 8 bytes
+        self.vreg_to_stack.insert(vreg, self.stack_offset);
+    }
+    
+    fn get_allocatable_regs(&self) -> &'static [PhysReg] {
+        match self.target {
+            Target::X86_64 => &[
+                PhysReg::Rax, PhysReg::Rcx, PhysReg::Rdx, PhysReg::Rsi, PhysReg::Rdi,
+                PhysReg::R8, PhysReg::R9, PhysReg::R10, PhysReg::R11,
+                PhysReg::Rbx, PhysReg::R12, PhysReg::R13, PhysReg::R14, PhysReg::R15,
+            ],
+            Target::Aarch64 => &[
+                PhysReg::X0, PhysReg::X1, PhysReg::X2, PhysReg::X3,
+                PhysReg::X4, PhysReg::X5, PhysReg::X6, PhysReg::X7,
+                PhysReg::X8, PhysReg::X9, PhysReg::X10, PhysReg::X11,
+                PhysReg::X12, PhysReg::X13, PhysReg::X14, PhysReg::X15,
+                PhysReg::X19, PhysReg::X20, PhysReg::X21, PhysReg::X22,
+                PhysReg::X23, PhysReg::X24, PhysReg::X25, PhysReg::X26,
+                PhysReg::X27, PhysReg::X28,
+            ],
+            Target::Riscv64 => &[
+                PhysReg::RvX10, PhysReg::RvX11, PhysReg::RvX12, PhysReg::RvX13,
+                PhysReg::RvX14, PhysReg::RvX15, PhysReg::RvX16, PhysReg::RvX17,
+                PhysReg::RvX5, PhysReg::RvX6, PhysReg::RvX7, PhysReg::RvX28,
+                PhysReg::RvX29, PhysReg::RvX30, PhysReg::RvX31,
+            ],
+        }
+    }
+}
+
+pub struct AllocationResult {
+    pub vreg_to_phys: HashMap<VReg, PhysReg>,
+    pub vreg_to_stack: HashMap<VReg, i32>,
+    pub stack_size: u32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ASSEMBLY EMITTER — x86_64
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct X86_64Emitter {
+    output: String,
+    alloc: AllocationResult,
+}
+
+impl X86_64Emitter {
+    pub fn new(alloc: AllocationResult) -> Self {
+        X86_64Emitter {
+            output: String::new(),
+            alloc,
+        }
+    }
+    
+    pub fn emit_module(&mut self, module: &IrModule) -> String {
+        // Header
+        self.output.push_str(".intel_syntax noprefix\n");
+        self.output.push_str(&format!("// Module: {}\n\n", module.name));
+        
+        // Constants
+        if !module.constants.is_empty() {
+            self.output.push_str(".section .rodata\n");
+            for constant in &module.constants {
+                self.emit_constant(constant);
+            }
+            self.output.push_str("\n");
+        }
+        
+        // Globals
+        if !module.globals.is_empty() {
+            self.output.push_str(".section .data\n");
+            for global in &module.globals {
+                self.emit_global(global);
+            }
+            self.output.push_str("\n");
+        }
+        
+        // Functions
+        self.output.push_str(".section .text\n");
+        for func in &module.functions {
+            self.emit_function(func);
+        }
+        
+        std::mem::take(&mut self.output)
+    }
+    
+    fn emit_constant(&mut self, constant: &IrConstant) {
+        self.output.push_str(&format!("{}:\n", constant.name));
+        self.output.push_str("    .byte ");
+        let bytes: Vec<_> = constant.data.iter().map(|b| format!("0x{:02x}", b)).collect();
+        self.output.push_str(&bytes.join(", "));
+        self.output.push_str("\n");
+    }
+    
+    fn emit_global(&mut self, global: &IrGlobal) {
+        self.output.push_str(&format!(".globl {}\n", global.name));
+        if let Some(ref section) = global.section {
+            self.output.push_str(&format!(".section {}\n", section));
+        }
+        self.output.push_str(&format!(".align {}\n", global.ty.align()));
+        self.output.push_str(&format!("{}:\n", global.name));
+        
+        if let Some(ref init) = global.init {
+            self.output.push_str("    .byte ");
+            let bytes: Vec<_> = init.iter().map(|b| format!("0x{:02x}", b)).collect();
+            self.output.push_str(&bytes.join(", "));
+        } else {
+            self.output.push_str(&format!("    .zero {}", global.ty.size()));
+        }
+        self.output.push_str("\n");
+    }
+    
+    fn emit_function(&mut self, func: &IrFunction) {
+        // Function header
+        self.output.push_str(&format!(".globl {}\n", func.name));
+        self.output.push_str(&format!(".type {}, @function\n", func.name));
+        self.output.push_str(&format!("{}:\n", func.name));
+        
+        // Prologue
+        self.emit_prologue(func);
+        
+        // Body
+        for block in &func.blocks {
+            self.emit_block(block);
+        }
+        
+        // Size directive
+        self.output.push_str(&format!(".size {}, .-{}\n\n", func.name, func.name));
+    }
+    
+    fn emit_prologue(&mut self, func: &IrFunction) {
+        let stack_size = (func.stack_size + 15) & !15; // Align to 16
+        
+        self.output.push_str("    push rbp\n");
+        self.output.push_str("    mov rbp, rsp\n");
+        
+        if stack_size > 0 {
+            self.output.push_str(&format!("    sub rsp, {}\n", stack_size));
+        }
+        
+        // Save callee-saved registers
+        for reg in PhysReg::x86_64_callee_saved() {
+            if self.alloc.vreg_to_phys.values().any(|r| r == reg) {
+                self.output.push_str(&format!("    push {}\n", self.reg_name(*reg)));
+            }
+        }
+    }
+    
+    fn emit_block(&mut self, block: &IrBlock) {
+        self.output.push_str(&format!("{}:\n", block.label));
+        
+        for inst in &block.instructions {
+            self.emit_inst(inst);
+        }
+        
+        self.emit_terminator(&block.terminator);
+    }
+    
+    fn emit_inst(&mut self, inst: &IrInst) {
+        match inst {
+            IrInst::Mov { dst, src } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let src_str = self.operand_str(src);
+                self.output.push_str(&format!("    mov {}, {}\n", dst_str, src_str));
+            }
+            
+            IrInst::Load { dst, addr, ty } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let addr_str = self.operand_str(addr);
+                let size_prefix = self.size_prefix(*ty);
+                self.output.push_str(&format!("    mov {}, {} [{}]\n", dst_str, size_prefix, addr_str));
+            }
+            
+            IrInst::Store { addr, value, ty } => {
+                let addr_str = self.operand_str(addr);
+                let val_str = self.operand_str(value);
+                let size_prefix = self.size_prefix(*ty);
+                self.output.push_str(&format!("    mov {} [{}], {}\n", size_prefix, addr_str, val_str));
+            }
+            
+            IrInst::Add { dst, lhs, rhs, .. } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let lhs_str = self.operand_str(lhs);
+                let rhs_str = self.operand_str(rhs);
+                
+                if dst_str != lhs_str {
+                    self.output.push_str(&format!("    mov {}, {}\n", dst_str, lhs_str));
+                }
+                self.output.push_str(&format!("    add {}, {}\n", dst_str, rhs_str));
+            }
+            
+            IrInst::Sub { dst, lhs, rhs, .. } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let lhs_str = self.operand_str(lhs);
+                let rhs_str = self.operand_str(rhs);
+                
+                if dst_str != lhs_str {
+                    self.output.push_str(&format!("    mov {}, {}\n", dst_str, lhs_str));
+                }
+                self.output.push_str(&format!("    sub {}, {}\n", dst_str, rhs_str));
+            }
+            
+            IrInst::Mul { dst, lhs, rhs, .. } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let lhs_str = self.operand_str(lhs);
+                let rhs_str = self.operand_str(rhs);
+                
+                self.output.push_str(&format!("    mov rax, {}\n", lhs_str));
+                self.output.push_str(&format!("    imul rax, {}\n", rhs_str));
+                self.output.push_str(&format!("    mov {}, rax\n", dst_str));
+            }
+            
+            IrInst::Div { dst, lhs, rhs, signed, .. } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let lhs_str = self.operand_str(lhs);
+                let rhs_str = self.operand_str(rhs);
+                
+                self.output.push_str(&format!("    mov rax, {}\n", lhs_str));
+                if *signed {
+                    self.output.push_str("    cqo\n");  // Sign extend rax into rdx:rax
+                    self.output.push_str(&format!("    idiv {}\n", rhs_str));
+                } else {
+                    self.output.push_str("    xor rdx, rdx\n");
+                    self.output.push_str(&format!("    div {}\n", rhs_str));
+                }
+                self.output.push_str(&format!("    mov {}, rax\n", dst_str));
+            }
+            
+            IrInst::And { dst, lhs, rhs } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let lhs_str = self.operand_str(lhs);
+                let rhs_str = self.operand_str(rhs);
+                
+                if dst_str != lhs_str {
+                    self.output.push_str(&format!("    mov {}, {}\n", dst_str, lhs_str));
+                }
+                self.output.push_str(&format!("    and {}, {}\n", dst_str, rhs_str));
+            }
+            
+            IrInst::Or { dst, lhs, rhs } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let lhs_str = self.operand_str(lhs);
+                let rhs_str = self.operand_str(rhs);
+                
+                if dst_str != lhs_str {
+                    self.output.push_str(&format!("    mov {}, {}\n", dst_str, lhs_str));
+                }
+                self.output.push_str(&format!("    or {}, {}\n", dst_str, rhs_str));
+            }
+            
+            IrInst::Xor { dst, lhs, rhs } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let lhs_str = self.operand_str(lhs);
+                let rhs_str = self.operand_str(rhs);
+                
+                if dst_str != lhs_str {
+                    self.output.push_str(&format!("    mov {}, {}\n", dst_str, lhs_str));
+                }
+                self.output.push_str(&format!("    xor {}, {}\n", dst_str, rhs_str));
+            }
+            
+            IrInst::Shl { dst, lhs, rhs } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let lhs_str = self.operand_str(lhs);
+                
+                if dst_str != lhs_str {
+                    self.output.push_str(&format!("    mov {}, {}\n", dst_str, lhs_str));
+                }
+                
+                match rhs {
+                    Operand::Imm(n) => {
+                        self.output.push_str(&format!("    shl {}, {}\n", dst_str, n));
+                    }
+                    _ => {
+                        let rhs_str = self.operand_str(rhs);
+                        self.output.push_str(&format!("    mov rcx, {}\n", rhs_str));
+                        self.output.push_str(&format!("    shl {}, cl\n", dst_str));
+                    }
+                }
+            }
+            
+            IrInst::Shr { dst, lhs, rhs, arithmetic } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let lhs_str = self.operand_str(lhs);
+                let op = if *arithmetic { "sar" } else { "shr" };
+                
+                if dst_str != lhs_str {
+                    self.output.push_str(&format!("    mov {}, {}\n", dst_str, lhs_str));
+                }
+                
+                match rhs {
+                    Operand::Imm(n) => {
+                        self.output.push_str(&format!("    {} {}, {}\n", op, dst_str, n));
+                    }
+                    _ => {
+                        let rhs_str = self.operand_str(rhs);
+                        self.output.push_str(&format!("    mov rcx, {}\n", rhs_str));
+                        self.output.push_str(&format!("    {} {}, cl\n", op, dst_str));
+                    }
+                }
+            }
+            
+            IrInst::Cmp { dst, lhs, rhs, cond } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let lhs_str = self.operand_str(lhs);
+                let rhs_str = self.operand_str(rhs);
+                
+                self.output.push_str(&format!("    cmp {}, {}\n", lhs_str, rhs_str));
+                
+                let set_op = match cond {
+                    Condition::Eq => "sete",
+                    Condition::Ne => "setne",
+                    Condition::Lt => "setl",
+                    Condition::Le => "setle",
+                    Condition::Gt => "setg",
+                    Condition::Ge => "setge",
+                    Condition::Ult => "setb",
+                    Condition::Ule => "setbe",
+                    Condition::Ugt => "seta",
+                    Condition::Uge => "setae",
+                };
+                
+                self.output.push_str(&format!("    {} al\n", set_op));
+                self.output.push_str(&format!("    movzx {}, al\n", dst_str));
+            }
+            
+            IrInst::Call { dst, func, args } => {
+                // Set up arguments in registers
+                let arg_regs = PhysReg::x86_64_arg_regs();
+                for (i, arg) in args.iter().enumerate() {
+                    if i < arg_regs.len() {
+                        let reg_name = self.reg_name(arg_regs[i]);
+                        let arg_str = self.operand_str(arg);
+                        self.output.push_str(&format!("    mov {}, {}\n", reg_name, arg_str));
+                    } else {
+                        // Stack arguments (push in reverse order)
+                        let arg_str = self.operand_str(arg);
+                        self.output.push_str(&format!("    push {}\n", arg_str));
+                    }
+                }
+                
+                let func_str = self.operand_str(func);
+                self.output.push_str(&format!("    call {}\n", func_str));
+                
+                // Clean up stack arguments
+                let stack_args = args.len().saturating_sub(arg_regs.len());
+                if stack_args > 0 {
+                    self.output.push_str(&format!("    add rsp, {}\n", stack_args * 8));
+                }
+                
+                // Move return value
+                if let Some(d) = dst {
+                    let dst_str = self.operand_str(&Operand::VReg(*d));
+                    self.output.push_str(&format!("    mov {}, rax\n", dst_str));
+                }
+            }
+            
+            IrInst::VolatileLoad { dst, addr, ty } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let addr_str = self.operand_str(addr);
+                let size_prefix = self.size_prefix(*ty);
+                // Use mov with explicit memory operand (compiler won't optimize away)
+                self.output.push_str(&format!("    mov {}, {} [{}]\n", dst_str, size_prefix, addr_str));
+            }
+            
+            IrInst::VolatileStore { addr, value, ty } => {
+                let addr_str = self.operand_str(addr);
+                let val_str = self.operand_str(value);
+                let size_prefix = self.size_prefix(*ty);
+                self.output.push_str(&format!("    mov {} [{}], {}\n", size_prefix, addr_str, val_str));
+            }
+            
+            IrInst::Fence { ordering } => {
+                match ordering {
+                    MemoryOrdering::SeqCst => self.output.push_str("    mfence\n"),
+                    MemoryOrdering::AcqRel => self.output.push_str("    mfence\n"),
+                    MemoryOrdering::Acquire => self.output.push_str("    lfence\n"),
+                    MemoryOrdering::Release => self.output.push_str("    sfence\n"),
+                    MemoryOrdering::Relaxed => {} // No fence needed
+                }
+            }
+            
+            IrInst::InlineAsm { template, .. } => {
+                // Emit inline assembly directly
+                for line in template.split('\n') {
+                    if !line.trim().is_empty() {
+                        self.output.push_str(&format!("    {}\n", line.trim()));
+                    }
+                }
+            }
+            
+            _ => {
+                self.output.push_str(&format!("    // TODO: {:?}\n", inst));
+            }
+        }
+    }
+    
+    fn emit_terminator(&mut self, term: &IrTerminator) {
+        match term {
+            IrTerminator::Return(None) => {
+                self.emit_epilogue();
+            }
+            IrTerminator::Return(Some(value)) => {
+                let val_str = self.operand_str(value);
+                self.output.push_str(&format!("    mov rax, {}\n", val_str));
+                self.emit_epilogue();
+            }
+            IrTerminator::Jump(label) => {
+                self.output.push_str(&format!("    jmp {}\n", label));
+            }
+            IrTerminator::Branch { cond, true_block, false_block } => {
+                let cond_str = self.operand_str(cond);
+                self.output.push_str(&format!("    test {}, {}\n", cond_str, cond_str));
+                self.output.push_str(&format!("    jnz {}\n", true_block));
+                self.output.push_str(&format!("    jmp {}\n", false_block));
+            }
+            IrTerminator::Switch { value, default, cases } => {
+                let val_str = self.operand_str(value);
+                for (case_val, label) in cases {
+                    self.output.push_str(&format!("    cmp {}, {}\n", val_str, case_val));
+                    self.output.push_str(&format!("    je {}\n", label));
+                }
+                self.output.push_str(&format!("    jmp {}\n", default));
+            }
+            IrTerminator::Unreachable => {
+                self.output.push_str("    ud2\n");
+            }
+        }
+    }
+    
+    fn emit_epilogue(&mut self) {
+        // Restore callee-saved registers (reverse order)
+        for reg in PhysReg::x86_64_callee_saved().iter().rev() {
+            if self.alloc.vreg_to_phys.values().any(|r| r == reg) {
+                self.output.push_str(&format!("    pop {}\n", self.reg_name(*reg)));
+            }
+        }
+        
+        self.output.push_str("    mov rsp, rbp\n");
+        self.output.push_str("    pop rbp\n");
+        self.output.push_str("    ret\n");
+    }
+    
+    fn operand_str(&self, op: &Operand) -> String {
+        match op {
+            Operand::VReg(vreg) => {
+                if let Some(phys) = self.alloc.vreg_to_phys.get(vreg) {
+                    self.reg_name(*phys)
+                } else if let Some(offset) = self.alloc.vreg_to_stack.get(vreg) {
+                    format!("[rbp{}]", if *offset >= 0 { format!("+{}", offset) } else { format!("{}", offset) })
+                } else {
+                    format!("v{}", vreg.0)
+                }
+            }
+            Operand::Imm(n) => format!("{}", n),
+            Operand::Label(l) => l.clone(),
+            Operand::Global(g) => format!("[rip + {}]", g),
+        }
+    }
+    
+    fn reg_name(&self, reg: PhysReg) -> String {
+        match reg {
+            PhysReg::Rax => "rax".to_string(),
+            PhysReg::Rbx => "rbx".to_string(),
+            PhysReg::Rcx => "rcx".to_string(),
+            PhysReg::Rdx => "rdx".to_string(),
+            PhysReg::Rsi => "rsi".to_string(),
+            PhysReg::Rdi => "rdi".to_string(),
+            PhysReg::Rbp => "rbp".to_string(),
+            PhysReg::Rsp => "rsp".to_string(),
+            PhysReg::R8 => "r8".to_string(),
+            PhysReg::R9 => "r9".to_string(),
+            PhysReg::R10 => "r10".to_string(),
+            PhysReg::R11 => "r11".to_string(),
+            PhysReg::R12 => "r12".to_string(),
+            PhysReg::R13 => "r13".to_string(),
+            PhysReg::R14 => "r14".to_string(),
+            PhysReg::R15 => "r15".to_string(),
+            _ => format!("{:?}", reg),
+        }
+    }
+    
+    fn size_prefix(&self, ty: IrType) -> &'static str {
+        match ty {
+            IrType::I8 => "byte ptr",
+            IrType::I16 => "word ptr",
+            IrType::I32 => "dword ptr",
+            IrType::I64 | IrType::Ptr => "qword ptr",
+            _ => "qword ptr",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ASSEMBLY EMITTER — ARM64
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct Arm64Emitter {
+    output: String,
+    alloc: AllocationResult,
+}
+
+impl Arm64Emitter {
+    pub fn new(alloc: AllocationResult) -> Self {
+        Arm64Emitter {
+            output: String::new(),
+            alloc,
+        }
+    }
+    
+    pub fn emit_module(&mut self, module: &IrModule) -> String {
+        self.output.push_str(&format!("// Module: {} (ARM64)\n\n", module.name));
+        
+        // Constants
+        if !module.constants.is_empty() {
+            self.output.push_str(".section .rodata\n");
+            for constant in &module.constants {
+                self.output.push_str(&format!("{}:\n", constant.name));
+                self.output.push_str("    .byte ");
+                let bytes: Vec<_> = constant.data.iter().map(|b| format!("0x{:02x}", b)).collect();
+                self.output.push_str(&bytes.join(", "));
+                self.output.push_str("\n");
+            }
+        }
+        
+        // Functions
+        self.output.push_str(".section .text\n");
+        for func in &module.functions {
+            self.emit_function(func);
+        }
+        
+        std::mem::take(&mut self.output)
+    }
+    
+    fn emit_function(&mut self, func: &IrFunction) {
+        self.output.push_str(&format!(".global {}\n", func.name));
+        self.output.push_str(&format!(".type {}, %function\n", func.name));
+        self.output.push_str(&format!("{}:\n", func.name));
+        
+        // Prologue
+        let stack_size = ((func.stack_size + 15) & !15) as i32;
+        self.output.push_str("    stp x29, x30, [sp, #-16]!\n");
+        self.output.push_str("    mov x29, sp\n");
+        if stack_size > 0 {
+            self.output.push_str(&format!("    sub sp, sp, #{}\n", stack_size));
+        }
+        
+        // Body
+        for block in &func.blocks {
+            self.output.push_str(&format!("{}:\n", block.label));
+            
+            for inst in &block.instructions {
+                self.emit_inst(inst);
+            }
+            
+            self.emit_terminator(&block.terminator, stack_size);
+        }
+        
+        self.output.push_str(&format!(".size {}, .-{}\n\n", func.name, func.name));
+    }
+    
+    fn emit_inst(&mut self, inst: &IrInst) {
+        match inst {
+            IrInst::Mov { dst, src } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let src_str = self.operand_str(src);
+                self.output.push_str(&format!("    mov {}, {}\n", dst_str, src_str));
+            }
+            
+            IrInst::Add { dst, lhs, rhs, .. } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let lhs_str = self.operand_str(lhs);
+                let rhs_str = self.operand_str(rhs);
+                self.output.push_str(&format!("    add {}, {}, {}\n", dst_str, lhs_str, rhs_str));
+            }
+            
+            IrInst::Sub { dst, lhs, rhs, .. } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let lhs_str = self.operand_str(lhs);
+                let rhs_str = self.operand_str(rhs);
+                self.output.push_str(&format!("    sub {}, {}, {}\n", dst_str, lhs_str, rhs_str));
+            }
+            
+            IrInst::Load { dst, addr, .. } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let addr_str = self.operand_str(addr);
+                self.output.push_str(&format!("    ldr {}, [{}]\n", dst_str, addr_str));
+            }
+            
+            IrInst::Store { addr, value, .. } => {
+                let addr_str = self.operand_str(addr);
+                let val_str = self.operand_str(value);
+                self.output.push_str(&format!("    str {}, [{}]\n", val_str, addr_str));
+            }
+            
+            IrInst::Call { dst, func, args } => {
+                // Set up arguments
+                let arg_regs = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
+                for (i, arg) in args.iter().enumerate() {
+                    if i < arg_regs.len() {
+                        let arg_str = self.operand_str(arg);
+                        self.output.push_str(&format!("    mov {}, {}\n", arg_regs[i], arg_str));
+                    }
+                }
+                
+                let func_str = self.operand_str(func);
+                self.output.push_str(&format!("    bl {}\n", func_str));
+                
+                if let Some(d) = dst {
+                    let dst_str = self.operand_str(&Operand::VReg(*d));
+                    self.output.push_str(&format!("    mov {}, x0\n", dst_str));
+                }
+            }
+            
+            IrInst::VolatileLoad { dst, addr, .. } => {
+                let dst_str = self.operand_str(&Operand::VReg(*dst));
+                let addr_str = self.operand_str(addr);
+                self.output.push_str(&format!("    ldr {}, [{}]\n", dst_str, addr_str));
+                self.output.push_str("    dmb ish\n"); // Data memory barrier
+            }
+            
+            IrInst::VolatileStore { addr, value, .. } => {
+                self.output.push_str("    dmb ish\n");
+                let addr_str = self.operand_str(addr);
+                let val_str = self.operand_str(value);
+                self.output.push_str(&format!("    str {}, [{}]\n", val_str, addr_str));
+            }
+            
+            IrInst::Fence { ordering } => {
+                match ordering {
+                    MemoryOrdering::SeqCst => self.output.push_str("    dmb ish\n"),
+                    MemoryOrdering::AcqRel => self.output.push_str("    dmb ish\n"),
+                    MemoryOrdering::Acquire => self.output.push_str("    dmb ishld\n"),
+                    MemoryOrdering::Release => self.output.push_str("    dmb ishst\n"),
+                    MemoryOrdering::Relaxed => {}
+                }
+            }
+            
+            _ => {
+                self.output.push_str(&format!("    // TODO: {:?}\n", inst));
+            }
+        }
+    }
+    
+    fn emit_terminator(&mut self, term: &IrTerminator, stack_size: i32) {
+        match term {
+            IrTerminator::Return(val) => {
+                if let Some(v) = val {
+                    let val_str = self.operand_str(v);
+                    self.output.push_str(&format!("    mov x0, {}\n", val_str));
+                }
+                
+                // Epilogue
+                if stack_size > 0 {
+                    self.output.push_str(&format!("    add sp, sp, #{}\n", stack_size));
+                }
+                self.output.push_str("    ldp x29, x30, [sp], #16\n");
+                self.output.push_str("    ret\n");
+            }
+            IrTerminator::Jump(label) => {
+                self.output.push_str(&format!("    b {}\n", label));
+            }
+            IrTerminator::Branch { cond, true_block, false_block } => {
+                let cond_str = self.operand_str(cond);
+                self.output.push_str(&format!("    cbnz {}, {}\n", cond_str, true_block));
+                self.output.push_str(&format!("    b {}\n", false_block));
+            }
+            IrTerminator::Unreachable => {
+                self.output.push_str("    brk #0\n");
+            }
+            _ => {}
+        }
+    }
+    
+    fn operand_str(&self, op: &Operand) -> String {
+        match op {
+            Operand::VReg(vreg) => {
+                if let Some(phys) = self.alloc.vreg_to_phys.get(vreg) {
+                    self.reg_name(*phys)
+                } else if let Some(offset) = self.alloc.vreg_to_stack.get(vreg) {
+                    format!("[sp, #{}]", offset)
+                } else {
+                    format!("v{}", vreg.0)
+                }
+            }
+            Operand::Imm(n) => format!("#{}", n),
+            Operand::Label(l) => l.clone(),
+            Operand::Global(g) => g.clone(),
+        }
+    }
+    
+    fn reg_name(&self, reg: PhysReg) -> String {
+        match reg {
+            PhysReg::X0 => "x0".to_string(),
+            PhysReg::X1 => "x1".to_string(),
+            PhysReg::X2 => "x2".to_string(),
+            PhysReg::X3 => "x3".to_string(),
+            PhysReg::X4 => "x4".to_string(),
+            PhysReg::X5 => "x5".to_string(),
+            PhysReg::X6 => "x6".to_string(),
+            PhysReg::X7 => "x7".to_string(),
+            PhysReg::X8 => "x8".to_string(),
+            PhysReg::X9 => "x9".to_string(),
+            PhysReg::X10 => "x10".to_string(),
+            PhysReg::X11 => "x11".to_string(),
+            PhysReg::X12 => "x12".to_string(),
+            PhysReg::X13 => "x13".to_string(),
+            PhysReg::X14 => "x14".to_string(),
+            PhysReg::X15 => "x15".to_string(),
+            PhysReg::X19 => "x19".to_string(),
+            PhysReg::X20 => "x20".to_string(),
+            PhysReg::X29 => "x29".to_string(),
+            PhysReg::X30 => "x30".to_string(),
+            _ => format!("{:?}", reg),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPILER DRIVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct Compiler {
+    target: Target,
+}
+
+impl Compiler {
+    pub fn new(target: Target) -> Self {
+        Compiler { target }
+    }
+    
+    pub fn compile(&self, ir_module: &IrModule) -> String {
+        // Register allocation
+        let mut total_alloc = AllocationResult {
+            vreg_to_phys: HashMap::new(),
+            vreg_to_stack: HashMap::new(),
+            stack_size: 0,
+        };
+        
+        for func in &ir_module.functions {
+            let mut allocator = RegisterAllocator::new(self.target);
+            let alloc = allocator.allocate(func);
+            total_alloc.vreg_to_phys.extend(alloc.vreg_to_phys);
+            total_alloc.vreg_to_stack.extend(alloc.vreg_to_stack);
+            total_alloc.stack_size = total_alloc.stack_size.max(alloc.stack_size);
+        }
+        
+        // Emit assembly
+        match self.target {
+            Target::X86_64 => {
+                let mut emitter = X86_64Emitter::new(total_alloc);
+                emitter.emit_module(ir_module)
+            }
+            Target::Aarch64 => {
+                let mut emitter = Arm64Emitter::new(total_alloc);
+                emitter.emit_module(ir_module)
+            }
+            Target::Riscv64 => {
+                // RISC-V emitter would go here
+                format!("// RISC-V codegen not yet implemented\n")
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_ir_builder() {
+        let mut builder = IrBuilder::new(Target::X86_64);
+        
+        builder.start_block("entry".to_string());
+        let a = builder.add(Operand::Imm(1), Operand::Imm(2), IrType::I64);
+        builder.terminate(IrTerminator::Return(Some(Operand::VReg(a))));
+        
+        let blocks = builder.finish();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].instructions.len(), 1);
+    }
+    
+    #[test]
+    fn test_register_allocation() {
+        let mut allocator = RegisterAllocator::new(Target::X86_64);
+        
+        let func = IrFunction {
+            name: "test".to_string(),
+            params: Vec::new(),
+            return_ty: IrType::I64,
+            blocks: vec![IrBlock {
+                label: "entry".to_string(),
+                instructions: vec![
+                    IrInst::Mov { dst: VReg(0), src: Operand::Imm(42) },
+                ],
+                terminator: IrTerminator::Return(Some(Operand::VReg(VReg(0)))),
+            }],
+            stack_size: 0,
+            is_kernel: false,
+            effects: EffectSet::pure(),
+        };
+        
+        let result = allocator.allocate(&func);
+        assert!(result.vreg_to_phys.contains_key(&VReg(0)) || result.vreg_to_stack.contains_key(&VReg(0)));
+    }
+}

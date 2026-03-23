@@ -1,0 +1,1763 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ FFI — C Header Parser
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Parses C headers to generate FFI bindings automatically.
+// Similar to rust-bindgen but native to QuantaLang.
+//
+// Features:
+// - C11 compatible parsing
+// - Preprocessor directive handling
+// - Type resolution and layout computation
+// - Automatic binding generation
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::ffi::parser
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use super::types::{
+    ForeignType, StructType, StructField, UnionType, EnumType, EnumVariant,
+    FunctionSignature, Parameter, TargetInfo, Abi,
+};
+use super::bindings::{Binding, FunctionBinding, TypeBinding, ConstantBinding, Safety};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PARSER CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Configuration for C header parsing
+#[derive(Debug, Clone)]
+pub struct ParseConfig {
+    /// Include paths for header resolution
+    pub include_paths: Vec<PathBuf>,
+    
+    /// Preprocessor definitions
+    pub defines: BTreeMap<String, String>,
+    
+    /// Headers to parse
+    pub headers: Vec<PathBuf>,
+    
+    /// Patterns for functions to include
+    pub allowlist_functions: Vec<String>,
+    
+    /// Patterns for functions to exclude
+    pub blocklist_functions: Vec<String>,
+    
+    /// Patterns for types to include
+    pub allowlist_types: Vec<String>,
+    
+    /// Patterns for types to exclude
+    pub blocklist_types: Vec<String>,
+    
+    /// Generate opaque types for complex structs
+    pub opaque_types: Vec<String>,
+    
+    /// Derive traits for generated types
+    pub derive_traits: Vec<String>,
+    
+    /// Target platform info
+    pub target: TargetInfo,
+    
+    /// Generate documentation comments
+    pub generate_docs: bool,
+    
+    /// Generate safety wrappers
+    pub generate_wrappers: bool,
+    
+    /// Clang arguments
+    pub clang_args: Vec<String>,
+    
+    /// Parse function bodies (for inline functions)
+    pub parse_bodies: bool,
+    
+    /// Emit #[repr(C)] on structs
+    pub repr_c: bool,
+    
+    /// Use core types instead of std
+    pub use_core: bool,
+}
+
+impl Default for ParseConfig {
+    fn default() -> Self {
+        ParseConfig {
+            include_paths: vec![PathBuf::from("/usr/include")],
+            defines: BTreeMap::new(),
+            headers: Vec::new(),
+            allowlist_functions: Vec::new(),
+            blocklist_functions: Vec::new(),
+            allowlist_types: Vec::new(),
+            blocklist_types: Vec::new(),
+            opaque_types: Vec::new(),
+            derive_traits: vec!["Debug".to_string(), "Clone".to_string()],
+            target: TargetInfo::host(),
+            generate_docs: true,
+            generate_wrappers: true,
+            clang_args: Vec::new(),
+            parse_bodies: false,
+            repr_c: true,
+            use_core: false,
+        }
+    }
+}
+
+impl ParseConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    pub fn header<P: AsRef<Path>>(mut self, path: P) -> Self {
+        self.headers.push(path.as_ref().to_path_buf());
+        self
+    }
+    
+    pub fn include_path<P: AsRef<Path>>(mut self, path: P) -> Self {
+        self.include_paths.push(path.as_ref().to_path_buf());
+        self
+    }
+    
+    pub fn define<S: Into<String>, V: Into<String>>(mut self, name: S, value: V) -> Self {
+        self.defines.insert(name.into(), value.into());
+        self
+    }
+    
+    pub fn allowlist_function<S: Into<String>>(mut self, pattern: S) -> Self {
+        self.allowlist_functions.push(pattern.into());
+        self
+    }
+    
+    pub fn blocklist_function<S: Into<String>>(mut self, pattern: S) -> Self {
+        self.blocklist_functions.push(pattern.into());
+        self
+    }
+    
+    pub fn allowlist_type<S: Into<String>>(mut self, pattern: S) -> Self {
+        self.allowlist_types.push(pattern.into());
+        self
+    }
+    
+    pub fn blocklist_type<S: Into<String>>(mut self, pattern: S) -> Self {
+        self.blocklist_types.push(pattern.into());
+        self
+    }
+    
+    pub fn opaque_type<S: Into<String>>(mut self, name: S) -> Self {
+        self.opaque_types.push(name.into());
+        self
+    }
+    
+    pub fn target(mut self, target: TargetInfo) -> Self {
+        self.target = target;
+        self
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LEXER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Token {
+    // Keywords
+    Void, Char, Short, Int, Long, Float, Double,
+    Signed, Unsigned, Const, Volatile, Restrict,
+    Struct, Union, Enum, Typedef,
+    Static, Extern, Inline, Register, Auto,
+    Sizeof, Alignof,
+    If, Else, While, For, Do, Switch, Case, Default,
+    Break, Continue, Return, Goto,
+    
+    // Punctuation
+    LParen, RParen, LBrace, RBrace, LBracket, RBracket,
+    Semicolon, Comma, Colon, Dot, Arrow,
+    Star, Ampersand, Plus, Minus, Slash, Percent,
+    Equals, DoubleEquals, NotEquals,
+    Less, Greater, LessEquals, GreaterEquals,
+    DoubleLess, DoubleGreater,
+    Bang, Tilde, Caret, Pipe, DoublePipe, DoubleAmpersand,
+    Question, Ellipsis,
+    PlusEquals, MinusEquals, StarEquals, SlashEquals,
+    
+    // Literals
+    Identifier(String),
+    IntLiteral(i64),
+    UIntLiteral(u64),
+    FloatLiteral(f64),
+    StringLiteral(String),
+    CharLiteral(char),
+    
+    // Preprocessor
+    Hash,
+    Include,
+    Define,
+    Undef,
+    Ifdef,
+    Ifndef,
+    Endif,
+    Pragma,
+    
+    // Special
+    Eof,
+    Newline,
+    Whitespace,
+    Comment(String),
+    DocComment(String),
+}
+
+pub struct Lexer<'a> {
+    input: &'a str,
+    pos: usize,
+    line: usize,
+    col: usize,
+}
+
+impl<'a> Lexer<'a> {
+    pub fn new(input: &'a str) -> Self {
+        Lexer {
+            input,
+            pos: 0,
+            line: 1,
+            col: 1,
+        }
+    }
+    
+    pub fn tokenize(&mut self) -> Result<Vec<Token>, ParseError> {
+        let mut tokens = Vec::new();
+        
+        while !self.is_eof() {
+            self.skip_whitespace();
+            
+            if self.is_eof() {
+                break;
+            }
+            
+            let token = self.next_token()?;
+            
+            // Skip whitespace and regular comments for AST
+            match &token {
+                Token::Whitespace | Token::Comment(_) | Token::Newline => continue,
+                _ => tokens.push(token),
+            }
+        }
+        
+        tokens.push(Token::Eof);
+        Ok(tokens)
+    }
+    
+    fn next_token(&mut self) -> Result<Token, ParseError> {
+        let ch = self.peek_char().unwrap();
+        
+        // Preprocessor directives
+        if ch == '#' && self.col == 1 {
+            return self.scan_preprocessor();
+        }
+        
+        // Comments
+        if ch == '/' {
+            if self.peek_char_at(1) == Some('/') {
+                return self.scan_line_comment();
+            }
+            if self.peek_char_at(1) == Some('*') {
+                return self.scan_block_comment();
+            }
+        }
+        
+        // Numbers
+        if ch.is_ascii_digit() || (ch == '.' && self.peek_char_at(1).map_or(false, |c| c.is_ascii_digit())) {
+            return self.scan_number();
+        }
+        
+        // Strings
+        if ch == '"' {
+            return self.scan_string();
+        }
+        
+        // Characters
+        if ch == '\'' {
+            return self.scan_char();
+        }
+        
+        // Identifiers and keywords
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            return self.scan_identifier();
+        }
+        
+        // Punctuation
+        self.scan_punctuation()
+    }
+    
+    fn scan_identifier(&mut self) -> Result<Token, ParseError> {
+        let start = self.pos;
+        
+        while let Some(ch) = self.peek_char() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        
+        let text = &self.input[start..self.pos];
+        
+        let token = match text {
+            "void" => Token::Void,
+            "char" => Token::Char,
+            "short" => Token::Short,
+            "int" => Token::Int,
+            "long" => Token::Long,
+            "float" => Token::Float,
+            "double" => Token::Double,
+            "signed" => Token::Signed,
+            "unsigned" => Token::Unsigned,
+            "const" => Token::Const,
+            "volatile" => Token::Volatile,
+            "restrict" => Token::Restrict,
+            "struct" => Token::Struct,
+            "union" => Token::Union,
+            "enum" => Token::Enum,
+            "typedef" => Token::Typedef,
+            "static" => Token::Static,
+            "extern" => Token::Extern,
+            "inline" => Token::Inline,
+            "register" => Token::Register,
+            "auto" => Token::Auto,
+            "sizeof" => Token::Sizeof,
+            "alignof" | "_Alignof" => Token::Alignof,
+            "if" => Token::If,
+            "else" => Token::Else,
+            "while" => Token::While,
+            "for" => Token::For,
+            "do" => Token::Do,
+            "switch" => Token::Switch,
+            "case" => Token::Case,
+            "default" => Token::Default,
+            "break" => Token::Break,
+            "continue" => Token::Continue,
+            "return" => Token::Return,
+            "goto" => Token::Goto,
+            _ => Token::Identifier(text.to_string()),
+        };
+        
+        Ok(token)
+    }
+    
+    fn scan_number(&mut self) -> Result<Token, ParseError> {
+        let start = self.pos;
+        let mut is_float = false;
+        let mut is_hex = false;
+        let mut is_unsigned = false;
+        let mut is_long = false;
+        
+        // Check for hex prefix
+        if self.peek_char() == Some('0') {
+            if self.peek_char_at(1) == Some('x') || self.peek_char_at(1) == Some('X') {
+                is_hex = true;
+                self.advance();
+                self.advance();
+            }
+        }
+        
+        // Scan digits
+        while let Some(ch) = self.peek_char() {
+            if is_hex {
+                if ch.is_ascii_hexdigit() {
+                    self.advance();
+                } else {
+                    break;
+                }
+            } else {
+                if ch.is_ascii_digit() {
+                    self.advance();
+                } else if ch == '.' && !is_float {
+                    is_float = true;
+                    self.advance();
+                } else if (ch == 'e' || ch == 'E') && !is_hex {
+                    is_float = true;
+                    self.advance();
+                    if self.peek_char() == Some('+') || self.peek_char() == Some('-') {
+                        self.advance();
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        
+        // Check for suffix
+        while let Some(ch) = self.peek_char() {
+            match ch {
+                'u' | 'U' => { is_unsigned = true; self.advance(); }
+                'l' | 'L' => { is_long = true; self.advance(); }
+                'f' | 'F' => { is_float = true; self.advance(); break; }
+                _ => break,
+            }
+        }
+        
+        let text = &self.input[start..self.pos];
+        
+        if is_float {
+            let value = text.trim_end_matches(|c| c == 'f' || c == 'F' || c == 'l' || c == 'L')
+                .parse::<f64>()
+                .map_err(|_| ParseError::InvalidNumber(text.to_string()))?;
+            Ok(Token::FloatLiteral(value))
+        } else if is_unsigned {
+            let num_text = text.trim_end_matches(|c: char| !c.is_ascii_hexdigit());
+            let value = if is_hex {
+                u64::from_str_radix(&num_text[2..], 16)
+            } else {
+                num_text.parse::<u64>()
+            }.map_err(|_| ParseError::InvalidNumber(text.to_string()))?;
+            Ok(Token::UIntLiteral(value))
+        } else {
+            let num_text = text.trim_end_matches(|c: char| !c.is_ascii_hexdigit());
+            let value = if is_hex {
+                i64::from_str_radix(&num_text[2..], 16)
+            } else {
+                num_text.parse::<i64>()
+            }.map_err(|_| ParseError::InvalidNumber(text.to_string()))?;
+            Ok(Token::IntLiteral(value))
+        }
+    }
+    
+    fn scan_string(&mut self) -> Result<Token, ParseError> {
+        self.advance(); // Skip opening quote
+        let mut value = String::new();
+        
+        while let Some(ch) = self.peek_char() {
+            if ch == '"' {
+                self.advance();
+                return Ok(Token::StringLiteral(value));
+            } else if ch == '\\' {
+                self.advance();
+                if let Some(escaped) = self.peek_char() {
+                    self.advance();
+                    match escaped {
+                        'n' => value.push('\n'),
+                        'r' => value.push('\r'),
+                        't' => value.push('\t'),
+                        '0' => value.push('\0'),
+                        '\\' => value.push('\\'),
+                        '"' => value.push('"'),
+                        'x' => {
+                            // Hex escape
+                            let mut hex = String::new();
+                            for _ in 0..2 {
+                                if let Some(h) = self.peek_char() {
+                                    if h.is_ascii_hexdigit() {
+                                        hex.push(h);
+                                        self.advance();
+                                    }
+                                }
+                            }
+                            if let Ok(code) = u8::from_str_radix(&hex, 16) {
+                                value.push(code as char);
+                            }
+                        }
+                        _ => value.push(escaped),
+                    }
+                }
+            } else if ch == '\n' {
+                return Err(ParseError::UnterminatedString);
+            } else {
+                value.push(ch);
+                self.advance();
+            }
+        }
+        
+        Err(ParseError::UnterminatedString)
+    }
+    
+    fn scan_char(&mut self) -> Result<Token, ParseError> {
+        self.advance(); // Skip opening quote
+        
+        let ch = if self.peek_char() == Some('\\') {
+            self.advance();
+            match self.peek_char() {
+                Some('n') => { self.advance(); '\n' }
+                Some('r') => { self.advance(); '\r' }
+                Some('t') => { self.advance(); '\t' }
+                Some('0') => { self.advance(); '\0' }
+                Some('\\') => { self.advance(); '\\' }
+                Some('\'') => { self.advance(); '\'' }
+                Some(c) => { self.advance(); c }
+                None => return Err(ParseError::UnterminatedChar),
+            }
+        } else if let Some(c) = self.peek_char() {
+            self.advance();
+            c
+        } else {
+            return Err(ParseError::UnterminatedChar);
+        };
+        
+        if self.peek_char() == Some('\'') {
+            self.advance();
+            Ok(Token::CharLiteral(ch))
+        } else {
+            Err(ParseError::UnterminatedChar)
+        }
+    }
+    
+    fn scan_punctuation(&mut self) -> Result<Token, ParseError> {
+        let ch = self.advance().unwrap();
+        
+        let token = match ch {
+            '(' => Token::LParen,
+            ')' => Token::RParen,
+            '{' => Token::LBrace,
+            '}' => Token::RBrace,
+            '[' => Token::LBracket,
+            ']' => Token::RBracket,
+            ';' => Token::Semicolon,
+            ',' => Token::Comma,
+            ':' => Token::Colon,
+            '?' => Token::Question,
+            '~' => Token::Tilde,
+            '.' => {
+                if self.peek_char() == Some('.') && self.peek_char_at(1) == Some('.') {
+                    self.advance();
+                    self.advance();
+                    Token::Ellipsis
+                } else {
+                    Token::Dot
+                }
+            }
+            '-' => {
+                if self.peek_char() == Some('>') {
+                    self.advance();
+                    Token::Arrow
+                } else if self.peek_char() == Some('=') {
+                    self.advance();
+                    Token::MinusEquals
+                } else {
+                    Token::Minus
+                }
+            }
+            '+' => {
+                if self.peek_char() == Some('=') {
+                    self.advance();
+                    Token::PlusEquals
+                } else {
+                    Token::Plus
+                }
+            }
+            '*' => {
+                if self.peek_char() == Some('=') {
+                    self.advance();
+                    Token::StarEquals
+                } else {
+                    Token::Star
+                }
+            }
+            '/' => {
+                if self.peek_char() == Some('=') {
+                    self.advance();
+                    Token::SlashEquals
+                } else {
+                    Token::Slash
+                }
+            }
+            '%' => Token::Percent,
+            '&' => {
+                if self.peek_char() == Some('&') {
+                    self.advance();
+                    Token::DoubleAmpersand
+                } else {
+                    Token::Ampersand
+                }
+            }
+            '|' => {
+                if self.peek_char() == Some('|') {
+                    self.advance();
+                    Token::DoublePipe
+                } else {
+                    Token::Pipe
+                }
+            }
+            '^' => Token::Caret,
+            '!' => {
+                if self.peek_char() == Some('=') {
+                    self.advance();
+                    Token::NotEquals
+                } else {
+                    Token::Bang
+                }
+            }
+            '=' => {
+                if self.peek_char() == Some('=') {
+                    self.advance();
+                    Token::DoubleEquals
+                } else {
+                    Token::Equals
+                }
+            }
+            '<' => {
+                if self.peek_char() == Some('=') {
+                    self.advance();
+                    Token::LessEquals
+                } else if self.peek_char() == Some('<') {
+                    self.advance();
+                    Token::DoubleLess
+                } else {
+                    Token::Less
+                }
+            }
+            '>' => {
+                if self.peek_char() == Some('=') {
+                    self.advance();
+                    Token::GreaterEquals
+                } else if self.peek_char() == Some('>') {
+                    self.advance();
+                    Token::DoubleGreater
+                } else {
+                    Token::Greater
+                }
+            }
+            '#' => Token::Hash,
+            c => return Err(ParseError::UnexpectedChar(c)),
+        };
+        
+        Ok(token)
+    }
+    
+    fn scan_line_comment(&mut self) -> Result<Token, ParseError> {
+        self.advance(); // /
+        self.advance(); // /
+        
+        let start = self.pos;
+        let is_doc = self.peek_char() == Some('/') || self.peek_char() == Some('!');
+        
+        while let Some(ch) = self.peek_char() {
+            if ch == '\n' {
+                break;
+            }
+            self.advance();
+        }
+        
+        let text = self.input[start..self.pos].trim().to_string();
+        
+        if is_doc {
+            Ok(Token::DocComment(text))
+        } else {
+            Ok(Token::Comment(text))
+        }
+    }
+    
+    fn scan_block_comment(&mut self) -> Result<Token, ParseError> {
+        self.advance(); // /
+        self.advance(); // *
+        
+        let start = self.pos;
+        let is_doc = self.peek_char() == Some('*');
+        
+        while !self.is_eof() {
+            if self.peek_char() == Some('*') && self.peek_char_at(1) == Some('/') {
+                let text = self.input[start..self.pos].trim().to_string();
+                self.advance();
+                self.advance();
+                
+                if is_doc {
+                    return Ok(Token::DocComment(text));
+                } else {
+                    return Ok(Token::Comment(text));
+                }
+            }
+            
+            if self.peek_char() == Some('\n') {
+                self.line += 1;
+                self.col = 1;
+            }
+            
+            self.advance();
+        }
+        
+        Err(ParseError::UnterminatedComment)
+    }
+    
+    fn scan_preprocessor(&mut self) -> Result<Token, ParseError> {
+        self.advance(); // #
+        self.skip_whitespace();
+        
+        let start = self.pos;
+        while let Some(ch) = self.peek_char() {
+            if ch.is_ascii_alphabetic() {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        
+        let directive = &self.input[start..self.pos];
+        
+        match directive {
+            "include" => Ok(Token::Include),
+            "define" => Ok(Token::Define),
+            "undef" => Ok(Token::Undef),
+            "ifdef" => Ok(Token::Ifdef),
+            "ifndef" => Ok(Token::Ifndef),
+            "endif" => Ok(Token::Endif),
+            "pragma" => Ok(Token::Pragma),
+            _ => Ok(Token::Hash), // Unknown directive
+        }
+    }
+    
+    fn peek_char(&self) -> Option<char> {
+        self.input[self.pos..].chars().next()
+    }
+    
+    fn peek_char_at(&self, offset: usize) -> Option<char> {
+        self.input[self.pos..].chars().nth(offset)
+    }
+    
+    fn advance(&mut self) -> Option<char> {
+        let ch = self.peek_char()?;
+        self.pos += ch.len_utf8();
+        if ch == '\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        Some(ch)
+    }
+    
+    fn skip_whitespace(&mut self) {
+        while let Some(ch) = self.peek_char() {
+            if ch.is_whitespace() {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+    }
+    
+    fn is_eof(&self) -> bool {
+        self.pos >= self.input.len()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PARSER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// C header parser
+pub struct CParser {
+    tokens: Vec<Token>,
+    pos: usize,
+    config: ParseConfig,
+    type_env: BTreeMap<String, CType>,
+    current_doc: Option<String>,
+}
+
+impl CParser {
+    pub fn new(config: ParseConfig) -> Self {
+        CParser {
+            tokens: Vec::new(),
+            pos: 0,
+            config,
+            type_env: BTreeMap::new(),
+            current_doc: None,
+        }
+    }
+    
+    /// Parse a C header file
+    pub fn parse_file<P: AsRef<Path>>(&mut self, path: P) -> Result<ParseResult, ParseError> {
+        let content = std::fs::read_to_string(path.as_ref())
+            .map_err(|e| ParseError::IoError(e.to_string()))?;
+        
+        self.parse_str(&content)
+    }
+    
+    /// Parse C source from string
+    pub fn parse_str(&mut self, source: &str) -> Result<ParseResult, ParseError> {
+        let mut lexer = Lexer::new(source);
+        self.tokens = lexer.tokenize()?;
+        self.pos = 0;
+        
+        let mut result = ParseResult::new();
+        
+        while !self.at_eof() {
+            // Capture doc comments
+            if let Token::DocComment(doc) = self.peek() {
+                self.current_doc = Some(doc.clone());
+                self.advance();
+                continue;
+            }
+            
+            if let Some(decl) = self.parse_declaration()? {
+                match decl {
+                    Declaration::Function(f) => {
+                        if self.should_include_function(&f.name) {
+                            result.functions.push(f);
+                        }
+                    }
+                    Declaration::Struct(s) => {
+                        if self.should_include_type(&s.name) {
+                            self.type_env.insert(s.name.clone(), CType::Struct(s.clone()));
+                            result.structs.push(s);
+                        }
+                    }
+                    Declaration::Union(u) => {
+                        if self.should_include_type(&u.name) {
+                            result.unions.push(u);
+                        }
+                    }
+                    Declaration::Enum(e) => {
+                        if self.should_include_type(&e.name) {
+                            result.enums.push(e);
+                        }
+                    }
+                    Declaration::Typedef(name, ty) => {
+                        if self.should_include_type(&name) {
+                            self.type_env.insert(name.clone(), ty.clone());
+                            result.typedefs.insert(name, ty);
+                        }
+                    }
+                    Declaration::Constant(c) => {
+                        result.constants.push(c);
+                    }
+                    Declaration::Variable(v) => {
+                        result.variables.push(v);
+                    }
+                }
+            }
+            
+            self.current_doc = None;
+        }
+        
+        Ok(result)
+    }
+    
+    fn parse_declaration(&mut self) -> Result<Option<Declaration>, ParseError> {
+        // Skip preprocessor directives for now
+        match self.peek() {
+            Token::Include | Token::Define | Token::Ifdef | 
+            Token::Ifndef | Token::Endif | Token::Pragma => {
+                self.skip_to_newline_or_semicolon();
+                return Ok(None);
+            }
+            Token::Typedef => return self.parse_typedef(),
+            Token::Struct => return self.parse_struct_decl(),
+            Token::Union => return self.parse_union_decl(),
+            Token::Enum => return self.parse_enum_decl(),
+            Token::Extern | Token::Static | Token::Inline => {
+                // Storage class specifier - continue to parse
+            }
+            Token::Semicolon => {
+                self.advance();
+                return Ok(None);
+            }
+            Token::Eof => return Ok(None),
+            _ => {}
+        }
+        
+        // Try to parse as function or variable declaration
+        self.parse_function_or_variable()
+    }
+    
+    fn parse_typedef(&mut self) -> Result<Option<Declaration>, ParseError> {
+        self.expect(Token::Typedef)?;
+        
+        // Parse the underlying type
+        let base_type = self.parse_type()?;
+        
+        // Parse declarator (name and possible pointer/array modifiers)
+        let (name, full_type) = self.parse_declarator(base_type)?;
+        
+        self.expect(Token::Semicolon)?;
+        
+        Ok(Some(Declaration::Typedef(name, full_type)))
+    }
+    
+    fn parse_struct_decl(&mut self) -> Result<Option<Declaration>, ParseError> {
+        self.expect(Token::Struct)?;
+        
+        let name = if let Token::Identifier(n) = self.peek() {
+            self.advance();
+            n
+        } else {
+            // Anonymous struct
+            format!("__anon_struct_{}", self.pos)
+        };
+        
+        // Check if this is just a declaration or a definition
+        if self.peek() != Token::LBrace {
+            // Forward declaration or usage
+            return Ok(None);
+        }
+        
+        self.expect(Token::LBrace)?;
+        
+        let mut fields = Vec::new();
+        
+        while self.peek() != Token::RBrace {
+            let field_type = self.parse_type()?;
+            let (field_name, full_type) = self.parse_declarator(field_type)?;
+            
+            fields.push(CStructField {
+                name: field_name,
+                ty: full_type,
+                doc: self.current_doc.take(),
+            });
+            
+            self.expect(Token::Semicolon)?;
+        }
+        
+        self.expect(Token::RBrace)?;
+        
+        // Check for trailing declarators
+        if self.peek() != Token::Semicolon {
+            // Has variable declarations after struct definition
+            self.skip_to_newline_or_semicolon();
+        } else {
+            self.advance();
+        }
+        
+        Ok(Some(Declaration::Struct(CStruct {
+            name,
+            fields,
+            doc: self.current_doc.take(),
+        })))
+    }
+    
+    fn parse_union_decl(&mut self) -> Result<Option<Declaration>, ParseError> {
+        self.expect(Token::Union)?;
+        
+        let name = if let Token::Identifier(n) = self.peek() {
+            self.advance();
+            n
+        } else {
+            format!("__anon_union_{}", self.pos)
+        };
+        
+        if self.peek() != Token::LBrace {
+            return Ok(None);
+        }
+        
+        self.expect(Token::LBrace)?;
+        
+        let mut variants = Vec::new();
+        
+        while self.peek() != Token::RBrace {
+            let var_type = self.parse_type()?;
+            let (var_name, full_type) = self.parse_declarator(var_type)?;
+            
+            variants.push(CUnionVariant {
+                name: var_name,
+                ty: full_type,
+            });
+            
+            self.expect(Token::Semicolon)?;
+        }
+        
+        self.expect(Token::RBrace)?;
+        self.consume_if(Token::Semicolon);
+        
+        Ok(Some(Declaration::Union(CUnion { name, variants })))
+    }
+    
+    fn parse_enum_decl(&mut self) -> Result<Option<Declaration>, ParseError> {
+        self.expect(Token::Enum)?;
+        
+        let name = if let Token::Identifier(n) = self.peek() {
+            self.advance();
+            n
+        } else {
+            format!("__anon_enum_{}", self.pos)
+        };
+        
+        if self.peek() != Token::LBrace {
+            return Ok(None);
+        }
+        
+        self.expect(Token::LBrace)?;
+        
+        let mut variants = Vec::new();
+        let mut next_value: i64 = 0;
+        
+        while self.peek() != Token::RBrace {
+            let var_name = self.expect_identifier()?;
+            
+            let value = if self.consume_if(Token::Equals) {
+                let v = self.parse_constant_expr()?;
+                next_value = v + 1;
+                v
+            } else {
+                let v = next_value;
+                next_value += 1;
+                v
+            };
+            
+            variants.push(CEnumVariant {
+                name: var_name,
+                value,
+            });
+            
+            if !self.consume_if(Token::Comma) {
+                break;
+            }
+        }
+        
+        self.expect(Token::RBrace)?;
+        self.consume_if(Token::Semicolon);
+        
+        Ok(Some(Declaration::Enum(CEnum { name, variants })))
+    }
+    
+    fn parse_function_or_variable(&mut self) -> Result<Option<Declaration>, ParseError> {
+        // Parse storage class and type qualifiers
+        let mut is_static = false;
+        let mut is_extern = false;
+        let mut is_inline = false;
+        
+        loop {
+            match self.peek() {
+                Token::Static => { is_static = true; self.advance(); }
+                Token::Extern => { is_extern = true; self.advance(); }
+                Token::Inline => { is_inline = true; self.advance(); }
+                _ => break,
+            }
+        }
+        
+        // Parse return type
+        let return_type = self.parse_type()?;
+        
+        // Parse declarator
+        let (name, full_type) = self.parse_declarator(return_type)?;
+        
+        // Check if this is a function (has parameter list)
+        if self.peek() == Token::LParen {
+            self.advance();
+            
+            let params = self.parse_parameter_list()?;
+            
+            self.expect(Token::RParen)?;
+            
+            // Skip function body if present
+            if self.peek() == Token::LBrace {
+                self.skip_block();
+            } else {
+                self.expect(Token::Semicolon)?;
+            }
+            
+            Ok(Some(Declaration::Function(CFunction {
+                name,
+                return_type: full_type,
+                params,
+                is_variadic: false, // TODO: detect
+                doc: self.current_doc.take(),
+            })))
+        } else {
+            // Variable declaration
+            self.expect(Token::Semicolon)?;
+            
+            Ok(Some(Declaration::Variable(CVariable {
+                name,
+                ty: full_type,
+                is_const: false,
+            })))
+        }
+    }
+    
+    fn parse_type(&mut self) -> Result<CType, ParseError> {
+        let mut is_const = false;
+        let mut is_volatile = false;
+        let mut is_signed = true;
+        let mut seen_sign = false;
+        let mut base: Option<CType> = None;
+        
+        loop {
+            match self.peek() {
+                Token::Const => { is_const = true; self.advance(); }
+                Token::Volatile => { is_volatile = true; self.advance(); }
+                Token::Signed => { is_signed = true; seen_sign = true; self.advance(); }
+                Token::Unsigned => { is_signed = false; seen_sign = true; self.advance(); }
+                Token::Void => { base = Some(CType::Void); self.advance(); break; }
+                Token::Char => { 
+                    base = Some(if is_signed { CType::SChar } else { CType::UChar }); 
+                    self.advance(); 
+                    break; 
+                }
+                Token::Short => { 
+                    base = Some(if is_signed { CType::Short } else { CType::UShort }); 
+                    self.advance();
+                    self.consume_if(Token::Int);
+                    break; 
+                }
+                Token::Int => { 
+                    base = Some(if is_signed { CType::Int } else { CType::UInt }); 
+                    self.advance(); 
+                    break; 
+                }
+                Token::Long => {
+                    self.advance();
+                    if self.consume_if(Token::Long) {
+                        base = Some(if is_signed { CType::LongLong } else { CType::ULongLong });
+                    } else {
+                        base = Some(if is_signed { CType::Long } else { CType::ULong });
+                    }
+                    self.consume_if(Token::Int);
+                    break;
+                }
+                Token::Float => { base = Some(CType::Float); self.advance(); break; }
+                Token::Double => { 
+                    base = Some(CType::Double); 
+                    self.advance();
+                    if self.peek() == Token::Long {
+                        // long double
+                    }
+                    break; 
+                }
+                Token::Struct => {
+                    self.advance();
+                    let name = self.expect_identifier()?;
+                    base = Some(CType::Struct(CStruct { 
+                        name, 
+                        fields: Vec::new(),
+                        doc: None,
+                    }));
+                    break;
+                }
+                Token::Union => {
+                    self.advance();
+                    let name = self.expect_identifier()?;
+                    base = Some(CType::Union(CUnion { name, variants: Vec::new() }));
+                    break;
+                }
+                Token::Enum => {
+                    self.advance();
+                    let name = self.expect_identifier()?;
+                    base = Some(CType::Enum(CEnum { name, variants: Vec::new() }));
+                    break;
+                }
+                Token::Identifier(name) => {
+                    // Could be a typedef name
+                    if let Some(ty) = self.type_env.get(&name) {
+                        base = Some(ty.clone());
+                        self.advance();
+                        break;
+                    } else {
+                        // Unknown type - treat as opaque
+                        base = Some(CType::Named(name.clone()));
+                        self.advance();
+                        break;
+                    }
+                }
+                _ => {
+                    if seen_sign {
+                        // Just signed/unsigned without base type means int
+                        base = Some(if is_signed { CType::Int } else { CType::UInt });
+                        break;
+                    }
+                    return Err(ParseError::ExpectedType);
+                }
+            }
+        }
+        
+        let mut ty = base.ok_or(ParseError::ExpectedType)?;
+        
+        if is_const {
+            ty = CType::Const(Box::new(ty));
+        }
+        
+        Ok(ty)
+    }
+    
+    fn parse_declarator(&mut self, base_type: CType) -> Result<(String, CType), ParseError> {
+        let mut ty = base_type;
+        
+        // Parse pointer prefixes
+        while self.consume_if(Token::Star) {
+            ty = CType::Pointer(Box::new(ty));
+            
+            // Handle const/volatile after star
+            while self.peek() == Token::Const || self.peek() == Token::Volatile {
+                if self.consume_if(Token::Const) {
+                    ty = CType::Const(Box::new(ty));
+                }
+                self.consume_if(Token::Volatile);
+            }
+        }
+        
+        // Parse name
+        let name = if let Token::Identifier(n) = self.peek() {
+            self.advance();
+            n
+        } else {
+            // Anonymous
+            String::new()
+        };
+        
+        // Parse array suffixes
+        while self.consume_if(Token::LBracket) {
+            let size = if self.peek() != Token::RBracket {
+                Some(self.parse_constant_expr()? as usize)
+            } else {
+                None
+            };
+            self.expect(Token::RBracket)?;
+            ty = CType::Array(Box::new(ty), size);
+        }
+        
+        Ok((name, ty))
+    }
+    
+    fn parse_parameter_list(&mut self) -> Result<Vec<CParam>, ParseError> {
+        let mut params = Vec::new();
+        
+        if self.peek() == Token::RParen {
+            return Ok(params);
+        }
+        
+        // Check for (void)
+        if self.peek() == Token::Void {
+            self.advance();
+            if self.peek() == Token::RParen {
+                return Ok(params);
+            }
+            // Otherwise it's a void* parameter
+            let (name, ty) = self.parse_declarator(CType::Void)?;
+            params.push(CParam { name, ty });
+        } else {
+            let ty = self.parse_type()?;
+            let (name, full_ty) = self.parse_declarator(ty)?;
+            params.push(CParam { name, ty: full_ty });
+        }
+        
+        while self.consume_if(Token::Comma) {
+            if self.peek() == Token::Ellipsis {
+                self.advance();
+                break; // Variadic
+            }
+            
+            let ty = self.parse_type()?;
+            let (name, full_ty) = self.parse_declarator(ty)?;
+            params.push(CParam { name, ty: full_ty });
+        }
+        
+        Ok(params)
+    }
+    
+    fn parse_constant_expr(&mut self) -> Result<i64, ParseError> {
+        // Simplified constant expression parsing
+        match self.peek() {
+            Token::IntLiteral(v) => {
+                self.advance();
+                Ok(v)
+            }
+            Token::UIntLiteral(v) => {
+                self.advance();
+                Ok(v as i64)
+            }
+            Token::Minus => {
+                self.advance();
+                Ok(-self.parse_constant_expr()?)
+            }
+            Token::LParen => {
+                self.advance();
+                let v = self.parse_constant_expr()?;
+                self.expect(Token::RParen)?;
+                Ok(v)
+            }
+            Token::Identifier(name) => {
+                // Could be a constant or enum value
+                self.advance();
+                Ok(0) // Placeholder
+            }
+            _ => Err(ParseError::ExpectedConstant),
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Helpers
+    // ─────────────────────────────────────────────────────────────────────────────
+    
+    fn peek(&self) -> Token {
+        self.tokens.get(self.pos).cloned().unwrap_or(Token::Eof)
+    }
+    
+    fn advance(&mut self) -> Token {
+        let tok = self.peek();
+        self.pos += 1;
+        tok
+    }
+    
+    fn expect(&mut self, expected: Token) -> Result<(), ParseError> {
+        let tok = self.advance();
+        if std::mem::discriminant(&tok) == std::mem::discriminant(&expected) {
+            Ok(())
+        } else {
+            Err(ParseError::Expected(format!("{:?}", expected), format!("{:?}", tok)))
+        }
+    }
+    
+    fn expect_identifier(&mut self) -> Result<String, ParseError> {
+        match self.advance() {
+            Token::Identifier(name) => Ok(name),
+            tok => Err(ParseError::Expected("identifier".to_string(), format!("{:?}", tok))),
+        }
+    }
+    
+    fn consume_if(&mut self, expected: Token) -> bool {
+        if std::mem::discriminant(&self.peek()) == std::mem::discriminant(&expected) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+    
+    fn at_eof(&self) -> bool {
+        matches!(self.peek(), Token::Eof)
+    }
+    
+    fn skip_to_newline_or_semicolon(&mut self) {
+        while !self.at_eof() {
+            match self.peek() {
+                Token::Semicolon | Token::Newline => {
+                    self.advance();
+                    break;
+                }
+                _ => { self.advance(); }
+            }
+        }
+    }
+    
+    fn skip_block(&mut self) {
+        let mut depth = 0;
+        
+        if self.peek() == Token::LBrace {
+            self.advance();
+            depth = 1;
+        }
+        
+        while depth > 0 && !self.at_eof() {
+            match self.advance() {
+                Token::LBrace => depth += 1,
+                Token::RBrace => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    
+    fn should_include_function(&self, name: &str) -> bool {
+        // Check blocklist first
+        for pattern in &self.config.blocklist_functions {
+            if glob_match(pattern, name) {
+                return false;
+            }
+        }
+        
+        // If allowlist is empty, include all
+        if self.config.allowlist_functions.is_empty() {
+            return true;
+        }
+        
+        // Check allowlist
+        for pattern in &self.config.allowlist_functions {
+            if glob_match(pattern, name) {
+                return true;
+            }
+        }
+        
+        false
+    }
+    
+    fn should_include_type(&self, name: &str) -> bool {
+        for pattern in &self.config.blocklist_types {
+            if glob_match(pattern, name) {
+                return false;
+            }
+        }
+        
+        if self.config.allowlist_types.is_empty() {
+            return true;
+        }
+        
+        for pattern in &self.config.allowlist_types {
+            if glob_match(pattern, name) {
+                return true;
+            }
+        }
+        
+        false
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PARSE RESULT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct ParseResult {
+    pub functions: Vec<CFunction>,
+    pub structs: Vec<CStruct>,
+    pub unions: Vec<CUnion>,
+    pub enums: Vec<CEnum>,
+    pub typedefs: BTreeMap<String, CType>,
+    pub constants: Vec<CConstant>,
+    pub variables: Vec<CVariable>,
+}
+
+impl ParseResult {
+    pub fn new() -> Self {
+        ParseResult {
+            functions: Vec::new(),
+            structs: Vec::new(),
+            unions: Vec::new(),
+            enums: Vec::new(),
+            typedefs: BTreeMap::new(),
+            constants: Vec::new(),
+            variables: Vec::new(),
+        }
+    }
+    
+    /// Generate QuantaLang FFI bindings
+    pub fn generate_bindings(&self, config: &ParseConfig) -> Binding {
+        let mut binding = Binding {
+            name: "ffi_bindings".to_string(),
+            functions: Vec::new(),
+            types: Vec::new(),
+            constants: Vec::new(),
+            statics: Vec::new(),
+        };
+        
+        // Generate function bindings
+        for func in &self.functions {
+            binding.functions.push(FunctionBinding {
+                name: func.name.clone(),
+                symbol: func.name.clone(),
+                signature: func.to_signature(config),
+                safety: Safety::Unsafe,
+                doc: func.doc.clone(),
+            });
+        }
+        
+        binding
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// C AST TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub enum Declaration {
+    Function(CFunction),
+    Struct(CStruct),
+    Union(CUnion),
+    Enum(CEnum),
+    Typedef(String, CType),
+    Constant(CConstant),
+    Variable(CVariable),
+}
+
+#[derive(Debug, Clone)]
+pub struct CFunction {
+    pub name: String,
+    pub return_type: CType,
+    pub params: Vec<CParam>,
+    pub is_variadic: bool,
+    pub doc: Option<String>,
+}
+
+impl CFunction {
+    pub fn to_signature(&self, config: &ParseConfig) -> FunctionSignature {
+        FunctionSignature {
+            name: self.name.clone(),
+            abi: Abi::C,
+            params: self.params.iter().map(|p| p.to_parameter(config)).collect(),
+            return_type: self.return_type.to_foreign_type(config),
+            variadic: self.is_variadic,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CParam {
+    pub name: String,
+    pub ty: CType,
+}
+
+impl CParam {
+    pub fn to_parameter(&self, config: &ParseConfig) -> Parameter {
+        Parameter {
+            name: self.name.clone(),
+            ty: self.ty.to_foreign_type(config),
+            nullable: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CStruct {
+    pub name: String,
+    pub fields: Vec<CStructField>,
+    pub doc: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CStructField {
+    pub name: String,
+    pub ty: CType,
+    pub doc: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CUnion {
+    pub name: String,
+    pub variants: Vec<CUnionVariant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CUnionVariant {
+    pub name: String,
+    pub ty: CType,
+}
+
+#[derive(Debug, Clone)]
+pub struct CEnum {
+    pub name: String,
+    pub variants: Vec<CEnumVariant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CEnumVariant {
+    pub name: String,
+    pub value: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CConstant {
+    pub name: String,
+    pub value: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CVariable {
+    pub name: String,
+    pub ty: CType,
+    pub is_const: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum CType {
+    Void,
+    Bool,
+    Char,
+    SChar,
+    UChar,
+    Short,
+    UShort,
+    Int,
+    UInt,
+    Long,
+    ULong,
+    LongLong,
+    ULongLong,
+    Float,
+    Double,
+    Pointer(Box<CType>),
+    Array(Box<CType>, Option<usize>),
+    Const(Box<CType>),
+    Struct(CStruct),
+    Union(CUnion),
+    Enum(CEnum),
+    Named(String),
+    Function(Box<CType>, Vec<CType>),
+}
+
+impl CType {
+    pub fn to_foreign_type(&self, config: &ParseConfig) -> ForeignType {
+        match self {
+            CType::Void => ForeignType::Void,
+            CType::Bool => ForeignType::Bool,
+            CType::Char | CType::SChar => ForeignType::I8,
+            CType::UChar => ForeignType::U8,
+            CType::Short => ForeignType::I16,
+            CType::UShort => ForeignType::U16,
+            CType::Int => ForeignType::I32,
+            CType::UInt => ForeignType::U32,
+            CType::Long => {
+                if config.target.is_lp64() {
+                    ForeignType::I64
+                } else {
+                    ForeignType::I32
+                }
+            }
+            CType::ULong => {
+                if config.target.is_lp64() {
+                    ForeignType::U64
+                } else {
+                    ForeignType::U32
+                }
+            }
+            CType::LongLong => ForeignType::I64,
+            CType::ULongLong => ForeignType::U64,
+            CType::Float => ForeignType::F32,
+            CType::Double => ForeignType::F64,
+            CType::Pointer(inner) => {
+                ForeignType::Pointer(Box::new(inner.to_foreign_type(config)))
+            }
+            CType::Array(elem, size) => {
+                ForeignType::Array {
+                    element: Box::new(elem.to_foreign_type(config)),
+                    len: *size,
+                }
+            }
+            CType::Const(inner) => inner.to_foreign_type(config),
+            CType::Struct(s) => ForeignType::Struct(StructType {
+                name: s.name.clone(),
+                fields: s.fields.iter().map(|f| StructField {
+                    name: f.name.clone(),
+                    ty: f.ty.to_foreign_type(config),
+                    offset: None,
+                }).collect(),
+                packed: false,
+            }),
+            CType::Named(name) => ForeignType::Named(name.clone()),
+            _ => ForeignType::Opaque(0),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub enum ParseError {
+    IoError(String),
+    UnexpectedChar(char),
+    UnterminatedString,
+    UnterminatedChar,
+    UnterminatedComment,
+    InvalidNumber(String),
+    Expected(String, String),
+    ExpectedType,
+    ExpectedConstant,
+    UnexpectedEof,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IoError(e) => write!(f, "I/O error: {}", e),
+            Self::UnexpectedChar(c) => write!(f, "unexpected character: '{}'", c),
+            Self::UnterminatedString => write!(f, "unterminated string literal"),
+            Self::UnterminatedChar => write!(f, "unterminated character literal"),
+            Self::UnterminatedComment => write!(f, "unterminated comment"),
+            Self::InvalidNumber(s) => write!(f, "invalid number: {}", s),
+            Self::Expected(exp, got) => write!(f, "expected {}, got {}", exp, got),
+            Self::ExpectedType => write!(f, "expected type"),
+            Self::ExpectedConstant => write!(f, "expected constant expression"),
+            Self::UnexpectedEof => write!(f, "unexpected end of file"),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    
+    if pattern.starts_with('*') && pattern.ends_with('*') {
+        let inner = &pattern[1..pattern.len()-1];
+        return text.contains(inner);
+    }
+    
+    if pattern.starts_with('*') {
+        return text.ends_with(&pattern[1..]);
+    }
+    
+    if pattern.ends_with('*') {
+        return text.starts_with(&pattern[..pattern.len()-1]);
+    }
+    
+    pattern == text
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_lexer_basic() {
+        let mut lexer = Lexer::new("int x;");
+        let tokens = lexer.tokenize().unwrap();
+        
+        assert!(matches!(tokens[0], Token::Int));
+        assert!(matches!(tokens[1], Token::Identifier(_)));
+        assert!(matches!(tokens[2], Token::Semicolon));
+    }
+    
+    #[test]
+    fn test_lexer_function() {
+        let mut lexer = Lexer::new("void foo(int a, char *b);");
+        let tokens = lexer.tokenize().unwrap();
+        
+        assert!(matches!(tokens[0], Token::Void));
+        assert!(matches!(tokens[1], Token::Identifier(_)));
+        assert!(matches!(tokens[2], Token::LParen));
+    }
+    
+    #[test]
+    fn test_parse_struct() {
+        let config = ParseConfig::default();
+        let mut parser = CParser::new(config);
+        
+        let result = parser.parse_str("struct Point { int x; int y; };").unwrap();
+        
+        assert_eq!(result.structs.len(), 1);
+        assert_eq!(result.structs[0].name, "Point");
+        assert_eq!(result.structs[0].fields.len(), 2);
+    }
+    
+    #[test]
+    fn test_parse_function() {
+        let config = ParseConfig::default();
+        let mut parser = CParser::new(config);
+        
+        let result = parser.parse_str("int add(int a, int b);").unwrap();
+        
+        assert_eq!(result.functions.len(), 1);
+        assert_eq!(result.functions[0].name, "add");
+        assert_eq!(result.functions[0].params.len(), 2);
+    }
+    
+    #[test]
+    fn test_parse_enum() {
+        let config = ParseConfig::default();
+        let mut parser = CParser::new(config);
+        
+        let result = parser.parse_str("enum Color { RED, GREEN = 5, BLUE };").unwrap();
+        
+        assert_eq!(result.enums.len(), 1);
+        assert_eq!(result.enums[0].variants.len(), 3);
+        assert_eq!(result.enums[0].variants[1].value, 5);
+        assert_eq!(result.enums[0].variants[2].value, 6);
+    }
+    
+    #[test]
+    fn test_glob_match() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("foo*", "foobar"));
+        assert!(glob_match("*bar", "foobar"));
+        assert!(glob_match("*oba*", "foobar"));
+        assert!(!glob_match("foo*", "barfoo"));
+    }
+}

@@ -1,0 +1,938 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ REPL — Readline & Input
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Line editing, history management, and completion support.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::repl::readline
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use std::io::{self, Read, Write, BufRead, BufReader};
+use std::path::Path;
+use std::fs::{File, OpenOptions};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HISTORY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Command history
+#[derive(Debug)]
+pub struct History {
+    /// History entries
+    entries: Vec<String>,
+    
+    /// Maximum entries
+    max_size: usize,
+    
+    /// Current position (for navigation)
+    position: usize,
+    
+    /// File path for persistence
+    file_path: Option<std::path::PathBuf>,
+    
+    /// Search query
+    search_query: Option<String>,
+    
+    /// Search results
+    search_results: Vec<usize>,
+    
+    /// Current search index
+    search_index: usize,
+}
+
+impl History {
+    pub fn new(max_size: usize) -> Self {
+        History {
+            entries: Vec::new(),
+            max_size,
+            position: 0,
+            file_path: None,
+            search_query: None,
+            search_results: Vec::new(),
+            search_index: 0,
+        }
+    }
+    
+    /// Load history from file
+    pub fn load(&mut self, path: &Path) -> io::Result<()> {
+        self.file_path = Some(path.to_path_buf());
+        
+        if !path.exists() {
+            return Ok(());
+        }
+        
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        
+        for line in reader.lines() {
+            let line = line?;
+            if !line.is_empty() {
+                self.entries.push(line);
+            }
+        }
+        
+        // Truncate if over max
+        while self.entries.len() > self.max_size {
+            self.entries.remove(0);
+        }
+        
+        self.position = self.entries.len();
+        
+        Ok(())
+    }
+    
+    /// Save history to file
+    pub fn save(&self) -> io::Result<()> {
+        let path = match &self.file_path {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        
+        for entry in &self.entries {
+            writeln!(file, "{}", entry)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Add entry to history
+    pub fn add(&mut self, line: &str) {
+        let line = line.trim();
+        
+        if line.is_empty() {
+            return;
+        }
+        
+        // Don't add duplicates of the last entry
+        if self.entries.last().map(|s| s.as_str()) == Some(line) {
+            return;
+        }
+        
+        self.entries.push(line.to_string());
+        
+        // Truncate if over max
+        while self.entries.len() > self.max_size {
+            self.entries.remove(0);
+        }
+        
+        self.position = self.entries.len();
+    }
+    
+    /// Get previous entry
+    pub fn prev(&mut self) -> Option<&str> {
+        if self.position > 0 {
+            self.position -= 1;
+            Some(&self.entries[self.position])
+        } else {
+            None
+        }
+    }
+    
+    /// Get next entry
+    pub fn next(&mut self) -> Option<&str> {
+        if self.position < self.entries.len() {
+            self.position += 1;
+            if self.position < self.entries.len() {
+                Some(&self.entries[self.position])
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+    
+    /// Reset position to end
+    pub fn reset_position(&mut self) {
+        self.position = self.entries.len();
+    }
+    
+    /// Get entry by index
+    pub fn get(&self, index: usize) -> Option<&str> {
+        self.entries.get(index).map(|s| s.as_str())
+    }
+    
+    /// Get all entries
+    pub fn entries(&self) -> &[String] {
+        &self.entries
+    }
+    
+    /// Get entry count
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    
+    /// Clear history
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.position = 0;
+    }
+    
+    /// Search history
+    pub fn search(&mut self, query: &str) {
+        self.search_query = Some(query.to_lowercase());
+        self.search_results.clear();
+        
+        let query_lower = query.to_lowercase();
+        
+        for (i, entry) in self.entries.iter().enumerate().rev() {
+            if entry.to_lowercase().contains(&query_lower) {
+                self.search_results.push(i);
+            }
+        }
+        
+        self.search_index = 0;
+    }
+    
+    /// Get current search result
+    pub fn search_current(&self) -> Option<&str> {
+        self.search_results.get(self.search_index)
+            .and_then(|&i| self.entries.get(i))
+            .map(|s| s.as_str())
+    }
+    
+    /// Next search result
+    pub fn search_next(&mut self) -> Option<&str> {
+        if self.search_index + 1 < self.search_results.len() {
+            self.search_index += 1;
+        }
+        self.search_current()
+    }
+    
+    /// Previous search result
+    pub fn search_prev(&mut self) -> Option<&str> {
+        if self.search_index > 0 {
+            self.search_index -= 1;
+        }
+        self.search_current()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINE EDITOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Line editor state
+#[derive(Debug)]
+pub struct LineEditor {
+    /// Current line buffer
+    buffer: String,
+    
+    /// Cursor position (byte offset)
+    cursor: usize,
+    
+    /// History
+    history: History,
+    
+    /// Completions
+    completions: Vec<String>,
+    
+    /// Current completion index
+    completion_index: usize,
+    
+    /// Original text before completion
+    completion_original: Option<String>,
+    
+    /// Multi-line mode
+    multiline: bool,
+    
+    /// Lines for multi-line input
+    lines: Vec<String>,
+    
+    /// Terminal width
+    width: usize,
+    
+    /// Prompt length
+    prompt_len: usize,
+}
+
+impl LineEditor {
+    pub fn new() -> Self {
+        LineEditor {
+            buffer: String::new(),
+            cursor: 0,
+            history: History::new(1000),
+            completions: Vec::new(),
+            completion_index: 0,
+            completion_original: None,
+            multiline: false,
+            lines: Vec::new(),
+            width: 80,
+            prompt_len: 4,
+        }
+    }
+    
+    /// Set history
+    pub fn with_history(mut self, history: History) -> Self {
+        self.history = history;
+        self
+    }
+    
+    /// Get history reference
+    pub fn history(&self) -> &History {
+        &self.history
+    }
+    
+    /// Get mutable history reference
+    pub fn history_mut(&mut self) -> &mut History {
+        &mut self.history
+    }
+    
+    /// Get current buffer
+    pub fn buffer(&self) -> &str {
+        &self.buffer
+    }
+    
+    /// Get cursor position
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+    
+    /// Set buffer
+    pub fn set_buffer(&mut self, text: &str) {
+        self.buffer = text.to_string();
+        self.cursor = self.buffer.len();
+    }
+    
+    /// Clear buffer
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+        self.cursor = 0;
+    }
+    
+    /// Insert character at cursor
+    pub fn insert(&mut self, c: char) {
+        self.buffer.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+        self.clear_completions();
+    }
+    
+    /// Insert string at cursor
+    pub fn insert_str(&mut self, s: &str) {
+        self.buffer.insert_str(self.cursor, s);
+        self.cursor += s.len();
+        self.clear_completions();
+    }
+    
+    /// Delete character before cursor (backspace)
+    pub fn backspace(&mut self) -> bool {
+        if self.cursor > 0 {
+            // Find previous char boundary
+            let prev = self.buffer[..self.cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            
+            self.buffer.remove(prev);
+            self.cursor = prev;
+            self.clear_completions();
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Delete character at cursor (delete)
+    pub fn delete(&mut self) -> bool {
+        if self.cursor < self.buffer.len() {
+            self.buffer.remove(self.cursor);
+            self.clear_completions();
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Move cursor left
+    pub fn move_left(&mut self) -> bool {
+        if self.cursor > 0 {
+            // Find previous char boundary
+            self.cursor = self.buffer[..self.cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Move cursor right
+    pub fn move_right(&mut self) -> bool {
+        if self.cursor < self.buffer.len() {
+            // Find next char boundary
+            self.cursor = self.buffer[self.cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| self.cursor + i)
+                .unwrap_or(self.buffer.len());
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Move cursor to start
+    pub fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+    
+    /// Move cursor to end
+    pub fn move_end(&mut self) {
+        self.cursor = self.buffer.len();
+    }
+    
+    /// Move to previous word
+    pub fn move_word_left(&mut self) {
+        while self.cursor > 0 {
+            self.move_left();
+            if self.cursor > 0 {
+                let c = self.buffer[..self.cursor].chars().last().unwrap();
+                if !c.is_alphanumeric() && c != '_' {
+                    break;
+                }
+            }
+        }
+    }
+    
+    /// Move to next word
+    pub fn move_word_right(&mut self) {
+        while self.cursor < self.buffer.len() {
+            self.move_right();
+            if self.cursor < self.buffer.len() {
+                let c = self.buffer[self.cursor..].chars().next().unwrap();
+                if !c.is_alphanumeric() && c != '_' {
+                    break;
+                }
+            }
+        }
+    }
+    
+    /// Delete word before cursor
+    pub fn delete_word(&mut self) {
+        let start = self.cursor;
+        self.move_word_left();
+        self.buffer.replace_range(self.cursor..start, "");
+        self.clear_completions();
+    }
+    
+    /// Delete to end of line
+    pub fn kill_line(&mut self) {
+        self.buffer.truncate(self.cursor);
+        self.clear_completions();
+    }
+    
+    /// Delete to start of line
+    pub fn kill_line_before(&mut self) {
+        self.buffer = self.buffer[self.cursor..].to_string();
+        self.cursor = 0;
+        self.clear_completions();
+    }
+    
+    /// Transpose characters
+    pub fn transpose(&mut self) {
+        if self.cursor > 0 && self.cursor < self.buffer.len() {
+            let chars: Vec<char> = self.buffer.chars().collect();
+            let char_idx = self.buffer[..self.cursor]
+                .chars()
+                .count()
+                .saturating_sub(1);
+            
+            if char_idx + 1 < chars.len() {
+                let mut new_chars = chars.clone();
+                new_chars.swap(char_idx, char_idx + 1);
+                self.buffer = new_chars.iter().collect();
+            }
+        }
+    }
+    
+    /// History: previous
+    pub fn history_prev(&mut self) {
+        if let Some(line) = self.history.prev() {
+            self.buffer = line.to_string();
+            self.cursor = self.buffer.len();
+        }
+    }
+    
+    /// History: next
+    pub fn history_next(&mut self) {
+        match self.history.next() {
+            Some(line) => {
+                self.buffer = line.to_string();
+                self.cursor = self.buffer.len();
+            }
+            None => {
+                self.buffer.clear();
+                self.cursor = 0;
+            }
+        }
+    }
+    
+    /// Set completions
+    pub fn set_completions(&mut self, completions: Vec<String>) {
+        self.completions = completions;
+        self.completion_index = 0;
+        
+        if !self.completions.is_empty() {
+            // Save original
+            let word_start = self.find_word_start();
+            self.completion_original = Some(self.buffer[word_start..self.cursor].to_string());
+        }
+    }
+    
+    /// Next completion
+    pub fn complete_next(&mut self) -> bool {
+        if self.completions.is_empty() {
+            return false;
+        }
+        
+        let word_start = self.find_word_start();
+        let completion = &self.completions[self.completion_index];
+        
+        // Replace current word with completion
+        self.buffer.replace_range(word_start..self.cursor, completion);
+        self.cursor = word_start + completion.len();
+        
+        self.completion_index = (self.completion_index + 1) % self.completions.len();
+        true
+    }
+    
+    /// Previous completion
+    pub fn complete_prev(&mut self) -> bool {
+        if self.completions.is_empty() {
+            return false;
+        }
+        
+        self.completion_index = if self.completion_index == 0 {
+            self.completions.len() - 1
+        } else {
+            self.completion_index - 1
+        };
+        
+        let word_start = self.find_word_start();
+        let completion = &self.completions[self.completion_index];
+        
+        self.buffer.replace_range(word_start..self.cursor, completion);
+        self.cursor = word_start + completion.len();
+        true
+    }
+    
+    /// Clear completions
+    pub fn clear_completions(&mut self) {
+        self.completions.clear();
+        self.completion_original = None;
+        self.completion_index = 0;
+    }
+    
+    /// Find start of current word
+    fn find_word_start(&self) -> usize {
+        self.buffer[..self.cursor]
+            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    }
+    
+    /// Get current word
+    pub fn current_word(&self) -> &str {
+        let start = self.find_word_start();
+        &self.buffer[start..self.cursor]
+    }
+    
+    /// Check if input is complete (balanced brackets)
+    pub fn is_complete(&self) -> bool {
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut in_char = false;
+        
+        for c in self.buffer.chars() {
+            match c {
+                '"' if !in_char => in_string = !in_string,
+                '\'' if !in_string => in_char = !in_char,
+                '{' | '(' | '[' if !in_string && !in_char => depth += 1,
+                '}' | ')' | ']' if !in_string && !in_char => depth -= 1,
+                _ => {}
+            }
+        }
+        
+        depth <= 0
+    }
+    
+    /// Submit current line
+    pub fn submit(&mut self) -> String {
+        let line = std::mem::take(&mut self.buffer);
+        self.cursor = 0;
+        self.history.add(&line);
+        self.history.reset_position();
+        self.clear_completions();
+        line
+    }
+}
+
+impl Default for LineEditor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TERMINAL INPUT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Key input
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Char(char),
+    Enter,
+    Tab,
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Escape,
+    CtrlA,
+    CtrlB,
+    CtrlC,
+    CtrlD,
+    CtrlE,
+    CtrlF,
+    CtrlK,
+    CtrlL,
+    CtrlN,
+    CtrlP,
+    CtrlR,
+    CtrlT,
+    CtrlU,
+    CtrlW,
+    AltB,
+    AltF,
+    Unknown,
+}
+
+/// Read a key from terminal
+pub fn read_key() -> io::Result<Key> {
+    let mut buf = [0u8; 4];
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+    
+    let n = handle.read(&mut buf[..1])?;
+    if n == 0 {
+        return Ok(Key::CtrlD);
+    }
+    
+    let key = match buf[0] {
+        0x00 => Key::Unknown,
+        0x01 => Key::CtrlA,
+        0x02 => Key::CtrlB,
+        0x03 => Key::CtrlC,
+        0x04 => Key::CtrlD,
+        0x05 => Key::CtrlE,
+        0x06 => Key::CtrlF,
+        0x0B => Key::CtrlK,
+        0x0C => Key::CtrlL,
+        0x0E => Key::CtrlN,
+        0x10 => Key::CtrlP,
+        0x12 => Key::CtrlR,
+        0x14 => Key::CtrlT,
+        0x15 => Key::CtrlU,
+        0x17 => Key::CtrlW,
+        0x09 => Key::Tab,
+        0x0D | 0x0A => Key::Enter,
+        0x1B => {
+            // Escape sequence
+            handle.read(&mut buf[1..2])?;
+            
+            if buf[1] == b'[' {
+                handle.read(&mut buf[2..3])?;
+                
+                match buf[2] {
+                    b'A' => Key::Up,
+                    b'B' => Key::Down,
+                    b'C' => Key::Right,
+                    b'D' => Key::Left,
+                    b'H' => Key::Home,
+                    b'F' => Key::End,
+                    b'3' => {
+                        handle.read(&mut buf[3..4])?;
+                        if buf[3] == b'~' {
+                            Key::Delete
+                        } else {
+                            Key::Unknown
+                        }
+                    }
+                    b'5' => {
+                        handle.read(&mut buf[3..4])?;
+                        Key::PageUp
+                    }
+                    b'6' => {
+                        handle.read(&mut buf[3..4])?;
+                        Key::PageDown
+                    }
+                    _ => Key::Unknown,
+                }
+            } else if buf[1] == b'b' {
+                Key::AltB
+            } else if buf[1] == b'f' {
+                Key::AltF
+            } else if buf[1] == 0x1B {
+                Key::Escape
+            } else {
+                Key::Escape
+            }
+        }
+        0x7F => Key::Backspace,
+        c => {
+            // UTF-8 handling
+            if c & 0x80 == 0 {
+                Key::Char(c as char)
+            } else if c & 0xE0 == 0xC0 {
+                handle.read(&mut buf[1..2])?;
+                let s = std::str::from_utf8(&buf[..2]).ok()
+                    .and_then(|s| s.chars().next());
+                s.map(Key::Char).unwrap_or(Key::Unknown)
+            } else if c & 0xF0 == 0xE0 {
+                handle.read(&mut buf[1..3])?;
+                let s = std::str::from_utf8(&buf[..3]).ok()
+                    .and_then(|s| s.chars().next());
+                s.map(Key::Char).unwrap_or(Key::Unknown)
+            } else if c & 0xF8 == 0xF0 {
+                handle.read(&mut buf[1..4])?;
+                let s = std::str::from_utf8(&buf[..4]).ok()
+                    .and_then(|s| s.chars().next());
+                s.map(Key::Char).unwrap_or(Key::Unknown)
+            } else {
+                Key::Unknown
+            }
+        }
+    };
+    
+    Ok(key)
+}
+
+/// Enable raw mode
+#[cfg(unix)]
+pub fn enable_raw_mode() -> io::Result<Termios> {
+    use std::os::unix::io::AsRawFd;
+    
+    let fd = io::stdin().as_raw_fd();
+    let original = get_termios(fd)?;
+    
+    let mut raw = original.clone();
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+    raw.c_iflag &= !(libc::IXON | libc::ICRNL);
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    
+    set_termios(fd, &raw)?;
+    
+    Ok(original)
+}
+
+/// Disable raw mode
+#[cfg(unix)]
+pub fn disable_raw_mode(original: &Termios) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = io::stdin().as_raw_fd();
+    set_termios(fd, original)
+}
+
+#[cfg(unix)]
+pub type Termios = libc::termios;
+
+#[cfg(unix)]
+fn get_termios(fd: i32) -> io::Result<Termios> {
+    unsafe {
+        let mut termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut termios) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(termios)
+    }
+}
+
+#[cfg(unix)]
+fn set_termios(fd: i32, termios: &Termios) -> io::Result<()> {
+    unsafe {
+        if libc::tcsetattr(fd, libc::TCSANOW, termios) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+pub type Termios = ();
+
+#[cfg(not(unix))]
+pub fn enable_raw_mode() -> io::Result<Termios> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn disable_raw_mode(_: &Termios) -> io::Result<()> {
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPLETION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Completion provider trait
+pub trait Completer {
+    fn complete(&self, line: &str, cursor: usize) -> Vec<String>;
+}
+
+/// Basic keyword completer
+pub struct KeywordCompleter {
+    keywords: Vec<String>,
+}
+
+impl KeywordCompleter {
+    pub fn new() -> Self {
+        KeywordCompleter {
+            keywords: vec![
+                "let".to_string(),
+                "mut".to_string(),
+                "fn".to_string(),
+                "if".to_string(),
+                "else".to_string(),
+                "match".to_string(),
+                "loop".to_string(),
+                "while".to_string(),
+                "for".to_string(),
+                "in".to_string(),
+                "return".to_string(),
+                "break".to_string(),
+                "continue".to_string(),
+                "struct".to_string(),
+                "enum".to_string(),
+                "impl".to_string(),
+                "trait".to_string(),
+                "type".to_string(),
+                "use".to_string(),
+                "mod".to_string(),
+                "pub".to_string(),
+                "self".to_string(),
+                "Self".to_string(),
+                "true".to_string(),
+                "false".to_string(),
+                "None".to_string(),
+                "Some".to_string(),
+                "Ok".to_string(),
+                "Err".to_string(),
+            ],
+        }
+    }
+    
+    pub fn add_keyword(&mut self, keyword: &str) {
+        self.keywords.push(keyword.to_string());
+    }
+}
+
+impl Default for KeywordCompleter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Completer for KeywordCompleter {
+    fn complete(&self, line: &str, cursor: usize) -> Vec<String> {
+        // Find current word
+        let word_start = line[..cursor]
+            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        
+        let prefix = &line[word_start..cursor];
+        
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+        
+        self.keywords
+            .iter()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_history() {
+        let mut history = History::new(10);
+        
+        history.add("first");
+        history.add("second");
+        history.add("third");
+        
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.prev(), Some("third"));
+        assert_eq!(history.prev(), Some("second"));
+        assert_eq!(history.prev(), Some("first"));
+        assert_eq!(history.prev(), None);
+    }
+    
+    #[test]
+    fn test_line_editor() {
+        let mut editor = LineEditor::new();
+        
+        editor.insert('h');
+        editor.insert('e');
+        editor.insert('l');
+        editor.insert('l');
+        editor.insert('o');
+        
+        assert_eq!(editor.buffer(), "hello");
+        assert_eq!(editor.cursor(), 5);
+        
+        editor.move_left();
+        editor.move_left();
+        assert_eq!(editor.cursor(), 3);
+        
+        editor.backspace();
+        assert_eq!(editor.buffer(), "helo");
+    }
+    
+    #[test]
+    fn test_completer() {
+        let completer = KeywordCompleter::new();
+        
+        let completions = completer.complete("le", 2);
+        assert!(completions.contains(&"let".to_string()));
+        
+        let completions = completer.complete("fn foo() { ret", 14);
+        assert!(completions.contains(&"return".to_string()));
+    }
+}

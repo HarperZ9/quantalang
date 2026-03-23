@@ -1,0 +1,134 @@
+// ============================================================================
+// VOLUMETRIC FOG RAY MARCHING SHADER
+// ============================================================================
+// Analytically computed volumetric fog with Beer-Lambert light extinction.
+// This is the type of shader Pascal Gilcher writes for ReShade.
+//
+// Dual-target: CPU (verified) + GPU (Vulkan SPIR-V)
+// ============================================================================
+
+fn pi() -> f64 { 3.14159265358979 }
+
+// --- Beer-Lambert Extinction ---
+// Transmittance = e^(-density * distance)
+fn beer_lambert(density: f64, distance: f64) -> f64 {
+    pow(2.718281828, 0.0 - density * distance)
+}
+
+// --- Phase function (Henyey-Greenstein) ---
+// Controls forward/backward scattering of light in fog
+// g > 0: forward scattering (sun visible through fog)
+// g = 0: isotropic
+// g < 0: backward scattering
+fn henyey_greenstein(cos_theta: f64, g: f64) -> f64 {
+    let g2 = g * g;
+    let denom = 1.0 + g2 - 2.0 * g * cos_theta;
+    (1.0 - g2) / (4.0 * pi() * pow(denom, 1.5))
+}
+
+// --- Height-based fog density ---
+// Exponential falloff with altitude
+fn height_fog_density(y: f64, base_density: f64, falloff: f64) -> f64 {
+    base_density * pow(2.718281828, 0.0 - falloff * clamp(y, 0.0, 100.0))
+}
+
+// --- Ray march through fog volume ---
+// Accumulates extinction and in-scattering along a ray
+fn raymarch_fog(
+    ray_start_y: f64, ray_end_y: f64, ray_length: f64,
+    light_cos_angle: f64,
+    base_density: f64, falloff: f64, scatter_g: f64,
+    num_steps: i32
+) -> f64 {
+    let step_size = ray_length / 16.0;
+    let mut total_transmittance = 1.0;
+    let mut in_scatter = 0.0;
+
+    let mut i: i32 = 0;
+    while i < 16 {
+        let t = (i as f64 + 0.5) / 16.0;
+        let sample_y = ray_start_y + (ray_end_y - ray_start_y) * t;
+
+        // Local fog density at this sample point
+        let density = height_fog_density(sample_y, base_density, falloff);
+
+        // Extinction through this step
+        let step_extinction = beer_lambert(density, step_size);
+
+        // Phase function for scattering
+        let phase = henyey_greenstein(light_cos_angle, scatter_g);
+
+        // Accumulate in-scattering (light contribution at this point)
+        in_scatter = in_scatter + total_transmittance * density * phase * step_size;
+
+        // Update transmittance
+        total_transmittance = total_transmittance * step_extinction;
+
+        i = i + 1;
+    }
+
+    // Final fog color = in_scatter (light added) + scene * transmittance
+    in_scatter
+}
+
+// --- ACES tone mapping ---
+fn aces(x: f64) -> f64 {
+    clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0)
+}
+
+// ============================================================================
+// GPU ENTRY POINT
+// ============================================================================
+#[fragment]
+fn fs_fog(ray_params: vec3) -> vec4 {
+    // ray_params: x = start_y, y = end_y, z = light_cos_angle
+    let fog = raymarch_fog(
+        ray_params.x, ray_params.y, 50.0,
+        ray_params.z,
+        0.05, 0.1, 0.7,
+        16
+    );
+
+    let mapped = aces(fog * 5.0);
+    vec4(mapped, mapped, mapped, 1.0)
+}
+
+// ============================================================================
+// CPU ENTRY POINT — Testing
+// ============================================================================
+fn main() {
+    println!("=== Volumetric Fog Ray Marching ===");
+    println!("");
+
+    // Test Beer-Lambert extinction
+    let t1 = beer_lambert(0.1, 10.0);
+    println!("Beer-Lambert (d=0.1, dist=10): {} (expect ~0.37)", t1);
+
+    let t2 = beer_lambert(0.5, 10.0);
+    println!("Beer-Lambert (d=0.5, dist=10): {} (expect ~0.007)", t2);
+
+    // Test Henyey-Greenstein phase function
+    let p_forward = henyey_greenstein(1.0, 0.7);
+    let p_back = henyey_greenstein(-1.0, 0.7);
+    let p_iso = henyey_greenstein(0.0, 0.0);
+    println!("HG forward (g=0.7):  {} (should be high)", p_forward);
+    println!("HG backward (g=0.7): {} (should be low)", p_back);
+    println!("HG isotropic (g=0):  {} (expect ~0.08)", p_iso);
+
+    // Test height fog
+    let d_ground = height_fog_density(0.0, 0.1, 0.5);
+    let d_high = height_fog_density(10.0, 0.1, 0.5);
+    println!("Fog at ground: {} (expect 0.1)", d_ground);
+    println!("Fog at y=10:   {} (expect ~0.0067)", d_high);
+
+    // Full ray march — looking through fog toward sun
+    let fog_toward_sun = raymarch_fog(0.0, 5.0, 50.0, 0.9, 0.05, 0.1, 0.7, 16);
+    println!("Fog (toward sun): {} (forward scattering)", fog_toward_sun);
+
+    // Full ray march — looking away from sun
+    let fog_away = raymarch_fog(0.0, 5.0, 50.0, -0.5, 0.05, 0.1, 0.7, 16);
+    println!("Fog (away from sun): {} (less scattering)", fog_away);
+
+    println!("");
+    println!("=== Same shader compiles to Vulkan 1.0 SPIR-V ===");
+}

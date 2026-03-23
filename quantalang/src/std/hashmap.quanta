@@ -1,0 +1,1155 @@
+// QUANTA Standard Library - HashMap
+// Robin Hood hashing with linear probing for cache efficiency
+
+module std::hashmap;
+
+use std::vec::Vec;
+use runtime::allocator::{Allocator, GlobalAllocator, Layout};
+use core::mem::{size_of, align_of, swap, zeroed};
+use core::ptr::{null_mut, drop_in_place, write, read};
+use core::hash::{Hash, Hasher, BuildHasher};
+use core::cmp::{PartialEq, Eq};
+use core::ops::Index;
+use core::iter::{Iterator, IntoIterator, FromIterator};
+use core::option::Option::{self, Some, None};
+use core::fmt::{Debug, Formatter, Result as FmtResult};
+use core::clone::Clone;
+
+/// Default hasher using SipHash 1-3
+pub struct DefaultHasher {
+    k0: u64,
+    k1: u64,
+    state: u64,
+    tail: u64,
+    ntail: usize,
+    len: usize,
+}
+
+impl DefaultHasher {
+    pub fn new() -> Self {
+        Self::with_keys(0x0706050403020100, 0x0f0e0d0c0b0a0908)
+    }
+    
+    pub fn with_keys(k0: u64, k1: u64) -> Self {
+        let mut state = Self {
+            k0,
+            k1,
+            state: 0,
+            tail: 0,
+            ntail: 0,
+            len: 0,
+        };
+        state.reset();
+        state
+    }
+    
+    fn reset(&mut self) {
+        self.state = self.k0 ^ 0x736f6d6570736575;
+        self.tail = 0;
+        self.ntail = 0;
+        self.len = 0;
+    }
+    
+    #[inline]
+    fn sip_round(&mut self) {
+        let mut v0 = self.state;
+        let mut v1 = self.k1 ^ 0x646f72616e646f6d;
+        let mut v2 = self.k0 ^ 0x6c7967656e657261;
+        let mut v3 = self.k1 ^ 0x7465646279746573;
+        
+        v0 = v0.wrapping_add(v1);
+        v1 = v1.rotate_left(13);
+        v1 ^= v0;
+        v0 = v0.rotate_left(32);
+        v2 = v2.wrapping_add(v3);
+        v3 = v3.rotate_left(16);
+        v3 ^= v2;
+        v0 = v0.wrapping_add(v3);
+        v3 = v3.rotate_left(21);
+        v3 ^= v0;
+        v2 = v2.wrapping_add(v1);
+        v1 = v1.rotate_left(17);
+        v1 ^= v2;
+        v2 = v2.rotate_left(32);
+        
+        self.state = v0 ^ v1 ^ v2 ^ v3;
+    }
+}
+
+impl Hasher for DefaultHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut data = bytes;
+        self.len += data.len();
+        
+        // Process tail
+        if self.ntail > 0 {
+            while self.ntail < 8 && !data.is_empty() {
+                self.tail |= (data[0] as u64) << (self.ntail * 8);
+                self.ntail += 1;
+                data = &data[1..];
+            }
+            if self.ntail == 8 {
+                self.state ^= self.tail;
+                self.sip_round();
+                self.tail = 0;
+                self.ntail = 0;
+            }
+        }
+        
+        // Process full u64 blocks
+        while data.len() >= 8 {
+            let block = u64::from_le_bytes([
+                data[0], data[1], data[2], data[3],
+                data[4], data[5], data[6], data[7]
+            ]);
+            self.state ^= block;
+            self.sip_round();
+            data = &data[8..];
+        }
+        
+        // Save remaining tail
+        for (i, &byte) in data.iter().enumerate() {
+            self.tail |= (byte as u64) << (i * 8);
+        }
+        self.ntail = data.len();
+    }
+    
+    fn finish(&self) -> u64 {
+        let mut state = self.state;
+        let b = ((self.len as u64) << 56) | self.tail;
+        state ^= b;
+        
+        // Final rounds
+        let mut v0 = state;
+        let mut v1 = self.k1 ^ 0x646f72616e646f6d;
+        let mut v2 = self.k0 ^ 0x6c7967656e657261 ^ 0xff;
+        let mut v3 = self.k1 ^ 0x7465646279746573;
+        
+        for _ in 0..3 {
+            v0 = v0.wrapping_add(v1);
+            v1 = v1.rotate_left(13);
+            v1 ^= v0;
+            v0 = v0.rotate_left(32);
+            v2 = v2.wrapping_add(v3);
+            v3 = v3.rotate_left(16);
+            v3 ^= v2;
+            v0 = v0.wrapping_add(v3);
+            v3 = v3.rotate_left(21);
+            v3 ^= v0;
+            v2 = v2.wrapping_add(v1);
+            v1 = v1.rotate_left(17);
+            v1 ^= v2;
+            v2 = v2.rotate_left(32);
+        }
+        
+        v0 ^ v1 ^ v2 ^ v3
+    }
+}
+
+/// Build hasher with random keys
+pub struct RandomState {
+    k0: u64,
+    k1: u64,
+}
+
+impl RandomState {
+    pub fn new() -> Self {
+        // Use ASLR-based entropy + thread ID + counter
+        static COUNTER: core::sync::atomic::AtomicU64 = 
+            core::sync::atomic::AtomicU64::new(0);
+        
+        let counter = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let stack_addr = &counter as *const _ as u64;
+        
+        Self {
+            k0: stack_addr ^ (counter << 32),
+            k1: stack_addr.wrapping_mul(0x517cc1b727220a95) ^ counter,
+        }
+    }
+}
+
+impl BuildHasher for RandomState {
+    type Hasher = DefaultHasher;
+    
+    fn build_hasher(&self) -> DefaultHasher {
+        DefaultHasher::with_keys(self.k0, self.k1)
+    }
+}
+
+impl Default for RandomState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Bucket state
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BucketState {
+    Empty,
+    Occupied,
+    Tombstone,
+}
+
+/// Bucket storing key-value pair with metadata
+struct Bucket<K, V> {
+    state: BucketState,
+    hash: u64,         // Cached hash
+    psl: u16,          // Probe sequence length (for Robin Hood)
+    key: core::mem::MaybeUninit<K>,
+    value: core::mem::MaybeUninit<V>,
+}
+
+impl<K, V> Bucket<K, V> {
+    const fn empty() -> Self {
+        Self {
+            state: BucketState::Empty,
+            hash: 0,
+            psl: 0,
+            key: core::mem::MaybeUninit::uninit(),
+            value: core::mem::MaybeUninit::uninit(),
+        }
+    }
+    
+    fn is_empty(&self) -> bool {
+        self.state == BucketState::Empty
+    }
+    
+    fn is_occupied(&self) -> bool {
+        self.state == BucketState::Occupied
+    }
+    
+    fn is_tombstone(&self) -> bool {
+        self.state == BucketState::Tombstone
+    }
+    
+    unsafe fn key(&self) -> &K {
+        self.key.assume_init_ref()
+    }
+    
+    unsafe fn value(&self) -> &V {
+        self.value.assume_init_ref()
+    }
+    
+    unsafe fn value_mut(&mut self) -> &mut V {
+        self.value.assume_init_mut()
+    }
+    
+    unsafe fn take(&mut self) -> (K, V) {
+        self.state = BucketState::Tombstone;
+        (self.key.assume_init_read(), self.value.assume_init_read())
+    }
+    
+    fn insert(&mut self, hash: u64, psl: u16, key: K, value: V) {
+        self.state = BucketState::Occupied;
+        self.hash = hash;
+        self.psl = psl;
+        self.key.write(key);
+        self.value.write(value);
+    }
+}
+
+/// Hash map parameters
+const INITIAL_CAPACITY: usize = 16;
+const MAX_LOAD_FACTOR: f64 = 0.875;
+const MIN_LOAD_FACTOR: f64 = 0.25;
+
+/// Hash map with Robin Hood hashing
+pub struct HashMap<K, V, S = RandomState> {
+    buckets: *mut Bucket<K, V>,
+    capacity: usize,
+    len: usize,
+    tombstones: usize,
+    hash_builder: S,
+}
+
+impl<K, V> HashMap<K, V, RandomState> {
+    /// Create empty HashMap
+    pub fn new() -> Self {
+        Self::with_hasher(RandomState::new())
+    }
+    
+    /// Create with capacity
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_and_hasher(capacity, RandomState::new())
+    }
+}
+
+impl<K, V, S: BuildHasher> HashMap<K, V, S> {
+    /// Create with custom hasher
+    pub fn with_hasher(hash_builder: S) -> Self {
+        Self {
+            buckets: null_mut(),
+            capacity: 0,
+            len: 0,
+            tombstones: 0,
+            hash_builder,
+        }
+    }
+    
+    /// Create with capacity and custom hasher
+    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
+        let capacity = capacity.next_power_of_two().max(INITIAL_CAPACITY);
+        let mut map = Self {
+            buckets: null_mut(),
+            capacity: 0,
+            len: 0,
+            tombstones: 0,
+            hash_builder,
+        };
+        map.allocate(capacity);
+        map
+    }
+    
+    /// Allocate bucket array
+    fn allocate(&mut self, capacity: usize) {
+        let layout = Layout::array::<Bucket<K, V>>(capacity).unwrap();
+        let ptr = unsafe { GlobalAllocator.alloc_zeroed(layout) as *mut Bucket<K, V> };
+        
+        if ptr.is_null() {
+            panic!("HashMap allocation failed");
+        }
+        
+        // Initialize empty buckets
+        for i in 0..capacity {
+            unsafe { write(ptr.add(i), Bucket::empty()); }
+        }
+        
+        self.buckets = ptr;
+        self.capacity = capacity;
+    }
+    
+    /// Deallocate bucket array
+    fn deallocate(&mut self) {
+        if !self.buckets.is_null() && self.capacity > 0 {
+            // Drop occupied buckets
+            for i in 0..self.capacity {
+                let bucket = unsafe { &mut *self.buckets.add(i) };
+                if bucket.is_occupied() {
+                    unsafe {
+                        drop_in_place(bucket.key.assume_init_mut());
+                        drop_in_place(bucket.value.assume_init_mut());
+                    }
+                }
+            }
+            
+            let layout = Layout::array::<Bucket<K, V>>(self.capacity).unwrap();
+            unsafe { GlobalAllocator.dealloc(self.buckets as *mut u8, layout); }
+            self.buckets = null_mut();
+            self.capacity = 0;
+        }
+    }
+    
+    /// Hash a key
+    fn hash_key<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
+        let mut hasher = self.hash_builder.build_hasher();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+    
+    /// Get bucket index from hash
+    #[inline]
+    fn bucket_index(&self, hash: u64) -> usize {
+        (hash as usize) & (self.capacity - 1)  // capacity is power of 2
+    }
+    
+    /// Number of entries
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    
+    /// Capacity
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    
+    /// Clear all entries
+    pub fn clear(&mut self) {
+        for i in 0..self.capacity {
+            let bucket = unsafe { &mut *self.buckets.add(i) };
+            if bucket.is_occupied() {
+                unsafe {
+                    drop_in_place(bucket.key.assume_init_mut());
+                    drop_in_place(bucket.value.assume_init_mut());
+                }
+                bucket.state = BucketState::Empty;
+            } else if bucket.is_tombstone() {
+                bucket.state = BucketState::Empty;
+            }
+        }
+        self.len = 0;
+        self.tombstones = 0;
+    }
+    
+    /// Check load factor and resize if needed
+    fn check_resize(&mut self) {
+        let load = (self.len + self.tombstones) as f64 / self.capacity as f64;
+        
+        if load > MAX_LOAD_FACTOR {
+            self.resize(self.capacity * 2);
+        } else if self.capacity > INITIAL_CAPACITY && 
+                  (self.len as f64 / self.capacity as f64) < MIN_LOAD_FACTOR {
+            self.resize(self.capacity / 2);
+        }
+    }
+    
+    /// Resize bucket array
+    fn resize(&mut self, new_capacity: usize) {
+        let old_buckets = self.buckets;
+        let old_capacity = self.capacity;
+        
+        self.allocate(new_capacity);
+        self.len = 0;
+        self.tombstones = 0;
+        
+        // Rehash all entries
+        for i in 0..old_capacity {
+            let bucket = unsafe { &mut *old_buckets.add(i) };
+            if bucket.is_occupied() {
+                let (key, value) = unsafe { bucket.take() };
+                self.insert_internal(bucket.hash, key, value);
+            }
+        }
+        
+        // Deallocate old array
+        if !old_buckets.is_null() && old_capacity > 0 {
+            let layout = Layout::array::<Bucket<K, V>>(old_capacity).unwrap();
+            unsafe { GlobalAllocator.dealloc(old_buckets as *mut u8, layout); }
+        }
+    }
+    
+    /// Insert with precomputed hash (internal)
+    fn insert_internal(&mut self, hash: u64, key: K, value: V) where K: Eq {
+        let mut idx = self.bucket_index(hash);
+        let mut psl: u16 = 0;
+        let mut current_key = key;
+        let mut current_value = value;
+        let mut current_hash = hash;
+        
+        loop {
+            let bucket = unsafe { &mut *self.buckets.add(idx) };
+            
+            if bucket.is_empty() || bucket.is_tombstone() {
+                bucket.insert(current_hash, psl, current_key, current_value);
+                self.len += 1;
+                if bucket.is_tombstone() {
+                    self.tombstones -= 1;
+                }
+                return;
+            }
+            
+            // Robin Hood: steal from rich (lower PSL)
+            if psl > bucket.psl {
+                // Swap entries
+                swap(&mut current_hash, &mut bucket.hash);
+                swap(&mut psl, &mut bucket.psl);
+                unsafe {
+                    let tmp_key = bucket.key.assume_init_read();
+                    let tmp_value = bucket.value.assume_init_read();
+                    bucket.key.write(current_key);
+                    bucket.value.write(current_value);
+                    current_key = tmp_key;
+                    current_value = tmp_value;
+                }
+            }
+            
+            idx = (idx + 1) & (self.capacity - 1);
+            psl += 1;
+            
+            if psl > 255 {
+                // Excessive probing - force resize
+                self.resize(self.capacity * 2);
+                self.insert_internal(current_hash, current_key, current_value);
+                return;
+            }
+        }
+    }
+}
+
+impl<K: Hash + Eq, V, S: BuildHasher> HashMap<K, V, S> {
+    /// Insert key-value pair, return old value if present
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        if self.capacity == 0 {
+            self.allocate(INITIAL_CAPACITY);
+        }
+        
+        self.check_resize();
+        
+        let hash = self.hash_key(&key);
+        
+        // Check for existing key first
+        if let Some(existing) = self.get_mut(&key) {
+            return Some(core::mem::replace(existing, value));
+        }
+        
+        self.insert_internal(hash, key, value);
+        None
+    }
+    
+    /// Get reference to value
+    pub fn get<Q>(&self, key: &Q) -> Option<&V> 
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if self.capacity == 0 {
+            return None;
+        }
+        
+        let hash = self.hash_key(key);
+        let mut idx = self.bucket_index(hash);
+        let mut psl: u16 = 0;
+        
+        loop {
+            let bucket = unsafe { &*self.buckets.add(idx) };
+            
+            if bucket.is_empty() {
+                return None;
+            }
+            
+            if bucket.is_occupied() {
+                // Early termination: if our PSL exceeds bucket's, key doesn't exist
+                if psl > bucket.psl {
+                    return None;
+                }
+                
+                if bucket.hash == hash {
+                    let bkey = unsafe { bucket.key() };
+                    if bkey.borrow() == key {
+                        return Some(unsafe { bucket.value() });
+                    }
+                }
+            }
+            
+            idx = (idx + 1) & (self.capacity - 1);
+            psl += 1;
+            
+            if psl > 255 {
+                return None;
+            }
+        }
+    }
+    
+    /// Get mutable reference to value
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if self.capacity == 0 {
+            return None;
+        }
+        
+        let hash = self.hash_key(key);
+        let mut idx = self.bucket_index(hash);
+        let mut psl: u16 = 0;
+        
+        loop {
+            let bucket = unsafe { &mut *self.buckets.add(idx) };
+            
+            if bucket.is_empty() {
+                return None;
+            }
+            
+            if bucket.is_occupied() {
+                if psl > bucket.psl {
+                    return None;
+                }
+                
+                if bucket.hash == hash {
+                    let matches = {
+                        let bkey = unsafe { bucket.key() };
+                        bkey.borrow() == key
+                    };
+                    if matches {
+                        return Some(unsafe { bucket.value_mut() });
+                    }
+                }
+            }
+            
+            idx = (idx + 1) & (self.capacity - 1);
+            psl += 1;
+            
+            if psl > 255 {
+                return None;
+            }
+        }
+    }
+    
+    /// Check if key exists
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.get(key).is_some()
+    }
+    
+    /// Remove key, return value if present
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if self.capacity == 0 {
+            return None;
+        }
+        
+        let hash = self.hash_key(key);
+        let mut idx = self.bucket_index(hash);
+        let mut psl: u16 = 0;
+        
+        loop {
+            let bucket = unsafe { &mut *self.buckets.add(idx) };
+            
+            if bucket.is_empty() {
+                return None;
+            }
+            
+            if bucket.is_occupied() {
+                if psl > bucket.psl {
+                    return None;
+                }
+                
+                if bucket.hash == hash {
+                    let matches = {
+                        let bkey = unsafe { bucket.key() };
+                        bkey.borrow() == key
+                    };
+                    if matches {
+                        let (_, value) = unsafe { bucket.take() };
+                        self.len -= 1;
+                        self.tombstones += 1;
+                        
+                        // Backward shift deletion (optional, reduces tombstones)
+                        self.backward_shift(idx);
+                        
+                        self.check_resize();
+                        return Some(value);
+                    }
+                }
+            }
+            
+            idx = (idx + 1) & (self.capacity - 1);
+            psl += 1;
+            
+            if psl > 255 {
+                return None;
+            }
+        }
+    }
+    
+    /// Backward shift deletion to reduce tombstones
+    fn backward_shift(&mut self, mut idx: usize) {
+        loop {
+            let next_idx = (idx + 1) & (self.capacity - 1);
+            let next_bucket = unsafe { &mut *self.buckets.add(next_idx) };
+            
+            if !next_bucket.is_occupied() || next_bucket.psl == 0 {
+                break;
+            }
+            
+            // Move next bucket back
+            let bucket = unsafe { &mut *self.buckets.add(idx) };
+            bucket.state = BucketState::Occupied;
+            bucket.hash = next_bucket.hash;
+            bucket.psl = next_bucket.psl - 1;
+            unsafe {
+                bucket.key.write(next_bucket.key.assume_init_read());
+                bucket.value.write(next_bucket.value.assume_init_read());
+            }
+            
+            next_bucket.state = BucketState::Empty;
+            self.tombstones -= 1;
+            
+            idx = next_idx;
+        }
+    }
+    
+    /// Get or insert with default
+    pub fn entry(&mut self, key: K) -> Entry<K, V, S> {
+        if self.capacity == 0 {
+            self.allocate(INITIAL_CAPACITY);
+        }
+        
+        let hash = self.hash_key(&key);
+        let mut idx = self.bucket_index(hash);
+        let mut psl: u16 = 0;
+        
+        loop {
+            let bucket = unsafe { &*self.buckets.add(idx) };
+            
+            if bucket.is_empty() || bucket.is_tombstone() {
+                return Entry::Vacant(VacantEntry {
+                    map: self,
+                    key,
+                    hash,
+                });
+            }
+            
+            if bucket.is_occupied() {
+                if psl > bucket.psl {
+                    return Entry::Vacant(VacantEntry {
+                        map: self,
+                        key,
+                        hash,
+                    });
+                }
+                
+                if bucket.hash == hash && unsafe { bucket.key() } == &key {
+                    return Entry::Occupied(OccupiedEntry {
+                        map: self,
+                        idx,
+                    });
+                }
+            }
+            
+            idx = (idx + 1) & (self.capacity - 1);
+            psl += 1;
+            
+            if psl > 255 {
+                return Entry::Vacant(VacantEntry {
+                    map: self,
+                    key,
+                    hash,
+                });
+            }
+        }
+    }
+    
+    /// Iterator over key-value pairs
+    pub fn iter(&self) -> Iter<K, V> {
+        Iter {
+            buckets: self.buckets,
+            capacity: self.capacity,
+            idx: 0,
+            remaining: self.len,
+            _marker: core::marker::PhantomData,
+        }
+    }
+    
+    /// Mutable iterator over key-value pairs
+    pub fn iter_mut(&mut self) -> IterMut<K, V> {
+        IterMut {
+            buckets: self.buckets,
+            capacity: self.capacity,
+            idx: 0,
+            remaining: self.len,
+            _marker: core::marker::PhantomData,
+        }
+    }
+    
+    /// Iterator over keys
+    pub fn keys(&self) -> Keys<K, V> {
+        Keys { inner: self.iter() }
+    }
+    
+    /// Iterator over values
+    pub fn values(&self) -> Values<K, V> {
+        Values { inner: self.iter() }
+    }
+    
+    /// Mutable iterator over values
+    pub fn values_mut(&mut self) -> ValuesMut<K, V> {
+        ValuesMut { inner: self.iter_mut() }
+    }
+    
+    /// Drain iterator
+    pub fn drain(&mut self) -> Drain<K, V> {
+        Drain {
+            buckets: self.buckets,
+            capacity: self.capacity,
+            idx: 0,
+            remaining: self.len,
+            map_len: &mut self.len,
+        }
+    }
+    
+    /// Retain entries matching predicate
+    pub fn retain<F: FnMut(&K, &mut V) -> bool>(&mut self, mut f: F) {
+        for i in 0..self.capacity {
+            let bucket = unsafe { &mut *self.buckets.add(i) };
+            if bucket.is_occupied() {
+                let keep = unsafe { f(bucket.key(), bucket.value_mut()) };
+                if !keep {
+                    unsafe { bucket.take(); }
+                    self.len -= 1;
+                    self.tombstones += 1;
+                }
+            }
+        }
+        self.check_resize();
+    }
+}
+
+impl<K, V, S> Drop for HashMap<K, V, S> {
+    fn drop(&mut self) {
+        self.deallocate();
+    }
+}
+
+impl<K: Clone, V: Clone, S: Clone> Clone for HashMap<K, V, S> 
+where S: BuildHasher 
+{
+    fn clone(&self) -> Self {
+        let mut map = Self::with_capacity_and_hasher(self.capacity, self.hash_builder.clone());
+        for i in 0..self.capacity {
+            let bucket = unsafe { &*self.buckets.add(i) };
+            if bucket.is_occupied() {
+                let new_bucket = unsafe { &mut *map.buckets.add(i) };
+                new_bucket.state = BucketState::Occupied;
+                new_bucket.hash = bucket.hash;
+                new_bucket.psl = bucket.psl;
+                unsafe {
+                    new_bucket.key.write(bucket.key().clone());
+                    new_bucket.value.write(bucket.value().clone());
+                }
+            }
+        }
+        map.len = self.len;
+        map.tombstones = self.tombstones;
+        map
+    }
+}
+
+impl<K: Hash + Eq + Debug, V: Debug, S: BuildHasher> Debug for HashMap<K, V, S> {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl<K, V, S: Default> Default for HashMap<K, V, S> {
+    fn default() -> Self {
+        Self::with_hasher(S::default())
+    }
+}
+
+impl<K: Hash + Eq, V, S: BuildHasher> Index<&K> for HashMap<K, V, S> {
+    type Output = V;
+    
+    fn index(&self, key: &K) -> &V {
+        self.get(key).expect("key not found")
+    }
+}
+
+impl<K: Hash + Eq, V, S: BuildHasher + Default> FromIterator<(K, V)> for HashMap<K, V, S> {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        let mut map = Self::with_capacity_and_hasher(lower, S::default());
+        for (k, v) in iter {
+            map.insert(k, v);
+        }
+        map
+    }
+}
+
+// Entry API
+pub enum Entry<'a, K, V, S> {
+    Occupied(OccupiedEntry<'a, K, V, S>),
+    Vacant(VacantEntry<'a, K, V, S>),
+}
+
+pub struct OccupiedEntry<'a, K, V, S> {
+    map: &'a mut HashMap<K, V, S>,
+    idx: usize,
+}
+
+pub struct VacantEntry<'a, K, V, S> {
+    map: &'a mut HashMap<K, V, S>,
+    key: K,
+    hash: u64,
+}
+
+impl<'a, K: Hash + Eq, V, S: BuildHasher> Entry<'a, K, V, S> {
+    pub fn or_insert(self, default: V) -> &'a mut V {
+        match self {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(default),
+        }
+    }
+    
+    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> &'a mut V {
+        match self {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(default()),
+        }
+    }
+    
+    pub fn or_default(self) -> &'a mut V where V: Default {
+        self.or_insert_with(V::default)
+    }
+    
+    pub fn key(&self) -> &K {
+        match self {
+            Entry::Occupied(e) => e.key(),
+            Entry::Vacant(e) => e.key(),
+        }
+    }
+}
+
+impl<'a, K, V, S> OccupiedEntry<'a, K, V, S> {
+    pub fn key(&self) -> &K {
+        unsafe { (*self.map.buckets.add(self.idx)).key() }
+    }
+    
+    pub fn get(&self) -> &V {
+        unsafe { (*self.map.buckets.add(self.idx)).value() }
+    }
+    
+    pub fn get_mut(&mut self) -> &mut V {
+        unsafe { (*self.map.buckets.add(self.idx)).value_mut() }
+    }
+    
+    pub fn into_mut(self) -> &'a mut V {
+        unsafe { (*self.map.buckets.add(self.idx)).value_mut() }
+    }
+    
+    pub fn insert(&mut self, value: V) -> V {
+        core::mem::replace(self.get_mut(), value)
+    }
+}
+
+impl<'a, K: Hash + Eq, V, S: BuildHasher> VacantEntry<'a, K, V, S> {
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+    
+    pub fn insert(self, value: V) -> &'a mut V {
+        self.map.insert_internal(self.hash, self.key, value);
+        // Find the inserted entry
+        let idx = self.map.bucket_index(self.hash);
+        for i in 0..self.map.capacity {
+            let bucket_idx = (idx + i) & (self.map.capacity - 1);
+            let bucket = unsafe { &mut *self.map.buckets.add(bucket_idx) };
+            if bucket.is_occupied() && bucket.hash == self.hash {
+                return unsafe { bucket.value_mut() };
+            }
+        }
+        unreachable!()
+    }
+}
+
+// Iterators
+pub struct Iter<'a, K, V> {
+    buckets: *const Bucket<K, V>,
+    capacity: usize,
+    idx: usize,
+    remaining: usize,
+    _marker: core::marker::PhantomData<&'a (K, V)>,
+}
+
+impl<'a, K, V> Iterator for Iter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.idx < self.capacity && self.remaining > 0 {
+            let bucket = unsafe { &*self.buckets.add(self.idx) };
+            self.idx += 1;
+            if bucket.is_occupied() {
+                self.remaining -= 1;
+                return Some(unsafe { (bucket.key(), bucket.value()) });
+            }
+        }
+        None
+    }
+    
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+pub struct IterMut<'a, K, V> {
+    buckets: *mut Bucket<K, V>,
+    capacity: usize,
+    idx: usize,
+    remaining: usize,
+    _marker: core::marker::PhantomData<&'a mut (K, V)>,
+}
+
+impl<'a, K, V> Iterator for IterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.idx < self.capacity && self.remaining > 0 {
+            let bucket = unsafe { &mut *self.buckets.add(self.idx) };
+            self.idx += 1;
+            if bucket.is_occupied() {
+                self.remaining -= 1;
+                return Some(unsafe { (bucket.key(), bucket.value_mut()) });
+            }
+        }
+        None
+    }
+}
+
+pub struct Keys<'a, K, V> {
+    inner: Iter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for Keys<'a, K, V> {
+    type Item = &'a K;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, _)| k)
+    }
+}
+
+pub struct Values<'a, K, V> {
+    inner: Iter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for Values<'a, K, V> {
+    type Item = &'a V;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, v)| v)
+    }
+}
+
+pub struct ValuesMut<'a, K, V> {
+    inner: IterMut<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
+    type Item = &'a mut V;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, v)| v)
+    }
+}
+
+pub struct Drain<'a, K, V> {
+    buckets: *mut Bucket<K, V>,
+    capacity: usize,
+    idx: usize,
+    remaining: usize,
+    map_len: &'a mut usize,
+}
+
+impl<'a, K, V> Iterator for Drain<'a, K, V> {
+    type Item = (K, V);
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.idx < self.capacity && self.remaining > 0 {
+            let bucket = unsafe { &mut *self.buckets.add(self.idx) };
+            self.idx += 1;
+            if bucket.is_occupied() {
+                self.remaining -= 1;
+                *self.map_len -= 1;
+                return Some(unsafe { bucket.take() });
+            }
+        }
+        None
+    }
+}
+
+impl<'a, K, V> Drop for Drain<'a, K, V> {
+    fn drop(&mut self) {
+        // Drain remaining elements
+        while let Some(_) = self.next() {}
+    }
+}
+
+pub struct IntoIter<K, V, S> {
+    map: HashMap<K, V, S>,
+    idx: usize,
+}
+
+impl<K, V, S> Iterator for IntoIter<K, V, S> {
+    type Item = (K, V);
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.idx < self.map.capacity {
+            let bucket = unsafe { &mut *self.map.buckets.add(self.idx) };
+            self.idx += 1;
+            if bucket.is_occupied() {
+                self.map.len -= 1;
+                return Some(unsafe { bucket.take() });
+            }
+        }
+        None
+    }
+}
+
+impl<K, V, S> IntoIterator for HashMap<K, V, S> {
+    type Item = (K, V);
+    type IntoIter = IntoIter<K, V, S>;
+    
+    fn into_iter(self) -> IntoIter<K, V, S> {
+        IntoIter { map: self, idx: 0 }
+    }
+}
+
+impl<'a, K, V, S> IntoIterator for &'a HashMap<K, V, S> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = Iter<'a, K, V>;
+    
+    fn into_iter(self) -> Iter<'a, K, V> {
+        self.iter()
+    }
+}
+
+// HashSet type alias
+pub type HashSet<K, S = RandomState> = HashMap<K, (), S>;
+
+impl<K: Hash + Eq, S: BuildHasher> HashSet<K, S> {
+    pub fn insert_set(&mut self, key: K) -> bool {
+        self.insert(key, ()).is_none()
+    }
+    
+    pub fn remove_set<Q>(&mut self, key: &Q) -> bool
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.remove(key).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_insert_get() {
+        let mut map = HashMap::new();
+        map.insert("key", 42);
+        assert_eq!(map.get(&"key"), Some(&42));
+        assert_eq!(map.get(&"missing"), None);
+    }
+    
+    #[test]
+    fn test_remove() {
+        let mut map = HashMap::new();
+        map.insert(1, "one");
+        map.insert(2, "two");
+        assert_eq!(map.remove(&1), Some("one"));
+        assert_eq!(map.get(&1), None);
+        assert_eq!(map.len(), 1);
+    }
+    
+    #[test]
+    fn test_entry() {
+        let mut map = HashMap::new();
+        map.entry("key").or_insert(0);
+        *map.entry("key").or_insert(0) += 1;
+        assert_eq!(map["key"], 1);
+    }
+    
+    #[test]
+    fn test_grow() {
+        let mut map = HashMap::new();
+        for i in 0..1000 {
+            map.insert(i, i * 2);
+        }
+        assert_eq!(map.len(), 1000);
+        for i in 0..1000 {
+            assert_eq!(map.get(&i), Some(&(i * 2)));
+        }
+    }
+}

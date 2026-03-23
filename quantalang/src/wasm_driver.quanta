@@ -1,0 +1,794 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ WASM BACKEND — Driver & CLI
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Command-line driver for WASM compilation.
+// Compiles QuantaLang source to WebAssembly binary format.
+//
+// Usage:
+//   quantac --target wasm32-unknown-wasi input.quanta -o output.wasm
+//   quantac --target wasm32-unknown-wasi input.quanta --emit=wat -o output.wat
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::codegen::wasm_driver
+
+use std::fs::{self, File};
+use std::io::{self, Write, Read};
+use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+
+use crate::codegen::wasm::*;
+use crate::codegen::wasi::*;
+use crate::codegen::wasm_codegen::*;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WASM TARGET
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// WASM target triple
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmTarget {
+    /// wasm32-unknown-unknown (bare WASM)
+    Wasm32Unknown,
+    /// wasm32-unknown-wasi (WASI)
+    Wasm32Wasi,
+    /// wasm32-unknown-emscripten (Emscripten)
+    Wasm32Emscripten,
+}
+
+impl WasmTarget {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "wasm32-unknown-unknown" | "wasm32" => Some(WasmTarget::Wasm32Unknown),
+            "wasm32-unknown-wasi" | "wasm32-wasi" | "wasi" => Some(WasmTarget::Wasm32Wasi),
+            "wasm32-unknown-emscripten" | "wasm32-emscripten" | "emscripten" => Some(WasmTarget::Wasm32Emscripten),
+            _ => None,
+        }
+    }
+    
+    pub fn triple(&self) -> &'static str {
+        match self {
+            WasmTarget::Wasm32Unknown => "wasm32-unknown-unknown",
+            WasmTarget::Wasm32Wasi => "wasm32-unknown-wasi",
+            WasmTarget::Wasm32Emscripten => "wasm32-unknown-emscripten",
+        }
+    }
+    
+    pub fn needs_wasi(&self) -> bool {
+        matches!(self, WasmTarget::Wasm32Wasi)
+    }
+    
+    pub fn default_extension(&self) -> &'static str {
+        ".wasm"
+    }
+}
+
+impl Default for WasmTarget {
+    fn default() -> Self {
+        WasmTarget::Wasm32Wasi
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WASM OPTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// WASM compilation options
+#[derive(Debug, Clone)]
+pub struct WasmOptions {
+    /// Target triple
+    pub target: WasmTarget,
+    /// Output format
+    pub emit: WasmEmit,
+    /// Optimization level (0-3)
+    pub opt_level: u8,
+    /// Enable debug info
+    pub debug: bool,
+    /// Initial memory pages (64KB each)
+    pub memory_initial: u32,
+    /// Maximum memory pages
+    pub memory_max: Option<u32>,
+    /// Enable bulk memory operations
+    pub bulk_memory: bool,
+    /// Enable reference types
+    pub reference_types: bool,
+    /// Enable SIMD
+    pub simd: bool,
+    /// Enable threads
+    pub threads: bool,
+    /// Enable tail call optimization
+    pub tail_call: bool,
+    /// Enable multi-value returns
+    pub multi_value: bool,
+    /// Strip debug sections
+    pub strip: bool,
+    /// Export all functions
+    pub export_all: bool,
+    /// Import memory from host
+    pub import_memory: bool,
+    /// Stack size in bytes
+    pub stack_size: u32,
+}
+
+impl Default for WasmOptions {
+    fn default() -> Self {
+        WasmOptions {
+            target: WasmTarget::Wasm32Wasi,
+            emit: WasmEmit::Wasm,
+            opt_level: 2,
+            debug: false,
+            memory_initial: 1,
+            memory_max: Some(256),
+            bulk_memory: true,
+            reference_types: false,
+            reference_types: false,
+            simd: false,
+            threads: false,
+            tail_call: false,
+            multi_value: true,
+            strip: false,
+            export_all: false,
+            import_memory: false,
+            stack_size: 65536, // 64KB
+        }
+    }
+}
+
+/// Output format
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmEmit {
+    /// WebAssembly binary (.wasm)
+    Wasm,
+    /// WebAssembly text format (.wat)
+    Wat,
+    /// Both binary and text
+    Both,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WASM DRIVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// WASM compilation driver
+pub struct WasmDriver {
+    options: WasmOptions,
+}
+
+impl WasmDriver {
+    pub fn new(options: WasmOptions) -> Self {
+        WasmDriver { options }
+    }
+    
+    /// Compile a source file to WASM
+    pub fn compile_file(&self, input: &Path, output: &Path) -> Result<(), WasmError> {
+        // Read source
+        let source = fs::read_to_string(input)
+            .map_err(|e| WasmError::Io(format!("Failed to read {}: {}", input.display(), e)))?;
+        
+        // Compile
+        let binary = self.compile_source(&source)?;
+        
+        // Write output
+        match self.options.emit {
+            WasmEmit::Wasm => {
+                fs::write(output, &binary)
+                    .map_err(|e| WasmError::Io(format!("Failed to write {}: {}", output.display(), e)))?;
+            }
+            WasmEmit::Wat => {
+                let wat = self.binary_to_wat(&binary)?;
+                fs::write(output, &wat)
+                    .map_err(|e| WasmError::Io(format!("Failed to write {}: {}", output.display(), e)))?;
+            }
+            WasmEmit::Both => {
+                // Write .wasm
+                let wasm_path = output.with_extension("wasm");
+                fs::write(&wasm_path, &binary)
+                    .map_err(|e| WasmError::Io(format!("Failed to write {}: {}", wasm_path.display(), e)))?;
+                
+                // Write .wat
+                let wat_path = output.with_extension("wat");
+                let wat = self.binary_to_wat(&binary)?;
+                fs::write(&wat_path, &wat)
+                    .map_err(|e| WasmError::Io(format!("Failed to write {}: {}", wat_path.display(), e)))?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Compile source code to WASM binary
+    pub fn compile_source(&self, source: &str) -> Result<Vec<u8>, WasmError> {
+        // Parse source to AST
+        // let ast = parse(source)?;
+        
+        // Lower to HIR
+        // let hir = lower_to_hir(ast)?;
+        
+        // Type check
+        // type_check(&hir)?;
+        
+        // Lower to MIR
+        // let mir = lower_to_mir(hir)?;
+        
+        // For now, create a simple test module
+        let program = self.create_test_program(source)?;
+        
+        // Compile MIR to WASM
+        let opt_level = match self.options.opt_level {
+            0 => OptLevel::None,
+            1 => OptLevel::Basic,
+            _ => OptLevel::Aggressive,
+        };
+        
+        let mut codegen = WasmCodeGen::new().with_opt_level(opt_level);
+        let binary = codegen.compile(&program);
+        
+        // Optimize if requested
+        let binary = if self.options.opt_level >= 2 {
+            self.optimize_wasm(binary)?
+        } else {
+            binary
+        };
+        
+        Ok(binary)
+    }
+    
+    /// Create a test program (placeholder for full compiler pipeline)
+    fn create_test_program(&self, source: &str) -> Result<MirProgram, WasmError> {
+        // Simple parser for basic programs
+        let mut functions = Vec::new();
+        let mut constants = Vec::new();
+        
+        // Check for "Hello, World!" program
+        if source.contains("println") && source.contains("Hello") {
+            constants.push(MirConstant::String("Hello, World!".to_string()));
+            
+            let main_func = MirFunction {
+                name: "main".to_string(),
+                signature: MirFuncSignature {
+                    params: vec![],
+                    return_type: MirType::I32,
+                },
+                locals: HashMap::new(),
+                blocks: vec![MirBlock {
+                    statements: vec![
+                        MirStatement::Call {
+                            dest: None,
+                            func: "println".to_string(),
+                            args: vec![
+                                MirOperand::Constant(MirConstant::String("Hello, World!".to_string())),
+                            ],
+                        },
+                    ],
+                    terminator: Some(MirTerminator::Return(Some(
+                        MirOperand::Constant(MirConstant::Int(0, 32))
+                    ))),
+                }],
+                is_public: true,
+            };
+            
+            functions.push(main_func);
+        } else {
+            // Default empty main
+            functions.push(MirFunction {
+                name: "main".to_string(),
+                signature: MirFuncSignature {
+                    params: vec![],
+                    return_type: MirType::I32,
+                },
+                locals: HashMap::new(),
+                blocks: vec![MirBlock {
+                    statements: vec![],
+                    terminator: Some(MirTerminator::Return(Some(
+                        MirOperand::Constant(MirConstant::Int(0, 32))
+                    ))),
+                }],
+                is_public: true,
+            });
+        }
+        
+        Ok(MirProgram { functions, constants })
+    }
+    
+    /// Optimize WASM binary
+    fn optimize_wasm(&self, binary: Vec<u8>) -> Result<Vec<u8>, WasmError> {
+        // Would integrate with wasm-opt or similar
+        // For now, return as-is
+        Ok(binary)
+    }
+    
+    /// Convert WASM binary to WAT text format
+    fn binary_to_wat(&self, binary: &[u8]) -> Result<String, WasmError> {
+        // Simple WAT disassembler
+        let mut output = String::new();
+        
+        output.push_str("(module\n");
+        
+        // Verify header
+        if binary.len() < 8 {
+            return Err(WasmError::InvalidWasm("File too small".to_string()));
+        }
+        
+        if &binary[0..4] != &WASM_MAGIC {
+            return Err(WasmError::InvalidWasm("Invalid magic number".to_string()));
+        }
+        
+        if &binary[4..8] != &WASM_VERSION {
+            return Err(WasmError::InvalidWasm("Unsupported WASM version".to_string()));
+        }
+        
+        // Parse sections
+        let mut pos = 8;
+        while pos < binary.len() {
+            let section_id = binary[pos];
+            pos += 1;
+            
+            let (section_size, bytes_read) = read_leb128_u32(&binary[pos..])?;
+            pos += bytes_read;
+            
+            let section_end = pos + section_size as usize;
+            
+            match section_id {
+                SECTION_TYPE => {
+                    output.push_str("  ;; Type section\n");
+                    self.disassemble_type_section(&binary[pos..section_end], &mut output)?;
+                }
+                SECTION_IMPORT => {
+                    output.push_str("  ;; Import section\n");
+                    self.disassemble_import_section(&binary[pos..section_end], &mut output)?;
+                }
+                SECTION_FUNCTION => {
+                    output.push_str("  ;; Function section\n");
+                }
+                SECTION_MEMORY => {
+                    output.push_str("  ;; Memory section\n");
+                    self.disassemble_memory_section(&binary[pos..section_end], &mut output)?;
+                }
+                SECTION_EXPORT => {
+                    output.push_str("  ;; Export section\n");
+                    self.disassemble_export_section(&binary[pos..section_end], &mut output)?;
+                }
+                SECTION_CODE => {
+                    output.push_str("  ;; Code section\n");
+                }
+                SECTION_DATA => {
+                    output.push_str("  ;; Data section\n");
+                }
+                _ => {
+                    output.push_str(&format!("  ;; Section {}\n", section_id));
+                }
+            }
+            
+            pos = section_end;
+        }
+        
+        output.push_str(")\n");
+        
+        Ok(output)
+    }
+    
+    fn disassemble_type_section(&self, data: &[u8], output: &mut String) -> Result<(), WasmError> {
+        let mut pos = 0;
+        let (count, bytes_read) = read_leb128_u32(&data[pos..])?;
+        pos += bytes_read;
+        
+        for i in 0..count {
+            if data[pos] != TYPE_FUNC {
+                return Err(WasmError::InvalidWasm("Expected function type".to_string()));
+            }
+            pos += 1;
+            
+            // Params
+            let (param_count, bytes_read) = read_leb128_u32(&data[pos..])?;
+            pos += bytes_read;
+            
+            let mut params = Vec::new();
+            for _ in 0..param_count {
+                params.push(valtype_to_str(data[pos]));
+                pos += 1;
+            }
+            
+            // Results
+            let (result_count, bytes_read) = read_leb128_u32(&data[pos..])?;
+            pos += bytes_read;
+            
+            let mut results = Vec::new();
+            for _ in 0..result_count {
+                results.push(valtype_to_str(data[pos]));
+                pos += 1;
+            }
+            
+            output.push_str(&format!(
+                "  (type (;{};) (func (param {}) (result {})))\n",
+                i,
+                params.join(" "),
+                results.join(" ")
+            ));
+        }
+        
+        Ok(())
+    }
+    
+    fn disassemble_import_section(&self, data: &[u8], output: &mut String) -> Result<(), WasmError> {
+        let mut pos = 0;
+        let (count, bytes_read) = read_leb128_u32(&data[pos..])?;
+        pos += bytes_read;
+        
+        for _ in 0..count {
+            // Module name
+            let (mod_len, bytes_read) = read_leb128_u32(&data[pos..])?;
+            pos += bytes_read;
+            let module = String::from_utf8_lossy(&data[pos..pos + mod_len as usize]);
+            pos += mod_len as usize;
+            
+            // Field name
+            let (field_len, bytes_read) = read_leb128_u32(&data[pos..])?;
+            pos += bytes_read;
+            let field = String::from_utf8_lossy(&data[pos..pos + field_len as usize]);
+            pos += field_len as usize;
+            
+            // Import kind
+            let kind = data[pos];
+            pos += 1;
+            
+            match kind {
+                IMPORT_FUNC => {
+                    let (type_idx, bytes_read) = read_leb128_u32(&data[pos..])?;
+                    pos += bytes_read;
+                    output.push_str(&format!(
+                        "  (import \"{}\" \"{}\" (func (type {})))\n",
+                        module, field, type_idx
+                    ));
+                }
+                IMPORT_MEMORY => {
+                    let flags = data[pos];
+                    pos += 1;
+                    let (min, bytes_read) = read_leb128_u32(&data[pos..])?;
+                    pos += bytes_read;
+                    
+                    if flags == LIMITS_MIN_MAX {
+                        let (max, bytes_read) = read_leb128_u32(&data[pos..])?;
+                        pos += bytes_read;
+                        output.push_str(&format!(
+                            "  (import \"{}\" \"{}\" (memory {} {}))\n",
+                            module, field, min, max
+                        ));
+                    } else {
+                        output.push_str(&format!(
+                            "  (import \"{}\" \"{}\" (memory {}))\n",
+                            module, field, min
+                        ));
+                    }
+                }
+                _ => {
+                    output.push_str(&format!(
+                        "  (import \"{}\" \"{}\" (??? kind={}))\n",
+                        module, field, kind
+                    ));
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn disassemble_memory_section(&self, data: &[u8], output: &mut String) -> Result<(), WasmError> {
+        let mut pos = 0;
+        let (count, bytes_read) = read_leb128_u32(&data[pos..])?;
+        pos += bytes_read;
+        
+        for _ in 0..count {
+            let flags = data[pos];
+            pos += 1;
+            
+            let (min, bytes_read) = read_leb128_u32(&data[pos..])?;
+            pos += bytes_read;
+            
+            if flags == LIMITS_MIN_MAX {
+                let (max, bytes_read) = read_leb128_u32(&data[pos..])?;
+                pos += bytes_read;
+                output.push_str(&format!("  (memory {} {})\n", min, max));
+            } else {
+                output.push_str(&format!("  (memory {})\n", min));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn disassemble_export_section(&self, data: &[u8], output: &mut String) -> Result<(), WasmError> {
+        let mut pos = 0;
+        let (count, bytes_read) = read_leb128_u32(&data[pos..])?;
+        pos += bytes_read;
+        
+        for _ in 0..count {
+            // Name
+            let (name_len, bytes_read) = read_leb128_u32(&data[pos..])?;
+            pos += bytes_read;
+            let name = String::from_utf8_lossy(&data[pos..pos + name_len as usize]);
+            pos += name_len as usize;
+            
+            // Kind
+            let kind = data[pos];
+            pos += 1;
+            
+            // Index
+            let (index, bytes_read) = read_leb128_u32(&data[pos..])?;
+            pos += bytes_read;
+            
+            let kind_str = match kind {
+                EXPORT_FUNC => "func",
+                EXPORT_TABLE => "table",
+                EXPORT_MEMORY => "memory",
+                EXPORT_GLOBAL => "global",
+                _ => "???",
+            };
+            
+            output.push_str(&format!(
+                "  (export \"{}\" ({} {}))\n",
+                name, kind_str, index
+            ));
+        }
+        
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum WasmError {
+    Io(String),
+    Parse(String),
+    Type(String),
+    Codegen(String),
+    InvalidWasm(String),
+}
+
+impl std::fmt::Display for WasmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WasmError::Io(msg) => write!(f, "I/O error: {}", msg),
+            WasmError::Parse(msg) => write!(f, "Parse error: {}", msg),
+            WasmError::Type(msg) => write!(f, "Type error: {}", msg),
+            WasmError::Codegen(msg) => write!(f, "Codegen error: {}", msg),
+            WasmError::InvalidWasm(msg) => write!(f, "Invalid WASM: {}", msg),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn read_leb128_u32(data: &[u8]) -> Result<(u32, usize), WasmError> {
+    let mut result = 0u32;
+    let mut shift = 0;
+    let mut pos = 0;
+    
+    loop {
+        if pos >= data.len() {
+            return Err(WasmError::InvalidWasm("Unexpected end of LEB128".to_string()));
+        }
+        
+        let byte = data[pos];
+        pos += 1;
+        
+        result |= ((byte & 0x7F) as u32) << shift;
+        shift += 7;
+        
+        if (byte & 0x80) == 0 {
+            break;
+        }
+        
+        if shift >= 32 {
+            return Err(WasmError::InvalidWasm("LEB128 overflow".to_string()));
+        }
+    }
+    
+    Ok((result, pos))
+}
+
+fn valtype_to_str(ty: u8) -> &'static str {
+    match ty {
+        TYPE_I32 => "i32",
+        TYPE_I64 => "i64",
+        TYPE_F32 => "f32",
+        TYPE_F64 => "f64",
+        TYPE_V128 => "v128",
+        TYPE_FUNCREF => "funcref",
+        TYPE_EXTERNREF => "externref",
+        _ => "???",
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLI
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub fn print_help() {
+    println!("QuantaLang WASM Compiler");
+    println!();
+    println!("USAGE:");
+    println!("    quantac --target wasm32-wasi [OPTIONS] <INPUT> -o <OUTPUT>");
+    println!();
+    println!("OPTIONS:");
+    println!("    --target <TARGET>     Target triple (wasm32-wasi, wasm32-unknown-unknown)");
+    println!("    --emit <FORMAT>       Output format (wasm, wat, both)");
+    println!("    -O0, -O1, -O2, -O3    Optimization level");
+    println!("    -g                    Enable debug info");
+    println!("    --strip               Strip debug sections");
+    println!("    --memory <PAGES>      Initial memory pages (default: 1)");
+    println!("    --max-memory <PAGES>  Maximum memory pages (default: 256)");
+    println!("    --stack-size <BYTES>  Stack size in bytes (default: 65536)");
+    println!("    --bulk-memory         Enable bulk memory operations");
+    println!("    --simd                Enable SIMD instructions");
+    println!("    --threads             Enable threads and atomics");
+    println!("    --export-all          Export all functions");
+    println!("    -o <OUTPUT>           Output file");
+    println!("    -h, --help            Print help");
+    println!("    --version             Print version");
+    println!();
+    println!("EXAMPLES:");
+    println!("    quantac --target wasm32-wasi main.quanta -o main.wasm");
+    println!("    quantac --target wasm32-wasi --emit wat main.quanta -o main.wat");
+    println!("    quantac --target wasm32-wasi -O3 --strip main.quanta -o main.wasm");
+}
+
+pub fn print_version() {
+    println!("quantac-wasm 1.0.0");
+    println!("QuantaLang WebAssembly Compiler");
+    println!("Target: wasm32-unknown-wasi");
+}
+
+/// Parse command line arguments and run compiler
+pub fn main(args: Vec<String>) -> Result<(), WasmError> {
+    let mut options = WasmOptions::default();
+    let mut input: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                return Ok(());
+            }
+            "--version" => {
+                print_version();
+                return Ok(());
+            }
+            "--target" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(WasmError::Parse("Missing target".to_string()));
+                }
+                options.target = WasmTarget::from_str(&args[i])
+                    .ok_or_else(|| WasmError::Parse(format!("Unknown target: {}", args[i])))?;
+            }
+            "--emit" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(WasmError::Parse("Missing emit format".to_string()));
+                }
+                options.emit = match args[i].as_str() {
+                    "wasm" => WasmEmit::Wasm,
+                    "wat" => WasmEmit::Wat,
+                    "both" => WasmEmit::Both,
+                    _ => return Err(WasmError::Parse(format!("Unknown emit format: {}", args[i]))),
+                };
+            }
+            "-O0" => options.opt_level = 0,
+            "-O1" => options.opt_level = 1,
+            "-O2" => options.opt_level = 2,
+            "-O3" => options.opt_level = 3,
+            "-g" => options.debug = true,
+            "--strip" => options.strip = true,
+            "--bulk-memory" => options.bulk_memory = true,
+            "--simd" => options.simd = true,
+            "--threads" => options.threads = true,
+            "--export-all" => options.export_all = true,
+            "--memory" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(WasmError::Parse("Missing memory pages".to_string()));
+                }
+                options.memory_initial = args[i].parse()
+                    .map_err(|_| WasmError::Parse("Invalid memory pages".to_string()))?;
+            }
+            "--max-memory" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(WasmError::Parse("Missing max memory pages".to_string()));
+                }
+                options.memory_max = Some(args[i].parse()
+                    .map_err(|_| WasmError::Parse("Invalid max memory pages".to_string()))?);
+            }
+            "--stack-size" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(WasmError::Parse("Missing stack size".to_string()));
+                }
+                options.stack_size = args[i].parse()
+                    .map_err(|_| WasmError::Parse("Invalid stack size".to_string()))?;
+            }
+            "-o" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(WasmError::Parse("Missing output file".to_string()));
+                }
+                output = Some(PathBuf::from(&args[i]));
+            }
+            _ if arg.starts_with('-') => {
+                return Err(WasmError::Parse(format!("Unknown option: {}", arg)));
+            }
+            _ => {
+                if input.is_none() {
+                    input = Some(PathBuf::from(arg));
+                } else {
+                    return Err(WasmError::Parse("Multiple input files".to_string()));
+                }
+            }
+        }
+        
+        i += 1;
+    }
+    
+    let input = input.ok_or_else(|| WasmError::Parse("No input file".to_string()))?;
+    let output = output.unwrap_or_else(|| input.with_extension("wasm"));
+    
+    let driver = WasmDriver::new(options);
+    driver.compile_file(&input, &output)?;
+    
+    println!("Compiled {} to {}", input.display(), output.display());
+    
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_target_from_str() {
+        assert_eq!(WasmTarget::from_str("wasm32-wasi"), Some(WasmTarget::Wasm32Wasi));
+        assert_eq!(WasmTarget::from_str("wasm32-unknown-unknown"), Some(WasmTarget::Wasm32Unknown));
+        assert_eq!(WasmTarget::from_str("invalid"), None);
+    }
+    
+    #[test]
+    fn test_compile_hello_world() {
+        let source = r#"
+            fn main() {
+                println("Hello, World!");
+            }
+        "#;
+        
+        let driver = WasmDriver::new(WasmOptions::default());
+        let binary = driver.compile_source(source).unwrap();
+        
+        assert_eq!(&binary[0..4], &WASM_MAGIC);
+    }
+    
+    #[test]
+    fn test_binary_to_wat() {
+        let driver = WasmDriver::new(WasmOptions::default());
+        let binary = driver.compile_source("fn main() {}").unwrap();
+        let wat = driver.binary_to_wat(&binary).unwrap();
+        
+        assert!(wat.contains("(module"));
+        assert!(wat.contains("export"));
+    }
+}

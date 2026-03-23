@@ -1,0 +1,553 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ FORMATTER — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The QuantaLang Formatter (quantafmt) provides automatic code formatting
+// for QuantaLang source files.
+//
+// Features:
+// - Wadler-Lindig pretty printing algorithm
+// - Configurable style options (.quantafmt.toml)
+// - AST-preserving transformations
+// - IDE integration support
+// - Check mode for CI/CD
+// - Diff output for review
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang Formatter
+//!
+//! Code formatter for QuantaLang source files.
+//!
+//! ## Quick Start
+//!
+//! ```bash
+//! # Format a file (output to stdout)
+//! quantafmt src/main.quanta
+//!
+//! # Format and write back
+//! quantafmt -w src/main.quanta
+//!
+//! # Check formatting (CI mode)
+//! quantafmt --check src/
+//!
+//! # Show diff
+//! quantafmt --diff src/main.quanta
+//! ```
+//!
+//! ## Configuration
+//!
+//! Create `.quantafmt.toml` in your project root:
+//!
+//! ```toml
+//! max_width = 100
+//! hard_tabs = false
+//! tab_spaces = 4
+//! edition = "2025"
+//!
+//! # Imports
+//! reorder_imports = true
+//! merge_imports = true
+//! group_imports = "StdExternalCrate"
+//!
+//! # Functions
+//! fn_args_layout = "Tall"
+//! fn_single_line = true
+//!
+//! # Trailing commas
+//! trailing_comma = "Vertical"
+//!
+//! # Comments
+//! wrap_comments = false
+//! format_code_in_doc_comments = false
+//! ```
+//!
+//! ## Programmatic API
+//!
+//! ```quanta
+//! use quantalang::fmt::{format_string, Config};
+//!
+//! let source = "fn   main(  ) {  }";
+//! let config = Config::default();
+//! let formatted = format_string(source, &config)?;
+//! assert_eq!(formatted, "fn main() {}\n");
+//! ```
+//!
+//! ## Modules
+//!
+//! - [`config`] - Configuration options and parsing
+//! - [`printer`] - Wadler-Lindig pretty printer
+//! - [`visitor`] - AST to document visitor
+//! - [`cli`] - Command-line interface
+
+module quantalang::fmt
+
+// Submodules
+pub mod config;
+pub mod printer;
+pub mod visitor;
+pub mod cli;
+
+// Re-exports
+pub use config::{
+    Config, ConfigError,
+    BraceStyle, ArgumentLayout, ImportsLayout, GroupImports,
+    TrailingComma, NewlineStyle, DocCommentStyle, HexCase,
+    Edition, EmitMode,
+};
+
+pub use printer::{
+    Doc, DocBuilder, Printer,
+    format, format_with_config,
+    list, block, inline_block,
+};
+
+pub use visitor::{
+    FormatVisitor,
+    SourceFile, Item, Expr, Stmt, Type, Pattern,
+};
+
+pub use cli::{
+    Options, ColorChoice, FormatResult,
+    parse_args, run, format_file, format_string,
+};
+
+// Version
+pub const VERSION: &str = "1.0.0";
+pub const CONFIG_FILE: &str = ".quantafmt.toml";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIGH-LEVEL API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Format source code with default configuration
+///
+/// # Examples
+///
+/// ```quanta
+/// use quantalang::fmt;
+///
+/// let source = "fn   foo(  x  :  i32  ) -> i32 { x }";
+/// let formatted = fmt::format_source(source)?;
+/// println!("{}", formatted);
+/// ```
+pub fn format_source(source: &str) -> Result<String, FormatError> {
+    format_source_with_config(source, &Config::default())
+}
+
+/// Format source code with custom configuration
+pub fn format_source_with_config(source: &str, config: &Config) -> Result<String, FormatError> {
+    cli::format_string(source, config)
+        .map_err(FormatError::Parse)
+}
+
+/// Format a file in place
+pub fn format_file_in_place(path: &std::path::Path) -> Result<bool, FormatError> {
+    let config = load_config_for_file(path)?;
+    let result = cli::format_file(path, &config)
+        .map_err(FormatError::Io)?;
+    
+    if result.changed {
+        std::fs::write(path, &result.formatted)
+            .map_err(|e| FormatError::Io(e.to_string()))?;
+    }
+    
+    Ok(result.changed)
+}
+
+/// Check if a file is formatted correctly
+pub fn check_file(path: &std::path::Path) -> Result<bool, FormatError> {
+    let config = load_config_for_file(path)?;
+    let result = cli::format_file(path, &config)
+        .map_err(FormatError::Io)?;
+    
+    Ok(!result.changed)
+}
+
+/// Get diff for a file
+pub fn diff_file(path: &std::path::Path) -> Result<String, FormatError> {
+    let config = load_config_for_file(path)?;
+    let result = cli::format_file(path, &config)
+        .map_err(FormatError::Io)?;
+    
+    Ok(result.diff())
+}
+
+/// Load configuration for a file
+fn load_config_for_file(path: &std::path::Path) -> Result<Config, FormatError> {
+    // Look for config file in parent directories
+    let mut current = path.parent();
+    
+    while let Some(dir) = current {
+        let config_path = dir.join(CONFIG_FILE);
+        if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path)
+                .map_err(|e| FormatError::Io(e.to_string()))?;
+            return Config::from_toml(&content)
+                .map_err(|e| FormatError::Config(e.to_string()));
+        }
+        current = dir.parent();
+    }
+    
+    Ok(Config::default())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUILDER API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Formatter builder for fluent configuration
+///
+/// # Examples
+///
+/// ```quanta
+/// use quantalang::fmt::Formatter;
+///
+/// let formatted = Formatter::new()
+///     .max_width(120)
+///     .hard_tabs(true)
+///     .trailing_comma(TrailingComma::Always)
+///     .format(source)?;
+/// ```
+pub struct Formatter {
+    config: Config,
+}
+
+impl Formatter {
+    /// Create a new formatter with default config
+    pub fn new() -> Self {
+        Formatter {
+            config: Config::default(),
+        }
+    }
+    
+    /// Create from existing config
+    pub fn with_config(config: Config) -> Self {
+        Formatter { config }
+    }
+    
+    /// Set maximum line width
+    pub fn max_width(mut self, width: usize) -> Self {
+        self.config.max_width = width;
+        self
+    }
+    
+    /// Use hard tabs
+    pub fn hard_tabs(mut self, enabled: bool) -> Self {
+        self.config.hard_tabs = enabled;
+        self
+    }
+    
+    /// Set spaces per tab
+    pub fn tab_spaces(mut self, spaces: usize) -> Self {
+        self.config.tab_spaces = spaces;
+        self
+    }
+    
+    /// Set brace style
+    pub fn brace_style(mut self, style: BraceStyle) -> Self {
+        self.config.brace_style = style;
+        self
+    }
+    
+    /// Set trailing comma behavior
+    pub fn trailing_comma(mut self, style: TrailingComma) -> Self {
+        self.config.trailing_comma = style;
+        self
+    }
+    
+    /// Enable import reordering
+    pub fn reorder_imports(mut self, enabled: bool) -> Self {
+        self.config.reorder_imports = enabled;
+        self
+    }
+    
+    /// Enable import merging
+    pub fn merge_imports(mut self, enabled: bool) -> Self {
+        self.config.merge_imports = enabled;
+        self
+    }
+    
+    /// Set import grouping
+    pub fn group_imports(mut self, grouping: GroupImports) -> Self {
+        self.config.group_imports = grouping;
+        self
+    }
+    
+    /// Enable comment wrapping
+    pub fn wrap_comments(mut self, enabled: bool) -> Self {
+        self.config.wrap_comments = enabled;
+        self
+    }
+    
+    /// Set newline style
+    pub fn newline_style(mut self, style: NewlineStyle) -> Self {
+        self.config.newline_style = style;
+        self
+    }
+    
+    /// Set edition
+    pub fn edition(mut self, edition: Edition) -> Self {
+        self.config.edition = edition;
+        self
+    }
+    
+    /// Get the built config
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+    
+    /// Format source code
+    pub fn format(&self, source: &str) -> Result<String, FormatError> {
+        format_source_with_config(source, &self.config)
+    }
+    
+    /// Format a file
+    pub fn format_file(&self, path: &std::path::Path) -> Result<FormatResult, FormatError> {
+        cli::format_file(path, &self.config)
+            .map_err(FormatError::Io)
+    }
+}
+
+impl Default for Formatter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STYLE PRESETS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Predefined formatting styles
+pub mod presets {
+    use super::*;
+    
+    /// Default QuantaLang style
+    pub fn default_style() -> Config {
+        Config::default()
+    }
+    
+    /// Minimal formatting (fastest)
+    pub fn minimal() -> Config {
+        Config::minimal()
+    }
+    
+    /// Strict formatting (maximum consistency)
+    pub fn strict() -> Config {
+        Config::strict()
+    }
+    
+    /// Compact style (smaller output)
+    pub fn compact() -> Config {
+        Config {
+            max_width: 120,
+            single_line_threshold: 80,
+            fn_single_line: true,
+            trailing_comma: TrailingComma::Never,
+            blank_lines_upper_bound: 1,
+            ..Config::default()
+        }
+    }
+    
+    /// Expanded style (more readable)
+    pub fn expanded() -> Config {
+        Config {
+            max_width: 80,
+            single_line_threshold: 40,
+            fn_single_line: false,
+            force_multiline_blocks: true,
+            trailing_comma: TrailingComma::Always,
+            blank_lines_upper_bound: 2,
+            ..Config::default()
+        }
+    }
+    
+    /// IDE-friendly style
+    pub fn ide() -> Config {
+        Config {
+            wrap_comments: true,
+            format_code_in_doc_comments: true,
+            reorder_imports: true,
+            merge_imports: true,
+            ..Config::default()
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// IDE INTEGRATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// IDE integration support
+pub mod ide {
+    use super::*;
+    
+    /// Format range in source
+    pub struct FormatRange {
+        pub start_line: usize,
+        pub start_column: usize,
+        pub end_line: usize,
+        pub end_column: usize,
+    }
+    
+    /// Text edit for IDE
+    pub struct TextEdit {
+        pub range: FormatRange,
+        pub new_text: String,
+    }
+    
+    /// Format a range of lines
+    pub fn format_range(
+        source: &str,
+        range: &FormatRange,
+        config: &Config,
+    ) -> Result<Vec<TextEdit>, FormatError> {
+        // For now, format entire file and return edits
+        // Future: implement partial formatting
+        let formatted = format_source_with_config(source, config)?;
+        
+        if formatted == source {
+            return Ok(Vec::new());
+        }
+        
+        Ok(vec![TextEdit {
+            range: FormatRange {
+                start_line: 0,
+                start_column: 0,
+                end_line: source.lines().count(),
+                end_column: 0,
+            },
+            new_text: formatted,
+        }])
+    }
+    
+    /// Format on type (triggered by specific characters)
+    pub fn format_on_type(
+        source: &str,
+        position: (usize, usize),
+        trigger_char: char,
+        config: &Config,
+    ) -> Result<Vec<TextEdit>, FormatError> {
+        // Characters that trigger formatting
+        match trigger_char {
+            '}' | ';' | '\n' => {
+                // Format the current statement/block
+                let range = FormatRange {
+                    start_line: position.0.saturating_sub(10),
+                    start_column: 0,
+                    end_line: position.0 + 1,
+                    end_column: 0,
+                };
+                format_range(source, &range, config)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+    
+    /// Get formatting options for LSP
+    pub fn formatting_options(config: &Config) -> FormattingOptions {
+        FormattingOptions {
+            tab_size: config.tab_spaces as u32,
+            insert_spaces: !config.hard_tabs,
+            trim_trailing_whitespace: config.remove_trailing_whitespace,
+            insert_final_newline: config.insert_final_newline,
+            trim_final_newlines: true,
+        }
+    }
+    
+    /// LSP formatting options
+    pub struct FormattingOptions {
+        pub tab_size: u32,
+        pub insert_spaces: bool,
+        pub trim_trailing_whitespace: bool,
+        pub insert_final_newline: bool,
+        pub trim_final_newlines: bool,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Formatter error
+#[derive(Debug)]
+pub enum FormatError {
+    /// Parse error
+    Parse(String),
+    /// I/O error
+    Io(String),
+    /// Configuration error
+    Config(String),
+    /// Internal error
+    Internal(String),
+}
+
+impl std::fmt::Display for FormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FormatError::Parse(msg) => write!(f, "parse error: {}", msg),
+            FormatError::Io(msg) => write!(f, "I/O error: {}", msg),
+            FormatError::Config(msg) => write!(f, "config error: {}", msg),
+            FormatError::Internal(msg) => write!(f, "internal error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for FormatError {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Main entry point for quantafmt binary
+pub fn main() -> Result<i32, String> {
+    cli::main()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_formatter_builder() {
+        let formatter = Formatter::new()
+            .max_width(120)
+            .hard_tabs(false)
+            .tab_spaces(4);
+        
+        assert_eq!(formatter.config().max_width, 120);
+        assert!(!formatter.config().hard_tabs);
+        assert_eq!(formatter.config().tab_spaces, 4);
+    }
+    
+    #[test]
+    fn test_presets() {
+        let default = presets::default_style();
+        assert_eq!(default.max_width, 100);
+        
+        let compact = presets::compact();
+        assert_eq!(compact.max_width, 120);
+        
+        let expanded = presets::expanded();
+        assert_eq!(expanded.max_width, 80);
+    }
+    
+    #[test]
+    fn test_ide_formatting_options() {
+        let config = Config::default();
+        let opts = ide::formatting_options(&config);
+        
+        assert_eq!(opts.tab_size, 4);
+        assert!(opts.insert_spaces);
+        assert!(opts.trim_trailing_whitespace);
+        assert!(opts.insert_final_newline);
+    }
+}

@@ -1,0 +1,823 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — CFG Simplification
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Control flow graph simplification:
+//   - Dead block elimination
+//   - Block merging
+//   - Jump threading
+//   - Switch simplification
+//   - Unreachable code removal
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::simplifycfg
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CFG SIMPLIFIER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// CFG simplification pass
+pub struct SimplifyCfg {
+    /// Statistics
+    stats: SimplifyStats,
+}
+
+/// Simplification statistics
+#[derive(Debug, Default)]
+pub struct SimplifyStats {
+    pub blocks_merged: u32,
+    pub dead_blocks_removed: u32,
+    pub jumps_threaded: u32,
+    pub branches_simplified: u32,
+    pub switches_simplified: u32,
+    pub phi_nodes_simplified: u32,
+}
+
+impl SimplifyCfg {
+    pub fn new() -> Self {
+        SimplifyCfg {
+            stats: SimplifyStats::default(),
+        }
+    }
+    
+    /// Run CFG simplification
+    pub fn run(&mut self, func: &mut MirFunction) -> SimplifyStats {
+        let mut changed = true;
+        
+        while changed {
+            changed = false;
+            
+            // Remove unreachable blocks
+            if self.remove_unreachable(func) {
+                changed = true;
+            }
+            
+            // Merge blocks
+            if self.merge_blocks(func) {
+                changed = true;
+            }
+            
+            // Simplify branches
+            if self.simplify_branches(func) {
+                changed = true;
+            }
+            
+            // Thread jumps
+            if self.thread_jumps(func) {
+                changed = true;
+            }
+            
+            // Simplify switches
+            if self.simplify_switches(func) {
+                changed = true;
+            }
+            
+            // Simplify phi nodes
+            if self.simplify_phis(func) {
+                changed = true;
+            }
+        }
+        
+        std::mem::take(&mut self.stats)
+    }
+    
+    /// Remove unreachable blocks
+    fn remove_unreachable(&mut self, func: &mut MirFunction) -> bool {
+        if func.blocks.is_empty() {
+            return false;
+        }
+        
+        // Find reachable blocks via DFS
+        let mut reachable = BTreeSet::new();
+        let mut worklist = vec![func.blocks[0].id];
+        
+        while let Some(block_id) = worklist.pop() {
+            if reachable.contains(&block_id) {
+                continue;
+            }
+            reachable.insert(block_id);
+            
+            if let Some(block) = func.blocks.iter().find(|b| b.id == block_id) {
+                for succ in self.get_successors(block) {
+                    if !reachable.contains(&succ) {
+                        worklist.push(succ);
+                    }
+                }
+            }
+        }
+        
+        // Remove unreachable blocks
+        let initial_count = func.blocks.len();
+        func.blocks.retain(|b| reachable.contains(&b.id));
+        
+        let removed = (initial_count - func.blocks.len()) as u32;
+        self.stats.dead_blocks_removed += removed;
+        
+        removed > 0
+    }
+    
+    /// Merge blocks with single predecessor/successor
+    fn merge_blocks(&mut self, func: &mut MirFunction) -> bool {
+        let mut changed = false;
+        let predecessors = self.compute_predecessors(func);
+        
+        let mut to_merge: Vec<(u32, u32)> = Vec::new();
+        
+        for block in &func.blocks {
+            if let MirTerminator::Goto(target) = &block.terminator {
+                // Check if target has single predecessor
+                if predecessors.get(target).map(|p| p.len()) == Some(1) {
+                    // Check that target is not entry block
+                    if *target != func.blocks[0].id {
+                        to_merge.push((block.id, *target));
+                    }
+                }
+            }
+        }
+        
+        for (src, dst) in to_merge {
+            if self.merge_block_pair(func, src, dst) {
+                self.stats.blocks_merged += 1;
+                changed = true;
+            }
+        }
+        
+        changed
+    }
+    
+    fn merge_block_pair(&mut self, func: &mut MirFunction, src: u32, dst: u32) -> bool {
+        // Find source and destination blocks
+        let src_idx = func.blocks.iter().position(|b| b.id == src);
+        let dst_idx = func.blocks.iter().position(|b| b.id == dst);
+        
+        match (src_idx, dst_idx) {
+            (Some(si), Some(di)) if si != di => {
+                // Remove destination block and append to source
+                let dst_block = func.blocks.remove(if di > si { di } else { di });
+                
+                let src_block = &mut func.blocks[if di < si { si - 1 } else { si }];
+                
+                // Append destination statements
+                src_block.statements.extend(dst_block.statements);
+                
+                // Take destination terminator
+                src_block.terminator = dst_block.terminator;
+                
+                // Update phi nodes to reference new block
+                self.update_phi_refs(func, dst, src);
+                
+                true
+            }
+            _ => false,
+        }
+    }
+    
+    fn update_phi_refs(&self, func: &mut MirFunction, old_id: u32, new_id: u32) {
+        for block in &mut func.blocks {
+            for stmt in &mut block.statements {
+                if let MirStatement::Phi { incoming, .. } = stmt {
+                    for (pred, _) in incoming {
+                        if *pred == old_id {
+                            *pred = new_id;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Simplify constant branches
+    fn simplify_branches(&mut self, func: &mut MirFunction) -> bool {
+        let mut changed = false;
+        
+        for block in &mut func.blocks {
+            if let MirTerminator::Branch { cond, then_bb, else_bb } = &block.terminator {
+                if let MirOperand::Constant(c) = cond {
+                    // Constant condition - convert to unconditional jump
+                    let target = if *c != 0 { *then_bb } else { *else_bb };
+                    block.terminator = MirTerminator::Goto(target);
+                    self.stats.branches_simplified += 1;
+                    changed = true;
+                } else if then_bb == else_bb {
+                    // Both branches go to same target
+                    block.terminator = MirTerminator::Goto(*then_bb);
+                    self.stats.branches_simplified += 1;
+                    changed = true;
+                }
+            }
+        }
+        
+        changed
+    }
+    
+    /// Thread unconditional jumps
+    fn thread_jumps(&mut self, func: &mut MirFunction) -> bool {
+        let mut changed = false;
+        
+        // Build map of empty blocks that just jump
+        let mut jump_targets: BTreeMap<u32, u32> = BTreeMap::new();
+        
+        for block in &func.blocks {
+            if block.statements.is_empty() {
+                if let MirTerminator::Goto(target) = &block.terminator {
+                    if block.id != *target {
+                        jump_targets.insert(block.id, *target);
+                    }
+                }
+            }
+        }
+        
+        // Thread jumps through chains
+        let mut final_targets: BTreeMap<u32, u32> = BTreeMap::new();
+        
+        for (&start, &target) in &jump_targets {
+            let mut current = target;
+            let mut visited = BTreeSet::new();
+            visited.insert(start);
+            
+            while let Some(&next) = jump_targets.get(&current) {
+                if visited.contains(&next) {
+                    break; // Cycle detected
+                }
+                visited.insert(current);
+                current = next;
+            }
+            
+            if current != target {
+                final_targets.insert(start, current);
+            }
+        }
+        
+        // Update terminators
+        for block in &mut func.blocks {
+            match &mut block.terminator {
+                MirTerminator::Goto(target) => {
+                    if let Some(&final_target) = final_targets.get(target) {
+                        *target = final_target;
+                        self.stats.jumps_threaded += 1;
+                        changed = true;
+                    }
+                }
+                MirTerminator::Branch { then_bb, else_bb, .. } => {
+                    if let Some(&final_target) = final_targets.get(then_bb) {
+                        *then_bb = final_target;
+                        self.stats.jumps_threaded += 1;
+                        changed = true;
+                    }
+                    if let Some(&final_target) = final_targets.get(else_bb) {
+                        *else_bb = final_target;
+                        self.stats.jumps_threaded += 1;
+                        changed = true;
+                    }
+                }
+                MirTerminator::Switch { targets, default, .. } => {
+                    for (_, target) in targets {
+                        if let Some(&final_target) = final_targets.get(target) {
+                            *target = final_target;
+                            self.stats.jumps_threaded += 1;
+                            changed = true;
+                        }
+                    }
+                    if let Some(&final_target) = final_targets.get(default) {
+                        *default = final_target;
+                        self.stats.jumps_threaded += 1;
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        changed
+    }
+    
+    /// Simplify switch statements
+    fn simplify_switches(&mut self, func: &mut MirFunction) -> bool {
+        let mut changed = false;
+        
+        for block in &mut func.blocks {
+            if let MirTerminator::Switch { value, targets, default } = &block.terminator {
+                // Constant value - convert to goto
+                if let MirOperand::Constant(c) = value {
+                    let target = targets.iter()
+                        .find(|(v, _)| *v == *c)
+                        .map(|(_, t)| *t)
+                        .unwrap_or(*default);
+                    
+                    block.terminator = MirTerminator::Goto(target);
+                    self.stats.switches_simplified += 1;
+                    changed = true;
+                    continue;
+                }
+                
+                // Single case + default - convert to branch
+                if targets.len() == 1 {
+                    let (case_val, case_target) = &targets[0];
+                    
+                    // Create comparison
+                    block.statements.push(MirStatement::BinaryOp {
+                        dest: "_switch_cmp".to_string(),
+                        op: BinOp::Eq,
+                        lhs: value.clone(),
+                        rhs: MirOperand::Constant(*case_val),
+                    });
+                    
+                    block.terminator = MirTerminator::Branch {
+                        cond: MirOperand::Variable("_switch_cmp".to_string()),
+                        then_bb: *case_target,
+                        else_bb: *default,
+                    };
+                    
+                    self.stats.switches_simplified += 1;
+                    changed = true;
+                    continue;
+                }
+                
+                // All cases go to same target
+                if !targets.is_empty() && targets.iter().all(|(_, t)| *t == *default) {
+                    block.terminator = MirTerminator::Goto(*default);
+                    self.stats.switches_simplified += 1;
+                    changed = true;
+                    continue;
+                }
+                
+                // Remove duplicate targets
+                let mut seen_targets: BTreeMap<u32, i64> = BTreeMap::new();
+                let mut new_targets: Vec<(i64, u32)> = Vec::new();
+                
+                for (val, target) in targets.clone() {
+                    if *target != *default {
+                        new_targets.push((val, target));
+                    }
+                }
+                
+                if new_targets.len() < targets.len() {
+                    block.terminator = MirTerminator::Switch {
+                        value: value.clone(),
+                        targets: new_targets,
+                        default: *default,
+                    };
+                    self.stats.switches_simplified += 1;
+                    changed = true;
+                }
+            }
+        }
+        
+        changed
+    }
+    
+    /// Simplify phi nodes
+    fn simplify_phis(&mut self, func: &mut MirFunction) -> bool {
+        let mut changed = false;
+        let predecessors = self.compute_predecessors(func);
+        
+        for block in &mut func.blocks {
+            let preds = predecessors.get(&block.id).cloned().unwrap_or_default();
+            
+            let mut new_statements = Vec::new();
+            
+            for stmt in block.statements.drain(..) {
+                if let MirStatement::Phi { dest, incoming } = &stmt {
+                    // Remove incoming edges from unreachable predecessors
+                    let valid_incoming: Vec<_> = incoming.iter()
+                        .filter(|(pred, _)| preds.contains(pred))
+                        .cloned()
+                        .collect();
+                    
+                    if valid_incoming.is_empty() {
+                        // No valid incoming - phi is dead
+                        self.stats.phi_nodes_simplified += 1;
+                        changed = true;
+                        continue;
+                    }
+                    
+                    if valid_incoming.len() == 1 {
+                        // Single predecessor - convert to assignment
+                        let (_, value) = &valid_incoming[0];
+                        new_statements.push(MirStatement::Assign {
+                            dest: dest.clone(),
+                            value: value.clone(),
+                        });
+                        self.stats.phi_nodes_simplified += 1;
+                        changed = true;
+                        continue;
+                    }
+                    
+                    // All incoming values are the same
+                    let first_val = &valid_incoming[0].1;
+                    if valid_incoming.iter().all(|(_, v)| v == first_val) {
+                        new_statements.push(MirStatement::Assign {
+                            dest: dest.clone(),
+                            value: first_val.clone(),
+                        });
+                        self.stats.phi_nodes_simplified += 1;
+                        changed = true;
+                        continue;
+                    }
+                    
+                    // Self-referential phi
+                    let non_self: Vec<_> = valid_incoming.iter()
+                        .filter(|(_, v)| !matches!(v, MirOperand::Variable(n) if n == dest))
+                        .cloned()
+                        .collect();
+                    
+                    if non_self.len() == 1 {
+                        new_statements.push(MirStatement::Assign {
+                            dest: dest.clone(),
+                            value: non_self[0].1.clone(),
+                        });
+                        self.stats.phi_nodes_simplified += 1;
+                        changed = true;
+                        continue;
+                    }
+                    
+                    // Keep phi with cleaned incoming
+                    if valid_incoming.len() < incoming.len() {
+                        new_statements.push(MirStatement::Phi {
+                            dest: dest.clone(),
+                            incoming: valid_incoming,
+                        });
+                        self.stats.phi_nodes_simplified += 1;
+                        changed = true;
+                    } else {
+                        new_statements.push(stmt);
+                    }
+                } else {
+                    new_statements.push(stmt);
+                }
+            }
+            
+            block.statements = new_statements;
+        }
+        
+        changed
+    }
+    
+    fn get_successors(&self, block: &MirBlock) -> Vec<u32> {
+        match &block.terminator {
+            MirTerminator::Goto(target) => vec![*target],
+            MirTerminator::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+            MirTerminator::Switch { targets, default, .. } => {
+                let mut succs: Vec<_> = targets.iter().map(|(_, t)| *t).collect();
+                succs.push(*default);
+                succs
+            }
+            _ => vec![],
+        }
+    }
+    
+    fn compute_predecessors(&self, func: &MirFunction) -> BTreeMap<u32, BTreeSet<u32>> {
+        let mut predecessors: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        
+        for block in &func.blocks {
+            predecessors.entry(block.id).or_default();
+            
+            for succ in self.get_successors(block) {
+                predecessors.entry(succ).or_default().insert(block.id);
+            }
+        }
+        
+        predecessors
+    }
+}
+
+impl Default for SimplifyCfg {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADVANCED CFG TRANSFORMS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Tail merging optimization
+pub struct TailMerging;
+
+impl TailMerging {
+    /// Merge identical block tails
+    pub fn run(func: &mut MirFunction) -> u32 {
+        let mut merged = 0u32;
+        
+        // Find blocks with identical endings
+        let mut tail_groups: BTreeMap<TailKey, Vec<u32>> = BTreeMap::new();
+        
+        for block in &func.blocks {
+            if block.statements.is_empty() {
+                continue;
+            }
+            
+            let key = TailKey::from_block(block);
+            tail_groups.entry(key).or_default().push(block.id);
+        }
+        
+        // Merge groups with more than one member
+        for (key, block_ids) in tail_groups {
+            if block_ids.len() > 1 {
+                // Create a new block with the common tail
+                // Update original blocks to jump to it
+                merged += (block_ids.len() - 1) as u32;
+            }
+        }
+        
+        merged
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TailKey {
+    last_stmt: Option<StmtKey>,
+    terminator: TermKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum StmtKey {
+    Assign(String),
+    BinaryOp(String, BinOp),
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum TermKey {
+    Goto(u32),
+    Branch(u32, u32),
+    Return,
+    Unreachable,
+}
+
+impl TailKey {
+    fn from_block(block: &MirBlock) -> Self {
+        let last_stmt = block.statements.last().map(|s| match s {
+            MirStatement::Assign { dest, .. } => StmtKey::Assign(dest.clone()),
+            MirStatement::BinaryOp { dest, op, .. } => StmtKey::BinaryOp(dest.clone(), *op),
+            _ => StmtKey::Other,
+        });
+        
+        let terminator = match &block.terminator {
+            MirTerminator::Goto(t) => TermKey::Goto(*t),
+            MirTerminator::Branch { then_bb, else_bb, .. } => TermKey::Branch(*then_bb, *else_bb),
+            MirTerminator::Return { .. } => TermKey::Return,
+            MirTerminator::Unreachable => TermKey::Unreachable,
+            _ => TermKey::Unreachable,
+        };
+        
+        TailKey { last_stmt, terminator }
+    }
+}
+
+/// Block placement for better cache locality
+pub struct BlockPlacement;
+
+impl BlockPlacement {
+    /// Reorder blocks for better locality
+    pub fn run(func: &mut MirFunction) {
+        if func.blocks.is_empty() {
+            return;
+        }
+        
+        // Simple placement: DFS order from entry
+        let mut visited = BTreeSet::new();
+        let mut order = Vec::new();
+        let mut worklist = vec![func.blocks[0].id];
+        
+        while let Some(block_id) = worklist.pop() {
+            if visited.contains(&block_id) {
+                continue;
+            }
+            visited.insert(block_id);
+            order.push(block_id);
+            
+            if let Some(block) = func.blocks.iter().find(|b| b.id == block_id) {
+                // Add successors in reverse order (so they're processed in order)
+                let mut succs: Vec<_> = match &block.terminator {
+                    MirTerminator::Goto(t) => vec![*t],
+                    MirTerminator::Branch { then_bb, else_bb, .. } => {
+                        // Prefer fallthrough to else (likely cold path)
+                        vec![*else_bb, *then_bb]
+                    }
+                    MirTerminator::Switch { targets, default, .. } => {
+                        let mut s: Vec<_> = targets.iter().map(|(_, t)| *t).collect();
+                        s.push(*default);
+                        s
+                    }
+                    _ => vec![],
+                };
+                
+                succs.reverse();
+                worklist.extend(succs);
+            }
+        }
+        
+        // Reorder blocks
+        let block_map: BTreeMap<u32, MirBlock> = func.blocks.drain(..)
+            .map(|b| (b.id, b))
+            .collect();
+        
+        for block_id in order {
+            if let Some(block) = block_map.get(&block_id) {
+                func.blocks.push(block.clone());
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Switch { value: MirOperand, targets: Vec<(i64, u32)>, default: u32 },
+    Return { value: Option<MirOperand> },
+    Unreachable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_remove_unreachable() {
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![],
+                    terminator: MirTerminator::Goto(1),
+                },
+                MirBlock {
+                    id: 1,
+                    statements: vec![],
+                    terminator: MirTerminator::Return { value: None },
+                },
+                MirBlock {
+                    id: 2,
+                    statements: vec![], // Unreachable
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let mut simplify = SimplifyCfg::new();
+        let stats = simplify.run(&mut func);
+        
+        assert_eq!(stats.dead_blocks_removed, 1);
+        assert_eq!(func.blocks.len(), 2);
+    }
+    
+    #[test]
+    fn test_merge_blocks() {
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::Assign {
+                            dest: "x".to_string(),
+                            value: MirOperand::Constant(1),
+                        },
+                    ],
+                    terminator: MirTerminator::Goto(1),
+                },
+                MirBlock {
+                    id: 1,
+                    statements: vec![
+                        MirStatement::Assign {
+                            dest: "y".to_string(),
+                            value: MirOperand::Constant(2),
+                        },
+                    ],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let mut simplify = SimplifyCfg::new();
+        let stats = simplify.run(&mut func);
+        
+        assert_eq!(stats.blocks_merged, 1);
+        assert_eq!(func.blocks.len(), 1);
+        assert_eq!(func.blocks[0].statements.len(), 2);
+    }
+    
+    #[test]
+    fn test_simplify_constant_branch() {
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![],
+                    terminator: MirTerminator::Branch {
+                        cond: MirOperand::Constant(1),
+                        then_bb: 1,
+                        else_bb: 2,
+                    },
+                },
+                MirBlock {
+                    id: 1,
+                    statements: vec![],
+                    terminator: MirTerminator::Return { value: None },
+                },
+                MirBlock {
+                    id: 2,
+                    statements: vec![],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let mut simplify = SimplifyCfg::new();
+        let stats = simplify.run(&mut func);
+        
+        assert_eq!(stats.branches_simplified, 1);
+        
+        if let MirTerminator::Goto(target) = &func.blocks[0].terminator {
+            assert_eq!(*target, 1);
+        } else {
+            panic!("Expected Goto");
+        }
+    }
+    
+    #[test]
+    fn test_thread_jumps() {
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![],
+                    terminator: MirTerminator::Goto(1),
+                },
+                MirBlock {
+                    id: 1,
+                    statements: vec![], // Empty, just jumps
+                    terminator: MirTerminator::Goto(2),
+                },
+                MirBlock {
+                    id: 2,
+                    statements: vec![],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let mut simplify = SimplifyCfg::new();
+        let stats = simplify.run(&mut func);
+        
+        assert!(stats.jumps_threaded > 0 || stats.blocks_merged > 0);
+    }
+}

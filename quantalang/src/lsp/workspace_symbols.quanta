@@ -1,0 +1,966 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ LSP — Workspace Symbols & Fuzzy Search
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Advanced workspace symbol search:
+// - Fuzzy matching with scoring
+// - Camel-case/snake-case aware matching
+// - Container hierarchy
+// - Symbol categories and filtering
+// - Incremental indexing
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::lsp::workspace_symbols
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, RwLock};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SYMBOL TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Symbol kind
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SymbolKind {
+    File = 1,
+    Module = 2,
+    Namespace = 3,
+    Package = 4,
+    Class = 5,
+    Method = 6,
+    Property = 7,
+    Field = 8,
+    Constructor = 9,
+    Enum = 10,
+    Interface = 11,
+    Function = 12,
+    Variable = 13,
+    Constant = 14,
+    String = 15,
+    Number = 16,
+    Boolean = 17,
+    Array = 18,
+    Object = 19,
+    Key = 20,
+    Null = 21,
+    EnumMember = 22,
+    Struct = 23,
+    Event = 24,
+    Operator = 25,
+    TypeParameter = 26,
+}
+
+impl SymbolKind {
+    pub fn from_u32(v: u32) -> Option<Self> {
+        if v >= 1 && v <= 26 {
+            Some(unsafe { std::mem::transmute(v as u8) })
+        } else {
+            None
+        }
+    }
+}
+
+/// Symbol tag
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolTag {
+    Deprecated = 1,
+}
+
+/// Position
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Position {
+    pub line: u32,
+    pub character: u32,
+}
+
+/// Range
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Range {
+    pub start: Position,
+    pub end: Position,
+}
+
+/// Location
+#[derive(Debug, Clone)]
+pub struct Location {
+    pub uri: String,
+    pub range: Range,
+}
+
+/// Workspace symbol
+#[derive(Debug, Clone)]
+pub struct WorkspaceSymbol {
+    /// Symbol name
+    pub name: String,
+    
+    /// Symbol kind
+    pub kind: SymbolKind,
+    
+    /// Tags (deprecated, etc.)
+    pub tags: Vec<SymbolTag>,
+    
+    /// Container name (parent)
+    pub container_name: Option<String>,
+    
+    /// Location
+    pub location: Location,
+    
+    /// Custom data for resolve
+    pub data: Option<WorkspaceSymbolData>,
+}
+
+/// Custom data for symbol resolution
+#[derive(Debug, Clone)]
+pub struct WorkspaceSymbolData {
+    pub symbol_id: u64,
+    pub file_id: u64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUZZY MATCHER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Fuzzy matching configuration
+#[derive(Debug, Clone)]
+pub struct FuzzyConfig {
+    /// Bonus for consecutive matches
+    pub consecutive_bonus: i32,
+    /// Bonus for matching at word start
+    pub word_start_bonus: i32,
+    /// Bonus for camel-case match
+    pub camel_bonus: i32,
+    /// Bonus for exact match
+    pub exact_bonus: i32,
+    /// Penalty for gaps
+    pub gap_penalty: i32,
+    /// Maximum gaps allowed
+    pub max_gaps: usize,
+    /// Case sensitivity
+    pub case_sensitive: bool,
+}
+
+impl Default for FuzzyConfig {
+    fn default() -> Self {
+        FuzzyConfig {
+            consecutive_bonus: 15,
+            word_start_bonus: 25,
+            camel_bonus: 20,
+            exact_bonus: 50,
+            gap_penalty: -3,
+            max_gaps: 10,
+            case_sensitive: false,
+        }
+    }
+}
+
+/// Match result with score and positions
+#[derive(Debug, Clone)]
+pub struct FuzzyMatch {
+    /// Match score (higher = better)
+    pub score: i32,
+    /// Matched character positions
+    pub positions: Vec<usize>,
+    /// Is exact match
+    pub is_exact: bool,
+}
+
+/// Fuzzy matcher
+pub struct FuzzyMatcher {
+    config: FuzzyConfig,
+}
+
+impl FuzzyMatcher {
+    pub fn new(config: FuzzyConfig) -> Self {
+        FuzzyMatcher { config }
+    }
+    
+    /// Match pattern against text
+    pub fn match_(&self, pattern: &str, text: &str) -> Option<FuzzyMatch> {
+        if pattern.is_empty() {
+            return Some(FuzzyMatch {
+                score: 0,
+                positions: vec![],
+                is_exact: false,
+            });
+        }
+        
+        let pattern_chars: Vec<char> = if self.config.case_sensitive {
+            pattern.chars().collect()
+        } else {
+            pattern.to_lowercase().chars().collect()
+        };
+        
+        let text_chars: Vec<char> = text.chars().collect();
+        let text_lower: Vec<char> = if self.config.case_sensitive {
+            text_chars.clone()
+        } else {
+            text.to_lowercase().chars().collect()
+        };
+        
+        // Check for exact match
+        if text_lower.iter().collect::<String>() == pattern_chars.iter().collect::<String>() {
+            return Some(FuzzyMatch {
+                score: self.config.exact_bonus + (text.len() as i32 * 10),
+                positions: (0..text.len()).collect(),
+                is_exact: true,
+            });
+        }
+        
+        // DP-based fuzzy matching
+        let mut best_score = i32::MIN;
+        let mut best_positions = Vec::new();
+        
+        self.match_recursive(
+            &pattern_chars,
+            0,
+            &text_chars,
+            &text_lower,
+            0,
+            &mut Vec::new(),
+            0,
+            0,
+            &mut best_score,
+            &mut best_positions,
+        );
+        
+        if best_score > i32::MIN / 2 {
+            Some(FuzzyMatch {
+                score: best_score,
+                positions: best_positions,
+                is_exact: false,
+            })
+        } else {
+            None
+        }
+    }
+    
+    fn match_recursive(
+        &self,
+        pattern: &[char],
+        p_idx: usize,
+        text: &[char],
+        text_lower: &[char],
+        t_idx: usize,
+        positions: &mut Vec<usize>,
+        score: i32,
+        gaps: usize,
+        best_score: &mut i32,
+        best_positions: &mut Vec<usize>,
+    ) {
+        // All pattern matched
+        if p_idx >= pattern.len() {
+            if score > *best_score {
+                *best_score = score;
+                *best_positions = positions.clone();
+            }
+            return;
+        }
+        
+        // No more text
+        if t_idx >= text.len() {
+            return;
+        }
+        
+        // Too many gaps
+        if gaps > self.config.max_gaps {
+            return;
+        }
+        
+        let p_char = pattern[p_idx];
+        
+        for i in t_idx..text.len() {
+            if text_lower[i] == p_char {
+                let mut local_score = score;
+                
+                // Consecutive match bonus
+                if positions.last() == Some(&(i - 1)) {
+                    local_score += self.config.consecutive_bonus;
+                }
+                
+                // Word start bonus
+                if i == 0 || !text[i - 1].is_alphanumeric() {
+                    local_score += self.config.word_start_bonus;
+                }
+                
+                // Camel case bonus
+                if i > 0 && text[i].is_uppercase() && text[i - 1].is_lowercase() {
+                    local_score += self.config.camel_bonus;
+                }
+                
+                // Snake case boundary bonus
+                if i > 0 && text[i - 1] == '_' {
+                    local_score += self.config.word_start_bonus;
+                }
+                
+                // Gap penalty
+                let new_gaps = if i > t_idx { gaps + 1 } else { gaps };
+                let gap_len = (i - t_idx) as i32;
+                local_score += gap_len * self.config.gap_penalty;
+                
+                positions.push(i);
+                self.match_recursive(
+                    pattern,
+                    p_idx + 1,
+                    text,
+                    text_lower,
+                    i + 1,
+                    positions,
+                    local_score,
+                    new_gaps,
+                    best_score,
+                    best_positions,
+                );
+                positions.pop();
+            }
+        }
+    }
+    
+    /// Match with path-aware scoring (file paths)
+    pub fn match_path(&self, pattern: &str, path: &str) -> Option<FuzzyMatch> {
+        // Split path into components
+        let components: Vec<&str> = path.split(&['/', '\\'][..]).collect();
+        let filename = components.last().unwrap_or(&"");
+        
+        // First try matching just filename
+        if let Some(mut m) = self.match_(pattern, filename) {
+            // Boost score for filename matches
+            m.score += 100;
+            return Some(m);
+        }
+        
+        // Try full path
+        self.match_(pattern, path)
+    }
+}
+
+impl Default for FuzzyMatcher {
+    fn default() -> Self {
+        Self::new(FuzzyConfig::default())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SYMBOL INDEX
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Indexed symbol entry
+#[derive(Debug, Clone)]
+struct IndexedSymbol {
+    symbol: WorkspaceSymbol,
+    /// Lowercase name for searching
+    name_lower: String,
+    /// Qualified name (with container)
+    qualified_name: String,
+    /// Priority (for ranking)
+    priority: i32,
+}
+
+/// Symbol index with efficient search
+pub struct SymbolIndex {
+    /// All symbols
+    symbols: RwLock<Vec<IndexedSymbol>>,
+    
+    /// Index by kind
+    by_kind: RwLock<BTreeMap<SymbolKind, Vec<usize>>>,
+    
+    /// Index by first character (trigram-like)
+    by_prefix: RwLock<BTreeMap<char, Vec<usize>>>,
+    
+    /// File to symbols mapping
+    by_file: RwLock<BTreeMap<String, Vec<usize>>>,
+    
+    /// Fuzzy matcher
+    matcher: FuzzyMatcher,
+}
+
+impl SymbolIndex {
+    pub fn new() -> Self {
+        SymbolIndex {
+            symbols: RwLock::new(Vec::new()),
+            by_kind: RwLock::new(BTreeMap::new()),
+            by_prefix: RwLock::new(BTreeMap::new()),
+            by_file: RwLock::new(BTreeMap::new()),
+            matcher: FuzzyMatcher::default(),
+        }
+    }
+    
+    /// Add symbol to index
+    pub fn add(&self, symbol: WorkspaceSymbol) {
+        let name_lower = symbol.name.to_lowercase();
+        let qualified_name = match &symbol.container_name {
+            Some(c) => format!("{}::{}", c, symbol.name),
+            None => symbol.name.clone(),
+        };
+        
+        let priority = self.compute_priority(&symbol);
+        
+        let indexed = IndexedSymbol {
+            symbol: symbol.clone(),
+            name_lower,
+            qualified_name,
+            priority,
+        };
+        
+        let mut symbols = self.symbols.write().unwrap();
+        let idx = symbols.len();
+        symbols.push(indexed);
+        
+        // Update kind index
+        self.by_kind.write().unwrap()
+            .entry(symbol.kind)
+            .or_insert_with(Vec::new)
+            .push(idx);
+        
+        // Update prefix index
+        if let Some(first) = symbol.name.chars().next() {
+            self.by_prefix.write().unwrap()
+                .entry(first.to_lowercase().next().unwrap_or(first))
+                .or_insert_with(Vec::new)
+                .push(idx);
+        }
+        
+        // Update file index
+        self.by_file.write().unwrap()
+            .entry(symbol.location.uri.clone())
+            .or_insert_with(Vec::new)
+            .push(idx);
+    }
+    
+    /// Remove symbols for file
+    pub fn remove_file(&self, uri: &str) {
+        // Get indices to remove
+        let indices: Vec<usize> = self.by_file.read().unwrap()
+            .get(uri)
+            .cloned()
+            .unwrap_or_default();
+        
+        if indices.is_empty() {
+            return;
+        }
+        
+        // Mark as removed (set empty name)
+        let mut symbols = self.symbols.write().unwrap();
+        for &idx in &indices {
+            if idx < symbols.len() {
+                symbols[idx].symbol.name.clear();
+            }
+        }
+        
+        // Remove from file index
+        self.by_file.write().unwrap().remove(uri);
+    }
+    
+    /// Search symbols
+    pub fn search(&self, query: &str, limit: usize) -> Vec<WorkspaceSymbol> {
+        self.search_filtered(query, None, limit)
+    }
+    
+    /// Search with kind filter
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        kind_filter: Option<SymbolKind>,
+        limit: usize,
+    ) -> Vec<WorkspaceSymbol> {
+        let symbols = self.symbols.read().unwrap();
+        
+        // Get candidate indices
+        let candidates: Vec<usize> = if let Some(kind) = kind_filter {
+            self.by_kind.read().unwrap()
+                .get(&kind)
+                .cloned()
+                .unwrap_or_default()
+        } else if let Some(first) = query.chars().next() {
+            let prefix = self.by_prefix.read().unwrap();
+            let first_lower = first.to_lowercase().next().unwrap_or(first);
+            prefix.get(&first_lower).cloned().unwrap_or_default()
+        } else {
+            (0..symbols.len()).collect()
+        };
+        
+        // Score and filter
+        let mut scored: Vec<(i32, usize)> = candidates.iter()
+            .filter_map(|&idx| {
+                let s = &symbols[idx];
+                if s.symbol.name.is_empty() {
+                    return None;
+                }
+                
+                // Try matching name
+                if let Some(m) = self.matcher.match_(query, &s.symbol.name) {
+                    let total_score = m.score + s.priority;
+                    return Some((total_score, idx));
+                }
+                
+                // Try matching qualified name
+                if let Some(m) = self.matcher.match_(query, &s.qualified_name) {
+                    let total_score = m.score + s.priority - 10; // Slight penalty
+                    return Some((total_score, idx));
+                }
+                
+                None
+            })
+            .collect();
+        
+        // Sort by score (descending)
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        
+        // Take top results
+        scored.into_iter()
+            .take(limit)
+            .map(|(_, idx)| symbols[idx].symbol.clone())
+            .collect()
+    }
+    
+    /// Resolve symbol (fill in additional data)
+    pub fn resolve(&self, symbol: WorkspaceSymbol) -> WorkspaceSymbol {
+        // Could add documentation, signature, etc.
+        symbol
+    }
+    
+    fn compute_priority(&self, symbol: &WorkspaceSymbol) -> i32 {
+        let mut priority = 0;
+        
+        // Boost public/exported symbols
+        if !symbol.name.starts_with('_') {
+            priority += 10;
+        }
+        
+        // Boost certain kinds
+        priority += match symbol.kind {
+            SymbolKind::Function | SymbolKind::Method => 5,
+            SymbolKind::Class | SymbolKind::Struct => 4,
+            SymbolKind::Interface | SymbolKind::Enum => 3,
+            SymbolKind::Module => 2,
+            _ => 0,
+        };
+        
+        // Penalize deprecated
+        if symbol.tags.contains(&SymbolTag::Deprecated) {
+            priority -= 20;
+        }
+        
+        priority
+    }
+    
+    /// Get symbol count
+    pub fn len(&self) -> usize {
+        self.symbols.read().unwrap()
+            .iter()
+            .filter(|s| !s.symbol.name.is_empty())
+            .count()
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for SymbolIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WORKSPACE SYMBOL PROVIDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Workspace symbol provider
+pub struct WorkspaceSymbolProvider {
+    /// Symbol index
+    index: Arc<SymbolIndex>,
+    
+    /// Configuration
+    config: WorkspaceSymbolConfig,
+}
+
+/// Configuration
+#[derive(Debug, Clone)]
+pub struct WorkspaceSymbolConfig {
+    /// Maximum results
+    pub max_results: usize,
+    /// Minimum query length
+    pub min_query_length: usize,
+    /// Include deprecated
+    pub include_deprecated: bool,
+}
+
+impl Default for WorkspaceSymbolConfig {
+    fn default() -> Self {
+        WorkspaceSymbolConfig {
+            max_results: 100,
+            min_query_length: 1,
+            include_deprecated: true,
+        }
+    }
+}
+
+impl WorkspaceSymbolProvider {
+    pub fn new(index: Arc<SymbolIndex>, config: WorkspaceSymbolConfig) -> Self {
+        WorkspaceSymbolProvider { index, config }
+    }
+    
+    /// Search workspace symbols
+    pub fn search(&self, query: &str) -> Vec<WorkspaceSymbol> {
+        if query.len() < self.config.min_query_length {
+            return Vec::new();
+        }
+        
+        let mut results = self.index.search(query, self.config.max_results);
+        
+        if !self.config.include_deprecated {
+            results.retain(|s| !s.tags.contains(&SymbolTag::Deprecated));
+        }
+        
+        results
+    }
+    
+    /// Search with type filter
+    pub fn search_typed(&self, query: &str, kind: SymbolKind) -> Vec<WorkspaceSymbol> {
+        if query.len() < self.config.min_query_length {
+            return Vec::new();
+        }
+        
+        self.index.search_filtered(query, Some(kind), self.config.max_results)
+    }
+    
+    /// Resolve symbol
+    pub fn resolve(&self, symbol: WorkspaceSymbol) -> WorkspaceSymbol {
+        self.index.resolve(symbol)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOCUMENT SYMBOLS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Document symbol (hierarchical)
+#[derive(Debug, Clone)]
+pub struct DocumentSymbol {
+    /// Symbol name
+    pub name: String,
+    
+    /// Detail (type signature, etc.)
+    pub detail: Option<String>,
+    
+    /// Kind
+    pub kind: SymbolKind,
+    
+    /// Tags
+    pub tags: Vec<SymbolTag>,
+    
+    /// Full range
+    pub range: Range,
+    
+    /// Selection range (name only)
+    pub selection_range: Range,
+    
+    /// Children
+    pub children: Vec<DocumentSymbol>,
+}
+
+impl DocumentSymbol {
+    pub fn new(
+        name: impl Into<String>,
+        kind: SymbolKind,
+        range: Range,
+        selection_range: Range,
+    ) -> Self {
+        DocumentSymbol {
+            name: name.into(),
+            detail: None,
+            kind,
+            tags: Vec::new(),
+            range,
+            selection_range,
+            children: Vec::new(),
+        }
+    }
+    
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+    
+    pub fn with_children(mut self, children: Vec<DocumentSymbol>) -> Self {
+        self.children = children;
+        self
+    }
+    
+    pub fn add_child(&mut self, child: DocumentSymbol) {
+        self.children.push(child);
+    }
+    
+    pub fn deprecated(mut self) -> Self {
+        self.tags.push(SymbolTag::Deprecated);
+        self
+    }
+}
+
+/// Document symbol provider
+pub struct DocumentSymbolProvider {
+    /// Configuration
+    config: DocumentSymbolConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct DocumentSymbolConfig {
+    /// Include private symbols
+    pub include_private: bool,
+    /// Hierarchical output
+    pub hierarchical: bool,
+    /// Include function parameters
+    pub include_parameters: bool,
+}
+
+impl Default for DocumentSymbolConfig {
+    fn default() -> Self {
+        DocumentSymbolConfig {
+            include_private: true,
+            hierarchical: true,
+            include_parameters: false,
+        }
+    }
+}
+
+impl DocumentSymbolProvider {
+    pub fn new(config: DocumentSymbolConfig) -> Self {
+        DocumentSymbolProvider { config }
+    }
+    
+    /// Get document symbols
+    pub fn symbols(&self, analysis: &DocumentAnalysis) -> Vec<DocumentSymbol> {
+        let mut symbols = Vec::new();
+        
+        // Modules
+        for module in &analysis.modules {
+            let mut sym = DocumentSymbol::new(
+                &module.name,
+                SymbolKind::Module,
+                module.range,
+                module.name_range,
+            );
+            
+            // Add nested items
+            if self.config.hierarchical {
+                sym.children = self.process_items(&module.items);
+            }
+            
+            symbols.push(sym);
+        }
+        
+        // Top-level items
+        symbols.extend(self.process_items(&analysis.items));
+        
+        symbols
+    }
+    
+    fn process_items(&self, items: &[DocumentItem]) -> Vec<DocumentSymbol> {
+        let mut symbols = Vec::new();
+        
+        for item in items {
+            // Skip private if configured
+            if !self.config.include_private && item.is_private {
+                continue;
+            }
+            
+            let kind = match item.kind {
+                ItemKind::Function => SymbolKind::Function,
+                ItemKind::Method => SymbolKind::Method,
+                ItemKind::Struct => SymbolKind::Struct,
+                ItemKind::Enum => SymbolKind::Enum,
+                ItemKind::Trait => SymbolKind::Interface,
+                ItemKind::TypeAlias => SymbolKind::TypeParameter,
+                ItemKind::Const => SymbolKind::Constant,
+                ItemKind::Static => SymbolKind::Variable,
+                ItemKind::Impl => SymbolKind::Class,
+                ItemKind::Field => SymbolKind::Field,
+                ItemKind::Variant => SymbolKind::EnumMember,
+            };
+            
+            let mut sym = DocumentSymbol::new(
+                &item.name,
+                kind,
+                item.range,
+                item.name_range,
+            );
+            
+            if let Some(detail) = &item.detail {
+                sym = sym.with_detail(detail);
+            }
+            
+            if item.deprecated {
+                sym = sym.deprecated();
+            }
+            
+            // Add children recursively
+            if self.config.hierarchical && !item.children.is_empty() {
+                sym.children = self.process_items(&item.children);
+            }
+            
+            symbols.push(sym);
+        }
+        
+        symbols
+    }
+}
+
+/// Document analysis result
+#[derive(Debug, Clone, Default)]
+pub struct DocumentAnalysis {
+    pub modules: Vec<ModuleInfo>,
+    pub items: Vec<DocumentItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleInfo {
+    pub name: String,
+    pub range: Range,
+    pub name_range: Range,
+    pub items: Vec<DocumentItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DocumentItem {
+    pub name: String,
+    pub kind: ItemKind,
+    pub detail: Option<String>,
+    pub range: Range,
+    pub name_range: Range,
+    pub is_private: bool,
+    pub deprecated: bool,
+    pub children: Vec<DocumentItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemKind {
+    Function,
+    Method,
+    Struct,
+    Enum,
+    Trait,
+    TypeAlias,
+    Const,
+    Static,
+    Impl,
+    Field,
+    Variant,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_fuzzy_exact() {
+        let matcher = FuzzyMatcher::default();
+        
+        let m = matcher.match_("foo", "foo").unwrap();
+        assert!(m.is_exact);
+        assert!(m.score > 0);
+    }
+    
+    #[test]
+    fn test_fuzzy_prefix() {
+        let matcher = FuzzyMatcher::default();
+        
+        let m = matcher.match_("foo", "foobar").unwrap();
+        assert!(!m.is_exact);
+        assert_eq!(m.positions, vec![0, 1, 2]);
+    }
+    
+    #[test]
+    fn test_fuzzy_camel() {
+        let matcher = FuzzyMatcher::default();
+        
+        let m = matcher.match_("gfi", "getFileInfo").unwrap();
+        assert!(!m.is_exact);
+        // Should match g-et, F-ile, I-nfo
+        assert_eq!(m.positions.len(), 3);
+    }
+    
+    #[test]
+    fn test_fuzzy_snake() {
+        let matcher = FuzzyMatcher::default();
+        
+        let m = matcher.match_("gfi", "get_file_info").unwrap();
+        assert!(!m.is_exact);
+        // Should match g-et_, f-ile_, i-nfo
+        assert_eq!(m.positions.len(), 3);
+    }
+    
+    #[test]
+    fn test_fuzzy_no_match() {
+        let matcher = FuzzyMatcher::default();
+        
+        assert!(matcher.match_("xyz", "foo").is_none());
+    }
+    
+    #[test]
+    fn test_symbol_index() {
+        let index = SymbolIndex::new();
+        
+        index.add(WorkspaceSymbol {
+            name: "getUserById".to_string(),
+            kind: SymbolKind::Function,
+            tags: vec![],
+            container_name: Some("UserService".to_string()),
+            location: Location {
+                uri: "file:///test.qn".to_string(),
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 10 },
+                },
+            },
+            data: None,
+        });
+        
+        let results = index.search("gubi", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "getUserById");
+    }
+    
+    #[test]
+    fn test_document_symbol_hierarchy() {
+        let sym = DocumentSymbol::new(
+            "MyStruct",
+            SymbolKind::Struct,
+            Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 10, character: 1 },
+            },
+            Range {
+                start: Position { line: 0, character: 7 },
+                end: Position { line: 0, character: 15 },
+            },
+        ).with_children(vec![
+            DocumentSymbol::new(
+                "field",
+                SymbolKind::Field,
+                Range {
+                    start: Position { line: 1, character: 4 },
+                    end: Position { line: 1, character: 20 },
+                },
+                Range {
+                    start: Position { line: 1, character: 4 },
+                    end: Position { line: 1, character: 9 },
+                },
+            ),
+        ]);
+        
+        assert_eq!(sym.name, "MyStruct");
+        assert_eq!(sym.children.len(), 1);
+        assert_eq!(sym.children[0].name, "field");
+    }
+}

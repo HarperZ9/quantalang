@@ -1,0 +1,732 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ BUILD SYSTEM — Dependency Graph
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Dependency graph construction and topological sorting for build ordering.
+// Implements Kahn's algorithm for cycle detection and topological sort.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::build::graph
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::PathBuf;
+use core::hash::{Hash, Hasher};
+use crate::build::config::BuildTarget;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UNIT ID
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unique identifier for a compilation unit
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnitId {
+    /// Package name
+    pub package: String,
+    
+    /// Package version
+    pub version: String,
+    
+    /// Target name
+    pub target: String,
+    
+    /// Target kind discriminator
+    pub kind: UnitKind,
+    
+    /// Profile name
+    pub profile: String,
+    
+    /// Target triple
+    pub triple: String,
+    
+    /// Features (sorted for determinism)
+    pub features: Vec<String>,
+}
+
+impl UnitId {
+    pub fn new(
+        package: &str,
+        version: &str,
+        target: &str,
+        kind: UnitKind,
+        profile: &str,
+        triple: &str,
+        features: Vec<String>,
+    ) -> Self {
+        let mut features = features;
+        features.sort();
+        
+        UnitId {
+            package: package.to_string(),
+            version: version.to_string(),
+            target: target.to_string(),
+            kind,
+            profile: profile.to_string(),
+            triple: triple.to_string(),
+            features,
+        }
+    }
+    
+    /// Create a fingerprint for caching
+    pub fn fingerprint(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+    
+    /// Display name
+    pub fn display_name(&self) -> String {
+        format!("{} v{} ({})", self.package, self.version, self.target)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UnitKind {
+    Lib,
+    Bin,
+    Test,
+    Bench,
+    Example,
+    BuildScript,
+    ProcMacro,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPILATION UNIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A single compilation unit
+#[derive(Debug, Clone)]
+pub struct Unit {
+    /// Unique identifier
+    pub id: UnitId,
+    
+    /// Source files
+    pub sources: Vec<SourceFile>,
+    
+    /// Direct dependencies (unit IDs)
+    pub dependencies: Vec<UnitId>,
+    
+    /// Build script dependencies
+    pub build_deps: Vec<UnitId>,
+    
+    /// Links attribute (for native libs)
+    pub links: Option<String>,
+    
+    /// Output artifacts
+    pub outputs: Vec<Artifact>,
+    
+    /// Is this the root crate
+    pub is_root: bool,
+    
+    /// Build priority (higher = build first)
+    pub priority: i32,
+}
+
+impl Unit {
+    pub fn new(id: UnitId) -> Self {
+        Unit {
+            id,
+            sources: Vec::new(),
+            dependencies: Vec::new(),
+            build_deps: Vec::new(),
+            links: None,
+            outputs: Vec::new(),
+            is_root: false,
+            priority: 0,
+        }
+    }
+    
+    /// Add source file
+    pub fn add_source(&mut self, path: PathBuf, kind: SourceKind) {
+        self.sources.push(SourceFile { path, kind });
+    }
+    
+    /// Add dependency
+    pub fn add_dependency(&mut self, dep: UnitId) {
+        if !self.dependencies.contains(&dep) {
+            self.dependencies.push(dep);
+        }
+    }
+    
+    /// Get all source paths
+    pub fn source_paths(&self) -> Vec<&PathBuf> {
+        self.sources.iter().map(|s| &s.path).collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceFile {
+    pub path: PathBuf,
+    pub kind: SourceKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Root,
+    Module,
+    Test,
+    Generated,
+}
+
+#[derive(Debug, Clone)]
+pub struct Artifact {
+    pub path: PathBuf,
+    pub kind: ArtifactKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactKind {
+    Executable,
+    Rlib,
+    Dylib,
+    Staticlib,
+    ProcMacro,
+    Metadata,
+    DepInfo,
+    Rmeta,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEPENDENCY GRAPH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Build dependency graph
+pub struct DependencyGraph {
+    /// All units
+    units: BTreeMap<UnitId, Unit>,
+    
+    /// Adjacency list (unit -> dependencies)
+    edges: BTreeMap<UnitId, BTreeSet<UnitId>>,
+    
+    /// Reverse edges (unit -> dependents)
+    reverse_edges: BTreeMap<UnitId, BTreeSet<UnitId>>,
+    
+    /// Root units (entry points)
+    roots: Vec<UnitId>,
+    
+    /// Cached topological order
+    topo_order: Option<Vec<UnitId>>,
+}
+
+impl DependencyGraph {
+    pub fn new() -> Self {
+        DependencyGraph {
+            units: BTreeMap::new(),
+            edges: BTreeMap::new(),
+            reverse_edges: BTreeMap::new(),
+            roots: Vec::new(),
+            topo_order: None,
+        }
+    }
+    
+    /// Add a unit to the graph
+    pub fn add_unit(&mut self, unit: Unit) {
+        let id = unit.id.clone();
+        
+        if unit.is_root {
+            self.roots.push(id.clone());
+        }
+        
+        // Add edges
+        for dep in &unit.dependencies {
+            self.edges
+                .entry(id.clone())
+                .or_default()
+                .insert(dep.clone());
+            
+            self.reverse_edges
+                .entry(dep.clone())
+                .or_default()
+                .insert(id.clone());
+        }
+        
+        self.units.insert(id, unit);
+        self.topo_order = None; // Invalidate cache
+    }
+    
+    /// Get unit by ID
+    pub fn get_unit(&self, id: &UnitId) -> Option<&Unit> {
+        self.units.get(id)
+    }
+    
+    /// Get mutable unit by ID
+    pub fn get_unit_mut(&mut self, id: &UnitId) -> Option<&mut Unit> {
+        self.topo_order = None;
+        self.units.get_mut(id)
+    }
+    
+    /// Get all units
+    pub fn units(&self) -> impl Iterator<Item = &Unit> {
+        self.units.values()
+    }
+    
+    /// Get root units
+    pub fn roots(&self) -> &[UnitId] {
+        &self.roots
+    }
+    
+    /// Get direct dependencies
+    pub fn dependencies(&self, id: &UnitId) -> impl Iterator<Item = &UnitId> {
+        self.edges
+            .get(id)
+            .map(|s| s.iter())
+            .into_iter()
+            .flatten()
+    }
+    
+    /// Get direct dependents
+    pub fn dependents(&self, id: &UnitId) -> impl Iterator<Item = &UnitId> {
+        self.reverse_edges
+            .get(id)
+            .map(|s| s.iter())
+            .into_iter()
+            .flatten()
+    }
+    
+    /// Get all transitive dependencies
+    pub fn transitive_dependencies(&self, id: &UnitId) -> BTreeSet<UnitId> {
+        let mut result = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        
+        if let Some(deps) = self.edges.get(id) {
+            queue.extend(deps.iter().cloned());
+        }
+        
+        while let Some(dep) = queue.pop_front() {
+            if result.insert(dep.clone()) {
+                if let Some(deps) = self.edges.get(&dep) {
+                    queue.extend(deps.iter().cloned());
+                }
+            }
+        }
+        
+        result
+    }
+    
+    /// Compute topological order using Kahn's algorithm
+    pub fn topological_order(&mut self) -> Result<&[UnitId], CycleError> {
+        if self.topo_order.is_some() {
+            return Ok(self.topo_order.as_ref().unwrap());
+        }
+        
+        let mut in_degree: BTreeMap<UnitId, usize> = BTreeMap::new();
+        
+        // Initialize in-degrees
+        for id in self.units.keys() {
+            in_degree.insert(id.clone(), 0);
+        }
+        
+        // Count in-degrees
+        for deps in self.edges.values() {
+            for dep in deps {
+                *in_degree.entry(dep.clone()).or_insert(0) += 1;
+            }
+        }
+        
+        // Find nodes with no incoming edges
+        let mut queue: VecDeque<UnitId> = in_degree
+            .iter()
+            .filter(|(_, &deg)| deg == 0)
+            .map(|(id, _)| id.clone())
+            .collect();
+        
+        let mut order = Vec::new();
+        
+        while let Some(id) = queue.pop_front() {
+            order.push(id.clone());
+            
+            if let Some(deps) = self.edges.get(&id) {
+                for dep in deps {
+                    if let Some(deg) = in_degree.get_mut(dep) {
+                        *deg -= 1;
+                        if *deg == 0 {
+                            queue.push_back(dep.clone());
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Check for cycles
+        if order.len() != self.units.len() {
+            // Find cycle
+            let cycle = self.find_cycle();
+            return Err(CycleError { cycle });
+        }
+        
+        // Reverse to get dependency-first order
+        order.reverse();
+        
+        self.topo_order = Some(order);
+        Ok(self.topo_order.as_ref().unwrap())
+    }
+    
+    /// Find a cycle in the graph (for error reporting)
+    fn find_cycle(&self) -> Vec<UnitId> {
+        let mut visited = BTreeSet::new();
+        let mut rec_stack = BTreeSet::new();
+        let mut path = Vec::new();
+        
+        for id in self.units.keys() {
+            if self.find_cycle_dfs(id, &mut visited, &mut rec_stack, &mut path) {
+                return path;
+            }
+        }
+        
+        Vec::new()
+    }
+    
+    fn find_cycle_dfs(
+        &self,
+        id: &UnitId,
+        visited: &mut BTreeSet<UnitId>,
+        rec_stack: &mut BTreeSet<UnitId>,
+        path: &mut Vec<UnitId>,
+    ) -> bool {
+        if rec_stack.contains(id) {
+            path.push(id.clone());
+            return true;
+        }
+        
+        if visited.contains(id) {
+            return false;
+        }
+        
+        visited.insert(id.clone());
+        rec_stack.insert(id.clone());
+        path.push(id.clone());
+        
+        if let Some(deps) = self.edges.get(id) {
+            for dep in deps {
+                if self.find_cycle_dfs(dep, visited, rec_stack, path) {
+                    return true;
+                }
+            }
+        }
+        
+        rec_stack.remove(id);
+        path.pop();
+        false
+    }
+    
+    /// Get units that can be built in parallel at each level
+    pub fn parallel_levels(&mut self) -> Result<Vec<Vec<UnitId>>, CycleError> {
+        self.topological_order()?;
+        
+        let mut levels: Vec<Vec<UnitId>> = Vec::new();
+        let mut assigned: BTreeMap<UnitId, usize> = BTreeMap::new();
+        
+        for id in self.topo_order.as_ref().unwrap() {
+            // Find the maximum level of dependencies
+            let max_dep_level = self.edges
+                .get(id)
+                .map(|deps| {
+                    deps.iter()
+                        .filter_map(|d| assigned.get(d))
+                        .max()
+                        .copied()
+                        .map(|l| l + 1)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            
+            // Assign to next level
+            while levels.len() <= max_dep_level {
+                levels.push(Vec::new());
+            }
+            
+            levels[max_dep_level].push(id.clone());
+            assigned.insert(id.clone(), max_dep_level);
+        }
+        
+        Ok(levels)
+    }
+    
+    /// Get units affected by changes to given files
+    pub fn affected_units(&self, changed_files: &[PathBuf]) -> Vec<UnitId> {
+        let mut affected = BTreeSet::new();
+        
+        // Find directly affected units
+        for (id, unit) in &self.units {
+            for source in &unit.sources {
+                if changed_files.contains(&source.path) {
+                    affected.insert(id.clone());
+                    break;
+                }
+            }
+        }
+        
+        // Propagate to dependents
+        let mut queue: VecDeque<UnitId> = affected.iter().cloned().collect();
+        
+        while let Some(id) = queue.pop_front() {
+            if let Some(dependents) = self.reverse_edges.get(&id) {
+                for dep in dependents {
+                    if affected.insert(dep.clone()) {
+                        queue.push_back(dep.clone());
+                    }
+                }
+            }
+        }
+        
+        affected.into_iter().collect()
+    }
+    
+    /// Get build order respecting unit priorities
+    pub fn prioritized_order(&mut self) -> Result<Vec<UnitId>, CycleError> {
+        let levels = self.parallel_levels()?;
+        
+        let mut result = Vec::new();
+        
+        for mut level in levels {
+            // Sort by priority within each level (higher first)
+            level.sort_by(|a, b| {
+                let pa = self.units.get(a).map(|u| u.priority).unwrap_or(0);
+                let pb = self.units.get(b).map(|u| u.priority).unwrap_or(0);
+                pb.cmp(&pa)
+            });
+            
+            result.extend(level);
+        }
+        
+        Ok(result)
+    }
+    
+    /// Statistics
+    pub fn stats(&self) -> GraphStats {
+        GraphStats {
+            unit_count: self.units.len(),
+            edge_count: self.edges.values().map(|s| s.len()).sum(),
+            root_count: self.roots.len(),
+            max_depth: self.max_depth(),
+        }
+    }
+    
+    fn max_depth(&self) -> usize {
+        let mut depth: BTreeMap<UnitId, usize> = BTreeMap::new();
+        
+        for id in self.units.keys() {
+            self.compute_depth(id, &mut depth);
+        }
+        
+        depth.values().copied().max().unwrap_or(0)
+    }
+    
+    fn compute_depth(&self, id: &UnitId, cache: &mut BTreeMap<UnitId, usize>) -> usize {
+        if let Some(&d) = cache.get(id) {
+            return d;
+        }
+        
+        let max_dep = self.edges
+            .get(id)
+            .map(|deps| {
+                deps.iter()
+                    .map(|d| self.compute_depth(d, cache))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        
+        let d = max_dep + 1;
+        cache.insert(id.clone(), d);
+        d
+    }
+}
+
+impl Default for DependencyGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphStats {
+    pub unit_count: usize,
+    pub edge_count: usize,
+    pub root_count: usize,
+    pub max_depth: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct CycleError {
+    pub cycle: Vec<UnitId>,
+}
+
+impl std::fmt::Display for CycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "dependency cycle detected: ")?;
+        for (i, id) in self.cycle.iter().enumerate() {
+            if i > 0 {
+                write!(f, " -> ")?;
+            }
+            write!(f, "{}", id.display_name())?;
+        }
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GRAPH BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Builder for constructing dependency graphs
+pub struct GraphBuilder {
+    graph: DependencyGraph,
+}
+
+impl GraphBuilder {
+    pub fn new() -> Self {
+        GraphBuilder {
+            graph: DependencyGraph::new(),
+        }
+    }
+    
+    /// Add a unit
+    pub fn add(&mut self, unit: Unit) -> &mut Self {
+        self.graph.add_unit(unit);
+        self
+    }
+    
+    /// Add edge from unit to dependency
+    pub fn edge(&mut self, from: &UnitId, to: &UnitId) -> &mut Self {
+        self.graph.edges
+            .entry(from.clone())
+            .or_default()
+            .insert(to.clone());
+        
+        self.graph.reverse_edges
+            .entry(to.clone())
+            .or_default()
+            .insert(from.clone());
+        
+        self.graph.topo_order = None;
+        self
+    }
+    
+    /// Build the graph
+    pub fn build(self) -> DependencyGraph {
+        self.graph
+    }
+}
+
+impl Default for GraphBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn make_unit(name: &str) -> Unit {
+        let id = UnitId::new(name, "1.0.0", name, UnitKind::Lib, "dev", "x86_64", vec![]);
+        Unit::new(id)
+    }
+    
+    #[test]
+    fn test_topological_order() {
+        let mut graph = DependencyGraph::new();
+        
+        let mut a = make_unit("a");
+        let mut b = make_unit("b");
+        let c = make_unit("c");
+        
+        b.add_dependency(c.id.clone());
+        a.add_dependency(b.id.clone());
+        
+        graph.add_unit(c);
+        graph.add_unit(b);
+        graph.add_unit(a);
+        
+        let order = graph.topological_order().unwrap();
+        
+        // c must come before b, b before a
+        let pos_a = order.iter().position(|id| id.package == "a").unwrap();
+        let pos_b = order.iter().position(|id| id.package == "b").unwrap();
+        let pos_c = order.iter().position(|id| id.package == "c").unwrap();
+        
+        assert!(pos_c < pos_b);
+        assert!(pos_b < pos_a);
+    }
+    
+    #[test]
+    fn test_cycle_detection() {
+        let mut graph = DependencyGraph::new();
+        
+        let mut a = make_unit("a");
+        let mut b = make_unit("b");
+        
+        a.add_dependency(b.id.clone());
+        b.add_dependency(a.id.clone());
+        
+        graph.add_unit(a);
+        graph.add_unit(b);
+        
+        let result = graph.topological_order();
+        assert!(result.is_err());
+    }
+    
+    #[test]
+    fn test_parallel_levels() {
+        let mut graph = DependencyGraph::new();
+        
+        let mut a = make_unit("a");
+        let b = make_unit("b");
+        let mut c = make_unit("c");
+        let d = make_unit("d");
+        
+        // a depends on b
+        // c depends on d
+        // b and d are independent
+        a.add_dependency(b.id.clone());
+        c.add_dependency(d.id.clone());
+        
+        graph.add_unit(a);
+        graph.add_unit(b);
+        graph.add_unit(c);
+        graph.add_unit(d);
+        
+        let levels = graph.parallel_levels().unwrap();
+        
+        // Level 0: b, d (no deps)
+        // Level 1: a, c (depend on level 0)
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0].len(), 2);
+        assert_eq!(levels[1].len(), 2);
+    }
+    
+    #[test]
+    fn test_affected_units() {
+        let mut graph = DependencyGraph::new();
+        
+        let mut a = make_unit("a");
+        a.add_source(PathBuf::from("a.quanta"), SourceKind::Root);
+        
+        let mut b = make_unit("b");
+        b.add_source(PathBuf::from("b.quanta"), SourceKind::Root);
+        b.add_dependency(a.id.clone());
+        
+        graph.add_unit(a);
+        graph.add_unit(b);
+        
+        // Changing a.quanta should affect both a and b
+        let affected = graph.affected_units(&[PathBuf::from("a.quanta")]);
+        assert_eq!(affected.len(), 2);
+    }
+}

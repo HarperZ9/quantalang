@@ -1,0 +1,789 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ INTEGRATION TEST FRAMEWORK
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// End-to-end compilation test suite for the QuantaLang compiler.
+// Tests the entire pipeline from source code to executable.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::tests::runner
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEST CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Test configuration and expected outcomes.
+#[derive(Debug, Clone)]
+pub struct TestConfig {
+    /// Test name
+    pub name: String,
+    
+    /// Source file path
+    pub source: PathBuf,
+    
+    /// Expected compilation result
+    pub compile_expected: CompileExpectation,
+    
+    /// Expected runtime result (if compilation succeeds)
+    pub run_expected: Option<RunExpectation>,
+    
+    /// Additional compiler flags
+    pub flags: Vec<String>,
+    
+    /// Target triple (default: host)
+    pub target: Option<String>,
+    
+    /// Timeout for compilation
+    pub compile_timeout: Duration,
+    
+    /// Timeout for execution
+    pub run_timeout: Duration,
+    
+    /// Tags for filtering tests
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CompileExpectation {
+    /// Compilation should succeed
+    Success,
+    
+    /// Compilation should fail with specific error
+    Error(ExpectedError),
+    
+    /// Compilation should produce specific warnings
+    Warning(Vec<String>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ExpectedError {
+    /// Error code (e.g., "E0001")
+    pub code: Option<String>,
+    
+    /// Error message substring
+    pub message: Option<String>,
+    
+    /// Expected line number
+    pub line: Option<u32>,
+    
+    /// Error kind
+    pub kind: ErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    Parse,
+    Type,
+    Borrow,
+    Codegen,
+    Link,
+    Any,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunExpectation {
+    /// Expected exit code
+    pub exit_code: i32,
+    
+    /// Expected stdout (substring match)
+    pub stdout: Option<String>,
+    
+    /// Expected stderr (substring match)
+    pub stderr: Option<String>,
+    
+    /// Exact stdout match
+    pub stdout_exact: Option<String>,
+    
+    /// Arguments to pass to the program
+    pub args: Vec<String>,
+    
+    /// Environment variables
+    pub env: HashMap<String, String>,
+    
+    /// Standard input
+    pub stdin: Option<String>,
+}
+
+impl Default for TestConfig {
+    fn default() -> Self {
+        TestConfig {
+            name: String::new(),
+            source: PathBuf::new(),
+            compile_expected: CompileExpectation::Success,
+            run_expected: None,
+            flags: Vec::new(),
+            target: None,
+            compile_timeout: Duration::from_secs(60),
+            run_timeout: Duration::from_secs(30),
+            tags: Vec::new(),
+        }
+    }
+}
+
+impl Default for RunExpectation {
+    fn default() -> Self {
+        RunExpectation {
+            exit_code: 0,
+            stdout: None,
+            stderr: None,
+            stdout_exact: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            stdin: None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEST RESULT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct TestResult {
+    pub name: String,
+    pub status: TestStatus,
+    pub compile_output: Option<CompileOutput>,
+    pub run_output: Option<RunOutput>,
+    pub duration: Duration,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestStatus {
+    Passed,
+    Failed,
+    Skipped,
+    Timeout,
+    Error,
+}
+
+#[derive(Debug)]
+pub struct CompileOutput {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub duration: Duration,
+    pub artifacts: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct RunOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration: Duration,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEST RUNNER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct TestRunner {
+    /// Path to the compiler binary
+    compiler: PathBuf,
+    
+    /// Test output directory
+    output_dir: PathBuf,
+    
+    /// Test results
+    results: Vec<TestResult>,
+    
+    /// Parallel execution
+    parallel: usize,
+    
+    /// Filter by tags
+    tag_filter: Option<Vec<String>>,
+    
+    /// Filter by name pattern
+    name_filter: Option<String>,
+    
+    /// Verbose output
+    verbose: bool,
+}
+
+impl TestRunner {
+    pub fn new(compiler: PathBuf, output_dir: PathBuf) -> Self {
+        TestRunner {
+            compiler,
+            output_dir,
+            results: Vec::new(),
+            parallel: 1,
+            tag_filter: None,
+            name_filter: None,
+            verbose: false,
+        }
+    }
+    
+    pub fn with_parallel(mut self, n: usize) -> Self {
+        self.parallel = n;
+        self
+    }
+    
+    pub fn with_tag_filter(mut self, tags: Vec<String>) -> Self {
+        self.tag_filter = Some(tags);
+        self
+    }
+    
+    pub fn with_name_filter(mut self, pattern: String) -> Self {
+        self.name_filter = Some(pattern);
+        self
+    }
+    
+    pub fn with_verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+    
+    /// Run a single test
+    pub fn run_test(&mut self, config: &TestConfig) -> TestResult {
+        let start = Instant::now();
+        
+        // Check filters
+        if !self.should_run(config) {
+            return TestResult {
+                name: config.name.clone(),
+                status: TestStatus::Skipped,
+                compile_output: None,
+                run_output: None,
+                duration: Duration::ZERO,
+                message: Some("Filtered out".to_string()),
+            };
+        }
+        
+        if self.verbose {
+            println!("Running test: {}", config.name);
+        }
+        
+        // Create test output directory
+        let test_dir = self.output_dir.join(&config.name);
+        let _ = fs::create_dir_all(&test_dir);
+        
+        // Compile
+        let compile_result = self.compile(config, &test_dir);
+        
+        let compile_success = match &config.compile_expected {
+            CompileExpectation::Success => compile_result.success,
+            CompileExpectation::Error(expected) => {
+                !compile_result.success && self.check_error(&compile_result, expected)
+            }
+            CompileExpectation::Warning(warnings) => {
+                compile_result.success && self.check_warnings(&compile_result, warnings)
+            }
+        };
+        
+        if !compile_success {
+            return TestResult {
+                name: config.name.clone(),
+                status: TestStatus::Failed,
+                compile_output: Some(compile_result),
+                run_output: None,
+                duration: start.elapsed(),
+                message: Some("Compilation expectation not met".to_string()),
+            };
+        }
+        
+        // Run (if expected)
+        if let Some(run_expected) = &config.run_expected {
+            if !compile_result.success {
+                return TestResult {
+                    name: config.name.clone(),
+                    status: TestStatus::Failed,
+                    compile_output: Some(compile_result),
+                    run_output: None,
+                    duration: start.elapsed(),
+                    message: Some("Cannot run: compilation failed".to_string()),
+                };
+            }
+            
+            let executable = test_dir.join("output");
+            let run_result = self.run(&executable, run_expected, config.run_timeout);
+            
+            let run_success = self.check_run(&run_result, run_expected);
+            
+            TestResult {
+                name: config.name.clone(),
+                status: if run_success { TestStatus::Passed } else { TestStatus::Failed },
+                compile_output: Some(compile_result),
+                run_output: Some(run_result),
+                duration: start.elapsed(),
+                message: if run_success { None } else { Some("Run expectation not met".to_string()) },
+            }
+        } else {
+            TestResult {
+                name: config.name.clone(),
+                status: TestStatus::Passed,
+                compile_output: Some(compile_result),
+                run_output: None,
+                duration: start.elapsed(),
+                message: None,
+            }
+        }
+    }
+    
+    fn should_run(&self, config: &TestConfig) -> bool {
+        // Check tag filter
+        if let Some(ref tags) = self.tag_filter {
+            if !tags.iter().any(|t| config.tags.contains(t)) {
+                return false;
+            }
+        }
+        
+        // Check name filter
+        if let Some(ref pattern) = self.name_filter {
+            if !config.name.contains(pattern) {
+                return false;
+            }
+        }
+        
+        true
+    }
+    
+    fn compile(&self, config: &TestConfig, output_dir: &Path) -> CompileOutput {
+        let output_path = output_dir.join("output");
+        let start = Instant::now();
+        
+        let mut cmd = Command::new(&self.compiler);
+        cmd.arg(&config.source)
+           .arg("-o")
+           .arg(&output_path);
+        
+        // Add target if specified
+        if let Some(ref target) = config.target {
+            cmd.arg("--target").arg(target);
+        }
+        
+        // Add additional flags
+        for flag in &config.flags {
+            cmd.arg(flag);
+        }
+        
+        let output = cmd.output().unwrap_or_else(|e| {
+            panic!("Failed to execute compiler: {}", e);
+        });
+        
+        let duration = start.elapsed();
+        
+        let mut artifacts = Vec::new();
+        if output_path.exists() {
+            artifacts.push(output_path);
+        }
+        
+        CompileOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+            duration,
+            artifacts,
+        }
+    }
+    
+    fn run(&self, executable: &Path, expected: &RunExpectation, timeout: Duration) -> RunOutput {
+        let start = Instant::now();
+        
+        let mut cmd = Command::new(executable);
+        
+        // Add arguments
+        for arg in &expected.args {
+            cmd.arg(arg);
+        }
+        
+        // Add environment variables
+        for (key, value) in &expected.env {
+            cmd.env(key, value);
+        }
+        
+        // TODO: Handle stdin and timeout
+        
+        let output = cmd.output().unwrap_or_else(|e| {
+            panic!("Failed to execute program: {}", e);
+        });
+        
+        RunOutput {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            duration: start.elapsed(),
+        }
+    }
+    
+    fn check_error(&self, output: &CompileOutput, expected: &ExpectedError) -> bool {
+        let stderr = &output.stderr;
+        
+        // Check error code
+        if let Some(ref code) = expected.code {
+            if !stderr.contains(code) {
+                return false;
+            }
+        }
+        
+        // Check error message
+        if let Some(ref message) = expected.message {
+            if !stderr.contains(message) {
+                return false;
+            }
+        }
+        
+        // Check line number
+        if let Some(line) = expected.line {
+            let line_pattern = format!(":{}", line);
+            if !stderr.contains(&line_pattern) {
+                return false;
+            }
+        }
+        
+        true
+    }
+    
+    fn check_warnings(&self, output: &CompileOutput, warnings: &[String]) -> bool {
+        for warning in warnings {
+            if !output.stderr.contains(warning) {
+                return false;
+            }
+        }
+        true
+    }
+    
+    fn check_run(&self, output: &RunOutput, expected: &RunExpectation) -> bool {
+        // Check exit code
+        if output.exit_code != expected.exit_code {
+            return false;
+        }
+        
+        // Check stdout substring
+        if let Some(ref stdout) = expected.stdout {
+            if !output.stdout.contains(stdout) {
+                return false;
+            }
+        }
+        
+        // Check stdout exact
+        if let Some(ref stdout_exact) = expected.stdout_exact {
+            if output.stdout.trim() != stdout_exact.trim() {
+                return false;
+            }
+        }
+        
+        // Check stderr substring
+        if let Some(ref stderr) = expected.stderr {
+            if !output.stderr.contains(stderr) {
+                return false;
+            }
+        }
+        
+        true
+    }
+    
+    /// Run all tests from a directory
+    pub fn run_all(&mut self, tests: Vec<TestConfig>) -> TestSummary {
+        let total = tests.len();
+        let mut passed = 0;
+        let mut failed = 0;
+        let mut skipped = 0;
+        
+        for config in tests {
+            let result = self.run_test(&config);
+            
+            match result.status {
+                TestStatus::Passed => {
+                    passed += 1;
+                    if self.verbose {
+                        println!("  ✓ {} ({:.2?})", result.name, result.duration);
+                    } else {
+                        print!(".");
+                    }
+                }
+                TestStatus::Failed => {
+                    failed += 1;
+                    if self.verbose {
+                        println!("  ✗ {} ({:.2?})", result.name, result.duration);
+                        if let Some(ref msg) = result.message {
+                            println!("    {}", msg);
+                        }
+                    } else {
+                        print!("F");
+                    }
+                }
+                TestStatus::Skipped => {
+                    skipped += 1;
+                    if self.verbose {
+                        println!("  - {} (skipped)", result.name);
+                    } else {
+                        print!("S");
+                    }
+                }
+                TestStatus::Timeout => {
+                    failed += 1;
+                    print!("T");
+                }
+                TestStatus::Error => {
+                    failed += 1;
+                    print!("E");
+                }
+            }
+            
+            self.results.push(result);
+        }
+        
+        if !self.verbose {
+            println!();
+        }
+        
+        TestSummary {
+            total,
+            passed,
+            failed,
+            skipped,
+            duration: self.results.iter().map(|r| r.duration).sum(),
+        }
+    }
+    
+    pub fn results(&self) -> &[TestResult] {
+        &self.results
+    }
+}
+
+#[derive(Debug)]
+pub struct TestSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub duration: Duration,
+}
+
+impl TestSummary {
+    pub fn print(&self) {
+        println!();
+        println!("═══════════════════════════════════════════════════════════════");
+        println!("Test Summary");
+        println!("═══════════════════════════════════════════════════════════════");
+        println!("  Total:   {}", self.total);
+        println!("  Passed:  {} ({:.1}%)", self.passed, 
+                 self.passed as f64 / self.total as f64 * 100.0);
+        println!("  Failed:  {}", self.failed);
+        println!("  Skipped: {}", self.skipped);
+        println!("  Duration: {:.2?}", self.duration);
+        println!("═══════════════════════════════════════════════════════════════");
+        
+        if self.failed == 0 {
+            println!("All tests passed!");
+        } else {
+            println!("Some tests failed.");
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEST PARSER (from source file annotations)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parses test configuration from source file comments.
+/// 
+/// Format:
+/// ```
+/// // @test: test_name
+/// // @compile: success | error(E0001) | warning(...)
+/// // @run: exit(0) | stdout("hello") | stdout_exact("hello\n")
+/// // @flags: -O2 --target x86_64-unknown-linux-gnu
+/// // @tags: basic, types, codegen
+/// ```
+pub fn parse_test_file(path: &Path) -> Option<TestConfig> {
+    let content = fs::read_to_string(path).ok()?;
+    
+    let mut config = TestConfig::default();
+    config.source = path.to_path_buf();
+    config.name = path.file_stem()?.to_str()?.to_string();
+    
+    for line in content.lines() {
+        let line = line.trim();
+        
+        if let Some(rest) = line.strip_prefix("// @test:") {
+            config.name = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("// @compile:") {
+            config.compile_expected = parse_compile_expectation(rest.trim());
+        } else if let Some(rest) = line.strip_prefix("// @run:") {
+            config.run_expected = Some(parse_run_expectation(rest.trim()));
+        } else if let Some(rest) = line.strip_prefix("// @flags:") {
+            config.flags = rest.split_whitespace().map(String::from).collect();
+        } else if let Some(rest) = line.strip_prefix("// @tags:") {
+            config.tags = rest.split(',').map(|s| s.trim().to_string()).collect();
+        } else if let Some(rest) = line.strip_prefix("// @target:") {
+            config.target = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("// @timeout:") {
+            if let Ok(secs) = rest.trim().parse::<u64>() {
+                config.compile_timeout = Duration::from_secs(secs);
+            }
+        }
+    }
+    
+    Some(config)
+}
+
+fn parse_compile_expectation(s: &str) -> CompileExpectation {
+    if s == "success" {
+        return CompileExpectation::Success;
+    }
+    
+    if let Some(rest) = s.strip_prefix("error") {
+        let mut expected = ExpectedError {
+            code: None,
+            message: None,
+            line: None,
+            kind: ErrorKind::Any,
+        };
+        
+        // Parse error details: error(E0001, "message", line:10, kind:type)
+        if let Some(inner) = rest.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+            for part in inner.split(',') {
+                let part = part.trim();
+                if part.starts_with('E') && part.len() == 5 {
+                    expected.code = Some(part.to_string());
+                } else if part.starts_with('"') && part.ends_with('"') {
+                    expected.message = Some(part[1..part.len()-1].to_string());
+                } else if let Some(line) = part.strip_prefix("line:") {
+                    expected.line = line.parse().ok();
+                } else if let Some(kind) = part.strip_prefix("kind:") {
+                    expected.kind = match kind {
+                        "parse" => ErrorKind::Parse,
+                        "type" => ErrorKind::Type,
+                        "borrow" => ErrorKind::Borrow,
+                        "codegen" => ErrorKind::Codegen,
+                        "link" => ErrorKind::Link,
+                        _ => ErrorKind::Any,
+                    };
+                }
+            }
+        }
+        
+        return CompileExpectation::Error(expected);
+    }
+    
+    CompileExpectation::Success
+}
+
+fn parse_run_expectation(s: &str) -> RunExpectation {
+    let mut expected = RunExpectation::default();
+    
+    // Parse: exit(0), stdout("hello"), stderr("error")
+    for part in s.split(',') {
+        let part = part.trim();
+        
+        if let Some(rest) = part.strip_prefix("exit(").and_then(|s| s.strip_suffix(')')) {
+            expected.exit_code = rest.parse().unwrap_or(0);
+        } else if let Some(rest) = part.strip_prefix("stdout(\"").and_then(|s| s.strip_suffix("\")")) {
+            expected.stdout = Some(rest.to_string());
+        } else if let Some(rest) = part.strip_prefix("stdout_exact(\"").and_then(|s| s.strip_suffix("\")")) {
+            expected.stdout_exact = Some(rest.replace("\\n", "\n"));
+        } else if let Some(rest) = part.strip_prefix("stderr(\"").and_then(|s| s.strip_suffix("\")")) {
+            expected.stderr = Some(rest.to_string());
+        } else if let Some(rest) = part.strip_prefix("args(\"").and_then(|s| s.strip_suffix("\")")) {
+            expected.args = rest.split_whitespace().map(String::from).collect();
+        }
+    }
+    
+    expected
+}
+
+/// Discover all test files in a directory
+pub fn discover_tests(dir: &Path) -> Vec<TestConfig> {
+    let mut tests = Vec::new();
+    
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            
+            if path.is_file() && path.extension().map_or(false, |e| e == "quanta") {
+                if let Some(config) = parse_test_file(&path) {
+                    tests.push(config);
+                }
+            } else if path.is_dir() {
+                tests.extend(discover_tests(&path));
+            }
+        }
+    }
+    
+    // Sort by name for consistent ordering
+    tests.sort_by(|a, b| a.name.cmp(&b.name));
+    tests
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    
+    let compiler = args.get(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./quantac"));
+    
+    let test_dir = args.get(2)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./tests"));
+    
+    let output_dir = args.get(3)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./test-output"));
+    
+    // Create output directory
+    let _ = fs::create_dir_all(&output_dir);
+    
+    // Discover tests
+    println!("Discovering tests in {:?}...", test_dir);
+    let tests = discover_tests(&test_dir);
+    println!("Found {} tests", tests.len());
+    println!();
+    
+    // Run tests
+    let mut runner = TestRunner::new(compiler, output_dir)
+        .with_verbose(std::env::var("VERBOSE").is_ok());
+    
+    let summary = runner.run_all(tests);
+    summary.print();
+    
+    // Print failed test details
+    let failed: Vec<_> = runner.results().iter()
+        .filter(|r| r.status == TestStatus::Failed)
+        .collect();
+    
+    if !failed.is_empty() {
+        println!();
+        println!("Failed tests:");
+        for result in failed {
+            println!();
+            println!("─── {} ───", result.name);
+            
+            if let Some(ref compile) = result.compile_output {
+                if !compile.success {
+                    println!("Compile stderr:");
+                    println!("{}", compile.stderr);
+                }
+            }
+            
+            if let Some(ref run) = result.run_output {
+                println!("Exit code: {}", run.exit_code);
+                if !run.stdout.is_empty() {
+                    println!("Stdout: {}", run.stdout);
+                }
+                if !run.stderr.is_empty() {
+                    println!("Stderr: {}", run.stderr);
+                }
+            }
+        }
+        
+        std::process::exit(1);
+    }
+}

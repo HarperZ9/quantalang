@@ -1,0 +1,849 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ RUNTIME HARDENING — Control Flow Integrity
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Control flow integrity mechanisms:
+// - Forward-edge CFI (indirect call validation)
+// - Backward-edge CFI (return address protection)
+// - Shadow stack implementation
+// - Jump table protection
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::runtime::hardening::cfi
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::collections::BTreeSet;
+use core::sync::atomic::{AtomicU64, AtomicUsize, AtomicPtr, Ordering};
+use core::ptr::NonNull;
+use core::hash::{Hash, Hasher};
+
+use super::memory::SecurityViolation;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CFI CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// CFI protection level
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CfiLevel {
+    /// No CFI protection
+    None,
+    
+    /// Basic CFI (type signature checking)
+    Basic,
+    
+    /// Strict CFI (precise call target validation)
+    Strict,
+    
+    /// Full CFI with shadow stack
+    Full,
+}
+
+impl Default for CfiLevel {
+    fn default() -> Self {
+        CfiLevel::Strict
+    }
+}
+
+/// CFI configuration
+#[derive(Debug, Clone)]
+pub struct CfiConfig {
+    /// CFI protection level
+    pub level: CfiLevel,
+    
+    /// Enable shadow stack for return address protection
+    pub shadow_stack: bool,
+    
+    /// Shadow stack size per thread (default: 1MB)
+    pub shadow_stack_size: usize,
+    
+    /// Enable indirect call validation
+    pub indirect_call_check: bool,
+    
+    /// Enable jump table bounds checking
+    pub jump_table_check: bool,
+    
+    /// Abort on violation (vs logging)
+    pub abort_on_violation: bool,
+}
+
+impl Default for CfiConfig {
+    fn default() -> Self {
+        CfiConfig {
+            level: CfiLevel::Strict,
+            shadow_stack: true,
+            shadow_stack_size: 1024 * 1024, // 1MB
+            indirect_call_check: true,
+            jump_table_check: true,
+            abort_on_violation: true,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUNCTION TYPE SIGNATURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type signature hash for CFI
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct TypeHash(u64);
+
+impl TypeHash {
+    /// Create from type information
+    pub fn from_signature(
+        return_type: &str,
+        param_types: &[&str],
+    ) -> Self {
+        let mut hasher = FnvHasher::new();
+        
+        // Hash return type
+        return_type.hash(&mut hasher);
+        
+        // Hash parameter count
+        param_types.len().hash(&mut hasher);
+        
+        // Hash each parameter type
+        for param in param_types {
+            param.hash(&mut hasher);
+        }
+        
+        TypeHash(hasher.finish())
+    }
+    
+    /// Create from raw hash
+    pub const fn from_raw(hash: u64) -> Self {
+        TypeHash(hash)
+    }
+    
+    /// Get raw hash value
+    pub fn as_raw(&self) -> u64 {
+        self.0
+    }
+    
+    /// Check if matches another signature
+    pub fn matches(&self, other: &TypeHash) -> bool {
+        self.0 == other.0
+    }
+}
+
+/// FNV-1a hasher for type signatures
+struct FnvHasher {
+    state: u64,
+}
+
+impl FnvHasher {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    
+    fn new() -> Self {
+        FnvHasher {
+            state: Self::FNV_OFFSET_BASIS,
+        }
+    }
+    
+    fn finish(&self) -> u64 {
+        self.state
+    }
+}
+
+impl Hasher for FnvHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.state ^= *byte as u64;
+            self.state = self.state.wrapping_mul(Self::FNV_PRIME);
+        }
+    }
+    
+    fn finish(&self) -> u64 {
+        self.state
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VALID CALL TARGET REGISTRY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Entry in the valid call target table
+#[derive(Debug, Clone, Copy)]
+pub struct CallTarget {
+    /// Function address
+    pub address: usize,
+    
+    /// Type signature hash
+    pub type_hash: TypeHash,
+    
+    /// Function name (for debugging)
+    pub name_hash: u64,
+}
+
+/// Registry of valid indirect call targets
+pub struct CallTargetRegistry {
+    /// Valid targets by address
+    targets: std::sync::RwLock<BTreeSet<usize>>,
+    
+    /// Type signatures by address
+    signatures: std::sync::RwLock<std::collections::HashMap<usize, TypeHash>>,
+    
+    /// Statistics
+    lookups: AtomicUsize,
+    hits: AtomicUsize,
+    misses: AtomicUsize,
+}
+
+impl CallTargetRegistry {
+    /// Create new registry
+    pub fn new() -> Self {
+        CallTargetRegistry {
+            targets: std::sync::RwLock::new(BTreeSet::new()),
+            signatures: std::sync::RwLock::new(std::collections::HashMap::new()),
+            lookups: AtomicUsize::new(0),
+            hits: AtomicUsize::new(0),
+            misses: AtomicUsize::new(0),
+        }
+    }
+    
+    /// Register a valid call target
+    pub fn register(&self, address: usize, type_hash: TypeHash) {
+        self.targets.write().unwrap().insert(address);
+        self.signatures.write().unwrap().insert(address, type_hash);
+    }
+    
+    /// Register multiple targets
+    pub fn register_batch(&self, targets: &[CallTarget]) {
+        let mut target_set = self.targets.write().unwrap();
+        let mut sig_map = self.signatures.write().unwrap();
+        
+        for target in targets {
+            target_set.insert(target.address);
+            sig_map.insert(target.address, target.type_hash);
+        }
+    }
+    
+    /// Unregister a target (e.g., for JIT compiled code unloading)
+    pub fn unregister(&self, address: usize) {
+        self.targets.write().unwrap().remove(&address);
+        self.signatures.write().unwrap().remove(&address);
+    }
+    
+    /// Check if address is a valid call target
+    pub fn is_valid_target(&self, address: usize) -> bool {
+        self.lookups.fetch_add(1, Ordering::Relaxed);
+        
+        let valid = self.targets.read().unwrap().contains(&address);
+        
+        if valid {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        
+        valid
+    }
+    
+    /// Validate call with type checking
+    pub fn validate_call(&self, address: usize, expected_type: TypeHash) -> CfiResult {
+        self.lookups.fetch_add(1, Ordering::Relaxed);
+        
+        // Check if address is registered
+        if !self.targets.read().unwrap().contains(&address) {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return CfiResult::InvalidTarget;
+        }
+        
+        // Check type signature
+        if let Some(actual_type) = self.signatures.read().unwrap().get(&address) {
+            if actual_type.matches(&expected_type) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                CfiResult::Valid
+            } else {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                CfiResult::TypeMismatch {
+                    expected: expected_type,
+                    actual: *actual_type,
+                }
+            }
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            CfiResult::InvalidTarget
+        }
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> CfiStats {
+        CfiStats {
+            lookups: self.lookups.load(Ordering::Relaxed),
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            registered_targets: self.targets.read().unwrap().len(),
+        }
+    }
+}
+
+impl Default for CallTargetRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// CFI validation result
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CfiResult {
+    Valid,
+    InvalidTarget,
+    TypeMismatch {
+        expected: TypeHash,
+        actual: TypeHash,
+    },
+    ReturnAddressTampered,
+    JumpTableOutOfBounds,
+}
+
+/// CFI statistics
+#[derive(Debug, Clone)]
+pub struct CfiStats {
+    pub lookups: usize,
+    pub hits: usize,
+    pub misses: usize,
+    pub registered_targets: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SHADOW STACK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Shadow stack entry
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct ShadowStackEntry {
+    /// Return address
+    return_address: usize,
+    
+    /// Frame pointer (for debugging)
+    frame_pointer: usize,
+}
+
+/// Thread-local shadow stack
+pub struct ShadowStack {
+    /// Stack storage
+    stack: Vec<ShadowStackEntry>,
+    
+    /// Current stack pointer
+    sp: AtomicUsize,
+    
+    /// Maximum size
+    max_size: usize,
+    
+    /// Overflow count
+    overflows: AtomicUsize,
+    
+    /// Tampering detections
+    tampering_detected: AtomicUsize,
+}
+
+impl ShadowStack {
+    /// Create new shadow stack
+    pub fn new(size: usize) -> Self {
+        let capacity = size / core::mem::size_of::<ShadowStackEntry>();
+        ShadowStack {
+            stack: Vec::with_capacity(capacity),
+            sp: AtomicUsize::new(0),
+            max_size: capacity,
+            overflows: AtomicUsize::new(0),
+            tampering_detected: AtomicUsize::new(0),
+        }
+    }
+    
+    /// Push return address onto shadow stack
+    #[inline]
+    pub fn push(&self, return_address: usize, frame_pointer: usize) -> bool {
+        let sp = self.sp.load(Ordering::Relaxed);
+        
+        if sp >= self.max_size {
+            self.overflows.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        
+        // Note: In real implementation, this would use unsafe to avoid Vec bounds checking
+        // For demonstration, we're being conservative
+        unsafe {
+            let stack_ptr = self.stack.as_ptr() as *mut ShadowStackEntry;
+            *stack_ptr.add(sp) = ShadowStackEntry {
+                return_address,
+                frame_pointer,
+            };
+        }
+        
+        self.sp.store(sp + 1, Ordering::Release);
+        true
+    }
+    
+    /// Pop and validate return address
+    #[inline]
+    pub fn pop_and_validate(&self, actual_return: usize) -> CfiResult {
+        let sp = self.sp.load(Ordering::Acquire);
+        
+        if sp == 0 {
+            return CfiResult::ReturnAddressTampered;
+        }
+        
+        let new_sp = sp - 1;
+        
+        let expected = unsafe {
+            let stack_ptr = self.stack.as_ptr();
+            (*stack_ptr.add(new_sp)).return_address
+        };
+        
+        self.sp.store(new_sp, Ordering::Release);
+        
+        if expected != actual_return {
+            self.tampering_detected.fetch_add(1, Ordering::Relaxed);
+            CfiResult::ReturnAddressTampered
+        } else {
+            CfiResult::Valid
+        }
+    }
+    
+    /// Get current depth
+    pub fn depth(&self) -> usize {
+        self.sp.load(Ordering::Relaxed)
+    }
+    
+    /// Get tampering count
+    pub fn tampering_count(&self) -> usize {
+        self.tampering_detected.load(Ordering::Relaxed)
+    }
+}
+
+// Thread-local shadow stack
+thread_local! {
+    static SHADOW_STACK: std::cell::RefCell<Option<ShadowStack>> = std::cell::RefCell::new(None);
+}
+
+/// Initialize shadow stack for current thread
+pub fn init_thread_shadow_stack(size: usize) {
+    SHADOW_STACK.with(|ss| {
+        *ss.borrow_mut() = Some(ShadowStack::new(size));
+    });
+}
+
+/// Push to thread shadow stack
+#[inline]
+pub fn shadow_push(return_address: usize, frame_pointer: usize) {
+    SHADOW_STACK.with(|ss| {
+        if let Some(ref stack) = *ss.borrow() {
+            stack.push(return_address, frame_pointer);
+        }
+    });
+}
+
+/// Pop and validate from thread shadow stack
+#[inline]
+pub fn shadow_pop_validate(actual_return: usize) -> CfiResult {
+    SHADOW_STACK.with(|ss| {
+        if let Some(ref stack) = *ss.borrow() {
+            stack.pop_and_validate(actual_return)
+        } else {
+            CfiResult::Valid // No shadow stack, skip validation
+        }
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JUMP TABLE PROTECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Protected jump table
+#[repr(C)]
+pub struct JumpTable {
+    /// Base address
+    base: usize,
+    
+    /// Number of entries
+    count: usize,
+    
+    /// Entry size
+    entry_size: usize,
+    
+    /// Valid entries bitmap
+    valid_entries: Vec<u64>,
+}
+
+impl JumpTable {
+    /// Create new jump table
+    pub fn new(base: usize, count: usize, entry_size: usize) -> Self {
+        let bitmap_size = (count + 63) / 64;
+        JumpTable {
+            base,
+            count,
+            entry_size,
+            valid_entries: vec![0; bitmap_size],
+        }
+    }
+    
+    /// Mark entry as valid
+    pub fn mark_valid(&mut self, index: usize) {
+        if index < self.count {
+            let word = index / 64;
+            let bit = index % 64;
+            self.valid_entries[word] |= 1 << bit;
+        }
+    }
+    
+    /// Check if jump index is valid
+    #[inline]
+    pub fn validate_jump(&self, index: usize) -> CfiResult {
+        // Bounds check
+        if index >= self.count {
+            return CfiResult::JumpTableOutOfBounds;
+        }
+        
+        // Check if entry is marked valid
+        let word = index / 64;
+        let bit = index % 64;
+        
+        if self.valid_entries[word] & (1 << bit) != 0 {
+            CfiResult::Valid
+        } else {
+            CfiResult::InvalidTarget
+        }
+    }
+    
+    /// Get jump target address
+    #[inline]
+    pub fn get_target(&self, index: usize) -> Option<usize> {
+        if self.validate_jump(index) == CfiResult::Valid {
+            Some(self.base + index * self.entry_size)
+        } else {
+            None
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CFI ENFORCEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// CFI enforcement engine
+pub struct CfiEnforcer {
+    config: CfiConfig,
+    registry: CallTargetRegistry,
+    violations: AtomicUsize,
+}
+
+impl CfiEnforcer {
+    /// Create new enforcer
+    pub fn new(config: CfiConfig) -> Self {
+        CfiEnforcer {
+            config,
+            registry: CallTargetRegistry::new(),
+            violations: AtomicUsize::new(0),
+        }
+    }
+    
+    /// Get call target registry
+    pub fn registry(&self) -> &CallTargetRegistry {
+        &self.registry
+    }
+    
+    /// Validate indirect call
+    #[inline]
+    pub fn validate_indirect_call(
+        &self,
+        target: usize,
+        expected_type: TypeHash,
+    ) -> bool {
+        if !self.config.indirect_call_check {
+            return true;
+        }
+        
+        let result = self.registry.validate_call(target, expected_type);
+        
+        match result {
+            CfiResult::Valid => true,
+            _ => {
+                self.handle_violation(result, target);
+                false
+            }
+        }
+    }
+    
+    /// Validate return (backward-edge CFI)
+    #[inline]
+    pub fn validate_return(&self, actual_return: usize) -> bool {
+        if !self.config.shadow_stack {
+            return true;
+        }
+        
+        let result = shadow_pop_validate(actual_return);
+        
+        match result {
+            CfiResult::Valid => true,
+            _ => {
+                self.handle_violation(result, actual_return);
+                false
+            }
+        }
+    }
+    
+    /// Handle CFI violation
+    fn handle_violation(&self, result: CfiResult, address: usize) {
+        self.violations.fetch_add(1, Ordering::Relaxed);
+        
+        // Log violation
+        #[cfg(feature = "std")]
+        eprintln!("CFI violation: {:?} at address 0x{:x}", result, address);
+        
+        if self.config.abort_on_violation {
+            // Report to security monitor
+            let violation = match result {
+                CfiResult::InvalidTarget => SecurityViolation::ControlFlowHijack {
+                    target: address,
+                },
+                CfiResult::TypeMismatch { .. } => SecurityViolation::TypeConfusion {
+                    address,
+                },
+                CfiResult::ReturnAddressTampered => SecurityViolation::ReturnAddressOverwrite {
+                    address,
+                },
+                CfiResult::JumpTableOutOfBounds => SecurityViolation::JumpTableOverflow {
+                    address,
+                },
+                _ => SecurityViolation::CfiViolation {
+                    address,
+                },
+            };
+            
+            if let Some(monitor) = super::memory::security_monitor() {
+                monitor.report_violation(violation);
+            }
+            
+            core::intrinsics::abort();
+        }
+    }
+    
+    /// Get violation count
+    pub fn violation_count(&self) -> usize {
+        self.violations.load(Ordering::Relaxed)
+    }
+}
+
+// Extended security violations
+impl SecurityViolation {
+    pub const fn control_flow_hijack(target: usize) -> Self {
+        SecurityViolation::ControlFlowHijack { target }
+    }
+}
+
+// Add CFI-specific violations to SecurityViolation
+#[derive(Debug, Clone)]
+pub enum CfiSecurityViolation {
+    ControlFlowHijack { target: usize },
+    TypeConfusion { address: usize },
+    ReturnAddressOverwrite { address: usize },
+    JumpTableOverflow { address: usize },
+    CfiViolation { address: usize },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HARDWARE CFI SUPPORT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Hardware CFI capabilities
+#[derive(Debug, Clone, Copy)]
+pub struct HardwareCfiSupport {
+    /// Intel CET Shadow Stack
+    pub intel_cet_ss: bool,
+    
+    /// Intel CET Indirect Branch Tracking
+    pub intel_cet_ibt: bool,
+    
+    /// ARM Branch Target Identification
+    pub arm_bti: bool,
+    
+    /// ARM Pointer Authentication
+    pub arm_pac: bool,
+}
+
+impl HardwareCfiSupport {
+    /// Detect hardware CFI support
+    pub fn detect() -> Self {
+        HardwareCfiSupport {
+            intel_cet_ss: Self::detect_intel_cet_ss(),
+            intel_cet_ibt: Self::detect_intel_cet_ibt(),
+            arm_bti: Self::detect_arm_bti(),
+            arm_pac: Self::detect_arm_pac(),
+        }
+    }
+    
+    #[cfg(target_arch = "x86_64")]
+    fn detect_intel_cet_ss() -> bool {
+        // Check CPUID for CET-SS support
+        unsafe {
+            let result: u32;
+            core::arch::asm!(
+                "mov eax, 7",
+                "mov ecx, 0",
+                "cpuid",
+                "mov {}, ecx",
+                out(reg) result,
+                out("eax") _,
+                out("ebx") _,
+                out("ecx") _,
+                out("edx") _,
+            );
+            (result & (1 << 7)) != 0 // CET_SS bit
+        }
+    }
+    
+    #[cfg(not(target_arch = "x86_64"))]
+    fn detect_intel_cet_ss() -> bool { false }
+    
+    #[cfg(target_arch = "x86_64")]
+    fn detect_intel_cet_ibt() -> bool {
+        unsafe {
+            let result: u32;
+            core::arch::asm!(
+                "mov eax, 7",
+                "mov ecx, 0",
+                "cpuid",
+                "mov {}, edx",
+                out(reg) result,
+                out("eax") _,
+                out("ebx") _,
+                out("ecx") _,
+                out("edx") _,
+            );
+            (result & (1 << 20)) != 0 // CET_IBT bit
+        }
+    }
+    
+    #[cfg(not(target_arch = "x86_64"))]
+    fn detect_intel_cet_ibt() -> bool { false }
+    
+    #[cfg(target_arch = "aarch64")]
+    fn detect_arm_bti() -> bool {
+        // Read ID_AA64PFR1_EL1 for BTI support
+        unsafe {
+            let result: u64;
+            core::arch::asm!(
+                "mrs {}, ID_AA64PFR1_EL1",
+                out(reg) result,
+            );
+            (result & 0xF) != 0 // BT field
+        }
+    }
+    
+    #[cfg(not(target_arch = "aarch64"))]
+    fn detect_arm_bti() -> bool { false }
+    
+    #[cfg(target_arch = "aarch64")]
+    fn detect_arm_pac() -> bool {
+        unsafe {
+            let result: u64;
+            core::arch::asm!(
+                "mrs {}, ID_AA64ISAR1_EL1",
+                out(reg) result,
+            );
+            // Check APA/API/GPA/GPI fields
+            (result & 0xFF00FF00) != 0
+        }
+    }
+    
+    #[cfg(not(target_arch = "aarch64"))]
+    fn detect_arm_pac() -> bool { false }
+    
+    /// Check if any hardware CFI is available
+    pub fn has_hardware_cfi(&self) -> bool {
+        self.intel_cet_ss || self.intel_cet_ibt || self.arm_bti || self.arm_pac
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_type_hash() {
+        let hash1 = TypeHash::from_signature("void", &["i32", "i32"]);
+        let hash2 = TypeHash::from_signature("void", &["i32", "i32"]);
+        let hash3 = TypeHash::from_signature("i32", &["i32"]);
+        
+        assert!(hash1.matches(&hash2));
+        assert!(!hash1.matches(&hash3));
+    }
+    
+    #[test]
+    fn test_call_target_registry() {
+        let registry = CallTargetRegistry::new();
+        let type_hash = TypeHash::from_signature("void", &[]);
+        
+        registry.register(0x1000, type_hash);
+        
+        assert!(registry.is_valid_target(0x1000));
+        assert!(!registry.is_valid_target(0x2000));
+        
+        assert_eq!(
+            registry.validate_call(0x1000, type_hash),
+            CfiResult::Valid
+        );
+    }
+    
+    #[test]
+    fn test_shadow_stack() {
+        let stack = ShadowStack::new(4096);
+        
+        stack.push(0x1000, 0x2000);
+        stack.push(0x3000, 0x4000);
+        
+        assert_eq!(stack.depth(), 2);
+        
+        assert_eq!(stack.pop_and_validate(0x3000), CfiResult::Valid);
+        assert_eq!(stack.pop_and_validate(0x1000), CfiResult::Valid);
+        
+        assert_eq!(stack.depth(), 0);
+    }
+    
+    #[test]
+    fn test_shadow_stack_tampering() {
+        let stack = ShadowStack::new(4096);
+        
+        stack.push(0x1000, 0x2000);
+        
+        // Wrong return address
+        assert_eq!(
+            stack.pop_and_validate(0x9999),
+            CfiResult::ReturnAddressTampered
+        );
+    }
+    
+    #[test]
+    fn test_jump_table() {
+        let mut table = JumpTable::new(0x10000, 100, 8);
+        
+        table.mark_valid(5);
+        table.mark_valid(10);
+        table.mark_valid(50);
+        
+        assert_eq!(table.validate_jump(5), CfiResult::Valid);
+        assert_eq!(table.validate_jump(10), CfiResult::Valid);
+        assert_eq!(table.validate_jump(7), CfiResult::InvalidTarget);
+        assert_eq!(table.validate_jump(200), CfiResult::JumpTableOutOfBounds);
+    }
+    
+    #[test]
+    fn test_hardware_detection() {
+        let support = HardwareCfiSupport::detect();
+        // Just verify it doesn't panic
+        let _ = support.has_hardware_cfi();
+    }
+}

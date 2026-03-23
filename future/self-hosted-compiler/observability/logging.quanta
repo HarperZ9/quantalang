@@ -1,0 +1,1054 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ OBSERVABILITY — Structured Logging
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Structured logging with OpenTelemetry correlation:
+// - Log levels and filtering
+// - Structured fields and context
+// - Trace correlation
+// - Multiple output targets
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::observability::logging
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, RwLock, Once};
+use std::time::SystemTime;
+use std::io::Write;
+
+use super::tracing::{TraceId, SpanId, current_span_context};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOG LEVELS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Log severity level (OpenTelemetry compatible)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum Level {
+    Trace = 1,
+    Debug = 5,
+    Info = 9,
+    Warn = 13,
+    Error = 17,
+    Fatal = 21,
+}
+
+impl Level {
+    /// Get level from string
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "trace" => Some(Level::Trace),
+            "debug" => Some(Level::Debug),
+            "info" => Some(Level::Info),
+            "warn" | "warning" => Some(Level::Warn),
+            "error" => Some(Level::Error),
+            "fatal" | "critical" => Some(Level::Fatal),
+            _ => None,
+        }
+    }
+    
+    /// Get level name
+    pub fn name(&self) -> &'static str {
+        match self {
+            Level::Trace => "TRACE",
+            Level::Debug => "DEBUG",
+            Level::Info => "INFO",
+            Level::Warn => "WARN",
+            Level::Error => "ERROR",
+            Level::Fatal => "FATAL",
+        }
+    }
+    
+    /// Get ANSI color code
+    pub fn color(&self) -> &'static str {
+        match self {
+            Level::Trace => "\x1b[90m",  // Gray
+            Level::Debug => "\x1b[36m",  // Cyan
+            Level::Info => "\x1b[32m",   // Green
+            Level::Warn => "\x1b[33m",   // Yellow
+            Level::Error => "\x1b[31m",  // Red
+            Level::Fatal => "\x1b[35m",  // Magenta
+        }
+    }
+    
+    /// OpenTelemetry severity number
+    pub fn otel_severity(&self) -> u8 {
+        *self as u8
+    }
+}
+
+impl std::fmt::Display for Level {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOG RECORD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Attribute value for log records
+#[derive(Debug, Clone)]
+pub enum Value {
+    String(String),
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Bytes(Vec<u8>),
+}
+
+impl From<&str> for Value {
+    fn from(s: &str) -> Self { Value::String(s.to_string()) }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Self { Value::String(s) }
+}
+
+impl From<bool> for Value {
+    fn from(b: bool) -> Self { Value::Bool(b) }
+}
+
+impl From<i64> for Value {
+    fn from(i: i64) -> Self { Value::Int(i) }
+}
+
+impl From<f64> for Value {
+    fn from(f: f64) -> Self { Value::Float(f) }
+}
+
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::String(s) => write!(f, "{}", s),
+            Value::Bool(b) => write!(f, "{}", b),
+            Value::Int(i) => write!(f, "{}", i),
+            Value::Float(fl) => write!(f, "{}", fl),
+            Value::Bytes(b) => write!(f, "{:?}", b),
+        }
+    }
+}
+
+/// A single log record
+#[derive(Debug, Clone)]
+pub struct LogRecord {
+    /// Timestamp when the log was created
+    pub timestamp: SystemTime,
+    
+    /// Observed timestamp (when log was observed by collection system)
+    pub observed_timestamp: Option<SystemTime>,
+    
+    /// Severity level
+    pub level: Level,
+    
+    /// Log message body
+    pub body: String,
+    
+    /// Structured attributes
+    pub attributes: Vec<(String, Value)>,
+    
+    /// Trace ID for correlation
+    pub trace_id: Option<TraceId>,
+    
+    /// Span ID for correlation
+    pub span_id: Option<SpanId>,
+    
+    /// Trace flags
+    pub trace_flags: Option<u8>,
+    
+    /// Resource attributes
+    pub resource: Option<Vec<(String, Value)>>,
+    
+    /// Instrumentation scope name
+    pub scope_name: Option<String>,
+    
+    /// Instrumentation scope version
+    pub scope_version: Option<String>,
+    
+    /// Source location
+    pub source: Option<SourceLocation>,
+}
+
+impl LogRecord {
+    /// Create a new log record
+    pub fn new(level: Level, body: impl Into<String>) -> Self {
+        let ctx = current_span_context();
+        
+        LogRecord {
+            timestamp: SystemTime::now(),
+            observed_timestamp: None,
+            level,
+            body: body.into(),
+            attributes: Vec::new(),
+            trace_id: ctx.as_ref().map(|c| c.trace_id),
+            span_id: ctx.as_ref().map(|c| c.span_id),
+            trace_flags: ctx.as_ref().map(|c| c.trace_flags.0),
+            resource: None,
+            scope_name: None,
+            scope_version: None,
+            source: None,
+        }
+    }
+    
+    /// Add attribute
+    pub fn with_attribute(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.attributes.push((key.into(), value.into()));
+        self
+    }
+    
+    /// Add multiple attributes
+    pub fn with_attributes<I, K, V>(mut self, attrs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<Value>,
+    {
+        for (k, v) in attrs {
+            self.attributes.push((k.into(), v.into()));
+        }
+        self
+    }
+    
+    /// Set source location
+    pub fn with_source(mut self, file: &'static str, line: u32, module: &'static str) -> Self {
+        self.source = Some(SourceLocation { file, line, module });
+        self
+    }
+    
+    /// Set scope
+    pub fn with_scope(mut self, name: impl Into<String>, version: Option<String>) -> Self {
+        self.scope_name = Some(name.into());
+        self.scope_version = version;
+        self
+    }
+}
+
+/// Source code location
+#[derive(Debug, Clone)]
+pub struct SourceLocation {
+    pub file: &'static str,
+    pub line: u32,
+    pub module: &'static str,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOGGER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Logger instance
+pub struct Logger {
+    name: String,
+    level: AtomicUsize,
+    provider: Arc<LoggerProvider>,
+    fields: RwLock<Vec<(String, Value)>>,
+}
+
+impl Logger {
+    /// Log at trace level
+    pub fn trace(&self, msg: impl Into<String>) {
+        self.log(Level::Trace, msg);
+    }
+    
+    /// Log at debug level
+    pub fn debug(&self, msg: impl Into<String>) {
+        self.log(Level::Debug, msg);
+    }
+    
+    /// Log at info level
+    pub fn info(&self, msg: impl Into<String>) {
+        self.log(Level::Info, msg);
+    }
+    
+    /// Log at warn level
+    pub fn warn(&self, msg: impl Into<String>) {
+        self.log(Level::Warn, msg);
+    }
+    
+    /// Log at error level
+    pub fn error(&self, msg: impl Into<String>) {
+        self.log(Level::Error, msg);
+    }
+    
+    /// Log at fatal level
+    pub fn fatal(&self, msg: impl Into<String>) {
+        self.log(Level::Fatal, msg);
+    }
+    
+    /// Log at specified level
+    pub fn log(&self, level: Level, msg: impl Into<String>) {
+        if !self.enabled(level) {
+            return;
+        }
+        
+        let mut record = LogRecord::new(level, msg);
+        record.scope_name = Some(self.name.clone());
+        
+        // Add logger fields
+        let fields = self.fields.read().unwrap();
+        for (k, v) in fields.iter() {
+            record.attributes.push((k.clone(), v.clone()));
+        }
+        
+        self.provider.emit(record);
+    }
+    
+    /// Log with structured fields
+    pub fn log_with<I, K, V>(&self, level: Level, msg: impl Into<String>, fields: I)
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<Value>,
+    {
+        if !self.enabled(level) {
+            return;
+        }
+        
+        let mut record = LogRecord::new(level, msg);
+        record.scope_name = Some(self.name.clone());
+        
+        // Add logger fields
+        let logger_fields = self.fields.read().unwrap();
+        for (k, v) in logger_fields.iter() {
+            record.attributes.push((k.clone(), v.clone()));
+        }
+        
+        // Add provided fields
+        for (k, v) in fields {
+            record.attributes.push((k.into(), v.into()));
+        }
+        
+        self.provider.emit(record);
+    }
+    
+    /// Create a child logger with additional fields
+    pub fn with_fields<I, K, V>(&self, fields: I) -> Logger
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<Value>,
+    {
+        let mut new_fields = self.fields.read().unwrap().clone();
+        for (k, v) in fields {
+            new_fields.push((k.into(), v.into()));
+        }
+        
+        Logger {
+            name: self.name.clone(),
+            level: AtomicUsize::new(self.level.load(Ordering::Relaxed)),
+            provider: self.provider.clone(),
+            fields: RwLock::new(new_fields),
+        }
+    }
+    
+    /// Check if level is enabled
+    pub fn enabled(&self, level: Level) -> bool {
+        let min_level = self.level.load(Ordering::Relaxed);
+        level as usize >= min_level
+    }
+    
+    /// Set minimum log level
+    pub fn set_level(&self, level: Level) {
+        self.level.store(level as usize, Ordering::Relaxed);
+    }
+    
+    /// Get logger name
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Clone for Logger {
+    fn clone(&self) -> Self {
+        Logger {
+            name: self.name.clone(),
+            level: AtomicUsize::new(self.level.load(Ordering::Relaxed)),
+            provider: self.provider.clone(),
+            fields: RwLock::new(self.fields.read().unwrap().clone()),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOGGER PROVIDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Logger provider
+pub struct LoggerProvider {
+    processors: RwLock<Vec<Arc<dyn LogProcessor>>>,
+    resource: RwLock<Vec<(String, Value)>>,
+    default_level: AtomicUsize,
+}
+
+impl LoggerProvider {
+    /// Create a new logger provider
+    pub fn new() -> Arc<Self> {
+        Arc::new(LoggerProvider {
+            processors: RwLock::new(Vec::new()),
+            resource: RwLock::new(Vec::new()),
+            default_level: AtomicUsize::new(Level::Info as usize),
+        })
+    }
+    
+    /// Create a builder
+    pub fn builder() -> LoggerProviderBuilder {
+        LoggerProviderBuilder::new()
+    }
+    
+    /// Get a logger
+    pub fn logger(self: &Arc<Self>, name: &str) -> Logger {
+        Logger {
+            name: name.to_string(),
+            level: AtomicUsize::new(self.default_level.load(Ordering::Relaxed)),
+            provider: self.clone(),
+            fields: RwLock::new(Vec::new()),
+        }
+    }
+    
+    /// Add a processor
+    pub fn add_processor(&self, processor: impl LogProcessor + 'static) {
+        self.processors.write().unwrap().push(Arc::new(processor));
+    }
+    
+    /// Set resource attributes
+    pub fn set_resource<I, K, V>(&self, attrs: I)
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<Value>,
+    {
+        let mut resource = self.resource.write().unwrap();
+        resource.clear();
+        for (k, v) in attrs {
+            resource.push((k.into(), v.into()));
+        }
+    }
+    
+    /// Set default log level
+    pub fn set_default_level(&self, level: Level) {
+        self.default_level.store(level as usize, Ordering::Relaxed);
+    }
+    
+    /// Emit a log record
+    pub fn emit(&self, mut record: LogRecord) {
+        // Add resource
+        record.resource = Some(self.resource.read().unwrap().clone());
+        
+        // Process through all processors
+        let processors = self.processors.read().unwrap();
+        for processor in processors.iter() {
+            processor.emit(&record);
+        }
+    }
+    
+    /// Shutdown the provider
+    pub fn shutdown(&self) -> Result<(), LoggingError> {
+        let processors = self.processors.read().unwrap();
+        for processor in processors.iter() {
+            processor.shutdown()?;
+        }
+        Ok(())
+    }
+    
+    /// Force flush all processors
+    pub fn force_flush(&self) -> Result<(), LoggingError> {
+        let processors = self.processors.read().unwrap();
+        for processor in processors.iter() {
+            processor.force_flush()?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for LoggerProvider {
+    fn default() -> Arc<Self> {
+        Self::new()
+    }
+}
+
+/// Logger provider builder
+pub struct LoggerProviderBuilder {
+    processors: Vec<Arc<dyn LogProcessor>>,
+    resource: Vec<(String, Value)>,
+    default_level: Level,
+}
+
+impl LoggerProviderBuilder {
+    pub fn new() -> Self {
+        LoggerProviderBuilder {
+            processors: Vec::new(),
+            resource: Vec::new(),
+            default_level: Level::Info,
+        }
+    }
+    
+    pub fn with_processor(mut self, processor: impl LogProcessor + 'static) -> Self {
+        self.processors.push(Arc::new(processor));
+        self
+    }
+    
+    pub fn with_resource<I, K, V>(mut self, attrs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<Value>,
+    {
+        for (k, v) in attrs {
+            self.resource.push((k.into(), v.into()));
+        }
+        self
+    }
+    
+    pub fn with_level(mut self, level: Level) -> Self {
+        self.default_level = level;
+        self
+    }
+    
+    pub fn build(self) -> Arc<LoggerProvider> {
+        let provider = LoggerProvider::new();
+        
+        for processor in self.processors {
+            provider.processors.write().unwrap().push(processor);
+        }
+        
+        *provider.resource.write().unwrap() = self.resource;
+        provider.default_level.store(self.default_level as usize, Ordering::Relaxed);
+        
+        provider
+    }
+}
+
+impl Default for LoggerProviderBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOG PROCESSOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Log processor trait
+pub trait LogProcessor: Send + Sync {
+    fn emit(&self, record: &LogRecord);
+    fn shutdown(&self) -> Result<(), LoggingError>;
+    fn force_flush(&self) -> Result<(), LoggingError>;
+}
+
+/// Simple synchronous processor
+pub struct SimpleProcessor {
+    exporter: Mutex<Box<dyn LogExporter>>,
+}
+
+impl SimpleProcessor {
+    pub fn new(exporter: impl LogExporter + 'static) -> Self {
+        SimpleProcessor {
+            exporter: Mutex::new(Box::new(exporter)),
+        }
+    }
+}
+
+impl LogProcessor for SimpleProcessor {
+    fn emit(&self, record: &LogRecord) {
+        let _ = self.exporter.lock().unwrap().export(vec![record.clone()]);
+    }
+    
+    fn shutdown(&self) -> Result<(), LoggingError> {
+        self.exporter.lock().unwrap().shutdown()
+    }
+    
+    fn force_flush(&self) -> Result<(), LoggingError> {
+        Ok(())
+    }
+}
+
+/// Batch processor
+pub struct BatchProcessor {
+    queue: Mutex<Vec<LogRecord>>,
+    exporter: Mutex<Box<dyn LogExporter>>,
+    config: BatchConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchConfig {
+    pub max_queue_size: usize,
+    pub max_export_batch_size: usize,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        BatchConfig {
+            max_queue_size: 2048,
+            max_export_batch_size: 512,
+        }
+    }
+}
+
+impl BatchProcessor {
+    pub fn new(exporter: impl LogExporter + 'static, config: BatchConfig) -> Self {
+        BatchProcessor {
+            queue: Mutex::new(Vec::with_capacity(config.max_queue_size)),
+            exporter: Mutex::new(Box::new(exporter)),
+            config,
+        }
+    }
+    
+    fn export_batch(&self) -> Result<(), LoggingError> {
+        let batch: Vec<LogRecord> = {
+            let mut queue = self.queue.lock().unwrap();
+            let count = queue.len().min(self.config.max_export_batch_size);
+            queue.drain(..count).collect()
+        };
+        
+        if !batch.is_empty() {
+            self.exporter.lock().unwrap().export(batch)?;
+        }
+        
+        Ok(())
+    }
+}
+
+impl LogProcessor for BatchProcessor {
+    fn emit(&self, record: &LogRecord) {
+        let mut queue = self.queue.lock().unwrap();
+        
+        if queue.len() < self.config.max_queue_size {
+            queue.push(record.clone());
+        }
+        
+        if queue.len() >= self.config.max_export_batch_size {
+            drop(queue);
+            let _ = self.export_batch();
+        }
+    }
+    
+    fn shutdown(&self) -> Result<(), LoggingError> {
+        while !self.queue.lock().unwrap().is_empty() {
+            self.export_batch()?;
+        }
+        self.exporter.lock().unwrap().shutdown()
+    }
+    
+    fn force_flush(&self) -> Result<(), LoggingError> {
+        while !self.queue.lock().unwrap().is_empty() {
+            self.export_batch()?;
+        }
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOG EXPORTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Log exporter trait
+pub trait LogExporter: Send {
+    fn export(&mut self, records: Vec<LogRecord>) -> Result<(), LoggingError>;
+    fn shutdown(&mut self) -> Result<(), LoggingError>;
+}
+
+/// Console exporter
+pub struct ConsoleExporter {
+    writer: Mutex<Box<dyn Write + Send>>,
+    format: LogFormat,
+    colored: bool,
+}
+
+impl ConsoleExporter {
+    pub fn new() -> Self {
+        ConsoleExporter {
+            writer: Mutex::new(Box::new(std::io::stderr())),
+            format: LogFormat::Text,
+            colored: true,
+        }
+    }
+    
+    pub fn with_format(mut self, format: LogFormat) -> Self {
+        self.format = format;
+        self
+    }
+    
+    pub fn with_colored(mut self, colored: bool) -> Self {
+        self.colored = colored;
+        self
+    }
+    
+    pub fn to_stdout(mut self) -> Self {
+        self.writer = Mutex::new(Box::new(std::io::stdout()));
+        self
+    }
+}
+
+impl Default for ConsoleExporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogExporter for ConsoleExporter {
+    fn export(&mut self, records: Vec<LogRecord>) -> Result<(), LoggingError> {
+        let mut writer = self.writer.lock().unwrap();
+        
+        for record in records {
+            match self.format {
+                LogFormat::Text => {
+                    let timestamp = record.timestamp
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    
+                    if self.colored {
+                        write!(
+                            writer,
+                            "{}{} {}{}\x1b[0m {} ",
+                            record.level.color(),
+                            timestamp,
+                            record.level.name(),
+                            "\x1b[0m",
+                            record.body,
+                        ).ok();
+                    } else {
+                        write!(
+                            writer,
+                            "{} {} {} ",
+                            timestamp,
+                            record.level.name(),
+                            record.body,
+                        ).ok();
+                    }
+                    
+                    // Print attributes
+                    for (key, value) in &record.attributes {
+                        write!(writer, "{}={} ", key, value).ok();
+                    }
+                    
+                    // Print trace context
+                    if let Some(trace_id) = &record.trace_id {
+                        write!(writer, "trace_id={} ", trace_id.to_hex()).ok();
+                    }
+                    if let Some(span_id) = &record.span_id {
+                        write!(writer, "span_id={} ", span_id.to_hex()).ok();
+                    }
+                    
+                    writeln!(writer).ok();
+                }
+                
+                LogFormat::Json => {
+                    let timestamp = record.timestamp
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    
+                    write!(writer, "{{").ok();
+                    write!(writer, "\"timestamp\":{}", timestamp).ok();
+                    write!(writer, ",\"level\":\"{}\"", record.level.name()).ok();
+                    write!(writer, ",\"body\":\"{}\"", escape_json(&record.body)).ok();
+                    
+                    if !record.attributes.is_empty() {
+                        write!(writer, ",\"attributes\":{{").ok();
+                        let mut first = true;
+                        for (key, value) in &record.attributes {
+                            if !first { write!(writer, ",").ok(); }
+                            first = false;
+                            write!(writer, "\"{}\":", key).ok();
+                            match value {
+                                Value::String(s) => write!(writer, "\"{}\"", escape_json(s)).ok(),
+                                Value::Bool(b) => write!(writer, "{}", b).ok(),
+                                Value::Int(i) => write!(writer, "{}", i).ok(),
+                                Value::Float(f) => write!(writer, "{}", f).ok(),
+                                Value::Bytes(b) => write!(writer, "{:?}", b).ok(),
+                            };
+                        }
+                        write!(writer, "}}").ok();
+                    }
+                    
+                    if let Some(trace_id) = &record.trace_id {
+                        write!(writer, ",\"trace_id\":\"{}\"", trace_id.to_hex()).ok();
+                    }
+                    if let Some(span_id) = &record.span_id {
+                        write!(writer, ",\"span_id\":\"{}\"", span_id.to_hex()).ok();
+                    }
+                    
+                    writeln!(writer, "}}").ok();
+                }
+            }
+        }
+        
+        writer.flush().map_err(|e| LoggingError::Export(e.to_string()))?;
+        Ok(())
+    }
+    
+    fn shutdown(&mut self) -> Result<(), LoggingError> {
+        Ok(())
+    }
+}
+
+/// Log format
+#[derive(Debug, Clone, Copy)]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
+/// File exporter
+pub struct FileExporter {
+    writer: Mutex<std::io::BufWriter<std::fs::File>>,
+    format: LogFormat,
+}
+
+impl FileExporter {
+    pub fn new(path: &str) -> Result<Self, LoggingError> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| LoggingError::Export(e.to_string()))?;
+        
+        Ok(FileExporter {
+            writer: Mutex::new(std::io::BufWriter::new(file)),
+            format: LogFormat::Json,
+        })
+    }
+    
+    pub fn with_format(mut self, format: LogFormat) -> Self {
+        self.format = format;
+        self
+    }
+}
+
+impl LogExporter for FileExporter {
+    fn export(&mut self, records: Vec<LogRecord>) -> Result<(), LoggingError> {
+        let mut writer = self.writer.lock().unwrap();
+        
+        for record in records {
+            let timestamp = record.timestamp
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            
+            match self.format {
+                LogFormat::Text => {
+                    write!(
+                        writer,
+                        "{} {} {} ",
+                        timestamp,
+                        record.level.name(),
+                        record.body,
+                    ).ok();
+                    
+                    for (key, value) in &record.attributes {
+                        write!(writer, "{}={} ", key, value).ok();
+                    }
+                    
+                    writeln!(writer).ok();
+                }
+                
+                LogFormat::Json => {
+                    // Similar to console JSON format
+                    write!(writer, "{{").ok();
+                    write!(writer, "\"timestamp\":{}", timestamp).ok();
+                    write!(writer, ",\"level\":\"{}\"", record.level.name()).ok();
+                    write!(writer, ",\"body\":\"{}\"", escape_json(&record.body)).ok();
+                    writeln!(writer, "}}").ok();
+                }
+            }
+        }
+        
+        writer.flush().map_err(|e| LoggingError::Export(e.to_string()))?;
+        Ok(())
+    }
+    
+    fn shutdown(&mut self) -> Result<(), LoggingError> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.flush().map_err(|e| LoggingError::Shutdown(e.to_string()))?;
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL LOGGER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static GLOBAL_PROVIDER: std::sync::OnceLock<Arc<LoggerProvider>> = std::sync::OnceLock::new();
+
+/// Get the global logger provider
+pub fn global_provider() -> &'static Arc<LoggerProvider> {
+    GLOBAL_PROVIDER.get_or_init(|| {
+        let provider = LoggerProvider::builder()
+            .with_processor(SimpleProcessor::new(ConsoleExporter::new()))
+            .with_level(Level::Info)
+            .build();
+        provider
+    })
+}
+
+/// Initialize global logger provider
+pub fn init_global_provider(provider: Arc<LoggerProvider>) {
+    let _ = GLOBAL_PROVIDER.set(provider);
+}
+
+/// Get a global logger
+pub fn logger(name: &str) -> Logger {
+    global_provider().logger(name)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MACROS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Log at trace level
+#[macro_export]
+macro_rules! trace {
+    ($logger:expr, $($arg:tt)*) => {
+        $logger.trace(format!($($arg)*))
+    };
+}
+
+/// Log at debug level
+#[macro_export]
+macro_rules! debug {
+    ($logger:expr, $($arg:tt)*) => {
+        $logger.debug(format!($($arg)*))
+    };
+}
+
+/// Log at info level
+#[macro_export]
+macro_rules! info {
+    ($logger:expr, $($arg:tt)*) => {
+        $logger.info(format!($($arg)*))
+    };
+}
+
+/// Log at warn level
+#[macro_export]
+macro_rules! warn {
+    ($logger:expr, $($arg:tt)*) => {
+        $logger.warn(format!($($arg)*))
+    };
+}
+
+/// Log at error level
+#[macro_export]
+macro_rules! error {
+    ($logger:expr, $($arg:tt)*) => {
+        $logger.error(format!($($arg)*))
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn escape_json(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            c if c.is_control() => {
+                result.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => result.push(c),
+        }
+    }
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum LoggingError {
+    Export(String),
+    Shutdown(String),
+    InvalidConfig(String),
+}
+
+impl std::fmt::Display for LoggingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Export(e) => write!(f, "export error: {}", e),
+            Self::Shutdown(e) => write!(f, "shutdown error: {}", e),
+            Self::InvalidConfig(e) => write!(f, "invalid config: {}", e),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_log_levels() {
+        assert!(Level::Error > Level::Info);
+        assert!(Level::Info > Level::Debug);
+        assert!(Level::Debug > Level::Trace);
+    }
+    
+    #[test]
+    fn test_level_from_str() {
+        assert_eq!(Level::from_str("info"), Some(Level::Info));
+        assert_eq!(Level::from_str("INFO"), Some(Level::Info));
+        assert_eq!(Level::from_str("warning"), Some(Level::Warn));
+    }
+    
+    #[test]
+    fn test_log_record() {
+        let record = LogRecord::new(Level::Info, "test message")
+            .with_attribute("key", "value")
+            .with_attribute("count", 42i64);
+        
+        assert_eq!(record.level, Level::Info);
+        assert_eq!(record.body, "test message");
+        assert_eq!(record.attributes.len(), 2);
+    }
+    
+    #[test]
+    fn test_logger_provider() {
+        let provider = LoggerProvider::builder()
+            .with_level(Level::Debug)
+            .build();
+        
+        let logger = provider.logger("test");
+        assert!(logger.enabled(Level::Info));
+        assert!(logger.enabled(Level::Debug));
+    }
+    
+    #[test]
+    fn test_logger_with_fields() {
+        let provider = LoggerProvider::new();
+        let logger = provider.logger("test");
+        
+        let child = logger.with_fields([
+            ("service", Value::String("my-service".into())),
+        ]);
+        
+        assert_eq!(child.fields.read().unwrap().len(), 1);
+    }
+    
+    #[test]
+    fn test_escape_json() {
+        assert_eq!(escape_json("hello"), "hello");
+        assert_eq!(escape_json("hello\nworld"), "hello\\nworld");
+        assert_eq!(escape_json("say \"hi\""), "say \\\"hi\\\"");
+    }
+}

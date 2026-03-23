@@ -1,0 +1,924 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ COMPLIANCE — Checker Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Static analysis compliance checker:
+// - Rule violation detection
+// - Automated fixing suggestions
+// - Deviation management
+// - Compliance reporting
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::compliance::checker
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+use super::standards::{
+    Standard, Rule, RuleClassification, RuleCategory, Decidability,
+    ComplianceProfile, RuleDatabase, SafetyLevel,
+    Suppression, SuppressionLocation,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VIOLATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compliance violation
+#[derive(Debug, Clone)]
+pub struct Violation {
+    /// Rule that was violated
+    pub rule_id: String,
+    
+    /// Violation severity
+    pub severity: ViolationSeverity,
+    
+    /// Location in source
+    pub location: SourceLocation,
+    
+    /// Violation message
+    pub message: String,
+    
+    /// Detailed explanation
+    pub explanation: Option<String>,
+    
+    /// Suggested fix
+    pub fix: Option<SuggestedFix>,
+    
+    /// Related locations
+    pub related: Vec<RelatedLocation>,
+    
+    /// Whether suppressed
+    pub suppressed: bool,
+    
+    /// Suppression info if suppressed
+    pub suppression: Option<Suppression>,
+}
+
+/// Violation severity
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ViolationSeverity {
+    /// Informational
+    Info,
+    /// Warning
+    Warning,
+    /// Error (must fix)
+    Error,
+    /// Critical (blocks compilation)
+    Critical,
+}
+
+impl ViolationSeverity {
+    pub fn from_classification(class: RuleClassification) -> Self {
+        match class {
+            RuleClassification::Mandatory => ViolationSeverity::Critical,
+            RuleClassification::Required => ViolationSeverity::Error,
+            RuleClassification::Advisory => ViolationSeverity::Warning,
+            RuleClassification::Documentary => ViolationSeverity::Info,
+        }
+    }
+    
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            ViolationSeverity::Info => "ℹ",
+            ViolationSeverity::Warning => "⚠",
+            ViolationSeverity::Error => "✗",
+            ViolationSeverity::Critical => "☠",
+        }
+    }
+    
+    pub fn name(&self) -> &'static str {
+        match self {
+            ViolationSeverity::Info => "info",
+            ViolationSeverity::Warning => "warning",
+            ViolationSeverity::Error => "error",
+            ViolationSeverity::Critical => "critical",
+        }
+    }
+}
+
+/// Source location
+#[derive(Debug, Clone)]
+pub struct SourceLocation {
+    pub file: PathBuf,
+    pub line: u32,
+    pub column: u32,
+    pub end_line: Option<u32>,
+    pub end_column: Option<u32>,
+}
+
+impl SourceLocation {
+    pub fn new(file: impl Into<PathBuf>, line: u32, column: u32) -> Self {
+        SourceLocation {
+            file: file.into(),
+            line,
+            column,
+            end_line: None,
+            end_column: None,
+        }
+    }
+    
+    pub fn with_end(mut self, line: u32, column: u32) -> Self {
+        self.end_line = Some(line);
+        self.end_column = Some(column);
+        self
+    }
+}
+
+impl std::fmt::Display for SourceLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}:{}", self.file.display(), self.line, self.column)
+    }
+}
+
+/// Related location for context
+#[derive(Debug, Clone)]
+pub struct RelatedLocation {
+    pub location: SourceLocation,
+    pub message: String,
+}
+
+/// Suggested fix
+#[derive(Debug, Clone)]
+pub struct SuggestedFix {
+    /// Fix description
+    pub description: String,
+    
+    /// Edits to apply
+    pub edits: Vec<TextEdit>,
+    
+    /// Confidence level
+    pub confidence: FixConfidence,
+}
+
+/// Text edit for fix
+#[derive(Debug, Clone)]
+pub struct TextEdit {
+    pub location: SourceLocation,
+    pub new_text: String,
+}
+
+/// Fix confidence
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixConfidence {
+    /// Safe to auto-apply
+    Safe,
+    /// Likely correct, review recommended
+    Likely,
+    /// May change semantics, manual review required
+    Uncertain,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHECKER CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Checker configuration
+#[derive(Debug, Clone)]
+pub struct CheckerConfig {
+    /// Compliance profile
+    pub profile: ComplianceProfile,
+    
+    /// Enable all rules
+    pub enable_all: bool,
+    
+    /// Treat warnings as errors
+    pub warnings_as_errors: bool,
+    
+    /// Maximum violations before stopping
+    pub max_violations: Option<usize>,
+    
+    /// Include suppressed in output
+    pub show_suppressed: bool,
+    
+    /// Generate fixes
+    pub suggest_fixes: bool,
+    
+    /// Parallel checking
+    pub parallel: bool,
+    
+    /// Number of threads
+    pub threads: usize,
+}
+
+impl Default for CheckerConfig {
+    fn default() -> Self {
+        CheckerConfig {
+            profile: ComplianceProfile::new("default"),
+            enable_all: true,
+            warnings_as_errors: false,
+            max_violations: None,
+            show_suppressed: false,
+            suggest_fixes: true,
+            parallel: true,
+            threads: num_cpus(),
+        }
+    }
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RULE CHECKER TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Individual rule checker
+pub trait RuleChecker: Send + Sync {
+    /// Rule ID this checker handles
+    fn rule_id(&self) -> &str;
+    
+    /// Check source file
+    fn check(&self, ctx: &CheckContext) -> Vec<Violation>;
+    
+    /// Get suggested fix for violation
+    fn suggest_fix(&self, violation: &Violation) -> Option<SuggestedFix> {
+        None
+    }
+    
+    /// Whether this checker is decidable
+    fn decidability(&self) -> Decidability {
+        Decidability::Decidable
+    }
+}
+
+/// Context for checking
+pub struct CheckContext<'a> {
+    /// Source file path
+    pub file: &'a Path,
+    
+    /// Source content
+    pub source: &'a str,
+    
+    /// AST (if available)
+    pub ast: Option<&'a dyn std::any::Any>,
+    
+    /// Semantic info (if available)
+    pub semantics: Option<&'a dyn std::any::Any>,
+    
+    /// Configuration
+    pub config: &'a CheckerConfig,
+    
+    /// Rule database
+    pub rules: &'a RuleDatabase,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPLIANCE CHECKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Main compliance checker
+pub struct ComplianceChecker {
+    config: CheckerConfig,
+    rules: Arc<RuleDatabase>,
+    checkers: Vec<Box<dyn RuleChecker>>,
+    violations: RwLock<Vec<Violation>>,
+    stats: RwLock<CheckerStats>,
+}
+
+/// Checker statistics
+#[derive(Debug, Clone, Default)]
+pub struct CheckerStats {
+    pub files_checked: usize,
+    pub lines_checked: usize,
+    pub rules_checked: usize,
+    pub violations_found: usize,
+    pub violations_suppressed: usize,
+    pub check_time: Duration,
+}
+
+impl ComplianceChecker {
+    /// Create new checker
+    pub fn new(config: CheckerConfig) -> Self {
+        ComplianceChecker {
+            config,
+            rules: Arc::new(RuleDatabase::new()),
+            checkers: Vec::new(),
+            violations: RwLock::new(Vec::new()),
+            stats: RwLock::new(CheckerStats::default()),
+        }
+    }
+    
+    /// Register rule checker
+    pub fn register_checker(&mut self, checker: Box<dyn RuleChecker>) {
+        self.checkers.push(checker);
+    }
+    
+    /// Check single file
+    pub fn check_file(&self, path: &Path) -> Result<Vec<Violation>, CheckerError> {
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| CheckerError::IoError(e.to_string()))?;
+        
+        self.check_source(path, &source)
+    }
+    
+    /// Check source string
+    pub fn check_source(&self, path: &Path, source: &str) -> Result<Vec<Violation>, CheckerError> {
+        let start = Instant::now();
+        let mut violations = Vec::new();
+        
+        let ctx = CheckContext {
+            file: path,
+            source,
+            ast: None,
+            semantics: None,
+            config: &self.config,
+            rules: &self.rules,
+        };
+        
+        // Run each checker
+        for checker in &self.checkers {
+            // Check if rule is enabled
+            if !self.is_rule_enabled(checker.rule_id()) {
+                continue;
+            }
+            
+            let mut rule_violations = checker.check(&ctx);
+            
+            // Apply suppressions
+            for v in &mut rule_violations {
+                self.apply_suppressions(v);
+            }
+            
+            // Generate fixes if requested
+            if self.config.suggest_fixes {
+                for v in &mut rule_violations {
+                    if v.fix.is_none() {
+                        v.fix = checker.suggest_fix(v);
+                    }
+                }
+            }
+            
+            violations.extend(rule_violations);
+        }
+        
+        // Update stats
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.files_checked += 1;
+            stats.lines_checked += source.lines().count();
+            stats.rules_checked += self.checkers.len();
+            stats.violations_found += violations.len();
+            stats.violations_suppressed += violations.iter()
+                .filter(|v| v.suppressed)
+                .count();
+            stats.check_time += start.elapsed();
+        }
+        
+        // Store violations
+        {
+            let mut all_violations = self.violations.write().unwrap();
+            all_violations.extend(violations.clone());
+        }
+        
+        // Check max violations
+        if let Some(max) = self.config.max_violations {
+            if violations.len() > max {
+                return Err(CheckerError::TooManyViolations(violations.len()));
+            }
+        }
+        
+        Ok(violations)
+    }
+    
+    /// Check directory recursively
+    pub fn check_directory(&self, path: &Path) -> Result<Vec<Violation>, CheckerError> {
+        let mut all_violations = Vec::new();
+        
+        for entry in walkdir(path)? {
+            if entry.path().extension().map(|e| e == "quanta").unwrap_or(false) {
+                let violations = self.check_file(entry.path())?;
+                all_violations.extend(violations);
+            }
+        }
+        
+        Ok(all_violations)
+    }
+    
+    /// Check if rule is enabled
+    fn is_rule_enabled(&self, rule_id: &str) -> bool {
+        // Explicit enable/disable takes precedence
+        if self.config.profile.disabled_rules.iter().any(|r| r == rule_id) {
+            return false;
+        }
+        
+        if !self.config.profile.enabled_rules.is_empty() {
+            return self.config.profile.enabled_rules.iter().any(|r| r == rule_id);
+        }
+        
+        self.config.enable_all
+    }
+    
+    /// Apply suppressions to violation
+    fn apply_suppressions(&self, violation: &mut Violation) {
+        if let Some(config) = self.config.profile.rule_config.get(&violation.rule_id) {
+            for suppression in &config.suppressions {
+                if self.suppression_matches(suppression, violation) {
+                    violation.suppressed = true;
+                    violation.suppression = Some(suppression.clone());
+                    return;
+                }
+            }
+        }
+    }
+    
+    /// Check if suppression matches violation
+    fn suppression_matches(&self, suppression: &Suppression, violation: &Violation) -> bool {
+        match &suppression.location {
+            SuppressionLocation::Project => true,
+            SuppressionLocation::File(f) => violation.location.file == *f,
+            SuppressionLocation::Function(_) => {
+                // Would need semantic info
+                false
+            }
+            SuppressionLocation::Line(f, line) => {
+                violation.location.file == *f && violation.location.line == *line
+            }
+            SuppressionLocation::LineRange(f, start, end) => {
+                violation.location.file == *f &&
+                violation.location.line >= *start &&
+                violation.location.line <= *end
+            }
+        }
+    }
+    
+    /// Get all violations
+    pub fn violations(&self) -> Vec<Violation> {
+        self.violations.read().unwrap().clone()
+    }
+    
+    /// Get non-suppressed violations
+    pub fn active_violations(&self) -> Vec<Violation> {
+        self.violations.read().unwrap()
+            .iter()
+            .filter(|v| !v.suppressed)
+            .cloned()
+            .collect()
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> CheckerStats {
+        self.stats.read().unwrap().clone()
+    }
+    
+    /// Generate report
+    pub fn generate_report(&self) -> ComplianceReport {
+        let violations = self.violations();
+        let stats = self.stats();
+        
+        let mut by_severity = BTreeMap::new();
+        let mut by_rule = BTreeMap::new();
+        let mut by_file = BTreeMap::new();
+        
+        for v in &violations {
+            *by_severity.entry(v.severity).or_insert(0) += 1;
+            *by_rule.entry(v.rule_id.clone()).or_insert(0) += 1;
+            *by_file.entry(v.location.file.clone()).or_insert(0) += 1;
+        }
+        
+        let compliant = violations.iter()
+            .filter(|v| !v.suppressed)
+            .filter(|v| v.severity >= ViolationSeverity::Error)
+            .count() == 0;
+        
+        ComplianceReport {
+            profile: self.config.profile.name.clone(),
+            compliant,
+            violations,
+            stats,
+            by_severity,
+            by_rule,
+            by_file,
+        }
+    }
+    
+    /// Clear violations
+    pub fn clear(&self) {
+        self.violations.write().unwrap().clear();
+        *self.stats.write().unwrap() = CheckerStats::default();
+    }
+}
+
+/// Directory walker (simplified)
+fn walkdir(path: &Path) -> Result<Vec<DirEntry>, CheckerError> {
+    let mut entries = Vec::new();
+    
+    fn walk_recursive(path: &Path, entries: &mut Vec<DirEntry>) -> Result<(), CheckerError> {
+        for entry in std::fs::read_dir(path)
+            .map_err(|e| CheckerError::IoError(e.to_string()))? 
+        {
+            let entry = entry.map_err(|e| CheckerError::IoError(e.to_string()))?;
+            let path = entry.path();
+            
+            if path.is_dir() {
+                walk_recursive(&path, entries)?;
+            } else {
+                entries.push(DirEntry { path });
+            }
+        }
+        Ok(())
+    }
+    
+    walk_recursive(path, &mut entries)?;
+    Ok(entries)
+}
+
+struct DirEntry {
+    path: PathBuf,
+}
+
+impl DirEntry {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPLIANCE REPORT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compliance report
+#[derive(Debug, Clone)]
+pub struct ComplianceReport {
+    /// Profile used
+    pub profile: String,
+    
+    /// Overall compliance status
+    pub compliant: bool,
+    
+    /// All violations
+    pub violations: Vec<Violation>,
+    
+    /// Statistics
+    pub stats: CheckerStats,
+    
+    /// Violations by severity
+    pub by_severity: BTreeMap<ViolationSeverity, usize>,
+    
+    /// Violations by rule
+    pub by_rule: BTreeMap<String, usize>,
+    
+    /// Violations by file
+    pub by_file: BTreeMap<PathBuf, usize>,
+}
+
+impl ComplianceReport {
+    /// Generate text report
+    pub fn to_text(&self) -> String {
+        let mut output = String::new();
+        
+        output.push_str("═══════════════════════════════════════════════════════════════\n");
+        output.push_str("                    COMPLIANCE REPORT\n");
+        output.push_str("═══════════════════════════════════════════════════════════════\n\n");
+        
+        output.push_str(&format!("Profile: {}\n", self.profile));
+        output.push_str(&format!("Status: {}\n\n", 
+            if self.compliant { "✓ COMPLIANT" } else { "✗ NON-COMPLIANT" }
+        ));
+        
+        output.push_str("─── Statistics ───────────────────────────────────────────────\n");
+        output.push_str(&format!("Files checked:        {}\n", self.stats.files_checked));
+        output.push_str(&format!("Lines checked:        {}\n", self.stats.lines_checked));
+        output.push_str(&format!("Rules checked:        {}\n", self.stats.rules_checked));
+        output.push_str(&format!("Violations found:     {}\n", self.stats.violations_found));
+        output.push_str(&format!("Violations suppressed: {}\n", self.stats.violations_suppressed));
+        output.push_str(&format!("Check time:           {:?}\n\n", self.stats.check_time));
+        
+        if !self.by_severity.is_empty() {
+            output.push_str("─── By Severity ──────────────────────────────────────────────\n");
+            for (severity, count) in &self.by_severity {
+                output.push_str(&format!("{} {}: {}\n", 
+                    severity.symbol(), severity.name(), count
+                ));
+            }
+            output.push('\n');
+        }
+        
+        if !self.violations.is_empty() {
+            output.push_str("─── Violations ───────────────────────────────────────────────\n");
+            for v in &self.violations {
+                if v.suppressed {
+                    continue;
+                }
+                output.push_str(&format!(
+                    "{} [{}] {}: {}\n",
+                    v.severity.symbol(),
+                    v.rule_id,
+                    v.location,
+                    v.message
+                ));
+            }
+        }
+        
+        output.push_str("\n═══════════════════════════════════════════════════════════════\n");
+        
+        output
+    }
+    
+    /// Generate JSON report
+    pub fn to_json(&self) -> String {
+        let mut json = String::from("{\n");
+        
+        json.push_str(&format!("  \"profile\": \"{}\",\n", self.profile));
+        json.push_str(&format!("  \"compliant\": {},\n", self.compliant));
+        json.push_str(&format!("  \"violation_count\": {},\n", self.violations.len()));
+        
+        json.push_str("  \"stats\": {\n");
+        json.push_str(&format!("    \"files_checked\": {},\n", self.stats.files_checked));
+        json.push_str(&format!("    \"lines_checked\": {},\n", self.stats.lines_checked));
+        json.push_str(&format!("    \"violations_found\": {},\n", self.stats.violations_found));
+        json.push_str(&format!("    \"check_time_ms\": {}\n", self.stats.check_time.as_millis()));
+        json.push_str("  },\n");
+        
+        json.push_str("  \"violations\": [\n");
+        for (i, v) in self.violations.iter().enumerate() {
+            json.push_str("    {\n");
+            json.push_str(&format!("      \"rule_id\": \"{}\",\n", v.rule_id));
+            json.push_str(&format!("      \"severity\": \"{}\",\n", v.severity.name()));
+            json.push_str(&format!("      \"file\": \"{}\",\n", v.location.file.display()));
+            json.push_str(&format!("      \"line\": {},\n", v.location.line));
+            json.push_str(&format!("      \"column\": {},\n", v.location.column));
+            json.push_str(&format!("      \"message\": \"{}\",\n", escape_json(&v.message)));
+            json.push_str(&format!("      \"suppressed\": {}\n", v.suppressed));
+            json.push_str("    }");
+            if i < self.violations.len() - 1 {
+                json.push(',');
+            }
+            json.push('\n');
+        }
+        json.push_str("  ]\n");
+        
+        json.push_str("}\n");
+        
+        json
+    }
+    
+    /// Generate SARIF report (Static Analysis Results Interchange Format)
+    pub fn to_sarif(&self) -> String {
+        let mut sarif = String::from("{\n");
+        sarif.push_str("  \"$schema\": \"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json\",\n");
+        sarif.push_str("  \"version\": \"2.1.0\",\n");
+        sarif.push_str("  \"runs\": [{\n");
+        sarif.push_str("    \"tool\": {\n");
+        sarif.push_str("      \"driver\": {\n");
+        sarif.push_str("        \"name\": \"QuantaLang Compliance Checker\",\n");
+        sarif.push_str("        \"version\": \"1.0.0\"\n");
+        sarif.push_str("      }\n");
+        sarif.push_str("    },\n");
+        sarif.push_str("    \"results\": [\n");
+        
+        for (i, v) in self.violations.iter().enumerate() {
+            sarif.push_str("      {\n");
+            sarif.push_str(&format!("        \"ruleId\": \"{}\",\n", v.rule_id));
+            sarif.push_str(&format!("        \"level\": \"{}\",\n", sarif_level(v.severity)));
+            sarif.push_str("        \"message\": {\n");
+            sarif.push_str(&format!("          \"text\": \"{}\"\n", escape_json(&v.message)));
+            sarif.push_str("        },\n");
+            sarif.push_str("        \"locations\": [{\n");
+            sarif.push_str("          \"physicalLocation\": {\n");
+            sarif.push_str("            \"artifactLocation\": {\n");
+            sarif.push_str(&format!("              \"uri\": \"{}\"\n", v.location.file.display()));
+            sarif.push_str("            },\n");
+            sarif.push_str("            \"region\": {\n");
+            sarif.push_str(&format!("              \"startLine\": {},\n", v.location.line));
+            sarif.push_str(&format!("              \"startColumn\": {}\n", v.location.column));
+            sarif.push_str("            }\n");
+            sarif.push_str("          }\n");
+            sarif.push_str("        }]\n");
+            sarif.push_str("      }");
+            if i < self.violations.len() - 1 {
+                sarif.push(',');
+            }
+            sarif.push('\n');
+        }
+        
+        sarif.push_str("    ]\n");
+        sarif.push_str("  }]\n");
+        sarif.push_str("}\n");
+        
+        sarif
+    }
+}
+
+fn sarif_level(severity: ViolationSeverity) -> &'static str {
+    match severity {
+        ViolationSeverity::Info => "note",
+        ViolationSeverity::Warning => "warning",
+        ViolationSeverity::Error | ViolationSeverity::Critical => "error",
+    }
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum CheckerError {
+    IoError(String),
+    ParseError(String),
+    TooManyViolations(usize),
+    ConfigError(String),
+}
+
+impl std::fmt::Display for CheckerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IoError(m) => write!(f, "I/O error: {}", m),
+            Self::ParseError(m) => write!(f, "parse error: {}", m),
+            Self::TooManyViolations(n) => write!(f, "too many violations: {}", n),
+            Self::ConfigError(m) => write!(f, "configuration error: {}", m),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUILT-IN CHECKERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unused return value checker (MISRA-C:2012-R17.7)
+pub struct UnusedReturnChecker;
+
+impl RuleChecker for UnusedReturnChecker {
+    fn rule_id(&self) -> &str {
+        "MISRA-C:2012-R17.7"
+    }
+    
+    fn check(&self, ctx: &CheckContext) -> Vec<Violation> {
+        let mut violations = Vec::new();
+        
+        // Pattern matching for function calls without assignment
+        // Simplified: look for lines ending with );
+        for (i, line) in ctx.source.lines().enumerate() {
+            let trimmed = line.trim();
+            
+            // Skip obvious non-violations
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            
+            // Check for function call pattern without assignment
+            if trimmed.ends_with(");") 
+                && !trimmed.contains('=') 
+                && !trimmed.starts_with("return")
+                && trimmed.contains('(')
+            {
+                // Extract function name
+                if let Some(paren) = trimmed.find('(') {
+                    let prefix = &trimmed[..paren];
+                    let func_name = prefix.split_whitespace().last().unwrap_or("");
+                    
+                    // Skip void functions (heuristic)
+                    if func_name.starts_with("set_") 
+                        || func_name.starts_with("init_")
+                        || func_name == "print"
+                        || func_name == "printf"
+                    {
+                        continue;
+                    }
+                    
+                    violations.push(Violation {
+                        rule_id: self.rule_id().to_string(),
+                        severity: ViolationSeverity::Warning,
+                        location: SourceLocation::new(ctx.file, (i + 1) as u32, 1),
+                        message: format!(
+                            "Return value of '{}' is unused",
+                            func_name
+                        ),
+                        explanation: Some(
+                            "Ignoring return values may indicate logic errors or missed error handling".to_string()
+                        ),
+                        fix: Some(SuggestedFix {
+                            description: "Cast to void to indicate intentional discard".to_string(),
+                            edits: vec![TextEdit {
+                                location: SourceLocation::new(ctx.file, (i + 1) as u32, 1),
+                                new_text: format!("(void) {}", trimmed),
+                            }],
+                            confidence: FixConfidence::Likely,
+                        }),
+                        related: vec![],
+                        suppressed: false,
+                        suppression: None,
+                    });
+                }
+            }
+        }
+        
+        violations
+    }
+}
+
+/// Goto statement checker
+pub struct GotoChecker;
+
+impl RuleChecker for GotoChecker {
+    fn rule_id(&self) -> &str {
+        "MISRA-C:2012-R15.1"
+    }
+    
+    fn check(&self, ctx: &CheckContext) -> Vec<Violation> {
+        let mut violations = Vec::new();
+        
+        for (i, line) in ctx.source.lines().enumerate() {
+            let trimmed = line.trim();
+            
+            if trimmed.starts_with("goto ") {
+                violations.push(Violation {
+                    rule_id: self.rule_id().to_string(),
+                    severity: ViolationSeverity::Error,
+                    location: SourceLocation::new(ctx.file, (i + 1) as u32, 1),
+                    message: "goto statement shall not be used".to_string(),
+                    explanation: Some(
+                        "goto statements make control flow difficult to analyze and can lead to unreachable code".to_string()
+                    ),
+                    fix: None,
+                    related: vec![],
+                    suppressed: false,
+                    suppression: None,
+                });
+            }
+        }
+        
+        violations
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_violation_severity() {
+        assert!(ViolationSeverity::Critical > ViolationSeverity::Error);
+        assert!(ViolationSeverity::Error > ViolationSeverity::Warning);
+        assert_eq!(ViolationSeverity::Error.name(), "error");
+    }
+    
+    #[test]
+    fn test_source_location() {
+        let loc = SourceLocation::new("test.quanta", 10, 5);
+        assert_eq!(format!("{}", loc), "test.quanta:10:5");
+    }
+    
+    #[test]
+    fn test_checker_config() {
+        let config = CheckerConfig::default();
+        assert!(config.enable_all);
+        assert!(config.suggest_fixes);
+    }
+    
+    #[test]
+    fn test_compliance_checker() {
+        let mut checker = ComplianceChecker::new(CheckerConfig::default());
+        checker.register_checker(Box::new(GotoChecker));
+        
+        let source = "fn main() {\n    goto error;\n    error:\n}";
+        let violations = checker.check_source(Path::new("test.quanta"), source).unwrap();
+        
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule_id, "MISRA-C:2012-R15.1");
+    }
+    
+    #[test]
+    fn test_report_generation() {
+        let report = ComplianceReport {
+            profile: "test".to_string(),
+            compliant: true,
+            violations: vec![],
+            stats: CheckerStats::default(),
+            by_severity: BTreeMap::new(),
+            by_rule: BTreeMap::new(),
+            by_file: BTreeMap::new(),
+        };
+        
+        let text = report.to_text();
+        assert!(text.contains("COMPLIANT"));
+        
+        let json = report.to_json();
+        assert!(json.contains("\"compliant\": true"));
+    }
+}

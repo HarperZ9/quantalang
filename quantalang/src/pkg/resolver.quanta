@@ -1,0 +1,700 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ PACKAGE MANAGER — Dependency Resolver
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Implements PubGrub-inspired version solving for dependency resolution.
+// Handles:
+// - Version constraints intersection
+// - Conflict detection and backtracking
+// - Feature unification
+// - Optional dependency activation
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::pkg::resolver
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::{BTreeMap, BTreeSet};
+use core::fmt;
+use crate::pkg::version::{Version, VersionReq};
+use crate::pkg::manifest::{Manifest, Dependency};
+use crate::pkg::lockfile::{Lockfile, LockedPackage};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RESOLVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Dependency resolver
+pub struct Resolver<'a> {
+    /// Package registry for fetching available versions
+    registry: &'a dyn Registry,
+    /// Root manifest
+    root: &'a Manifest,
+    /// Existing lock file (for preferring locked versions)
+    lockfile: Option<&'a Lockfile>,
+    /// Resolved packages
+    solution: BTreeMap<String, ResolvedPackage>,
+    /// Active feature sets per package
+    features: BTreeMap<String, BTreeSet<String>>,
+    /// Incompatibilities discovered during resolution
+    incompatibilities: Vec<Incompatibility>,
+    /// Decision stack for backtracking
+    decisions: Vec<Decision>,
+    /// Maximum resolution depth
+    max_depth: usize,
+}
+
+impl<'a> Resolver<'a> {
+    pub fn new(registry: &'a dyn Registry, root: &'a Manifest) -> Self {
+        Resolver {
+            registry,
+            root,
+            lockfile: None,
+            solution: BTreeMap::new(),
+            features: BTreeMap::new(),
+            incompatibilities: Vec::new(),
+            decisions: Vec::new(),
+            max_depth: 100,
+        }
+    }
+    
+    /// Use existing lock file to prefer locked versions
+    pub fn with_lockfile(mut self, lockfile: &'a Lockfile) -> Self {
+        self.lockfile = Some(lockfile);
+        self
+    }
+    
+    /// Set maximum resolution depth
+    pub fn with_max_depth(mut self, depth: usize) -> Self {
+        self.max_depth = depth;
+        self
+    }
+    
+    /// Resolve all dependencies
+    pub fn resolve(&mut self) -> Result<Resolution, ResolveError> {
+        // Add root package constraints
+        self.add_root_constraints()?;
+        
+        // Main resolution loop
+        while let Some(next) = self.next_unsolved() {
+            if self.decisions.len() > self.max_depth {
+                return Err(ResolveError::MaxDepthExceeded);
+            }
+            
+            match self.solve_package(&next)? {
+                SolveResult::Solved(pkg) => {
+                    self.decisions.push(Decision::Select(next.clone(), pkg.version.clone()));
+                    self.solution.insert(next, pkg);
+                }
+                SolveResult::Conflict(incomp) => {
+                    self.incompatibilities.push(incomp.clone());
+                    
+                    if !self.backtrack(&incomp)? {
+                        return Err(ResolveError::NoSolution(incomp));
+                    }
+                }
+            }
+        }
+        
+        Ok(self.build_resolution())
+    }
+    
+    /// Add constraints from root manifest
+    fn add_root_constraints(&mut self) -> Result<(), ResolveError> {
+        // Add root package itself
+        let root_pkg = ResolvedPackage {
+            name: self.root.package.name.clone(),
+            version: Version::parse(&self.root.package.version)
+                .map_err(|e| ResolveError::InvalidVersion(e.message))?,
+            source: PackageSource::Root,
+            dependencies: Vec::new(),
+            features: self.get_default_features(&self.root.package.name),
+        };
+        
+        self.solution.insert(self.root.package.name.clone(), root_pkg);
+        
+        // Add dependency constraints
+        for (name, dep) in &self.root.dependencies {
+            let constraint = self.dep_to_constraint(name, dep)?;
+            self.add_constraint(constraint)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Convert dependency to constraint
+    fn dep_to_constraint(&self, name: &str, dep: &Dependency) -> Result<Constraint, ResolveError> {
+        let req = if let Some(ref v) = dep.version {
+            VersionReq::parse(v).map_err(|e| ResolveError::InvalidVersion(e.message))?
+        } else {
+            VersionReq::STAR
+        };
+        
+        Ok(Constraint {
+            package: name.to_string(),
+            version_req: req,
+            features: dep.features.clone(),
+            optional: dep.optional,
+            source: if dep.is_git() {
+                Some(ConstraintSource::Git {
+                    url: dep.git.clone().unwrap(),
+                    reference: dep.branch.clone()
+                        .or(dep.tag.clone())
+                        .or(dep.rev.clone()),
+                })
+            } else if dep.is_path() {
+                Some(ConstraintSource::Path(dep.path.clone().unwrap()))
+            } else {
+                None
+            },
+        })
+    }
+    
+    /// Add a constraint
+    fn add_constraint(&mut self, constraint: Constraint) -> Result<(), ResolveError> {
+        // Activate features for this package
+        let features = self.features.entry(constraint.package.clone())
+            .or_insert_with(BTreeSet::new);
+        features.extend(constraint.features.iter().cloned());
+        
+        // Check compatibility with existing solution
+        if let Some(existing) = self.solution.get(&constraint.package) {
+            if !constraint.version_req.matches(&existing.version) {
+                return Err(ResolveError::Conflict(Incompatibility {
+                    package: constraint.package,
+                    terms: vec![
+                        Term::Positive(existing.version.clone()),
+                        Term::Negative(constraint.version_req),
+                    ],
+                    cause: IncompatibilityCause::Dependency,
+                }));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Find next unsolved package
+    fn next_unsolved(&self) -> Option<String> {
+        for (name, _) in &self.features {
+            if !self.solution.contains_key(name) {
+                return Some(name.clone());
+            }
+        }
+        None
+    }
+    
+    /// Solve for a specific package
+    fn solve_package(&self, name: &str) -> Result<SolveResult, ResolveError> {
+        // Get available versions
+        let versions = self.registry.get_versions(name)
+            .map_err(|e| ResolveError::RegistryError(e))?;
+        
+        if versions.is_empty() {
+            return Err(ResolveError::PackageNotFound(name.to_string()));
+        }
+        
+        // Collect all constraints for this package
+        let constraints = self.collect_constraints(name);
+        
+        // Find best matching version
+        // Prefer: locked version > latest compatible
+        let preferred = self.lockfile
+            .and_then(|l| l.get_package(name))
+            .map(|p| &p.version);
+        
+        for version in self.sort_versions(&versions, preferred) {
+            if self.version_satisfies_constraints(&version, &constraints) {
+                // Check if dependencies can be satisfied
+                match self.check_dependencies(name, &version) {
+                    Ok(deps) => {
+                        return Ok(SolveResult::Solved(ResolvedPackage {
+                            name: name.to_string(),
+                            version,
+                            source: PackageSource::Registry("https://registry.quantalang.dev".to_string()),
+                            dependencies: deps,
+                            features: self.features.get(name).cloned().unwrap_or_default(),
+                        }));
+                    }
+                    Err(incomp) => {
+                        // This version doesn't work, try next
+                        continue;
+                    }
+                }
+            }
+        }
+        
+        // No compatible version found
+        Ok(SolveResult::Conflict(Incompatibility {
+            package: name.to_string(),
+            terms: constraints.iter()
+                .map(|c| Term::Negative(c.version_req.clone()))
+                .collect(),
+            cause: IncompatibilityCause::NoVersions,
+        }))
+    }
+    
+    /// Collect all constraints affecting a package
+    fn collect_constraints(&self, name: &str) -> Vec<Constraint> {
+        let mut constraints = Vec::new();
+        
+        // From root dependencies
+        if let Some(dep) = self.root.dependencies.get(name) {
+            if let Ok(c) = self.dep_to_constraint(name, dep) {
+                constraints.push(c);
+            }
+        }
+        
+        // From solved packages
+        for (_, pkg) in &self.solution {
+            for dep in &pkg.dependencies {
+                if dep.package == name {
+                    constraints.push(dep.clone());
+                }
+            }
+        }
+        
+        constraints
+    }
+    
+    /// Check if version satisfies all constraints
+    fn version_satisfies_constraints(&self, version: &Version, constraints: &[Constraint]) -> bool {
+        constraints.iter().all(|c| c.version_req.matches(version))
+    }
+    
+    /// Sort versions (newest first, with preference)
+    fn sort_versions(&self, versions: &[Version], preferred: Option<&Version>) -> Vec<Version> {
+        let mut sorted = versions.to_vec();
+        sorted.sort_by(|a, b| b.cmp(a)); // Newest first
+        
+        // Move preferred to front if present
+        if let Some(pref) = preferred {
+            if let Some(pos) = sorted.iter().position(|v| v == pref) {
+                let v = sorted.remove(pos);
+                sorted.insert(0, v);
+            }
+        }
+        
+        sorted
+    }
+    
+    /// Check if package dependencies can be satisfied
+    fn check_dependencies(&self, name: &str, version: &Version) -> Result<Vec<Constraint>, Incompatibility> {
+        let metadata = self.registry.get_metadata(name, version)
+            .map_err(|_| Incompatibility {
+                package: name.to_string(),
+                terms: vec![Term::Positive(version.clone())],
+                cause: IncompatibilityCause::NoVersions,
+            })?;
+        
+        let mut deps = Vec::new();
+        
+        for (dep_name, dep_req) in &metadata.dependencies {
+            let req = VersionReq::parse(dep_req).map_err(|_| Incompatibility {
+                package: name.to_string(),
+                terms: vec![Term::Positive(version.clone())],
+                cause: IncompatibilityCause::InvalidDependency(dep_name.clone()),
+            })?;
+            
+            deps.push(Constraint {
+                package: dep_name.clone(),
+                version_req: req,
+                features: Vec::new(),
+                optional: false,
+                source: None,
+            });
+        }
+        
+        Ok(deps)
+    }
+    
+    /// Backtrack after conflict
+    fn backtrack(&mut self, incomp: &Incompatibility) -> Result<bool, ResolveError> {
+        // Find decision to undo
+        while let Some(decision) = self.decisions.pop() {
+            match decision {
+                Decision::Select(name, _) => {
+                    self.solution.remove(&name);
+                    
+                    // If this decision caused the conflict, we've found our backtrack point
+                    if incomp.package == name {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        
+        // No backtrack possible
+        Ok(false)
+    }
+    
+    /// Get default features for a package
+    fn get_default_features(&self, name: &str) -> BTreeSet<String> {
+        if let Some(features) = self.root.features.get("default") {
+            features.iter().cloned().collect()
+        } else {
+            BTreeSet::new()
+        }
+    }
+    
+    /// Build final resolution
+    fn build_resolution(&self) -> Resolution {
+        Resolution {
+            packages: self.solution.values().cloned().collect(),
+            features: self.features.clone(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RESOLUTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Result of dependency resolution
+#[derive(Debug, Clone)]
+pub struct Resolution {
+    /// Resolved packages
+    pub packages: Vec<ResolvedPackage>,
+    /// Active features per package
+    pub features: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Resolution {
+    /// Convert to lock file
+    pub fn to_lockfile(&self) -> Lockfile {
+        let mut lockfile = Lockfile::new();
+        
+        for pkg in &self.packages {
+            let mut locked = LockedPackage::new(&pkg.name, pkg.version.clone());
+            
+            locked.source = match &pkg.source {
+                PackageSource::Registry(url) => Some(format!("registry+{}", url)),
+                PackageSource::Git { url, rev } => {
+                    Some(format!("git+{}#{}", url, rev.as_deref().unwrap_or("HEAD")))
+                }
+                PackageSource::Path(p) => Some(format!("path+{}", p)),
+                PackageSource::Root => None,
+            };
+            
+            for dep in &pkg.dependencies {
+                locked.add_dependency(&dep.package, &dep.version_req.to_string());
+            }
+            
+            locked.features = pkg.features.iter().cloned().collect();
+            
+            lockfile.add_package(locked);
+        }
+        
+        lockfile.sort();
+        lockfile
+    }
+    
+    /// Get resolved version for a package
+    pub fn get_version(&self, name: &str) -> Option<&Version> {
+        self.packages.iter()
+            .find(|p| p.name == name)
+            .map(|p| &p.version)
+    }
+    
+    /// Get topologically sorted packages (dependencies before dependents)
+    pub fn topological_sort(&self) -> Vec<&ResolvedPackage> {
+        let mut result = Vec::new();
+        let mut visited = BTreeSet::new();
+        let pkg_map: BTreeMap<_, _> = self.packages.iter()
+            .map(|p| (&p.name, p))
+            .collect();
+        
+        fn visit<'a>(
+            name: &str,
+            pkg_map: &BTreeMap<&String, &'a ResolvedPackage>,
+            visited: &mut BTreeSet<String>,
+            result: &mut Vec<&'a ResolvedPackage>,
+        ) {
+            if visited.contains(name) {
+                return;
+            }
+            visited.insert(name.to_string());
+            
+            if let Some(pkg) = pkg_map.get(&name.to_string()) {
+                for dep in &pkg.dependencies {
+                    visit(&dep.package, pkg_map, visited, result);
+                }
+                result.push(*pkg);
+            }
+        }
+        
+        for pkg in &self.packages {
+            visit(&pkg.name, &pkg_map, &mut visited, &mut result);
+        }
+        
+        result
+    }
+}
+
+/// A resolved package
+#[derive(Debug, Clone)]
+pub struct ResolvedPackage {
+    pub name: String,
+    pub version: Version,
+    pub source: PackageSource,
+    pub dependencies: Vec<Constraint>,
+    pub features: BTreeSet<String>,
+}
+
+/// Package source
+#[derive(Debug, Clone)]
+pub enum PackageSource {
+    Registry(String),
+    Git { url: String, rev: Option<String> },
+    Path(String),
+    Root,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONSTRAINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A dependency constraint
+#[derive(Debug, Clone)]
+pub struct Constraint {
+    pub package: String,
+    pub version_req: VersionReq,
+    pub features: Vec<String>,
+    pub optional: bool,
+    pub source: Option<ConstraintSource>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConstraintSource {
+    Git { url: String, reference: Option<String> },
+    Path(String),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INCOMPATIBILITY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Represents why certain versions are incompatible
+#[derive(Debug, Clone)]
+pub struct Incompatibility {
+    pub package: String,
+    pub terms: Vec<Term>,
+    pub cause: IncompatibilityCause,
+}
+
+impl fmt::Display for Incompatibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {:?}", self.package, self.cause)
+    }
+}
+
+/// A term in an incompatibility
+#[derive(Debug, Clone)]
+pub enum Term {
+    /// Version must be selected
+    Positive(Version),
+    /// Version must NOT be selected
+    Negative(VersionReq),
+}
+
+/// Cause of incompatibility
+#[derive(Debug, Clone)]
+pub enum IncompatibilityCause {
+    /// Root dependency
+    Root,
+    /// Dependency constraint
+    Dependency,
+    /// No versions satisfy constraints
+    NoVersions,
+    /// Invalid dependency specification
+    InvalidDependency(String),
+    /// Derived from other incompatibilities
+    Derived(Box<Incompatibility>, Box<Incompatibility>),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DECISION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A decision made during resolution
+#[derive(Debug, Clone)]
+enum Decision {
+    Select(String, Version),
+}
+
+/// Result of solving for a package
+enum SolveResult {
+    Solved(ResolvedPackage),
+    Conflict(Incompatibility),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTRY TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Package registry interface
+pub trait Registry {
+    /// Get all available versions for a package
+    fn get_versions(&self, name: &str) -> Result<Vec<Version>, String>;
+    
+    /// Get package metadata for a specific version
+    fn get_metadata(&self, name: &str, version: &Version) -> Result<PackageMetadata, String>;
+    
+    /// Download package
+    fn download(&self, name: &str, version: &Version) -> Result<Vec<u8>, String>;
+}
+
+/// Package metadata from registry
+#[derive(Debug, Clone)]
+pub struct PackageMetadata {
+    pub name: String,
+    pub version: Version,
+    pub dependencies: BTreeMap<String, String>,
+    pub features: BTreeMap<String, Vec<String>>,
+    pub checksum: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Resolution error
+#[derive(Debug)]
+pub enum ResolveError {
+    PackageNotFound(String),
+    NoSolution(Incompatibility),
+    RegistryError(String),
+    InvalidVersion(String),
+    Conflict(Incompatibility),
+    MaxDepthExceeded,
+    CyclicDependency(Vec<String>),
+}
+
+impl fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResolveError::PackageNotFound(name) => {
+                write!(f, "package not found: {}", name)
+            }
+            ResolveError::NoSolution(incomp) => {
+                write!(f, "no solution found: {}", incomp)
+            }
+            ResolveError::RegistryError(msg) => {
+                write!(f, "registry error: {}", msg)
+            }
+            ResolveError::InvalidVersion(msg) => {
+                write!(f, "invalid version: {}", msg)
+            }
+            ResolveError::Conflict(incomp) => {
+                write!(f, "version conflict: {}", incomp)
+            }
+            ResolveError::MaxDepthExceeded => {
+                write!(f, "maximum resolution depth exceeded")
+            }
+            ResolveError::CyclicDependency(path) => {
+                write!(f, "cyclic dependency: {}", path.join(" -> "))
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MOCK REGISTRY (for testing)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// In-memory registry for testing
+pub struct MockRegistry {
+    packages: BTreeMap<String, BTreeMap<Version, PackageMetadata>>,
+}
+
+impl MockRegistry {
+    pub fn new() -> Self {
+        MockRegistry {
+            packages: BTreeMap::new(),
+        }
+    }
+    
+    pub fn add_package(&mut self, metadata: PackageMetadata) {
+        let versions = self.packages.entry(metadata.name.clone())
+            .or_insert_with(BTreeMap::new);
+        versions.insert(metadata.version.clone(), metadata);
+    }
+}
+
+impl Registry for MockRegistry {
+    fn get_versions(&self, name: &str) -> Result<Vec<Version>, String> {
+        self.packages.get(name)
+            .map(|versions| versions.keys().cloned().collect())
+            .ok_or_else(|| format!("package not found: {}", name))
+    }
+    
+    fn get_metadata(&self, name: &str, version: &Version) -> Result<PackageMetadata, String> {
+        self.packages.get(name)
+            .and_then(|versions| versions.get(version))
+            .cloned()
+            .ok_or_else(|| format!("version not found: {} {}", name, version))
+    }
+    
+    fn download(&self, _name: &str, _version: &Version) -> Result<Vec<u8>, String> {
+        Ok(Vec::new())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn make_metadata(name: &str, version: &str, deps: &[(&str, &str)]) -> PackageMetadata {
+        PackageMetadata {
+            name: name.to_string(),
+            version: Version::parse(version).unwrap(),
+            dependencies: deps.iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            features: BTreeMap::new(),
+            checksum: None,
+        }
+    }
+    
+    #[test]
+    fn test_simple_resolution() {
+        let mut registry = MockRegistry::new();
+        registry.add_package(make_metadata("dep_a", "1.0.0", &[]));
+        registry.add_package(make_metadata("dep_a", "1.1.0", &[]));
+        registry.add_package(make_metadata("dep_b", "2.0.0", &[("dep_a", "^1.0")]));
+        
+        let mut manifest = Manifest::new("test", "0.1.0");
+        manifest.add_dependency("dep_b", Dependency::version("^2.0"));
+        
+        let mut resolver = Resolver::new(&registry, &manifest);
+        let resolution = resolver.resolve().unwrap();
+        
+        assert!(resolution.get_version("dep_a").is_some());
+        assert!(resolution.get_version("dep_b").is_some());
+    }
+    
+    #[test]
+    fn test_version_preference() {
+        let mut registry = MockRegistry::new();
+        registry.add_package(make_metadata("dep", "1.0.0", &[]));
+        registry.add_package(make_metadata("dep", "1.1.0", &[]));
+        registry.add_package(make_metadata("dep", "1.2.0", &[]));
+        
+        let mut manifest = Manifest::new("test", "0.1.0");
+        manifest.add_dependency("dep", Dependency::version("^1.0"));
+        
+        let mut resolver = Resolver::new(&registry, &manifest);
+        let resolution = resolver.resolve().unwrap();
+        
+        // Should pick newest compatible version
+        assert_eq!(resolution.get_version("dep"), Some(&Version::new(1, 2, 0)));
+    }
+}

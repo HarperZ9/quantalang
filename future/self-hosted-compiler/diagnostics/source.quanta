@@ -1,0 +1,693 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DIAGNOSTICS — Source Mapping
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Source location tracking and mapping:
+// - Byte offsets to line/column conversion
+// - Source spans with file tracking
+// - Multi-file source maps
+// - Efficient line index caching
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::diagnostics::source
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::collections::BTreeMap;
+use core::ops::Range;
+use core::cmp::Ordering;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOURCE FILE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unique identifier for a source file
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FileId(pub u32);
+
+impl FileId {
+    pub const DUMMY: FileId = FileId(u32::MAX);
+    
+    pub fn new(id: u32) -> Self {
+        FileId(id)
+    }
+    
+    pub fn is_dummy(&self) -> bool {
+        *self == Self::DUMMY
+    }
+}
+
+/// A source file with content and metadata
+#[derive(Debug, Clone)]
+pub struct SourceFile {
+    /// Unique file identifier
+    pub id: FileId,
+    
+    /// File name (may be path or synthetic name)
+    pub name: String,
+    
+    /// Full file path (if available)
+    pub path: Option<String>,
+    
+    /// Source content
+    content: Arc<String>,
+    
+    /// Cached line start offsets
+    line_starts: Vec<u32>,
+}
+
+impl SourceFile {
+    /// Create a new source file
+    pub fn new(id: FileId, name: impl Into<String>, content: impl Into<String>) -> Self {
+        let content = content.into();
+        let line_starts = Self::compute_line_starts(&content);
+        
+        SourceFile {
+            id,
+            name: name.into(),
+            path: None,
+            content: Arc::new(content),
+            line_starts,
+        }
+    }
+    
+    /// Create with path
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+    
+    /// Get source content
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+    
+    /// Get content length in bytes
+    pub fn len(&self) -> usize {
+        self.content.len()
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.content.is_empty()
+    }
+    
+    /// Get number of lines
+    pub fn line_count(&self) -> usize {
+        self.line_starts.len()
+    }
+    
+    /// Get line content (0-indexed)
+    pub fn line(&self, line: usize) -> Option<&str> {
+        if line >= self.line_starts.len() {
+            return None;
+        }
+        
+        let start = self.line_starts[line] as usize;
+        let end = if line + 1 < self.line_starts.len() {
+            self.line_starts[line + 1] as usize
+        } else {
+            self.content.len()
+        };
+        
+        // Trim trailing newline
+        let line_content = &self.content[start..end];
+        Some(line_content.trim_end_matches('\n').trim_end_matches('\r'))
+    }
+    
+    /// Convert byte offset to line/column (both 0-indexed)
+    pub fn offset_to_line_col(&self, offset: u32) -> (usize, usize) {
+        let offset = offset as usize;
+        
+        // Binary search for the line
+        let line = match self.line_starts.binary_search(&(offset as u32)) {
+            Ok(line) => line,
+            Err(line) => line.saturating_sub(1),
+        };
+        
+        let line_start = self.line_starts[line] as usize;
+        let col = offset.saturating_sub(line_start);
+        
+        (line, col)
+    }
+    
+    /// Convert line/column to byte offset (both 0-indexed)
+    pub fn line_col_to_offset(&self, line: usize, col: usize) -> Option<u32> {
+        if line >= self.line_starts.len() {
+            return None;
+        }
+        
+        let line_start = self.line_starts[line] as usize;
+        let line_end = if line + 1 < self.line_starts.len() {
+            self.line_starts[line + 1] as usize
+        } else {
+            self.content.len()
+        };
+        
+        let offset = line_start + col;
+        if offset <= line_end {
+            Some(offset as u32)
+        } else {
+            None
+        }
+    }
+    
+    /// Get the line range for a span
+    pub fn span_lines(&self, span: Span) -> Range<usize> {
+        let (start_line, _) = self.offset_to_line_col(span.start);
+        let (end_line, _) = self.offset_to_line_col(span.end);
+        start_line..end_line + 1
+    }
+    
+    /// Get slice of source content
+    pub fn slice(&self, span: Span) -> Option<&str> {
+        let start = span.start as usize;
+        let end = span.end as usize;
+        
+        if end <= self.content.len() && start <= end {
+            Some(&self.content[start..end])
+        } else {
+            None
+        }
+    }
+    
+    /// Compute line start offsets
+    fn compute_line_starts(content: &str) -> Vec<u32> {
+        let mut starts = vec![0];
+        
+        for (i, c) in content.char_indices() {
+            if c == '\n' {
+                starts.push((i + 1) as u32);
+            }
+        }
+        
+        starts
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPAN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A span in source code (byte offsets)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Span {
+    /// Start byte offset (inclusive)
+    pub start: u32,
+    
+    /// End byte offset (exclusive)
+    pub end: u32,
+}
+
+impl Span {
+    /// Create a new span
+    pub const fn new(start: u32, end: u32) -> Self {
+        Span { start, end }
+    }
+    
+    /// Create a dummy span
+    pub const fn dummy() -> Self {
+        Span { start: 0, end: 0 }
+    }
+    
+    /// Check if this is a dummy span
+    pub fn is_dummy(&self) -> bool {
+        self.start == 0 && self.end == 0
+    }
+    
+    /// Get span length
+    pub fn len(&self) -> u32 {
+        self.end.saturating_sub(self.start)
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.start >= self.end
+    }
+    
+    /// Check if this span contains an offset
+    pub fn contains(&self, offset: u32) -> bool {
+        offset >= self.start && offset < self.end
+    }
+    
+    /// Check if this span contains another span
+    pub fn contains_span(&self, other: Span) -> bool {
+        self.start <= other.start && self.end >= other.end
+    }
+    
+    /// Merge two spans (creates span covering both)
+    pub fn merge(self, other: Span) -> Span {
+        Span {
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+        }
+    }
+    
+    /// Extend span to include offset
+    pub fn extend_to(self, offset: u32) -> Span {
+        Span {
+            start: self.start.min(offset),
+            end: self.end.max(offset + 1),
+        }
+    }
+    
+    /// Get the start position
+    pub fn start(&self) -> u32 {
+        self.start
+    }
+    
+    /// Get the end position
+    pub fn end(&self) -> u32 {
+        self.end
+    }
+    
+    /// Shrink span by n bytes from start
+    pub fn shrink_start(self, n: u32) -> Span {
+        Span {
+            start: self.start.saturating_add(n).min(self.end),
+            end: self.end,
+        }
+    }
+    
+    /// Shrink span by n bytes from end
+    pub fn shrink_end(self, n: u32) -> Span {
+        Span {
+            start: self.start,
+            end: self.end.saturating_sub(n).max(self.start),
+        }
+    }
+    
+    /// Convert to range
+    pub fn to_range(self) -> Range<usize> {
+        self.start as usize..self.end as usize
+    }
+}
+
+impl Default for Span {
+    fn default() -> Self {
+        Self::dummy()
+    }
+}
+
+impl From<Range<usize>> for Span {
+    fn from(range: Range<usize>) -> Self {
+        Span::new(range.start as u32, range.end as u32)
+    }
+}
+
+impl From<Range<u32>> for Span {
+    fn from(range: Range<u32>) -> Self {
+        Span::new(range.start, range.end)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOCATED SPAN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A span with file information
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LocatedSpan {
+    pub file: FileId,
+    pub span: Span,
+}
+
+impl LocatedSpan {
+    pub fn new(file: FileId, span: Span) -> Self {
+        LocatedSpan { file, span }
+    }
+    
+    pub fn dummy() -> Self {
+        LocatedSpan {
+            file: FileId::DUMMY,
+            span: Span::dummy(),
+        }
+    }
+    
+    pub fn is_dummy(&self) -> bool {
+        self.file.is_dummy() || self.span.is_dummy()
+    }
+    
+    pub fn merge(self, other: LocatedSpan) -> LocatedSpan {
+        debug_assert_eq!(self.file, other.file);
+        LocatedSpan {
+            file: self.file,
+            span: self.span.merge(other.span),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOURCE LOCATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Human-readable source location
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLocation {
+    /// File name
+    pub file: String,
+    
+    /// Line number (1-indexed)
+    pub line: usize,
+    
+    /// Column number (1-indexed)
+    pub column: usize,
+}
+
+impl SourceLocation {
+    pub fn new(file: impl Into<String>, line: usize, column: usize) -> Self {
+        SourceLocation {
+            file: file.into(),
+            line,
+            column,
+        }
+    }
+}
+
+impl std::fmt::Display for SourceLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}:{}", self.file, self.line, self.column)
+    }
+}
+
+/// Source range with start and end locations
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRange {
+    pub file: String,
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+impl SourceRange {
+    pub fn start(&self) -> SourceLocation {
+        SourceLocation {
+            file: self.file.clone(),
+            line: self.start_line,
+            column: self.start_column,
+        }
+    }
+    
+    pub fn end(&self) -> SourceLocation {
+        SourceLocation {
+            file: self.file.clone(),
+            line: self.end_line,
+            column: self.end_column,
+        }
+    }
+    
+    pub fn is_single_line(&self) -> bool {
+        self.start_line == self.end_line
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOURCE MAP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Collection of source files
+pub struct SourceMap {
+    files: BTreeMap<FileId, Arc<SourceFile>>,
+    path_to_id: BTreeMap<String, FileId>,
+    next_id: u32,
+}
+
+impl SourceMap {
+    /// Create a new source map
+    pub fn new() -> Self {
+        SourceMap {
+            files: BTreeMap::new(),
+            path_to_id: BTreeMap::new(),
+            next_id: 0,
+        }
+    }
+    
+    /// Add a source file
+    pub fn add_file(&mut self, name: impl Into<String>, content: impl Into<String>) -> FileId {
+        let id = FileId::new(self.next_id);
+        self.next_id += 1;
+        
+        let name = name.into();
+        let file = SourceFile::new(id, name.clone(), content);
+        
+        self.path_to_id.insert(name, id);
+        self.files.insert(id, Arc::new(file));
+        
+        id
+    }
+    
+    /// Add a source file with path
+    pub fn add_file_with_path(
+        &mut self,
+        name: impl Into<String>,
+        path: impl Into<String>,
+        content: impl Into<String>,
+    ) -> FileId {
+        let id = FileId::new(self.next_id);
+        self.next_id += 1;
+        
+        let name = name.into();
+        let path = path.into();
+        let file = SourceFile::new(id, name.clone(), content).with_path(path.clone());
+        
+        self.path_to_id.insert(name, id);
+        self.path_to_id.insert(path, id);
+        self.files.insert(id, Arc::new(file));
+        
+        id
+    }
+    
+    /// Get a file by ID
+    pub fn get_file(&self, id: FileId) -> Option<&Arc<SourceFile>> {
+        self.files.get(&id)
+    }
+    
+    /// Get a file by name or path
+    pub fn get_file_by_name(&self, name: &str) -> Option<&Arc<SourceFile>> {
+        self.path_to_id.get(name)
+            .and_then(|id| self.files.get(id))
+    }
+    
+    /// Look up file ID by name
+    pub fn file_id(&self, name: &str) -> Option<FileId> {
+        self.path_to_id.get(name).copied()
+    }
+    
+    /// Convert located span to source range
+    pub fn span_to_range(&self, span: LocatedSpan) -> Option<SourceRange> {
+        let file = self.get_file(span.file)?;
+        let (start_line, start_col) = file.offset_to_line_col(span.span.start);
+        let (end_line, end_col) = file.offset_to_line_col(span.span.end);
+        
+        Some(SourceRange {
+            file: file.name.clone(),
+            start_line: start_line + 1,
+            start_column: start_col + 1,
+            end_line: end_line + 1,
+            end_column: end_col + 1,
+        })
+    }
+    
+    /// Convert located span to source location (start)
+    pub fn span_to_location(&self, span: LocatedSpan) -> Option<SourceLocation> {
+        let file = self.get_file(span.file)?;
+        let (line, col) = file.offset_to_line_col(span.span.start);
+        
+        Some(SourceLocation {
+            file: file.name.clone(),
+            line: line + 1,
+            column: col + 1,
+        })
+    }
+    
+    /// Get source snippet for span
+    pub fn snippet(&self, span: LocatedSpan) -> Option<&str> {
+        let file = self.get_file(span.file)?;
+        file.slice(span.span)
+    }
+    
+    /// Get line content
+    pub fn line(&self, file: FileId, line: usize) -> Option<&str> {
+        self.get_file(file)?.line(line)
+    }
+    
+    /// Iterate over all files
+    pub fn files(&self) -> impl Iterator<Item = &Arc<SourceFile>> {
+        self.files.values()
+    }
+    
+    /// Number of files
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+}
+
+impl Default for SourceMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPANNED
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A value with an associated span
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spanned<T> {
+    pub value: T,
+    pub span: Span,
+}
+
+impl<T> Spanned<T> {
+    pub fn new(value: T, span: Span) -> Self {
+        Spanned { value, span }
+    }
+    
+    pub fn dummy(value: T) -> Self {
+        Spanned {
+            value,
+            span: Span::dummy(),
+        }
+    }
+    
+    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Spanned<U> {
+        Spanned {
+            value: f(self.value),
+            span: self.span,
+        }
+    }
+    
+    pub fn as_ref(&self) -> Spanned<&T> {
+        Spanned {
+            value: &self.value,
+            span: self.span,
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Spanned<T> {
+    type Target = T;
+    
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+/// A value with a located span
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Located<T> {
+    pub value: T,
+    pub span: LocatedSpan,
+}
+
+impl<T> Located<T> {
+    pub fn new(value: T, span: LocatedSpan) -> Self {
+        Located { value, span }
+    }
+    
+    pub fn dummy(value: T) -> Self {
+        Located {
+            value,
+            span: LocatedSpan::dummy(),
+        }
+    }
+    
+    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Located<U> {
+        Located {
+            value: f(self.value),
+            span: self.span,
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Located<T> {
+    type Target = T;
+    
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_source_file() {
+        let file = SourceFile::new(FileId(0), "test.quanta", "line1\nline2\nline3");
+        
+        assert_eq!(file.line_count(), 3);
+        assert_eq!(file.line(0), Some("line1"));
+        assert_eq!(file.line(1), Some("line2"));
+        assert_eq!(file.line(2), Some("line3"));
+        assert_eq!(file.line(3), None);
+    }
+    
+    #[test]
+    fn test_offset_conversion() {
+        let file = SourceFile::new(FileId(0), "test.quanta", "abc\ndefgh\nij");
+        
+        // Line 0: bytes 0-3 (abc\n)
+        assert_eq!(file.offset_to_line_col(0), (0, 0)); // 'a'
+        assert_eq!(file.offset_to_line_col(2), (0, 2)); // 'c'
+        
+        // Line 1: bytes 4-9 (defgh\n)
+        assert_eq!(file.offset_to_line_col(4), (1, 0)); // 'd'
+        assert_eq!(file.offset_to_line_col(6), (1, 2)); // 'f'
+        
+        // Line 2: bytes 10-11 (ij)
+        assert_eq!(file.offset_to_line_col(10), (2, 0)); // 'i'
+    }
+    
+    #[test]
+    fn test_span() {
+        let span1 = Span::new(5, 10);
+        let span2 = Span::new(8, 15);
+        
+        assert_eq!(span1.len(), 5);
+        assert!(span1.contains(7));
+        assert!(!span1.contains(10));
+        
+        let merged = span1.merge(span2);
+        assert_eq!(merged.start, 5);
+        assert_eq!(merged.end, 15);
+    }
+    
+    #[test]
+    fn test_source_map() {
+        let mut map = SourceMap::new();
+        
+        let id1 = map.add_file("main.quanta", "fn main() {}");
+        let id2 = map.add_file("lib.quanta", "pub fn foo() {}");
+        
+        assert_eq!(map.file_count(), 2);
+        assert!(map.get_file(id1).is_some());
+        assert!(map.get_file(id2).is_some());
+        assert!(map.get_file_by_name("main.quanta").is_some());
+    }
+    
+    #[test]
+    fn test_span_to_range() {
+        let mut map = SourceMap::new();
+        let id = map.add_file("test.quanta", "fn main() {\n    println()\n}");
+        
+        let span = LocatedSpan::new(id, Span::new(0, 2));
+        let range = map.span_to_range(span).unwrap();
+        
+        assert_eq!(range.start_line, 1);
+        assert_eq!(range.start_column, 1);
+        assert_eq!(range.end_line, 1);
+        assert_eq!(range.end_column, 3);
+    }
+}

@@ -1,0 +1,504 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ BUILD SYSTEM — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The QuantaLang Build System provides compilation orchestration, incremental
+// builds, parallel execution, and artifact caching.
+//
+// Features:
+// - Dependency graph computation and topological ordering
+// - Parallel compilation with configurable job count
+// - Content-addressable fingerprinting for incremental builds
+// - Artifact caching with SHA-256 verification
+// - Multiple output formats (human, JSON, diagnostic)
+// - Cross-compilation support (x86_64, AArch64, WASM)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang Build System
+//!
+//! Compilation orchestration for QuantaLang projects.
+//!
+//! ## Quick Start
+//!
+//! ```quanta
+//! use quantalang::build::{Build, Profile};
+//!
+//! // Build with defaults
+//! let result = Build::new()
+//!     .profile(Profile::release())
+//!     .run()?;
+//!
+//! // Build with custom configuration
+//! let result = Build::new()
+//!     .profile(Profile::dev())
+//!     .jobs(8)
+//!     .target("aarch64-apple-darwin")
+//!     .features(&["serde", "async"])
+//!     .run()?;
+//! ```
+//!
+//! ## Modules
+//!
+//! - [`config`] - Build configuration and profiles
+//! - [`graph`] - Dependency graph and topological ordering
+//! - [`cache`] - Fingerprinting and artifact caching
+//! - [`compiler`] - Compiler invocation
+//! - [`executor`] - Build execution engine
+
+module quantalang::build
+
+// Submodules
+pub mod config;
+pub mod graph;
+pub mod cache;
+pub mod compiler;
+pub mod executor;
+
+// Re-exports
+pub use config::{
+    BuildConfig, Profile, BuildTarget, TargetTriple,
+    OptLevel, DebugInfo, Lto, PanicStrategy, Strip, SplitDebugInfo,
+    Architecture, OperatingSystem, Endianness,
+    TargetKind, CrateType, Edition,
+    BuildMode, ColorChoice, MessageFormat,
+};
+
+pub use graph::{
+    DependencyGraph, GraphBuilder, GraphStats,
+    Unit, UnitId, UnitKind,
+    SourceFile, SourceKind, Artifact, ArtifactKind,
+    CycleError,
+};
+
+pub use cache::{
+    BuildCache, Fingerprint, FingerprintComponents,
+    MtimeCache, DepInfo, CacheStats, CleanResult,
+};
+
+pub use compiler::{
+    CompilerInvocation, CompileResult, CompileProcess,
+    CompilerMessage, MessageLevel, DiagnosticCode, DiagnosticSpan,
+    EmitType, ErrorFormat, ColorOutput,
+};
+
+pub use executor::{
+    BuildExecutor, BuildExecutorBuilder,
+    BuildResult, BuildError, BuildProgress,
+    JobQueue, Job,
+};
+
+// Version
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIGH-LEVEL API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// High-level build API
+///
+/// # Examples
+///
+/// ```quanta
+/// use quantalang::build::Build;
+///
+/// // Simple release build
+/// let result = Build::new()
+///     .release()
+///     .run()?;
+///
+/// // Verbose debug build with 4 jobs
+/// let result = Build::new()
+///     .debug()
+///     .jobs(4)
+///     .verbose(true)
+///     .run()?;
+/// ```
+pub struct Build {
+    config: BuildConfig,
+    manifest_path: Option<std::path::PathBuf>,
+    workspace: bool,
+    packages: Vec<String>,
+    targets: BuildTargets,
+}
+
+impl Build {
+    /// Create a new build with default configuration
+    pub fn new() -> Self {
+        Build {
+            config: BuildConfig::default(),
+            manifest_path: None,
+            workspace: false,
+            packages: Vec::new(),
+            targets: BuildTargets::default(),
+        }
+    }
+    
+    /// Set release profile
+    pub fn release(mut self) -> Self {
+        self.config.profile = Profile::release();
+        self
+    }
+    
+    /// Set debug profile
+    pub fn debug(mut self) -> Self {
+        self.config.profile = Profile::dev();
+        self
+    }
+    
+    /// Set custom profile
+    pub fn profile(mut self, profile: Profile) -> Self {
+        self.config.profile = profile;
+        self
+    }
+    
+    /// Set target triple
+    pub fn target(mut self, target: &str) -> Self {
+        if let Some(t) = TargetTriple::from_str(target) {
+            self.config.target = t;
+        }
+        self
+    }
+    
+    /// Set number of parallel jobs
+    pub fn jobs(mut self, jobs: usize) -> Self {
+        self.config.jobs = jobs;
+        self
+    }
+    
+    /// Enable features
+    pub fn features(mut self, features: &[&str]) -> Self {
+        self.config.features.extend(features.iter().map(|s| s.to_string()));
+        self
+    }
+    
+    /// Enable all features
+    pub fn all_features(mut self) -> Self {
+        self.config.all_features = true;
+        self
+    }
+    
+    /// Disable default features
+    pub fn no_default_features(mut self) -> Self {
+        self.config.no_default_features = true;
+        self
+    }
+    
+    /// Set verbose output
+    pub fn verbose(mut self, verbose: bool) -> Self {
+        self.config.verbose = verbose;
+        self
+    }
+    
+    /// Set manifest path
+    pub fn manifest_path(mut self, path: &std::path::Path) -> Self {
+        self.manifest_path = Some(path.to_path_buf());
+        self
+    }
+    
+    /// Build all workspace members
+    pub fn workspace(mut self) -> Self {
+        self.workspace = true;
+        self
+    }
+    
+    /// Build specific package
+    pub fn package(mut self, name: &str) -> Self {
+        self.packages.push(name.to_string());
+        self
+    }
+    
+    /// Build only lib
+    pub fn lib(mut self) -> Self {
+        self.targets.lib = true;
+        self
+    }
+    
+    /// Build only bins
+    pub fn bins(mut self) -> Self {
+        self.targets.bins = true;
+        self
+    }
+    
+    /// Build specific binary
+    pub fn bin(mut self, name: &str) -> Self {
+        self.targets.bin_names.push(name.to_string());
+        self
+    }
+    
+    /// Build tests
+    pub fn tests(mut self) -> Self {
+        self.targets.tests = true;
+        self
+    }
+    
+    /// Build examples
+    pub fn examples(mut self) -> Self {
+        self.targets.examples = true;
+        self
+    }
+    
+    /// Get configuration
+    pub fn config(&self) -> &BuildConfig {
+        &self.config
+    }
+    
+    /// Execute the build
+    pub fn run(self) -> Result<BuildResult, BuildError> {
+        // Determine project root
+        let root = self.manifest_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| BuildError::Io("cannot determine project root".to_string()))?;
+        
+        // Build dependency graph
+        let mut graph = build_graph(&root, &self)?;
+        
+        // Create executor
+        let cache_dir = self.config.target_dir.join(".cache");
+        let mut executor = BuildExecutor::new(self.config.clone(), &cache_dir)
+            .map_err(|e| BuildError::Io(e.to_string()))?;
+        
+        // Execute build
+        Ok(executor.execute(&mut graph))
+    }
+    
+    /// Check only (don't produce artifacts)
+    pub fn check(mut self) -> Result<BuildResult, BuildError> {
+        self.config.mode = BuildMode::Check;
+        self.run()
+    }
+    
+    /// Build documentation
+    pub fn doc(mut self) -> Result<BuildResult, BuildError> {
+        self.config.mode = BuildMode::Doc;
+        self.run()
+    }
+}
+
+impl Default for Build {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Default)]
+struct BuildTargets {
+    lib: bool,
+    bins: bool,
+    tests: bool,
+    examples: bool,
+    benches: bool,
+    bin_names: Vec<String>,
+    example_names: Vec<String>,
+    test_names: Vec<String>,
+}
+
+/// Build dependency graph from project
+fn build_graph(root: &std::path::Path, build: &Build) -> Result<DependencyGraph, BuildError> {
+    let mut graph = DependencyGraph::new();
+    
+    // Parse manifest
+    let manifest_path = root.join("quanta.toml");
+    if !manifest_path.exists() {
+        return Err(BuildError::Io(format!(
+            "manifest not found: {}",
+            manifest_path.display()
+        )));
+    }
+    
+    // Discover source files and create units
+    // This is a simplified version - real implementation would parse manifest
+    let src_dir = root.join("src");
+    if src_dir.exists() {
+        let main_path = src_dir.join("main.quanta");
+        let lib_path = src_dir.join("lib.quanta");
+        
+        if main_path.exists() && (build.targets.bins || build.targets.bin_names.is_empty()) {
+            let id = UnitId::new(
+                "main",
+                "0.1.0",
+                "main",
+                UnitKind::Bin,
+                &build.config.profile.name,
+                build.config.target.triple(),
+                build.config.features.iter().cloned().collect(),
+            );
+            
+            let mut unit = Unit::new(id);
+            unit.add_source(main_path, SourceKind::Root);
+            unit.is_root = true;
+            
+            graph.add_unit(unit);
+        }
+        
+        if lib_path.exists() && (build.targets.lib || build.targets.bin_names.is_empty()) {
+            let id = UnitId::new(
+                "lib",
+                "0.1.0",
+                "lib",
+                UnitKind::Lib,
+                &build.config.profile.name,
+                build.config.target.triple(),
+                build.config.features.iter().cloned().collect(),
+            );
+            
+            let mut unit = Unit::new(id);
+            unit.add_source(lib_path, SourceKind::Root);
+            unit.is_root = true;
+            
+            graph.add_unit(unit);
+        }
+    }
+    
+    Ok(graph)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONVENIENCE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Build in release mode
+pub fn build_release() -> Result<BuildResult, BuildError> {
+    Build::new().release().run()
+}
+
+/// Build in debug mode
+pub fn build_debug() -> Result<BuildResult, BuildError> {
+    Build::new().debug().run()
+}
+
+/// Check without producing artifacts
+pub fn check() -> Result<BuildResult, BuildError> {
+    Build::new().check()
+}
+
+/// Clean build artifacts
+pub fn clean(target_dir: &std::path::Path) -> std::io::Result<()> {
+    if target_dir.exists() {
+        std::fs::remove_dir_all(target_dir)?;
+    }
+    Ok(())
+}
+
+/// Clean build cache only
+pub fn clean_cache(target_dir: &std::path::Path) -> std::io::Result<()> {
+    let cache_dir = target_dir.join(".cache");
+    if cache_dir.exists() {
+        std::fs::remove_dir_all(&cache_dir)?;
+    }
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUILD SCRIPT SUPPORT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Build script output
+pub mod build_script {
+    /// Emit rerun-if-changed directive
+    pub fn rerun_if_changed(path: &str) {
+        println!("cargo:rerun-if-changed={}", path);
+    }
+    
+    /// Emit rerun-if-env-changed directive
+    pub fn rerun_if_env_changed(var: &str) {
+        println!("cargo:rerun-if-env-changed={}", var);
+    }
+    
+    /// Emit rustc-link-lib directive
+    pub fn link_lib(lib: &str) {
+        println!("cargo:rustc-link-lib={}", lib);
+    }
+    
+    /// Emit rustc-link-search directive
+    pub fn link_search(path: &str) {
+        println!("cargo:rustc-link-search={}", path);
+    }
+    
+    /// Emit rustc-cfg directive
+    pub fn cfg(cfg: &str) {
+        println!("cargo:rustc-cfg={}", cfg);
+    }
+    
+    /// Emit rustc-env directive
+    pub fn env(key: &str, value: &str) {
+        println!("cargo:rustc-env={}={}", key, value);
+    }
+    
+    /// Emit warning
+    pub fn warning(msg: &str) {
+        println!("cargo:warning={}", msg);
+    }
+    
+    /// Get environment variable from build
+    pub fn get_env(key: &str) -> Option<String> {
+        std::env::var(key).ok()
+    }
+    
+    /// Get output directory
+    pub fn out_dir() -> Option<String> {
+        get_env("OUT_DIR")
+    }
+    
+    /// Get target triple
+    pub fn target() -> Option<String> {
+        get_env("TARGET")
+    }
+    
+    /// Get host triple
+    pub fn host() -> Option<String> {
+        get_env("HOST")
+    }
+    
+    /// Get profile
+    pub fn profile() -> Option<String> {
+        get_env("PROFILE")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_build_new() {
+        let build = Build::new();
+        assert_eq!(build.config.profile.name, "dev");
+    }
+    
+    #[test]
+    fn test_build_release() {
+        let build = Build::new().release();
+        assert_eq!(build.config.profile.name, "release");
+        assert_eq!(build.config.profile.opt_level, OptLevel::O3);
+    }
+    
+    #[test]
+    fn test_build_jobs() {
+        let build = Build::new().jobs(8);
+        assert_eq!(build.config.jobs, 8);
+    }
+    
+    #[test]
+    fn test_build_features() {
+        let build = Build::new().features(&["serde", "async"]);
+        assert!(build.config.features.contains("serde"));
+        assert!(build.config.features.contains("async"));
+    }
+    
+    #[test]
+    fn test_target_triple() {
+        let build = Build::new().target("aarch64-apple-darwin");
+        assert_eq!(build.config.target.arch, Architecture::Aarch64);
+    }
+}

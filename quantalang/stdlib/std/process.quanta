@@ -1,0 +1,474 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ STANDARD LIBRARY — Process Module
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Process management:
+// - Command execution
+// - Child process handling
+// - Exit status
+// - Process I/O (stdin, stdout, stderr)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module std::process
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use core::fmt;
+use crate::io::{self, Read, Write, Result};
+use crate::path::Path;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMMAND
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A process builder for spawning processes
+pub struct Command {
+    program: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    env_clear: bool,
+    cwd: Option<String>,
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+}
+
+impl Command {
+    /// Create a new Command for launching the given program
+    pub fn new<S: AsRef<str>>(program: S) -> Self {
+        Command {
+            program: program.as_ref().to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            env_clear: false,
+            cwd: None,
+            stdin: Stdio::Inherit,
+            stdout: Stdio::Inherit,
+            stderr: Stdio::Inherit,
+        }
+    }
+    
+    /// Add an argument
+    pub fn arg<S: AsRef<str>>(&mut self, arg: S) -> &mut Self {
+        self.args.push(arg.as_ref().to_string());
+        self
+    }
+    
+    /// Add multiple arguments
+    pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for arg in args {
+            self.args.push(arg.as_ref().to_string());
+        }
+        self
+    }
+    
+    /// Set an environment variable
+    pub fn env<K, V>(&mut self, key: K, val: V) -> &mut Self
+    where
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        self.env.insert(key.as_ref().to_string(), val.as_ref().to_string());
+        self
+    }
+    
+    /// Set multiple environment variables
+    pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        for (key, val) in vars {
+            self.env.insert(key.as_ref().to_string(), val.as_ref().to_string());
+        }
+        self
+    }
+    
+    /// Remove an environment variable
+    pub fn env_remove<K: AsRef<str>>(&mut self, key: K) -> &mut Self {
+        self.env.remove(key.as_ref());
+        self
+    }
+    
+    /// Clear all environment variables
+    pub fn env_clear(&mut self) -> &mut Self {
+        self.env_clear = true;
+        self.env.clear();
+        self
+    }
+    
+    /// Set the working directory
+    pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
+        self.cwd = Some(dir.as_ref().to_string_lossy().to_string());
+        self
+    }
+    
+    /// Set stdin behavior
+    pub fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.stdin = cfg.into();
+        self
+    }
+    
+    /// Set stdout behavior
+    pub fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.stdout = cfg.into();
+        self
+    }
+    
+    /// Set stderr behavior
+    pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.stderr = cfg.into();
+        self
+    }
+    
+    /// Get the program
+    pub fn get_program(&self) -> &str {
+        &self.program
+    }
+    
+    /// Get the arguments
+    pub fn get_args(&self) -> impl Iterator<Item = &str> {
+        self.args.iter().map(|s| s.as_str())
+    }
+    
+    /// Get the environment
+    pub fn get_envs(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
+        self.env.iter().map(|(k, v)| (k.as_str(), Some(v.as_str())))
+    }
+    
+    /// Get the working directory
+    pub fn get_current_dir(&self) -> Option<&Path> {
+        self.cwd.as_ref().map(|s| Path::new(s))
+    }
+    
+    /// Spawn the process
+    pub fn spawn(&mut self) -> Result<Child> {
+        crate::sys::spawn_process(self).map(|inner| Child { inner })
+    }
+    
+    /// Spawn and wait for completion, collecting output
+    pub fn output(&mut self) -> Result<Output> {
+        self.stdout(Stdio::piped());
+        self.stderr(Stdio::piped());
+        
+        let mut child = self.spawn()?;
+        
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        
+        if let Some(ref mut out) = child.stdout {
+            out.read_to_end(&mut stdout)?;
+        }
+        
+        if let Some(ref mut err) = child.stderr {
+            err.read_to_end(&mut stderr)?;
+        }
+        
+        let status = child.wait()?;
+        
+        Ok(Output { status, stdout, stderr })
+    }
+    
+    /// Spawn and wait for completion
+    pub fn status(&mut self) -> Result<ExitStatus> {
+        self.spawn()?.wait()
+    }
+}
+
+impl fmt::Debug for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Command")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .finish()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STDIO
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// I/O configuration for child process
+#[derive(Debug)]
+pub enum Stdio {
+    /// Inherit from parent
+    Inherit,
+    /// Create a pipe
+    Piped,
+    /// Redirect to /dev/null
+    Null,
+}
+
+impl Stdio {
+    /// Create a piped stdio
+    pub fn piped() -> Self {
+        Stdio::Piped
+    }
+    
+    /// Create an inherited stdio
+    pub fn inherit() -> Self {
+        Stdio::Inherit
+    }
+    
+    /// Create a null stdio
+    pub fn null() -> Self {
+        Stdio::Null
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHILD PROCESS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Represents a running child process
+pub struct Child {
+    inner: crate::sys::Child,
+}
+
+impl Child {
+    /// Get the process ID
+    pub fn id(&self) -> u32 {
+        self.inner.id()
+    }
+    
+    /// Wait for the child to exit
+    pub fn wait(&mut self) -> Result<ExitStatus> {
+        self.inner.wait().map(|inner| ExitStatus { inner })
+    }
+    
+    /// Try to collect exit status without blocking
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        self.inner.try_wait().map(|opt| opt.map(|inner| ExitStatus { inner }))
+    }
+    
+    /// Kill the child process
+    pub fn kill(&mut self) -> Result<()> {
+        self.inner.kill()
+    }
+    
+    /// Wait and collect output
+    pub fn wait_with_output(mut self) -> Result<Output> {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        
+        if let Some(ref mut out) = self.stdout {
+            out.read_to_end(&mut stdout)?;
+        }
+        
+        if let Some(ref mut err) = self.stderr {
+            err.read_to_end(&mut stderr)?;
+        }
+        
+        let status = self.wait()?;
+        
+        Ok(Output { status, stdout, stderr })
+    }
+    
+    /// Access to child's stdin
+    pub stdin: Option<ChildStdin>,
+    
+    /// Access to child's stdout
+    pub stdout: Option<ChildStdout>,
+    
+    /// Access to child's stderr
+    pub stderr: Option<ChildStderr>,
+}
+
+/// Child's stdin handle
+pub struct ChildStdin {
+    inner: crate::sys::ChildStdin,
+}
+
+impl Write for ChildStdin {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        self.inner.write(buf)
+    }
+    
+    fn flush(&mut self) -> Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Child's stdout handle
+pub struct ChildStdout {
+    inner: crate::sys::ChildStdout,
+}
+
+impl Read for ChildStdout {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+/// Child's stderr handle
+pub struct ChildStderr {
+    inner: crate::sys::ChildStderr,
+}
+
+impl Read for ChildStderr {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OUTPUT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Output of a finished command
+#[derive(Clone, Debug)]
+pub struct Output {
+    /// Exit status
+    pub status: ExitStatus,
+    /// Captured stdout
+    pub stdout: Vec<u8>,
+    /// Captured stderr
+    pub stderr: Vec<u8>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXIT STATUS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Exit status of a process
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExitStatus {
+    inner: crate::sys::ExitStatus,
+}
+
+impl ExitStatus {
+    /// Was the process successful (exit code 0)?
+    pub fn success(&self) -> bool {
+        self.inner.success()
+    }
+    
+    /// Get the exit code
+    pub fn code(&self) -> Option<i32> {
+        self.inner.code()
+    }
+}
+
+impl fmt::Display for ExitStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(code) = self.code() {
+            write!(f, "exit code: {}", code)
+        } else {
+            write!(f, "terminated by signal")
+        }
+    }
+}
+
+/// Exit code for the current process
+#[derive(Clone, Copy, Debug)]
+pub struct ExitCode(i32);
+
+impl ExitCode {
+    /// Success exit code
+    pub const SUCCESS: ExitCode = ExitCode(0);
+    
+    /// Failure exit code
+    pub const FAILURE: ExitCode = ExitCode(1);
+    
+    /// Create from raw value
+    pub fn from_raw(code: i32) -> Self {
+        ExitCode(code)
+    }
+}
+
+impl From<u8> for ExitCode {
+    fn from(code: u8) -> Self {
+        ExitCode(code as i32)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROCESS FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Exit the current process
+pub fn exit(code: i32) -> ! {
+    crate::sys::exit(code)
+}
+
+/// Abort the process immediately
+pub fn abort() -> ! {
+    crate::sys::abort()
+}
+
+/// Get the current process ID
+pub fn id() -> u32 {
+    crate::sys::getpid()
+}
+
+/// Terminate the current process
+pub trait Termination {
+    fn report(self) -> ExitCode;
+}
+
+impl Termination for () {
+    fn report(self) -> ExitCode {
+        ExitCode::SUCCESS
+    }
+}
+
+impl Termination for ExitCode {
+    fn report(self) -> ExitCode {
+        self
+    }
+}
+
+impl<T: Termination, E: fmt::Debug> Termination for core::result::Result<T, E> {
+    fn report(self) -> ExitCode {
+        match self {
+            Ok(val) => val.report(),
+            Err(err) => {
+                eprintln!("Error: {:?}", err);
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+impl Termination for ! {
+    fn report(self) -> ExitCode {
+        self
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_command_builder() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("hello").arg("world");
+        
+        assert_eq!(cmd.get_program(), "echo");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, vec!["hello", "world"]);
+    }
+    
+    #[test]
+    fn test_exit_code() {
+        let success = ExitCode::SUCCESS;
+        let failure = ExitCode::FAILURE;
+        
+        assert_eq!(success.0, 0);
+        assert_eq!(failure.0, 1);
+    }
+}

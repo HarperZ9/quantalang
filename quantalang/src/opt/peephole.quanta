@@ -1,0 +1,944 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Peephole Optimizations
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Peephole optimization infrastructure:
+//   - Pattern matching engine
+//   - Instruction combining
+//   - Algebraic simplification
+//   - Target-specific patterns
+//   - Cost-based selection
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::peephole
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PATTERN LANGUAGE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Pattern for matching instructions
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    /// Match any instruction, capture as variable
+    Any(String),
+    /// Match a specific constant
+    Const(i64),
+    /// Match any constant, capture value
+    AnyConst(String),
+    /// Match a specific opcode with operand patterns
+    Op(Opcode, Vec<Pattern>),
+    /// Match if predicate holds
+    If(Box<Pattern>, Predicate),
+    /// Match either pattern
+    Or(Box<Pattern>, Box<Pattern>),
+    /// Match sequence of patterns
+    Seq(Vec<Pattern>),
+}
+
+/// Predicate for conditional patterns
+#[derive(Debug, Clone)]
+pub enum Predicate {
+    /// Value is a power of 2
+    IsPowerOf2(String),
+    /// Value equals another
+    Equals(String, String),
+    /// Value is zero
+    IsZero(String),
+    /// Value is one
+    IsOne(String),
+    /// Value is all ones (-1)
+    IsAllOnes(String),
+    /// Values are the same
+    Same(String, String),
+    /// Custom predicate
+    Custom(String),
+}
+
+/// Replacement for matched pattern
+#[derive(Debug, Clone)]
+pub enum Replacement {
+    /// Replace with captured value
+    Var(String),
+    /// Replace with constant
+    Const(i64),
+    /// Replace with operation on captured values
+    Op(Opcode, Vec<Replacement>),
+    /// Replace with computed value
+    Compute(Computation),
+    /// Delete instruction (use for dead code)
+    Delete,
+}
+
+/// Computation for replacement
+#[derive(Debug, Clone)]
+pub enum Computation {
+    /// Log2 of captured value
+    Log2(String),
+    /// Negate captured value
+    Neg(String),
+    /// Add captured values
+    Add(String, String),
+    /// Subtract captured values
+    Sub(String, String),
+}
+
+/// Opcodes for pattern matching
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Opcode {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Not,
+    Shl, Shr, Sar,
+    Eq, Ne, Lt, Le, Gt, Ge,
+    Neg, Abs,
+    ZExt, SExt, Trunc,
+    Load, Store,
+    Select,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PEEPHOLE RULE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A peephole optimization rule
+#[derive(Debug, Clone)]
+pub struct PeepholeRule {
+    /// Rule name
+    pub name: String,
+    /// Pattern to match
+    pub pattern: Pattern,
+    /// Replacement
+    pub replacement: Replacement,
+    /// Priority (higher = applied first)
+    pub priority: i32,
+    /// Estimated cost reduction
+    pub benefit: i32,
+}
+
+impl PeepholeRule {
+    pub fn new(name: impl Into<String>, pattern: Pattern, replacement: Replacement) -> Self {
+        PeepholeRule {
+            name: name.into(),
+            pattern,
+            replacement,
+            priority: 0,
+            benefit: 1,
+        }
+    }
+    
+    pub fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = priority;
+        self
+    }
+    
+    pub fn with_benefit(mut self, benefit: i32) -> Self {
+        self.benefit = benefit;
+        self
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PATTERN MATCHER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Match result with captured bindings
+#[derive(Debug, Clone)]
+pub struct MatchResult {
+    /// Captured values
+    pub bindings: BTreeMap<String, MatchValue>,
+    /// Matched instruction indices
+    pub matched: Vec<usize>,
+}
+
+/// Value captured during matching
+#[derive(Debug, Clone)]
+pub enum MatchValue {
+    Instruction(usize),
+    Constant(i64),
+    Operand(MirOperand),
+}
+
+impl MatchResult {
+    pub fn new() -> Self {
+        MatchResult {
+            bindings: BTreeMap::new(),
+            matched: Vec::new(),
+        }
+    }
+    
+    pub fn bind(&mut self, name: &str, value: MatchValue) {
+        self.bindings.insert(name.to_string(), value);
+    }
+    
+    pub fn get_const(&self, name: &str) -> Option<i64> {
+        match self.bindings.get(name) {
+            Some(MatchValue::Constant(c)) => Some(*c),
+            _ => None,
+        }
+    }
+    
+    pub fn get_operand(&self, name: &str) -> Option<&MirOperand> {
+        match self.bindings.get(name) {
+            Some(MatchValue::Operand(op)) => Some(op),
+            _ => None,
+        }
+    }
+}
+
+impl Default for MatchResult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Pattern matcher
+pub struct PatternMatcher {
+    /// Rules to apply
+    rules: Vec<PeepholeRule>,
+}
+
+impl PatternMatcher {
+    pub fn new() -> Self {
+        PatternMatcher { rules: Vec::new() }
+    }
+    
+    /// Add a rule
+    pub fn add_rule(&mut self, rule: PeepholeRule) {
+        self.rules.push(rule);
+        // Sort by priority
+        self.rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+    }
+    
+    /// Try to match a pattern against an instruction
+    pub fn match_pattern(
+        &self,
+        pattern: &Pattern,
+        inst: &MirStatement,
+        block: &MirBlock,
+        idx: usize,
+    ) -> Option<MatchResult> {
+        let mut result = MatchResult::new();
+        
+        if self.match_impl(pattern, inst, block, idx, &mut result) {
+            Some(result)
+        } else {
+            None
+        }
+    }
+    
+    fn match_impl(
+        &self,
+        pattern: &Pattern,
+        inst: &MirStatement,
+        block: &MirBlock,
+        idx: usize,
+        result: &mut MatchResult,
+    ) -> bool {
+        match pattern {
+            Pattern::Any(name) => {
+                result.bind(name, MatchValue::Instruction(idx));
+                result.matched.push(idx);
+                true
+            }
+            Pattern::Const(expected) => {
+                if let MirStatement::Assign { value: MirOperand::Constant(c), .. } = inst {
+                    *c == *expected
+                } else {
+                    false
+                }
+            }
+            Pattern::AnyConst(name) => {
+                if let MirStatement::Assign { value: MirOperand::Constant(c), .. } = inst {
+                    result.bind(name, MatchValue::Constant(*c));
+                    true
+                } else {
+                    false
+                }
+            }
+            Pattern::Op(opcode, operands) => {
+                self.match_opcode(opcode, operands, inst, block, idx, result)
+            }
+            Pattern::If(inner, pred) => {
+                if self.match_impl(inner, inst, block, idx, result) {
+                    self.check_predicate(pred, result)
+                } else {
+                    false
+                }
+            }
+            Pattern::Or(a, b) => {
+                let mut result_a = result.clone();
+                if self.match_impl(a, inst, block, idx, &mut result_a) {
+                    *result = result_a;
+                    true
+                } else {
+                    self.match_impl(b, inst, block, idx, result)
+                }
+            }
+            Pattern::Seq(patterns) => {
+                if patterns.is_empty() {
+                    return true;
+                }
+                
+                let mut current_idx = idx;
+                for pattern in patterns {
+                    if current_idx >= block.statements.len() {
+                        return false;
+                    }
+                    
+                    if !self.match_impl(pattern, &block.statements[current_idx], block, current_idx, result) {
+                        return false;
+                    }
+                    
+                    current_idx += 1;
+                }
+                
+                true
+            }
+        }
+    }
+    
+    fn match_opcode(
+        &self,
+        opcode: &Opcode,
+        operands: &[Pattern],
+        inst: &MirStatement,
+        block: &MirBlock,
+        idx: usize,
+        result: &mut MatchResult,
+    ) -> bool {
+        match inst {
+            MirStatement::BinaryOp { op, lhs, rhs, .. } => {
+                let inst_opcode = match op {
+                    BinOp::Add => Opcode::Add,
+                    BinOp::Sub => Opcode::Sub,
+                    BinOp::Mul => Opcode::Mul,
+                    BinOp::Div => Opcode::Div,
+                    BinOp::Rem => Opcode::Rem,
+                    BinOp::And => Opcode::And,
+                    BinOp::Or => Opcode::Or,
+                    BinOp::Xor => Opcode::Xor,
+                    BinOp::Shl => Opcode::Shl,
+                    BinOp::Shr => Opcode::Shr,
+                    BinOp::Eq => Opcode::Eq,
+                    BinOp::Ne => Opcode::Ne,
+                    BinOp::Lt => Opcode::Lt,
+                    BinOp::Le => Opcode::Le,
+                    BinOp::Gt => Opcode::Gt,
+                    BinOp::Ge => Opcode::Ge,
+                };
+                
+                if inst_opcode != *opcode {
+                    return false;
+                }
+                
+                if operands.len() != 2 {
+                    return false;
+                }
+                
+                result.matched.push(idx);
+                
+                // Match operands
+                self.match_operand(&operands[0], lhs, result) &&
+                self.match_operand(&operands[1], rhs, result)
+            }
+            _ => false,
+        }
+    }
+    
+    fn match_operand(&self, pattern: &Pattern, operand: &MirOperand, result: &mut MatchResult) -> bool {
+        match pattern {
+            Pattern::Any(name) => {
+                result.bind(name, MatchValue::Operand(operand.clone()));
+                true
+            }
+            Pattern::Const(expected) => {
+                if let MirOperand::Constant(c) = operand {
+                    *c == *expected
+                } else {
+                    false
+                }
+            }
+            Pattern::AnyConst(name) => {
+                if let MirOperand::Constant(c) = operand {
+                    result.bind(name, MatchValue::Constant(*c));
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+    
+    fn check_predicate(&self, pred: &Predicate, result: &MatchResult) -> bool {
+        match pred {
+            Predicate::IsPowerOf2(name) => {
+                result.get_const(name)
+                    .map(|c| c > 0 && (c & (c - 1)) == 0)
+                    .unwrap_or(false)
+            }
+            Predicate::IsZero(name) => {
+                result.get_const(name).map(|c| c == 0).unwrap_or(false)
+            }
+            Predicate::IsOne(name) => {
+                result.get_const(name).map(|c| c == 1).unwrap_or(false)
+            }
+            Predicate::IsAllOnes(name) => {
+                result.get_const(name).map(|c| c == -1).unwrap_or(false)
+            }
+            Predicate::Equals(a, b) => {
+                match (result.get_const(a), result.get_const(b)) {
+                    (Some(va), Some(vb)) => va == vb,
+                    _ => false,
+                }
+            }
+            Predicate::Same(a, b) => {
+                match (result.get_operand(a), result.get_operand(b)) {
+                    (Some(oa), Some(ob)) => oa == ob,
+                    _ => false,
+                }
+            }
+            Predicate::Custom(_) => true, // Custom predicates handled elsewhere
+        }
+    }
+}
+
+impl Default for PatternMatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PEEPHOLE OPTIMIZER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Peephole optimizer
+pub struct PeepholeOptimizer {
+    /// Pattern matcher
+    matcher: PatternMatcher,
+    /// Statistics
+    stats: PeepholeStats,
+}
+
+/// Statistics for peephole optimization
+#[derive(Debug, Clone, Default)]
+pub struct PeepholeStats {
+    /// Number of instructions examined
+    pub examined: usize,
+    /// Number of patterns matched
+    pub matched: usize,
+    /// Number of transformations applied
+    pub transformed: usize,
+    /// Per-rule statistics
+    pub per_rule: BTreeMap<String, usize>,
+}
+
+impl PeepholeOptimizer {
+    pub fn new() -> Self {
+        let mut optimizer = PeepholeOptimizer {
+            matcher: PatternMatcher::new(),
+            stats: PeepholeStats::default(),
+        };
+        
+        // Add standard rules
+        optimizer.add_standard_rules();
+        
+        optimizer
+    }
+    
+    fn add_standard_rules(&mut self) {
+        // x + 0 = x
+        self.matcher.add_rule(PeepholeRule::new(
+            "add_zero",
+            Pattern::Op(Opcode::Add, vec![
+                Pattern::Any("x".to_string()),
+                Pattern::Const(0),
+            ]),
+            Replacement::Var("x".to_string()),
+        ));
+        
+        // 0 + x = x
+        self.matcher.add_rule(PeepholeRule::new(
+            "zero_add",
+            Pattern::Op(Opcode::Add, vec![
+                Pattern::Const(0),
+                Pattern::Any("x".to_string()),
+            ]),
+            Replacement::Var("x".to_string()),
+        ));
+        
+        // x - 0 = x
+        self.matcher.add_rule(PeepholeRule::new(
+            "sub_zero",
+            Pattern::Op(Opcode::Sub, vec![
+                Pattern::Any("x".to_string()),
+                Pattern::Const(0),
+            ]),
+            Replacement::Var("x".to_string()),
+        ));
+        
+        // x - x = 0
+        self.matcher.add_rule(PeepholeRule::new(
+            "sub_self",
+            Pattern::If(
+                Box::new(Pattern::Op(Opcode::Sub, vec![
+                    Pattern::Any("x".to_string()),
+                    Pattern::Any("y".to_string()),
+                ])),
+                Predicate::Same("x".to_string(), "y".to_string()),
+            ),
+            Replacement::Const(0),
+        ));
+        
+        // x * 0 = 0
+        self.matcher.add_rule(PeepholeRule::new(
+            "mul_zero",
+            Pattern::Op(Opcode::Mul, vec![
+                Pattern::Any("x".to_string()),
+                Pattern::Const(0),
+            ]),
+            Replacement::Const(0),
+        ));
+        
+        // x * 1 = x
+        self.matcher.add_rule(PeepholeRule::new(
+            "mul_one",
+            Pattern::Op(Opcode::Mul, vec![
+                Pattern::Any("x".to_string()),
+                Pattern::Const(1),
+            ]),
+            Replacement::Var("x".to_string()),
+        ));
+        
+        // x * 2^n = x << n (strength reduction)
+        self.matcher.add_rule(PeepholeRule::new(
+            "mul_pow2",
+            Pattern::If(
+                Box::new(Pattern::Op(Opcode::Mul, vec![
+                    Pattern::Any("x".to_string()),
+                    Pattern::AnyConst("c".to_string()),
+                ])),
+                Predicate::IsPowerOf2("c".to_string()),
+            ),
+            Replacement::Op(Opcode::Shl, vec![
+                Replacement::Var("x".to_string()),
+                Replacement::Compute(Computation::Log2("c".to_string())),
+            ]),
+        ).with_benefit(2));
+        
+        // x / 1 = x
+        self.matcher.add_rule(PeepholeRule::new(
+            "div_one",
+            Pattern::Op(Opcode::Div, vec![
+                Pattern::Any("x".to_string()),
+                Pattern::Const(1),
+            ]),
+            Replacement::Var("x".to_string()),
+        ));
+        
+        // x & 0 = 0
+        self.matcher.add_rule(PeepholeRule::new(
+            "and_zero",
+            Pattern::Op(Opcode::And, vec![
+                Pattern::Any("x".to_string()),
+                Pattern::Const(0),
+            ]),
+            Replacement::Const(0),
+        ));
+        
+        // x & -1 = x
+        self.matcher.add_rule(PeepholeRule::new(
+            "and_all_ones",
+            Pattern::If(
+                Box::new(Pattern::Op(Opcode::And, vec![
+                    Pattern::Any("x".to_string()),
+                    Pattern::AnyConst("c".to_string()),
+                ])),
+                Predicate::IsAllOnes("c".to_string()),
+            ),
+            Replacement::Var("x".to_string()),
+        ));
+        
+        // x & x = x
+        self.matcher.add_rule(PeepholeRule::new(
+            "and_self",
+            Pattern::If(
+                Box::new(Pattern::Op(Opcode::And, vec![
+                    Pattern::Any("x".to_string()),
+                    Pattern::Any("y".to_string()),
+                ])),
+                Predicate::Same("x".to_string(), "y".to_string()),
+            ),
+            Replacement::Var("x".to_string()),
+        ));
+        
+        // x | 0 = x
+        self.matcher.add_rule(PeepholeRule::new(
+            "or_zero",
+            Pattern::Op(Opcode::Or, vec![
+                Pattern::Any("x".to_string()),
+                Pattern::Const(0),
+            ]),
+            Replacement::Var("x".to_string()),
+        ));
+        
+        // x | x = x
+        self.matcher.add_rule(PeepholeRule::new(
+            "or_self",
+            Pattern::If(
+                Box::new(Pattern::Op(Opcode::Or, vec![
+                    Pattern::Any("x".to_string()),
+                    Pattern::Any("y".to_string()),
+                ])),
+                Predicate::Same("x".to_string(), "y".to_string()),
+            ),
+            Replacement::Var("x".to_string()),
+        ));
+        
+        // x ^ 0 = x
+        self.matcher.add_rule(PeepholeRule::new(
+            "xor_zero",
+            Pattern::Op(Opcode::Xor, vec![
+                Pattern::Any("x".to_string()),
+                Pattern::Const(0),
+            ]),
+            Replacement::Var("x".to_string()),
+        ));
+        
+        // x ^ x = 0
+        self.matcher.add_rule(PeepholeRule::new(
+            "xor_self",
+            Pattern::If(
+                Box::new(Pattern::Op(Opcode::Xor, vec![
+                    Pattern::Any("x".to_string()),
+                    Pattern::Any("y".to_string()),
+                ])),
+                Predicate::Same("x".to_string(), "y".to_string()),
+            ),
+            Replacement::Const(0),
+        ));
+        
+        // x << 0 = x
+        self.matcher.add_rule(PeepholeRule::new(
+            "shl_zero",
+            Pattern::Op(Opcode::Shl, vec![
+                Pattern::Any("x".to_string()),
+                Pattern::Const(0),
+            ]),
+            Replacement::Var("x".to_string()),
+        ));
+        
+        // x >> 0 = x
+        self.matcher.add_rule(PeepholeRule::new(
+            "shr_zero",
+            Pattern::Op(Opcode::Shr, vec![
+                Pattern::Any("x".to_string()),
+                Pattern::Const(0),
+            ]),
+            Replacement::Var("x".to_string()),
+        ));
+        
+        // 0 << x = 0
+        self.matcher.add_rule(PeepholeRule::new(
+            "zero_shl",
+            Pattern::Op(Opcode::Shl, vec![
+                Pattern::Const(0),
+                Pattern::Any("x".to_string()),
+            ]),
+            Replacement::Const(0),
+        ));
+        
+        // x == x = true
+        self.matcher.add_rule(PeepholeRule::new(
+            "eq_self",
+            Pattern::If(
+                Box::new(Pattern::Op(Opcode::Eq, vec![
+                    Pattern::Any("x".to_string()),
+                    Pattern::Any("y".to_string()),
+                ])),
+                Predicate::Same("x".to_string(), "y".to_string()),
+            ),
+            Replacement::Const(1),
+        ));
+        
+        // x != x = false
+        self.matcher.add_rule(PeepholeRule::new(
+            "ne_self",
+            Pattern::If(
+                Box::new(Pattern::Op(Opcode::Ne, vec![
+                    Pattern::Any("x".to_string()),
+                    Pattern::Any("y".to_string()),
+                ])),
+                Predicate::Same("x".to_string(), "y".to_string()),
+            ),
+            Replacement::Const(0),
+        ));
+    }
+    
+    /// Add a custom rule
+    pub fn add_rule(&mut self, rule: PeepholeRule) {
+        self.matcher.add_rule(rule);
+    }
+    
+    /// Run peephole optimization on a function
+    pub fn optimize(&mut self, func: &mut MirFunction) -> &PeepholeStats {
+        self.stats = PeepholeStats::default();
+        
+        let mut changed = true;
+        let mut iterations = 0;
+        
+        while changed && iterations < 10 {
+            changed = false;
+            iterations += 1;
+            
+            for block in &mut func.blocks {
+                changed |= self.optimize_block(block);
+            }
+        }
+        
+        &self.stats
+    }
+    
+    fn optimize_block(&mut self, block: &mut MirBlock) -> bool {
+        let mut changed = false;
+        let mut i = 0;
+        
+        while i < block.statements.len() {
+            self.stats.examined += 1;
+            
+            for rule in &self.matcher.rules {
+                if let Some(match_result) = self.matcher.match_pattern(
+                    &rule.pattern,
+                    &block.statements[i],
+                    block,
+                    i,
+                ) {
+                    self.stats.matched += 1;
+                    
+                    if let Some(replacement) = self.apply_replacement(
+                        &rule.replacement,
+                        &match_result,
+                        &block.statements[i],
+                    ) {
+                        block.statements[i] = replacement;
+                        self.stats.transformed += 1;
+                        *self.stats.per_rule.entry(rule.name.clone()).or_insert(0) += 1;
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            
+            i += 1;
+        }
+        
+        changed
+    }
+    
+    fn apply_replacement(
+        &self,
+        replacement: &Replacement,
+        match_result: &MatchResult,
+        original: &MirStatement,
+    ) -> Option<MirStatement> {
+        let dest = match original {
+            MirStatement::Assign { dest, .. } |
+            MirStatement::BinaryOp { dest, .. } => dest.clone(),
+            _ => return None,
+        };
+        
+        let value = self.compute_replacement(replacement, match_result)?;
+        
+        Some(MirStatement::Assign { dest, value })
+    }
+    
+    fn compute_replacement(
+        &self,
+        replacement: &Replacement,
+        match_result: &MatchResult,
+    ) -> Option<MirOperand> {
+        match replacement {
+            Replacement::Var(name) => {
+                match_result.get_operand(name).cloned()
+            }
+            Replacement::Const(c) => {
+                Some(MirOperand::Constant(*c))
+            }
+            Replacement::Compute(comp) => {
+                match comp {
+                    Computation::Log2(name) => {
+                        let c = match_result.get_const(name)?;
+                        let log2 = (c as u64).trailing_zeros() as i64;
+                        Some(MirOperand::Constant(log2))
+                    }
+                    Computation::Neg(name) => {
+                        let c = match_result.get_const(name)?;
+                        Some(MirOperand::Constant(-c))
+                    }
+                    Computation::Add(a, b) => {
+                        let va = match_result.get_const(a)?;
+                        let vb = match_result.get_const(b)?;
+                        Some(MirOperand::Constant(va.wrapping_add(vb)))
+                    }
+                    Computation::Sub(a, b) => {
+                        let va = match_result.get_const(a)?;
+                        let vb = match_result.get_const(b)?;
+                        Some(MirOperand::Constant(va.wrapping_sub(vb)))
+                    }
+                }
+            }
+            Replacement::Delete => None,
+            Replacement::Op(_, _) => None, // Complex replacements need more work
+        }
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &PeepholeStats {
+        &self.stats
+    }
+}
+
+impl Default for PeepholeOptimizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand },
+    Store { ptr: MirOperand, value: MirOperand },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Return { value: Option<MirOperand> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_add_zero() {
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::BinaryOp {
+                            dest: "y".to_string(),
+                            op: BinOp::Add,
+                            lhs: MirOperand::Variable("x".to_string()),
+                            rhs: MirOperand::Constant(0),
+                        },
+                    ],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let mut opt = PeepholeOptimizer::new();
+        opt.optimize(&mut func);
+        
+        // Should be simplified to just x
+        if let MirStatement::Assign { value: MirOperand::Variable(v), .. } = &func.blocks[0].statements[0] {
+            assert_eq!(v, "x");
+        } else {
+            panic!("Expected assignment to variable x");
+        }
+    }
+    
+    #[test]
+    fn test_mul_zero() {
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::BinaryOp {
+                            dest: "y".to_string(),
+                            op: BinOp::Mul,
+                            lhs: MirOperand::Variable("x".to_string()),
+                            rhs: MirOperand::Constant(0),
+                        },
+                    ],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let mut opt = PeepholeOptimizer::new();
+        opt.optimize(&mut func);
+        
+        // Should be simplified to 0
+        if let MirStatement::Assign { value: MirOperand::Constant(c), .. } = &func.blocks[0].statements[0] {
+            assert_eq!(*c, 0);
+        } else {
+            panic!("Expected constant 0");
+        }
+    }
+    
+    #[test]
+    fn test_predicate_is_power_of_2() {
+        let matcher = PatternMatcher::new();
+        let mut result = MatchResult::new();
+        result.bind("c", MatchValue::Constant(8));
+        
+        assert!(matcher.check_predicate(&Predicate::IsPowerOf2("c".to_string()), &result));
+        
+        result.bind("c", MatchValue::Constant(7));
+        assert!(!matcher.check_predicate(&Predicate::IsPowerOf2("c".to_string()), &result));
+    }
+}

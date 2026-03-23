@@ -1,0 +1,919 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DOCUMENTATION GENERATOR — Documentation Model
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Data structures representing documented items:
+// - Crates, modules, and items
+// - Functions, types, traits, impls
+// - Documentation metadata
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::doc::model
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use crate::doc::parser::{ParsedDoc, DocAttributes, DeprecationInfo};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISIBILITY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Item visibility
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Visibility {
+    /// pub
+    Public,
+    /// pub(crate)
+    Crate,
+    /// pub(super)
+    Super,
+    /// pub(in path)
+    Restricted(String),
+    /// Private (no visibility modifier)
+    Private,
+}
+
+impl Visibility {
+    pub fn is_public(&self) -> bool {
+        matches!(self, Visibility::Public)
+    }
+    
+    pub fn is_exported(&self) -> bool {
+        !matches!(self, Visibility::Private)
+    }
+}
+
+impl Default for Visibility {
+    fn default() -> Self {
+        Visibility::Private
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PATHS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A path to an item (e.g., std::collections::Vec)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ItemPath {
+    pub segments: Vec<String>,
+}
+
+impl ItemPath {
+    pub fn new(segments: Vec<String>) -> Self {
+        ItemPath { segments }
+    }
+    
+    pub fn from_str(s: &str) -> Self {
+        ItemPath {
+            segments: s.split("::").map(String::from).collect(),
+        }
+    }
+    
+    pub fn root() -> Self {
+        ItemPath { segments: Vec::new() }
+    }
+    
+    pub fn push(&mut self, segment: &str) {
+        self.segments.push(segment.to_string());
+    }
+    
+    pub fn join(&self, segment: &str) -> Self {
+        let mut new = self.clone();
+        new.push(segment);
+        new
+    }
+    
+    pub fn parent(&self) -> Option<Self> {
+        if self.segments.is_empty() {
+            None
+        } else {
+            let mut new = self.clone();
+            new.segments.pop();
+            Some(new)
+        }
+    }
+    
+    pub fn name(&self) -> Option<&str> {
+        self.segments.last().map(|s| s.as_str())
+    }
+    
+    pub fn is_root(&self) -> bool {
+        self.segments.is_empty()
+    }
+    
+    pub fn to_string(&self) -> String {
+        self.segments.join("::")
+    }
+    
+    pub fn to_file_path(&self) -> String {
+        self.segments.join("/")
+    }
+}
+
+impl core::fmt::Display for ItemPath {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.segments.join("::"))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOURCE LOCATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Source file location
+#[derive(Debug, Clone)]
+pub struct SourceLocation {
+    /// File path
+    pub file: String,
+    /// Line number (1-indexed)
+    pub line: u32,
+    /// Column number (1-indexed)
+    pub column: u32,
+}
+
+impl SourceLocation {
+    pub fn new(file: String, line: u32, column: u32) -> Self {
+        SourceLocation { file, line, column }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOCUMENTED CRATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A documented crate
+#[derive(Debug, Clone)]
+pub struct DocCrate {
+    /// Crate name
+    pub name: String,
+    /// Crate version
+    pub version: String,
+    /// Crate documentation (from //! comments in lib.rs)
+    pub doc: ParsedDoc,
+    /// Root module
+    pub root_module: DocModule,
+    /// All items indexed by path
+    pub index: BTreeMap<String, ItemKind>,
+    /// External crate dependencies
+    pub dependencies: Vec<DependencyInfo>,
+    /// Feature flags
+    pub features: Vec<FeatureInfo>,
+}
+
+impl DocCrate {
+    pub fn new(name: String, version: String) -> Self {
+        DocCrate {
+            name: name.clone(),
+            version,
+            doc: ParsedDoc::new(),
+            root_module: DocModule::new(name),
+            index: BTreeMap::new(),
+            dependencies: Vec::new(),
+            features: Vec::new(),
+        }
+    }
+    
+    /// Get an item by path
+    pub fn get_item(&self, path: &str) -> Option<&ItemKind> {
+        self.index.get(path)
+    }
+    
+    /// Iterate all public items
+    pub fn public_items(&self) -> impl Iterator<Item = (&String, &ItemKind)> {
+        self.index.iter().filter(|(_, item)| item.is_public())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DependencyInfo {
+    pub name: String,
+    pub version: String,
+    pub features: Vec<String>,
+    pub optional: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeatureInfo {
+    pub name: String,
+    pub description: Option<String>,
+    pub dependencies: Vec<String>,
+    pub default: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ITEM KIND
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Kind of documented item
+#[derive(Debug, Clone)]
+pub enum ItemKind {
+    Module(DocModule),
+    Function(DocFunction),
+    Struct(DocStruct),
+    Enum(DocEnum),
+    Trait(DocTrait),
+    TypeAlias(DocTypeAlias),
+    Constant(DocConstant),
+    Static(DocStatic),
+    Macro(DocMacro),
+    Impl(DocImpl),
+    Import(DocImport),
+}
+
+impl ItemKind {
+    pub fn name(&self) -> &str {
+        match self {
+            ItemKind::Module(m) => &m.name,
+            ItemKind::Function(f) => &f.name,
+            ItemKind::Struct(s) => &s.name,
+            ItemKind::Enum(e) => &e.name,
+            ItemKind::Trait(t) => &t.name,
+            ItemKind::TypeAlias(t) => &t.name,
+            ItemKind::Constant(c) => &c.name,
+            ItemKind::Static(s) => &s.name,
+            ItemKind::Macro(m) => &m.name,
+            ItemKind::Impl(i) => &i.self_ty,
+            ItemKind::Import(i) => &i.name,
+        }
+    }
+    
+    pub fn visibility(&self) -> &Visibility {
+        match self {
+            ItemKind::Module(m) => &m.visibility,
+            ItemKind::Function(f) => &f.visibility,
+            ItemKind::Struct(s) => &s.visibility,
+            ItemKind::Enum(e) => &e.visibility,
+            ItemKind::Trait(t) => &t.visibility,
+            ItemKind::TypeAlias(t) => &t.visibility,
+            ItemKind::Constant(c) => &c.visibility,
+            ItemKind::Static(s) => &s.visibility,
+            ItemKind::Macro(m) => &m.visibility,
+            ItemKind::Impl(_) => &Visibility::Public, // Impls inherit visibility
+            ItemKind::Import(i) => &i.visibility,
+        }
+    }
+    
+    pub fn is_public(&self) -> bool {
+        self.visibility().is_public()
+    }
+    
+    pub fn doc(&self) -> &ParsedDoc {
+        match self {
+            ItemKind::Module(m) => &m.doc,
+            ItemKind::Function(f) => &f.doc,
+            ItemKind::Struct(s) => &s.doc,
+            ItemKind::Enum(e) => &e.doc,
+            ItemKind::Trait(t) => &t.doc,
+            ItemKind::TypeAlias(t) => &t.doc,
+            ItemKind::Constant(c) => &c.doc,
+            ItemKind::Static(s) => &s.doc,
+            ItemKind::Macro(m) => &m.doc,
+            ItemKind::Impl(i) => &i.doc,
+            ItemKind::Import(i) => &i.doc,
+        }
+    }
+    
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            ItemKind::Module(_) => "Module",
+            ItemKind::Function(_) => "Function",
+            ItemKind::Struct(_) => "Struct",
+            ItemKind::Enum(_) => "Enum",
+            ItemKind::Trait(_) => "Trait",
+            ItemKind::TypeAlias(_) => "Type Alias",
+            ItemKind::Constant(_) => "Constant",
+            ItemKind::Static(_) => "Static",
+            ItemKind::Macro(_) => "Macro",
+            ItemKind::Impl(_) => "Impl",
+            ItemKind::Import(_) => "Import",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODULE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A documented module
+#[derive(Debug, Clone)]
+pub struct DocModule {
+    pub name: String,
+    pub visibility: Visibility,
+    pub doc: ParsedDoc,
+    pub path: ItemPath,
+    pub location: Option<SourceLocation>,
+    /// Child modules
+    pub modules: Vec<DocModule>,
+    /// Functions in this module
+    pub functions: Vec<DocFunction>,
+    /// Structs
+    pub structs: Vec<DocStruct>,
+    /// Enums
+    pub enums: Vec<DocEnum>,
+    /// Traits
+    pub traits: Vec<DocTrait>,
+    /// Type aliases
+    pub type_aliases: Vec<DocTypeAlias>,
+    /// Constants
+    pub constants: Vec<DocConstant>,
+    /// Statics
+    pub statics: Vec<DocStatic>,
+    /// Macros
+    pub macros: Vec<DocMacro>,
+    /// Impls
+    pub impls: Vec<DocImpl>,
+    /// Re-exports
+    pub imports: Vec<DocImport>,
+}
+
+impl DocModule {
+    pub fn new(name: String) -> Self {
+        DocModule {
+            name: name.clone(),
+            visibility: Visibility::Public,
+            doc: ParsedDoc::new(),
+            path: ItemPath::from_str(&name),
+            location: None,
+            modules: Vec::new(),
+            functions: Vec::new(),
+            structs: Vec::new(),
+            enums: Vec::new(),
+            traits: Vec::new(),
+            type_aliases: Vec::new(),
+            constants: Vec::new(),
+            statics: Vec::new(),
+            macros: Vec::new(),
+            impls: Vec::new(),
+            imports: Vec::new(),
+        }
+    }
+    
+    /// Get all public items
+    pub fn public_items(&self) -> impl Iterator<Item = &dyn HasDoc> {
+        let funcs = self.functions.iter()
+            .filter(|f| f.visibility.is_public())
+            .map(|f| f as &dyn HasDoc);
+        let structs = self.structs.iter()
+            .filter(|s| s.visibility.is_public())
+            .map(|s| s as &dyn HasDoc);
+        let enums = self.enums.iter()
+            .filter(|e| e.visibility.is_public())
+            .map(|e| e as &dyn HasDoc);
+        let traits = self.traits.iter()
+            .filter(|t| t.visibility.is_public())
+            .map(|t| t as &dyn HasDoc);
+        
+        funcs.chain(structs).chain(enums).chain(traits)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUNCTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A documented function
+#[derive(Debug, Clone)]
+pub struct DocFunction {
+    pub name: String,
+    pub visibility: Visibility,
+    pub doc: ParsedDoc,
+    pub path: ItemPath,
+    pub location: Option<SourceLocation>,
+    /// Function signature
+    pub signature: FunctionSignature,
+    /// Generic parameters
+    pub generics: Generics,
+    /// Is this async?
+    pub is_async: bool,
+    /// Is this const?
+    pub is_const: bool,
+    /// Is this unsafe?
+    pub is_unsafe: bool,
+    /// ABI (e.g., "C", "system")
+    pub abi: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionSignature {
+    /// Self parameter
+    pub self_param: Option<SelfParam>,
+    /// Parameters
+    pub params: Vec<FunctionParam>,
+    /// Return type
+    pub return_type: Option<TypeRef>,
+    /// Where clause
+    pub where_clause: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelfParam {
+    pub is_ref: bool,
+    pub is_mut: bool,
+    pub lifetime: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionParam {
+    pub name: String,
+    pub ty: TypeRef,
+    pub default: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRUCT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A documented struct
+#[derive(Debug, Clone)]
+pub struct DocStruct {
+    pub name: String,
+    pub visibility: Visibility,
+    pub doc: ParsedDoc,
+    pub path: ItemPath,
+    pub location: Option<SourceLocation>,
+    /// Generic parameters
+    pub generics: Generics,
+    /// Struct kind
+    pub kind: StructKind,
+    /// Fields
+    pub fields: Vec<DocField>,
+    /// Implementations
+    pub impls: Vec<ImplRef>,
+    /// Derived traits
+    pub derives: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StructKind {
+    /// Regular struct with named fields
+    Regular,
+    /// Tuple struct
+    Tuple,
+    /// Unit struct
+    Unit,
+}
+
+#[derive(Debug, Clone)]
+pub struct DocField {
+    pub name: Option<String>, // None for tuple fields
+    pub visibility: Visibility,
+    pub doc: ParsedDoc,
+    pub ty: TypeRef,
+    pub index: usize, // For tuple structs
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENUM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A documented enum
+#[derive(Debug, Clone)]
+pub struct DocEnum {
+    pub name: String,
+    pub visibility: Visibility,
+    pub doc: ParsedDoc,
+    pub path: ItemPath,
+    pub location: Option<SourceLocation>,
+    /// Generic parameters
+    pub generics: Generics,
+    /// Variants
+    pub variants: Vec<DocVariant>,
+    /// Implementations
+    pub impls: Vec<ImplRef>,
+    /// Derived traits
+    pub derives: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DocVariant {
+    pub name: String,
+    pub doc: ParsedDoc,
+    /// Discriminant value
+    pub discriminant: Option<String>,
+    /// Variant kind
+    pub kind: VariantKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum VariantKind {
+    /// Unit variant
+    Unit,
+    /// Tuple variant
+    Tuple(Vec<TypeRef>),
+    /// Struct variant
+    Struct(Vec<DocField>),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A documented trait
+#[derive(Debug, Clone)]
+pub struct DocTrait {
+    pub name: String,
+    pub visibility: Visibility,
+    pub doc: ParsedDoc,
+    pub path: ItemPath,
+    pub location: Option<SourceLocation>,
+    /// Generic parameters
+    pub generics: Generics,
+    /// Super traits
+    pub super_traits: Vec<TraitBound>,
+    /// Associated types
+    pub assoc_types: Vec<DocAssocType>,
+    /// Associated constants
+    pub assoc_consts: Vec<DocAssocConst>,
+    /// Required methods
+    pub required_methods: Vec<DocFunction>,
+    /// Provided methods
+    pub provided_methods: Vec<DocFunction>,
+    /// Is this an auto trait?
+    pub is_auto: bool,
+    /// Is this unsafe?
+    pub is_unsafe: bool,
+    /// Known implementors
+    pub implementors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DocAssocType {
+    pub name: String,
+    pub doc: ParsedDoc,
+    pub bounds: Vec<TraitBound>,
+    pub default: Option<TypeRef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DocAssocConst {
+    pub name: String,
+    pub doc: ParsedDoc,
+    pub ty: TypeRef,
+    pub default: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE ALIAS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A documented type alias
+#[derive(Debug, Clone)]
+pub struct DocTypeAlias {
+    pub name: String,
+    pub visibility: Visibility,
+    pub doc: ParsedDoc,
+    pub path: ItemPath,
+    pub location: Option<SourceLocation>,
+    /// Generic parameters
+    pub generics: Generics,
+    /// The aliased type
+    pub ty: TypeRef,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONSTANT / STATIC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A documented constant
+#[derive(Debug, Clone)]
+pub struct DocConstant {
+    pub name: String,
+    pub visibility: Visibility,
+    pub doc: ParsedDoc,
+    pub path: ItemPath,
+    pub location: Option<SourceLocation>,
+    pub ty: TypeRef,
+    pub value: Option<String>,
+}
+
+/// A documented static
+#[derive(Debug, Clone)]
+pub struct DocStatic {
+    pub name: String,
+    pub visibility: Visibility,
+    pub doc: ParsedDoc,
+    pub path: ItemPath,
+    pub location: Option<SourceLocation>,
+    pub ty: TypeRef,
+    pub is_mut: bool,
+    pub value: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MACRO
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A documented macro
+#[derive(Debug, Clone)]
+pub struct DocMacro {
+    pub name: String,
+    pub visibility: Visibility,
+    pub doc: ParsedDoc,
+    pub path: ItemPath,
+    pub location: Option<SourceLocation>,
+    /// Macro kind
+    pub kind: MacroKind,
+    /// Example invocations
+    pub matchers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MacroKind {
+    /// macro_rules!
+    DeclarativeMacro,
+    /// #[proc_macro]
+    ProcMacro,
+    /// #[proc_macro_derive]
+    DeriveMacro,
+    /// #[proc_macro_attribute]
+    AttributeMacro,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// IMPL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A documented impl block
+#[derive(Debug, Clone)]
+pub struct DocImpl {
+    pub doc: ParsedDoc,
+    pub path: ItemPath,
+    pub location: Option<SourceLocation>,
+    /// Generic parameters
+    pub generics: Generics,
+    /// Self type
+    pub self_ty: String,
+    /// Trait being implemented (if any)
+    pub trait_ref: Option<TraitRef>,
+    /// Is this a negative impl?
+    pub is_negative: bool,
+    /// Associated types
+    pub assoc_types: Vec<DocAssocType>,
+    /// Associated constants
+    pub assoc_consts: Vec<DocAssocConst>,
+    /// Methods
+    pub methods: Vec<DocFunction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImplRef {
+    pub trait_ref: Option<TraitRef>,
+    pub path: ItemPath,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraitRef {
+    pub path: ItemPath,
+    pub generics: Vec<TypeRef>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// IMPORT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A documented re-export
+#[derive(Debug, Clone)]
+pub struct DocImport {
+    pub name: String,
+    pub visibility: Visibility,
+    pub doc: ParsedDoc,
+    pub path: ItemPath,
+    pub source: ItemPath,
+    pub is_glob: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GENERICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Generic parameters
+#[derive(Debug, Clone, Default)]
+pub struct Generics {
+    pub params: Vec<GenericParam>,
+    pub where_predicates: Vec<WherePredicate>,
+}
+
+impl Generics {
+    pub fn is_empty(&self) -> bool {
+        self.params.is_empty()
+    }
+    
+    pub fn to_string(&self) -> String {
+        if self.params.is_empty() {
+            return String::new();
+        }
+        
+        let params: Vec<String> = self.params.iter().map(|p| p.to_string()).collect();
+        format!("<{}>", params.join(", "))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum GenericParam {
+    Type(TypeParam),
+    Lifetime(LifetimeParam),
+    Const(ConstParam),
+}
+
+impl GenericParam {
+    pub fn to_string(&self) -> String {
+        match self {
+            GenericParam::Type(t) => t.to_string(),
+            GenericParam::Lifetime(l) => format!("'{}", l.name),
+            GenericParam::Const(c) => format!("const {}: {}", c.name, c.ty.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeParam {
+    pub name: String,
+    pub bounds: Vec<TraitBound>,
+    pub default: Option<TypeRef>,
+}
+
+impl TypeParam {
+    pub fn to_string(&self) -> String {
+        let mut s = self.name.clone();
+        if !self.bounds.is_empty() {
+            s.push_str(": ");
+            s.push_str(&self.bounds.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" + "));
+        }
+        if let Some(ref default) = self.default {
+            s.push_str(" = ");
+            s.push_str(&default.to_string());
+        }
+        s
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LifetimeParam {
+    pub name: String,
+    pub bounds: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstParam {
+    pub name: String,
+    pub ty: TypeRef,
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraitBound {
+    pub path: ItemPath,
+    pub generics: Vec<TypeRef>,
+    pub is_maybe: bool, // ?Sized
+}
+
+impl TraitBound {
+    pub fn to_string(&self) -> String {
+        let mut s = if self.is_maybe { "?".to_string() } else { String::new() };
+        s.push_str(&self.path.to_string());
+        if !self.generics.is_empty() {
+            s.push('<');
+            s.push_str(&self.generics.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(", "));
+            s.push('>');
+        }
+        s
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WherePredicate {
+    pub subject: String,
+    pub bounds: Vec<TraitBound>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE REFERENCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A type reference
+#[derive(Debug, Clone)]
+pub enum TypeRef {
+    /// Named type (path)
+    Path(ItemPath, Vec<TypeRef>),
+    /// Reference (&T or &mut T)
+    Reference { lifetime: Option<String>, is_mut: bool, ty: Box<TypeRef> },
+    /// Pointer (*const T or *mut T)
+    Pointer { is_mut: bool, ty: Box<TypeRef> },
+    /// Slice [T]
+    Slice(Box<TypeRef>),
+    /// Array [T; N]
+    Array(Box<TypeRef>, String),
+    /// Tuple (T1, T2, ...)
+    Tuple(Vec<TypeRef>),
+    /// Function pointer fn(T) -> R
+    FnPointer { params: Vec<TypeRef>, ret: Option<Box<TypeRef>> },
+    /// Impl trait
+    ImplTrait(Vec<TraitBound>),
+    /// Dyn trait
+    DynTrait(Vec<TraitBound>),
+    /// Inferred type _
+    Infer,
+    /// Never type !
+    Never,
+    /// Raw string representation (fallback)
+    Raw(String),
+}
+
+impl TypeRef {
+    pub fn to_string(&self) -> String {
+        match self {
+            TypeRef::Path(path, generics) => {
+                let mut s = path.to_string();
+                if !generics.is_empty() {
+                    s.push('<');
+                    s.push_str(&generics.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(", "));
+                    s.push('>');
+                }
+                s
+            }
+            TypeRef::Reference { lifetime, is_mut, ty } => {
+                let mut s = "&".to_string();
+                if let Some(lt) = lifetime {
+                    s.push_str(lt);
+                    s.push(' ');
+                }
+                if *is_mut {
+                    s.push_str("mut ");
+                }
+                s.push_str(&ty.to_string());
+                s
+            }
+            TypeRef::Pointer { is_mut, ty } => {
+                format!("*{} {}", if *is_mut { "mut" } else { "const" }, ty.to_string())
+            }
+            TypeRef::Slice(ty) => format!("[{}]", ty.to_string()),
+            TypeRef::Array(ty, len) => format!("[{}; {}]", ty.to_string(), len),
+            TypeRef::Tuple(types) => {
+                format!("({})", types.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "))
+            }
+            TypeRef::FnPointer { params, ret } => {
+                let params = params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
+                match ret {
+                    Some(r) => format!("fn({}) -> {}", params, r.to_string()),
+                    None => format!("fn({})", params),
+                }
+            }
+            TypeRef::ImplTrait(bounds) => {
+                format!("impl {}", bounds.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" + "))
+            }
+            TypeRef::DynTrait(bounds) => {
+                format!("dyn {}", bounds.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" + "))
+            }
+            TypeRef::Infer => "_".to_string(),
+            TypeRef::Never => "!".to_string(),
+            TypeRef::Raw(s) => s.clone(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRAITS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Trait for items that have documentation
+pub trait HasDoc {
+    fn doc(&self) -> &ParsedDoc;
+    fn name(&self) -> &str;
+    fn visibility(&self) -> &Visibility;
+}
+
+impl HasDoc for DocFunction {
+    fn doc(&self) -> &ParsedDoc { &self.doc }
+    fn name(&self) -> &str { &self.name }
+    fn visibility(&self) -> &Visibility { &self.visibility }
+}
+
+impl HasDoc for DocStruct {
+    fn doc(&self) -> &ParsedDoc { &self.doc }
+    fn name(&self) -> &str { &self.name }
+    fn visibility(&self) -> &Visibility { &self.visibility }
+}
+
+impl HasDoc for DocEnum {
+    fn doc(&self) -> &ParsedDoc { &self.doc }
+    fn name(&self) -> &str { &self.name }
+    fn visibility(&self) -> &Visibility { &self.visibility }
+}
+
+impl HasDoc for DocTrait {
+    fn doc(&self) -> &ParsedDoc { &self.doc }
+    fn name(&self) -> &str { &self.name }
+    fn visibility(&self) -> &Visibility { &self.visibility }
+}
+
+impl HasDoc for DocModule {
+    fn doc(&self) -> &ParsedDoc { &self.doc }
+    fn name(&self) -> &str { &self.name }
+    fn visibility(&self) -> &Visibility { &self.visibility }
+}

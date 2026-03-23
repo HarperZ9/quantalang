@@ -1,0 +1,1390 @@
+// QUANTA Standard Library - Networking Module
+// TCP/UDP sockets, IP addresses, network primitives
+// Part of Phase 12: Standard Library Implementation
+
+module std::net;
+
+use std::io::{Read, Write, Result, Error, ErrorKind};
+use std::string::String;
+use std::vec::Vec;
+use std::option::{Option, Some, None};
+use std::result::{Result as StdResult, Ok, Err};
+use std::time::Duration;
+
+// ============================================================================
+// IP Addresses
+// ============================================================================
+
+/// IPv4 address (32-bit)
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ipv4Addr {
+    octets: [u8; 4],
+}
+
+impl Ipv4Addr {
+    /// Create new IPv4 address
+    pub const fn new(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
+        Ipv4Addr { octets: [a, b, c, d] }
+    }
+    
+    /// Localhost (127.0.0.1)
+    pub const LOCALHOST: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+    
+    /// Unspecified (0.0.0.0)
+    pub const UNSPECIFIED: Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0);
+    
+    /// Broadcast (255.255.255.255)
+    pub const BROADCAST: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 255);
+    
+    /// Get octets
+    pub const fn octets(&self) -> [u8; 4] {
+        self.octets
+    }
+    
+    /// Check if unspecified
+    pub const fn is_unspecified(&self) -> bool {
+        self.octets[0] == 0 && self.octets[1] == 0 && 
+        self.octets[2] == 0 && self.octets[3] == 0
+    }
+    
+    /// Check if loopback (127.0.0.0/8)
+    pub const fn is_loopback(&self) -> bool {
+        self.octets[0] == 127
+    }
+    
+    /// Check if private
+    pub const fn is_private(&self) -> bool {
+        // 10.0.0.0/8 or 172.16.0.0/12 or 192.168.0.0/16
+        self.octets[0] == 10 ||
+        (self.octets[0] == 172 && (self.octets[1] & 0xf0) == 16) ||
+        (self.octets[0] == 192 && self.octets[1] == 168)
+    }
+    
+    /// Check if link-local (169.254.0.0/16)
+    pub const fn is_link_local(&self) -> bool {
+        self.octets[0] == 169 && self.octets[1] == 254
+    }
+    
+    /// Check if multicast (224.0.0.0/4)
+    pub const fn is_multicast(&self) -> bool {
+        self.octets[0] >= 224 && self.octets[0] <= 239
+    }
+    
+    /// Check if broadcast
+    pub const fn is_broadcast(&self) -> bool {
+        self.octets[0] == 255 && self.octets[1] == 255 &&
+        self.octets[2] == 255 && self.octets[3] == 255
+    }
+    
+    /// Convert to IPv6 mapped address
+    pub const fn to_ipv6_mapped(&self) -> Ipv6Addr {
+        let [a, b, c, d] = self.octets;
+        Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 
+                      ((a as u16) << 8) | (b as u16),
+                      ((c as u16) << 8) | (d as u16))
+    }
+    
+    /// Parse from string
+    pub fn parse(s: &str) -> StdResult<Ipv4Addr, ParseError> {
+        let mut octets = [0u8; 4];
+        let mut octet_idx = 0;
+        let mut current = 0u32;
+        
+        for c in s.chars() {
+            if c == '.' {
+                if current > 255 || octet_idx >= 3 {
+                    return Err(ParseError::InvalidFormat);
+                }
+                octets[octet_idx] = current as u8;
+                octet_idx += 1;
+                current = 0;
+            } else if c.is_ascii_digit() {
+                current = current * 10 + (c as u32 - '0' as u32);
+            } else {
+                return Err(ParseError::InvalidFormat);
+            }
+        }
+        
+        if current > 255 || octet_idx != 3 {
+            return Err(ParseError::InvalidFormat);
+        }
+        octets[3] = current as u8;
+        
+        Ok(Ipv4Addr { octets })
+    }
+}
+
+impl Debug for Ipv4Addr {
+    fn fmt(&self, f: &mut Formatter) -> StdResult<(), FormatError> {
+        write!(f, "{}.{}.{}.{}", 
+               self.octets[0], self.octets[1], 
+               self.octets[2], self.octets[3])
+    }
+}
+
+impl Display for Ipv4Addr {
+    fn fmt(&self, f: &mut Formatter) -> StdResult<(), FormatError> {
+        write!(f, "{}.{}.{}.{}", 
+               self.octets[0], self.octets[1], 
+               self.octets[2], self.octets[3])
+    }
+}
+
+/// IPv6 address (128-bit)
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ipv6Addr {
+    segments: [u16; 8],
+}
+
+impl Ipv6Addr {
+    /// Create new IPv6 address
+    pub const fn new(a: u16, b: u16, c: u16, d: u16, 
+                     e: u16, f: u16, g: u16, h: u16) -> Ipv6Addr {
+        Ipv6Addr { segments: [a, b, c, d, e, f, g, h] }
+    }
+    
+    /// Localhost (::1)
+    pub const LOCALHOST: Ipv6Addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1);
+    
+    /// Unspecified (::)
+    pub const UNSPECIFIED: Ipv6Addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0);
+    
+    /// Get segments
+    pub const fn segments(&self) -> [u16; 8] {
+        self.segments
+    }
+    
+    /// Get as bytes
+    pub const fn octets(&self) -> [u8; 16] {
+        let s = self.segments;
+        [
+            (s[0] >> 8) as u8, s[0] as u8,
+            (s[1] >> 8) as u8, s[1] as u8,
+            (s[2] >> 8) as u8, s[2] as u8,
+            (s[3] >> 8) as u8, s[3] as u8,
+            (s[4] >> 8) as u8, s[4] as u8,
+            (s[5] >> 8) as u8, s[5] as u8,
+            (s[6] >> 8) as u8, s[6] as u8,
+            (s[7] >> 8) as u8, s[7] as u8,
+        ]
+    }
+    
+    /// Check if unspecified
+    pub const fn is_unspecified(&self) -> bool {
+        self.segments[0] == 0 && self.segments[1] == 0 &&
+        self.segments[2] == 0 && self.segments[3] == 0 &&
+        self.segments[4] == 0 && self.segments[5] == 0 &&
+        self.segments[6] == 0 && self.segments[7] == 0
+    }
+    
+    /// Check if loopback
+    pub const fn is_loopback(&self) -> bool {
+        self.segments[0] == 0 && self.segments[1] == 0 &&
+        self.segments[2] == 0 && self.segments[3] == 0 &&
+        self.segments[4] == 0 && self.segments[5] == 0 &&
+        self.segments[6] == 0 && self.segments[7] == 1
+    }
+    
+    /// Check if multicast
+    pub const fn is_multicast(&self) -> bool {
+        (self.segments[0] & 0xff00) == 0xff00
+    }
+    
+    /// Check if IPv4-mapped (::ffff:x.x.x.x)
+    pub const fn is_ipv4_mapped(&self) -> bool {
+        self.segments[0] == 0 && self.segments[1] == 0 &&
+        self.segments[2] == 0 && self.segments[3] == 0 &&
+        self.segments[4] == 0 && self.segments[5] == 0xffff
+    }
+    
+    /// Convert to IPv4 if mapped
+    pub const fn to_ipv4(&self) -> Option<Ipv4Addr> {
+        if self.is_ipv4_mapped() {
+            Some(Ipv4Addr::new(
+                (self.segments[6] >> 8) as u8,
+                self.segments[6] as u8,
+                (self.segments[7] >> 8) as u8,
+                self.segments[7] as u8,
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+impl Debug for Ipv6Addr {
+    fn fmt(&self, f: &mut Formatter) -> StdResult<(), FormatError> {
+        write!(f, "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+               self.segments[0], self.segments[1],
+               self.segments[2], self.segments[3],
+               self.segments[4], self.segments[5],
+               self.segments[6], self.segments[7])
+    }
+}
+
+/// Either IPv4 or IPv6 address
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IpAddr {
+    V4(Ipv4Addr),
+    V6(Ipv6Addr),
+}
+
+impl IpAddr {
+    /// Check if unspecified
+    pub const fn is_unspecified(&self) -> bool {
+        match self {
+            IpAddr::V4(addr) => addr.is_unspecified(),
+            IpAddr::V6(addr) => addr.is_unspecified(),
+        }
+    }
+    
+    /// Check if loopback
+    pub const fn is_loopback(&self) -> bool {
+        match self {
+            IpAddr::V4(addr) => addr.is_loopback(),
+            IpAddr::V6(addr) => addr.is_loopback(),
+        }
+    }
+    
+    /// Check if multicast
+    pub const fn is_multicast(&self) -> bool {
+        match self {
+            IpAddr::V4(addr) => addr.is_multicast(),
+            IpAddr::V6(addr) => addr.is_multicast(),
+        }
+    }
+    
+    /// Check if IPv4
+    pub const fn is_ipv4(&self) -> bool {
+        matches!(self, IpAddr::V4(_))
+    }
+    
+    /// Check if IPv6
+    pub const fn is_ipv6(&self) -> bool {
+        matches!(self, IpAddr::V6(_))
+    }
+}
+
+impl From<Ipv4Addr> for IpAddr {
+    fn from(addr: Ipv4Addr) -> IpAddr {
+        IpAddr::V4(addr)
+    }
+}
+
+impl From<Ipv6Addr> for IpAddr {
+    fn from(addr: Ipv6Addr) -> IpAddr {
+        IpAddr::V6(addr)
+    }
+}
+
+// ============================================================================
+// Socket Addresses
+// ============================================================================
+
+/// IPv4 socket address (IP + port)
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SocketAddrV4 {
+    ip: Ipv4Addr,
+    port: u16,
+}
+
+impl SocketAddrV4 {
+    /// Create new socket address
+    pub const fn new(ip: Ipv4Addr, port: u16) -> SocketAddrV4 {
+        SocketAddrV4 { ip, port }
+    }
+    
+    /// Get IP address
+    pub const fn ip(&self) -> &Ipv4Addr {
+        &self.ip
+    }
+    
+    /// Set IP address
+    pub fn set_ip(&mut self, ip: Ipv4Addr) {
+        self.ip = ip;
+    }
+    
+    /// Get port
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+    
+    /// Set port
+    pub fn set_port(&mut self, port: u16) {
+        self.port = port;
+    }
+}
+
+impl Debug for SocketAddrV4 {
+    fn fmt(&self, f: &mut Formatter) -> StdResult<(), FormatError> {
+        write!(f, "{}:{}", self.ip, self.port)
+    }
+}
+
+/// IPv6 socket address
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SocketAddrV6 {
+    ip: Ipv6Addr,
+    port: u16,
+    flowinfo: u32,
+    scope_id: u32,
+}
+
+impl SocketAddrV6 {
+    /// Create new socket address
+    pub const fn new(ip: Ipv6Addr, port: u16, flowinfo: u32, scope_id: u32) -> SocketAddrV6 {
+        SocketAddrV6 { ip, port, flowinfo, scope_id }
+    }
+    
+    /// Get IP address
+    pub const fn ip(&self) -> &Ipv6Addr {
+        &self.ip
+    }
+    
+    /// Get port
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+    
+    /// Get flow info
+    pub const fn flowinfo(&self) -> u32 {
+        self.flowinfo
+    }
+    
+    /// Get scope ID
+    pub const fn scope_id(&self) -> u32 {
+        self.scope_id
+    }
+}
+
+/// Either IPv4 or IPv6 socket address
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SocketAddr {
+    V4(SocketAddrV4),
+    V6(SocketAddrV6),
+}
+
+impl SocketAddr {
+    /// Create new V4 socket address
+    pub const fn new(ip: IpAddr, port: u16) -> SocketAddr {
+        match ip {
+            IpAddr::V4(addr) => SocketAddr::V4(SocketAddrV4::new(addr, port)),
+            IpAddr::V6(addr) => SocketAddr::V6(SocketAddrV6::new(addr, port, 0, 0)),
+        }
+    }
+    
+    /// Get IP address
+    pub const fn ip(&self) -> IpAddr {
+        match self {
+            SocketAddr::V4(addr) => IpAddr::V4(*addr.ip()),
+            SocketAddr::V6(addr) => IpAddr::V6(*addr.ip()),
+        }
+    }
+    
+    /// Get port
+    pub const fn port(&self) -> u16 {
+        match self {
+            SocketAddr::V4(addr) => addr.port(),
+            SocketAddr::V6(addr) => addr.port(),
+        }
+    }
+    
+    /// Check if IPv4
+    pub const fn is_ipv4(&self) -> bool {
+        matches!(self, SocketAddr::V4(_))
+    }
+    
+    /// Check if IPv6
+    pub const fn is_ipv6(&self) -> bool {
+        matches!(self, SocketAddr::V6(_))
+    }
+    
+    /// Parse from string "ip:port"
+    pub fn parse(s: &str) -> StdResult<SocketAddr, ParseError> {
+        // Find last colon for port
+        let colon_idx = s.rfind(':').ok_or(ParseError::InvalidFormat)?;
+        let ip_str = &s[..colon_idx];
+        let port_str = &s[colon_idx + 1..];
+        
+        let port: u16 = port_str.parse().map_err(|_| ParseError::InvalidFormat)?;
+        
+        // Try IPv4 first
+        if let Ok(ip) = Ipv4Addr::parse(ip_str) {
+            return Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+        }
+        
+        // Try IPv6 (strip brackets if present)
+        let ip_str = ip_str.trim_start_matches('[').trim_end_matches(']');
+        // IPv6 parsing would go here
+        
+        Err(ParseError::InvalidFormat)
+    }
+}
+
+impl From<SocketAddrV4> for SocketAddr {
+    fn from(addr: SocketAddrV4) -> SocketAddr {
+        SocketAddr::V4(addr)
+    }
+}
+
+impl From<SocketAddrV6> for SocketAddr {
+    fn from(addr: SocketAddrV6) -> SocketAddr {
+        SocketAddr::V6(addr)
+    }
+}
+
+impl Debug for SocketAddr {
+    fn fmt(&self, f: &mut Formatter) -> StdResult<(), FormatError> {
+        match self {
+            SocketAddr::V4(addr) => write!(f, "{}", addr),
+            SocketAddr::V6(addr) => write!(f, "[{}]:{}", addr.ip(), addr.port()),
+        }
+    }
+}
+
+/// Parse error
+pub struct ParseError {
+    kind: ParseErrorKind,
+}
+
+pub enum ParseErrorKind {
+    InvalidFormat,
+}
+
+impl ParseError {
+    pub const InvalidFormat: ParseError = ParseError { kind: ParseErrorKind::InvalidFormat };
+}
+
+// ============================================================================
+// ToSocketAddrs Trait
+// ============================================================================
+
+/// Trait for types that can be resolved to socket addresses
+pub trait ToSocketAddrs {
+    type Iter: Iterator<Item = SocketAddr>;
+    
+    fn to_socket_addrs(&self) -> Result<Self::Iter>;
+}
+
+impl ToSocketAddrs for SocketAddr {
+    type Iter = std::iter::Once<SocketAddr>;
+    
+    fn to_socket_addrs(&self) -> Result<Self::Iter> {
+        Ok(std::iter::once(*self))
+    }
+}
+
+impl ToSocketAddrs for SocketAddrV4 {
+    type Iter = std::iter::Once<SocketAddr>;
+    
+    fn to_socket_addrs(&self) -> Result<Self::Iter> {
+        Ok(std::iter::once(SocketAddr::V4(*self)))
+    }
+}
+
+impl ToSocketAddrs for (IpAddr, u16) {
+    type Iter = std::iter::Once<SocketAddr>;
+    
+    fn to_socket_addrs(&self) -> Result<Self::Iter> {
+        Ok(std::iter::once(SocketAddr::new(self.0, self.1)))
+    }
+}
+
+impl ToSocketAddrs for (Ipv4Addr, u16) {
+    type Iter = std::iter::Once<SocketAddr>;
+    
+    fn to_socket_addrs(&self) -> Result<Self::Iter> {
+        Ok(std::iter::once(SocketAddr::V4(SocketAddrV4::new(self.0, self.1))))
+    }
+}
+
+impl ToSocketAddrs for (&str, u16) {
+    type Iter = Vec<SocketAddr>;
+    
+    fn to_socket_addrs(&self) -> Result<Self::Iter> {
+        // Try parsing as IP first
+        if let Ok(ip) = Ipv4Addr::parse(self.0) {
+            return Ok(vec![SocketAddr::V4(SocketAddrV4::new(ip, self.1))]);
+        }
+        
+        // Otherwise do DNS lookup
+        lookup_host(self.0).map(|addrs| {
+            addrs.into_iter()
+                 .map(|ip| SocketAddr::new(ip, self.1))
+                 .collect()
+        })
+    }
+}
+
+impl ToSocketAddrs for &str {
+    type Iter = Vec<SocketAddr>;
+    
+    fn to_socket_addrs(&self) -> Result<Self::Iter> {
+        // Parse "host:port" format
+        if let Ok(addr) = SocketAddr::parse(self) {
+            return Ok(vec![addr]);
+        }
+        
+        Err(Error::new(ErrorKind::InvalidInput, String::from("invalid socket address")))
+    }
+}
+
+// ============================================================================
+// DNS Lookup
+// ============================================================================
+
+/// Look up IP addresses for hostname
+pub fn lookup_host(host: &str) -> Result<Vec<IpAddr>> {
+    let mut addrs = Vec::new();
+    let ret = unsafe { 
+        syscall_getaddrinfo(host.as_ptr(), host.len(), addrs.as_mut_ptr(), &mut addrs.len()) 
+    };
+    
+    if ret < 0 {
+        Err(Error::from_kind(ErrorKind::Other))
+    } else {
+        Ok(addrs)
+    }
+}
+
+// ============================================================================
+// TCP Stream
+// ============================================================================
+
+/// TCP connection stream
+pub struct TcpStream {
+    fd: i32,
+    peer_addr: SocketAddr,
+    local_addr: SocketAddr,
+}
+
+impl TcpStream {
+    /// Connect to remote address
+    pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<TcpStream> {
+        let addrs = addr.to_socket_addrs()?;
+        let mut last_err = None;
+        
+        for addr in addrs {
+            match TcpStream::connect_addr(addr) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        
+        Err(last_err.unwrap_or_else(|| Error::from_kind(ErrorKind::InvalidInput)))
+    }
+    
+    /// Connect to specific socket address
+    fn connect_addr(addr: SocketAddr) -> Result<TcpStream> {
+        let domain = match addr {
+            SocketAddr::V4(_) => AF_INET,
+            SocketAddr::V6(_) => AF_INET6,
+        };
+        
+        // Create socket
+        let fd = unsafe { syscall_socket(domain, SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(socket_error(-fd));
+        }
+        
+        // Connect
+        let ret = unsafe { syscall_connect(fd, &addr) };
+        if ret < 0 {
+            unsafe { syscall_close(fd) };
+            return Err(socket_error(-ret));
+        }
+        
+        // Get local address
+        let local_addr = TcpStream::get_local_addr(fd)?;
+        
+        Ok(TcpStream {
+            fd,
+            peer_addr: addr,
+            local_addr,
+        })
+    }
+    
+    /// Connect with timeout
+    pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> Result<TcpStream> {
+        let domain = match addr {
+            SocketAddr::V4(_) => AF_INET,
+            SocketAddr::V6(_) => AF_INET6,
+        };
+        
+        let fd = unsafe { syscall_socket(domain, SOCK_STREAM | SOCK_NONBLOCK, 0) };
+        if fd < 0 {
+            return Err(socket_error(-fd));
+        }
+        
+        // Start non-blocking connect
+        let ret = unsafe { syscall_connect(fd, addr) };
+        if ret < 0 {
+            let errno = -ret;
+            if errno != EINPROGRESS {
+                unsafe { syscall_close(fd) };
+                return Err(socket_error(errno));
+            }
+        }
+        
+        // Wait for connection with timeout
+        let ret = unsafe { syscall_poll_write(fd, timeout.as_millis() as i32) };
+        if ret <= 0 {
+            unsafe { syscall_close(fd) };
+            return Err(Error::from_kind(ErrorKind::TimedOut));
+        }
+        
+        // Check for connection error
+        let so_error = TcpStream::get_socket_error(fd)?;
+        if so_error != 0 {
+            unsafe { syscall_close(fd) };
+            return Err(socket_error(so_error));
+        }
+        
+        // Set back to blocking mode
+        unsafe { syscall_set_blocking(fd, true) };
+        
+        let local_addr = TcpStream::get_local_addr(fd)?;
+        
+        Ok(TcpStream {
+            fd,
+            peer_addr: *addr,
+            local_addr,
+        })
+    }
+    
+    fn get_local_addr(fd: i32) -> Result<SocketAddr> {
+        let mut addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+        let ret = unsafe { syscall_getsockname(fd, &mut addr) };
+        if ret < 0 {
+            Err(socket_error(-ret))
+        } else {
+            Ok(addr)
+        }
+    }
+    
+    fn get_socket_error(fd: i32) -> Result<i32> {
+        let mut error = 0i32;
+        let ret = unsafe { syscall_getsockopt_error(fd, &mut error) };
+        if ret < 0 {
+            Err(socket_error(-ret))
+        } else {
+            Ok(error)
+        }
+    }
+    
+    /// Get peer address
+    pub fn peer_addr(&self) -> Result<SocketAddr> {
+        Ok(self.peer_addr)
+    }
+    
+    /// Get local address
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+    
+    /// Shutdown read, write, or both
+    pub fn shutdown(&self, how: Shutdown) -> Result<()> {
+        let how_int = match how {
+            Shutdown::Read => 0,
+            Shutdown::Write => 1,
+            Shutdown::Both => 2,
+        };
+        
+        let ret = unsafe { syscall_shutdown(self.fd, how_int) };
+        if ret < 0 {
+            Err(socket_error(-ret))
+        } else {
+            Ok(())
+        }
+    }
+    
+    /// Clone the stream handle
+    pub fn try_clone(&self) -> Result<TcpStream> {
+        let new_fd = unsafe { syscall_dup(self.fd) };
+        if new_fd < 0 {
+            Err(socket_error(-new_fd))
+        } else {
+            Ok(TcpStream {
+                fd: new_fd,
+                peer_addr: self.peer_addr,
+                local_addr: self.local_addr,
+            })
+        }
+    }
+    
+    /// Set read timeout
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        let timeout = dur.map(|d| d.as_micros() as i64).unwrap_or(0);
+        let ret = unsafe { syscall_setsockopt_timeout(self.fd, SO_RCVTIMEO, timeout) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+    
+    /// Set write timeout
+    pub fn set_write_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        let timeout = dur.map(|d| d.as_micros() as i64).unwrap_or(0);
+        let ret = unsafe { syscall_setsockopt_timeout(self.fd, SO_SNDTIMEO, timeout) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+    
+    /// Get read timeout
+    pub fn read_timeout(&self) -> Result<Option<Duration>> {
+        let mut timeout = 0i64;
+        let ret = unsafe { syscall_getsockopt_timeout(self.fd, SO_RCVTIMEO, &mut timeout) };
+        if ret < 0 {
+            Err(socket_error(-ret))
+        } else if timeout == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(Duration::from_micros(timeout as u64)))
+        }
+    }
+    
+    /// Get write timeout
+    pub fn write_timeout(&self) -> Result<Option<Duration>> {
+        let mut timeout = 0i64;
+        let ret = unsafe { syscall_getsockopt_timeout(self.fd, SO_SNDTIMEO, &mut timeout) };
+        if ret < 0 {
+            Err(socket_error(-ret))
+        } else if timeout == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(Duration::from_micros(timeout as u64)))
+        }
+    }
+    
+    /// Set TCP_NODELAY (disable Nagle's algorithm)
+    pub fn set_nodelay(&self, nodelay: bool) -> Result<()> {
+        let ret = unsafe { syscall_setsockopt_bool(self.fd, TCP_NODELAY, nodelay) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+    
+    /// Get TCP_NODELAY
+    pub fn nodelay(&self) -> Result<bool> {
+        let mut nodelay = false;
+        let ret = unsafe { syscall_getsockopt_bool(self.fd, TCP_NODELAY, &mut nodelay) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(nodelay) }
+    }
+    
+    /// Set TTL
+    pub fn set_ttl(&self, ttl: u32) -> Result<()> {
+        let ret = unsafe { syscall_setsockopt_int(self.fd, IP_TTL, ttl as i32) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+    
+    /// Get TTL
+    pub fn ttl(&self) -> Result<u32> {
+        let mut ttl = 0i32;
+        let ret = unsafe { syscall_getsockopt_int(self.fd, IP_TTL, &mut ttl) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(ttl as u32) }
+    }
+    
+    /// Peek at incoming data without consuming
+    pub fn peek(&self, buf: &mut [u8]) -> Result<usize> {
+        let ret = unsafe { syscall_recv(self.fd, buf.as_mut_ptr(), buf.len(), MSG_PEEK) };
+        if ret < 0 {
+            Err(socket_error(-ret as i32))
+        } else {
+            Ok(ret as usize)
+        }
+    }
+    
+    /// Set non-blocking mode
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        let ret = unsafe { syscall_set_blocking(self.fd, !nonblocking) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+}
+
+impl Read for TcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let ret = unsafe { syscall_read(self.fd, buf.as_mut_ptr(), buf.len()) };
+        if ret < 0 {
+            Err(socket_error(-ret as i32))
+        } else {
+            Ok(ret as usize)
+        }
+    }
+}
+
+impl Write for TcpStream {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        let ret = unsafe { syscall_write(self.fd, buf.as_ptr(), buf.len()) };
+        if ret < 0 {
+            Err(socket_error(-ret as i32))
+        } else {
+            Ok(ret as usize)
+        }
+    }
+    
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        unsafe { syscall_close(self.fd) };
+    }
+}
+
+/// Shutdown mode
+pub enum Shutdown {
+    Read,
+    Write,
+    Both,
+}
+
+// ============================================================================
+// TCP Listener
+// ============================================================================
+
+/// TCP listener for accepting connections
+pub struct TcpListener {
+    fd: i32,
+    local_addr: SocketAddr,
+}
+
+impl TcpListener {
+    /// Bind to local address
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<TcpListener> {
+        let addrs = addr.to_socket_addrs()?;
+        let mut last_err = None;
+        
+        for addr in addrs {
+            match TcpListener::bind_addr(addr) {
+                Ok(listener) => return Ok(listener),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        
+        Err(last_err.unwrap_or_else(|| Error::from_kind(ErrorKind::InvalidInput)))
+    }
+    
+    fn bind_addr(addr: SocketAddr) -> Result<TcpListener> {
+        let domain = match addr {
+            SocketAddr::V4(_) => AF_INET,
+            SocketAddr::V6(_) => AF_INET6,
+        };
+        
+        // Create socket
+        let fd = unsafe { syscall_socket(domain, SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(socket_error(-fd));
+        }
+        
+        // Set SO_REUSEADDR
+        let ret = unsafe { syscall_setsockopt_bool(fd, SO_REUSEADDR, true) };
+        if ret < 0 {
+            unsafe { syscall_close(fd) };
+            return Err(socket_error(-ret));
+        }
+        
+        // Bind
+        let ret = unsafe { syscall_bind(fd, &addr) };
+        if ret < 0 {
+            unsafe { syscall_close(fd) };
+            return Err(socket_error(-ret));
+        }
+        
+        // Listen
+        let ret = unsafe { syscall_listen(fd, 128) };
+        if ret < 0 {
+            unsafe { syscall_close(fd) };
+            return Err(socket_error(-ret));
+        }
+        
+        // Get actual bound address
+        let local_addr = TcpStream::get_local_addr(fd)?;
+        
+        Ok(TcpListener { fd, local_addr })
+    }
+    
+    /// Get local address
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+    
+    /// Accept incoming connection
+    pub fn accept(&self) -> Result<(TcpStream, SocketAddr)> {
+        let mut peer_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+        
+        let fd = unsafe { syscall_accept(self.fd, &mut peer_addr) };
+        if fd < 0 {
+            return Err(socket_error(-fd));
+        }
+        
+        let local_addr = TcpStream::get_local_addr(fd)?;
+        
+        Ok((TcpStream { fd, peer_addr, local_addr }, peer_addr))
+    }
+    
+    /// Iterator over incoming connections
+    pub fn incoming(&self) -> Incoming<'_> {
+        Incoming { listener: self }
+    }
+    
+    /// Clone the listener handle
+    pub fn try_clone(&self) -> Result<TcpListener> {
+        let new_fd = unsafe { syscall_dup(self.fd) };
+        if new_fd < 0 {
+            Err(socket_error(-new_fd))
+        } else {
+            Ok(TcpListener {
+                fd: new_fd,
+                local_addr: self.local_addr,
+            })
+        }
+    }
+    
+    /// Set TTL
+    pub fn set_ttl(&self, ttl: u32) -> Result<()> {
+        let ret = unsafe { syscall_setsockopt_int(self.fd, IP_TTL, ttl as i32) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+    
+    /// Get TTL
+    pub fn ttl(&self) -> Result<u32> {
+        let mut ttl = 0i32;
+        let ret = unsafe { syscall_getsockopt_int(self.fd, IP_TTL, &mut ttl) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(ttl as u32) }
+    }
+    
+    /// Set non-blocking mode
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        let ret = unsafe { syscall_set_blocking(self.fd, !nonblocking) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+}
+
+impl Drop for TcpListener {
+    fn drop(&mut self) {
+        unsafe { syscall_close(self.fd) };
+    }
+}
+
+/// Iterator over incoming connections
+pub struct Incoming<'a> {
+    listener: &'a TcpListener,
+}
+
+impl<'a> Iterator for Incoming<'a> {
+    type Item = Result<TcpStream>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.listener.accept().map(|(stream, _)| stream))
+    }
+}
+
+// ============================================================================
+// UDP Socket
+// ============================================================================
+
+/// UDP socket for datagram communication
+pub struct UdpSocket {
+    fd: i32,
+    local_addr: SocketAddr,
+}
+
+impl UdpSocket {
+    /// Bind to local address
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<UdpSocket> {
+        let addrs = addr.to_socket_addrs()?;
+        let mut last_err = None;
+        
+        for addr in addrs {
+            match UdpSocket::bind_addr(addr) {
+                Ok(socket) => return Ok(socket),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        
+        Err(last_err.unwrap_or_else(|| Error::from_kind(ErrorKind::InvalidInput)))
+    }
+    
+    fn bind_addr(addr: SocketAddr) -> Result<UdpSocket> {
+        let domain = match addr {
+            SocketAddr::V4(_) => AF_INET,
+            SocketAddr::V6(_) => AF_INET6,
+        };
+        
+        let fd = unsafe { syscall_socket(domain, SOCK_DGRAM, 0) };
+        if fd < 0 {
+            return Err(socket_error(-fd));
+        }
+        
+        let ret = unsafe { syscall_bind(fd, &addr) };
+        if ret < 0 {
+            unsafe { syscall_close(fd) };
+            return Err(socket_error(-ret));
+        }
+        
+        let local_addr = TcpStream::get_local_addr(fd)?;
+        
+        Ok(UdpSocket { fd, local_addr })
+    }
+    
+    /// Get local address
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+    
+    /// Receive data and sender address
+    pub fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        let mut addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+        
+        let ret = unsafe { syscall_recvfrom(self.fd, buf.as_mut_ptr(), buf.len(), 0, &mut addr) };
+        if ret < 0 {
+            Err(socket_error(-ret as i32))
+        } else {
+            Ok((ret as usize, addr))
+        }
+    }
+    
+    /// Peek at data without consuming
+    pub fn peek_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        let mut addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+        
+        let ret = unsafe { syscall_recvfrom(self.fd, buf.as_mut_ptr(), buf.len(), MSG_PEEK, &mut addr) };
+        if ret < 0 {
+            Err(socket_error(-ret as i32))
+        } else {
+            Ok((ret as usize, addr))
+        }
+    }
+    
+    /// Send data to address
+    pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> Result<usize> {
+        let addr = addr.to_socket_addrs()?.next()
+            .ok_or_else(|| Error::from_kind(ErrorKind::InvalidInput))?;
+        
+        let ret = unsafe { syscall_sendto(self.fd, buf.as_ptr(), buf.len(), 0, &addr) };
+        if ret < 0 {
+            Err(socket_error(-ret as i32))
+        } else {
+            Ok(ret as usize)
+        }
+    }
+    
+    /// Connect to remote address (for send/recv without address)
+    pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> Result<()> {
+        let addr = addr.to_socket_addrs()?.next()
+            .ok_or_else(|| Error::from_kind(ErrorKind::InvalidInput))?;
+        
+        let ret = unsafe { syscall_connect(self.fd, &addr) };
+        if ret < 0 {
+            Err(socket_error(-ret))
+        } else {
+            Ok(())
+        }
+    }
+    
+    /// Receive from connected peer
+    pub fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+        let ret = unsafe { syscall_recv(self.fd, buf.as_mut_ptr(), buf.len(), 0) };
+        if ret < 0 {
+            Err(socket_error(-ret as i32))
+        } else {
+            Ok(ret as usize)
+        }
+    }
+    
+    /// Send to connected peer
+    pub fn send(&self, buf: &[u8]) -> Result<usize> {
+        let ret = unsafe { syscall_send(self.fd, buf.as_ptr(), buf.len(), 0) };
+        if ret < 0 {
+            Err(socket_error(-ret as i32))
+        } else {
+            Ok(ret as usize)
+        }
+    }
+    
+    /// Get peer address (if connected)
+    pub fn peer_addr(&self) -> Result<SocketAddr> {
+        let mut addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+        let ret = unsafe { syscall_getpeername(self.fd, &mut addr) };
+        if ret < 0 {
+            Err(socket_error(-ret))
+        } else {
+            Ok(addr)
+        }
+    }
+    
+    /// Clone the socket handle
+    pub fn try_clone(&self) -> Result<UdpSocket> {
+        let new_fd = unsafe { syscall_dup(self.fd) };
+        if new_fd < 0 {
+            Err(socket_error(-new_fd))
+        } else {
+            Ok(UdpSocket {
+                fd: new_fd,
+                local_addr: self.local_addr,
+            })
+        }
+    }
+    
+    /// Set read timeout
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        let timeout = dur.map(|d| d.as_micros() as i64).unwrap_or(0);
+        let ret = unsafe { syscall_setsockopt_timeout(self.fd, SO_RCVTIMEO, timeout) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+    
+    /// Set write timeout
+    pub fn set_write_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        let timeout = dur.map(|d| d.as_micros() as i64).unwrap_or(0);
+        let ret = unsafe { syscall_setsockopt_timeout(self.fd, SO_SNDTIMEO, timeout) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+    
+    /// Set broadcast mode
+    pub fn set_broadcast(&self, broadcast: bool) -> Result<()> {
+        let ret = unsafe { syscall_setsockopt_bool(self.fd, SO_BROADCAST, broadcast) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+    
+    /// Get broadcast mode
+    pub fn broadcast(&self) -> Result<bool> {
+        let mut broadcast = false;
+        let ret = unsafe { syscall_getsockopt_bool(self.fd, SO_BROADCAST, &mut broadcast) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(broadcast) }
+    }
+    
+    /// Set multicast loop
+    pub fn set_multicast_loop_v4(&self, loop_: bool) -> Result<()> {
+        let ret = unsafe { syscall_setsockopt_bool(self.fd, IP_MULTICAST_LOOP, loop_) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+    
+    /// Get multicast loop
+    pub fn multicast_loop_v4(&self) -> Result<bool> {
+        let mut loop_ = false;
+        let ret = unsafe { syscall_getsockopt_bool(self.fd, IP_MULTICAST_LOOP, &mut loop_) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(loop_) }
+    }
+    
+    /// Set multicast TTL
+    pub fn set_multicast_ttl_v4(&self, ttl: u32) -> Result<()> {
+        let ret = unsafe { syscall_setsockopt_int(self.fd, IP_MULTICAST_TTL, ttl as i32) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+    
+    /// Get multicast TTL
+    pub fn multicast_ttl_v4(&self) -> Result<u32> {
+        let mut ttl = 0i32;
+        let ret = unsafe { syscall_getsockopt_int(self.fd, IP_MULTICAST_TTL, &mut ttl) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(ttl as u32) }
+    }
+    
+    /// Join multicast group
+    pub fn join_multicast_v4(&self, multiaddr: &Ipv4Addr, interface: &Ipv4Addr) -> Result<()> {
+        let ret = unsafe { 
+            syscall_join_multicast_v4(self.fd, multiaddr.octets(), interface.octets()) 
+        };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+    
+    /// Leave multicast group
+    pub fn leave_multicast_v4(&self, multiaddr: &Ipv4Addr, interface: &Ipv4Addr) -> Result<()> {
+        let ret = unsafe { 
+            syscall_leave_multicast_v4(self.fd, multiaddr.octets(), interface.octets()) 
+        };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+    
+    /// Set TTL
+    pub fn set_ttl(&self, ttl: u32) -> Result<()> {
+        let ret = unsafe { syscall_setsockopt_int(self.fd, IP_TTL, ttl as i32) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+    
+    /// Get TTL
+    pub fn ttl(&self) -> Result<u32> {
+        let mut ttl = 0i32;
+        let ret = unsafe { syscall_getsockopt_int(self.fd, IP_TTL, &mut ttl) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(ttl as u32) }
+    }
+    
+    /// Set non-blocking mode
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        let ret = unsafe { syscall_set_blocking(self.fd, !nonblocking) };
+        if ret < 0 { Err(socket_error(-ret)) } else { Ok(()) }
+    }
+}
+
+impl Drop for UdpSocket {
+    fn drop(&mut self) {
+        unsafe { syscall_close(self.fd) };
+    }
+}
+
+// ============================================================================
+// Socket Constants
+// ============================================================================
+
+// Address families
+const AF_INET: i32 = 2;
+const AF_INET6: i32 = 10;
+
+// Socket types
+const SOCK_STREAM: i32 = 1;
+const SOCK_DGRAM: i32 = 2;
+const SOCK_NONBLOCK: i32 = 2048;
+
+// Socket options
+const SO_REUSEADDR: i32 = 2;
+const SO_BROADCAST: i32 = 6;
+const SO_RCVTIMEO: i32 = 20;
+const SO_SNDTIMEO: i32 = 21;
+
+// TCP options
+const TCP_NODELAY: i32 = 1;
+
+// IP options
+const IP_TTL: i32 = 2;
+const IP_MULTICAST_TTL: i32 = 33;
+const IP_MULTICAST_LOOP: i32 = 34;
+
+// Message flags
+const MSG_PEEK: i32 = 2;
+
+// Error codes
+const EINPROGRESS: i32 = 115;
+
+// ============================================================================
+// Socket Syscalls
+// ============================================================================
+
+fn socket_error(errno: i32) -> Error {
+    let kind = match errno {
+        111 => ErrorKind::ConnectionRefused,
+        104 => ErrorKind::ConnectionReset,
+        103 => ErrorKind::ConnectionAborted,
+        107 => ErrorKind::NotConnected,
+        98 => ErrorKind::AddrInUse,
+        99 => ErrorKind::AddrNotAvailable,
+        32 => ErrorKind::BrokenPipe,
+        11 | 115 => ErrorKind::WouldBlock,
+        110 => ErrorKind::TimedOut,
+        13 => ErrorKind::PermissionDenied,
+        _ => ErrorKind::Other,
+    };
+    Error::from_kind(kind)
+}
+
+extern "C" {
+    fn syscall_socket(domain: i32, type_: i32, protocol: i32) -> i32;
+    fn syscall_bind(fd: i32, addr: *const SocketAddr) -> i32;
+    fn syscall_listen(fd: i32, backlog: i32) -> i32;
+    fn syscall_accept(fd: i32, addr: *mut SocketAddr) -> i32;
+    fn syscall_connect(fd: i32, addr: *const SocketAddr) -> i32;
+    fn syscall_shutdown(fd: i32, how: i32) -> i32;
+    fn syscall_getsockname(fd: i32, addr: *mut SocketAddr) -> i32;
+    fn syscall_getpeername(fd: i32, addr: *mut SocketAddr) -> i32;
+    fn syscall_setsockopt_bool(fd: i32, opt: i32, value: bool) -> i32;
+    fn syscall_getsockopt_bool(fd: i32, opt: i32, value: *mut bool) -> i32;
+    fn syscall_setsockopt_int(fd: i32, opt: i32, value: i32) -> i32;
+    fn syscall_getsockopt_int(fd: i32, opt: i32, value: *mut i32) -> i32;
+    fn syscall_setsockopt_timeout(fd: i32, opt: i32, timeout: i64) -> i32;
+    fn syscall_getsockopt_timeout(fd: i32, opt: i32, timeout: *mut i64) -> i32;
+    fn syscall_getsockopt_error(fd: i32, error: *mut i32) -> i32;
+    fn syscall_recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
+    fn syscall_send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
+    fn syscall_recvfrom(fd: i32, buf: *mut u8, len: usize, flags: i32, addr: *mut SocketAddr) -> isize;
+    fn syscall_sendto(fd: i32, buf: *const u8, len: usize, flags: i32, addr: *const SocketAddr) -> isize;
+    fn syscall_poll_write(fd: i32, timeout_ms: i32) -> i32;
+    fn syscall_set_blocking(fd: i32, blocking: bool) -> i32;
+    fn syscall_join_multicast_v4(fd: i32, multiaddr: [u8; 4], interface: [u8; 4]) -> i32;
+    fn syscall_leave_multicast_v4(fd: i32, multiaddr: [u8; 4], interface: [u8; 4]) -> i32;
+    fn syscall_getaddrinfo(host: *const u8, host_len: usize, addrs: *mut IpAddr, count: *mut usize) -> i32;
+    fn syscall_read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn syscall_write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn syscall_close(fd: i32) -> i32;
+    fn syscall_dup(fd: i32) -> i32;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_ipv4_addr() {
+        let addr = Ipv4Addr::new(192, 168, 1, 1);
+        assert_eq!(addr.octets(), [192, 168, 1, 1]);
+        assert!(addr.is_private());
+        assert!(!addr.is_loopback());
+        
+        assert!(Ipv4Addr::LOCALHOST.is_loopback());
+        assert!(Ipv4Addr::UNSPECIFIED.is_unspecified());
+        assert!(Ipv4Addr::BROADCAST.is_broadcast());
+    }
+    
+    #[test]
+    fn test_ipv4_parse() {
+        let addr = Ipv4Addr::parse("127.0.0.1").unwrap();
+        assert_eq!(addr, Ipv4Addr::LOCALHOST);
+        
+        let addr = Ipv4Addr::parse("192.168.0.1").unwrap();
+        assert_eq!(addr.octets(), [192, 168, 0, 1]);
+        
+        assert!(Ipv4Addr::parse("256.0.0.1").is_err());
+        assert!(Ipv4Addr::parse("1.2.3").is_err());
+    }
+    
+    #[test]
+    fn test_ipv6_addr() {
+        let addr = Ipv6Addr::LOCALHOST;
+        assert!(addr.is_loopback());
+        
+        let addr = Ipv6Addr::UNSPECIFIED;
+        assert!(addr.is_unspecified());
+        
+        let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        assert!(mapped.is_ipv4_mapped());
+        assert_eq!(mapped.to_ipv4(), Some(Ipv4Addr::LOCALHOST));
+    }
+    
+    #[test]
+    fn test_socket_addr() {
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080));
+        assert_eq!(addr.port(), 8080);
+        assert!(addr.is_ipv4());
+    }
+    
+    #[test]
+    fn test_socket_addr_parse() {
+        let addr = SocketAddr::parse("127.0.0.1:8080").unwrap();
+        assert_eq!(addr.port(), 8080);
+        assert!(addr.ip().is_loopback());
+    }
+    
+    #[test]
+    fn test_ip_addr_enum() {
+        let v4: IpAddr = Ipv4Addr::LOCALHOST.into();
+        assert!(v4.is_ipv4());
+        assert!(v4.is_loopback());
+        
+        let v6: IpAddr = Ipv6Addr::LOCALHOST.into();
+        assert!(v6.is_ipv6());
+        assert!(v6.is_loopback());
+    }
+    
+    #[test]
+    fn test_private_addresses() {
+        assert!(Ipv4Addr::new(10, 0, 0, 1).is_private());
+        assert!(Ipv4Addr::new(172, 16, 0, 1).is_private());
+        assert!(Ipv4Addr::new(172, 31, 255, 255).is_private());
+        assert!(Ipv4Addr::new(192, 168, 0, 1).is_private());
+        assert!(!Ipv4Addr::new(8, 8, 8, 8).is_private());
+    }
+    
+    #[test]
+    fn test_multicast() {
+        assert!(Ipv4Addr::new(224, 0, 0, 1).is_multicast());
+        assert!(Ipv4Addr::new(239, 255, 255, 255).is_multicast());
+        assert!(!Ipv4Addr::new(223, 255, 255, 255).is_multicast());
+    }
+}

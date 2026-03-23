@@ -1,0 +1,864 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ CONCURRENT — Atomic Utilities
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Extended atomic operations and utilities:
+// - AtomicF32/AtomicF64 (atomic floats)
+// - AtomicOption (atomic optional)
+// - AtomicArc (atomic Arc pointer)
+// - Backoff (exponential backoff)
+// - CachePadded (cache line alignment)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::concurrent::atomic
+
+use alloc::sync::Arc;
+use core::sync::atomic::{
+    AtomicU32, AtomicU64, AtomicUsize, AtomicPtr, AtomicBool,
+    Ordering, fence, compiler_fence,
+};
+use core::cell::UnsafeCell;
+use core::mem::{size_of, align_of, transmute};
+use core::ptr::{null_mut, NonNull};
+use core::ops::{Deref, DerefMut};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ATOMIC FLOAT 32
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Atomic 32-bit floating point
+#[repr(transparent)]
+pub struct AtomicF32 {
+    bits: AtomicU32,
+}
+
+impl AtomicF32 {
+    /// Create a new atomic f32
+    pub const fn new(value: f32) -> Self {
+        AtomicF32 {
+            bits: AtomicU32::new(value.to_bits()),
+        }
+    }
+    
+    /// Load the value
+    pub fn load(&self, order: Ordering) -> f32 {
+        f32::from_bits(self.bits.load(order))
+    }
+    
+    /// Store a value
+    pub fn store(&self, value: f32, order: Ordering) {
+        self.bits.store(value.to_bits(), order);
+    }
+    
+    /// Swap values
+    pub fn swap(&self, value: f32, order: Ordering) -> f32 {
+        f32::from_bits(self.bits.swap(value.to_bits(), order))
+    }
+    
+    /// Compare and exchange
+    pub fn compare_exchange(
+        &self,
+        current: f32,
+        new: f32,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<f32, f32> {
+        match self.bits.compare_exchange(
+            current.to_bits(),
+            new.to_bits(),
+            success,
+            failure,
+        ) {
+            Ok(bits) => Ok(f32::from_bits(bits)),
+            Err(bits) => Err(f32::from_bits(bits)),
+        }
+    }
+    
+    /// Compare and exchange weak
+    pub fn compare_exchange_weak(
+        &self,
+        current: f32,
+        new: f32,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<f32, f32> {
+        match self.bits.compare_exchange_weak(
+            current.to_bits(),
+            new.to_bits(),
+            success,
+            failure,
+        ) {
+            Ok(bits) => Ok(f32::from_bits(bits)),
+            Err(bits) => Err(f32::from_bits(bits)),
+        }
+    }
+    
+    /// Fetch and add (using CAS loop)
+    pub fn fetch_add(&self, value: f32, order: Ordering) -> f32 {
+        loop {
+            let current = self.load(Ordering::Relaxed);
+            let new = current + value;
+            
+            match self.compare_exchange_weak(current, new, order, Ordering::Relaxed) {
+                Ok(v) => return v,
+                Err(_) => continue,
+            }
+        }
+    }
+    
+    /// Fetch and subtract
+    pub fn fetch_sub(&self, value: f32, order: Ordering) -> f32 {
+        self.fetch_add(-value, order)
+    }
+    
+    /// Fetch and update with function
+    pub fn fetch_update<F>(
+        &self,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        mut f: F,
+    ) -> Result<f32, f32>
+    where
+        F: FnMut(f32) -> Option<f32>,
+    {
+        let mut prev = self.load(fetch_order);
+        
+        while let Some(next) = f(prev) {
+            match self.compare_exchange_weak(prev, next, set_order, fetch_order) {
+                Ok(x) => return Ok(x),
+                Err(next_prev) => prev = next_prev,
+            }
+        }
+        
+        Err(prev)
+    }
+    
+    /// Fetch max
+    pub fn fetch_max(&self, value: f32, order: Ordering) -> f32 {
+        self.fetch_update(order, order, |x| Some(x.max(value))).unwrap()
+    }
+    
+    /// Fetch min
+    pub fn fetch_min(&self, value: f32, order: Ordering) -> f32 {
+        self.fetch_update(order, order, |x| Some(x.min(value))).unwrap()
+    }
+    
+    /// Get mutable reference
+    pub fn get_mut(&mut self) -> &mut f32 {
+        // Safety: we have exclusive access
+        unsafe { &mut *(self.bits.get_mut() as *mut u32 as *mut f32) }
+    }
+    
+    /// Into inner value
+    pub fn into_inner(self) -> f32 {
+        f32::from_bits(self.bits.into_inner())
+    }
+}
+
+impl Default for AtomicF32 {
+    fn default() -> Self {
+        Self::new(0.0)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ATOMIC FLOAT 64
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Atomic 64-bit floating point
+#[repr(transparent)]
+pub struct AtomicF64 {
+    bits: AtomicU64,
+}
+
+impl AtomicF64 {
+    /// Create a new atomic f64
+    pub const fn new(value: f64) -> Self {
+        AtomicF64 {
+            bits: AtomicU64::new(value.to_bits()),
+        }
+    }
+    
+    /// Load the value
+    pub fn load(&self, order: Ordering) -> f64 {
+        f64::from_bits(self.bits.load(order))
+    }
+    
+    /// Store a value
+    pub fn store(&self, value: f64, order: Ordering) {
+        self.bits.store(value.to_bits(), order);
+    }
+    
+    /// Swap values
+    pub fn swap(&self, value: f64, order: Ordering) -> f64 {
+        f64::from_bits(self.bits.swap(value.to_bits(), order))
+    }
+    
+    /// Compare and exchange
+    pub fn compare_exchange(
+        &self,
+        current: f64,
+        new: f64,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<f64, f64> {
+        match self.bits.compare_exchange(
+            current.to_bits(),
+            new.to_bits(),
+            success,
+            failure,
+        ) {
+            Ok(bits) => Ok(f64::from_bits(bits)),
+            Err(bits) => Err(f64::from_bits(bits)),
+        }
+    }
+    
+    /// Fetch and add
+    pub fn fetch_add(&self, value: f64, order: Ordering) -> f64 {
+        loop {
+            let current = self.load(Ordering::Relaxed);
+            let new = current + value;
+            
+            match self.compare_exchange_weak(current, new, order, Ordering::Relaxed) {
+                Ok(v) => return v,
+                Err(_) => continue,
+            }
+        }
+    }
+    
+    /// Compare and exchange weak
+    pub fn compare_exchange_weak(
+        &self,
+        current: f64,
+        new: f64,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<f64, f64> {
+        match self.bits.compare_exchange_weak(
+            current.to_bits(),
+            new.to_bits(),
+            success,
+            failure,
+        ) {
+            Ok(bits) => Ok(f64::from_bits(bits)),
+            Err(bits) => Err(f64::from_bits(bits)),
+        }
+    }
+    
+    /// Fetch and subtract
+    pub fn fetch_sub(&self, value: f64, order: Ordering) -> f64 {
+        self.fetch_add(-value, order)
+    }
+    
+    /// Get mutable reference
+    pub fn get_mut(&mut self) -> &mut f64 {
+        unsafe { &mut *(self.bits.get_mut() as *mut u64 as *mut f64) }
+    }
+    
+    /// Into inner value
+    pub fn into_inner(self) -> f64 {
+        f64::from_bits(self.bits.into_inner())
+    }
+}
+
+impl Default for AtomicF64 {
+    fn default() -> Self {
+        Self::new(0.0)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ATOMIC OPTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Atomic optional pointer
+pub struct AtomicOption<T> {
+    ptr: AtomicPtr<T>,
+}
+
+unsafe impl<T: Send> Send for AtomicOption<T> {}
+unsafe impl<T: Send> Sync for AtomicOption<T> {}
+
+impl<T> AtomicOption<T> {
+    /// Create empty option
+    pub const fn none() -> Self {
+        AtomicOption {
+            ptr: AtomicPtr::new(null_mut()),
+        }
+    }
+    
+    /// Create with value
+    pub fn some(value: T) -> Self {
+        AtomicOption {
+            ptr: AtomicPtr::new(Box::into_raw(Box::new(value))),
+        }
+    }
+    
+    /// Check if contains a value
+    pub fn is_some(&self) -> bool {
+        !self.ptr.load(Ordering::Acquire).is_null()
+    }
+    
+    /// Check if empty
+    pub fn is_none(&self) -> bool {
+        self.ptr.load(Ordering::Acquire).is_null()
+    }
+    
+    /// Take the value (atomic swap with None)
+    pub fn take(&self, order: Ordering) -> Option<Box<T>> {
+        let ptr = self.ptr.swap(null_mut(), order);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { Box::from_raw(ptr) })
+        }
+    }
+    
+    /// Store a value (drops previous)
+    pub fn store(&self, value: Option<T>, order: Ordering) {
+        let new_ptr = match value {
+            Some(v) => Box::into_raw(Box::new(v)),
+            None => null_mut(),
+        };
+        
+        let old_ptr = self.ptr.swap(new_ptr, order);
+        
+        if !old_ptr.is_null() {
+            unsafe { drop(Box::from_raw(old_ptr)) };
+        }
+    }
+    
+    /// Swap values
+    pub fn swap(&self, value: Option<T>, order: Ordering) -> Option<Box<T>> {
+        let new_ptr = match value {
+            Some(v) => Box::into_raw(Box::new(v)),
+            None => null_mut(),
+        };
+        
+        let old_ptr = self.ptr.swap(new_ptr, order);
+        
+        if old_ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { Box::from_raw(old_ptr) })
+        }
+    }
+    
+    /// Compare and exchange
+    pub fn compare_exchange(
+        &self,
+        current: *mut T,
+        new: Option<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Option<Box<T>>, *mut T> {
+        let new_ptr = match new {
+            Some(v) => Box::into_raw(Box::new(v)),
+            None => null_mut(),
+        };
+        
+        match self.ptr.compare_exchange(current, new_ptr, success, failure) {
+            Ok(old) => {
+                if old.is_null() {
+                    Ok(None)
+                } else {
+                    Ok(Some(unsafe { Box::from_raw(old) }))
+                }
+            }
+            Err(actual) => {
+                // Put back the new value since CAS failed
+                if !new_ptr.is_null() {
+                    unsafe { drop(Box::from_raw(new_ptr)) };
+                }
+                Err(actual)
+            }
+        }
+    }
+    
+    /// Get raw pointer
+    pub fn as_ptr(&self) -> *mut T {
+        self.ptr.load(Ordering::Acquire)
+    }
+}
+
+impl<T> Default for AtomicOption<T> {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+impl<T> Drop for AtomicOption<T> {
+    fn drop(&mut self) {
+        let ptr = *self.ptr.get_mut();
+        if !ptr.is_null() {
+            unsafe { drop(Box::from_raw(ptr)) };
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ATOMIC ARC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Atomic Arc pointer
+pub struct AtomicArc<T> {
+    ptr: AtomicPtr<T>,
+}
+
+unsafe impl<T: Send + Sync> Send for AtomicArc<T> {}
+unsafe impl<T: Send + Sync> Sync for AtomicArc<T> {}
+
+impl<T> AtomicArc<T> {
+    /// Create from Arc
+    pub fn new(arc: Arc<T>) -> Self {
+        AtomicArc {
+            ptr: AtomicPtr::new(Arc::into_raw(arc) as *mut T),
+        }
+    }
+    
+    /// Create null
+    pub const fn null() -> Self {
+        AtomicArc {
+            ptr: AtomicPtr::new(null_mut()),
+        }
+    }
+    
+    /// Load the Arc (increments refcount)
+    pub fn load(&self, order: Ordering) -> Option<Arc<T>> {
+        loop {
+            let ptr = self.ptr.load(order);
+            
+            if ptr.is_null() {
+                return None;
+            }
+            
+            // Increment refcount
+            let arc = unsafe { Arc::from_raw(ptr) };
+            let cloned = arc.clone();
+            std::mem::forget(arc); // Don't decrement
+            
+            // Verify pointer hasn't changed
+            if self.ptr.load(Ordering::Acquire) == ptr {
+                return Some(cloned);
+            }
+            
+            // Pointer changed, undo our clone
+            drop(cloned);
+        }
+    }
+    
+    /// Store an Arc
+    pub fn store(&self, arc: Option<Arc<T>>, order: Ordering) {
+        let new_ptr = match arc {
+            Some(a) => Arc::into_raw(a) as *mut T,
+            None => null_mut(),
+        };
+        
+        let old_ptr = self.ptr.swap(new_ptr, order);
+        
+        if !old_ptr.is_null() {
+            // Decrement old refcount
+            unsafe { drop(Arc::from_raw(old_ptr)) };
+        }
+    }
+    
+    /// Swap Arcs
+    pub fn swap(&self, arc: Option<Arc<T>>, order: Ordering) -> Option<Arc<T>> {
+        let new_ptr = match arc {
+            Some(a) => Arc::into_raw(a) as *mut T,
+            None => null_mut(),
+        };
+        
+        let old_ptr = self.ptr.swap(new_ptr, order);
+        
+        if old_ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { Arc::from_raw(old_ptr) })
+        }
+    }
+    
+    /// Compare and swap
+    pub fn compare_and_swap(
+        &self,
+        current: &Arc<T>,
+        new: Arc<T>,
+        order: Ordering,
+    ) -> Result<Arc<T>, Arc<T>> {
+        let current_ptr = Arc::as_ptr(current) as *mut T;
+        let new_ptr = Arc::into_raw(new) as *mut T;
+        
+        match self.ptr.compare_exchange(current_ptr, new_ptr, order, Ordering::Relaxed) {
+            Ok(_) => {
+                // Return old value
+                Ok(unsafe { Arc::from_raw(current_ptr) })
+            }
+            Err(_) => {
+                // Return new value (CAS failed)
+                Err(unsafe { Arc::from_raw(new_ptr) })
+            }
+        }
+    }
+    
+    /// Check if null
+    pub fn is_null(&self) -> bool {
+        self.ptr.load(Ordering::Acquire).is_null()
+    }
+}
+
+impl<T> Drop for AtomicArc<T> {
+    fn drop(&mut self) {
+        let ptr = *self.ptr.get_mut();
+        if !ptr.is_null() {
+            unsafe { drop(Arc::from_raw(ptr)) };
+        }
+    }
+}
+
+impl<T> Clone for AtomicArc<T> {
+    fn clone(&self) -> Self {
+        match self.load(Ordering::Acquire) {
+            Some(arc) => AtomicArc::new(arc),
+            None => AtomicArc::null(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BACKOFF
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Exponential backoff for spin loops
+#[derive(Debug)]
+pub struct Backoff {
+    step: u32,
+}
+
+impl Backoff {
+    /// Spin limit before yielding
+    const SPIN_LIMIT: u32 = 6;
+    /// Yield limit before sleeping
+    const YIELD_LIMIT: u32 = 10;
+    
+    /// Create a new backoff
+    pub const fn new() -> Self {
+        Backoff { step: 0 }
+    }
+    
+    /// Reset the backoff
+    pub fn reset(&mut self) {
+        self.step = 0;
+    }
+    
+    /// Spin once (lightweight pause)
+    pub fn spin(&mut self) {
+        for _ in 0..1 << self.step.min(Self::SPIN_LIMIT) {
+            std::hint::spin_loop();
+        }
+        
+        if self.step <= Self::SPIN_LIMIT {
+            self.step += 1;
+        }
+    }
+    
+    /// Snooze (spin, yield, or sleep based on contention)
+    pub fn snooze(&mut self) {
+        if self.step <= Self::SPIN_LIMIT {
+            for _ in 0..1 << self.step {
+                std::hint::spin_loop();
+            }
+        } else if self.step <= Self::YIELD_LIMIT {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(10));
+        }
+        
+        if self.step <= Self::YIELD_LIMIT {
+            self.step += 1;
+        }
+    }
+    
+    /// Check if should yield
+    pub fn is_completed(&self) -> bool {
+        self.step > Self::YIELD_LIMIT
+    }
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CACHE PADDED
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cache line size (typically 64 bytes on x86-64)
+const CACHE_LINE_SIZE: usize = 64;
+
+/// Pad a value to cache line size to prevent false sharing
+#[repr(align(64))]
+pub struct CachePadded<T> {
+    value: T,
+}
+
+impl<T> CachePadded<T> {
+    /// Create a new cache-padded value
+    pub const fn new(value: T) -> Self {
+        CachePadded { value }
+    }
+    
+    /// Get inner value
+    pub fn into_inner(self) -> T {
+        self.value
+    }
+}
+
+impl<T> Deref for CachePadded<T> {
+    type Target = T;
+    
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> DerefMut for CachePadded<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
+
+impl<T: Default> Default for CachePadded<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T: Clone> Clone for CachePadded<T> {
+    fn clone(&self) -> Self {
+        CachePadded::new(self.value.clone())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PARKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Thread parker for waiting
+pub struct Parker {
+    state: AtomicUsize,
+    mutex: std::sync::Mutex<()>,
+    condvar: std::sync::Condvar,
+}
+
+const EMPTY: usize = 0;
+const PARKED: usize = 1;
+const NOTIFIED: usize = 2;
+
+impl Parker {
+    /// Create a new parker
+    pub fn new() -> Self {
+        Parker {
+            state: AtomicUsize::new(EMPTY),
+            mutex: std::sync::Mutex::new(()),
+            condvar: std::sync::Condvar::new(),
+        }
+    }
+    
+    /// Park the current thread
+    pub fn park(&self) {
+        // Try to consume a notification
+        if self.state.compare_exchange(
+            NOTIFIED,
+            EMPTY,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ).is_ok() {
+            return;
+        }
+        
+        // Set state to parked
+        self.state.store(PARKED, Ordering::SeqCst);
+        
+        let guard = self.mutex.lock().unwrap();
+        
+        while self.state.load(Ordering::SeqCst) == PARKED {
+            let _ = self.condvar.wait(guard.clone());
+        }
+        
+        self.state.store(EMPTY, Ordering::SeqCst);
+    }
+    
+    /// Park with timeout
+    pub fn park_timeout(&self, timeout: std::time::Duration) -> bool {
+        if self.state.compare_exchange(
+            NOTIFIED,
+            EMPTY,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ).is_ok() {
+            return true;
+        }
+        
+        self.state.store(PARKED, Ordering::SeqCst);
+        
+        let guard = self.mutex.lock().unwrap();
+        let result = self.condvar.wait_timeout(guard, timeout);
+        
+        let was_notified = self.state.load(Ordering::SeqCst) == NOTIFIED;
+        self.state.store(EMPTY, Ordering::SeqCst);
+        
+        was_notified || result.is_ok()
+    }
+    
+    /// Unpark (notify) the thread
+    pub fn unpark(&self) {
+        let state = self.state.swap(NOTIFIED, Ordering::SeqCst);
+        
+        if state == PARKED {
+            let _guard = self.mutex.lock().unwrap();
+            self.condvar.notify_one();
+        }
+    }
+}
+
+impl Default for Parker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Handle to an unparker
+pub struct Unparker {
+    inner: Arc<Parker>,
+}
+
+impl Unparker {
+    /// Unpark the thread
+    pub fn unpark(&self) {
+        self.inner.unpark();
+    }
+}
+
+impl Clone for Unparker {
+    fn clone(&self) -> Self {
+        Unparker {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FENCE HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Full memory fence (SeqCst)
+#[inline]
+pub fn full_fence() {
+    fence(Ordering::SeqCst);
+}
+
+/// Acquire fence
+#[inline]
+pub fn acquire_fence() {
+    fence(Ordering::Acquire);
+}
+
+/// Release fence
+#[inline]
+pub fn release_fence() {
+    fence(Ordering::Release);
+}
+
+/// Compiler fence (prevents reordering by compiler only)
+#[inline]
+pub fn compiler_barrier() {
+    compiler_fence(Ordering::SeqCst);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_atomic_f32() {
+        let a = AtomicF32::new(1.0);
+        assert_eq!(a.load(Ordering::SeqCst), 1.0);
+        
+        a.store(2.5, Ordering::SeqCst);
+        assert_eq!(a.load(Ordering::SeqCst), 2.5);
+        
+        let old = a.fetch_add(1.5, Ordering::SeqCst);
+        assert_eq!(old, 2.5);
+        assert_eq!(a.load(Ordering::SeqCst), 4.0);
+    }
+    
+    #[test]
+    fn test_atomic_f64() {
+        let a = AtomicF64::new(1.0);
+        assert_eq!(a.load(Ordering::SeqCst), 1.0);
+        
+        let old = a.swap(2.0, Ordering::SeqCst);
+        assert_eq!(old, 1.0);
+        assert_eq!(a.load(Ordering::SeqCst), 2.0);
+    }
+    
+    #[test]
+    fn test_atomic_option() {
+        let opt: AtomicOption<i32> = AtomicOption::none();
+        assert!(opt.is_none());
+        
+        opt.store(Some(42), Ordering::SeqCst);
+        assert!(opt.is_some());
+        
+        let taken = opt.take(Ordering::SeqCst);
+        assert_eq!(*taken.unwrap(), 42);
+        assert!(opt.is_none());
+    }
+    
+    #[test]
+    fn test_backoff() {
+        let mut backoff = Backoff::new();
+        
+        for _ in 0..5 {
+            backoff.spin();
+        }
+        
+        assert!(!backoff.is_completed());
+        
+        for _ in 0..10 {
+            backoff.snooze();
+        }
+        
+        assert!(backoff.is_completed());
+    }
+    
+    #[test]
+    fn test_cache_padded() {
+        let padded = CachePadded::new(42);
+        assert_eq!(*padded, 42);
+        assert!(size_of::<CachePadded<i32>>() >= CACHE_LINE_SIZE);
+    }
+    
+    #[test]
+    fn test_parker() {
+        let parker = Arc::new(Parker::new());
+        let parker2 = parker.clone();
+        
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            parker2.unpark();
+        });
+        
+        parker.park_timeout(std::time::Duration::from_secs(1));
+    }
+}

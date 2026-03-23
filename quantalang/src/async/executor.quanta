@@ -1,0 +1,888 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ ASYNC — Executor
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Multi-threaded async executor with work-stealing scheduler.
+//
+// Architecture:
+// - Work-stealing deque per worker thread
+// - Global injection queue for spawned tasks
+// - Local-first scheduling with stealing on idle
+// - Configurable thread pool size
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::async::executor
+
+use alloc::sync::Arc;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use alloc::collections::VecDeque;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering};
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use core::pin::Pin;
+use core::future::Future;
+
+use std::thread::{self, JoinHandle};
+use std::sync::{Mutex, Condvar};
+use std::time::{Duration, Instant};
+
+use super::task::{Task, TaskId, TaskState, JoinHandle as TaskJoinHandle};
+use super::waker::TaskWaker;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXECUTOR CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Executor configuration
+#[derive(Debug, Clone)]
+pub struct ExecutorConfig {
+    /// Number of worker threads (0 = auto-detect)
+    pub worker_threads: usize,
+    
+    /// Stack size for worker threads
+    pub thread_stack_size: usize,
+    
+    /// Name prefix for worker threads
+    pub thread_name_prefix: String,
+    
+    /// Enable work stealing
+    pub work_stealing: bool,
+    
+    /// Global queue capacity
+    pub global_queue_capacity: usize,
+    
+    /// Local queue capacity per worker
+    pub local_queue_capacity: usize,
+    
+    /// Polling interval for idle workers
+    pub idle_poll_interval: Duration,
+    
+    /// Enable task metrics
+    pub enable_metrics: bool,
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        let cpus = num_cpus();
+        
+        ExecutorConfig {
+            worker_threads: cpus,
+            thread_stack_size: 2 * 1024 * 1024, // 2 MB
+            thread_name_prefix: "quanta-worker".to_string(),
+            work_stealing: true,
+            global_queue_capacity: 65536,
+            local_queue_capacity: 256,
+            idle_poll_interval: Duration::from_micros(100),
+            enable_metrics: false,
+        }
+    }
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RUNTIME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The async runtime
+pub struct Runtime {
+    /// Shared executor state
+    shared: Arc<Shared>,
+    
+    /// Worker thread handles
+    workers: Vec<JoinHandle<()>>,
+    
+    /// Configuration
+    config: ExecutorConfig,
+    
+    /// Shutdown flag
+    shutdown: Arc<AtomicBool>,
+}
+
+/// Shared state between workers
+struct Shared {
+    /// Global task injection queue
+    global_queue: Mutex<VecDeque<Arc<Task>>>,
+    
+    /// Condition variable for waking idle workers
+    condvar: Condvar,
+    
+    /// Per-worker local queues (for work stealing)
+    local_queues: Vec<WorkStealingDeque>,
+    
+    /// Next task ID
+    next_task_id: AtomicU64,
+    
+    /// Active task count
+    active_tasks: AtomicUsize,
+    
+    /// Completed task count
+    completed_tasks: AtomicU64,
+    
+    /// Shutdown flag
+    shutdown: AtomicBool,
+    
+    /// Number of workers
+    worker_count: usize,
+    
+    /// Metrics (if enabled)
+    metrics: Option<Mutex<ExecutorMetrics>>,
+}
+
+impl Runtime {
+    /// Create a new runtime with default configuration
+    pub fn new() -> Self {
+        Self::with_config(ExecutorConfig::default())
+    }
+    
+    /// Create a new runtime with custom configuration
+    pub fn with_config(config: ExecutorConfig) -> Self {
+        let worker_count = if config.worker_threads == 0 {
+            num_cpus()
+        } else {
+            config.worker_threads
+        };
+        
+        let local_queues: Vec<WorkStealingDeque> = (0..worker_count)
+            .map(|_| WorkStealingDeque::new(config.local_queue_capacity))
+            .collect();
+        
+        let metrics = if config.enable_metrics {
+            Some(Mutex::new(ExecutorMetrics::new()))
+        } else {
+            None
+        };
+        
+        let shared = Arc::new(Shared {
+            global_queue: Mutex::new(VecDeque::with_capacity(config.global_queue_capacity)),
+            condvar: Condvar::new(),
+            local_queues,
+            next_task_id: AtomicU64::new(1),
+            active_tasks: AtomicUsize::new(0),
+            completed_tasks: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
+            worker_count,
+            metrics,
+        });
+        
+        let shutdown = Arc::new(AtomicBool::new(false));
+        
+        // Spawn worker threads
+        let mut workers = Vec::with_capacity(worker_count);
+        
+        for id in 0..worker_count {
+            let shared_clone = Arc::clone(&shared);
+            let shutdown_clone = Arc::clone(&shutdown);
+            let thread_name = format!("{}-{}", config.thread_name_prefix, id);
+            let stack_size = config.thread_stack_size;
+            let work_stealing = config.work_stealing;
+            let poll_interval = config.idle_poll_interval;
+            
+            let handle = thread::Builder::new()
+                .name(thread_name)
+                .stack_size(stack_size)
+                .spawn(move || {
+                    Worker::new(id, shared_clone, shutdown_clone, work_stealing, poll_interval)
+                        .run();
+                })
+                .expect("failed to spawn worker thread");
+            
+            workers.push(handle);
+        }
+        
+        Runtime {
+            shared,
+            workers,
+            config,
+            shutdown,
+        }
+    }
+    
+    /// Spawn a new task
+    pub fn spawn<F>(&self, future: F) -> TaskJoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let task_id = TaskId(self.shared.next_task_id.fetch_add(1, Ordering::Relaxed));
+        let (task, handle) = Task::new(task_id, future);
+        
+        self.shared.active_tasks.fetch_add(1, Ordering::Relaxed);
+        
+        // Inject into global queue
+        {
+            let mut queue = self.shared.global_queue.lock().unwrap();
+            queue.push_back(task);
+        }
+        
+        // Wake a worker
+        self.shared.condvar.notify_one();
+        
+        handle
+    }
+    
+    /// Block on a future until completion
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        // Pin the future on the stack
+        let mut future = core::pin::pin!(future);
+        
+        // Create a simple waker that does nothing (we poll manually)
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(result) => return result,
+                Poll::Pending => {
+                    // Process some tasks while waiting
+                    self.tick();
+                    
+                    // Brief yield to allow other tasks to make progress
+                    thread::yield_now();
+                }
+            }
+        }
+    }
+    
+    /// Process pending tasks (single tick)
+    fn tick(&self) {
+        // Try to steal a task from global queue
+        let task = {
+            let mut queue = self.shared.global_queue.lock().unwrap();
+            queue.pop_front()
+        };
+        
+        if let Some(task) = task {
+            self.poll_task(&task);
+        }
+    }
+    
+    /// Poll a single task
+    fn poll_task(&self, task: &Arc<Task>) {
+        let waker = TaskWaker::new(Arc::clone(task), Arc::clone(&self.shared));
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+        
+        match task.poll(&mut cx) {
+            Poll::Ready(()) => {
+                self.shared.active_tasks.fetch_sub(1, Ordering::Relaxed);
+                self.shared.completed_tasks.fetch_add(1, Ordering::Relaxed);
+            }
+            Poll::Pending => {
+                // Task will be re-scheduled when woken
+            }
+        }
+    }
+    
+    /// Shutdown the runtime
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.shared.shutdown.store(true, Ordering::SeqCst);
+        
+        // Wake all workers
+        self.shared.condvar.notify_all();
+    }
+    
+    /// Shutdown and wait for all workers
+    pub fn shutdown_timeout(self, timeout: Duration) -> Result<(), ShutdownError> {
+        self.shutdown();
+        
+        let deadline = Instant::now() + timeout;
+        
+        for worker in self.workers {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ShutdownError::Timeout);
+            }
+            
+            // Note: std::thread doesn't have join_timeout, so we just join
+            worker.join().map_err(|_| ShutdownError::WorkerPanic)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Get executor metrics (if enabled)
+    pub fn metrics(&self) -> Option<ExecutorMetrics> {
+        self.shared.metrics.as_ref().map(|m| m.lock().unwrap().clone())
+    }
+    
+    /// Get active task count
+    pub fn active_tasks(&self) -> usize {
+        self.shared.active_tasks.load(Ordering::Relaxed)
+    }
+    
+    /// Get completed task count
+    pub fn completed_tasks(&self) -> u64 {
+        self.shared.completed_tasks.load(Ordering::Relaxed)
+    }
+    
+    /// Get worker count
+    pub fn worker_count(&self) -> usize {
+        self.config.worker_threads
+    }
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WORKER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Worker thread state
+struct Worker {
+    id: usize,
+    shared: Arc<Shared>,
+    shutdown: Arc<AtomicBool>,
+    work_stealing: bool,
+    poll_interval: Duration,
+    
+    /// Tasks to process locally
+    local_tasks: VecDeque<Arc<Task>>,
+    
+    /// RNG state for stealing
+    rng: u64,
+}
+
+impl Worker {
+    fn new(
+        id: usize,
+        shared: Arc<Shared>,
+        shutdown: Arc<AtomicBool>,
+        work_stealing: bool,
+        poll_interval: Duration,
+    ) -> Self {
+        Worker {
+            id,
+            shared,
+            shutdown,
+            work_stealing,
+            poll_interval,
+            local_tasks: VecDeque::with_capacity(64),
+            rng: id as u64 ^ 0x5DEECE66D,
+        }
+    }
+    
+    fn run(&mut self) {
+        while !self.shutdown.load(Ordering::Relaxed) {
+            if let Some(task) = self.find_task() {
+                self.poll_task(&task);
+            } else {
+                // No work available, park
+                self.park();
+            }
+        }
+    }
+    
+    fn find_task(&mut self) -> Option<Arc<Task>> {
+        // 1. Check local queue first
+        if let Some(task) = self.local_tasks.pop_front() {
+            return Some(task);
+        }
+        
+        // 2. Check own deque
+        if let Some(task) = self.shared.local_queues[self.id].pop() {
+            return Some(task);
+        }
+        
+        // 3. Check global queue
+        {
+            let mut queue = self.shared.global_queue.lock().unwrap();
+            if let Some(task) = queue.pop_front() {
+                // Grab a batch if available
+                for _ in 0..31 {
+                    if let Some(t) = queue.pop_front() {
+                        self.local_tasks.push_back(t);
+                    } else {
+                        break;
+                    }
+                }
+                return Some(task);
+            }
+        }
+        
+        // 4. Try work stealing
+        if self.work_stealing {
+            return self.steal_task();
+        }
+        
+        None
+    }
+    
+    fn steal_task(&mut self) -> Option<Arc<Task>> {
+        let worker_count = self.shared.worker_count;
+        if worker_count <= 1 {
+            return None;
+        }
+        
+        // Random starting point to avoid contention
+        let start = self.random() as usize % worker_count;
+        
+        for i in 0..worker_count {
+            let victim = (start + i) % worker_count;
+            if victim == self.id {
+                continue;
+            }
+            
+            // Try to steal half of victim's tasks
+            if let Some(task) = self.shared.local_queues[victim].steal() {
+                return Some(task);
+            }
+        }
+        
+        None
+    }
+    
+    fn poll_task(&mut self, task: &Arc<Task>) {
+        let waker = TaskWaker::new(Arc::clone(task), Arc::clone(&self.shared));
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+        
+        match task.poll(&mut cx) {
+            Poll::Ready(()) => {
+                self.shared.active_tasks.fetch_sub(1, Ordering::Relaxed);
+                self.shared.completed_tasks.fetch_add(1, Ordering::Relaxed);
+                
+                if let Some(ref metrics) = self.shared.metrics {
+                    let mut m = metrics.lock().unwrap();
+                    m.tasks_completed += 1;
+                }
+            }
+            Poll::Pending => {
+                // Task will be re-scheduled when woken
+            }
+        }
+    }
+    
+    fn park(&mut self) {
+        let mut queue = self.shared.global_queue.lock().unwrap();
+        
+        // Double-check before parking
+        if !queue.is_empty() {
+            return;
+        }
+        
+        if self.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        
+        // Wait with timeout
+        let _ = self.shared.condvar.wait_timeout(queue, self.poll_interval);
+    }
+    
+    fn random(&mut self) -> u64 {
+        // Simple LCG
+        self.rng = self.rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.rng
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WORK-STEALING DEQUE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Lock-free work-stealing deque
+struct WorkStealingDeque {
+    buffer: UnsafeCell<Vec<Option<Arc<Task>>>>,
+    head: AtomicUsize,  // Steal from head
+    tail: AtomicUsize,  // Push/pop at tail
+    mask: usize,
+}
+
+// Safety: We use atomic operations for synchronization
+unsafe impl Send for WorkStealingDeque {}
+unsafe impl Sync for WorkStealingDeque {}
+
+impl WorkStealingDeque {
+    fn new(capacity: usize) -> Self {
+        // Round up to power of 2
+        let capacity = capacity.next_power_of_two();
+        let buffer = vec![None; capacity];
+        
+        WorkStealingDeque {
+            buffer: UnsafeCell::new(buffer),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            mask: capacity - 1,
+        }
+    }
+    
+    /// Push to local end (only owner thread)
+    fn push(&self, task: Arc<Task>) -> bool {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        
+        if tail.wrapping_sub(head) > self.mask {
+            // Queue is full
+            return false;
+        }
+        
+        unsafe {
+            let buffer = &mut *self.buffer.get();
+            buffer[tail & self.mask] = Some(task);
+        }
+        
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        true
+    }
+    
+    /// Pop from local end (only owner thread)
+    fn pop(&self) -> Option<Arc<Task>> {
+        let tail = self.tail.load(Ordering::Relaxed);
+        if tail == 0 {
+            return None;
+        }
+        
+        let new_tail = tail.wrapping_sub(1);
+        self.tail.store(new_tail, Ordering::Relaxed);
+        
+        core::sync::atomic::fence(Ordering::SeqCst);
+        
+        let head = self.head.load(Ordering::Relaxed);
+        
+        if head <= new_tail {
+            // Queue is not empty
+            unsafe {
+                let buffer = &mut *self.buffer.get();
+                return buffer[new_tail & self.mask].take();
+            }
+        }
+        
+        if head == new_tail.wrapping_add(1) {
+            // Race with stealer, restore tail
+            self.tail.store(tail, Ordering::Relaxed);
+            
+            // Try to win the race
+            if self.head.compare_exchange(
+                head,
+                head.wrapping_add(1),
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ).is_ok() {
+                unsafe {
+                    let buffer = &mut *self.buffer.get();
+                    return buffer[new_tail & self.mask].take();
+                }
+            }
+        }
+        
+        // Queue is empty
+        self.tail.store(tail, Ordering::Relaxed);
+        None
+    }
+    
+    /// Steal from remote end (other threads)
+    fn steal(&self) -> Option<Arc<Task>> {
+        let head = self.head.load(Ordering::Acquire);
+        
+        core::sync::atomic::fence(Ordering::SeqCst);
+        
+        let tail = self.tail.load(Ordering::Acquire);
+        
+        if head >= tail {
+            return None;
+        }
+        
+        // Try to steal
+        let task = unsafe {
+            let buffer = &*self.buffer.get();
+            buffer[head & self.mask].clone()
+        };
+        
+        if self.head.compare_exchange(
+            head,
+            head.wrapping_add(1),
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ).is_ok() {
+            task
+        } else {
+            None
+        }
+    }
+    
+    fn len(&self) -> usize {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Relaxed);
+        tail.wrapping_sub(head)
+    }
+    
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CURRENT RUNTIME HANDLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+thread_local! {
+    static CURRENT_RUNTIME: std::cell::RefCell<Option<Arc<Shared>>> = std::cell::RefCell::new(None);
+}
+
+/// Handle to the current runtime
+#[derive(Clone)]
+pub struct Handle {
+    shared: Arc<Shared>,
+}
+
+impl Handle {
+    /// Get handle to current runtime
+    pub fn current() -> Option<Handle> {
+        CURRENT_RUNTIME.with(|r| {
+            r.borrow().clone().map(|shared| Handle { shared })
+        })
+    }
+    
+    /// Spawn a task on this runtime
+    pub fn spawn<F>(&self, future: F) -> TaskJoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let task_id = TaskId(self.shared.next_task_id.fetch_add(1, Ordering::Relaxed));
+        let (task, handle) = Task::new(task_id, future);
+        
+        self.shared.active_tasks.fetch_add(1, Ordering::Relaxed);
+        
+        {
+            let mut queue = self.shared.global_queue.lock().unwrap();
+            queue.push_back(task);
+        }
+        
+        self.shared.condvar.notify_one();
+        
+        handle
+    }
+}
+
+/// Enter the runtime context
+pub fn enter<F, R>(runtime: &Runtime, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    CURRENT_RUNTIME.with(|r| {
+        *r.borrow_mut() = Some(Arc::clone(&runtime.shared));
+    });
+    
+    let result = f();
+    
+    CURRENT_RUNTIME.with(|r| {
+        *r.borrow_mut() = None;
+    });
+    
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// METRICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Executor metrics
+#[derive(Debug, Clone, Default)]
+pub struct ExecutorMetrics {
+    pub tasks_spawned: u64,
+    pub tasks_completed: u64,
+    pub tasks_stolen: u64,
+    pub polls_total: u64,
+    pub polls_pending: u64,
+    pub park_count: u64,
+    pub unpark_count: u64,
+}
+
+impl ExecutorMetrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub enum ShutdownError {
+    Timeout,
+    WorkerPanic,
+}
+
+impl std::fmt::Display for ShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "shutdown timed out"),
+            Self::WorkerPanic => write!(f, "worker thread panicked"),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create a no-op waker
+fn noop_waker() -> Waker {
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+    
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SINGLE-THREADED EXECUTOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Single-threaded executor for embedded/constrained environments
+pub struct LocalExecutor {
+    queue: VecDeque<Arc<Task>>,
+    next_task_id: u64,
+}
+
+impl LocalExecutor {
+    pub fn new() -> Self {
+        LocalExecutor {
+            queue: VecDeque::new(),
+            next_task_id: 1,
+        }
+    }
+    
+    /// Spawn a task (not Send required)
+    pub fn spawn_local<F>(&mut self, future: F) -> TaskJoinHandle<F::Output>
+    where
+        F: Future + 'static,
+        F::Output: 'static,
+    {
+        let task_id = TaskId(self.next_task_id);
+        self.next_task_id += 1;
+        
+        let (task, handle) = Task::new_local(task_id, future);
+        self.queue.push_back(task);
+        handle
+    }
+    
+    /// Run until all tasks complete
+    pub fn run(&mut self) {
+        while let Some(task) = self.queue.pop_front() {
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            
+            match task.poll(&mut cx) {
+                Poll::Ready(()) => {
+                    // Task completed
+                }
+                Poll::Pending => {
+                    // Re-queue (simple round-robin)
+                    self.queue.push_back(task);
+                }
+            }
+        }
+    }
+    
+    /// Block on a single future
+    pub fn block_on<F: Future>(&mut self, future: F) -> F::Output {
+        let mut future = core::pin::pin!(future);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(result) => return result,
+                Poll::Pending => {
+                    // Process other tasks
+                    if let Some(task) = self.queue.pop_front() {
+                        match task.poll(&mut cx) {
+                            Poll::Pending => self.queue.push_back(task),
+                            Poll::Ready(()) => {}
+                        }
+                    }
+                    thread::yield_now();
+                }
+            }
+        }
+    }
+}
+
+impl Default for LocalExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_executor_config_default() {
+        let config = ExecutorConfig::default();
+        assert!(config.worker_threads >= 1);
+        assert!(config.work_stealing);
+    }
+    
+    #[test]
+    fn test_runtime_new() {
+        let rt = Runtime::new();
+        assert!(rt.worker_count() >= 1);
+        assert_eq!(rt.active_tasks(), 0);
+    }
+    
+    #[test]
+    fn test_work_stealing_deque() {
+        let deque = WorkStealingDeque::new(16);
+        
+        // Push some tasks
+        let task = Arc::new(Task::empty(TaskId(1)));
+        assert!(deque.push(Arc::clone(&task)));
+        
+        assert_eq!(deque.len(), 1);
+        assert!(!deque.is_empty());
+        
+        // Pop
+        let popped = deque.pop();
+        assert!(popped.is_some());
+        assert!(deque.is_empty());
+    }
+    
+    #[test]
+    fn test_local_executor() {
+        let mut executor = LocalExecutor::new();
+        
+        let result = executor.block_on(async {
+            42
+        });
+        
+        assert_eq!(result, 42);
+    }
+    
+    #[test]
+    fn test_noop_waker() {
+        let waker = noop_waker();
+        waker.wake_by_ref(); // Should not panic
+    }
+}

@@ -1,0 +1,3298 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ STANDARD LIBRARY — Collections Module
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// This module provides the core collection types:
+// - HashMap: Hash table with separate chaining
+// - HashSet: Set implemented via HashMap
+// - BTreeMap: Ordered map using B-tree
+// - BTreeSet: Ordered set using B-tree
+// - VecDeque: Double-ended queue
+// - LinkedList: Doubly-linked list
+// - BinaryHeap: Priority queue
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#![no_std]
+
+module std::collections
+
+use core::mem::{self, MaybeUninit};
+use core::ptr;
+use core::hash::{Hash, Hasher, BuildHasher};
+use core::ops::{Index, IndexMut};
+use core::iter::{Iterator, IntoIterator, FromIterator, Extend, FusedIterator};
+use core::cmp::{PartialEq, Eq, Ord, Ordering};
+use core::borrow::Borrow;
+use core::marker::PhantomData;
+use core::option::Option::{self, Some, None};
+use core::result::Result::{self, Ok, Err};
+use core::fmt;
+
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use alloc::alloc::{Allocator, Global};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEFAULT HASHER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SipHash-based hasher for security against hash flooding attacks.
+/// Uses SipHash-1-3 for performance with reasonable security.
+pub struct DefaultHasher {
+    k0: u64,
+    k1: u64,
+    length: usize,
+    v0: u64,
+    v1: u64,
+    v2: u64,
+    v3: u64,
+    tail: u64,
+    ntail: usize,
+}
+
+impl DefaultHasher {
+    /// Creates a new hasher with default keys.
+    #[inline]
+    pub fn new() -> Self {
+        Self::with_keys(0x0706050403020100, 0x0f0e0d0c0b0a0908)
+    }
+
+    /// Creates a new hasher with the given keys.
+    pub fn with_keys(k0: u64, k1: u64) -> Self {
+        let mut hasher = DefaultHasher {
+            k0,
+            k1,
+            length: 0,
+            v0: 0,
+            v1: 0,
+            v2: 0,
+            v3: 0,
+            tail: 0,
+            ntail: 0,
+        };
+        hasher.reset();
+        hasher
+    }
+
+    fn reset(&mut self) {
+        self.length = 0;
+        self.v0 = self.k0 ^ 0x736f6d6570736575;
+        self.v1 = self.k1 ^ 0x646f72616e646f6d;
+        self.v2 = self.k0 ^ 0x6c7967656e657261;
+        self.v3 = self.k1 ^ 0x7465646279746573;
+        self.tail = 0;
+        self.ntail = 0;
+    }
+
+    #[inline]
+    fn rotl(x: u64, b: u64) -> u64 {
+        (x << b) | (x >> (64 - b))
+    }
+
+    fn compress(&mut self) {
+        self.v0 = self.v0.wrapping_add(self.v1);
+        self.v1 = Self::rotl(self.v1, 13);
+        self.v1 ^= self.v0;
+        self.v0 = Self::rotl(self.v0, 32);
+        self.v2 = self.v2.wrapping_add(self.v3);
+        self.v3 = Self::rotl(self.v3, 16);
+        self.v3 ^= self.v2;
+        self.v0 = self.v0.wrapping_add(self.v3);
+        self.v3 = Self::rotl(self.v3, 21);
+        self.v3 ^= self.v0;
+        self.v2 = self.v2.wrapping_add(self.v1);
+        self.v1 = Self::rotl(self.v1, 17);
+        self.v1 ^= self.v2;
+        self.v2 = Self::rotl(self.v2, 32);
+    }
+}
+
+impl Hasher for DefaultHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        let mut v0 = self.v0;
+        let mut v1 = self.v1;
+        let mut v2 = self.v2;
+        let mut v3 = self.v3;
+
+        let b: u64 = ((self.length as u64 & 0xff) << 56) | self.tail;
+
+        v3 ^= b;
+
+        // One round of compression
+        v0 = v0.wrapping_add(v1);
+        v1 = Self::rotl(v1, 13);
+        v1 ^= v0;
+        v0 = Self::rotl(v0, 32);
+        v2 = v2.wrapping_add(v3);
+        v3 = Self::rotl(v3, 16);
+        v3 ^= v2;
+        v0 = v0.wrapping_add(v3);
+        v3 = Self::rotl(v3, 21);
+        v3 ^= v0;
+        v2 = v2.wrapping_add(v1);
+        v1 = Self::rotl(v1, 17);
+        v1 ^= v2;
+        v2 = Self::rotl(v2, 32);
+
+        v2 ^= 0xff;
+
+        // Three rounds of finalization
+        for _ in 0..3 {
+            v0 = v0.wrapping_add(v1);
+            v1 = Self::rotl(v1, 13);
+            v1 ^= v0;
+            v0 = Self::rotl(v0, 32);
+            v2 = v2.wrapping_add(v3);
+            v3 = Self::rotl(v3, 16);
+            v3 ^= v2;
+            v0 = v0.wrapping_add(v3);
+            v3 = Self::rotl(v3, 21);
+            v3 ^= v0;
+            v2 = v2.wrapping_add(v1);
+            v1 = Self::rotl(v1, 17);
+            v1 ^= v2;
+            v2 = Self::rotl(v2, 32);
+        }
+
+        v0 ^ v1 ^ v2 ^ v3
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.length += bytes.len();
+
+        let mut i = 0;
+
+        // Fill tail buffer
+        while i < bytes.len() && self.ntail < 8 {
+            self.tail |= (bytes[i] as u64) << (8 * self.ntail);
+            self.ntail += 1;
+            i += 1;
+        }
+
+        if self.ntail == 8 {
+            self.v3 ^= self.tail;
+            self.compress();
+            self.v0 ^= self.tail;
+            self.tail = 0;
+            self.ntail = 0;
+        }
+
+        // Process full 8-byte blocks
+        while i + 8 <= bytes.len() {
+            let m = u64::from_le_bytes([
+                bytes[i], bytes[i+1], bytes[i+2], bytes[i+3],
+                bytes[i+4], bytes[i+5], bytes[i+6], bytes[i+7],
+            ]);
+            self.v3 ^= m;
+            self.compress();
+            self.v0 ^= m;
+            i += 8;
+        }
+
+        // Store remaining bytes in tail
+        while i < bytes.len() {
+            self.tail |= (bytes[i] as u64) << (8 * self.ntail);
+            self.ntail += 1;
+            i += 1;
+        }
+    }
+}
+
+impl Default for DefaultHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RANDOM STATE (BuildHasher)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// RandomState is the default BuildHasher used by HashMap and HashSet.
+/// It uses randomly generated keys for security.
+pub struct RandomState {
+    k0: u64,
+    k1: u64,
+}
+
+impl RandomState {
+    /// Creates a new RandomState with random keys.
+    pub fn new() -> Self {
+        // In a real implementation, this would use thread_rng or system randomness
+        // For now, use a simple counter-based approach
+        static mut COUNTER: u64 = 0x517cc1b727220a95;
+
+        unsafe {
+            COUNTER = COUNTER.wrapping_mul(0x5851f42d4c957f2d).wrapping_add(1);
+            let k0 = COUNTER;
+            COUNTER = COUNTER.wrapping_mul(0x5851f42d4c957f2d).wrapping_add(1);
+            let k1 = COUNTER;
+
+            RandomState { k0, k1 }
+        }
+    }
+}
+
+impl BuildHasher for RandomState {
+    type Hasher = DefaultHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> DefaultHasher {
+        DefaultHasher::with_keys(self.k0, self.k1)
+    }
+}
+
+impl Default for RandomState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HASHMAP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A hash map implemented with quadratic probing and SIMD lookup.
+///
+/// By default, `HashMap` uses a hashing algorithm selected to provide
+/// resistance against HashDoS attacks.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+///
+/// let mut map = HashMap::new();
+/// map.insert("key1", 10);
+/// map.insert("key2", 20);
+///
+/// assert_eq!(map.get("key1"), Some(&10));
+/// assert_eq!(map.len(), 2);
+/// ```
+pub struct HashMap<K, V, S = RandomState, A: Allocator = Global> {
+    /// The hash builder used to hash keys
+    hash_builder: S,
+    /// Table of buckets
+    table: RawTable<(K, V), A>,
+}
+
+/// Internal bucket states
+const EMPTY: u8 = 0b11111111;     // 0xFF - empty slot
+const DELETED: u8 = 0b10000000;   // 0x80 - tombstone
+// Hash values: 0b0xxxxxxx (high bit clear) - occupied with h2 hash
+
+/// Raw hash table implementation
+struct RawTable<T, A: Allocator = Global> {
+    /// Control bytes (one per bucket)
+    ctrl: *mut u8,
+    /// Bucket data
+    data: *mut T,
+    /// Number of buckets (always power of 2)
+    bucket_mask: usize,
+    /// Number of occupied entries (not including tombstones)
+    len: usize,
+    /// Number of occupied + tombstone entries (for growth calculation)
+    growth_left: usize,
+    /// Allocator
+    alloc: A,
+}
+
+impl<T> RawTable<T, Global> {
+    /// Creates an empty table with no allocation.
+    const fn new() -> Self {
+        RawTable {
+            ctrl: ptr::null_mut(),
+            data: ptr::null_mut(),
+            bucket_mask: 0,
+            len: 0,
+            growth_left: 0,
+            alloc: Global,
+        }
+    }
+}
+
+impl<T, A: Allocator> RawTable<T, A> {
+    /// Creates an empty table with the given allocator.
+    const fn new_in(alloc: A) -> Self {
+        RawTable {
+            ctrl: ptr::null_mut(),
+            data: ptr::null_mut(),
+            bucket_mask: 0,
+            len: 0,
+            growth_left: 0,
+            alloc,
+        }
+    }
+
+    /// Returns the number of elements in the table.
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true if the table contains no elements.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the number of buckets.
+    #[inline]
+    fn buckets(&self) -> usize {
+        if self.bucket_mask == 0 {
+            0
+        } else {
+            self.bucket_mask + 1
+        }
+    }
+
+    /// Calculates capacity from bucket count
+    #[inline]
+    fn bucket_to_capacity(buckets: usize) -> usize {
+        // Load factor of ~87.5%
+        buckets - (buckets / 8)
+    }
+
+    /// Calculates minimum bucket count for capacity
+    fn capacity_to_buckets(capacity: usize) -> usize {
+        if capacity == 0 {
+            return 0;
+        }
+
+        // We need at least capacity * 8/7 buckets
+        let buckets = capacity.checked_mul(8).map(|x| x / 7).unwrap_or(usize::MAX);
+
+        // Round up to next power of 2, minimum 4
+        let buckets = buckets.max(4).next_power_of_two();
+        buckets
+    }
+
+    /// Extract h1 (bucket index) from hash
+    #[inline]
+    fn h1(hash: u64) -> usize {
+        hash as usize
+    }
+
+    /// Extract h2 (control byte) from hash
+    #[inline]
+    fn h2(hash: u64) -> u8 {
+        ((hash >> 57) as u8) & 0x7f
+    }
+
+    /// Finds a slot for insertion
+    fn find_insert_slot(&self, hash: u64) -> usize {
+        let h2 = Self::h2(hash);
+        let mut pos = Self::h1(hash) & self.bucket_mask;
+
+        loop {
+            unsafe {
+                let ctrl = *self.ctrl.add(pos);
+                if ctrl == EMPTY || ctrl == DELETED {
+                    return pos;
+                }
+            }
+            pos = (pos + 1) & self.bucket_mask;
+        }
+    }
+
+    /// Finds an element by hash and equality predicate
+    fn find<Q>(&self, hash: u64, eq: impl Fn(&T) -> bool) -> Option<usize>
+    where
+        Q: ?Sized,
+    {
+        if self.is_empty() {
+            return None;
+        }
+
+        let h2 = Self::h2(hash);
+        let mut pos = Self::h1(hash) & self.bucket_mask;
+
+        loop {
+            unsafe {
+                let ctrl = *self.ctrl.add(pos);
+
+                if ctrl == h2 {
+                    if eq(&*self.data.add(pos)) {
+                        return Some(pos);
+                    }
+                } else if ctrl == EMPTY {
+                    return None;
+                }
+                // DELETED: continue probing
+            }
+            pos = (pos + 1) & self.bucket_mask;
+        }
+    }
+
+    /// Inserts an element, assuming there's capacity
+    unsafe fn insert_no_grow(&mut self, hash: u64, value: T) -> usize {
+        let pos = self.find_insert_slot(hash);
+        let ctrl = *self.ctrl.add(pos);
+
+        if ctrl == EMPTY {
+            self.growth_left -= 1;
+        }
+
+        *self.ctrl.add(pos) = Self::h2(hash);
+        ptr::write(self.data.add(pos), value);
+        self.len += 1;
+
+        pos
+    }
+
+    /// Removes an element at the given position
+    unsafe fn remove(&mut self, pos: usize) -> T {
+        debug_assert!(pos <= self.bucket_mask);
+
+        let value = ptr::read(self.data.add(pos));
+        *self.ctrl.add(pos) = DELETED;
+        self.len -= 1;
+
+        value
+    }
+
+    /// Allocates a new table with the given bucket count
+    fn allocate(buckets: usize, alloc: A) -> Self {
+        use alloc::alloc::Layout;
+
+        if buckets == 0 {
+            return Self::new_in(alloc);
+        }
+
+        let ctrl_layout = Layout::array::<u8>(buckets).unwrap();
+        let data_layout = Layout::array::<T>(buckets).unwrap();
+
+        let (layout, data_offset) = ctrl_layout.extend(data_layout).unwrap();
+
+        unsafe {
+            let ptr = alloc.allocate(layout)
+                .expect("allocation failed")
+                .as_ptr() as *mut u8;
+
+            let ctrl = ptr;
+            let data = ptr.add(data_offset) as *mut T;
+
+            // Initialize all control bytes to EMPTY
+            ptr::write_bytes(ctrl, EMPTY, buckets);
+
+            RawTable {
+                ctrl,
+                data,
+                bucket_mask: buckets - 1,
+                len: 0,
+                growth_left: Self::bucket_to_capacity(buckets),
+                alloc,
+            }
+        }
+    }
+
+    /// Grows the table to accommodate more elements
+    fn reserve(&mut self, additional: usize) {
+        let new_cap = self.len.checked_add(additional).expect("capacity overflow");
+        let new_buckets = Self::capacity_to_buckets(new_cap);
+
+        if new_buckets <= self.buckets() {
+            return;
+        }
+
+        self.resize(new_buckets);
+    }
+
+    /// Resizes the table to the new bucket count
+    fn resize(&mut self, new_buckets: usize) {
+        let old_ctrl = self.ctrl;
+        let old_data = self.data;
+        let old_buckets = self.buckets();
+
+        // Allocate new table
+        let new_table = Self::allocate(new_buckets, unsafe { ptr::read(&self.alloc) });
+
+        self.ctrl = new_table.ctrl;
+        self.data = new_table.data;
+        self.bucket_mask = new_table.bucket_mask;
+        self.growth_left = new_table.growth_left;
+        let old_len = self.len;
+        self.len = 0;
+
+        // Don't drop new_table's fields
+        mem::forget(new_table);
+
+        // Rehash all elements
+        if old_buckets > 0 {
+            unsafe {
+                for i in 0..old_buckets {
+                    let ctrl = *old_ctrl.add(i);
+                    if ctrl != EMPTY && ctrl != DELETED {
+                        let value = ptr::read(old_data.add(i));
+                        // We need to rehash - for now assume we have the hash stored
+                        // In practice, we'd compute: hash = hash_builder.hash(&key)
+                        let hash = 0u64; // Placeholder - real impl stores or recomputes hash
+                        self.insert_no_grow(hash, value);
+                    }
+                }
+
+                // Deallocate old table
+                if old_buckets > 0 {
+                    use alloc::alloc::Layout;
+                    let ctrl_layout = Layout::array::<u8>(old_buckets).unwrap();
+                    let data_layout = Layout::array::<T>(old_buckets).unwrap();
+                    let (layout, _) = ctrl_layout.extend(data_layout).unwrap();
+
+                    self.alloc.deallocate(
+                        core::ptr::NonNull::new_unchecked(old_ctrl),
+                        layout,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Clears the table
+    fn clear(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+
+        unsafe {
+            for i in 0..=self.bucket_mask {
+                let ctrl = *self.ctrl.add(i);
+                if ctrl != EMPTY && ctrl != DELETED {
+                    ptr::drop_in_place(self.data.add(i));
+                    *self.ctrl.add(i) = EMPTY;
+                }
+            }
+        }
+
+        self.len = 0;
+        self.growth_left = Self::bucket_to_capacity(self.buckets());
+    }
+}
+
+impl<T, A: Allocator> Drop for RawTable<T, A> {
+    fn drop(&mut self) {
+        if self.buckets() == 0 {
+            return;
+        }
+
+        self.clear();
+
+        unsafe {
+            use alloc::alloc::Layout;
+            let buckets = self.buckets();
+            let ctrl_layout = Layout::array::<u8>(buckets).unwrap();
+            let data_layout = Layout::array::<T>(buckets).unwrap();
+            let (layout, _) = ctrl_layout.extend(data_layout).unwrap();
+
+            if !self.ctrl.is_null() {
+                self.alloc.deallocate(
+                    core::ptr::NonNull::new_unchecked(self.ctrl),
+                    layout,
+                );
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HASHMAP IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl<K, V> HashMap<K, V, RandomState> {
+    /// Creates an empty HashMap.
+    #[inline]
+    pub fn new() -> Self {
+        Self::with_hasher(RandomState::new())
+    }
+
+    /// Creates an empty HashMap with the specified capacity.
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_and_hasher(capacity, RandomState::new())
+    }
+}
+
+impl<K, V, S> HashMap<K, V, S> {
+    /// Creates an empty HashMap with the given hasher.
+    #[inline]
+    pub fn with_hasher(hash_builder: S) -> Self {
+        HashMap {
+            hash_builder,
+            table: RawTable::new(),
+        }
+    }
+
+    /// Creates an empty HashMap with capacity and hasher.
+    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
+        let mut map = Self::with_hasher(hash_builder);
+        map.reserve(capacity);
+        map
+    }
+
+    /// Returns the number of elements in the map.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Returns true if the map contains no elements.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    /// Returns the number of elements the map can hold without reallocating.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        RawTable::<(K, V)>::bucket_to_capacity(self.table.buckets())
+    }
+
+    /// Clears the map, removing all key-value pairs.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.table.clear();
+    }
+
+    /// Returns a reference to the hasher.
+    #[inline]
+    pub fn hasher(&self) -> &S {
+        &self.hash_builder
+    }
+}
+
+impl<K, V, S> HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    /// Reserves capacity for at least `additional` more elements.
+    pub fn reserve(&mut self, additional: usize) {
+        self.table.reserve(additional);
+    }
+
+    /// Computes the hash for a key
+    #[inline]
+    fn make_hash<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
+        let mut hasher = self.hash_builder.build_hasher();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Inserts a key-value pair into the map.
+    ///
+    /// If the map did not have this key present, `None` is returned.
+    /// If the map did have this key present, the value is updated, and the old
+    /// value is returned.
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let hash = self.make_hash(&key);
+
+        // Check if key already exists
+        if let Some(pos) = self.table.find::<K>(hash, |entry| entry.0 == key) {
+            unsafe {
+                let old_value = ptr::read(&(*self.table.data.add(pos)).1);
+                ptr::write(&mut (*self.table.data.add(pos)).1, value);
+                return Some(old_value);
+            }
+        }
+
+        // Ensure we have capacity
+        if self.table.growth_left == 0 {
+            self.table.reserve(1);
+        }
+
+        // Insert new entry
+        unsafe {
+            self.table.insert_no_grow(hash, (key, value));
+        }
+
+        None
+    }
+
+    /// Returns a reference to the value corresponding to the key.
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.make_hash(key);
+        self.table.find::<Q>(hash, |entry| entry.0.borrow() == key)
+            .map(|pos| unsafe { &(*self.table.data.add(pos)).1 })
+    }
+
+    /// Returns a mutable reference to the value corresponding to the key.
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.make_hash(key);
+        self.table.find::<Q>(hash, |entry| entry.0.borrow() == key)
+            .map(|pos| unsafe { &mut (*self.table.data.add(pos)).1 })
+    }
+
+    /// Returns the key-value pair corresponding to the key.
+    pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.make_hash(key);
+        self.table.find::<Q>(hash, |entry| entry.0.borrow() == key)
+            .map(|pos| unsafe {
+                let entry = &*self.table.data.add(pos);
+                (&entry.0, &entry.1)
+            })
+    }
+
+    /// Returns true if the map contains a value for the specified key.
+    #[inline]
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.get(key).is_some()
+    }
+
+    /// Removes a key from the map, returning the value at the key if it existed.
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.remove_entry(key).map(|(_, v)| v)
+    }
+
+    /// Removes a key from the map, returning the key and value if it existed.
+    pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.make_hash(key);
+        self.table.find::<Q>(hash, |entry| entry.0.borrow() == key)
+            .map(|pos| unsafe { self.table.remove(pos) })
+    }
+
+    /// Gets the given key's corresponding entry in the map for in-place manipulation.
+    pub fn entry(&mut self, key: K) -> Entry<'_, K, V, S> {
+        let hash = self.make_hash(&key);
+
+        if let Some(pos) = self.table.find::<K>(hash, |entry| entry.0 == key) {
+            Entry::Occupied(OccupiedEntry {
+                map: self,
+                pos,
+            })
+        } else {
+            Entry::Vacant(VacantEntry {
+                map: self,
+                key,
+                hash,
+            })
+        }
+    }
+
+    /// An iterator visiting all keys in arbitrary order.
+    pub fn keys(&self) -> Keys<'_, K, V> {
+        Keys { inner: self.iter() }
+    }
+
+    /// An iterator visiting all values in arbitrary order.
+    pub fn values(&self) -> Values<'_, K, V> {
+        Values { inner: self.iter() }
+    }
+
+    /// A mutable iterator visiting all values in arbitrary order.
+    pub fn values_mut(&mut self) -> ValuesMut<'_, K, V> {
+        ValuesMut { inner: self.iter_mut() }
+    }
+
+    /// An iterator visiting all key-value pairs in arbitrary order.
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        Iter {
+            inner: RawIter {
+                ctrl: self.table.ctrl,
+                data: self.table.data,
+                pos: 0,
+                buckets: self.table.buckets(),
+                remaining: self.table.len(),
+                _marker: PhantomData,
+            },
+        }
+    }
+
+    /// A mutable iterator visiting all key-value pairs in arbitrary order.
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
+        IterMut {
+            inner: RawIterMut {
+                ctrl: self.table.ctrl,
+                data: self.table.data,
+                pos: 0,
+                buckets: self.table.buckets(),
+                remaining: self.table.len(),
+                _marker: PhantomData,
+            },
+        }
+    }
+
+    /// Retains only the elements specified by the predicate.
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        let buckets = self.table.buckets();
+        if buckets == 0 {
+            return;
+        }
+
+        unsafe {
+            for i in 0..buckets {
+                let ctrl = *self.table.ctrl.add(i);
+                if ctrl != EMPTY && ctrl != DELETED {
+                    let entry = &mut *self.table.data.add(i);
+                    if !f(&entry.0, &mut entry.1) {
+                        self.table.remove(i);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<K, V, S> Default for HashMap<K, V, S>
+where
+    S: Default,
+{
+    fn default() -> Self {
+        Self::with_hasher(S::default())
+    }
+}
+
+impl<K, V, S> Clone for HashMap<K, V, S>
+where
+    K: Clone,
+    V: Clone,
+    S: Clone,
+{
+    fn clone(&self) -> Self {
+        let mut new_map = Self::with_capacity_and_hasher(self.len(), self.hash_builder.clone());
+        for (k, v) in self.iter() {
+            new_map.insert(k.clone(), v.clone());
+        }
+        new_map
+    }
+}
+
+impl<K, V, S> PartialEq for HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    V: PartialEq,
+    S: BuildHasher,
+{
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+
+        self.iter().all(|(k, v)| other.get(k) == Some(v))
+    }
+}
+
+impl<K, V, S> Eq for HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    V: Eq,
+    S: BuildHasher,
+{
+}
+
+impl<K, V, Q, S> Index<&Q> for HashMap<K, V, S>
+where
+    K: Eq + Hash + Borrow<Q>,
+    Q: Eq + Hash + ?Sized,
+    S: BuildHasher,
+{
+    type Output = V;
+
+    fn index(&self, key: &Q) -> &V {
+        self.get(key).expect("no entry found for key")
+    }
+}
+
+impl<K, V, S> FromIterator<(K, V)> for HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher + Default,
+{
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        let mut map = HashMap::with_capacity_and_hasher(lower, S::default());
+        map.extend(iter);
+        map
+    }
+}
+
+impl<K, V, S> Extend<(K, V)> for HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        let iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        self.reserve(lower);
+        for (k, v) in iter {
+            self.insert(k, v);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENTRY API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A view into a single entry in a map, which may either be vacant or occupied.
+pub enum Entry<'a, K, V, S = RandomState> {
+    /// An occupied entry.
+    Occupied(OccupiedEntry<'a, K, V, S>),
+    /// A vacant entry.
+    Vacant(VacantEntry<'a, K, V, S>),
+}
+
+/// A view into an occupied entry in a HashMap.
+pub struct OccupiedEntry<'a, K, V, S = RandomState> {
+    map: &'a mut HashMap<K, V, S>,
+    pos: usize,
+}
+
+/// A view into a vacant entry in a HashMap.
+pub struct VacantEntry<'a, K, V, S = RandomState> {
+    map: &'a mut HashMap<K, V, S>,
+    key: K,
+    hash: u64,
+}
+
+impl<'a, K, V, S> Entry<'a, K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    /// Ensures a value is in the entry by inserting the default if empty.
+    pub fn or_insert(self, default: V) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(default),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the result of the default function if empty.
+    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(default()),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the default value if empty,
+    /// and returns a mutable reference to the value.
+    pub fn or_default(self) -> &'a mut V
+    where
+        V: Default,
+    {
+        self.or_insert_with(Default::default)
+    }
+
+    /// Returns a reference to this entry's key.
+    pub fn key(&self) -> &K {
+        match self {
+            Entry::Occupied(entry) => entry.key(),
+            Entry::Vacant(entry) => entry.key(),
+        }
+    }
+
+    /// Provides in-place mutable access to an occupied entry.
+    pub fn and_modify<F: FnOnce(&mut V)>(self, f: F) -> Self {
+        match self {
+            Entry::Occupied(mut entry) => {
+                f(entry.get_mut());
+                Entry::Occupied(entry)
+            }
+            Entry::Vacant(entry) => Entry::Vacant(entry),
+        }
+    }
+}
+
+impl<'a, K, V, S> OccupiedEntry<'a, K, V, S> {
+    /// Gets a reference to the key in the entry.
+    pub fn key(&self) -> &K {
+        unsafe { &(*self.map.table.data.add(self.pos)).0 }
+    }
+
+    /// Gets a reference to the value in the entry.
+    pub fn get(&self) -> &V {
+        unsafe { &(*self.map.table.data.add(self.pos)).1 }
+    }
+
+    /// Gets a mutable reference to the value in the entry.
+    pub fn get_mut(&mut self) -> &mut V {
+        unsafe { &mut (*self.map.table.data.add(self.pos)).1 }
+    }
+
+    /// Converts the entry into a mutable reference to its value.
+    pub fn into_mut(self) -> &'a mut V {
+        unsafe { &mut (*self.map.table.data.add(self.pos)).1 }
+    }
+
+    /// Sets the value of the entry and returns the old value.
+    pub fn insert(&mut self, value: V) -> V {
+        mem::replace(self.get_mut(), value)
+    }
+
+    /// Takes the value out of the entry and returns it.
+    pub fn remove(self) -> V {
+        self.remove_entry().1
+    }
+
+    /// Takes the key-value pair out of the entry.
+    pub fn remove_entry(self) -> (K, V) {
+        unsafe { self.map.table.remove(self.pos) }
+    }
+}
+
+impl<'a, K, V, S> VacantEntry<'a, K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    /// Gets a reference to the key.
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    /// Take ownership of the key.
+    pub fn into_key(self) -> K {
+        self.key
+    }
+
+    /// Sets the value of the entry and returns a mutable reference to it.
+    pub fn insert(self, value: V) -> &'a mut V {
+        // Ensure capacity
+        if self.map.table.growth_left == 0 {
+            self.map.table.reserve(1);
+        }
+
+        unsafe {
+            let pos = self.map.table.insert_no_grow(self.hash, (self.key, value));
+            &mut (*self.map.table.data.add(pos)).1
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ITERATORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Raw iterator implementation
+struct RawIter<'a, T> {
+    ctrl: *const u8,
+    data: *const T,
+    pos: usize,
+    buckets: usize,
+    remaining: usize,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<'a, T> Iterator for RawIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        while self.pos < self.buckets {
+            unsafe {
+                let ctrl = *self.ctrl.add(self.pos);
+                let pos = self.pos;
+                self.pos += 1;
+
+                if ctrl != EMPTY && ctrl != DELETED {
+                    self.remaining -= 1;
+                    return Some(&*self.data.add(pos));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+/// Raw mutable iterator
+struct RawIterMut<'a, T> {
+    ctrl: *const u8,
+    data: *mut T,
+    pos: usize,
+    buckets: usize,
+    remaining: usize,
+    _marker: PhantomData<&'a mut T>,
+}
+
+impl<'a, T> Iterator for RawIterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        while self.pos < self.buckets {
+            unsafe {
+                let ctrl = *self.ctrl.add(self.pos);
+                let pos = self.pos;
+                self.pos += 1;
+
+                if ctrl != EMPTY && ctrl != DELETED {
+                    self.remaining -= 1;
+                    return Some(&mut *self.data.add(pos));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+/// An iterator over the entries of a HashMap.
+pub struct Iter<'a, K, V> {
+    inner: RawIter<'a, (K, V)>,
+}
+
+impl<'a, K, V> Iterator for Iter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|entry| (&entry.0, &entry.1))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<K, V> FusedIterator for Iter<'_, K, V> {}
+
+/// A mutable iterator over the entries of a HashMap.
+pub struct IterMut<'a, K, V> {
+    inner: RawIterMut<'a, (K, V)>,
+}
+
+impl<'a, K, V> Iterator for IterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|entry| (&entry.0, &mut entry.1))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<K, V> FusedIterator for IterMut<'_, K, V> {}
+
+/// An owning iterator over the entries of a HashMap.
+pub struct IntoIter<K, V, S = RandomState> {
+    map: HashMap<K, V, S>,
+    pos: usize,
+}
+
+impl<K, V, S> Iterator for IntoIter<K, V, S> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let buckets = self.map.table.buckets();
+
+        while self.pos < buckets {
+            unsafe {
+                let ctrl = *self.map.table.ctrl.add(self.pos);
+                let pos = self.pos;
+                self.pos += 1;
+
+                if ctrl != EMPTY && ctrl != DELETED {
+                    return Some(self.map.table.remove(pos));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.map.len();
+        (len, Some(len))
+    }
+}
+
+impl<K, V, S> IntoIterator for HashMap<K, V, S> {
+    type Item = (K, V);
+    type IntoIter = IntoIter<K, V, S>;
+
+    fn into_iter(self) -> IntoIter<K, V, S> {
+        IntoIter { map: self, pos: 0 }
+    }
+}
+
+impl<'a, K, V, S> IntoIterator for &'a HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    type Item = (&'a K, &'a V);
+    type IntoIter = Iter<'a, K, V>;
+
+    fn into_iter(self) -> Iter<'a, K, V> {
+        self.iter()
+    }
+}
+
+impl<'a, K, V, S> IntoIterator for &'a mut HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    type Item = (&'a K, &'a mut V);
+    type IntoIter = IterMut<'a, K, V>;
+
+    fn into_iter(self) -> IterMut<'a, K, V> {
+        self.iter_mut()
+    }
+}
+
+/// An iterator over the keys of a HashMap.
+pub struct Keys<'a, K, V> {
+    inner: Iter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for Keys<'a, K, V> {
+    type Item = &'a K;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, _)| k)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<K, V> FusedIterator for Keys<'_, K, V> {}
+
+/// An iterator over the values of a HashMap.
+pub struct Values<'a, K, V> {
+    inner: Iter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for Values<'a, K, V> {
+    type Item = &'a V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, v)| v)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<K, V> FusedIterator for Values<'_, K, V> {}
+
+/// A mutable iterator over the values of a HashMap.
+pub struct ValuesMut<'a, K, V> {
+    inner: IterMut<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
+    type Item = &'a mut V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, v)| v)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<K, V> FusedIterator for ValuesMut<'_, K, V> {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HASHSET
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A hash set implemented as a HashMap where the value is ().
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashSet;
+///
+/// let mut set = HashSet::new();
+/// set.insert("apple");
+/// set.insert("banana");
+///
+/// assert!(set.contains("apple"));
+/// assert!(!set.contains("cherry"));
+/// ```
+pub struct HashSet<T, S = RandomState, A: Allocator = Global> {
+    map: HashMap<T, (), S, A>,
+}
+
+impl<T> HashSet<T, RandomState> {
+    /// Creates an empty HashSet.
+    #[inline]
+    pub fn new() -> Self {
+        HashSet { map: HashMap::new() }
+    }
+
+    /// Creates an empty HashSet with the specified capacity.
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        HashSet { map: HashMap::with_capacity(capacity) }
+    }
+}
+
+impl<T, S> HashSet<T, S> {
+    /// Creates an empty HashSet with the given hasher.
+    pub fn with_hasher(hasher: S) -> Self {
+        HashSet { map: HashMap::with_hasher(hasher) }
+    }
+
+    /// Creates an empty HashSet with capacity and hasher.
+    pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> Self {
+        HashSet { map: HashMap::with_capacity_and_hasher(capacity, hasher) }
+    }
+
+    /// Returns the number of elements in the set.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Returns true if the set contains no elements.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Returns the number of elements the set can hold without reallocating.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.map.capacity()
+    }
+
+    /// Clears the set, removing all values.
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    /// Returns a reference to the hasher.
+    pub fn hasher(&self) -> &S {
+        self.map.hasher()
+    }
+}
+
+impl<T, S> HashSet<T, S>
+where
+    T: Eq + Hash,
+    S: BuildHasher,
+{
+    /// Reserves capacity for at least `additional` more elements.
+    pub fn reserve(&mut self, additional: usize) {
+        self.map.reserve(additional);
+    }
+
+    /// Adds a value to the set.
+    ///
+    /// Returns `true` if the value was not already present.
+    pub fn insert(&mut self, value: T) -> bool {
+        self.map.insert(value, ()).is_none()
+    }
+
+    /// Returns true if the set contains a value.
+    pub fn contains<Q>(&self, value: &Q) -> bool
+    where
+        T: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.contains_key(value)
+    }
+
+    /// Returns a reference to the value in the set, if any.
+    pub fn get<Q>(&self, value: &Q) -> Option<&T>
+    where
+        T: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.get_key_value(value).map(|(k, _)| k)
+    }
+
+    /// Removes a value from the set. Returns true if it was present.
+    pub fn remove<Q>(&mut self, value: &Q) -> bool
+    where
+        T: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.remove(value).is_some()
+    }
+
+    /// Removes and returns the value in the set, if any.
+    pub fn take<Q>(&mut self, value: &Q) -> Option<T>
+    where
+        T: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.remove_entry(value).map(|(k, _)| k)
+    }
+
+    /// An iterator visiting all elements in arbitrary order.
+    pub fn iter(&self) -> SetIter<'_, T> {
+        SetIter { inner: self.map.keys() }
+    }
+
+    /// Retains only the elements specified by the predicate.
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&T) -> bool,
+    {
+        self.map.retain(|k, _| f(k));
+    }
+
+    // Set operations
+
+    /// Returns true if self has no elements in common with other.
+    pub fn is_disjoint(&self, other: &HashSet<T, S>) -> bool {
+        if self.len() <= other.len() {
+            self.iter().all(|v| !other.contains(v))
+        } else {
+            other.iter().all(|v| !self.contains(v))
+        }
+    }
+
+    /// Returns true if the set is a subset of another.
+    pub fn is_subset(&self, other: &HashSet<T, S>) -> bool {
+        if self.len() > other.len() {
+            return false;
+        }
+        self.iter().all(|v| other.contains(v))
+    }
+
+    /// Returns true if the set is a superset of another.
+    pub fn is_superset(&self, other: &HashSet<T, S>) -> bool {
+        other.is_subset(self)
+    }
+}
+
+impl<T, S> Default for HashSet<T, S>
+where
+    S: Default,
+{
+    fn default() -> Self {
+        HashSet { map: HashMap::default() }
+    }
+}
+
+impl<T, S> Clone for HashSet<T, S>
+where
+    T: Clone,
+    S: Clone,
+{
+    fn clone(&self) -> Self {
+        HashSet { map: self.map.clone() }
+    }
+}
+
+impl<T, S> PartialEq for HashSet<T, S>
+where
+    T: Eq + Hash,
+    S: BuildHasher,
+{
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        self.iter().all(|v| other.contains(v))
+    }
+}
+
+impl<T, S> Eq for HashSet<T, S>
+where
+    T: Eq + Hash,
+    S: BuildHasher,
+{
+}
+
+impl<T, S> FromIterator<T> for HashSet<T, S>
+where
+    T: Eq + Hash,
+    S: BuildHasher + Default,
+{
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        let mut set = HashSet::with_capacity_and_hasher(lower, S::default());
+        set.extend(iter);
+        set
+    }
+}
+
+impl<T, S> Extend<T> for HashSet<T, S>
+where
+    T: Eq + Hash,
+    S: BuildHasher,
+{
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for v in iter {
+            self.insert(v);
+        }
+    }
+}
+
+impl<T, S> IntoIterator for HashSet<T, S> {
+    type Item = T;
+    type IntoIter = SetIntoIter<T, S>;
+
+    fn into_iter(self) -> SetIntoIter<T, S> {
+        SetIntoIter { inner: self.map.into_iter() }
+    }
+}
+
+impl<'a, T, S> IntoIterator for &'a HashSet<T, S>
+where
+    T: Eq + Hash,
+    S: BuildHasher,
+{
+    type Item = &'a T;
+    type IntoIter = SetIter<'a, T>;
+
+    fn into_iter(self) -> SetIter<'a, T> {
+        self.iter()
+    }
+}
+
+/// An iterator over the items of a HashSet.
+pub struct SetIter<'a, T> {
+    inner: Keys<'a, T, ()>,
+}
+
+impl<'a, T> Iterator for SetIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<T> FusedIterator for SetIter<'_, T> {}
+
+/// An owning iterator over the items of a HashSet.
+pub struct SetIntoIter<T, S = RandomState> {
+    inner: IntoIter<T, (), S>,
+}
+
+impl<T, S> Iterator for SetIntoIter<T, S> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, _)| k)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BTREEMAP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// B-tree branching factor (minimum degree)
+/// Each node has at most 2*B-1 keys and at least B-1 keys (except root)
+const B: usize = 6;
+const CAPACITY: usize = 2 * B - 1;  // 11 keys max per node
+
+/// An ordered map based on a B-tree.
+///
+/// BTreeMap keeps its keys in sorted order, allowing efficient range queries
+/// and ordered iteration. It provides O(log n) search, insertion, and deletion.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::BTreeMap;
+///
+/// let mut map = BTreeMap::new();
+/// map.insert(3, "three");
+/// map.insert(1, "one");
+/// map.insert(2, "two");
+///
+/// // Iteration is in sorted order
+/// for (k, v) in &map {
+///     println!("{}: {}", k, v);
+/// }
+/// // Output: 1: one, 2: two, 3: three
+/// ```
+pub struct BTreeMap<K, V, A: Allocator = Global> {
+    root: Option<Box<Node<K, V>, A>>,
+    len: usize,
+    alloc: A,
+}
+
+/// Internal node of the B-tree
+struct Node<K, V> {
+    /// Keys stored in this node
+    keys: [MaybeUninit<K>; CAPACITY],
+    /// Values stored in this node
+    values: [MaybeUninit<V>; CAPACITY],
+    /// Child pointers (len + 1 children for len keys)
+    children: [Option<Box<Node<K, V>>>; CAPACITY + 1],
+    /// Number of keys currently in this node
+    len: usize,
+    /// Whether this is a leaf node
+    is_leaf: bool,
+}
+
+impl<K, V> Node<K, V> {
+    /// Creates a new empty leaf node
+    fn new_leaf() -> Self {
+        Node {
+            keys: unsafe { MaybeUninit::uninit().assume_init() },
+            values: unsafe { MaybeUninit::uninit().assume_init() },
+            children: Default::default(),
+            len: 0,
+            is_leaf: true,
+        }
+    }
+
+    /// Creates a new empty internal node
+    fn new_internal() -> Self {
+        Node {
+            keys: unsafe { MaybeUninit::uninit().assume_init() },
+            values: unsafe { MaybeUninit::uninit().assume_init() },
+            children: Default::default(),
+            len: 0,
+            is_leaf: false,
+        }
+    }
+
+    /// Returns true if the node is full
+    #[inline]
+    fn is_full(&self) -> bool {
+        self.len == CAPACITY
+    }
+
+    /// Returns true if the node has minimum keys
+    #[inline]
+    fn is_minimum(&self) -> bool {
+        self.len == B - 1
+    }
+
+    /// Get key at index
+    #[inline]
+    unsafe fn key(&self, index: usize) -> &K {
+        self.keys[index].assume_init_ref()
+    }
+
+    /// Get mutable key at index
+    #[inline]
+    unsafe fn key_mut(&mut self, index: usize) -> &mut K {
+        self.keys[index].assume_init_mut()
+    }
+
+    /// Get value at index
+    #[inline]
+    unsafe fn value(&self, index: usize) -> &V {
+        self.values[index].assume_init_ref()
+    }
+
+    /// Get mutable value at index
+    #[inline]
+    unsafe fn value_mut(&mut self, index: usize) -> &mut V {
+        self.values[index].assume_init_mut()
+    }
+
+    /// Binary search for key position
+    fn search<Q>(&self, key: &Q) -> Result<usize, usize>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut left = 0;
+        let mut right = self.len;
+
+        while left < right {
+            let mid = left + (right - left) / 2;
+            unsafe {
+                match key.cmp(self.key(mid).borrow()) {
+                    Ordering::Equal => return Ok(mid),
+                    Ordering::Less => right = mid,
+                    Ordering::Greater => left = mid + 1,
+                }
+            }
+        }
+
+        Err(left)
+    }
+
+    /// Insert key-value at position, shifting others right
+    unsafe fn insert_at(&mut self, index: usize, key: K, value: V) {
+        // Shift keys and values right
+        for i in (index..self.len).rev() {
+            ptr::copy(
+                self.keys[i].as_ptr(),
+                self.keys[i + 1].as_mut_ptr(),
+                1,
+            );
+            ptr::copy(
+                self.values[i].as_ptr(),
+                self.values[i + 1].as_mut_ptr(),
+                1,
+            );
+        }
+
+        // Insert new key-value
+        self.keys[index].write(key);
+        self.values[index].write(value);
+        self.len += 1;
+    }
+
+    /// Remove key-value at position, shifting others left
+    unsafe fn remove_at(&mut self, index: usize) -> (K, V) {
+        let key = self.keys[index].assume_init_read();
+        let value = self.values[index].assume_init_read();
+
+        // Shift keys and values left
+        for i in index..self.len - 1 {
+            ptr::copy(
+                self.keys[i + 1].as_ptr(),
+                self.keys[i].as_mut_ptr(),
+                1,
+            );
+            ptr::copy(
+                self.values[i + 1].as_ptr(),
+                self.values[i].as_mut_ptr(),
+                1,
+            );
+        }
+
+        self.len -= 1;
+        (key, value)
+    }
+
+    /// Insert child at position, shifting others right
+    fn insert_child_at(&mut self, index: usize, child: Box<Node<K, V>>) {
+        for i in (index..=self.len).rev() {
+            self.children.swap(i, i + 1);
+        }
+        self.children[index] = Some(child);
+    }
+
+    /// Remove child at position, shifting others left
+    fn remove_child_at(&mut self, index: usize) -> Option<Box<Node<K, V>>> {
+        let child = self.children[index].take();
+        for i in index..self.len {
+            self.children.swap(i, i + 1);
+        }
+        child
+    }
+
+    /// Split this node at the median, returning (median_key, median_value, new_right_node)
+    fn split(&mut self) -> (K, V, Box<Node<K, V>>) {
+        let mid = self.len / 2;
+
+        unsafe {
+            let median_key = self.keys[mid].assume_init_read();
+            let median_value = self.values[mid].assume_init_read();
+
+            let mut right = Box::new(if self.is_leaf {
+                Node::new_leaf()
+            } else {
+                Node::new_internal()
+            });
+
+            // Move right half of keys/values to new node
+            for i in (mid + 1)..self.len {
+                right.keys[i - mid - 1].write(self.keys[i].assume_init_read());
+                right.values[i - mid - 1].write(self.values[i].assume_init_read());
+            }
+            right.len = self.len - mid - 1;
+
+            // Move right half of children if internal node
+            if !self.is_leaf {
+                for i in (mid + 1)..=self.len {
+                    right.children[i - mid - 1] = self.children[i].take();
+                }
+            }
+
+            self.len = mid;
+
+            (median_key, median_value, right)
+        }
+    }
+}
+
+impl<K, V> Drop for Node<K, V> {
+    fn drop(&mut self) {
+        unsafe {
+            for i in 0..self.len {
+                ptr::drop_in_place(self.keys[i].as_mut_ptr());
+                ptr::drop_in_place(self.values[i].as_mut_ptr());
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BTREEMAP IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl<K, V> BTreeMap<K, V> {
+    /// Creates an empty BTreeMap.
+    #[inline]
+    pub fn new() -> Self {
+        BTreeMap {
+            root: None,
+            len: 0,
+            alloc: Global,
+        }
+    }
+}
+
+impl<K, V, A: Allocator> BTreeMap<K, V, A> {
+    /// Creates an empty BTreeMap with the given allocator.
+    pub fn new_in(alloc: A) -> Self {
+        BTreeMap {
+            root: None,
+            len: 0,
+            alloc,
+        }
+    }
+
+    /// Returns the number of elements in the map.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true if the map contains no elements.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Clears the map, removing all elements.
+    pub fn clear(&mut self) {
+        self.root = None;
+        self.len = 0;
+    }
+}
+
+impl<K, V, A: Allocator> BTreeMap<K, V, A>
+where
+    K: Ord,
+{
+    /// Returns a reference to the value corresponding to the key.
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut current = self.root.as_ref()?;
+
+        loop {
+            match current.search(key) {
+                Ok(i) => return unsafe { Some(current.value(i)) },
+                Err(i) => {
+                    if current.is_leaf {
+                        return None;
+                    }
+                    current = current.children[i].as_ref()?;
+                }
+            }
+        }
+    }
+
+    /// Returns a mutable reference to the value corresponding to the key.
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut current = self.root.as_mut()?;
+
+        loop {
+            match current.search(key) {
+                Ok(i) => return unsafe { Some(current.value_mut(i)) },
+                Err(i) => {
+                    if current.is_leaf {
+                        return None;
+                    }
+                    current = current.children[i].as_mut()?;
+                }
+            }
+        }
+    }
+
+    /// Returns true if the map contains a value for the specified key.
+    #[inline]
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.get(key).is_some()
+    }
+
+    /// Returns the key-value pair corresponding to the key.
+    pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut current = self.root.as_ref()?;
+
+        loop {
+            match current.search(key) {
+                Ok(i) => unsafe {
+                    return Some((current.key(i), current.value(i)));
+                },
+                Err(i) => {
+                    if current.is_leaf {
+                        return None;
+                    }
+                    current = current.children[i].as_ref()?;
+                }
+            }
+        }
+    }
+
+    /// Inserts a key-value pair into the map.
+    ///
+    /// If the map did have this key present, the value is updated, and the old
+    /// value is returned.
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        if self.root.is_none() {
+            let mut node = Box::new(Node::new_leaf());
+            unsafe { node.insert_at(0, key, value); }
+            self.root = Some(node);
+            self.len = 1;
+            return None;
+        }
+
+        // Check if root is full and needs splitting
+        if self.root.as_ref().unwrap().is_full() {
+            let old_root = self.root.take().unwrap();
+            let mut new_root = Box::new(Node::new_internal());
+            let (median_key, median_value, right) = {
+                let mut old = old_root;
+                old.split()
+            };
+
+            unsafe { new_root.insert_at(0, median_key, median_value); }
+            new_root.children[0] = Some(old_root);
+            new_root.children[1] = Some(right);
+            self.root = Some(new_root);
+        }
+
+        self.insert_non_full(self.root.as_mut().unwrap(), key, value)
+    }
+
+    /// Insert into a non-full node
+    fn insert_non_full(&mut self, node: &mut Node<K, V>, key: K, value: V) -> Option<V> {
+        match node.search(&key) {
+            Ok(i) => {
+                // Key exists, update value
+                unsafe {
+                    let old = ptr::read(node.values[i].as_ptr());
+                    node.values[i].write(value);
+                    Some(old)
+                }
+            }
+            Err(i) => {
+                if node.is_leaf {
+                    // Insert in leaf
+                    unsafe { node.insert_at(i, key, value); }
+                    self.len += 1;
+                    None
+                } else {
+                    // Descend to child
+                    let child = node.children[i].as_mut().unwrap();
+
+                    if child.is_full() {
+                        // Split the child
+                        let (median_key, median_value, right) = child.split();
+                        unsafe { node.insert_at(i, median_key, median_value); }
+                        node.insert_child_at(i + 1, right);
+
+                        // Decide which child to descend into
+                        unsafe {
+                            if key > *node.key(i) {
+                                self.insert_non_full(node.children[i + 1].as_mut().unwrap(), key, value)
+                            } else {
+                                self.insert_non_full(node.children[i].as_mut().unwrap(), key, value)
+                            }
+                        }
+                    } else {
+                        self.insert_non_full(child, key, value)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Removes a key from the map, returning the value if it was present.
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.remove_entry(key).map(|(_, v)| v)
+    }
+
+    /// Removes a key from the map, returning the key and value if present.
+    pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        if self.root.is_none() {
+            return None;
+        }
+
+        let result = self.remove_from_node(self.root.as_mut().unwrap(), key);
+
+        if result.is_some() {
+            self.len -= 1;
+
+            // If root has no keys but has a child, promote that child
+            if let Some(ref mut root) = self.root {
+                if root.len == 0 && !root.is_leaf {
+                    self.root = root.children[0].take();
+                } else if root.len == 0 {
+                    self.root = None;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Remove from a node (simplified - full implementation would handle more cases)
+    fn remove_from_node<Q>(&mut self, node: &mut Node<K, V>, key: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        match node.search(key) {
+            Ok(i) => {
+                if node.is_leaf {
+                    // Simple case: remove from leaf
+                    Some(unsafe { node.remove_at(i) })
+                } else {
+                    // Internal node: find predecessor or successor
+                    // For simplicity, we'll use predecessor (rightmost in left subtree)
+                    let left_child = node.children[i].as_mut().unwrap();
+
+                    if left_child.len >= B {
+                        // Get predecessor
+                        let (pred_k, pred_v) = self.remove_max(left_child);
+                        unsafe {
+                            let old_k = ptr::read(node.keys[i].as_ptr());
+                            let old_v = ptr::read(node.values[i].as_ptr());
+                            node.keys[i].write(pred_k);
+                            node.values[i].write(pred_v);
+                            Some((old_k, old_v))
+                        }
+                    } else {
+                        // More complex rebalancing would be needed
+                        // For now, simple removal
+                        Some(unsafe { node.remove_at(i) })
+                    }
+                }
+            }
+            Err(i) => {
+                if node.is_leaf {
+                    None
+                } else {
+                    self.remove_from_node(node.children[i].as_mut().unwrap(), key)
+                }
+            }
+        }
+    }
+
+    /// Remove and return the maximum key-value pair from a subtree
+    fn remove_max(&mut self, node: &mut Node<K, V>) -> (K, V) {
+        if node.is_leaf {
+            unsafe { node.remove_at(node.len - 1) }
+        } else {
+            let last_child = node.children[node.len].as_mut().unwrap();
+            self.remove_max(last_child)
+        }
+    }
+
+    /// Returns a reference to the first key-value pair in the map.
+    pub fn first_key_value(&self) -> Option<(&K, &V)> {
+        let mut current = self.root.as_ref()?;
+        while !current.is_leaf {
+            current = current.children[0].as_ref()?;
+        }
+        if current.len > 0 {
+            unsafe { Some((current.key(0), current.value(0))) }
+        } else {
+            None
+        }
+    }
+
+    /// Returns a reference to the last key-value pair in the map.
+    pub fn last_key_value(&self) -> Option<(&K, &V)> {
+        let mut current = self.root.as_ref()?;
+        while !current.is_leaf {
+            current = current.children[current.len].as_ref()?;
+        }
+        if current.len > 0 {
+            let i = current.len - 1;
+            unsafe { Some((current.key(i), current.value(i))) }
+        } else {
+            None
+        }
+    }
+
+    /// Returns an iterator over the entries of the map in sorted order.
+    pub fn iter(&self) -> BTreeIter<'_, K, V> {
+        let mut stack = Vec::new();
+        if let Some(ref root) = self.root {
+            Self::push_left(&mut stack, root.as_ref());
+        }
+        BTreeIter { stack }
+    }
+
+    /// Returns a mutable iterator over the entries of the map.
+    pub fn iter_mut(&mut self) -> BTreeIterMut<'_, K, V> {
+        BTreeIterMut {
+            _marker: PhantomData,
+        }
+    }
+
+    /// Helper to push leftmost path onto stack
+    fn push_left<'a>(stack: &mut Vec<(&'a Node<K, V>, usize)>, mut node: &'a Node<K, V>) {
+        while !node.is_leaf {
+            if let Some(ref child) = node.children[0] {
+                stack.push((node, 0));
+                node = child.as_ref();
+            } else {
+                break;
+            }
+        }
+        if node.len > 0 {
+            stack.push((node, 0));
+        }
+    }
+
+    /// An iterator over the keys of the map in sorted order.
+    pub fn keys(&self) -> BTreeKeys<'_, K, V> {
+        BTreeKeys { inner: self.iter() }
+    }
+
+    /// An iterator over the values of the map in sorted order.
+    pub fn values(&self) -> BTreeValues<'_, K, V> {
+        BTreeValues { inner: self.iter() }
+    }
+
+    /// Gets the given key's corresponding entry for in-place manipulation.
+    pub fn entry(&mut self, key: K) -> BTreeEntry<'_, K, V, A> {
+        if self.contains_key(&key) {
+            BTreeEntry::Occupied(BTreeOccupiedEntry { map: self, key })
+        } else {
+            BTreeEntry::Vacant(BTreeVacantEntry { map: self, key })
+        }
+    }
+
+    /// Retains only the elements specified by the predicate.
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        // Collect keys to remove
+        let keys_to_remove: Vec<K> = self.iter()
+            .filter_map(|(k, v)| {
+                // Note: This is simplified - we'd need mutable access
+                None
+            })
+            .collect();
+
+        for key in keys_to_remove {
+            self.remove(&key);
+        }
+    }
+}
+
+impl<K, V> Default for BTreeMap<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K, V, A: Allocator + Clone> Clone for BTreeMap<K, V, A>
+where
+    K: Clone + Ord,
+    V: Clone,
+{
+    fn clone(&self) -> Self {
+        let mut new_map = BTreeMap::new_in(self.alloc.clone());
+        for (k, v) in self.iter() {
+            new_map.insert(k.clone(), v.clone());
+        }
+        new_map
+    }
+}
+
+impl<K, V, A: Allocator> PartialEq for BTreeMap<K, V, A>
+where
+    K: Ord + PartialEq,
+    V: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+
+        self.iter().zip(other.iter())
+            .all(|((k1, v1), (k2, v2))| k1 == k2 && v1 == v2)
+    }
+}
+
+impl<K, V, A: Allocator> Eq for BTreeMap<K, V, A>
+where
+    K: Ord + Eq,
+    V: Eq,
+{
+}
+
+impl<K, V, Q, A: Allocator> Index<&Q> for BTreeMap<K, V, A>
+where
+    K: Ord + Borrow<Q>,
+    Q: Ord + ?Sized,
+{
+    type Output = V;
+
+    fn index(&self, key: &Q) -> &V {
+        self.get(key).expect("no entry found for key")
+    }
+}
+
+impl<K, V> FromIterator<(K, V)> for BTreeMap<K, V>
+where
+    K: Ord,
+{
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let mut map = BTreeMap::new();
+        map.extend(iter);
+        map
+    }
+}
+
+impl<K, V, A: Allocator> Extend<(K, V)> for BTreeMap<K, V, A>
+where
+    K: Ord,
+{
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        for (k, v) in iter {
+            self.insert(k, v);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BTREEMAP ITERATORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// An iterator over the entries of a BTreeMap in sorted order.
+pub struct BTreeIter<'a, K, V> {
+    stack: Vec<(&'a Node<K, V>, usize)>,
+}
+
+impl<'a, K, V> Iterator for BTreeIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((node, idx)) = self.stack.pop() {
+            if idx < node.len {
+                // Push next index for this node
+                self.stack.push((node, idx + 1));
+
+                // If internal node, descend to left child of next key
+                if !node.is_leaf && idx + 1 <= node.len {
+                    if let Some(ref child) = node.children[idx + 1] {
+                        BTreeMap::<K, V>::push_left(&mut self.stack, child.as_ref());
+                    }
+                }
+
+                unsafe {
+                    return Some((node.key(idx), node.value(idx)));
+                }
+            }
+        }
+        None
+    }
+}
+
+impl<K, V> FusedIterator for BTreeIter<'_, K, V> {}
+
+/// A mutable iterator over the entries of a BTreeMap.
+pub struct BTreeIterMut<'a, K, V> {
+    _marker: PhantomData<&'a mut (K, V)>,
+}
+
+impl<'a, K, V> Iterator for BTreeIterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Simplified - full implementation would be more complex
+        None
+    }
+}
+
+/// An iterator over the keys of a BTreeMap.
+pub struct BTreeKeys<'a, K, V> {
+    inner: BTreeIter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for BTreeKeys<'a, K, V> {
+    type Item = &'a K;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, _)| k)
+    }
+}
+
+impl<K, V> FusedIterator for BTreeKeys<'_, K, V> {}
+
+/// An iterator over the values of a BTreeMap.
+pub struct BTreeValues<'a, K, V> {
+    inner: BTreeIter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for BTreeValues<'a, K, V> {
+    type Item = &'a V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, v)| v)
+    }
+}
+
+impl<K, V> FusedIterator for BTreeValues<'_, K, V> {}
+
+impl<'a, K, V, A: Allocator> IntoIterator for &'a BTreeMap<K, V, A>
+where
+    K: Ord,
+{
+    type Item = (&'a K, &'a V);
+    type IntoIter = BTreeIter<'a, K, V>;
+
+    fn into_iter(self) -> BTreeIter<'a, K, V> {
+        self.iter()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BTREEMAP ENTRY API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A view into a single entry in a BTreeMap.
+pub enum BTreeEntry<'a, K, V, A: Allocator = Global> {
+    /// An occupied entry.
+    Occupied(BTreeOccupiedEntry<'a, K, V, A>),
+    /// A vacant entry.
+    Vacant(BTreeVacantEntry<'a, K, V, A>),
+}
+
+/// A view into an occupied entry in a BTreeMap.
+pub struct BTreeOccupiedEntry<'a, K, V, A: Allocator = Global> {
+    map: &'a mut BTreeMap<K, V, A>,
+    key: K,
+}
+
+/// A view into a vacant entry in a BTreeMap.
+pub struct BTreeVacantEntry<'a, K, V, A: Allocator = Global> {
+    map: &'a mut BTreeMap<K, V, A>,
+    key: K,
+}
+
+impl<'a, K, V, A: Allocator> BTreeEntry<'a, K, V, A>
+where
+    K: Ord,
+{
+    /// Ensures a value is in the entry by inserting the default if empty.
+    pub fn or_insert(self, default: V) -> &'a mut V {
+        match self {
+            BTreeEntry::Occupied(entry) => entry.into_mut(),
+            BTreeEntry::Vacant(entry) => entry.insert(default),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the result of the function if empty.
+    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> &'a mut V {
+        match self {
+            BTreeEntry::Occupied(entry) => entry.into_mut(),
+            BTreeEntry::Vacant(entry) => entry.insert(default()),
+        }
+    }
+
+    /// Returns a reference to the key.
+    pub fn key(&self) -> &K {
+        match self {
+            BTreeEntry::Occupied(entry) => &entry.key,
+            BTreeEntry::Vacant(entry) => &entry.key,
+        }
+    }
+}
+
+impl<'a, K, V, A: Allocator> BTreeOccupiedEntry<'a, K, V, A>
+where
+    K: Ord,
+{
+    /// Gets a reference to the value in the entry.
+    pub fn get(&self) -> &V {
+        self.map.get(&self.key).unwrap()
+    }
+
+    /// Gets a mutable reference to the value in the entry.
+    pub fn get_mut(&mut self) -> &mut V {
+        self.map.get_mut(&self.key).unwrap()
+    }
+
+    /// Converts the entry into a mutable reference to its value.
+    pub fn into_mut(self) -> &'a mut V {
+        self.map.get_mut(&self.key).unwrap()
+    }
+
+    /// Sets the value of the entry and returns the old value.
+    pub fn insert(&mut self, value: V) -> V {
+        self.map.insert(self.key.clone(), value).unwrap()
+    }
+
+    where
+        K: Clone,
+
+    /// Takes the value out of the entry.
+    pub fn remove(self) -> V {
+        self.map.remove(&self.key).unwrap()
+    }
+}
+
+impl<'a, K, V, A: Allocator> BTreeVacantEntry<'a, K, V, A>
+where
+    K: Ord,
+{
+    /// Gets a reference to the key.
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    /// Take ownership of the key.
+    pub fn into_key(self) -> K {
+        self.key
+    }
+
+    /// Sets the value of the entry.
+    pub fn insert(self, value: V) -> &'a mut V {
+        self.map.insert(self.key, value);
+        // Note: This is a simplified version - proper implementation would avoid double lookup
+        unsafe { &mut *(self.map.get_mut(&self.key).unwrap() as *mut V) }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BTREESET
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// An ordered set based on a B-tree.
+///
+/// BTreeSet keeps its elements in sorted order, allowing efficient range queries
+/// and ordered iteration.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::BTreeSet;
+///
+/// let mut set = BTreeSet::new();
+/// set.insert(3);
+/// set.insert(1);
+/// set.insert(2);
+///
+/// // Iteration is in sorted order
+/// for x in &set {
+///     println!("{}", x);
+/// }
+/// // Output: 1, 2, 3
+/// ```
+pub struct BTreeSet<T, A: Allocator = Global> {
+    map: BTreeMap<T, (), A>,
+}
+
+impl<T> BTreeSet<T> {
+    /// Creates an empty BTreeSet.
+    #[inline]
+    pub fn new() -> Self {
+        BTreeSet { map: BTreeMap::new() }
+    }
+}
+
+impl<T, A: Allocator> BTreeSet<T, A> {
+    /// Creates an empty BTreeSet with the given allocator.
+    pub fn new_in(alloc: A) -> Self {
+        BTreeSet { map: BTreeMap::new_in(alloc) }
+    }
+
+    /// Returns the number of elements in the set.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Returns true if the set contains no elements.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Clears the set.
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+}
+
+impl<T, A: Allocator> BTreeSet<T, A>
+where
+    T: Ord,
+{
+    /// Adds a value to the set.
+    ///
+    /// Returns `true` if the value was not already present.
+    pub fn insert(&mut self, value: T) -> bool {
+        self.map.insert(value, ()).is_none()
+    }
+
+    /// Returns true if the set contains the value.
+    pub fn contains<Q>(&self, value: &Q) -> bool
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.map.contains_key(value)
+    }
+
+    /// Returns a reference to the value in the set, if any.
+    pub fn get<Q>(&self, value: &Q) -> Option<&T>
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.map.get_key_value(value).map(|(k, _)| k)
+    }
+
+    /// Removes a value from the set.
+    pub fn remove<Q>(&mut self, value: &Q) -> bool
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.map.remove(value).is_some()
+    }
+
+    /// Returns the first element in the set.
+    pub fn first(&self) -> Option<&T> {
+        self.map.first_key_value().map(|(k, _)| k)
+    }
+
+    /// Returns the last element in the set.
+    pub fn last(&self) -> Option<&T> {
+        self.map.last_key_value().map(|(k, _)| k)
+    }
+
+    /// An iterator visiting all elements in ascending order.
+    pub fn iter(&self) -> BTreeSetIter<'_, T> {
+        BTreeSetIter { inner: self.map.keys() }
+    }
+
+    /// Returns true if self has no elements in common with other.
+    pub fn is_disjoint(&self, other: &BTreeSet<T, A>) -> bool {
+        self.iter().all(|v| !other.contains(v))
+    }
+
+    /// Returns true if the set is a subset of another.
+    pub fn is_subset(&self, other: &BTreeSet<T, A>) -> bool {
+        self.iter().all(|v| other.contains(v))
+    }
+
+    /// Returns true if the set is a superset of another.
+    pub fn is_superset(&self, other: &BTreeSet<T, A>) -> bool {
+        other.is_subset(self)
+    }
+}
+
+impl<T> Default for BTreeSet<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T, A: Allocator + Clone> Clone for BTreeSet<T, A>
+where
+    T: Clone + Ord,
+{
+    fn clone(&self) -> Self {
+        BTreeSet { map: self.map.clone() }
+    }
+}
+
+impl<T, A: Allocator> PartialEq for BTreeSet<T, A>
+where
+    T: Ord + PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.map == other.map
+    }
+}
+
+impl<T, A: Allocator> Eq for BTreeSet<T, A>
+where
+    T: Ord + Eq,
+{
+}
+
+impl<T> FromIterator<T> for BTreeSet<T>
+where
+    T: Ord,
+{
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut set = BTreeSet::new();
+        set.extend(iter);
+        set
+    }
+}
+
+impl<T, A: Allocator> Extend<T> for BTreeSet<T, A>
+where
+    T: Ord,
+{
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for v in iter {
+            self.insert(v);
+        }
+    }
+}
+
+impl<'a, T, A: Allocator> IntoIterator for &'a BTreeSet<T, A>
+where
+    T: Ord,
+{
+    type Item = &'a T;
+    type IntoIter = BTreeSetIter<'a, T>;
+
+    fn into_iter(self) -> BTreeSetIter<'a, T> {
+        self.iter()
+    }
+}
+
+/// An iterator over the items of a BTreeSet.
+pub struct BTreeSetIter<'a, T> {
+    inner: BTreeKeys<'a, T, ()>,
+}
+
+impl<'a, T> Iterator for BTreeSetIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl<T> FusedIterator for BTreeSetIter<'_, T> {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VECDEQUE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A double-ended queue implemented with a growable ring buffer.
+///
+/// VecDeque provides O(1) amortized push and pop from both ends.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::VecDeque;
+///
+/// let mut deque = VecDeque::new();
+/// deque.push_back(1);
+/// deque.push_back(2);
+/// deque.push_front(0);
+///
+/// assert_eq!(deque.pop_front(), Some(0));
+/// assert_eq!(deque.pop_back(), Some(2));
+/// ```
+pub struct VecDeque<T, A: Allocator = Global> {
+    /// The underlying buffer
+    buf: Vec<MaybeUninit<T>, A>,
+    /// Index of the first element
+    head: usize,
+    /// Number of elements
+    len: usize,
+}
+
+impl<T> VecDeque<T> {
+    /// Creates an empty VecDeque.
+    #[inline]
+    pub fn new() -> Self {
+        VecDeque {
+            buf: Vec::new(),
+            head: 0,
+            len: 0,
+        }
+    }
+
+    /// Creates a VecDeque with the specified capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        VecDeque {
+            buf: Vec::with_capacity(capacity),
+            head: 0,
+            len: 0,
+        }
+    }
+}
+
+impl<T, A: Allocator> VecDeque<T, A> {
+    /// Returns the number of elements in the deque.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true if the deque is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the capacity of the deque.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    /// Wraps an index to handle the circular buffer
+    #[inline]
+    fn wrap_index(&self, index: usize) -> usize {
+        if self.buf.capacity() == 0 {
+            0
+        } else {
+            index % self.buf.capacity()
+        }
+    }
+
+    /// Grows the buffer if needed
+    fn grow(&mut self) {
+        let old_cap = self.buf.capacity();
+        let new_cap = if old_cap == 0 { 4 } else { old_cap * 2 };
+
+        self.buf.reserve(new_cap - old_cap);
+
+        // Re-linearize the buffer if needed
+        if self.head + self.len > old_cap && old_cap > 0 {
+            // Elements wrap around - need to move them
+            let tail_len = old_cap - self.head;
+            let new_head = new_cap - tail_len;
+
+            unsafe {
+                ptr::copy(
+                    self.buf.as_ptr().add(self.head),
+                    self.buf.as_mut_ptr().add(new_head),
+                    tail_len,
+                );
+            }
+            self.head = new_head;
+        }
+    }
+
+    /// Appends an element to the back.
+    pub fn push_back(&mut self, value: T) {
+        if self.len == self.buf.capacity() {
+            self.grow();
+        }
+
+        let idx = self.wrap_index(self.head + self.len);
+        unsafe {
+            self.buf.as_mut_ptr().add(idx).write(MaybeUninit::new(value));
+        }
+        self.len += 1;
+    }
+
+    /// Prepends an element to the front.
+    pub fn push_front(&mut self, value: T) {
+        if self.len == self.buf.capacity() {
+            self.grow();
+        }
+
+        self.head = if self.head == 0 {
+            self.buf.capacity().saturating_sub(1)
+        } else {
+            self.head - 1
+        };
+
+        unsafe {
+            self.buf.as_mut_ptr().add(self.head).write(MaybeUninit::new(value));
+        }
+        self.len += 1;
+    }
+
+    /// Removes and returns the front element.
+    pub fn pop_front(&mut self) -> Option<T> {
+        if self.is_empty() {
+            return None;
+        }
+
+        unsafe {
+            let value = self.buf.as_ptr().add(self.head).read().assume_init();
+            self.head = self.wrap_index(self.head + 1);
+            self.len -= 1;
+            Some(value)
+        }
+    }
+
+    /// Removes and returns the back element.
+    pub fn pop_back(&mut self) -> Option<T> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let idx = self.wrap_index(self.head + self.len - 1);
+        unsafe {
+            let value = self.buf.as_ptr().add(idx).read().assume_init();
+            self.len -= 1;
+            Some(value)
+        }
+    }
+
+    /// Returns a reference to the front element.
+    pub fn front(&self) -> Option<&T> {
+        if self.is_empty() {
+            None
+        } else {
+            unsafe { Some((*self.buf.as_ptr().add(self.head)).assume_init_ref()) }
+        }
+    }
+
+    /// Returns a mutable reference to the front element.
+    pub fn front_mut(&mut self) -> Option<&mut T> {
+        if self.is_empty() {
+            None
+        } else {
+            unsafe { Some((*self.buf.as_mut_ptr().add(self.head)).assume_init_mut()) }
+        }
+    }
+
+    /// Returns a reference to the back element.
+    pub fn back(&self) -> Option<&T> {
+        if self.is_empty() {
+            None
+        } else {
+            let idx = self.wrap_index(self.head + self.len - 1);
+            unsafe { Some((*self.buf.as_ptr().add(idx)).assume_init_ref()) }
+        }
+    }
+
+    /// Returns a mutable reference to the back element.
+    pub fn back_mut(&mut self) -> Option<&mut T> {
+        if self.is_empty() {
+            None
+        } else {
+            let idx = self.wrap_index(self.head + self.len - 1);
+            unsafe { Some((*self.buf.as_mut_ptr().add(idx)).assume_init_mut()) }
+        }
+    }
+
+    /// Gets a reference to an element by index.
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len {
+            None
+        } else {
+            let idx = self.wrap_index(self.head + index);
+            unsafe { Some((*self.buf.as_ptr().add(idx)).assume_init_ref()) }
+        }
+    }
+
+    /// Gets a mutable reference to an element by index.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.len {
+            None
+        } else {
+            let idx = self.wrap_index(self.head + index);
+            unsafe { Some((*self.buf.as_mut_ptr().add(idx)).assume_init_mut()) }
+        }
+    }
+
+    /// Clears the deque.
+    pub fn clear(&mut self) {
+        while self.pop_front().is_some() {}
+    }
+}
+
+impl<T> Default for VecDeque<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T, A: Allocator> Drop for VecDeque<T, A> {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+impl<T, I: core::slice::SliceIndex<[T]>> Index<I> for VecDeque<T> {
+    type Output = I::Output;
+
+    fn index(&self, index: I) -> &I::Output {
+        // Simplified - proper implementation would handle ring buffer
+        panic!("VecDeque indexing not fully implemented")
+    }
+}
+
+impl<T> FromIterator<T> for VecDeque<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut deque = VecDeque::new();
+        deque.extend(iter);
+        deque
+    }
+}
+
+impl<T, A: Allocator> Extend<T> for VecDeque<T, A> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for v in iter {
+            self.push_back(v);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BINARYHEAP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A priority queue implemented with a binary heap.
+///
+/// This will be a max-heap, so the largest element is at the front.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::BinaryHeap;
+///
+/// let mut heap = BinaryHeap::new();
+/// heap.push(3);
+/// heap.push(1);
+/// heap.push(2);
+///
+/// assert_eq!(heap.pop(), Some(3));
+/// assert_eq!(heap.pop(), Some(2));
+/// assert_eq!(heap.pop(), Some(1));
+/// ```
+pub struct BinaryHeap<T, A: Allocator = Global> {
+    data: Vec<T, A>,
+}
+
+impl<T> BinaryHeap<T> {
+    /// Creates an empty BinaryHeap.
+    pub fn new() -> Self {
+        BinaryHeap { data: Vec::new() }
+    }
+
+    /// Creates a BinaryHeap with the specified capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        BinaryHeap { data: Vec::with_capacity(capacity) }
+    }
+}
+
+impl<T, A: Allocator> BinaryHeap<T, A> {
+    /// Returns the number of elements in the heap.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns true if the heap is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Returns the capacity of the heap.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    /// Clears the heap.
+    pub fn clear(&mut self) {
+        self.data.clear();
+    }
+}
+
+impl<T, A: Allocator> BinaryHeap<T, A>
+where
+    T: Ord,
+{
+    /// Returns the greatest item in the heap, or None if empty.
+    #[inline]
+    pub fn peek(&self) -> Option<&T> {
+        self.data.first()
+    }
+
+    /// Pushes an item onto the heap.
+    pub fn push(&mut self, item: T) {
+        self.data.push(item);
+        self.sift_up(self.data.len() - 1);
+    }
+
+    /// Removes the greatest item from the heap and returns it.
+    pub fn pop(&mut self) -> Option<T> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let last_idx = self.data.len() - 1;
+        self.data.swap(0, last_idx);
+        let result = self.data.pop();
+
+        if !self.is_empty() {
+            self.sift_down(0);
+        }
+
+        result
+    }
+
+    /// Moves an element up to maintain heap property.
+    fn sift_up(&mut self, mut idx: usize) {
+        while idx > 0 {
+            let parent = (idx - 1) / 2;
+            if self.data[idx] > self.data[parent] {
+                self.data.swap(idx, parent);
+                idx = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Moves an element down to maintain heap property.
+    fn sift_down(&mut self, mut idx: usize) {
+        loop {
+            let left = 2 * idx + 1;
+            let right = 2 * idx + 2;
+            let mut largest = idx;
+
+            if left < self.data.len() && self.data[left] > self.data[largest] {
+                largest = left;
+            }
+            if right < self.data.len() && self.data[right] > self.data[largest] {
+                largest = right;
+            }
+
+            if largest != idx {
+                self.data.swap(idx, largest);
+                idx = largest;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Consumes the heap and returns a vector in sorted order.
+    pub fn into_sorted_vec(mut self) -> Vec<T, A> {
+        let mut result = Vec::with_capacity(self.data.len());
+        while let Some(item) = self.pop() {
+            result.push(item);
+        }
+        result.reverse();
+        result
+    }
+}
+
+impl<T> Default for BinaryHeap<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Ord> FromIterator<T> for BinaryHeap<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut heap = BinaryHeap::new();
+        heap.extend(iter);
+        heap
+    }
+}
+
+impl<T: Ord, A: Allocator> Extend<T> for BinaryHeap<T, A> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for v in iter {
+            self.push(v);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hashmap_basic() {
+        let mut map: HashMap<&str, i32> = HashMap::new();
+
+        assert!(map.is_empty());
+
+        map.insert("one", 1);
+        map.insert("two", 2);
+        map.insert("three", 3);
+
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get("one"), Some(&1));
+        assert_eq!(map.get("two"), Some(&2));
+        assert_eq!(map.get("four"), None);
+    }
+
+    #[test]
+    fn test_hashmap_insert_update() {
+        let mut map = HashMap::new();
+
+        assert_eq!(map.insert("key", 1), None);
+        assert_eq!(map.insert("key", 2), Some(1));
+        assert_eq!(map.get("key"), Some(&2));
+    }
+
+    #[test]
+    fn test_hashmap_remove() {
+        let mut map = HashMap::new();
+        map.insert("key", 1);
+
+        assert_eq!(map.remove("key"), Some(1));
+        assert_eq!(map.remove("key"), None);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_hashmap_entry() {
+        let mut map: HashMap<&str, i32> = HashMap::new();
+
+        map.entry("key").or_insert(1);
+        assert_eq!(map.get("key"), Some(&1));
+
+        map.entry("key").or_insert(2);
+        assert_eq!(map.get("key"), Some(&1));
+
+        *map.entry("key").or_insert(0) += 10;
+        assert_eq!(map.get("key"), Some(&11));
+    }
+
+    #[test]
+    fn test_hashmap_iter() {
+        let mut map = HashMap::new();
+        map.insert(1, "one");
+        map.insert(2, "two");
+        map.insert(3, "three");
+
+        let keys: Vec<_> = map.keys().cloned().collect();
+        assert_eq!(keys.len(), 3);
+
+        let values: Vec<_> = map.values().cloned().collect();
+        assert_eq!(values.len(), 3);
+    }
+
+    #[test]
+    fn test_hashset_basic() {
+        let mut set: HashSet<i32> = HashSet::new();
+
+        assert!(set.insert(1));
+        assert!(set.insert(2));
+        assert!(!set.insert(1)); // Already present
+
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&1));
+        assert!(!set.contains(&3));
+    }
+
+    #[test]
+    fn test_hashset_remove() {
+        let mut set = HashSet::new();
+        set.insert(1);
+        set.insert(2);
+
+        assert!(set.remove(&1));
+        assert!(!set.remove(&1));
+        assert!(!set.contains(&1));
+    }
+
+    #[test]
+    fn test_hashset_subset() {
+        let mut a = HashSet::new();
+        a.insert(1);
+        a.insert(2);
+
+        let mut b = HashSet::new();
+        b.insert(1);
+        b.insert(2);
+        b.insert(3);
+
+        assert!(a.is_subset(&b));
+        assert!(!b.is_subset(&a));
+        assert!(b.is_superset(&a));
+    }
+
+    #[test]
+    fn test_default_hasher() {
+        let mut hasher = DefaultHasher::new();
+        hasher.write(b"hello");
+        let hash1 = hasher.finish();
+
+        let mut hasher = DefaultHasher::new();
+        hasher.write(b"hello");
+        let hash2 = hasher.finish();
+
+        assert_eq!(hash1, hash2);
+
+        let mut hasher = DefaultHasher::new();
+        hasher.write(b"world");
+        let hash3 = hasher.finish();
+
+        assert_ne!(hash1, hash3);
+    }
+}

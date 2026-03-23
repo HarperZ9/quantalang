@@ -1,0 +1,1244 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ ASYNC — I/O Reactor
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Cross-platform async I/O reactor using:
+// - Linux: epoll
+// - macOS/BSD: kqueue
+// - Windows: IOCP
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::async::io
+
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::time::Duration;
+
+use super::waker::Waker;
+use super::task::TaskId;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REACTOR CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// I/O reactor configuration
+#[derive(Debug, Clone)]
+pub struct ReactorConfig {
+    /// Maximum events per poll
+    pub max_events: usize,
+    
+    /// Default poll timeout
+    pub poll_timeout: Option<Duration>,
+    
+    /// Enable edge-triggered mode
+    pub edge_triggered: bool,
+    
+    /// Pre-allocate event buffer
+    pub preallocate_events: bool,
+    
+    /// Enable one-shot mode
+    pub oneshot: bool,
+}
+
+impl Default for ReactorConfig {
+    fn default() -> Self {
+        ReactorConfig {
+            max_events: 1024,
+            poll_timeout: Some(Duration::from_millis(100)),
+            edge_triggered: true,
+            preallocate_events: true,
+            oneshot: false,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTEREST FLAGS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// I/O interest flags
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Interest(u8);
+
+impl Interest {
+    pub const READABLE: Interest = Interest(0b001);
+    pub const WRITABLE: Interest = Interest(0b010);
+    pub const ERROR: Interest = Interest(0b100);
+    
+    pub fn readable() -> Self { Self::READABLE }
+    pub fn writable() -> Self { Self::WRITABLE }
+    
+    pub fn is_readable(self) -> bool { self.0 & Self::READABLE.0 != 0 }
+    pub fn is_writable(self) -> bool { self.0 & Self::WRITABLE.0 != 0 }
+    pub fn is_error(self) -> bool { self.0 & Self::ERROR.0 != 0 }
+    
+    pub fn add(self, other: Interest) -> Self {
+        Interest(self.0 | other.0)
+    }
+    
+    pub fn remove(self, other: Interest) -> Self {
+        Interest(self.0 & !other.0)
+    }
+}
+
+impl std::ops::BitOr for Interest {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Interest(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitAnd for Interest {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Interest(self.0 & rhs.0)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EVENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// I/O event
+#[derive(Debug, Clone)]
+pub struct Event {
+    /// Token identifying the source
+    pub token: Token,
+    
+    /// Ready interests
+    pub readiness: Interest,
+}
+
+impl Event {
+    pub fn new(token: Token, readiness: Interest) -> Self {
+        Event { token, readiness }
+    }
+    
+    pub fn is_readable(&self) -> bool {
+        self.readiness.is_readable()
+    }
+    
+    pub fn is_writable(&self) -> bool {
+        self.readiness.is_writable()
+    }
+    
+    pub fn is_error(&self) -> bool {
+        self.readiness.is_error()
+    }
+}
+
+/// Token for identifying registered sources
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Token(pub usize);
+
+impl Token {
+    pub fn new(value: usize) -> Self {
+        Token(value)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REACTOR TRAIT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Platform-agnostic reactor interface
+pub trait Reactor: Send + Sync {
+    /// Register a file descriptor for events
+    fn register(&self, fd: RawFd, token: Token, interest: Interest) -> Result<(), IoError>;
+    
+    /// Modify registration
+    fn reregister(&self, fd: RawFd, token: Token, interest: Interest) -> Result<(), IoError>;
+    
+    /// Deregister a file descriptor
+    fn deregister(&self, fd: RawFd) -> Result<(), IoError>;
+    
+    /// Poll for events
+    fn poll(&self, events: &mut Events, timeout: Option<Duration>) -> Result<usize, IoError>;
+    
+    /// Wake up the reactor
+    fn wake(&self) -> Result<(), IoError>;
+}
+
+/// Raw file descriptor type
+#[cfg(unix)]
+pub type RawFd = i32;
+
+#[cfg(windows)]
+pub type RawFd = usize; // HANDLE
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EVENTS BUFFER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Event buffer for poll results
+pub struct Events {
+    events: Vec<Event>,
+    capacity: usize,
+}
+
+impl Events {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Events {
+            events: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+    
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+    
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+    
+    pub fn clear(&mut self) {
+        self.events.clear();
+    }
+    
+    pub fn iter(&self) -> impl Iterator<Item = &Event> {
+        self.events.iter()
+    }
+    
+    pub fn push(&mut self, event: Event) {
+        if self.events.len() < self.capacity {
+            self.events.push(event);
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a Events {
+    type Item = &'a Event;
+    type IntoIter = std::slice::Iter<'a, Event>;
+    
+    fn into_iter(self) -> Self::IntoIter {
+        self.events.iter()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EPOLL REACTOR (Linux)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(target_os = "linux")]
+pub mod epoll {
+    use super::*;
+    
+    // Epoll constants
+    const EPOLL_CTL_ADD: i32 = 1;
+    const EPOLL_CTL_DEL: i32 = 2;
+    const EPOLL_CTL_MOD: i32 = 3;
+    
+    const EPOLLIN: u32 = 0x001;
+    const EPOLLOUT: u32 = 0x004;
+    const EPOLLERR: u32 = 0x008;
+    const EPOLLHUP: u32 = 0x010;
+    const EPOLLET: u32 = 1 << 31;
+    const EPOLLONESHOT: u32 = 1 << 30;
+    
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct EpollEvent {
+        events: u32,
+        data: u64,
+    }
+    
+    extern "C" {
+        fn epoll_create1(flags: i32) -> i32;
+        fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: *mut EpollEvent) -> i32;
+        fn epoll_wait(epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32) -> i32;
+        fn close(fd: i32) -> i32;
+        fn eventfd(initval: u32, flags: i32) -> i32;
+        fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+        fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    }
+    
+    /// Epoll-based reactor
+    pub struct EpollReactor {
+        epoll_fd: i32,
+        wake_fd: i32,
+        config: ReactorConfig,
+    }
+    
+    impl EpollReactor {
+        pub fn new(config: ReactorConfig) -> Result<Self, IoError> {
+            let epoll_fd = unsafe { epoll_create1(0) };
+            if epoll_fd < 0 {
+                return Err(IoError::from_errno());
+            }
+            
+            // Create eventfd for wakeup
+            let wake_fd = unsafe { eventfd(0, 0) };
+            if wake_fd < 0 {
+                unsafe { close(epoll_fd) };
+                return Err(IoError::from_errno());
+            }
+            
+            let reactor = EpollReactor {
+                epoll_fd,
+                wake_fd,
+                config,
+            };
+            
+            // Register wake fd
+            reactor.register(wake_fd, Token(usize::MAX), Interest::READABLE)?;
+            
+            Ok(reactor)
+        }
+        
+        fn interest_to_epoll(&self, interest: Interest) -> u32 {
+            let mut events = 0u32;
+            
+            if interest.is_readable() {
+                events |= EPOLLIN;
+            }
+            if interest.is_writable() {
+                events |= EPOLLOUT;
+            }
+            
+            if self.config.edge_triggered {
+                events |= EPOLLET;
+            }
+            if self.config.oneshot {
+                events |= EPOLLONESHOT;
+            }
+            
+            events
+        }
+        
+        fn epoll_to_interest(events: u32) -> Interest {
+            let mut interest = Interest(0);
+            
+            if events & EPOLLIN != 0 {
+                interest = interest.add(Interest::READABLE);
+            }
+            if events & EPOLLOUT != 0 {
+                interest = interest.add(Interest::WRITABLE);
+            }
+            if events & (EPOLLERR | EPOLLHUP) != 0 {
+                interest = interest.add(Interest::ERROR);
+            }
+            
+            interest
+        }
+    }
+    
+    impl Reactor for EpollReactor {
+        fn register(&self, fd: RawFd, token: Token, interest: Interest) -> Result<(), IoError> {
+            let mut event = EpollEvent {
+                events: self.interest_to_epoll(interest),
+                data: token.0 as u64,
+            };
+            
+            let ret = unsafe {
+                epoll_ctl(self.epoll_fd, EPOLL_CTL_ADD, fd, &mut event)
+            };
+            
+            if ret < 0 {
+                Err(IoError::from_errno())
+            } else {
+                Ok(())
+            }
+        }
+        
+        fn reregister(&self, fd: RawFd, token: Token, interest: Interest) -> Result<(), IoError> {
+            let mut event = EpollEvent {
+                events: self.interest_to_epoll(interest),
+                data: token.0 as u64,
+            };
+            
+            let ret = unsafe {
+                epoll_ctl(self.epoll_fd, EPOLL_CTL_MOD, fd, &mut event)
+            };
+            
+            if ret < 0 {
+                Err(IoError::from_errno())
+            } else {
+                Ok(())
+            }
+        }
+        
+        fn deregister(&self, fd: RawFd) -> Result<(), IoError> {
+            let ret = unsafe {
+                epoll_ctl(self.epoll_fd, EPOLL_CTL_DEL, fd, std::ptr::null_mut())
+            };
+            
+            if ret < 0 {
+                Err(IoError::from_errno())
+            } else {
+                Ok(())
+            }
+        }
+        
+        fn poll(&self, events: &mut Events, timeout: Option<Duration>) -> Result<usize, IoError> {
+            let timeout_ms = timeout
+                .map(|d| d.as_millis() as i32)
+                .unwrap_or(-1);
+            
+            let mut epoll_events: Vec<EpollEvent> = vec![
+                EpollEvent { events: 0, data: 0 };
+                self.config.max_events
+            ];
+            
+            let ret = unsafe {
+                epoll_wait(
+                    self.epoll_fd,
+                    epoll_events.as_mut_ptr(),
+                    self.config.max_events as i32,
+                    timeout_ms,
+                )
+            };
+            
+            if ret < 0 {
+                return Err(IoError::from_errno());
+            }
+            
+            events.clear();
+            
+            for i in 0..ret as usize {
+                let ep_event = &epoll_events[i];
+                let token = Token(ep_event.data as usize);
+                
+                // Handle wakeup
+                if token.0 == usize::MAX {
+                    let mut buf = [0u8; 8];
+                    unsafe { read(self.wake_fd, buf.as_mut_ptr(), 8) };
+                    continue;
+                }
+                
+                events.push(Event {
+                    token,
+                    readiness: Self::epoll_to_interest(ep_event.events),
+                });
+            }
+            
+            Ok(events.len())
+        }
+        
+        fn wake(&self) -> Result<(), IoError> {
+            let buf: u64 = 1;
+            let ret = unsafe {
+                write(self.wake_fd, &buf as *const u64 as *const u8, 8)
+            };
+            
+            if ret < 0 {
+                Err(IoError::from_errno())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    
+    impl Drop for EpollReactor {
+        fn drop(&mut self) {
+            unsafe {
+                close(self.wake_fd);
+                close(self.epoll_fd);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KQUEUE REACTOR (macOS/BSD)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+pub mod kqueue {
+    use super::*;
+    
+    const EVFILT_READ: i16 = -1;
+    const EVFILT_WRITE: i16 = -2;
+    const EVFILT_USER: i16 = -10;
+    
+    const EV_ADD: u16 = 0x0001;
+    const EV_DELETE: u16 = 0x0002;
+    const EV_ENABLE: u16 = 0x0004;
+    const EV_CLEAR: u16 = 0x0020;
+    const EV_ONESHOT: u16 = 0x0010;
+    
+    const NOTE_TRIGGER: u32 = 0x01000000;
+    
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Kevent {
+        ident: usize,
+        filter: i16,
+        flags: u16,
+        fflags: u32,
+        data: isize,
+        udata: *mut std::ffi::c_void,
+    }
+    
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Timespec {
+        tv_sec: i64,
+        tv_nsec: i64,
+    }
+    
+    extern "C" {
+        fn kqueue() -> i32;
+        fn kevent(
+            kq: i32,
+            changelist: *const Kevent,
+            nchanges: i32,
+            eventlist: *mut Kevent,
+            nevents: i32,
+            timeout: *const Timespec,
+        ) -> i32;
+        fn close(fd: i32) -> i32;
+    }
+    
+    /// Kqueue-based reactor
+    pub struct KqueueReactor {
+        kq_fd: i32,
+        config: ReactorConfig,
+        wake_ident: usize,
+    }
+    
+    impl KqueueReactor {
+        pub fn new(config: ReactorConfig) -> Result<Self, IoError> {
+            let kq_fd = unsafe { kqueue() };
+            if kq_fd < 0 {
+                return Err(IoError::from_errno());
+            }
+            
+            let wake_ident = usize::MAX - 1;
+            
+            let reactor = KqueueReactor {
+                kq_fd,
+                config,
+                wake_ident,
+            };
+            
+            // Register user event for wakeup
+            let change = Kevent {
+                ident: wake_ident,
+                filter: EVFILT_USER,
+                flags: EV_ADD | EV_CLEAR,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            
+            let ret = unsafe {
+                kevent(kq_fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null())
+            };
+            
+            if ret < 0 {
+                unsafe { close(kq_fd) };
+                return Err(IoError::from_errno());
+            }
+            
+            Ok(reactor)
+        }
+        
+        fn add_filter(&self, fd: RawFd, token: Token, filter: i16) -> Result<(), IoError> {
+            let mut flags = EV_ADD | EV_ENABLE;
+            if self.config.edge_triggered {
+                flags |= EV_CLEAR;
+            }
+            if self.config.oneshot {
+                flags |= EV_ONESHOT;
+            }
+            
+            let change = Kevent {
+                ident: fd as usize,
+                filter,
+                flags,
+                fflags: 0,
+                data: 0,
+                udata: token.0 as *mut std::ffi::c_void,
+            };
+            
+            let ret = unsafe {
+                kevent(self.kq_fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null())
+            };
+            
+            if ret < 0 {
+                Err(IoError::from_errno())
+            } else {
+                Ok(())
+            }
+        }
+        
+        fn del_filter(&self, fd: RawFd, filter: i16) -> Result<(), IoError> {
+            let change = Kevent {
+                ident: fd as usize,
+                filter,
+                flags: EV_DELETE,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            
+            let ret = unsafe {
+                kevent(self.kq_fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null())
+            };
+            
+            if ret < 0 {
+                // Ignore ENOENT
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno != 2 { // ENOENT
+                    return Err(IoError::from_errno());
+                }
+            }
+            
+            Ok(())
+        }
+    }
+    
+    impl Reactor for KqueueReactor {
+        fn register(&self, fd: RawFd, token: Token, interest: Interest) -> Result<(), IoError> {
+            if interest.is_readable() {
+                self.add_filter(fd, token, EVFILT_READ)?;
+            }
+            if interest.is_writable() {
+                self.add_filter(fd, token, EVFILT_WRITE)?;
+            }
+            Ok(())
+        }
+        
+        fn reregister(&self, fd: RawFd, token: Token, interest: Interest) -> Result<(), IoError> {
+            // Remove old filters and add new ones
+            self.del_filter(fd, EVFILT_READ)?;
+            self.del_filter(fd, EVFILT_WRITE)?;
+            self.register(fd, token, interest)
+        }
+        
+        fn deregister(&self, fd: RawFd) -> Result<(), IoError> {
+            self.del_filter(fd, EVFILT_READ)?;
+            self.del_filter(fd, EVFILT_WRITE)?;
+            Ok(())
+        }
+        
+        fn poll(&self, events: &mut Events, timeout: Option<Duration>) -> Result<usize, IoError> {
+            let ts = timeout.map(|d| Timespec {
+                tv_sec: d.as_secs() as i64,
+                tv_nsec: d.subsec_nanos() as i64,
+            });
+            
+            let ts_ptr = ts.as_ref()
+                .map(|t| t as *const Timespec)
+                .unwrap_or(std::ptr::null());
+            
+            let mut kevents: Vec<Kevent> = vec![
+                Kevent {
+                    ident: 0,
+                    filter: 0,
+                    flags: 0,
+                    fflags: 0,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                };
+                self.config.max_events
+            ];
+            
+            let ret = unsafe {
+                kevent(
+                    self.kq_fd,
+                    std::ptr::null(),
+                    0,
+                    kevents.as_mut_ptr(),
+                    self.config.max_events as i32,
+                    ts_ptr,
+                )
+            };
+            
+            if ret < 0 {
+                return Err(IoError::from_errno());
+            }
+            
+            events.clear();
+            
+            for i in 0..ret as usize {
+                let kev = &kevents[i];
+                
+                // Handle wakeup
+                if kev.ident == self.wake_ident {
+                    continue;
+                }
+                
+                let token = Token(kev.udata as usize);
+                let readiness = match kev.filter {
+                    EVFILT_READ => Interest::READABLE,
+                    EVFILT_WRITE => Interest::WRITABLE,
+                    _ => Interest(0),
+                };
+                
+                events.push(Event { token, readiness });
+            }
+            
+            Ok(events.len())
+        }
+        
+        fn wake(&self) -> Result<(), IoError> {
+            let change = Kevent {
+                ident: self.wake_ident,
+                filter: EVFILT_USER,
+                flags: 0,
+                fflags: NOTE_TRIGGER,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            
+            let ret = unsafe {
+                kevent(self.kq_fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null())
+            };
+            
+            if ret < 0 {
+                Err(IoError::from_errno())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    
+    impl Drop for KqueueReactor {
+        fn drop(&mut self) {
+            unsafe { close(self.kq_fd) };
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// IOCP REACTOR (Windows)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(target_os = "windows")]
+pub mod iocp {
+    use super::*;
+    
+    type HANDLE = *mut std::ffi::c_void;
+    type DWORD = u32;
+    type ULONG_PTR = usize;
+    type BOOL = i32;
+    
+    const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
+    const INFINITE: DWORD = 0xFFFFFFFF;
+    
+    #[repr(C)]
+    struct OVERLAPPED {
+        internal: ULONG_PTR,
+        internal_high: ULONG_PTR,
+        offset: DWORD,
+        offset_high: DWORD,
+        event: HANDLE,
+    }
+    
+    #[repr(C)]
+    struct OVERLAPPED_ENTRY {
+        completion_key: ULONG_PTR,
+        overlapped: *mut OVERLAPPED,
+        internal: ULONG_PTR,
+        bytes_transferred: DWORD,
+    }
+    
+    extern "system" {
+        fn CreateIoCompletionPort(
+            file_handle: HANDLE,
+            existing_completion_port: HANDLE,
+            completion_key: ULONG_PTR,
+            number_of_concurrent_threads: DWORD,
+        ) -> HANDLE;
+        
+        fn GetQueuedCompletionStatusEx(
+            completion_port: HANDLE,
+            completion_port_entries: *mut OVERLAPPED_ENTRY,
+            count: DWORD,
+            num_entries_removed: *mut DWORD,
+            milliseconds: DWORD,
+            alertable: BOOL,
+        ) -> BOOL;
+        
+        fn PostQueuedCompletionStatus(
+            completion_port: HANDLE,
+            bytes_transferred: DWORD,
+            completion_key: ULONG_PTR,
+            overlapped: *mut OVERLAPPED,
+        ) -> BOOL;
+        
+        fn CloseHandle(handle: HANDLE) -> BOOL;
+    }
+    
+    /// IOCP-based reactor
+    pub struct IocpReactor {
+        iocp: HANDLE,
+        config: ReactorConfig,
+    }
+    
+    impl IocpReactor {
+        pub fn new(config: ReactorConfig) -> Result<Self, IoError> {
+            let iocp = unsafe {
+                CreateIoCompletionPort(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                )
+            };
+            
+            if iocp.is_null() {
+                return Err(IoError::from_last_os_error());
+            }
+            
+            Ok(IocpReactor { iocp, config })
+        }
+    }
+    
+    impl Reactor for IocpReactor {
+        fn register(&self, fd: RawFd, token: Token, _interest: Interest) -> Result<(), IoError> {
+            let handle = fd as HANDLE;
+            
+            let result = unsafe {
+                CreateIoCompletionPort(
+                    handle,
+                    self.iocp,
+                    token.0,
+                    0,
+                )
+            };
+            
+            if result.is_null() {
+                Err(IoError::from_last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+        
+        fn reregister(&self, _fd: RawFd, _token: Token, _interest: Interest) -> Result<(), IoError> {
+            // IOCP doesn't need reregistration
+            Ok(())
+        }
+        
+        fn deregister(&self, _fd: RawFd) -> Result<(), IoError> {
+            // IOCP handles are automatically deregistered when closed
+            Ok(())
+        }
+        
+        fn poll(&self, events: &mut Events, timeout: Option<Duration>) -> Result<usize, IoError> {
+            let timeout_ms = timeout
+                .map(|d| d.as_millis() as DWORD)
+                .unwrap_or(INFINITE);
+            
+            let mut entries: Vec<OVERLAPPED_ENTRY> = vec![
+                OVERLAPPED_ENTRY {
+                    completion_key: 0,
+                    overlapped: std::ptr::null_mut(),
+                    internal: 0,
+                    bytes_transferred: 0,
+                };
+                self.config.max_events
+            ];
+            
+            let mut num_entries: DWORD = 0;
+            
+            let ret = unsafe {
+                GetQueuedCompletionStatusEx(
+                    self.iocp,
+                    entries.as_mut_ptr(),
+                    self.config.max_events as DWORD,
+                    &mut num_entries,
+                    timeout_ms,
+                    0,
+                )
+            };
+            
+            if ret == 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(258) { // WAIT_TIMEOUT
+                    return Ok(0);
+                }
+                return Err(IoError::from_last_os_error());
+            }
+            
+            events.clear();
+            
+            for i in 0..num_entries as usize {
+                let entry = &entries[i];
+                
+                // Skip wakeup events
+                if entry.completion_key == usize::MAX {
+                    continue;
+                }
+                
+                events.push(Event {
+                    token: Token(entry.completion_key),
+                    readiness: Interest::READABLE | Interest::WRITABLE,
+                });
+            }
+            
+            Ok(events.len())
+        }
+        
+        fn wake(&self) -> Result<(), IoError> {
+            let ret = unsafe {
+                PostQueuedCompletionStatus(
+                    self.iocp,
+                    0,
+                    usize::MAX,
+                    std::ptr::null_mut(),
+                )
+            };
+            
+            if ret == 0 {
+                Err(IoError::from_last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    
+    impl Drop for IocpReactor {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.iocp) };
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CROSS-PLATFORM REACTOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Platform-specific reactor type alias
+#[cfg(target_os = "linux")]
+pub type PlatformReactor = epoll::EpollReactor;
+
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+pub type PlatformReactor = kqueue::KqueueReactor;
+
+#[cfg(target_os = "windows")]
+pub type PlatformReactor = iocp::IocpReactor;
+
+/// Create a reactor for the current platform
+pub fn create_reactor(config: ReactorConfig) -> Result<PlatformReactor, IoError> {
+    PlatformReactor::new(config)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// I/O SOURCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Async I/O source
+pub struct IoSource<T> {
+    inner: T,
+    token: Token,
+    interest: Interest,
+}
+
+impl<T: AsRawFd> IoSource<T> {
+    pub fn new(inner: T, token: Token) -> Self {
+        IoSource {
+            inner,
+            token,
+            interest: Interest(0),
+        }
+    }
+    
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+    
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+    
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+    
+    pub fn token(&self) -> Token {
+        self.token
+    }
+}
+
+/// Trait for getting raw file descriptor
+pub trait AsRawFd {
+    fn as_raw_fd(&self) -> RawFd;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ASYNC READ/WRITE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Async readable trait
+pub trait AsyncRead {
+    /// Poll for read readiness
+    fn poll_read(&mut self, buf: &mut [u8]) -> Poll<Result<usize, IoError>>;
+}
+
+/// Async writable trait
+pub trait AsyncWrite {
+    /// Poll for write readiness
+    fn poll_write(&mut self, buf: &[u8]) -> Poll<Result<usize, IoError>>;
+    
+    /// Poll for flush
+    fn poll_flush(&mut self) -> Poll<Result<(), IoError>>;
+}
+
+/// Poll result
+pub enum Poll<T> {
+    Ready(T),
+    Pending,
+}
+
+impl<T> Poll<T> {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Poll::Ready(_))
+    }
+    
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Poll::Pending)
+    }
+    
+    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Poll<U> {
+        match self {
+            Poll::Ready(t) => Poll::Ready(f(t)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTRATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Registration handle for I/O sources
+pub struct Registration {
+    token: Token,
+    waker: Option<Waker>,
+}
+
+impl Registration {
+    pub fn new(token: Token) -> Self {
+        Registration {
+            token,
+            waker: None,
+        }
+    }
+    
+    pub fn token(&self) -> Token {
+        self.token
+    }
+    
+    pub fn set_waker(&mut self, waker: Waker) {
+        self.waker = Some(waker);
+    }
+    
+    pub fn wake(&self) {
+        if let Some(ref waker) = self.waker {
+            waker.wake();
+        }
+    }
+    
+    pub fn clear_waker(&mut self) {
+        self.waker = None;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DRIVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// I/O driver that manages the reactor and wakers
+pub struct IoDriver {
+    reactor: PlatformReactor,
+    registrations: BTreeMap<Token, Registration>,
+    next_token: AtomicUsize,
+    woken: AtomicBool,
+}
+
+impl IoDriver {
+    pub fn new(config: ReactorConfig) -> Result<Self, IoError> {
+        Ok(IoDriver {
+            reactor: create_reactor(config)?,
+            registrations: BTreeMap::new(),
+            next_token: AtomicUsize::new(1),
+            woken: AtomicBool::new(false),
+        })
+    }
+    
+    /// Allocate a new token
+    pub fn allocate_token(&self) -> Token {
+        Token(self.next_token.fetch_add(1, Ordering::Relaxed))
+    }
+    
+    /// Register a source
+    pub fn register<T: AsRawFd>(
+        &mut self,
+        source: &T,
+        interest: Interest,
+    ) -> Result<Token, IoError> {
+        let token = self.allocate_token();
+        self.reactor.register(source.as_raw_fd(), token, interest)?;
+        self.registrations.insert(token, Registration::new(token));
+        Ok(token)
+    }
+    
+    /// Deregister a source
+    pub fn deregister<T: AsRawFd>(&mut self, source: &T, token: Token) -> Result<(), IoError> {
+        self.reactor.deregister(source.as_raw_fd())?;
+        self.registrations.remove(&token);
+        Ok(())
+    }
+    
+    /// Set waker for a registration
+    pub fn set_waker(&mut self, token: Token, waker: Waker) {
+        if let Some(reg) = self.registrations.get_mut(&token) {
+            reg.set_waker(waker);
+        }
+    }
+    
+    /// Drive I/O events
+    pub fn drive(&mut self, timeout: Option<Duration>) -> Result<usize, IoError> {
+        let mut events = Events::with_capacity(1024);
+        
+        let count = self.reactor.poll(&mut events, timeout)?;
+        
+        for event in &events {
+            if let Some(reg) = self.registrations.get(&event.token) {
+                reg.wake();
+            }
+        }
+        
+        Ok(count)
+    }
+    
+    /// Wake up the driver
+    pub fn wake(&self) -> Result<(), IoError> {
+        self.woken.store(true, Ordering::Release);
+        self.reactor.wake()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct IoError {
+    kind: IoErrorKind,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoErrorKind {
+    NotFound,
+    PermissionDenied,
+    ConnectionRefused,
+    ConnectionReset,
+    ConnectionAborted,
+    NotConnected,
+    AddrInUse,
+    AddrNotAvailable,
+    BrokenPipe,
+    AlreadyExists,
+    WouldBlock,
+    InvalidInput,
+    InvalidData,
+    TimedOut,
+    WriteZero,
+    Interrupted,
+    Other,
+}
+
+impl IoError {
+    pub fn new(kind: IoErrorKind, message: impl Into<String>) -> Self {
+        IoError {
+            kind,
+            message: message.into(),
+        }
+    }
+    
+    pub fn kind(&self) -> IoErrorKind {
+        self.kind
+    }
+    
+    #[cfg(unix)]
+    pub fn from_errno() -> Self {
+        let err = std::io::Error::last_os_error();
+        IoError {
+            kind: IoErrorKind::Other,
+            message: err.to_string(),
+        }
+    }
+    
+    #[cfg(windows)]
+    pub fn from_last_os_error() -> Self {
+        let err = std::io::Error::last_os_error();
+        IoError {
+            kind: IoErrorKind::Other,
+            message: err.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for IoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.kind, self.message)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_interest_flags() {
+        let interest = Interest::READABLE | Interest::WRITABLE;
+        assert!(interest.is_readable());
+        assert!(interest.is_writable());
+        assert!(!interest.is_error());
+    }
+    
+    #[test]
+    fn test_events_buffer() {
+        let mut events = Events::with_capacity(10);
+        assert!(events.is_empty());
+        
+        events.push(Event::new(Token(1), Interest::READABLE));
+        assert_eq!(events.len(), 1);
+    }
+    
+    #[test]
+    fn test_token() {
+        let t1 = Token::new(1);
+        let t2 = Token::new(2);
+        assert!(t1 < t2);
+    }
+    
+    #[test]
+    fn test_reactor_config_default() {
+        let config = ReactorConfig::default();
+        assert_eq!(config.max_events, 1024);
+        assert!(config.edge_triggered);
+    }
+    
+    #[test]
+    fn test_poll_map() {
+        let poll: Poll<i32> = Poll::Ready(42);
+        let mapped = poll.map(|x| x * 2);
+        assert!(matches!(mapped, Poll::Ready(84)));
+    }
+    
+    #[test]
+    fn test_registration() {
+        let reg = Registration::new(Token(1));
+        assert_eq!(reg.token().0, 1);
+    }
+}

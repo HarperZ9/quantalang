@@ -1,0 +1,1013 @@
+// QUANTA Standard Library - BTreeMap
+// Self-balancing B-tree for ordered key-value storage with O(log n) operations
+
+module std::btree;
+
+use std::vec::Vec;
+use runtime::allocator::{Allocator, GlobalAllocator, Layout};
+use core::mem::{size_of, swap};
+use core::ptr::{null_mut, drop_in_place, write, read};
+use core::cmp::{Ordering, PartialOrd, Ord, PartialEq, Eq};
+use core::ops::Index;
+use core::iter::{Iterator, IntoIterator, FromIterator, DoubleEndedIterator};
+use core::option::Option::{self, Some, None};
+use core::fmt::{Debug, Formatter, Result as FmtResult};
+use core::clone::Clone;
+
+/// B-tree branching factor (B = 6, so 5-11 keys per node)
+const B: usize = 6;
+const MIN_KEYS: usize = B - 1;      // 5
+const MAX_KEYS: usize = 2 * B - 1;  // 11
+const MIN_CHILDREN: usize = B;       // 6
+const MAX_CHILDREN: usize = 2 * B;   // 12
+
+/// B-tree node
+struct Node<K, V> {
+    keys: [core::mem::MaybeUninit<K>; MAX_KEYS],
+    values: [core::mem::MaybeUninit<V>; MAX_KEYS],
+    children: [*mut Node<K, V>; MAX_CHILDREN],
+    len: usize,       // Number of keys
+    is_leaf: bool,
+}
+
+impl<K, V> Node<K, V> {
+    fn new_leaf() -> *mut Self {
+        let layout = Layout::new::<Self>();
+        let ptr = unsafe { GlobalAllocator.alloc_zeroed(layout) as *mut Self };
+        if ptr.is_null() {
+            panic!("BTreeMap node allocation failed");
+        }
+        unsafe {
+            (*ptr).len = 0;
+            (*ptr).is_leaf = true;
+            for i in 0..MAX_CHILDREN {
+                (*ptr).children[i] = null_mut();
+            }
+        }
+        ptr
+    }
+    
+    fn new_internal() -> *mut Self {
+        let node = Self::new_leaf();
+        unsafe { (*node).is_leaf = false; }
+        node
+    }
+    
+    unsafe fn free(node: *mut Self) {
+        if node.is_null() {
+            return;
+        }
+        
+        // Drop keys and values
+        for i in 0..(*node).len {
+            drop_in_place((*node).keys[i].assume_init_mut());
+            drop_in_place((*node).values[i].assume_init_mut());
+        }
+        
+        // Recursively free children
+        if !(*node).is_leaf {
+            for i in 0..=(*node).len {
+                Self::free((*node).children[i]);
+            }
+        }
+        
+        let layout = Layout::new::<Self>();
+        GlobalAllocator.dealloc(node as *mut u8, layout);
+    }
+    
+    unsafe fn key(&self, idx: usize) -> &K {
+        self.keys[idx].assume_init_ref()
+    }
+    
+    unsafe fn value(&self, idx: usize) -> &V {
+        self.values[idx].assume_init_ref()
+    }
+    
+    unsafe fn value_mut(&mut self, idx: usize) -> &mut V {
+        self.values[idx].assume_init_mut()
+    }
+    
+    unsafe fn set_key(&mut self, idx: usize, key: K) {
+        self.keys[idx].write(key);
+    }
+    
+    unsafe fn set_value(&mut self, idx: usize, value: V) {
+        self.values[idx].write(value);
+    }
+    
+    /// Binary search for key position
+    fn search<Q: ?Sized>(&self, key: &Q) -> Result<usize, usize> 
+    where K: core::borrow::Borrow<Q>, Q: Ord
+    {
+        let mut lo = 0;
+        let mut hi = self.len;
+        
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let k = unsafe { self.key(mid) };
+            match key.cmp(k.borrow()) {
+                Ordering::Equal => return Ok(mid),
+                Ordering::Less => hi = mid,
+                Ordering::Greater => lo = mid + 1,
+            }
+        }
+        
+        Err(lo)
+    }
+    
+    /// Check if node is full
+    fn is_full(&self) -> bool {
+        self.len == MAX_KEYS
+    }
+    
+    /// Check if node has minimum keys
+    fn is_minimal(&self) -> bool {
+        self.len == MIN_KEYS
+    }
+    
+    /// Insert key-value into non-full leaf
+    unsafe fn insert_leaf(&mut self, idx: usize, key: K, value: V) {
+        // Shift right
+        for i in (idx..self.len).rev() {
+            self.keys[i + 1] = core::mem::MaybeUninit::new(self.keys[i].assume_init_read());
+            self.values[i + 1] = core::mem::MaybeUninit::new(self.values[i].assume_init_read());
+        }
+        
+        self.keys[idx].write(key);
+        self.values[idx].write(value);
+        self.len += 1;
+    }
+    
+    /// Insert key-value and child into non-full internal node
+    unsafe fn insert_internal(&mut self, idx: usize, key: K, value: V, right_child: *mut Self) {
+        // Shift keys and values right
+        for i in (idx..self.len).rev() {
+            self.keys[i + 1] = core::mem::MaybeUninit::new(self.keys[i].assume_init_read());
+            self.values[i + 1] = core::mem::MaybeUninit::new(self.values[i].assume_init_read());
+        }
+        
+        // Shift children right
+        for i in (idx + 1..=self.len).rev() {
+            self.children[i + 1] = self.children[i];
+        }
+        
+        self.keys[idx].write(key);
+        self.values[idx].write(value);
+        self.children[idx + 1] = right_child;
+        self.len += 1;
+    }
+    
+    /// Split full node, returning (median_key, median_value, right_half)
+    unsafe fn split(&mut self) -> (K, V, *mut Self) {
+        let mid = self.len / 2;
+        
+        let right = if self.is_leaf {
+            Self::new_leaf()
+        } else {
+            Self::new_internal()
+        };
+        
+        // Extract median
+        let median_key = self.keys[mid].assume_init_read();
+        let median_value = self.values[mid].assume_init_read();
+        
+        // Move right half to new node
+        let right_len = self.len - mid - 1;
+        for i in 0..right_len {
+            (*right).keys[i].write(self.keys[mid + 1 + i].assume_init_read());
+            (*right).values[i].write(self.values[mid + 1 + i].assume_init_read());
+        }
+        
+        // Move children if internal
+        if !self.is_leaf {
+            for i in 0..=right_len {
+                (*right).children[i] = self.children[mid + 1 + i];
+            }
+        }
+        
+        (*right).len = right_len;
+        self.len = mid;
+        
+        (median_key, median_value, right)
+    }
+    
+    /// Remove key at index from leaf
+    unsafe fn remove_leaf(&mut self, idx: usize) -> (K, V) {
+        let key = self.keys[idx].assume_init_read();
+        let value = self.values[idx].assume_init_read();
+        
+        // Shift left
+        for i in idx..self.len - 1 {
+            self.keys[i] = core::mem::MaybeUninit::new(self.keys[i + 1].assume_init_read());
+            self.values[i] = core::mem::MaybeUninit::new(self.values[i + 1].assume_init_read());
+        }
+        
+        self.len -= 1;
+        (key, value)
+    }
+}
+
+/// Ordered map based on B-tree
+pub struct BTreeMap<K, V> {
+    root: *mut Node<K, V>,
+    len: usize,
+}
+
+impl<K: Ord, V> BTreeMap<K, V> {
+    /// Create empty BTreeMap
+    pub fn new() -> Self {
+        Self {
+            root: null_mut(),
+            len: 0,
+        }
+    }
+    
+    /// Number of entries
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    
+    /// Clear all entries
+    pub fn clear(&mut self) {
+        unsafe { Node::free(self.root); }
+        self.root = null_mut();
+        self.len = 0;
+    }
+    
+    /// Get reference to value
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        if self.root.is_null() {
+            return None;
+        }
+        
+        let mut node = self.root;
+        
+        unsafe {
+            while !node.is_null() {
+                match (*node).search(key) {
+                    Ok(idx) => return Some((*node).value(idx)),
+                    Err(idx) => {
+                        if (*node).is_leaf {
+                            return None;
+                        }
+                        node = (*node).children[idx];
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    /// Get mutable reference to value
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        if self.root.is_null() {
+            return None;
+        }
+        
+        let mut node = self.root;
+        
+        unsafe {
+            while !node.is_null() {
+                match (*node).search(key) {
+                    Ok(idx) => return Some((*node).value_mut(idx)),
+                    Err(idx) => {
+                        if (*node).is_leaf {
+                            return None;
+                        }
+                        node = (*node).children[idx];
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    /// Check if key exists
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.get(key).is_some()
+    }
+    
+    /// Insert key-value pair
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        if self.root.is_null() {
+            self.root = Node::new_leaf();
+            unsafe {
+                (*self.root).set_key(0, key);
+                (*self.root).set_value(0, value);
+                (*self.root).len = 1;
+            }
+            self.len = 1;
+            return None;
+        }
+        
+        // Check if root needs split
+        unsafe {
+            if (*self.root).is_full() {
+                let old_root = self.root;
+                self.root = Node::new_internal();
+                (*self.root).children[0] = old_root;
+                
+                let (med_key, med_value, right) = (*old_root).split();
+                (*self.root).set_key(0, med_key);
+                (*self.root).set_value(0, med_value);
+                (*self.root).children[1] = right;
+                (*self.root).len = 1;
+            }
+        }
+        
+        self.insert_non_full(self.root, key, value)
+    }
+    
+    /// Insert into non-full node
+    fn insert_non_full(&mut self, node: *mut Node<K, V>, key: K, value: V) -> Option<V> {
+        unsafe {
+            match (*node).search(&key) {
+                Ok(idx) => {
+                    // Key exists, replace value
+                    let old = (*node).values[idx].assume_init_read();
+                    (*node).values[idx].write(value);
+                    return Some(old);
+                }
+                Err(idx) => {
+                    if (*node).is_leaf {
+                        (*node).insert_leaf(idx, key, value);
+                        self.len += 1;
+                        return None;
+                    }
+                    
+                    // Go to child
+                    let mut child_idx = idx;
+                    let child = (*node).children[child_idx];
+                    
+                    // Split child if full
+                    if (*child).is_full() {
+                        let (med_key, med_value, right) = (*child).split();
+                        (*node).insert_internal(child_idx, med_key, med_value, right);
+                        
+                        // Determine which child to descend into
+                        if key > *(*node).key(child_idx) {
+                            child_idx += 1;
+                        }
+                    }
+                    
+                    return self.insert_non_full((*node).children[child_idx], key, value);
+                }
+            }
+        }
+    }
+    
+    /// Remove key and return value
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        if self.root.is_null() {
+            return None;
+        }
+        
+        let result = self.remove_from(self.root, key);
+        
+        // Shrink root if empty internal node
+        unsafe {
+            if !self.root.is_null() && (*self.root).len == 0 && !(*self.root).is_leaf {
+                let old_root = self.root;
+                self.root = (*self.root).children[0];
+                let layout = Layout::new::<Node<K, V>>();
+                GlobalAllocator.dealloc(old_root as *mut u8, layout);
+            }
+        }
+        
+        if result.is_some() {
+            self.len -= 1;
+        }
+        
+        result
+    }
+    
+    /// Remove from subtree
+    fn remove_from<Q>(&mut self, node: *mut Node<K, V>, key: &Q) -> Option<V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        unsafe {
+            match (*node).search(key) {
+                Ok(idx) => {
+                    if (*node).is_leaf {
+                        // Case 1: Key in leaf
+                        let (_, value) = (*node).remove_leaf(idx);
+                        return Some(value);
+                    }
+                    
+                    // Case 2: Key in internal node
+                    let left_child = (*node).children[idx];
+                    let right_child = (*node).children[idx + 1];
+                    
+                    if (*left_child).len >= MIN_KEYS + 1 {
+                        // Case 2a: Get predecessor
+                        let (pred_key, pred_value) = self.remove_max(left_child);
+                        let old_key = (*node).keys[idx].assume_init_read();
+                        let old_value = (*node).values[idx].assume_init_read();
+                        (*node).keys[idx].write(pred_key);
+                        (*node).values[idx].write(pred_value);
+                        drop(old_key);
+                        return Some(old_value);
+                    } else if (*right_child).len >= MIN_KEYS + 1 {
+                        // Case 2b: Get successor
+                        let (succ_key, succ_value) = self.remove_min(right_child);
+                        let old_key = (*node).keys[idx].assume_init_read();
+                        let old_value = (*node).values[idx].assume_init_read();
+                        (*node).keys[idx].write(succ_key);
+                        (*node).values[idx].write(succ_value);
+                        drop(old_key);
+                        return Some(old_value);
+                    } else {
+                        // Case 2c: Merge children
+                        self.merge_children(node, idx);
+                        return self.remove_from(left_child, key);
+                    }
+                }
+                Err(idx) => {
+                    if (*node).is_leaf {
+                        return None;
+                    }
+                    
+                    // Ensure child has enough keys
+                    let child = (*node).children[idx];
+                    if (*child).len == MIN_KEYS {
+                        self.fill_child(node, idx);
+                    }
+                    
+                    // Child index may have changed after fill
+                    let new_idx = if idx > (*node).len { idx - 1 } else { idx };
+                    return self.remove_from((*node).children[new_idx], key);
+                }
+            }
+        }
+    }
+    
+    /// Remove and return minimum key-value from subtree
+    fn remove_min(&mut self, node: *mut Node<K, V>) -> (K, V) {
+        unsafe {
+            if (*node).is_leaf {
+                return (*node).remove_leaf(0);
+            }
+            
+            let child = (*node).children[0];
+            if (*child).len == MIN_KEYS {
+                self.fill_child(node, 0);
+            }
+            
+            self.remove_min((*node).children[0])
+        }
+    }
+    
+    /// Remove and return maximum key-value from subtree
+    fn remove_max(&mut self, node: *mut Node<K, V>) -> (K, V) {
+        unsafe {
+            if (*node).is_leaf {
+                let idx = (*node).len - 1;
+                return (*node).remove_leaf(idx);
+            }
+            
+            let child_idx = (*node).len;
+            let child = (*node).children[child_idx];
+            if (*child).len == MIN_KEYS {
+                self.fill_child(node, child_idx);
+            }
+            
+            self.remove_max((*node).children[(*node).len])
+        }
+    }
+    
+    /// Fill child that has MIN_KEYS
+    fn fill_child(&mut self, node: *mut Node<K, V>, idx: usize) {
+        unsafe {
+            let has_left = idx > 0;
+            let has_right = idx < (*node).len;
+            
+            if has_left && (*(*node).children[idx - 1]).len > MIN_KEYS {
+                // Borrow from left sibling
+                self.borrow_from_left(node, idx);
+            } else if has_right && (*(*node).children[idx + 1]).len > MIN_KEYS {
+                // Borrow from right sibling
+                self.borrow_from_right(node, idx);
+            } else if has_left {
+                // Merge with left sibling
+                self.merge_children(node, idx - 1);
+            } else {
+                // Merge with right sibling
+                self.merge_children(node, idx);
+            }
+        }
+    }
+    
+    /// Borrow key from left sibling
+    fn borrow_from_left(&mut self, node: *mut Node<K, V>, idx: usize) {
+        unsafe {
+            let child = (*node).children[idx];
+            let left = (*node).children[idx - 1];
+            
+            // Shift child's keys right
+            for i in (0..(*child).len).rev() {
+                (*child).keys[i + 1] = core::mem::MaybeUninit::new((*child).keys[i].assume_init_read());
+                (*child).values[i + 1] = core::mem::MaybeUninit::new((*child).values[i].assume_init_read());
+            }
+            
+            if !(*child).is_leaf {
+                for i in (0..=(*child).len).rev() {
+                    (*child).children[i + 1] = (*child).children[i];
+                }
+            }
+            
+            // Move parent key down to child
+            (*child).keys[0].write((*node).keys[idx - 1].assume_init_read());
+            (*child).values[0].write((*node).values[idx - 1].assume_init_read());
+            
+            // Move last key from left sibling to parent
+            let last_idx = (*left).len - 1;
+            (*node).keys[idx - 1].write((*left).keys[last_idx].assume_init_read());
+            (*node).values[idx - 1].write((*left).values[last_idx].assume_init_read());
+            
+            // Move last child from left sibling
+            if !(*child).is_leaf {
+                (*child).children[0] = (*left).children[(*left).len];
+            }
+            
+            (*child).len += 1;
+            (*left).len -= 1;
+        }
+    }
+    
+    /// Borrow key from right sibling
+    fn borrow_from_right(&mut self, node: *mut Node<K, V>, idx: usize) {
+        unsafe {
+            let child = (*node).children[idx];
+            let right = (*node).children[idx + 1];
+            
+            // Move parent key down to end of child
+            let child_len = (*child).len;
+            (*child).keys[child_len].write((*node).keys[idx].assume_init_read());
+            (*child).values[child_len].write((*node).values[idx].assume_init_read());
+            
+            // Move first child from right sibling
+            if !(*child).is_leaf {
+                (*child).children[child_len + 1] = (*right).children[0];
+            }
+            
+            // Move first key from right sibling to parent
+            (*node).keys[idx].write((*right).keys[0].assume_init_read());
+            (*node).values[idx].write((*right).values[0].assume_init_read());
+            
+            // Shift right sibling's keys left
+            for i in 0..(*right).len - 1 {
+                (*right).keys[i] = core::mem::MaybeUninit::new((*right).keys[i + 1].assume_init_read());
+                (*right).values[i] = core::mem::MaybeUninit::new((*right).values[i + 1].assume_init_read());
+            }
+            
+            if !(*right).is_leaf {
+                for i in 0..(*right).len {
+                    (*right).children[i] = (*right).children[i + 1];
+                }
+            }
+            
+            (*child).len += 1;
+            (*right).len -= 1;
+        }
+    }
+    
+    /// Merge children[idx] and children[idx+1]
+    fn merge_children(&mut self, node: *mut Node<K, V>, idx: usize) {
+        unsafe {
+            let left = (*node).children[idx];
+            let right = (*node).children[idx + 1];
+            
+            // Move parent key to left child
+            let left_len = (*left).len;
+            (*left).keys[left_len].write((*node).keys[idx].assume_init_read());
+            (*left).values[left_len].write((*node).values[idx].assume_init_read());
+            
+            // Move all keys from right to left
+            for i in 0..(*right).len {
+                (*left).keys[left_len + 1 + i].write((*right).keys[i].assume_init_read());
+                (*left).values[left_len + 1 + i].write((*right).values[i].assume_init_read());
+            }
+            
+            // Move children
+            if !(*left).is_leaf {
+                for i in 0..=(*right).len {
+                    (*left).children[left_len + 1 + i] = (*right).children[i];
+                }
+            }
+            
+            (*left).len = left_len + 1 + (*right).len;
+            
+            // Shift parent keys left
+            for i in idx..(*node).len - 1 {
+                (*node).keys[i] = core::mem::MaybeUninit::new((*node).keys[i + 1].assume_init_read());
+                (*node).values[i] = core::mem::MaybeUninit::new((*node).values[i + 1].assume_init_read());
+            }
+            
+            // Shift parent children left
+            for i in idx + 1..(*node).len {
+                (*node).children[i] = (*node).children[i + 1];
+            }
+            
+            (*node).len -= 1;
+            
+            // Free right node
+            let layout = Layout::new::<Node<K, V>>();
+            GlobalAllocator.dealloc(right as *mut u8, layout);
+        }
+    }
+    
+    /// First key-value pair
+    pub fn first_key_value(&self) -> Option<(&K, &V)> {
+        if self.root.is_null() {
+            return None;
+        }
+        
+        let mut node = self.root;
+        unsafe {
+            while !(*node).is_leaf {
+                node = (*node).children[0];
+            }
+            Some(((*node).key(0), (*node).value(0)))
+        }
+    }
+    
+    /// Last key-value pair
+    pub fn last_key_value(&self) -> Option<(&K, &V)> {
+        if self.root.is_null() {
+            return None;
+        }
+        
+        let mut node = self.root;
+        unsafe {
+            while !(*node).is_leaf {
+                node = (*node).children[(*node).len];
+            }
+            let idx = (*node).len - 1;
+            Some(((*node).key(idx), (*node).value(idx)))
+        }
+    }
+    
+    /// Iterator
+    pub fn iter(&self) -> Iter<K, V> {
+        Iter::new(self)
+    }
+    
+    /// Mutable iterator
+    pub fn iter_mut(&mut self) -> IterMut<K, V> {
+        IterMut::new(self)
+    }
+    
+    /// Keys iterator
+    pub fn keys(&self) -> Keys<K, V> {
+        Keys { inner: self.iter() }
+    }
+    
+    /// Values iterator
+    pub fn values(&self) -> Values<K, V> {
+        Values { inner: self.iter() }
+    }
+    
+    /// Range iterator
+    pub fn range<Q, R>(&self, range: R) -> Range<K, V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: core::ops::RangeBounds<Q>,
+    {
+        Range::new(self, range)
+    }
+}
+
+impl<K, V> Drop for BTreeMap<K, V> {
+    fn drop(&mut self) {
+        unsafe { Node::free(self.root); }
+    }
+}
+
+impl<K: Clone + Ord, V: Clone> Clone for BTreeMap<K, V> {
+    fn clone(&self) -> Self {
+        let mut map = BTreeMap::new();
+        for (k, v) in self.iter() {
+            map.insert(k.clone(), v.clone());
+        }
+        map
+    }
+}
+
+impl<K: Ord + Debug, V: Debug> Debug for BTreeMap<K, V> {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl<K: Ord, V> Default for BTreeMap<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: Ord, V, Q: ?Sized> Index<&Q> for BTreeMap<K, V>
+where K: core::borrow::Borrow<Q>, Q: Ord
+{
+    type Output = V;
+    
+    fn index(&self, key: &Q) -> &V {
+        self.get(key).expect("key not found")
+    }
+}
+
+impl<K: Ord, V> FromIterator<(K, V)> for BTreeMap<K, V> {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let mut map = BTreeMap::new();
+        for (k, v) in iter {
+            map.insert(k, v);
+        }
+        map
+    }
+}
+
+// Iterator implementation
+pub struct Iter<'a, K, V> {
+    stack: Vec<(*const Node<K, V>, usize)>,
+    len: usize,
+    _marker: core::marker::PhantomData<&'a (K, V)>,
+}
+
+impl<'a, K: Ord, V> Iter<'a, K, V> {
+    fn new(map: &'a BTreeMap<K, V>) -> Self {
+        let mut iter = Self {
+            stack: Vec::new(),
+            len: map.len,
+            _marker: core::marker::PhantomData,
+        };
+        
+        if !map.root.is_null() {
+            iter.push_left(map.root);
+        }
+        
+        iter
+    }
+    
+    fn push_left(&mut self, mut node: *const Node<K, V>) {
+        unsafe {
+            while !node.is_null() {
+                self.stack.push((node, 0));
+                if (*node).is_leaf {
+                    break;
+                }
+                node = (*node).children[0];
+            }
+        }
+    }
+}
+
+impl<'a, K: Ord, V> Iterator for Iter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((node, idx)) = self.stack.pop() {
+            unsafe {
+                if idx < (*node).len {
+                    // Return current key-value
+                    let result = ((*node).key(idx), (*node).value(idx));
+                    
+                    // Push back with incremented index
+                    self.stack.push((node, idx + 1));
+                    
+                    // Push left subtree of right child
+                    if !(*node).is_leaf {
+                        self.push_left((*node).children[idx + 1]);
+                    }
+                    
+                    self.len -= 1;
+                    return Some(result);
+                }
+            }
+        }
+        None
+    }
+    
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
+    }
+}
+
+impl<'a, K: Ord, V> ExactSizeIterator for Iter<'a, K, V> {}
+
+pub struct IterMut<'a, K, V> {
+    stack: Vec<(*mut Node<K, V>, usize)>,
+    len: usize,
+    _marker: core::marker::PhantomData<&'a mut (K, V)>,
+}
+
+impl<'a, K: Ord, V> IterMut<'a, K, V> {
+    fn new(map: &'a mut BTreeMap<K, V>) -> Self {
+        let mut iter = Self {
+            stack: Vec::new(),
+            len: map.len,
+            _marker: core::marker::PhantomData,
+        };
+        
+        if !map.root.is_null() {
+            iter.push_left(map.root);
+        }
+        
+        iter
+    }
+    
+    fn push_left(&mut self, mut node: *mut Node<K, V>) {
+        unsafe {
+            while !node.is_null() {
+                self.stack.push((node, 0));
+                if (*node).is_leaf {
+                    break;
+                }
+                node = (*node).children[0];
+            }
+        }
+    }
+}
+
+impl<'a, K: Ord, V> Iterator for IterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((node, idx)) = self.stack.pop() {
+            unsafe {
+                if idx < (*node).len {
+                    let result = ((*node).key(idx), (*node).value_mut(idx));
+                    self.stack.push((node, idx + 1));
+                    if !(*node).is_leaf {
+                        self.push_left((*node).children[idx + 1]);
+                    }
+                    self.len -= 1;
+                    return Some(result);
+                }
+            }
+        }
+        None
+    }
+}
+
+pub struct Keys<'a, K, V> {
+    inner: Iter<'a, K, V>,
+}
+
+impl<'a, K: Ord, V> Iterator for Keys<'a, K, V> {
+    type Item = &'a K;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, _)| k)
+    }
+}
+
+pub struct Values<'a, K, V> {
+    inner: Iter<'a, K, V>,
+}
+
+impl<'a, K: Ord, V> Iterator for Values<'a, K, V> {
+    type Item = &'a V;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, v)| v)
+    }
+}
+
+pub struct Range<'a, K, V> {
+    iter: Iter<'a, K, V>,
+    // Range bounds would be stored here for filtering
+}
+
+impl<'a, K: Ord, V> Range<'a, K, V> {
+    fn new<Q, R>(map: &'a BTreeMap<K, V>, _range: R) -> Self
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: core::ops::RangeBounds<Q>,
+    {
+        // Simplified - full implementation would seek to start
+        Self { iter: map.iter() }
+    }
+}
+
+impl<'a, K: Ord, V> Iterator for Range<'a, K, V> {
+    type Item = (&'a K, &'a V);
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+}
+
+pub struct IntoIter<K, V> {
+    map: BTreeMap<K, V>,
+}
+
+impl<K: Ord, V> Iterator for IntoIter<K, V> {
+    type Item = (K, V);
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some((k, _)) = self.map.first_key_value() {
+            // Clone key for removal lookup (could optimize)
+            let k_clone = unsafe { core::ptr::read(k) };
+            self.map.remove(&k_clone).map(|v| (k_clone, v))
+        } else {
+            None
+        }
+    }
+}
+
+impl<K: Ord, V> IntoIterator for BTreeMap<K, V> {
+    type Item = (K, V);
+    type IntoIter = IntoIter<K, V>;
+    
+    fn into_iter(self) -> IntoIter<K, V> {
+        IntoIter { map: self }
+    }
+}
+
+// BTreeSet as type alias
+pub type BTreeSet<K> = BTreeMap<K, ()>;
+
+impl<K: Ord> BTreeSet<K> {
+    pub fn insert_set(&mut self, key: K) -> bool {
+        self.insert(key, ()).is_none()
+    }
+    
+    pub fn remove_set<Q>(&mut self, key: &Q) -> bool
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.remove(key).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_insert_get() {
+        let mut map = BTreeMap::new();
+        map.insert(3, "three");
+        map.insert(1, "one");
+        map.insert(2, "two");
+        
+        assert_eq!(map.get(&1), Some(&"one"));
+        assert_eq!(map.get(&2), Some(&"two"));
+        assert_eq!(map.get(&3), Some(&"three"));
+        assert_eq!(map.get(&4), None);
+    }
+    
+    #[test]
+    fn test_ordering() {
+        let mut map = BTreeMap::new();
+        for i in (0..100).rev() {
+            map.insert(i, i * 2);
+        }
+        
+        let keys: Vec<_> = map.keys().copied().collect();
+        for i in 0..99 {
+            assert!(keys[i] < keys[i + 1]);
+        }
+    }
+    
+    #[test]
+    fn test_remove() {
+        let mut map = BTreeMap::new();
+        for i in 0..50 {
+            map.insert(i, i);
+        }
+        
+        for i in 0..25 {
+            assert_eq!(map.remove(&i), Some(i));
+        }
+        
+        assert_eq!(map.len(), 25);
+    }
+}

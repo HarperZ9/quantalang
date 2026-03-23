@@ -1,0 +1,844 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Value Range Propagation
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Value range analysis and propagation:
+//   - Integer range tracking
+//   - Constant range propagation  
+//   - Overflow detection
+//   - Range narrowing
+//   - Conditional range refinement
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::vrp
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VALUE RANGES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Value range for integers
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueRange {
+    /// Empty range (no possible values)
+    Empty,
+    /// Full range (any value)
+    Full,
+    /// Constant value
+    Constant(i64),
+    /// Bounded range [min, max]
+    Range { min: i64, max: i64 },
+    /// Set of discrete values
+    Set(BTreeSet<i64>),
+    /// Strided range {base, +step*n : n in [0, count)}
+    Strided { base: i64, step: i64, count: u64 },
+}
+
+impl ValueRange {
+    /// Create empty range
+    pub fn empty() -> Self {
+        ValueRange::Empty
+    }
+    
+    /// Create full range
+    pub fn full() -> Self {
+        ValueRange::Full
+    }
+    
+    /// Create constant range
+    pub fn constant(value: i64) -> Self {
+        ValueRange::Constant(value)
+    }
+    
+    /// Create bounded range
+    pub fn range(min: i64, max: i64) -> Self {
+        if min > max {
+            ValueRange::Empty
+        } else if min == max {
+            ValueRange::Constant(min)
+        } else {
+            ValueRange::Range { min, max }
+        }
+    }
+    
+    /// Create from a set of values
+    pub fn from_set(values: BTreeSet<i64>) -> Self {
+        match values.len() {
+            0 => ValueRange::Empty,
+            1 => ValueRange::Constant(*values.iter().next().unwrap()),
+            n if n <= 16 => ValueRange::Set(values),
+            _ => {
+                let min = *values.iter().next().unwrap();
+                let max = *values.iter().last().unwrap();
+                ValueRange::Range { min, max }
+            }
+        }
+    }
+    
+    /// Get minimum value
+    pub fn min(&self) -> Option<i64> {
+        match self {
+            ValueRange::Empty => None,
+            ValueRange::Full => Some(i64::MIN),
+            ValueRange::Constant(c) => Some(*c),
+            ValueRange::Range { min, .. } => Some(*min),
+            ValueRange::Set(s) => s.iter().next().copied(),
+            ValueRange::Strided { base, .. } => Some(*base),
+        }
+    }
+    
+    /// Get maximum value
+    pub fn max(&self) -> Option<i64> {
+        match self {
+            ValueRange::Empty => None,
+            ValueRange::Full => Some(i64::MAX),
+            ValueRange::Constant(c) => Some(*c),
+            ValueRange::Range { max, .. } => Some(*max),
+            ValueRange::Set(s) => s.iter().last().copied(),
+            ValueRange::Strided { base, step, count } => {
+                Some(base.saturating_add(step.saturating_mul(*count as i64 - 1)))
+            }
+        }
+    }
+    
+    /// Check if range is empty
+    pub fn is_empty(&self) -> bool {
+        matches!(self, ValueRange::Empty)
+    }
+    
+    /// Check if range is a constant
+    pub fn is_constant(&self) -> bool {
+        matches!(self, ValueRange::Constant(_))
+    }
+    
+    /// Get constant value if this is a constant
+    pub fn get_constant(&self) -> Option<i64> {
+        if let ValueRange::Constant(c) = self {
+            Some(*c)
+        } else {
+            None
+        }
+    }
+    
+    /// Check if range contains a value
+    pub fn contains(&self, value: i64) -> bool {
+        match self {
+            ValueRange::Empty => false,
+            ValueRange::Full => true,
+            ValueRange::Constant(c) => *c == value,
+            ValueRange::Range { min, max } => value >= *min && value <= *max,
+            ValueRange::Set(s) => s.contains(&value),
+            ValueRange::Strided { base, step, count } => {
+                if value < *base {
+                    return false;
+                }
+                let diff = value - base;
+                if *step == 0 {
+                    return diff == 0;
+                }
+                diff % step == 0 && (diff / step) < *count as i64
+            }
+        }
+    }
+    
+    /// Union of two ranges
+    pub fn union(&self, other: &ValueRange) -> ValueRange {
+        match (self, other) {
+            (ValueRange::Empty, r) | (r, ValueRange::Empty) => r.clone(),
+            (ValueRange::Full, _) | (_, ValueRange::Full) => ValueRange::Full,
+            (ValueRange::Constant(a), ValueRange::Constant(b)) => {
+                if a == b {
+                    ValueRange::Constant(*a)
+                } else {
+                    ValueRange::Range {
+                        min: (*a).min(*b),
+                        max: (*a).max(*b),
+                    }
+                }
+            }
+            (ValueRange::Constant(c), ValueRange::Range { min, max }) |
+            (ValueRange::Range { min, max }, ValueRange::Constant(c)) => {
+                ValueRange::Range {
+                    min: (*min).min(*c),
+                    max: (*max).max(*c),
+                }
+            }
+            (ValueRange::Range { min: min1, max: max1 }, 
+             ValueRange::Range { min: min2, max: max2 }) => {
+                ValueRange::Range {
+                    min: (*min1).min(*min2),
+                    max: (*max1).max(*max2),
+                }
+            }
+            (ValueRange::Set(s1), ValueRange::Set(s2)) => {
+                let union: BTreeSet<_> = s1.union(s2).copied().collect();
+                ValueRange::from_set(union)
+            }
+            _ => {
+                // Fallback to range
+                let min = self.min().unwrap_or(i64::MIN).min(other.min().unwrap_or(i64::MIN));
+                let max = self.max().unwrap_or(i64::MAX).max(other.max().unwrap_or(i64::MAX));
+                ValueRange::Range { min, max }
+            }
+        }
+    }
+    
+    /// Intersection of two ranges
+    pub fn intersect(&self, other: &ValueRange) -> ValueRange {
+        match (self, other) {
+            (ValueRange::Empty, _) | (_, ValueRange::Empty) => ValueRange::Empty,
+            (ValueRange::Full, r) | (r, ValueRange::Full) => r.clone(),
+            (ValueRange::Constant(a), ValueRange::Constant(b)) => {
+                if a == b {
+                    ValueRange::Constant(*a)
+                } else {
+                    ValueRange::Empty
+                }
+            }
+            (ValueRange::Constant(c), other) | (other, ValueRange::Constant(c)) => {
+                if other.contains(*c) {
+                    ValueRange::Constant(*c)
+                } else {
+                    ValueRange::Empty
+                }
+            }
+            (ValueRange::Range { min: min1, max: max1 },
+             ValueRange::Range { min: min2, max: max2 }) => {
+                let min = (*min1).max(*min2);
+                let max = (*max1).min(*max2);
+                ValueRange::range(min, max)
+            }
+            (ValueRange::Set(s1), ValueRange::Set(s2)) => {
+                let intersection: BTreeSet<_> = s1.intersection(s2).copied().collect();
+                ValueRange::from_set(intersection)
+            }
+            _ => {
+                let min = self.min().unwrap_or(i64::MIN).max(other.min().unwrap_or(i64::MIN));
+                let max = self.max().unwrap_or(i64::MAX).min(other.max().unwrap_or(i64::MAX));
+                ValueRange::range(min, max)
+            }
+        }
+    }
+    
+    /// Add two ranges
+    pub fn add(&self, other: &ValueRange) -> ValueRange {
+        match (self, other) {
+            (ValueRange::Empty, _) | (_, ValueRange::Empty) => ValueRange::Empty,
+            (ValueRange::Constant(a), ValueRange::Constant(b)) => {
+                ValueRange::Constant(a.wrapping_add(*b))
+            }
+            (ValueRange::Constant(c), ValueRange::Range { min, max }) |
+            (ValueRange::Range { min, max }, ValueRange::Constant(c)) => {
+                ValueRange::Range {
+                    min: min.saturating_add(*c),
+                    max: max.saturating_add(*c),
+                }
+            }
+            (ValueRange::Range { min: min1, max: max1 },
+             ValueRange::Range { min: min2, max: max2 }) => {
+                ValueRange::Range {
+                    min: min1.saturating_add(*min2),
+                    max: max1.saturating_add(*max2),
+                }
+            }
+            _ => ValueRange::Full,
+        }
+    }
+    
+    /// Subtract two ranges
+    pub fn sub(&self, other: &ValueRange) -> ValueRange {
+        match (self, other) {
+            (ValueRange::Empty, _) | (_, ValueRange::Empty) => ValueRange::Empty,
+            (ValueRange::Constant(a), ValueRange::Constant(b)) => {
+                ValueRange::Constant(a.wrapping_sub(*b))
+            }
+            (ValueRange::Range { min, max }, ValueRange::Constant(c)) => {
+                ValueRange::Range {
+                    min: min.saturating_sub(*c),
+                    max: max.saturating_sub(*c),
+                }
+            }
+            (ValueRange::Range { min: min1, max: max1 },
+             ValueRange::Range { min: min2, max: max2 }) => {
+                ValueRange::Range {
+                    min: min1.saturating_sub(*max2),
+                    max: max1.saturating_sub(*min2),
+                }
+            }
+            _ => ValueRange::Full,
+        }
+    }
+    
+    /// Multiply two ranges
+    pub fn mul(&self, other: &ValueRange) -> ValueRange {
+        match (self, other) {
+            (ValueRange::Empty, _) | (_, ValueRange::Empty) => ValueRange::Empty,
+            (ValueRange::Constant(0), _) | (_, ValueRange::Constant(0)) => {
+                ValueRange::Constant(0)
+            }
+            (ValueRange::Constant(a), ValueRange::Constant(b)) => {
+                ValueRange::Constant(a.wrapping_mul(*b))
+            }
+            (ValueRange::Constant(c), ValueRange::Range { min, max }) |
+            (ValueRange::Range { min, max }, ValueRange::Constant(c)) => {
+                if *c >= 0 {
+                    ValueRange::Range {
+                        min: min.saturating_mul(*c),
+                        max: max.saturating_mul(*c),
+                    }
+                } else {
+                    ValueRange::Range {
+                        min: max.saturating_mul(*c),
+                        max: min.saturating_mul(*c),
+                    }
+                }
+            }
+            (ValueRange::Range { min: min1, max: max1 },
+             ValueRange::Range { min: min2, max: max2 }) => {
+                // Consider all corner products
+                let products = [
+                    min1.saturating_mul(*min2),
+                    min1.saturating_mul(*max2),
+                    max1.saturating_mul(*min2),
+                    max1.saturating_mul(*max2),
+                ];
+                
+                ValueRange::Range {
+                    min: *products.iter().min().unwrap(),
+                    max: *products.iter().max().unwrap(),
+                }
+            }
+            _ => ValueRange::Full,
+        }
+    }
+    
+    /// Signed division
+    pub fn sdiv(&self, other: &ValueRange) -> ValueRange {
+        if other.contains(0) {
+            return ValueRange::Full; // Division by zero possible
+        }
+        
+        match (self, other) {
+            (ValueRange::Empty, _) | (_, ValueRange::Empty) => ValueRange::Empty,
+            (ValueRange::Constant(a), ValueRange::Constant(b)) => {
+                ValueRange::Constant(a / b)
+            }
+            _ => ValueRange::Full,
+        }
+    }
+    
+    /// Bitwise AND
+    pub fn and(&self, other: &ValueRange) -> ValueRange {
+        match (self, other) {
+            (ValueRange::Empty, _) | (_, ValueRange::Empty) => ValueRange::Empty,
+            (ValueRange::Constant(a), ValueRange::Constant(b)) => {
+                ValueRange::Constant(a & b)
+            }
+            (ValueRange::Constant(0), _) | (_, ValueRange::Constant(0)) => {
+                ValueRange::Constant(0)
+            }
+            _ => {
+                // Result is non-negative if either operand is non-negative
+                let self_min = self.min().unwrap_or(i64::MIN);
+                let other_min = other.min().unwrap_or(i64::MIN);
+                
+                if self_min >= 0 || other_min >= 0 {
+                    let max = self.max().unwrap_or(i64::MAX)
+                        .min(other.max().unwrap_or(i64::MAX));
+                    ValueRange::Range { min: 0, max }
+                } else {
+                    ValueRange::Full
+                }
+            }
+        }
+    }
+    
+    /// Bitwise OR
+    pub fn or(&self, other: &ValueRange) -> ValueRange {
+        match (self, other) {
+            (ValueRange::Empty, _) | (_, ValueRange::Empty) => ValueRange::Empty,
+            (ValueRange::Constant(a), ValueRange::Constant(b)) => {
+                ValueRange::Constant(a | b)
+            }
+            _ => ValueRange::Full,
+        }
+    }
+    
+    /// Left shift
+    pub fn shl(&self, other: &ValueRange) -> ValueRange {
+        match (self, other) {
+            (ValueRange::Empty, _) | (_, ValueRange::Empty) => ValueRange::Empty,
+            (ValueRange::Constant(a), ValueRange::Constant(b)) => {
+                if *b >= 0 && *b < 64 {
+                    ValueRange::Constant(a.wrapping_shl(*b as u32))
+                } else {
+                    ValueRange::Full
+                }
+            }
+            _ => ValueRange::Full,
+        }
+    }
+    
+    /// Right shift (arithmetic)
+    pub fn shr(&self, other: &ValueRange) -> ValueRange {
+        match (self, other) {
+            (ValueRange::Empty, _) | (_, ValueRange::Empty) => ValueRange::Empty,
+            (ValueRange::Constant(a), ValueRange::Constant(b)) => {
+                if *b >= 0 && *b < 64 {
+                    ValueRange::Constant(a.wrapping_shr(*b as u32))
+                } else {
+                    ValueRange::Full
+                }
+            }
+            _ => ValueRange::Full,
+        }
+    }
+    
+    /// Width of the range (number of possible values)
+    pub fn width(&self) -> Option<u64> {
+        match self {
+            ValueRange::Empty => Some(0),
+            ValueRange::Full => None,
+            ValueRange::Constant(_) => Some(1),
+            ValueRange::Range { min, max } => {
+                if *max >= *min {
+                    Some((*max as u64).wrapping_sub(*min as u64).wrapping_add(1))
+                } else {
+                    Some(0)
+                }
+            }
+            ValueRange::Set(s) => Some(s.len() as u64),
+            ValueRange::Strided { count, .. } => Some(*count),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VALUE RANGE PROPAGATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Value range propagation analysis
+pub struct ValueRangePropagation {
+    /// Ranges for each variable
+    ranges: BTreeMap<String, ValueRange>,
+    /// Conditional ranges (block -> var -> range)
+    conditional_ranges: BTreeMap<u32, BTreeMap<String, ValueRange>>,
+}
+
+impl ValueRangePropagation {
+    pub fn new() -> Self {
+        ValueRangePropagation {
+            ranges: BTreeMap::new(),
+            conditional_ranges: BTreeMap::new(),
+        }
+    }
+    
+    /// Analyze a function
+    pub fn analyze(&mut self, func: &MirFunction) {
+        // Initialize with full ranges
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let Some(dest) = self.get_definition(stmt) {
+                    self.ranges.insert(dest.to_string(), ValueRange::Full);
+                }
+            }
+        }
+        
+        // Iterate until fixed point
+        let mut changed = true;
+        let mut iterations = 0;
+        
+        while changed && iterations < 100 {
+            changed = false;
+            iterations += 1;
+            
+            for block in &func.blocks {
+                for stmt in &block.statements {
+                    if self.analyze_statement(stmt) {
+                        changed = true;
+                    }
+                }
+                
+                // Handle conditional branches
+                if let MirTerminator::Branch { cond, then_bb, else_bb } = &block.terminator {
+                    self.handle_branch(cond, *then_bb, *else_bb);
+                }
+            }
+        }
+    }
+    
+    fn analyze_statement(&mut self, stmt: &MirStatement) -> bool {
+        match stmt {
+            MirStatement::Assign { dest, value } => {
+                let range = self.get_operand_range(value);
+                self.update_range(dest, range)
+            }
+            MirStatement::BinaryOp { dest, op, lhs, rhs } => {
+                let lhs_range = self.get_operand_range(lhs);
+                let rhs_range = self.get_operand_range(rhs);
+                
+                let range = match op {
+                    BinOp::Add => lhs_range.add(&rhs_range),
+                    BinOp::Sub => lhs_range.sub(&rhs_range),
+                    BinOp::Mul => lhs_range.mul(&rhs_range),
+                    BinOp::Div => lhs_range.sdiv(&rhs_range),
+                    BinOp::Rem => {
+                        if let Some(rhs_max) = rhs_range.max() {
+                            if rhs_max > 0 {
+                                ValueRange::Range {
+                                    min: -(rhs_max.abs() - 1),
+                                    max: rhs_max.abs() - 1,
+                                }
+                            } else {
+                                ValueRange::Full
+                            }
+                        } else {
+                            ValueRange::Full
+                        }
+                    }
+                    BinOp::And => lhs_range.and(&rhs_range),
+                    BinOp::Or => lhs_range.or(&rhs_range),
+                    BinOp::Xor => {
+                        if let (ValueRange::Constant(a), ValueRange::Constant(b)) = 
+                               (&lhs_range, &rhs_range) {
+                            ValueRange::Constant(a ^ b)
+                        } else {
+                            ValueRange::Full
+                        }
+                    }
+                    BinOp::Shl => lhs_range.shl(&rhs_range),
+                    BinOp::Shr => lhs_range.shr(&rhs_range),
+                    BinOp::Eq => {
+                        let intersect = lhs_range.intersect(&rhs_range);
+                        if intersect.is_empty() {
+                            ValueRange::Constant(0) // Always false
+                        } else if lhs_range == rhs_range && lhs_range.is_constant() {
+                            ValueRange::Constant(1) // Always true
+                        } else {
+                            ValueRange::Range { min: 0, max: 1 }
+                        }
+                    }
+                    BinOp::Ne => {
+                        let intersect = lhs_range.intersect(&rhs_range);
+                        if intersect.is_empty() {
+                            ValueRange::Constant(1) // Always true
+                        } else if lhs_range == rhs_range && lhs_range.is_constant() {
+                            ValueRange::Constant(0) // Always false
+                        } else {
+                            ValueRange::Range { min: 0, max: 1 }
+                        }
+                    }
+                    BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        self.analyze_comparison(*op, &lhs_range, &rhs_range)
+                    }
+                };
+                
+                self.update_range(dest, range)
+            }
+            MirStatement::Load { dest, .. } => {
+                // Loads are conservatively full range
+                self.update_range(dest, ValueRange::Full)
+            }
+            MirStatement::Call { dest: Some(d), .. } => {
+                // Call results are conservatively full range
+                self.update_range(d, ValueRange::Full)
+            }
+            MirStatement::Phi { dest, incoming } => {
+                let mut range = ValueRange::Empty;
+                
+                for (_, val) in incoming {
+                    range = range.union(&self.get_operand_range(val));
+                }
+                
+                self.update_range(dest, range)
+            }
+            _ => false,
+        }
+    }
+    
+    fn analyze_comparison(&self, op: BinOp, lhs: &ValueRange, rhs: &ValueRange) -> ValueRange {
+        let lhs_min = lhs.min().unwrap_or(i64::MIN);
+        let lhs_max = lhs.max().unwrap_or(i64::MAX);
+        let rhs_min = rhs.min().unwrap_or(i64::MIN);
+        let rhs_max = rhs.max().unwrap_or(i64::MAX);
+        
+        match op {
+            BinOp::Lt => {
+                if lhs_max < rhs_min {
+                    ValueRange::Constant(1) // Always true
+                } else if lhs_min >= rhs_max {
+                    ValueRange::Constant(0) // Always false
+                } else {
+                    ValueRange::Range { min: 0, max: 1 }
+                }
+            }
+            BinOp::Le => {
+                if lhs_max <= rhs_min {
+                    ValueRange::Constant(1)
+                } else if lhs_min > rhs_max {
+                    ValueRange::Constant(0)
+                } else {
+                    ValueRange::Range { min: 0, max: 1 }
+                }
+            }
+            BinOp::Gt => {
+                if lhs_min > rhs_max {
+                    ValueRange::Constant(1)
+                } else if lhs_max <= rhs_min {
+                    ValueRange::Constant(0)
+                } else {
+                    ValueRange::Range { min: 0, max: 1 }
+                }
+            }
+            BinOp::Ge => {
+                if lhs_min >= rhs_max {
+                    ValueRange::Constant(1)
+                } else if lhs_max < rhs_min {
+                    ValueRange::Constant(0)
+                } else {
+                    ValueRange::Range { min: 0, max: 1 }
+                }
+            }
+            _ => ValueRange::Range { min: 0, max: 1 },
+        }
+    }
+    
+    fn handle_branch(&mut self, cond: &MirOperand, then_bb: u32, else_bb: u32) {
+        // Refine ranges based on branch condition
+        // This is a simplified version - full implementation would track
+        // the comparison that produced the condition
+    }
+    
+    fn get_operand_range(&self, operand: &MirOperand) -> ValueRange {
+        match operand {
+            MirOperand::Constant(c) => ValueRange::Constant(*c),
+            MirOperand::Variable(name) => {
+                self.ranges.get(name).cloned().unwrap_or(ValueRange::Full)
+            }
+        }
+    }
+    
+    fn update_range(&mut self, var: &str, range: ValueRange) -> bool {
+        let old = self.ranges.get(var).cloned().unwrap_or(ValueRange::Full);
+        let new = old.intersect(&range);
+        
+        if new != self.ranges.get(var).cloned().unwrap_or(ValueRange::Full) {
+            self.ranges.insert(var.to_string(), new);
+            true
+        } else {
+            false
+        }
+    }
+    
+    fn get_definition<'a>(&self, stmt: &'a MirStatement) -> Option<&'a str> {
+        match stmt {
+            MirStatement::Assign { dest, .. } |
+            MirStatement::BinaryOp { dest, .. } |
+            MirStatement::Load { dest, .. } |
+            MirStatement::Phi { dest, .. } => Some(dest.as_str()),
+            MirStatement::Call { dest: Some(d), .. } => Some(d.as_str()),
+            _ => None,
+        }
+    }
+    
+    /// Get range for a variable
+    pub fn get_range(&self, var: &str) -> ValueRange {
+        self.ranges.get(var).cloned().unwrap_or(ValueRange::Full)
+    }
+    
+    /// Check if a variable can be zero
+    pub fn can_be_zero(&self, var: &str) -> bool {
+        self.get_range(var).contains(0)
+    }
+    
+    /// Check if a variable is always non-negative
+    pub fn is_non_negative(&self, var: &str) -> bool {
+        let range = self.get_range(var);
+        range.min().map(|m| m >= 0).unwrap_or(false)
+    }
+    
+    /// Check if a variable is always positive
+    pub fn is_positive(&self, var: &str) -> bool {
+        let range = self.get_range(var);
+        range.min().map(|m| m > 0).unwrap_or(false)
+    }
+    
+    /// Get constant value if variable is constant
+    pub fn get_constant(&self, var: &str) -> Option<i64> {
+        self.get_range(var).get_constant()
+    }
+}
+
+impl Default for ValueRangePropagation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Nop,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Switch { value: MirOperand, targets: Vec<(i64, u32)>, default: u32 },
+    Return { value: Option<MirOperand> },
+    Unreachable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_value_range_constant() {
+        let range = ValueRange::constant(42);
+        assert!(range.is_constant());
+        assert_eq!(range.get_constant(), Some(42));
+        assert!(range.contains(42));
+        assert!(!range.contains(0));
+    }
+    
+    #[test]
+    fn test_value_range_range() {
+        let range = ValueRange::range(10, 20);
+        assert!(!range.is_constant());
+        assert_eq!(range.min(), Some(10));
+        assert_eq!(range.max(), Some(20));
+        assert!(range.contains(15));
+        assert!(!range.contains(5));
+    }
+    
+    #[test]
+    fn test_value_range_add() {
+        let a = ValueRange::range(1, 10);
+        let b = ValueRange::range(5, 15);
+        let sum = a.add(&b);
+        
+        assert_eq!(sum.min(), Some(6));
+        assert_eq!(sum.max(), Some(25));
+    }
+    
+    #[test]
+    fn test_value_range_mul() {
+        let a = ValueRange::range(2, 5);
+        let b = ValueRange::constant(3);
+        let product = a.mul(&b);
+        
+        assert_eq!(product.min(), Some(6));
+        assert_eq!(product.max(), Some(15));
+    }
+    
+    #[test]
+    fn test_value_range_union() {
+        let a = ValueRange::range(1, 5);
+        let b = ValueRange::range(10, 15);
+        let union = a.union(&b);
+        
+        assert_eq!(union.min(), Some(1));
+        assert_eq!(union.max(), Some(15));
+    }
+    
+    #[test]
+    fn test_value_range_intersect() {
+        let a = ValueRange::range(1, 10);
+        let b = ValueRange::range(5, 15);
+        let intersect = a.intersect(&b);
+        
+        assert_eq!(intersect.min(), Some(5));
+        assert_eq!(intersect.max(), Some(10));
+    }
+    
+    #[test]
+    fn test_value_range_empty_intersect() {
+        let a = ValueRange::range(1, 5);
+        let b = ValueRange::range(10, 15);
+        let intersect = a.intersect(&b);
+        
+        assert!(intersect.is_empty());
+    }
+    
+    #[test]
+    fn test_vrp_analysis() {
+        let func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::Assign {
+                            dest: "x".to_string(),
+                            value: MirOperand::Constant(10),
+                        },
+                        MirStatement::BinaryOp {
+                            dest: "y".to_string(),
+                            op: BinOp::Add,
+                            lhs: MirOperand::Variable("x".to_string()),
+                            rhs: MirOperand::Constant(5),
+                        },
+                    ],
+                    terminator: MirTerminator::Return {
+                        value: Some(MirOperand::Variable("y".to_string())),
+                    },
+                },
+            ],
+        };
+        
+        let mut vrp = ValueRangePropagation::new();
+        vrp.analyze(&func);
+        
+        assert_eq!(vrp.get_constant("x"), Some(10));
+        assert_eq!(vrp.get_constant("y"), Some(15));
+    }
+}

@@ -1,0 +1,959 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ WASM BACKEND — MIR to WASM Translation
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Translates QuantaLang MIR (Mid-level IR) to WebAssembly instructions.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::codegen::wasm_codegen
+
+use std::collections::HashMap;
+use crate::mir::*;
+use crate::types::*;
+use crate::codegen::wasm::*;
+use crate::codegen::wasi::*;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WASM CODE GENERATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// WASM code generator from MIR
+pub struct WasmCodeGen {
+    /// Module builder
+    builder: WasiModuleBuilder,
+    /// Function indices by name
+    func_indices: HashMap<String, u32>,
+    /// String constants (ptr, len)
+    strings: HashMap<String, (u32, u32)>,
+    /// Current function being compiled
+    current_func: Option<WasmFunction>,
+    /// Local variable mapping (MIR local -> WASM local index)
+    locals: HashMap<u32, u32>,
+    /// Local types for current function
+    local_types: Vec<WasmType>,
+    /// Block depth for break/continue
+    block_depth: u32,
+    /// Loop labels for break targets
+    loop_labels: Vec<u32>,
+    /// Optimization level
+    opt_level: OptLevel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptLevel {
+    None,
+    Basic,
+    Aggressive,
+}
+
+impl WasmCodeGen {
+    pub fn new() -> Self {
+        WasmCodeGen {
+            builder: WasiModuleBuilder::new(),
+            func_indices: HashMap::new(),
+            strings: HashMap::new(),
+            current_func: None,
+            locals: HashMap::new(),
+            local_types: Vec::new(),
+            block_depth: 0,
+            loop_labels: Vec::new(),
+            opt_level: OptLevel::Basic,
+        }
+    }
+    
+    pub fn with_opt_level(mut self, level: OptLevel) -> Self {
+        self.opt_level = level;
+        self
+    }
+    
+    /// Compile a MIR program to WASM
+    pub fn compile(&mut self, program: &MirProgram) -> Vec<u8> {
+        // First pass: register all functions
+        for func in &program.functions {
+            let type_idx = self.compile_func_type(&func.signature);
+            let func_idx = self.builder.module_mut().func_types.len() as u32 
+                + self.builder.wasi().fd_write; // Account for imports
+            self.func_indices.insert(func.name.clone(), func_idx);
+        }
+        
+        // Add string constants
+        for constant in &program.constants {
+            if let MirConstant::String(s) = constant {
+                if !self.strings.contains_key(s) {
+                    let (ptr, len) = self.builder.add_string(s);
+                    self.strings.insert(s.clone(), (ptr, len));
+                }
+            }
+        }
+        
+        // Second pass: compile function bodies
+        for func in &program.functions {
+            self.compile_function(func);
+        }
+        
+        // Create _start function if main exists
+        if let Some(&main_idx) = self.func_indices.get("main") {
+            self.create_start_function(main_idx);
+        }
+        
+        // Build final binary
+        std::mem::take(&mut self.builder).build()
+    }
+    
+    fn compile_func_type(&mut self, sig: &MirFuncSignature) -> u32 {
+        let params: Vec<WasmType> = sig.params.iter()
+            .map(|ty| self.mir_type_to_wasm(ty))
+            .collect();
+        
+        let results: Vec<WasmType> = if sig.return_type == MirType::Unit {
+            vec![]
+        } else {
+            vec![self.mir_type_to_wasm(&sig.return_type)]
+        };
+        
+        self.builder.add_type(FuncType::new(params, results))
+    }
+    
+    fn mir_type_to_wasm(&self, ty: &MirType) -> WasmType {
+        match ty {
+            MirType::Bool | MirType::I8 | MirType::U8 |
+            MirType::I16 | MirType::U16 | MirType::I32 | MirType::U32 |
+            MirType::Char => WasmType::I32,
+            
+            MirType::I64 | MirType::U64 | MirType::ISize | MirType::USize => WasmType::I64,
+            
+            MirType::F32 => WasmType::F32,
+            MirType::F64 => WasmType::F64,
+            
+            MirType::Ptr(_) | MirType::Ref(_) | MirType::RefMut(_) |
+            MirType::Array(_, _) | MirType::Slice(_) | MirType::String |
+            MirType::Struct(_) | MirType::Enum(_) | MirType::Box(_) |
+            MirType::Rc(_) | MirType::Arc(_) => WasmType::I32, // Pointers are i32 in wasm32
+            
+            MirType::Tuple(types) if types.is_empty() => WasmType::I32, // Unit
+            MirType::Tuple(_) => WasmType::I32, // Tuple pointer
+            
+            MirType::Unit | MirType::Never => WasmType::I32,
+            
+            MirType::Function(_, _) => WasmType::I32, // Function pointer
+            
+            MirType::Generic(_) | MirType::Infer => {
+                panic!("Unresolved type in codegen")
+            }
+        }
+    }
+    
+    fn compile_function(&mut self, func: &MirFunction) {
+        let type_idx = self.compile_func_type(&func.signature);
+        
+        self.current_func = Some(WasmFunction::new());
+        self.locals.clear();
+        self.local_types.clear();
+        self.block_depth = 0;
+        self.loop_labels.clear();
+        
+        // Map parameters to locals (params come first in WASM)
+        for (i, param) in func.signature.params.iter().enumerate() {
+            self.locals.insert(i as u32, i as u32);
+            self.local_types.push(self.mir_type_to_wasm(param));
+        }
+        
+        // Add explicit locals
+        for (idx, local) in &func.locals {
+            if *idx >= func.signature.params.len() as u32 {
+                let wasm_ty = self.mir_type_to_wasm(local);
+                let local_idx = self.current_func.as_mut().unwrap().add_local(wasm_ty);
+                self.locals.insert(*idx, local_idx + func.signature.params.len() as u32);
+            }
+        }
+        
+        // Compile basic blocks
+        for block in &func.blocks {
+            self.compile_block(block);
+        }
+        
+        // Ensure function ends properly
+        self.emit(WasmOp::End);
+        
+        let wasm_func = self.current_func.take().unwrap();
+        let func_idx = self.builder.add_function(type_idx, wasm_func);
+        
+        // Export public functions
+        if func.is_public {
+            self.builder.export_function(&func.name, func_idx);
+        }
+    }
+    
+    fn compile_block(&mut self, block: &MirBlock) {
+        for stmt in &block.statements {
+            self.compile_statement(stmt);
+        }
+        
+        if let Some(ref terminator) = block.terminator {
+            self.compile_terminator(terminator);
+        }
+    }
+    
+    fn compile_statement(&mut self, stmt: &MirStatement) {
+        match stmt {
+            MirStatement::Assign { dest, value } => {
+                self.compile_rvalue(value);
+                self.compile_place_store(dest);
+            }
+            
+            MirStatement::StorageLive(_) | MirStatement::StorageDead(_) => {
+                // No-op in WASM (stack is managed automatically)
+            }
+            
+            MirStatement::Nop => {}
+            
+            MirStatement::Call { dest, func, args } => {
+                // Push arguments
+                for arg in args {
+                    self.compile_operand(arg);
+                }
+                
+                // Call function
+                if let Some(&func_idx) = self.func_indices.get(func) {
+                    self.emit_u32(WasmOp::Call, func_idx);
+                } else {
+                    // Check for built-in functions
+                    self.compile_builtin_call(func, args.len());
+                }
+                
+                // Store result if needed
+                if let Some(dest) = dest {
+                    self.compile_place_store(dest);
+                }
+            }
+            
+            MirStatement::Drop { place } => {
+                // Call drop if type implements Drop
+                // For now, no-op
+                let _ = place;
+            }
+            
+            MirStatement::SetDiscriminant { place, variant } => {
+                // Store discriminant value
+                self.compile_place_addr(place);
+                self.emit_i32(WasmOp::I32Const, *variant as i32);
+                self.emit_memarg(WasmOp::I32Store, 2, 0);
+            }
+        }
+    }
+    
+    fn compile_terminator(&mut self, term: &MirTerminator) {
+        match term {
+            MirTerminator::Return(operand) => {
+                if let Some(op) = operand {
+                    self.compile_operand(op);
+                }
+                self.emit(WasmOp::Return);
+            }
+            
+            MirTerminator::Goto(target) => {
+                // Branch to target block
+                self.emit_u32(WasmOp::Br, self.block_depth - *target as u32);
+            }
+            
+            MirTerminator::SwitchInt { operand, targets, otherwise } => {
+                self.compile_operand(operand);
+                
+                // Use br_table for multiple targets
+                let mut table = Vec::new();
+                for target in targets.values() {
+                    table.push(*target as u32);
+                }
+                
+                self.emit(WasmOp::BrTable);
+                write_leb128_u32(self.current_func.as_mut().unwrap().code.as_mut(), table.len() as u32);
+                for idx in &table {
+                    write_leb128_u32(self.current_func.as_mut().unwrap().code.as_mut(), *idx);
+                }
+                write_leb128_u32(self.current_func.as_mut().unwrap().code.as_mut(), *otherwise as u32);
+            }
+            
+            MirTerminator::Call { func, args, dest, target, unwind: _ } => {
+                // Push arguments
+                for arg in args {
+                    self.compile_operand(arg);
+                }
+                
+                // Call function
+                if let Some(&func_idx) = self.func_indices.get(func) {
+                    self.emit_u32(WasmOp::Call, func_idx);
+                } else {
+                    self.compile_builtin_call(func, args.len());
+                }
+                
+                // Store result
+                if let Some(dest) = dest {
+                    self.compile_place_store(dest);
+                }
+                
+                // Continue to target block
+                if let Some(target) = target {
+                    self.emit_u32(WasmOp::Br, self.block_depth - *target as u32);
+                }
+            }
+            
+            MirTerminator::Assert { cond, expected, msg, target } => {
+                self.compile_operand(cond);
+                
+                if !*expected {
+                    self.emit(WasmOp::I32Eqz);
+                }
+                
+                self.emit_block(WasmOp::If, None);
+                
+                // Assertion failed - call panic
+                if let Some((ptr, len)) = self.strings.get(msg) {
+                    self.emit_i32(WasmOp::I32Const, *ptr as i32);
+                    self.emit_i32(WasmOp::I32Const, *len as i32);
+                    self.emit_u32(WasmOp::Call, self.builder.print_fn);
+                }
+                self.emit_i32(WasmOp::I32Const, 1);
+                self.emit_u32(WasmOp::Call, self.builder.exit_fn);
+                
+                self.emit(WasmOp::End);
+                
+                // Continue to target
+                self.emit_u32(WasmOp::Br, self.block_depth - *target as u32);
+            }
+            
+            MirTerminator::Unreachable => {
+                self.emit(WasmOp::Unreachable);
+            }
+            
+            MirTerminator::Drop { place, target, unwind: _ } => {
+                // Call destructor if needed
+                let _ = place;
+                self.emit_u32(WasmOp::Br, self.block_depth - *target as u32);
+            }
+        }
+    }
+    
+    fn compile_rvalue(&mut self, rvalue: &MirRValue) {
+        match rvalue {
+            MirRValue::Use(operand) => {
+                self.compile_operand(operand);
+            }
+            
+            MirRValue::Ref(_, place) | MirRValue::AddressOf(_, place) => {
+                self.compile_place_addr(place);
+            }
+            
+            MirRValue::BinaryOp(op, lhs, rhs) => {
+                self.compile_operand(lhs);
+                self.compile_operand(rhs);
+                self.compile_binop(op);
+            }
+            
+            MirRValue::UnaryOp(op, operand) => {
+                self.compile_operand(operand);
+                self.compile_unop(op);
+            }
+            
+            MirRValue::Cast(kind, operand, ty) => {
+                self.compile_operand(operand);
+                self.compile_cast(kind, ty);
+            }
+            
+            MirRValue::Aggregate(kind, operands) => {
+                match kind {
+                    MirAggregateKind::Array(_) | MirAggregateKind::Tuple => {
+                        // Allocate space and store elements
+                        let size = operands.len() as i32 * 8; // Assume 8 bytes per element
+                        self.emit_i32(WasmOp::I32Const, size);
+                        self.emit_u32(WasmOp::Call, self.builder.alloc_fn);
+                        
+                        // Store each element
+                        for (i, op) in operands.iter().enumerate() {
+                            self.emit(WasmOp::LocalTee); // Keep pointer on stack
+                            self.emit_u32(WasmOp::LocalGet, 0); // Placeholder
+                            self.emit_i32(WasmOp::I32Const, (i * 8) as i32);
+                            self.emit(WasmOp::I32Add);
+                            self.compile_operand(op);
+                            self.emit_memarg(WasmOp::I64Store, 3, 0);
+                        }
+                    }
+                    
+                    MirAggregateKind::Struct(name) => {
+                        // Allocate struct and initialize fields
+                        let size = self.get_struct_size(name);
+                        self.emit_i32(WasmOp::I32Const, size as i32);
+                        self.emit_u32(WasmOp::Call, self.builder.alloc_fn);
+                        
+                        for (i, op) in operands.iter().enumerate() {
+                            let offset = self.get_field_offset(name, i);
+                            self.emit(WasmOp::LocalTee);
+                            self.emit_u32(WasmOp::LocalGet, 0);
+                            self.compile_operand(op);
+                            self.emit_memarg(WasmOp::I32Store, 2, offset);
+                        }
+                    }
+                    
+                    MirAggregateKind::Enum(_, variant) => {
+                        // Allocate enum and set discriminant + fields
+                        self.emit_i32(WasmOp::I32Const, 16); // Fixed size for now
+                        self.emit_u32(WasmOp::Call, self.builder.alloc_fn);
+                        
+                        // Store discriminant
+                        self.emit(WasmOp::LocalTee);
+                        self.emit_u32(WasmOp::LocalGet, 0);
+                        self.emit_i32(WasmOp::I32Const, *variant as i32);
+                        self.emit_memarg(WasmOp::I32Store, 2, 0);
+                        
+                        // Store fields
+                        for (i, op) in operands.iter().enumerate() {
+                            self.emit(WasmOp::LocalTee);
+                            self.emit_u32(WasmOp::LocalGet, 0);
+                            self.compile_operand(op);
+                            self.emit_memarg(WasmOp::I32Store, 2, 4 + (i as u32 * 4));
+                        }
+                    }
+                }
+            }
+            
+            MirRValue::Discriminant(place) => {
+                self.compile_place_addr(place);
+                self.emit_memarg(WasmOp::I32Load, 2, 0);
+            }
+            
+            MirRValue::Len(place) => {
+                // Load length from slice/array
+                self.compile_place_addr(place);
+                self.emit_i32(WasmOp::I32Const, 4);
+                self.emit(WasmOp::I32Add);
+                self.emit_memarg(WasmOp::I32Load, 2, 0);
+            }
+            
+            MirRValue::NullaryOp(op, ty) => {
+                match op {
+                    MirNullaryOp::SizeOf => {
+                        let size = self.type_size(ty);
+                        self.emit_i32(WasmOp::I32Const, size as i32);
+                    }
+                    MirNullaryOp::AlignOf => {
+                        let align = self.type_align(ty);
+                        self.emit_i32(WasmOp::I32Const, align as i32);
+                    }
+                }
+            }
+            
+            MirRValue::Repeat(operand, count) => {
+                // Create array with repeated value
+                let size = *count as i32 * 8;
+                self.emit_i32(WasmOp::I32Const, size);
+                self.emit_u32(WasmOp::Call, self.builder.alloc_fn);
+                
+                // Initialize all elements
+                let ptr_local = self.current_func.as_mut().unwrap().add_local(WasmType::I32);
+                self.emit_u32(WasmOp::LocalSet, ptr_local);
+                
+                for i in 0..*count {
+                    self.emit_u32(WasmOp::LocalGet, ptr_local);
+                    self.emit_i32(WasmOp::I32Const, (i * 8) as i32);
+                    self.emit(WasmOp::I32Add);
+                    self.compile_operand(operand);
+                    self.emit_memarg(WasmOp::I64Store, 3, 0);
+                }
+                
+                self.emit_u32(WasmOp::LocalGet, ptr_local);
+            }
+        }
+    }
+    
+    fn compile_operand(&mut self, operand: &MirOperand) {
+        match operand {
+            MirOperand::Copy(place) | MirOperand::Move(place) => {
+                self.compile_place_load(place);
+            }
+            
+            MirOperand::Constant(constant) => {
+                self.compile_constant(constant);
+            }
+        }
+    }
+    
+    fn compile_constant(&mut self, constant: &MirConstant) {
+        match constant {
+            MirConstant::Bool(b) => {
+                self.emit_i32(WasmOp::I32Const, if *b { 1 } else { 0 });
+            }
+            MirConstant::Int(v, _) => {
+                if *v >= i32::MIN as i128 && *v <= i32::MAX as i128 {
+                    self.emit_i32(WasmOp::I32Const, *v as i32);
+                } else {
+                    self.emit_i64(WasmOp::I64Const, *v as i64);
+                }
+            }
+            MirConstant::Float(v, size) => {
+                if *size == 32 {
+                    self.emit_f32(WasmOp::F32Const, *v as f32);
+                } else {
+                    self.emit_f64(WasmOp::F64Const, *v);
+                }
+            }
+            MirConstant::Char(c) => {
+                self.emit_i32(WasmOp::I32Const, *c as i32);
+            }
+            MirConstant::String(s) => {
+                if let Some(&(ptr, len)) = self.strings.get(s) {
+                    // Return fat pointer (ptr, len)
+                    self.emit_i32(WasmOp::I32Const, ptr as i32);
+                    self.emit_i32(WasmOp::I32Const, len as i32);
+                }
+            }
+            MirConstant::Unit => {
+                self.emit_i32(WasmOp::I32Const, 0);
+            }
+            MirConstant::ZeroSized => {
+                self.emit_i32(WasmOp::I32Const, 0);
+            }
+            MirConstant::Undef => {
+                self.emit_i32(WasmOp::I32Const, 0);
+            }
+        }
+    }
+    
+    fn compile_place_load(&mut self, place: &MirPlace) {
+        // Get address
+        self.compile_place_addr(place);
+        
+        // Load value based on type
+        // For now, assume i32 load
+        self.emit_memarg(WasmOp::I32Load, 2, 0);
+    }
+    
+    fn compile_place_store(&mut self, place: &MirPlace) {
+        // Value is on stack, need to store it
+        let value_local = self.current_func.as_mut().unwrap().add_local(WasmType::I32);
+        self.emit_u32(WasmOp::LocalSet, value_local);
+        
+        self.compile_place_addr(place);
+        self.emit_u32(WasmOp::LocalGet, value_local);
+        self.emit_memarg(WasmOp::I32Store, 2, 0);
+    }
+    
+    fn compile_place_addr(&mut self, place: &MirPlace) {
+        // Start with local
+        if let Some(&local_idx) = self.locals.get(&place.local) {
+            self.emit_u32(WasmOp::LocalGet, local_idx);
+        } else {
+            // Allocate on stack
+            self.emit_u32(WasmOp::GlobalGet, self.builder.stack_ptr_global);
+        }
+        
+        // Apply projections
+        for proj in &place.projection {
+            match proj {
+                MirProjection::Deref => {
+                    self.emit_memarg(WasmOp::I32Load, 2, 0);
+                }
+                MirProjection::Field(idx, _) => {
+                    self.emit_i32(WasmOp::I32Const, (*idx as i32) * 4);
+                    self.emit(WasmOp::I32Add);
+                }
+                MirProjection::Index(idx_local) => {
+                    if let Some(&idx) = self.locals.get(idx_local) {
+                        self.emit_u32(WasmOp::LocalGet, idx);
+                        self.emit_i32(WasmOp::I32Const, 4);
+                        self.emit(WasmOp::I32Mul);
+                        self.emit(WasmOp::I32Add);
+                    }
+                }
+                MirProjection::ConstantIndex { offset, from_end, .. } => {
+                    if *from_end {
+                        // Load length first
+                        self.emit(WasmOp::LocalTee);
+                        self.emit_u32(WasmOp::LocalGet, 0);
+                        self.emit_memarg(WasmOp::I32Load, 2, 4);
+                        self.emit_i32(WasmOp::I32Const, *offset as i32);
+                        self.emit(WasmOp::I32Sub);
+                    } else {
+                        self.emit_i32(WasmOp::I32Const, (*offset as i32) * 4);
+                    }
+                    self.emit(WasmOp::I32Add);
+                }
+                MirProjection::Downcast(_) => {
+                    // Skip discriminant
+                    self.emit_i32(WasmOp::I32Const, 4);
+                    self.emit(WasmOp::I32Add);
+                }
+                MirProjection::Subslice { from, to, from_end } => {
+                    self.emit_i32(WasmOp::I32Const, (*from as i32) * 4);
+                    self.emit(WasmOp::I32Add);
+                    // TODO: Adjust length for subslice
+                    let _ = (to, from_end);
+                }
+            }
+        }
+    }
+    
+    fn compile_binop(&mut self, op: &MirBinOp) {
+        match op {
+            MirBinOp::Add => self.emit(WasmOp::I32Add),
+            MirBinOp::Sub => self.emit(WasmOp::I32Sub),
+            MirBinOp::Mul => self.emit(WasmOp::I32Mul),
+            MirBinOp::Div => self.emit(WasmOp::I32DivS),
+            MirBinOp::Rem => self.emit(WasmOp::I32RemS),
+            MirBinOp::BitAnd => self.emit(WasmOp::I32And),
+            MirBinOp::BitOr => self.emit(WasmOp::I32Or),
+            MirBinOp::BitXor => self.emit(WasmOp::I32Xor),
+            MirBinOp::Shl => self.emit(WasmOp::I32Shl),
+            MirBinOp::Shr => self.emit(WasmOp::I32ShrS),
+            MirBinOp::Eq => self.emit(WasmOp::I32Eq),
+            MirBinOp::Ne => self.emit(WasmOp::I32Ne),
+            MirBinOp::Lt => self.emit(WasmOp::I32LtS),
+            MirBinOp::Le => self.emit(WasmOp::I32LeS),
+            MirBinOp::Gt => self.emit(WasmOp::I32GtS),
+            MirBinOp::Ge => self.emit(WasmOp::I32GeS),
+            MirBinOp::Offset => {
+                self.emit(WasmOp::I32Add);
+            }
+        }
+    }
+    
+    fn compile_unop(&mut self, op: &MirUnaryOp) {
+        match op {
+            MirUnaryOp::Not => {
+                self.emit(WasmOp::I32Eqz);
+            }
+            MirUnaryOp::Neg => {
+                self.emit_i32(WasmOp::I32Const, 0);
+                self.emit(WasmOp::I32Sub);
+                // Swap operands
+            }
+        }
+    }
+    
+    fn compile_cast(&mut self, kind: &MirCastKind, ty: &MirType) {
+        let target = self.mir_type_to_wasm(ty);
+        
+        match kind {
+            MirCastKind::IntToInt => {
+                match target {
+                    WasmType::I64 => self.emit(WasmOp::I64ExtendI32S),
+                    WasmType::I32 => self.emit(WasmOp::I32WrapI64),
+                    _ => {}
+                }
+            }
+            MirCastKind::FloatToInt => {
+                match target {
+                    WasmType::I32 => self.emit(WasmOp::I32TruncF64S),
+                    WasmType::I64 => self.emit(WasmOp::I64TruncF64S),
+                    _ => {}
+                }
+            }
+            MirCastKind::IntToFloat => {
+                match target {
+                    WasmType::F32 => self.emit(WasmOp::F32ConvertI32S),
+                    WasmType::F64 => self.emit(WasmOp::F64ConvertI32S),
+                    _ => {}
+                }
+            }
+            MirCastKind::FloatToFloat => {
+                match target {
+                    WasmType::F32 => self.emit(WasmOp::F32DemoteF64),
+                    WasmType::F64 => self.emit(WasmOp::F64PromoteF32),
+                    _ => {}
+                }
+            }
+            MirCastKind::PtrToPtr | MirCastKind::Unsize | 
+            MirCastKind::Transmute | MirCastKind::PointerExposeAddress |
+            MirCastKind::PointerFromExposedAddress => {
+                // No-op for pointer casts in wasm32
+            }
+        }
+    }
+    
+    fn compile_builtin_call(&mut self, name: &str, _arg_count: usize) {
+        match name {
+            "print" | "println" => {
+                self.emit_u32(WasmOp::Call, self.builder.print_fn);
+            }
+            "exit" | "panic" => {
+                self.emit_u32(WasmOp::Call, self.builder.exit_fn);
+            }
+            "alloc" => {
+                self.emit_u32(WasmOp::Call, self.builder.alloc_fn);
+            }
+            "read_line" => {
+                self.emit_u32(WasmOp::Call, self.builder.read_line_fn);
+            }
+            _ => {
+                // Unknown function - trap
+                self.emit(WasmOp::Unreachable);
+            }
+        }
+    }
+    
+    fn create_start_function(&mut self, main_idx: u32) {
+        let type_idx = self.builder.add_type(FuncType::void());
+        
+        let mut func = WasmFunction::new();
+        
+        // Call main()
+        func.emit_u32(WasmOp::Call, main_idx);
+        
+        // Exit with main's return value (or 0)
+        func.emit_i32(WasmOp::I32Const, 0);
+        func.emit_u32(WasmOp::Call, self.builder.exit_fn);
+        
+        func.emit(WasmOp::End);
+        
+        let start_idx = self.builder.add_function(type_idx, func);
+        self.builder.export_function("_start", start_idx);
+    }
+    
+    // Helper methods
+    fn emit(&mut self, op: WasmOp) {
+        self.current_func.as_mut().unwrap().emit(op);
+    }
+    
+    fn emit_u32(&mut self, op: WasmOp, val: u32) {
+        self.current_func.as_mut().unwrap().emit_u32(op, val);
+    }
+    
+    fn emit_i32(&mut self, op: WasmOp, val: i32) {
+        self.current_func.as_mut().unwrap().emit_i32(op, val);
+    }
+    
+    fn emit_i64(&mut self, op: WasmOp, val: i64) {
+        self.current_func.as_mut().unwrap().emit_i64(op, val);
+    }
+    
+    fn emit_f32(&mut self, op: WasmOp, val: f32) {
+        self.current_func.as_mut().unwrap().emit_f32(op, val);
+    }
+    
+    fn emit_f64(&mut self, op: WasmOp, val: f64) {
+        self.current_func.as_mut().unwrap().emit_f64(op, val);
+    }
+    
+    fn emit_memarg(&mut self, op: WasmOp, align: u32, offset: u32) {
+        self.current_func.as_mut().unwrap().emit_memarg(op, align, offset);
+    }
+    
+    fn emit_block(&mut self, op: WasmOp, ty: Option<WasmType>) {
+        self.current_func.as_mut().unwrap().emit_block(op, ty);
+        self.block_depth += 1;
+    }
+    
+    fn type_size(&self, _ty: &MirType) -> u32 {
+        4 // Simplified
+    }
+    
+    fn type_align(&self, _ty: &MirType) -> u32 {
+        4 // Simplified
+    }
+    
+    fn get_struct_size(&self, _name: &str) -> u32 {
+        16 // Simplified
+    }
+    
+    fn get_field_offset(&self, _name: &str, idx: usize) -> u32 {
+        (idx * 4) as u32
+    }
+}
+
+impl Default for WasmCodeGen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES (Placeholders - would come from mir module)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirType {
+    Bool, I8, U8, I16, U16, I32, U32, I64, U64, ISize, USize,
+    F32, F64, Char, Unit, Never, String,
+    Ptr(Box<MirType>), Ref(Box<MirType>), RefMut(Box<MirType>),
+    Array(Box<MirType>, usize), Slice(Box<MirType>),
+    Tuple(Vec<MirType>), Struct(String), Enum(String),
+    Box(Box<MirType>), Rc(Box<MirType>), Arc(Box<MirType>),
+    Function(Vec<MirType>, Box<MirType>), Generic(String), Infer,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirFuncSignature {
+    pub params: Vec<MirType>,
+    pub return_type: MirType,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub signature: MirFuncSignature,
+    pub locals: HashMap<u32, MirType>,
+    pub blocks: Vec<MirBlock>,
+    pub is_public: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub statements: Vec<MirStatement>,
+    pub terminator: Option<MirTerminator>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: MirPlace, value: MirRValue },
+    StorageLive(u32),
+    StorageDead(u32),
+    Nop,
+    Call { dest: Option<MirPlace>, func: String, args: Vec<MirOperand> },
+    Drop { place: MirPlace },
+    SetDiscriminant { place: MirPlace, variant: usize },
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Return(Option<MirOperand>),
+    Goto(usize),
+    SwitchInt { operand: MirOperand, targets: HashMap<i128, usize>, otherwise: usize },
+    Call { func: String, args: Vec<MirOperand>, dest: Option<MirPlace>, target: Option<usize>, unwind: Option<usize> },
+    Assert { cond: MirOperand, expected: bool, msg: String, target: usize },
+    Unreachable,
+    Drop { place: MirPlace, target: usize, unwind: Option<usize> },
+}
+
+#[derive(Debug, Clone)]
+pub struct MirPlace {
+    pub local: u32,
+    pub projection: Vec<MirProjection>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirProjection {
+    Deref,
+    Field(usize, MirType),
+    Index(u32),
+    ConstantIndex { offset: usize, min_length: usize, from_end: bool },
+    Subslice { from: usize, to: usize, from_end: bool },
+    Downcast(usize),
+}
+
+#[derive(Debug, Clone)]
+pub enum MirOperand {
+    Copy(MirPlace),
+    Move(MirPlace),
+    Constant(MirConstant),
+}
+
+#[derive(Debug, Clone)]
+pub enum MirConstant {
+    Bool(bool),
+    Int(i128, u32),
+    Float(f64, u32),
+    Char(char),
+    String(String),
+    Unit,
+    ZeroSized,
+    Undef,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirRValue {
+    Use(MirOperand),
+    Ref(bool, MirPlace),
+    AddressOf(bool, MirPlace),
+    BinaryOp(MirBinOp, MirOperand, MirOperand),
+    UnaryOp(MirUnaryOp, MirOperand),
+    Cast(MirCastKind, MirOperand, MirType),
+    Aggregate(MirAggregateKind, Vec<MirOperand>),
+    Discriminant(MirPlace),
+    Len(MirPlace),
+    NullaryOp(MirNullaryOp, MirType),
+    Repeat(MirOperand, usize),
+}
+
+#[derive(Debug, Clone)]
+pub enum MirBinOp {
+    Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge, Offset,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirUnaryOp { Not, Neg }
+
+#[derive(Debug, Clone)]
+pub enum MirCastKind {
+    IntToInt, FloatToInt, IntToFloat, FloatToFloat,
+    PtrToPtr, Unsize, Transmute, PointerExposeAddress, PointerFromExposedAddress,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirAggregateKind {
+    Array(MirType),
+    Tuple,
+    Struct(String),
+    Enum(String, usize),
+}
+
+#[derive(Debug, Clone)]
+pub enum MirNullaryOp { SizeOf, AlignOf }
+
+#[derive(Debug, Clone)]
+pub struct MirProgram {
+    pub functions: Vec<MirFunction>,
+    pub constants: Vec<MirConstant>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_empty_program() {
+        let program = MirProgram {
+            functions: vec![],
+            constants: vec![],
+        };
+        
+        let mut codegen = WasmCodeGen::new();
+        let binary = codegen.compile(&program);
+        
+        assert_eq!(&binary[0..4], &WASM_MAGIC);
+    }
+    
+    #[test]
+    fn test_simple_function() {
+        let program = MirProgram {
+            functions: vec![MirFunction {
+                name: "main".to_string(),
+                signature: MirFuncSignature {
+                    params: vec![],
+                    return_type: MirType::I32,
+                },
+                locals: HashMap::new(),
+                blocks: vec![MirBlock {
+                    statements: vec![],
+                    terminator: Some(MirTerminator::Return(Some(
+                        MirOperand::Constant(MirConstant::Int(42, 32))
+                    ))),
+                }],
+                is_public: true,
+            }],
+            constants: vec![],
+        };
+        
+        let mut codegen = WasmCodeGen::new();
+        let binary = codegen.compile(&program);
+        
+        // Should have _start export
+        assert!(binary.len() > 100);
+    }
+}

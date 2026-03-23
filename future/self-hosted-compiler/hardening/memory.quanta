@@ -1,0 +1,630 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ HARDENING — Memory Safety
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Runtime memory safety mechanisms:
+// - Bounds checking with minimal overhead
+// - Use-after-free detection
+// - Double-free prevention
+// - Buffer overflow protection
+// - Stack canaries
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::hardening::memory
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::format;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, AtomicUsize, AtomicBool, Ordering};
+use core::cell::UnsafeCell;
+use core::ptr::NonNull;
+use core::mem;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALLOCATION METADATA
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Magic values for allocation validation
+const ALLOC_MAGIC_LIVE: u64 = 0xDEAD_BEEF_CAFE_BABE;
+const ALLOC_MAGIC_FREED: u64 = 0xFEED_FACE_DEAD_C0DE;
+const CANARY_VALUE: u64 = 0xC0DE_CAFE_1337_B00B;
+
+/// Allocation header for tracking
+#[repr(C)]
+pub struct AllocationHeader {
+    /// Magic number for validation
+    magic: AtomicU64,
+    
+    /// Allocation size (not including header)
+    size: usize,
+    
+    /// Allocation ID for tracking
+    id: u64,
+    
+    /// Source location (file:line)
+    source: &'static str,
+    
+    /// Canary for overflow detection
+    canary_front: u64,
+}
+
+impl AllocationHeader {
+    /// Create new header
+    pub fn new(size: usize, id: u64, source: &'static str) -> Self {
+        AllocationHeader {
+            magic: AtomicU64::new(ALLOC_MAGIC_LIVE),
+            size,
+            id,
+            source,
+            canary_front: CANARY_VALUE,
+        }
+    }
+    
+    /// Check if allocation is valid
+    pub fn is_valid(&self) -> bool {
+        self.magic.load(Ordering::Acquire) == ALLOC_MAGIC_LIVE &&
+        self.canary_front == CANARY_VALUE
+    }
+    
+    /// Check if freed
+    pub fn is_freed(&self) -> bool {
+        self.magic.load(Ordering::Acquire) == ALLOC_MAGIC_FREED
+    }
+    
+    /// Mark as freed
+    pub fn mark_freed(&self) {
+        self.magic.store(ALLOC_MAGIC_FREED, Ordering::Release);
+    }
+    
+    /// Get size
+    pub fn size(&self) -> usize {
+        self.size
+    }
+}
+
+/// Canary footer for overflow detection
+#[repr(C)]
+pub struct AllocationFooter {
+    canary: u64,
+}
+
+impl AllocationFooter {
+    pub fn new() -> Self {
+        AllocationFooter { canary: CANARY_VALUE }
+    }
+    
+    pub fn is_valid(&self) -> bool {
+        self.canary == CANARY_VALUE
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GUARDED ALLOCATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Hardened memory allocator
+pub struct GuardedAllocator {
+    /// Allocation counter
+    next_id: AtomicU64,
+    
+    /// Total allocations
+    total_allocs: AtomicUsize,
+    
+    /// Total frees
+    total_frees: AtomicUsize,
+    
+    /// Current allocated bytes
+    current_bytes: AtomicUsize,
+    
+    /// Peak allocated bytes
+    peak_bytes: AtomicUsize,
+    
+    /// Enable quarantine (delay reuse of freed memory)
+    quarantine_enabled: bool,
+    
+    /// Quarantine size limit
+    quarantine_limit: usize,
+    
+    /// Fill freed memory with pattern
+    poison_after_free: bool,
+}
+
+impl GuardedAllocator {
+    /// Create new allocator
+    pub const fn new() -> Self {
+        GuardedAllocator {
+            next_id: AtomicU64::new(1),
+            total_allocs: AtomicUsize::new(0),
+            total_frees: AtomicUsize::new(0),
+            current_bytes: AtomicUsize::new(0),
+            peak_bytes: AtomicUsize::new(0),
+            quarantine_enabled: true,
+            quarantine_limit: 1024 * 1024, // 1MB
+            poison_after_free: true,
+        }
+    }
+    
+    /// Allocate with guards
+    pub unsafe fn alloc(&self, layout: core::alloc::Layout, source: &'static str) -> *mut u8 {
+        let header_size = mem::size_of::<AllocationHeader>();
+        let footer_size = mem::size_of::<AllocationFooter>();
+        
+        // Calculate total size with alignment
+        let total_size = header_size + layout.size() + footer_size;
+        let total_align = layout.align().max(mem::align_of::<AllocationHeader>());
+        
+        let total_layout = core::alloc::Layout::from_size_align_unchecked(
+            total_size,
+            total_align,
+        );
+        
+        // Allocate
+        let ptr = alloc::alloc::alloc(total_layout);
+        if ptr.is_null() {
+            return ptr;
+        }
+        
+        // Setup header
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let header = ptr as *mut AllocationHeader;
+        header.write(AllocationHeader::new(layout.size(), id, source));
+        
+        // Setup footer
+        let user_ptr = ptr.add(header_size);
+        let footer = user_ptr.add(layout.size()) as *mut AllocationFooter;
+        footer.write(AllocationFooter::new());
+        
+        // Update stats
+        self.total_allocs.fetch_add(1, Ordering::Relaxed);
+        let new_bytes = self.current_bytes.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+        
+        // Update peak
+        let mut peak = self.peak_bytes.load(Ordering::Relaxed);
+        while new_bytes > peak {
+            match self.peak_bytes.compare_exchange_weak(
+                peak, new_bytes, Ordering::Relaxed, Ordering::Relaxed
+            ) {
+                Ok(_) => break,
+                Err(p) => peak = p,
+            }
+        }
+        
+        user_ptr
+    }
+    
+    /// Free with validation
+    pub unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) -> Result<(), MemoryError> {
+        if ptr.is_null() {
+            return Err(MemoryError::NullPointer);
+        }
+        
+        let header_size = mem::size_of::<AllocationHeader>();
+        let footer_size = mem::size_of::<AllocationFooter>();
+        
+        // Get header
+        let header_ptr = ptr.sub(header_size) as *mut AllocationHeader;
+        let header = &*header_ptr;
+        
+        // Check for double-free
+        if header.is_freed() {
+            return Err(MemoryError::DoubleFree {
+                id: header.id,
+                source: header.source,
+            });
+        }
+        
+        // Check for corruption
+        if !header.is_valid() {
+            return Err(MemoryError::HeapCorruption {
+                address: ptr as usize,
+            });
+        }
+        
+        // Check size matches
+        if header.size != layout.size() {
+            return Err(MemoryError::SizeMismatch {
+                expected: header.size,
+                got: layout.size(),
+            });
+        }
+        
+        // Check footer canary
+        let footer = ptr.add(layout.size()) as *const AllocationFooter;
+        if !(*footer).is_valid() {
+            return Err(MemoryError::BufferOverflow {
+                id: header.id,
+                source: header.source,
+            });
+        }
+        
+        // Mark as freed
+        header.mark_freed();
+        
+        // Poison memory if enabled
+        if self.poison_after_free {
+            core::ptr::write_bytes(ptr, 0xDD, layout.size());
+        }
+        
+        // Update stats
+        self.total_frees.fetch_add(1, Ordering::Relaxed);
+        self.current_bytes.fetch_sub(layout.size(), Ordering::Relaxed);
+        
+        // Actually free (unless quarantined)
+        if !self.quarantine_enabled {
+            let total_size = header_size + layout.size() + footer_size;
+            let total_align = layout.align().max(mem::align_of::<AllocationHeader>());
+            let total_layout = core::alloc::Layout::from_size_align_unchecked(
+                total_size,
+                total_align,
+            );
+            alloc::alloc::dealloc(header_ptr as *mut u8, total_layout);
+        }
+        
+        Ok(())
+    }
+    
+    /// Get stats
+    pub fn stats(&self) -> AllocatorStats {
+        AllocatorStats {
+            total_allocs: self.total_allocs.load(Ordering::Relaxed),
+            total_frees: self.total_frees.load(Ordering::Relaxed),
+            current_bytes: self.current_bytes.load(Ordering::Relaxed),
+            peak_bytes: self.peak_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Allocator statistics
+#[derive(Debug, Clone)]
+pub struct AllocatorStats {
+    pub total_allocs: usize,
+    pub total_frees: usize,
+    pub current_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+impl AllocatorStats {
+    pub fn leaks(&self) -> usize {
+        self.total_allocs.saturating_sub(self.total_frees)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BOUNDS CHECKING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Checked slice with bounds validation
+#[derive(Debug)]
+pub struct CheckedSlice<T> {
+    ptr: NonNull<T>,
+    len: usize,
+}
+
+impl<T> CheckedSlice<T> {
+    /// Create from raw parts with validation
+    pub unsafe fn from_raw_parts(ptr: *mut T, len: usize) -> Option<Self> {
+        NonNull::new(ptr).map(|ptr| CheckedSlice { ptr, len })
+    }
+    
+    /// Get length
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    
+    /// Bounds-checked get
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index < self.len {
+            unsafe { Some(&*self.ptr.as_ptr().add(index)) }
+        } else {
+            None
+        }
+    }
+    
+    /// Bounds-checked get_mut
+    #[inline]
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index < self.len {
+            unsafe { Some(&mut *self.ptr.as_ptr().add(index)) }
+        } else {
+            None
+        }
+    }
+    
+    /// Bounds-checked index with panic
+    #[inline]
+    pub fn index(&self, index: usize) -> &T {
+        self.get(index).unwrap_or_else(|| {
+            bounds_check_failed(index, self.len)
+        })
+    }
+    
+    /// Bounds-checked slice
+    pub fn slice(&self, start: usize, end: usize) -> Option<CheckedSlice<T>> {
+        if start <= end && end <= self.len {
+            Some(CheckedSlice {
+                ptr: unsafe { NonNull::new_unchecked(self.ptr.as_ptr().add(start)) },
+                len: end - start,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Bounds check failure (cold path)
+#[cold]
+#[inline(never)]
+fn bounds_check_failed(index: usize, len: usize) -> ! {
+    panic!("index out of bounds: index {} but len is {}", index, len);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STACK PROTECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Stack canary for buffer overflow detection
+pub struct StackGuard {
+    canary: u64,
+}
+
+impl StackGuard {
+    /// Create new stack guard
+    #[inline]
+    pub fn new() -> Self {
+        StackGuard {
+            canary: generate_canary(),
+        }
+    }
+    
+    /// Verify canary is intact
+    #[inline]
+    pub fn verify(&self) -> bool {
+        // Compare with timing-safe comparison
+        constant_time_compare(self.canary, generate_canary())
+    }
+    
+    /// Verify and panic if corrupted
+    #[inline]
+    pub fn check(&self) {
+        if !self.verify() {
+            stack_smash_detected();
+        }
+    }
+}
+
+impl Drop for StackGuard {
+    fn drop(&mut self) {
+        self.check();
+    }
+}
+
+/// Generate random canary value
+fn generate_canary() -> u64 {
+    // In real implementation, this would use thread-local random canary
+    // initialized at program start from secure random source
+    CANARY_VALUE ^ 0x1234_5678_9ABC_DEF0
+}
+
+/// Constant-time comparison
+#[inline]
+fn constant_time_compare(a: u64, b: u64) -> bool {
+    // XOR produces 0 only if equal, timing independent
+    (a ^ b) == 0
+}
+
+/// Stack smash handler
+#[cold]
+#[inline(never)]
+fn stack_smash_detected() -> ! {
+    // In real implementation, would call __stack_chk_fail
+    panic!("*** stack smashing detected ***");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SAFE POINTER WRAPPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Non-null pointer with lifetime tracking
+pub struct TrackedPtr<T> {
+    ptr: NonNull<T>,
+    generation: u64,
+}
+
+impl<T> TrackedPtr<T> {
+    /// Create new tracked pointer
+    pub fn new(ptr: NonNull<T>) -> Self {
+        static GENERATION: AtomicU64 = AtomicU64::new(0);
+        TrackedPtr {
+            ptr,
+            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+    
+    /// Get raw pointer
+    pub fn as_ptr(&self) -> *mut T {
+        self.ptr.as_ptr()
+    }
+    
+    /// Get generation
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Unique ownership pointer with drop tracking
+pub struct UniquePtr<T> {
+    ptr: Option<NonNull<T>>,
+    dropped: AtomicBool,
+}
+
+impl<T> UniquePtr<T> {
+    /// Create from boxed value
+    pub fn new(value: T) -> Self {
+        let ptr = Box::into_raw(Box::new(value));
+        UniquePtr {
+            ptr: NonNull::new(ptr),
+            dropped: AtomicBool::new(false),
+        }
+    }
+    
+    /// Take ownership (can only be called once)
+    pub fn take(&self) -> Option<Box<T>> {
+        if self.dropped.swap(true, Ordering::AcqRel) {
+            None // Already taken
+        } else {
+            self.ptr.map(|p| unsafe { Box::from_raw(p.as_ptr()) })
+        }
+    }
+    
+    /// Borrow reference
+    pub fn as_ref(&self) -> Option<&T> {
+        if self.dropped.load(Ordering::Acquire) {
+            None
+        } else {
+            self.ptr.map(|p| unsafe { &*p.as_ptr() })
+        }
+    }
+}
+
+impl<T> Drop for UniquePtr<T> {
+    fn drop(&mut self) {
+        if !self.dropped.swap(true, Ordering::AcqRel) {
+            if let Some(ptr) = self.ptr {
+                unsafe { drop(Box::from_raw(ptr.as_ptr())) };
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum MemoryError {
+    NullPointer,
+    DoubleFree { id: u64, source: &'static str },
+    UseAfterFree { id: u64, source: &'static str },
+    BufferOverflow { id: u64, source: &'static str },
+    HeapCorruption { address: usize },
+    SizeMismatch { expected: usize, got: usize },
+    OutOfMemory { requested: usize },
+}
+
+impl std::fmt::Display for MemoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NullPointer => write!(f, "null pointer dereference"),
+            Self::DoubleFree { id, source } => {
+                write!(f, "double free detected: allocation {} from {}", id, source)
+            }
+            Self::UseAfterFree { id, source } => {
+                write!(f, "use after free: allocation {} from {}", id, source)
+            }
+            Self::BufferOverflow { id, source } => {
+                write!(f, "buffer overflow detected: allocation {} from {}", id, source)
+            }
+            Self::HeapCorruption { address } => {
+                write!(f, "heap corruption at address 0x{:x}", address)
+            }
+            Self::SizeMismatch { expected, got } => {
+                write!(f, "size mismatch: expected {} but got {}", expected, got)
+            }
+            Self::OutOfMemory { requested } => {
+                write!(f, "out of memory: requested {} bytes", requested)
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL ALLOCATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Global guarded allocator instance
+pub static GUARDED_ALLOCATOR: GuardedAllocator = GuardedAllocator::new();
+
+/// Allocate with tracking
+#[inline]
+pub unsafe fn guarded_alloc(size: usize, align: usize) -> *mut u8 {
+    let layout = core::alloc::Layout::from_size_align_unchecked(size, align);
+    GUARDED_ALLOCATOR.alloc(layout, "unknown")
+}
+
+/// Free with validation
+#[inline]
+pub unsafe fn guarded_dealloc(ptr: *mut u8, size: usize, align: usize) -> Result<(), MemoryError> {
+    let layout = core::alloc::Layout::from_size_align_unchecked(size, align);
+    GUARDED_ALLOCATOR.dealloc(ptr, layout)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_allocation_header() {
+        let header = AllocationHeader::new(100, 1, "test.quanta:10");
+        assert!(header.is_valid());
+        assert!(!header.is_freed());
+        assert_eq!(header.size(), 100);
+        
+        header.mark_freed();
+        assert!(header.is_freed());
+    }
+    
+    #[test]
+    fn test_checked_slice() {
+        let mut data = vec![1, 2, 3, 4, 5];
+        let slice = unsafe {
+            CheckedSlice::from_raw_parts(data.as_mut_ptr(), data.len())
+        }.unwrap();
+        
+        assert_eq!(slice.len(), 5);
+        assert_eq!(*slice.get(0).unwrap(), 1);
+        assert_eq!(*slice.get(4).unwrap(), 5);
+        assert!(slice.get(5).is_none());
+    }
+    
+    #[test]
+    fn test_stack_guard() {
+        let guard = StackGuard::new();
+        assert!(guard.verify());
+    }
+    
+    #[test]
+    fn test_unique_ptr() {
+        let ptr = UniquePtr::new(42);
+        assert_eq!(*ptr.as_ref().unwrap(), 42);
+        
+        let taken = ptr.take().unwrap();
+        assert_eq!(*taken, 42);
+        
+        // Second take returns None
+        assert!(ptr.take().is_none());
+    }
+    
+    #[test]
+    fn test_allocator_stats() {
+        let allocator = GuardedAllocator::new();
+        let stats = allocator.stats();
+        
+        assert_eq!(stats.total_allocs, 0);
+        assert_eq!(stats.leaks(), 0);
+    }
+}

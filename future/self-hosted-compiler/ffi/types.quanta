@@ -1,0 +1,1286 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ FFI — Foreign Type System
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Foreign Function Interface type system for C interoperability:
+// - ABI (Application Binary Interface) definitions
+// - Foreign type declarations (C types mapped to Quanta)
+// - Type marshaling and conversion
+// - Platform-specific type handling
+// - Struct layout computation (alignment, padding)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::ffi::types
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ABI DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Calling convention / ABI
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Abi {
+    /// C calling convention (platform default)
+    C,
+    /// System V AMD64 ABI (Linux, macOS x86_64)
+    SysV64,
+    /// Microsoft x64 ABI (Windows x86_64)
+    Win64,
+    /// ARM64 AAPCS (ARM 64-bit)
+    Aapcs64,
+    /// RISC-V LP64 ABI
+    RiscV64,
+    /// stdcall (Windows 32-bit)
+    Stdcall,
+    /// fastcall
+    Fastcall,
+    /// vectorcall (SIMD-optimized)
+    Vectorcall,
+    /// Rust ABI (internal)
+    Rust,
+    /// QuantaLang ABI (internal)
+    Quanta,
+}
+
+impl Abi {
+    /// Get the platform default C ABI
+    pub fn platform_c() -> Self {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        { Abi::SysV64 }
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        { Abi::SysV64 }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        { Abi::Aapcs64 }
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        { Abi::Win64 }
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        { Abi::Aapcs64 }
+        #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+        { Abi::RiscV64 }
+        #[cfg(not(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "windows", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "aarch64"),
+            all(target_os = "linux", target_arch = "riscv64"),
+        )))]
+        { Abi::C }
+    }
+    
+    /// Get ABI name as string
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Abi::C => "C",
+            Abi::SysV64 => "sysv64",
+            Abi::Win64 => "win64",
+            Abi::Aapcs64 => "aapcs64",
+            Abi::RiscV64 => "riscv64",
+            Abi::Stdcall => "stdcall",
+            Abi::Fastcall => "fastcall",
+            Abi::Vectorcall => "vectorcall",
+            Abi::Rust => "Rust",
+            Abi::Quanta => "Quanta",
+        }
+    }
+    
+    /// Parse ABI from string
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "c" | "cdecl" => Some(Abi::C),
+            "sysv64" | "sysv" | "system-v" => Some(Abi::SysV64),
+            "win64" | "ms64" | "microsoft" => Some(Abi::Win64),
+            "aapcs64" | "aapcs" | "arm64" => Some(Abi::Aapcs64),
+            "riscv64" | "riscv" => Some(Abi::RiscV64),
+            "stdcall" => Some(Abi::Stdcall),
+            "fastcall" => Some(Abi::Fastcall),
+            "vectorcall" => Some(Abi::Vectorcall),
+            "rust" => Some(Abi::Rust),
+            "quanta" => Some(Abi::Quanta),
+            _ => None,
+        }
+    }
+    
+    /// Number of integer/pointer argument registers
+    pub fn int_arg_registers(&self) -> usize {
+        match self {
+            Abi::SysV64 => 6,      // rdi, rsi, rdx, rcx, r8, r9
+            Abi::Win64 => 4,       // rcx, rdx, r8, r9
+            Abi::Aapcs64 => 8,     // x0-x7
+            Abi::RiscV64 => 8,     // a0-a7
+            _ => 0,
+        }
+    }
+    
+    /// Number of floating-point argument registers
+    pub fn float_arg_registers(&self) -> usize {
+        match self {
+            Abi::SysV64 => 8,      // xmm0-xmm7
+            Abi::Win64 => 4,       // xmm0-xmm3
+            Abi::Aapcs64 => 8,     // v0-v7
+            Abi::RiscV64 => 8,     // fa0-fa7
+            _ => 0,
+        }
+    }
+    
+    /// Stack alignment requirement
+    pub fn stack_alignment(&self) -> usize {
+        match self {
+            Abi::SysV64 => 16,
+            Abi::Win64 => 16,
+            Abi::Aapcs64 => 16,
+            Abi::RiscV64 => 16,
+            _ => 8,
+        }
+    }
+    
+    /// Shadow space / red zone size
+    pub fn shadow_space(&self) -> usize {
+        match self {
+            Abi::Win64 => 32,      // 4 * 8 bytes shadow space
+            Abi::SysV64 => 128,    // Red zone
+            Abi::Aapcs64 => 0,     // No red zone by default
+            _ => 0,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FOREIGN TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Foreign (C) type representation
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ForeignType {
+    // Void
+    Void,
+    
+    // Boolean
+    Bool,
+    
+    // Integer types
+    Char,           // char (signed on most platforms)
+    UChar,          // unsigned char
+    Short,          // short
+    UShort,         // unsigned short
+    Int,            // int
+    UInt,           // unsigned int
+    Long,           // long
+    ULong,          // unsigned long
+    LongLong,       // long long
+    ULongLong,      // unsigned long long
+    
+    // Fixed-width integers (stdint.h)
+    I8,             // int8_t
+    U8,             // uint8_t
+    I16,            // int16_t
+    U16,            // uint16_t
+    I32,            // int32_t
+    U32,            // uint32_t
+    I64,            // int64_t
+    U64,            // uint64_t
+    
+    // Size types
+    Size,           // size_t
+    SSize,          // ssize_t
+    PtrDiff,        // ptrdiff_t
+    IntPtr,         // intptr_t
+    UIntPtr,        // uintptr_t
+    
+    // Floating point
+    Float,          // float
+    Double,         // double
+    LongDouble,     // long double
+    
+    // Pointers
+    Pointer(Box<ForeignType>),      // T*
+    ConstPointer(Box<ForeignType>), // const T*
+    MutPointer(Box<ForeignType>),   // T* (explicitly mutable)
+    
+    // Arrays
+    Array(Box<ForeignType>, usize), // T[N]
+    FlexArray(Box<ForeignType>),    // T[] (flexible array member)
+    
+    // Composite types
+    Struct(StructType),
+    Union(UnionType),
+    Enum(EnumType),
+    
+    // Function pointer
+    FnPtr(FunctionSignature),
+    
+    // Opaque type (forward declaration)
+    Opaque(String),
+    
+    // Type alias
+    Alias(String, Box<ForeignType>),
+}
+
+impl ForeignType {
+    /// Get size in bytes
+    pub fn size(&self, target: &TargetInfo) -> usize {
+        match self {
+            ForeignType::Void => 0,
+            ForeignType::Bool => 1,
+            ForeignType::Char | ForeignType::UChar => 1,
+            ForeignType::Short | ForeignType::UShort => 2,
+            ForeignType::Int | ForeignType::UInt => 4,
+            ForeignType::Long | ForeignType::ULong => target.long_size,
+            ForeignType::LongLong | ForeignType::ULongLong => 8,
+            ForeignType::I8 | ForeignType::U8 => 1,
+            ForeignType::I16 | ForeignType::U16 => 2,
+            ForeignType::I32 | ForeignType::U32 => 4,
+            ForeignType::I64 | ForeignType::U64 => 8,
+            ForeignType::Size | ForeignType::SSize => target.pointer_size,
+            ForeignType::PtrDiff | ForeignType::IntPtr | ForeignType::UIntPtr => target.pointer_size,
+            ForeignType::Float => 4,
+            ForeignType::Double => 8,
+            ForeignType::LongDouble => target.long_double_size,
+            ForeignType::Pointer(_) | ForeignType::ConstPointer(_) | ForeignType::MutPointer(_) => {
+                target.pointer_size
+            }
+            ForeignType::Array(elem, count) => elem.size(target) * count,
+            ForeignType::FlexArray(_) => 0,
+            ForeignType::Struct(s) => s.size(target),
+            ForeignType::Union(u) => u.size(target),
+            ForeignType::Enum(e) => e.underlying.size(target),
+            ForeignType::FnPtr(_) => target.pointer_size,
+            ForeignType::Opaque(_) => 0, // Unknown
+            ForeignType::Alias(_, inner) => inner.size(target),
+        }
+    }
+    
+    /// Get alignment in bytes
+    pub fn alignment(&self, target: &TargetInfo) -> usize {
+        match self {
+            ForeignType::Void => 1,
+            ForeignType::Bool => 1,
+            ForeignType::Char | ForeignType::UChar => 1,
+            ForeignType::Short | ForeignType::UShort => 2,
+            ForeignType::Int | ForeignType::UInt => 4,
+            ForeignType::Long | ForeignType::ULong => target.long_size,
+            ForeignType::LongLong | ForeignType::ULongLong => 8,
+            ForeignType::I8 | ForeignType::U8 => 1,
+            ForeignType::I16 | ForeignType::U16 => 2,
+            ForeignType::I32 | ForeignType::U32 => 4,
+            ForeignType::I64 | ForeignType::U64 => 8,
+            ForeignType::Size | ForeignType::SSize => target.pointer_size,
+            ForeignType::PtrDiff | ForeignType::IntPtr | ForeignType::UIntPtr => target.pointer_size,
+            ForeignType::Float => 4,
+            ForeignType::Double => 8,
+            ForeignType::LongDouble => target.long_double_align,
+            ForeignType::Pointer(_) | ForeignType::ConstPointer(_) | ForeignType::MutPointer(_) => {
+                target.pointer_size
+            }
+            ForeignType::Array(elem, _) => elem.alignment(target),
+            ForeignType::FlexArray(elem) => elem.alignment(target),
+            ForeignType::Struct(s) => s.alignment(target),
+            ForeignType::Union(u) => u.alignment(target),
+            ForeignType::Enum(e) => e.underlying.alignment(target),
+            ForeignType::FnPtr(_) => target.pointer_size,
+            ForeignType::Opaque(_) => 1,
+            ForeignType::Alias(_, inner) => inner.alignment(target),
+        }
+    }
+    
+    /// Check if type is a pointer
+    pub fn is_pointer(&self) -> bool {
+        matches!(
+            self,
+            ForeignType::Pointer(_) | ForeignType::ConstPointer(_) | ForeignType::MutPointer(_)
+        )
+    }
+    
+    /// Check if type is an integer
+    pub fn is_integer(&self) -> bool {
+        matches!(
+            self,
+            ForeignType::Bool
+                | ForeignType::Char
+                | ForeignType::UChar
+                | ForeignType::Short
+                | ForeignType::UShort
+                | ForeignType::Int
+                | ForeignType::UInt
+                | ForeignType::Long
+                | ForeignType::ULong
+                | ForeignType::LongLong
+                | ForeignType::ULongLong
+                | ForeignType::I8
+                | ForeignType::U8
+                | ForeignType::I16
+                | ForeignType::U16
+                | ForeignType::I32
+                | ForeignType::U32
+                | ForeignType::I64
+                | ForeignType::U64
+                | ForeignType::Size
+                | ForeignType::SSize
+                | ForeignType::PtrDiff
+                | ForeignType::IntPtr
+                | ForeignType::UIntPtr
+        )
+    }
+    
+    /// Check if type is floating point
+    pub fn is_float(&self) -> bool {
+        matches!(
+            self,
+            ForeignType::Float | ForeignType::Double | ForeignType::LongDouble
+        )
+    }
+    
+    /// Check if type is signed
+    pub fn is_signed(&self) -> bool {
+        matches!(
+            self,
+            ForeignType::Char  // Platform dependent, usually signed
+                | ForeignType::Short
+                | ForeignType::Int
+                | ForeignType::Long
+                | ForeignType::LongLong
+                | ForeignType::I8
+                | ForeignType::I16
+                | ForeignType::I32
+                | ForeignType::I64
+                | ForeignType::SSize
+                | ForeignType::PtrDiff
+                | ForeignType::IntPtr
+                | ForeignType::Float
+                | ForeignType::Double
+                | ForeignType::LongDouble
+        )
+    }
+    
+    /// Get C type name
+    pub fn c_name(&self) -> String {
+        match self {
+            ForeignType::Void => "void".to_string(),
+            ForeignType::Bool => "_Bool".to_string(),
+            ForeignType::Char => "char".to_string(),
+            ForeignType::UChar => "unsigned char".to_string(),
+            ForeignType::Short => "short".to_string(),
+            ForeignType::UShort => "unsigned short".to_string(),
+            ForeignType::Int => "int".to_string(),
+            ForeignType::UInt => "unsigned int".to_string(),
+            ForeignType::Long => "long".to_string(),
+            ForeignType::ULong => "unsigned long".to_string(),
+            ForeignType::LongLong => "long long".to_string(),
+            ForeignType::ULongLong => "unsigned long long".to_string(),
+            ForeignType::I8 => "int8_t".to_string(),
+            ForeignType::U8 => "uint8_t".to_string(),
+            ForeignType::I16 => "int16_t".to_string(),
+            ForeignType::U16 => "uint16_t".to_string(),
+            ForeignType::I32 => "int32_t".to_string(),
+            ForeignType::U32 => "uint32_t".to_string(),
+            ForeignType::I64 => "int64_t".to_string(),
+            ForeignType::U64 => "uint64_t".to_string(),
+            ForeignType::Size => "size_t".to_string(),
+            ForeignType::SSize => "ssize_t".to_string(),
+            ForeignType::PtrDiff => "ptrdiff_t".to_string(),
+            ForeignType::IntPtr => "intptr_t".to_string(),
+            ForeignType::UIntPtr => "uintptr_t".to_string(),
+            ForeignType::Float => "float".to_string(),
+            ForeignType::Double => "double".to_string(),
+            ForeignType::LongDouble => "long double".to_string(),
+            ForeignType::Pointer(inner) => format!("{}*", inner.c_name()),
+            ForeignType::ConstPointer(inner) => format!("const {}*", inner.c_name()),
+            ForeignType::MutPointer(inner) => format!("{}*", inner.c_name()),
+            ForeignType::Array(elem, n) => format!("{}[{}]", elem.c_name(), n),
+            ForeignType::FlexArray(elem) => format!("{}[]", elem.c_name()),
+            ForeignType::Struct(s) => format!("struct {}", s.name),
+            ForeignType::Union(u) => format!("union {}", u.name),
+            ForeignType::Enum(e) => format!("enum {}", e.name),
+            ForeignType::FnPtr(sig) => sig.c_signature(),
+            ForeignType::Opaque(name) => format!("struct {}", name),
+            ForeignType::Alias(name, _) => name.clone(),
+        }
+    }
+    
+    /// Convert to Quanta type representation
+    pub fn to_quanta_type(&self) -> String {
+        match self {
+            ForeignType::Void => "()".to_string(),
+            ForeignType::Bool => "bool".to_string(),
+            ForeignType::Char => "i8".to_string(),
+            ForeignType::UChar => "u8".to_string(),
+            ForeignType::Short => "i16".to_string(),
+            ForeignType::UShort => "u16".to_string(),
+            ForeignType::Int => "i32".to_string(),
+            ForeignType::UInt => "u32".to_string(),
+            ForeignType::Long => "isize".to_string(), // Platform dependent
+            ForeignType::ULong => "usize".to_string(),
+            ForeignType::LongLong => "i64".to_string(),
+            ForeignType::ULongLong => "u64".to_string(),
+            ForeignType::I8 => "i8".to_string(),
+            ForeignType::U8 => "u8".to_string(),
+            ForeignType::I16 => "i16".to_string(),
+            ForeignType::U16 => "u16".to_string(),
+            ForeignType::I32 => "i32".to_string(),
+            ForeignType::U32 => "u32".to_string(),
+            ForeignType::I64 => "i64".to_string(),
+            ForeignType::U64 => "u64".to_string(),
+            ForeignType::Size => "usize".to_string(),
+            ForeignType::SSize => "isize".to_string(),
+            ForeignType::PtrDiff => "isize".to_string(),
+            ForeignType::IntPtr => "isize".to_string(),
+            ForeignType::UIntPtr => "usize".to_string(),
+            ForeignType::Float => "f32".to_string(),
+            ForeignType::Double => "f64".to_string(),
+            ForeignType::LongDouble => "f128".to_string(),
+            ForeignType::Pointer(inner) => format!("*mut {}", inner.to_quanta_type()),
+            ForeignType::ConstPointer(inner) => format!("*const {}", inner.to_quanta_type()),
+            ForeignType::MutPointer(inner) => format!("*mut {}", inner.to_quanta_type()),
+            ForeignType::Array(elem, n) => format!("[{}; {}]", elem.to_quanta_type(), n),
+            ForeignType::FlexArray(elem) => format!("[{}]", elem.to_quanta_type()),
+            ForeignType::Struct(s) => s.name.clone(),
+            ForeignType::Union(u) => u.name.clone(),
+            ForeignType::Enum(e) => e.name.clone(),
+            ForeignType::FnPtr(sig) => sig.to_quanta_fn_ptr(),
+            ForeignType::Opaque(name) => format!("Opaque<{}>", name),
+            ForeignType::Alias(name, _) => name.clone(),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPOSITE TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// C struct definition
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StructType {
+    /// Struct name
+    pub name: String,
+    /// Fields
+    pub fields: Vec<StructField>,
+    /// Is packed (no padding)
+    pub packed: bool,
+    /// Explicit alignment override
+    pub alignment_override: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StructField {
+    pub name: String,
+    pub ty: ForeignType,
+    pub bit_width: Option<u8>, // For bit fields
+}
+
+impl StructType {
+    pub fn new(name: impl Into<String>) -> Self {
+        StructType {
+            name: name.into(),
+            fields: Vec::new(),
+            packed: false,
+            alignment_override: None,
+        }
+    }
+    
+    pub fn field(mut self, name: impl Into<String>, ty: ForeignType) -> Self {
+        self.fields.push(StructField {
+            name: name.into(),
+            ty,
+            bit_width: None,
+        });
+        self
+    }
+    
+    pub fn bit_field(mut self, name: impl Into<String>, ty: ForeignType, bits: u8) -> Self {
+        self.fields.push(StructField {
+            name: name.into(),
+            ty,
+            bit_width: Some(bits),
+        });
+        self
+    }
+    
+    pub fn packed(mut self) -> Self {
+        self.packed = true;
+        self
+    }
+    
+    pub fn align(mut self, alignment: usize) -> Self {
+        self.alignment_override = Some(alignment);
+        self
+    }
+    
+    /// Compute struct layout
+    pub fn layout(&self, target: &TargetInfo) -> StructLayout {
+        let mut offset = 0usize;
+        let mut max_align = 1usize;
+        let mut field_offsets = Vec::with_capacity(self.fields.len());
+        
+        for field in &self.fields {
+            let field_size = field.ty.size(target);
+            let field_align = if self.packed { 1 } else { field.ty.alignment(target) };
+            
+            // Add padding for alignment
+            let padding = (field_align - (offset % field_align)) % field_align;
+            offset += padding;
+            
+            field_offsets.push(FieldLayout {
+                name: field.name.clone(),
+                offset,
+                size: field_size,
+                alignment: field_align,
+            });
+            
+            offset += field_size;
+            max_align = max_align.max(field_align);
+        }
+        
+        // Override alignment if specified
+        if let Some(align) = self.alignment_override {
+            max_align = align;
+        }
+        
+        // Final padding
+        let final_padding = (max_align - (offset % max_align)) % max_align;
+        let total_size = offset + final_padding;
+        
+        StructLayout {
+            name: self.name.clone(),
+            size: total_size,
+            alignment: max_align,
+            fields: field_offsets,
+        }
+    }
+    
+    pub fn size(&self, target: &TargetInfo) -> usize {
+        self.layout(target).size
+    }
+    
+    pub fn alignment(&self, target: &TargetInfo) -> usize {
+        self.layout(target).alignment
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StructLayout {
+    pub name: String,
+    pub size: usize,
+    pub alignment: usize,
+    pub fields: Vec<FieldLayout>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldLayout {
+    pub name: String,
+    pub offset: usize,
+    pub size: usize,
+    pub alignment: usize,
+}
+
+/// C union definition
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnionType {
+    pub name: String,
+    pub variants: Vec<UnionVariant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnionVariant {
+    pub name: String,
+    pub ty: ForeignType,
+}
+
+impl UnionType {
+    pub fn new(name: impl Into<String>) -> Self {
+        UnionType {
+            name: name.into(),
+            variants: Vec::new(),
+        }
+    }
+    
+    pub fn variant(mut self, name: impl Into<String>, ty: ForeignType) -> Self {
+        self.variants.push(UnionVariant {
+            name: name.into(),
+            ty,
+        });
+        self
+    }
+    
+    pub fn size(&self, target: &TargetInfo) -> usize {
+        self.variants.iter()
+            .map(|v| v.ty.size(target))
+            .max()
+            .unwrap_or(0)
+    }
+    
+    pub fn alignment(&self, target: &TargetInfo) -> usize {
+        self.variants.iter()
+            .map(|v| v.ty.alignment(target))
+            .max()
+            .unwrap_or(1)
+    }
+}
+
+/// C enum definition
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EnumType {
+    pub name: String,
+    pub variants: Vec<EnumVariant>,
+    pub underlying: Box<ForeignType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EnumVariant {
+    pub name: String,
+    pub value: i64,
+}
+
+impl EnumType {
+    pub fn new(name: impl Into<String>) -> Self {
+        EnumType {
+            name: name.into(),
+            variants: Vec::new(),
+            underlying: Box::new(ForeignType::Int),
+        }
+    }
+    
+    pub fn underlying(mut self, ty: ForeignType) -> Self {
+        self.underlying = Box::new(ty);
+        self
+    }
+    
+    pub fn variant(mut self, name: impl Into<String>, value: i64) -> Self {
+        self.variants.push(EnumVariant {
+            name: name.into(),
+            value,
+        });
+        self
+    }
+    
+    pub fn variants_auto(mut self, names: &[&str]) -> Self {
+        for (i, name) in names.iter().enumerate() {
+            self.variants.push(EnumVariant {
+                name: name.to_string(),
+                value: i as i64,
+            });
+        }
+        self
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUNCTION SIGNATURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Foreign function signature
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FunctionSignature {
+    /// Function name
+    pub name: String,
+    /// Return type
+    pub return_type: ForeignType,
+    /// Parameters
+    pub parameters: Vec<Parameter>,
+    /// Calling convention
+    pub abi: Abi,
+    /// Is variadic (...)
+    pub variadic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Parameter {
+    pub name: String,
+    pub ty: ForeignType,
+}
+
+impl FunctionSignature {
+    pub fn new(name: impl Into<String>) -> Self {
+        FunctionSignature {
+            name: name.into(),
+            return_type: ForeignType::Void,
+            parameters: Vec::new(),
+            abi: Abi::C,
+            variadic: false,
+        }
+    }
+    
+    pub fn returns(mut self, ty: ForeignType) -> Self {
+        self.return_type = ty;
+        self
+    }
+    
+    pub fn param(mut self, name: impl Into<String>, ty: ForeignType) -> Self {
+        self.parameters.push(Parameter {
+            name: name.into(),
+            ty,
+        });
+        self
+    }
+    
+    pub fn abi(mut self, abi: Abi) -> Self {
+        self.abi = abi;
+        self
+    }
+    
+    pub fn variadic(mut self) -> Self {
+        self.variadic = true;
+        self
+    }
+    
+    /// Generate C signature string
+    pub fn c_signature(&self) -> String {
+        let params: Vec<String> = self.parameters.iter()
+            .map(|p| format!("{} {}", p.ty.c_name(), p.name))
+            .collect();
+        
+        let params_str = if self.variadic {
+            if params.is_empty() {
+                "...".to_string()
+            } else {
+                format!("{}, ...", params.join(", "))
+            }
+        } else if params.is_empty() {
+            "void".to_string()
+        } else {
+            params.join(", ")
+        };
+        
+        format!("{} {}({})", self.return_type.c_name(), self.name, params_str)
+    }
+    
+    /// Generate Quanta function pointer type
+    pub fn to_quanta_fn_ptr(&self) -> String {
+        let params: Vec<String> = self.parameters.iter()
+            .map(|p| p.ty.to_quanta_type())
+            .collect();
+        
+        let ret = if matches!(self.return_type, ForeignType::Void) {
+            String::new()
+        } else {
+            format!(" -> {}", self.return_type.to_quanta_type())
+        };
+        
+        format!("extern \"{}\" fn({}){}", self.abi.as_str(), params.join(", "), ret)
+    }
+    
+    /// Generate Quanta extern declaration
+    pub fn to_quanta_extern(&self) -> String {
+        let params: Vec<String> = self.parameters.iter()
+            .map(|p| format!("{}: {}", p.name, p.ty.to_quanta_type()))
+            .collect();
+        
+        let ret = if matches!(self.return_type, ForeignType::Void) {
+            String::new()
+        } else {
+            format!(" -> {}", self.return_type.to_quanta_type())
+        };
+        
+        format!(
+            "extern \"{}\" fn {}({}){}",
+            self.abi.as_str(),
+            self.name,
+            params.join(", "),
+            ret
+        )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TARGET INFORMATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Target platform information
+#[derive(Debug, Clone)]
+pub struct TargetInfo {
+    /// Target triple (e.g., "x86_64-unknown-linux-gnu")
+    pub triple: String,
+    /// Architecture
+    pub arch: Architecture,
+    /// Operating system
+    pub os: OperatingSystem,
+    /// Pointer size in bytes
+    pub pointer_size: usize,
+    /// Long size in bytes (4 on Windows, 8 on Unix x86_64)
+    pub long_size: usize,
+    /// Long double size
+    pub long_double_size: usize,
+    /// Long double alignment
+    pub long_double_align: usize,
+    /// Is big endian
+    pub big_endian: bool,
+    /// Default ABI
+    pub default_abi: Abi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Architecture {
+    X86_64,
+    Aarch64,
+    Arm,
+    X86,
+    Riscv64,
+    Wasm32,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatingSystem {
+    Linux,
+    MacOS,
+    Windows,
+    FreeBSD,
+    Wasi,
+    Unknown,
+}
+
+impl TargetInfo {
+    /// Detect current target
+    pub fn current() -> Self {
+        Self::from_cfg()
+    }
+    
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn from_cfg() -> Self {
+        TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".to_string(),
+            arch: Architecture::X86_64,
+            os: OperatingSystem::Linux,
+            pointer_size: 8,
+            long_size: 8,
+            long_double_size: 16,
+            long_double_align: 16,
+            big_endian: false,
+            default_abi: Abi::SysV64,
+        }
+    }
+    
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    fn from_cfg() -> Self {
+        TargetInfo {
+            triple: "x86_64-apple-darwin".to_string(),
+            arch: Architecture::X86_64,
+            os: OperatingSystem::MacOS,
+            pointer_size: 8,
+            long_size: 8,
+            long_double_size: 16,
+            long_double_align: 16,
+            big_endian: false,
+            default_abi: Abi::SysV64,
+        }
+    }
+    
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn from_cfg() -> Self {
+        TargetInfo {
+            triple: "aarch64-apple-darwin".to_string(),
+            arch: Architecture::Aarch64,
+            os: OperatingSystem::MacOS,
+            pointer_size: 8,
+            long_size: 8,
+            long_double_size: 8, // ARM64 Darwin uses 8-byte long double
+            long_double_align: 8,
+            big_endian: false,
+            default_abi: Abi::Aapcs64,
+        }
+    }
+    
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn from_cfg() -> Self {
+        TargetInfo {
+            triple: "x86_64-pc-windows-msvc".to_string(),
+            arch: Architecture::X86_64,
+            os: OperatingSystem::Windows,
+            pointer_size: 8,
+            long_size: 4, // Windows uses 32-bit long
+            long_double_size: 8, // Same as double on Windows
+            long_double_align: 8,
+            big_endian: false,
+            default_abi: Abi::Win64,
+        }
+    }
+    
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn from_cfg() -> Self {
+        TargetInfo {
+            triple: "aarch64-unknown-linux-gnu".to_string(),
+            arch: Architecture::Aarch64,
+            os: OperatingSystem::Linux,
+            pointer_size: 8,
+            long_size: 8,
+            long_double_size: 16,
+            long_double_align: 16,
+            big_endian: false,
+            default_abi: Abi::Aapcs64,
+        }
+    }
+    
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+    )))]
+    fn from_cfg() -> Self {
+        TargetInfo {
+            triple: "unknown".to_string(),
+            arch: Architecture::Unknown,
+            os: OperatingSystem::Unknown,
+            pointer_size: std::mem::size_of::<*const ()>(),
+            long_size: std::mem::size_of::<std::os::raw::c_long>(),
+            long_double_size: 8,
+            long_double_align: 8,
+            big_endian: cfg!(target_endian = "big"),
+            default_abi: Abi::C,
+        }
+    }
+    
+    /// Create from target triple
+    pub fn from_triple(triple: &str) -> Self {
+        let parts: Vec<&str> = triple.split('-').collect();
+        let arch = match parts.get(0).map(|s| *s) {
+            Some("x86_64") => Architecture::X86_64,
+            Some("aarch64") | Some("arm64") => Architecture::Aarch64,
+            Some("arm") | Some("armv7") => Architecture::Arm,
+            Some("i686") | Some("i386") => Architecture::X86,
+            Some("riscv64") => Architecture::Riscv64,
+            Some("wasm32") => Architecture::Wasm32,
+            _ => Architecture::Unknown,
+        };
+        
+        let os = parts.iter().find_map(|&p| {
+            match p {
+                "linux" => Some(OperatingSystem::Linux),
+                "darwin" | "macos" => Some(OperatingSystem::MacOS),
+                "windows" | "win32" => Some(OperatingSystem::Windows),
+                "freebsd" => Some(OperatingSystem::FreeBSD),
+                "wasi" => Some(OperatingSystem::Wasi),
+                _ => None,
+            }
+        }).unwrap_or(OperatingSystem::Unknown);
+        
+        let is_64bit = matches!(arch, Architecture::X86_64 | Architecture::Aarch64 | Architecture::Riscv64);
+        let is_windows = matches!(os, OperatingSystem::Windows);
+        
+        TargetInfo {
+            triple: triple.to_string(),
+            arch,
+            os,
+            pointer_size: if is_64bit { 8 } else { 4 },
+            long_size: if is_64bit && !is_windows { 8 } else { 4 },
+            long_double_size: if is_64bit { 16 } else { 8 },
+            long_double_align: if is_64bit { 16 } else { 8 },
+            big_endian: false,
+            default_abi: match (arch, os) {
+                (Architecture::X86_64, OperatingSystem::Windows) => Abi::Win64,
+                (Architecture::X86_64, _) => Abi::SysV64,
+                (Architecture::Aarch64, _) => Abi::Aapcs64,
+                (Architecture::Riscv64, _) => Abi::RiscV64,
+                _ => Abi::C,
+            },
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE MARSHALING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type marshaling strategy
+#[derive(Debug, Clone)]
+pub enum MarshalStrategy {
+    /// Direct copy (no conversion)
+    Direct,
+    /// Cast between compatible integer types
+    IntegerCast { from_bits: u8, to_bits: u8, signed: bool },
+    /// Float conversion
+    FloatCast { from: FloatKind, to: FloatKind },
+    /// Pointer cast
+    PointerCast,
+    /// String to C string (null-terminated)
+    StringToCStr,
+    /// C string to String
+    CStrToString,
+    /// Slice to pointer + length
+    SliceToPtr,
+    /// Array copy
+    ArrayCopy { elem_size: usize, count: usize },
+    /// Struct field-by-field
+    StructMarshal { layout: StructLayout },
+    /// Union (tagged or untagged)
+    UnionMarshal,
+    /// Enum to integer
+    EnumToInt,
+    /// Integer to enum
+    IntToEnum,
+    /// Opaque handle
+    OpaqueHandle,
+    /// Custom marshaler
+    Custom { name: String },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum FloatKind {
+    F32,
+    F64,
+    F128,
+}
+
+/// Type marshaler for converting between Quanta and C types
+pub struct TypeMarshaler {
+    target: TargetInfo,
+    custom_marshalers: BTreeMap<String, Box<dyn CustomMarshaler>>,
+}
+
+impl TypeMarshaler {
+    pub fn new(target: TargetInfo) -> Self {
+        TypeMarshaler {
+            target,
+            custom_marshalers: BTreeMap::new(),
+        }
+    }
+    
+    /// Register a custom marshaler
+    pub fn register<M: CustomMarshaler + 'static>(&mut self, name: &str, marshaler: M) {
+        self.custom_marshalers.insert(name.to_string(), Box::new(marshaler));
+    }
+    
+    /// Get marshaling strategy for converting from Quanta type to C type
+    pub fn strategy_to_c(&self, quanta_type: &str, c_type: &ForeignType) -> MarshalStrategy {
+        match (quanta_type, c_type) {
+            // Direct mappings
+            ("bool", ForeignType::Bool) => MarshalStrategy::Direct,
+            ("i8", ForeignType::I8 | ForeignType::Char) => MarshalStrategy::Direct,
+            ("u8", ForeignType::U8 | ForeignType::UChar) => MarshalStrategy::Direct,
+            ("i16", ForeignType::I16 | ForeignType::Short) => MarshalStrategy::Direct,
+            ("u16", ForeignType::U16 | ForeignType::UShort) => MarshalStrategy::Direct,
+            ("i32", ForeignType::I32 | ForeignType::Int) => MarshalStrategy::Direct,
+            ("u32", ForeignType::U32 | ForeignType::UInt) => MarshalStrategy::Direct,
+            ("i64", ForeignType::I64 | ForeignType::LongLong) => MarshalStrategy::Direct,
+            ("u64", ForeignType::U64 | ForeignType::ULongLong) => MarshalStrategy::Direct,
+            ("f32", ForeignType::Float) => MarshalStrategy::Direct,
+            ("f64", ForeignType::Double) => MarshalStrategy::Direct,
+            
+            // Size types (platform dependent)
+            ("isize", ForeignType::SSize | ForeignType::PtrDiff | ForeignType::IntPtr) => {
+                MarshalStrategy::Direct
+            }
+            ("usize", ForeignType::Size | ForeignType::UIntPtr) => MarshalStrategy::Direct,
+            
+            // Long (platform dependent)
+            ("isize", ForeignType::Long) if self.target.long_size == self.target.pointer_size => {
+                MarshalStrategy::Direct
+            }
+            ("i32", ForeignType::Long) if self.target.long_size == 4 => MarshalStrategy::Direct,
+            ("i64", ForeignType::Long) if self.target.long_size == 8 => MarshalStrategy::Direct,
+            
+            // Pointers
+            (qt, ForeignType::Pointer(_) | ForeignType::ConstPointer(_) | ForeignType::MutPointer(_))
+                if qt.starts_with("*") => MarshalStrategy::PointerCast,
+            
+            // Strings
+            ("String", ForeignType::Pointer(inner) | ForeignType::ConstPointer(inner))
+                if matches!(inner.as_ref(), ForeignType::Char) => MarshalStrategy::StringToCStr,
+            
+            // Arrays
+            (qt, ForeignType::Array(_, count)) if qt.starts_with("[") => {
+                let elem_size = c_type.size(&self.target) / count;
+                MarshalStrategy::ArrayCopy { elem_size, count: *count }
+            }
+            
+            // Structs
+            (_, ForeignType::Struct(s)) => {
+                MarshalStrategy::StructMarshal { layout: s.layout(&self.target) }
+            }
+            
+            // Enums
+            (_, ForeignType::Enum(_)) => MarshalStrategy::EnumToInt,
+            
+            // Fallback: integer cast
+            (qt, ct) if ct.is_integer() => {
+                let to_bits = (c_type.size(&self.target) * 8) as u8;
+                let from_bits = match qt {
+                    "i8" | "u8" => 8,
+                    "i16" | "u16" => 16,
+                    "i32" | "u32" => 32,
+                    "i64" | "u64" => 64,
+                    "isize" | "usize" => (self.target.pointer_size * 8) as u8,
+                    _ => 32,
+                };
+                MarshalStrategy::IntegerCast {
+                    from_bits,
+                    to_bits,
+                    signed: ct.is_signed(),
+                }
+            }
+            
+            // Float cast
+            (qt, ct) if ct.is_float() => {
+                let from = match qt {
+                    "f32" => FloatKind::F32,
+                    "f64" => FloatKind::F64,
+                    "f128" => FloatKind::F128,
+                    _ => FloatKind::F64,
+                };
+                let to = match ct {
+                    ForeignType::Float => FloatKind::F32,
+                    ForeignType::Double => FloatKind::F64,
+                    ForeignType::LongDouble => FloatKind::F128,
+                    _ => FloatKind::F64,
+                };
+                MarshalStrategy::FloatCast { from, to }
+            }
+            
+            _ => MarshalStrategy::Direct,
+        }
+    }
+    
+    /// Get marshaling strategy for converting from C type to Quanta type
+    pub fn strategy_from_c(&self, c_type: &ForeignType, quanta_type: &str) -> MarshalStrategy {
+        // Similar logic but reversed
+        match (c_type, quanta_type) {
+            (ForeignType::Pointer(inner), "String")
+                if matches!(inner.as_ref(), ForeignType::Char) => MarshalStrategy::CStrToString,
+            
+            (ForeignType::Enum(_), _) => MarshalStrategy::IntToEnum,
+            
+            // Most other cases are symmetric
+            _ => self.strategy_to_c(quanta_type, c_type),
+        }
+    }
+}
+
+/// Custom marshaler trait
+pub trait CustomMarshaler: Send + Sync {
+    fn marshal_to_c(&self, value: &[u8]) -> Vec<u8>;
+    fn marshal_from_c(&self, value: &[u8]) -> Vec<u8>;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_abi_platform() {
+        let abi = Abi::platform_c();
+        // Should return a valid ABI
+        assert!(!abi.as_str().is_empty());
+    }
+    
+    #[test]
+    fn test_foreign_type_size() {
+        let target = TargetInfo::from_triple("x86_64-unknown-linux-gnu");
+        
+        assert_eq!(ForeignType::I8.size(&target), 1);
+        assert_eq!(ForeignType::I16.size(&target), 2);
+        assert_eq!(ForeignType::I32.size(&target), 4);
+        assert_eq!(ForeignType::I64.size(&target), 8);
+        assert_eq!(ForeignType::Float.size(&target), 4);
+        assert_eq!(ForeignType::Double.size(&target), 8);
+    }
+    
+    #[test]
+    fn test_pointer_size() {
+        let target64 = TargetInfo::from_triple("x86_64-unknown-linux-gnu");
+        let ptr_type = ForeignType::Pointer(Box::new(ForeignType::Void));
+        assert_eq!(ptr_type.size(&target64), 8);
+    }
+    
+    #[test]
+    fn test_struct_layout() {
+        let target = TargetInfo::from_triple("x86_64-unknown-linux-gnu");
+        
+        let s = StructType::new("test")
+            .field("a", ForeignType::I8)
+            .field("b", ForeignType::I32)
+            .field("c", ForeignType::I8);
+        
+        let layout = s.layout(&target);
+        
+        // i8 at 0, padding 3, i32 at 4, i8 at 8, padding 3, total 12
+        assert_eq!(layout.size, 12);
+        assert_eq!(layout.alignment, 4);
+        assert_eq!(layout.fields[0].offset, 0);
+        assert_eq!(layout.fields[1].offset, 4);
+        assert_eq!(layout.fields[2].offset, 8);
+    }
+    
+    #[test]
+    fn test_packed_struct() {
+        let target = TargetInfo::from_triple("x86_64-unknown-linux-gnu");
+        
+        let s = StructType::new("packed_test")
+            .field("a", ForeignType::I8)
+            .field("b", ForeignType::I32)
+            .field("c", ForeignType::I8)
+            .packed();
+        
+        let layout = s.layout(&target);
+        
+        // No padding: i8 at 0, i32 at 1, i8 at 5, total 6
+        assert_eq!(layout.size, 6);
+        assert_eq!(layout.fields[0].offset, 0);
+        assert_eq!(layout.fields[1].offset, 1);
+        assert_eq!(layout.fields[2].offset, 5);
+    }
+    
+    #[test]
+    fn test_union_size() {
+        let target = TargetInfo::from_triple("x86_64-unknown-linux-gnu");
+        
+        let u = UnionType::new("test_union")
+            .variant("i", ForeignType::I32)
+            .variant("d", ForeignType::Double);
+        
+        // Union size is max of variants
+        assert_eq!(u.size(&target), 8);
+        assert_eq!(u.alignment(&target), 8);
+    }
+    
+    #[test]
+    fn test_function_signature() {
+        let sig = FunctionSignature::new("printf")
+            .returns(ForeignType::Int)
+            .param("format", ForeignType::ConstPointer(Box::new(ForeignType::Char)))
+            .variadic();
+        
+        assert!(sig.c_signature().contains("printf"));
+        assert!(sig.c_signature().contains("..."));
+    }
+    
+    #[test]
+    fn test_c_type_names() {
+        assert_eq!(ForeignType::Int.c_name(), "int");
+        assert_eq!(ForeignType::Size.c_name(), "size_t");
+        assert_eq!(
+            ForeignType::Pointer(Box::new(ForeignType::Void)).c_name(),
+            "void*"
+        );
+    }
+    
+    #[test]
+    fn test_quanta_type_conversion() {
+        assert_eq!(ForeignType::Int.to_quanta_type(), "i32");
+        assert_eq!(ForeignType::Size.to_quanta_type(), "usize");
+        assert_eq!(ForeignType::Double.to_quanta_type(), "f64");
+    }
+    
+    #[test]
+    fn test_target_from_triple() {
+        let linux64 = TargetInfo::from_triple("x86_64-unknown-linux-gnu");
+        assert_eq!(linux64.pointer_size, 8);
+        assert_eq!(linux64.long_size, 8);
+        assert_eq!(linux64.default_abi, Abi::SysV64);
+        
+        let win64 = TargetInfo::from_triple("x86_64-pc-windows-msvc");
+        assert_eq!(win64.pointer_size, 8);
+        assert_eq!(win64.long_size, 4); // Windows uses 32-bit long
+        assert_eq!(win64.default_abi, Abi::Win64);
+    }
+}

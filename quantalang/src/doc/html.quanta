@@ -1,0 +1,1349 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DOCUMENTATION GENERATOR — HTML Renderer
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Generates HTML documentation from the documentation model.
+// Features:
+// - Responsive design
+// - Syntax highlighting
+// - Search functionality
+// - Navigation sidebar
+// - Source links
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::doc::html
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::format;
+use alloc::collections::BTreeMap;
+use crate::doc::model::*;
+use crate::doc::parser::{ParsedDoc, StandardSection};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HTML RENDERER CONFIG
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Configuration for HTML generation
+#[derive(Debug, Clone)]
+pub struct HtmlConfig {
+    /// Output directory
+    pub output_dir: String,
+    /// Crate name
+    pub crate_name: String,
+    /// Crate version
+    pub crate_version: String,
+    /// Include source links
+    pub include_source: bool,
+    /// Include private items
+    pub document_private: bool,
+    /// Custom CSS path
+    pub custom_css: Option<String>,
+    /// Custom JavaScript path
+    pub custom_js: Option<String>,
+    /// Theme (light, dark, auto)
+    pub theme: Theme,
+    /// Logo path
+    pub logo: Option<String>,
+    /// Favicon path
+    pub favicon: Option<String>,
+    /// Enable search
+    pub enable_search: bool,
+    /// Generate single page (for small crates)
+    pub single_page: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Theme {
+    Light,
+    Dark,
+    Auto,
+}
+
+impl Default for HtmlConfig {
+    fn default() -> Self {
+        HtmlConfig {
+            output_dir: "target/doc".to_string(),
+            crate_name: String::new(),
+            crate_version: String::new(),
+            include_source: true,
+            document_private: false,
+            custom_css: None,
+            custom_js: None,
+            theme: Theme::Auto,
+            logo: None,
+            favicon: None,
+            enable_search: true,
+            single_page: false,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HTML RENDERER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// HTML documentation renderer
+pub struct HtmlRenderer {
+    config: HtmlConfig,
+    /// Generated files
+    files: BTreeMap<String, String>,
+    /// Search index entries
+    search_index: Vec<SearchEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct SearchEntry {
+    name: String,
+    path: String,
+    kind: String,
+    description: String,
+    parent: Option<String>,
+}
+
+impl HtmlRenderer {
+    pub fn new(config: HtmlConfig) -> Self {
+        HtmlRenderer {
+            config,
+            files: BTreeMap::new(),
+            search_index: Vec::new(),
+        }
+    }
+    
+    /// Render a complete crate
+    pub fn render_crate(&mut self, krate: &DocCrate) -> Result<(), String> {
+        // Generate index page
+        self.render_crate_index(krate)?;
+        
+        // Generate module pages
+        self.render_module(&krate.root_module, &[])?;
+        
+        // Generate search index
+        if self.config.enable_search {
+            self.generate_search_index()?;
+        }
+        
+        // Generate static assets
+        self.generate_static_assets()?;
+        
+        Ok(())
+    }
+    
+    /// Get all generated files
+    pub fn files(&self) -> &BTreeMap<String, String> {
+        &self.files
+    }
+    
+    /// Render crate index page
+    fn render_crate_index(&mut self, krate: &DocCrate) -> Result<(), String> {
+        let mut html = String::new();
+        
+        html.push_str(&self.render_head(&krate.name, &[]));
+        html.push_str("<body class=\"quanta-doc\">\n");
+        html.push_str(&self.render_nav(krate, &[]));
+        
+        html.push_str("<main>\n");
+        html.push_str(&format!("<h1>Crate <code>{}</code></h1>\n", krate.name));
+        
+        if !krate.version.is_empty() {
+            html.push_str(&format!("<span class=\"version\">Version {}</span>\n", krate.version));
+        }
+        
+        // Crate documentation
+        html.push_str(&self.render_doc(&krate.doc));
+        
+        // Module listing
+        if !krate.root_module.modules.is_empty() {
+            html.push_str("<h2>Modules</h2>\n");
+            html.push_str("<ul class=\"module-list\">\n");
+            for module in &krate.root_module.modules {
+                if module.visibility.is_public() || self.config.document_private {
+                    html.push_str(&format!(
+                        "<li><a href=\"{}/index.html\"><code>{}</code></a>",
+                        module.name, module.name
+                    ));
+                    if let Some(brief) = module.doc.brief() {
+                        html.push_str(&format!(" — {}", self.escape_html(brief)));
+                    }
+                    html.push_str("</li>\n");
+                }
+            }
+            html.push_str("</ul>\n");
+        }
+        
+        // Re-exports
+        self.render_reexports(&mut html, &krate.root_module);
+        
+        // Items
+        self.render_module_items(&mut html, &krate.root_module);
+        
+        html.push_str("</main>\n");
+        html.push_str(&self.render_footer());
+        html.push_str("</body>\n</html>");
+        
+        self.files.insert("index.html".to_string(), html);
+        Ok(())
+    }
+    
+    /// Render a module page
+    fn render_module(&mut self, module: &DocModule, path: &[&str]) -> Result<(), String> {
+        let mut current_path = path.to_vec();
+        current_path.push(&module.name);
+        
+        // Build file path
+        let file_path = if path.is_empty() {
+            "index.html".to_string()
+        } else {
+            format!("{}/index.html", current_path.join("/"))
+        };
+        
+        let mut html = String::new();
+        
+        let title = format!("{} - {}", module.name, self.config.crate_name);
+        html.push_str(&self.render_head(&title, &current_path));
+        html.push_str("<body class=\"quanta-doc\">\n");
+        // html.push_str(&self.render_nav(...));
+        
+        html.push_str("<main>\n");
+        html.push_str(&format!("<h1>Module <code>{}</code></h1>\n", module.path));
+        
+        // Module documentation
+        html.push_str(&self.render_doc(&module.doc));
+        
+        // Submodules
+        if !module.modules.is_empty() {
+            html.push_str("<h2 id=\"modules\">Modules</h2>\n");
+            html.push_str("<ul class=\"item-list\">\n");
+            for submodule in &module.modules {
+                if submodule.visibility.is_public() || self.config.document_private {
+                    let href = format!("{}/index.html", submodule.name);
+                    html.push_str(&format!(
+                        "<li><a href=\"{}\"><code>{}</code></a>",
+                        href, submodule.name
+                    ));
+                    if let Some(brief) = submodule.doc.brief() {
+                        html.push_str(&format!(" — {}", self.escape_html(brief)));
+                    }
+                    html.push_str("</li>\n");
+                }
+            }
+            html.push_str("</ul>\n");
+        }
+        
+        // Render items
+        self.render_module_items(&mut html, module);
+        
+        html.push_str("</main>\n");
+        html.push_str(&self.render_footer());
+        html.push_str("</body>\n</html>");
+        
+        // Only add if not root (root is crate index)
+        if !path.is_empty() || module.name != self.config.crate_name {
+            self.files.insert(file_path, html);
+        }
+        
+        // Render submodules
+        for submodule in &module.modules {
+            if submodule.visibility.is_public() || self.config.document_private {
+                self.render_module(submodule, &current_path)?;
+            }
+        }
+        
+        // Render individual item pages
+        for func in &module.functions {
+            if func.visibility.is_public() || self.config.document_private {
+                self.render_function_page(func, &current_path)?;
+            }
+        }
+        
+        for struc in &module.structs {
+            if struc.visibility.is_public() || self.config.document_private {
+                self.render_struct_page(struc, &current_path)?;
+            }
+        }
+        
+        for enm in &module.enums {
+            if enm.visibility.is_public() || self.config.document_private {
+                self.render_enum_page(enm, &current_path)?;
+            }
+        }
+        
+        for trt in &module.traits {
+            if trt.visibility.is_public() || self.config.document_private {
+                self.render_trait_page(trt, &current_path)?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn render_module_items(&self, html: &mut String, module: &DocModule) {
+        // Structs
+        if !module.structs.is_empty() {
+            html.push_str("<h2 id=\"structs\">Structs</h2>\n");
+            html.push_str("<ul class=\"item-list\">\n");
+            for struc in &module.structs {
+                if struc.visibility.is_public() || self.config.document_private {
+                    html.push_str(&format!(
+                        "<li><a href=\"struct.{}.html\"><code>{}</code></a>",
+                        struc.name, struc.name
+                    ));
+                    if let Some(brief) = struc.doc.brief() {
+                        html.push_str(&format!(" — {}", self.escape_html(brief)));
+                    }
+                    html.push_str("</li>\n");
+                }
+            }
+            html.push_str("</ul>\n");
+        }
+        
+        // Enums
+        if !module.enums.is_empty() {
+            html.push_str("<h2 id=\"enums\">Enums</h2>\n");
+            html.push_str("<ul class=\"item-list\">\n");
+            for enm in &module.enums {
+                if enm.visibility.is_public() || self.config.document_private {
+                    html.push_str(&format!(
+                        "<li><a href=\"enum.{}.html\"><code>{}</code></a>",
+                        enm.name, enm.name
+                    ));
+                    if let Some(brief) = enm.doc.brief() {
+                        html.push_str(&format!(" — {}", self.escape_html(brief)));
+                    }
+                    html.push_str("</li>\n");
+                }
+            }
+            html.push_str("</ul>\n");
+        }
+        
+        // Traits
+        if !module.traits.is_empty() {
+            html.push_str("<h2 id=\"traits\">Traits</h2>\n");
+            html.push_str("<ul class=\"item-list\">\n");
+            for trt in &module.traits {
+                if trt.visibility.is_public() || self.config.document_private {
+                    html.push_str(&format!(
+                        "<li><a href=\"trait.{}.html\"><code>{}</code></a>",
+                        trt.name, trt.name
+                    ));
+                    if let Some(brief) = trt.doc.brief() {
+                        html.push_str(&format!(" — {}", self.escape_html(brief)));
+                    }
+                    html.push_str("</li>\n");
+                }
+            }
+            html.push_str("</ul>\n");
+        }
+        
+        // Functions
+        if !module.functions.is_empty() {
+            html.push_str("<h2 id=\"functions\">Functions</h2>\n");
+            html.push_str("<ul class=\"item-list\">\n");
+            for func in &module.functions {
+                if func.visibility.is_public() || self.config.document_private {
+                    html.push_str(&format!(
+                        "<li><a href=\"fn.{}.html\"><code>{}</code></a>",
+                        func.name, func.name
+                    ));
+                    if let Some(brief) = func.doc.brief() {
+                        html.push_str(&format!(" — {}", self.escape_html(brief)));
+                    }
+                    html.push_str("</li>\n");
+                }
+            }
+            html.push_str("</ul>\n");
+        }
+        
+        // Type aliases
+        if !module.type_aliases.is_empty() {
+            html.push_str("<h2 id=\"types\">Type Aliases</h2>\n");
+            html.push_str("<ul class=\"item-list\">\n");
+            for alias in &module.type_aliases {
+                if alias.visibility.is_public() || self.config.document_private {
+                    html.push_str(&format!(
+                        "<li><code>type {} = {}</code>",
+                        alias.name, alias.ty.to_string()
+                    ));
+                    if let Some(brief) = alias.doc.brief() {
+                        html.push_str(&format!(" — {}", self.escape_html(brief)));
+                    }
+                    html.push_str("</li>\n");
+                }
+            }
+            html.push_str("</ul>\n");
+        }
+        
+        // Constants
+        if !module.constants.is_empty() {
+            html.push_str("<h2 id=\"constants\">Constants</h2>\n");
+            html.push_str("<ul class=\"item-list\">\n");
+            for cnst in &module.constants {
+                if cnst.visibility.is_public() || self.config.document_private {
+                    html.push_str(&format!(
+                        "<li><code>{}: {}</code>",
+                        cnst.name, cnst.ty.to_string()
+                    ));
+                    if let Some(ref val) = cnst.value {
+                        html.push_str(&format!(" = <code>{}</code>", self.escape_html(val)));
+                    }
+                    if let Some(brief) = cnst.doc.brief() {
+                        html.push_str(&format!(" — {}", self.escape_html(brief)));
+                    }
+                    html.push_str("</li>\n");
+                }
+            }
+            html.push_str("</ul>\n");
+        }
+    }
+    
+    fn render_reexports(&self, html: &mut String, module: &DocModule) {
+        let public_imports: Vec<_> = module.imports.iter()
+            .filter(|i| i.visibility.is_public())
+            .collect();
+        
+        if !public_imports.is_empty() {
+            html.push_str("<h2 id=\"reexports\">Re-exports</h2>\n");
+            html.push_str("<ul class=\"item-list reexports\">\n");
+            for imp in public_imports {
+                html.push_str(&format!(
+                    "<li><code>pub use {}",
+                    imp.source
+                ));
+                if imp.name != imp.source.name().unwrap_or("") {
+                    html.push_str(&format!(" as {}", imp.name));
+                }
+                html.push_str(";</code></li>\n");
+            }
+            html.push_str("</ul>\n");
+        }
+    }
+    
+    /// Render function page
+    fn render_function_page(&mut self, func: &DocFunction, path: &[&str]) -> Result<(), String> {
+        let file_path = format!("{}/fn.{}.html", path.join("/"), func.name);
+        
+        let mut html = String::new();
+        let title = format!("{} - {}", func.name, self.config.crate_name);
+        html.push_str(&self.render_head(&title, path));
+        html.push_str("<body class=\"quanta-doc\">\n");
+        
+        html.push_str("<main>\n");
+        html.push_str("<div class=\"item-header\">\n");
+        html.push_str(&format!("<h1>Function <code>{}</code></h1>\n", func.name));
+        html.push_str("</div>\n");
+        
+        // Signature
+        html.push_str("<pre class=\"signature\">");
+        html.push_str(&self.render_function_signature(func));
+        html.push_str("</pre>\n");
+        
+        // Documentation
+        html.push_str(&self.render_doc(&func.doc));
+        
+        // Source link
+        if self.config.include_source {
+            if let Some(ref loc) = func.location {
+                html.push_str(&format!(
+                    "<div class=\"source-link\"><a href=\"../src/{}.html#{}\">[src]</a></div>\n",
+                    loc.file, loc.line
+                ));
+            }
+        }
+        
+        html.push_str("</main>\n");
+        html.push_str(&self.render_footer());
+        html.push_str("</body>\n</html>");
+        
+        self.files.insert(file_path, html);
+        
+        // Add to search index
+        self.search_index.push(SearchEntry {
+            name: func.name.clone(),
+            path: func.path.to_string(),
+            kind: "function".to_string(),
+            description: func.doc.brief().unwrap_or("").to_string(),
+            parent: path.last().map(|s| s.to_string()),
+        });
+        
+        Ok(())
+    }
+    
+    /// Render struct page
+    fn render_struct_page(&mut self, struc: &DocStruct, path: &[&str]) -> Result<(), String> {
+        let file_path = format!("{}/struct.{}.html", path.join("/"), struc.name);
+        
+        let mut html = String::new();
+        let title = format!("{} - {}", struc.name, self.config.crate_name);
+        html.push_str(&self.render_head(&title, path));
+        html.push_str("<body class=\"quanta-doc\">\n");
+        
+        html.push_str("<main>\n");
+        html.push_str("<div class=\"item-header\">\n");
+        html.push_str(&format!("<h1>Struct <code>{}</code></h1>\n", struc.name));
+        html.push_str("</div>\n");
+        
+        // Definition
+        html.push_str("<pre class=\"definition\">");
+        html.push_str(&self.render_struct_definition(struc));
+        html.push_str("</pre>\n");
+        
+        // Documentation
+        html.push_str(&self.render_doc(&struc.doc));
+        
+        // Fields
+        if !struc.fields.is_empty() && struc.kind == StructKind::Regular {
+            html.push_str("<h2 id=\"fields\">Fields</h2>\n");
+            html.push_str("<div class=\"fields\">\n");
+            for field in &struc.fields {
+                html.push_str("<div class=\"field\">\n");
+                html.push_str(&format!(
+                    "<code class=\"field-name\">{}</code>: <code class=\"field-type\">{}</code>\n",
+                    field.name.as_deref().unwrap_or("_"),
+                    field.ty.to_string()
+                ));
+                if !field.doc.is_empty() {
+                    html.push_str(&self.render_doc(&field.doc));
+                }
+                html.push_str("</div>\n");
+            }
+            html.push_str("</div>\n");
+        }
+        
+        // Implementations
+        if !struc.impls.is_empty() {
+            html.push_str("<h2 id=\"implementations\">Implementations</h2>\n");
+            for impl_ref in &struc.impls {
+                if let Some(ref trait_ref) = impl_ref.trait_ref {
+                    html.push_str(&format!(
+                        "<h3><a href=\"trait.{}.html\"><code>{}</code></a></h3>\n",
+                        trait_ref.path.name().unwrap_or(""),
+                        trait_ref.path
+                    ));
+                }
+            }
+        }
+        
+        html.push_str("</main>\n");
+        html.push_str(&self.render_footer());
+        html.push_str("</body>\n</html>");
+        
+        self.files.insert(file_path, html);
+        
+        // Add to search index
+        self.search_index.push(SearchEntry {
+            name: struc.name.clone(),
+            path: struc.path.to_string(),
+            kind: "struct".to_string(),
+            description: struc.doc.brief().unwrap_or("").to_string(),
+            parent: path.last().map(|s| s.to_string()),
+        });
+        
+        Ok(())
+    }
+    
+    /// Render enum page
+    fn render_enum_page(&mut self, enm: &DocEnum, path: &[&str]) -> Result<(), String> {
+        let file_path = format!("{}/enum.{}.html", path.join("/"), enm.name);
+        
+        let mut html = String::new();
+        let title = format!("{} - {}", enm.name, self.config.crate_name);
+        html.push_str(&self.render_head(&title, path));
+        html.push_str("<body class=\"quanta-doc\">\n");
+        
+        html.push_str("<main>\n");
+        html.push_str("<div class=\"item-header\">\n");
+        html.push_str(&format!("<h1>Enum <code>{}</code></h1>\n", enm.name));
+        html.push_str("</div>\n");
+        
+        // Definition
+        html.push_str("<pre class=\"definition\">");
+        html.push_str(&self.render_enum_definition(enm));
+        html.push_str("</pre>\n");
+        
+        // Documentation
+        html.push_str(&self.render_doc(&enm.doc));
+        
+        // Variants
+        if !enm.variants.is_empty() {
+            html.push_str("<h2 id=\"variants\">Variants</h2>\n");
+            html.push_str("<div class=\"variants\">\n");
+            for variant in &enm.variants {
+                html.push_str("<div class=\"variant\">\n");
+                html.push_str(&format!("<code class=\"variant-name\">{}</code>\n", variant.name));
+                if !variant.doc.is_empty() {
+                    html.push_str(&self.render_doc(&variant.doc));
+                }
+                html.push_str("</div>\n");
+            }
+            html.push_str("</div>\n");
+        }
+        
+        html.push_str("</main>\n");
+        html.push_str(&self.render_footer());
+        html.push_str("</body>\n</html>");
+        
+        self.files.insert(file_path, html);
+        
+        // Add to search index
+        self.search_index.push(SearchEntry {
+            name: enm.name.clone(),
+            path: enm.path.to_string(),
+            kind: "enum".to_string(),
+            description: enm.doc.brief().unwrap_or("").to_string(),
+            parent: path.last().map(|s| s.to_string()),
+        });
+        
+        Ok(())
+    }
+    
+    /// Render trait page
+    fn render_trait_page(&mut self, trt: &DocTrait, path: &[&str]) -> Result<(), String> {
+        let file_path = format!("{}/trait.{}.html", path.join("/"), trt.name);
+        
+        let mut html = String::new();
+        let title = format!("{} - {}", trt.name, self.config.crate_name);
+        html.push_str(&self.render_head(&title, path));
+        html.push_str("<body class=\"quanta-doc\">\n");
+        
+        html.push_str("<main>\n");
+        html.push_str("<div class=\"item-header\">\n");
+        html.push_str(&format!("<h1>Trait <code>{}</code></h1>\n", trt.name));
+        html.push_str("</div>\n");
+        
+        // Definition
+        html.push_str("<pre class=\"definition\">");
+        html.push_str(&self.render_trait_definition(trt));
+        html.push_str("</pre>\n");
+        
+        // Documentation
+        html.push_str(&self.render_doc(&trt.doc));
+        
+        // Associated types
+        if !trt.assoc_types.is_empty() {
+            html.push_str("<h2 id=\"associated-types\">Associated Types</h2>\n");
+            for assoc in &trt.assoc_types {
+                html.push_str(&format!("<h3><code>type {}</code></h3>\n", assoc.name));
+                html.push_str(&self.render_doc(&assoc.doc));
+            }
+        }
+        
+        // Required methods
+        if !trt.required_methods.is_empty() {
+            html.push_str("<h2 id=\"required-methods\">Required Methods</h2>\n");
+            for method in &trt.required_methods {
+                html.push_str(&format!("<h3 id=\"method.{}\"><code>{}</code></h3>\n", 
+                    method.name, self.render_function_signature(method)));
+                html.push_str(&self.render_doc(&method.doc));
+            }
+        }
+        
+        // Provided methods
+        if !trt.provided_methods.is_empty() {
+            html.push_str("<h2 id=\"provided-methods\">Provided Methods</h2>\n");
+            for method in &trt.provided_methods {
+                html.push_str(&format!("<h3 id=\"method.{}\"><code>{}</code></h3>\n",
+                    method.name, self.render_function_signature(method)));
+                html.push_str(&self.render_doc(&method.doc));
+            }
+        }
+        
+        // Implementors
+        if !trt.implementors.is_empty() {
+            html.push_str("<h2 id=\"implementors\">Implementors</h2>\n");
+            html.push_str("<ul class=\"implementors-list\">\n");
+            for impl_ty in &trt.implementors {
+                html.push_str(&format!("<li><code>{}</code></li>\n", impl_ty));
+            }
+            html.push_str("</ul>\n");
+        }
+        
+        html.push_str("</main>\n");
+        html.push_str(&self.render_footer());
+        html.push_str("</body>\n</html>");
+        
+        self.files.insert(file_path, html);
+        
+        // Add to search index
+        self.search_index.push(SearchEntry {
+            name: trt.name.clone(),
+            path: trt.path.to_string(),
+            kind: "trait".to_string(),
+            description: trt.doc.brief().unwrap_or("").to_string(),
+            parent: path.last().map(|s| s.to_string()),
+        });
+        
+        Ok(())
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HELPER RENDERERS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn render_head(&self, title: &str, _path: &[&str]) -> String {
+        let theme_class = match self.config.theme {
+            Theme::Light => "theme-light",
+            Theme::Dark => "theme-dark",
+            Theme::Auto => "theme-auto",
+        };
+        
+        let mut html = format!(r#"<!DOCTYPE html>
+<html lang="en" class="{}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="generator" content="quantadoc">
+    <title>{}</title>
+    <link rel="stylesheet" href="/static/quanta.css">
+"#, theme_class, self.escape_html(title));
+        
+        if let Some(ref favicon) = self.config.favicon {
+            html.push_str(&format!("    <link rel=\"icon\" href=\"{}\">\n", favicon));
+        }
+        
+        if let Some(ref custom_css) = self.config.custom_css {
+            html.push_str(&format!("    <link rel=\"stylesheet\" href=\"{}\">\n", custom_css));
+        }
+        
+        html.push_str("</head>\n");
+        html
+    }
+    
+    fn render_nav(&self, krate: &DocCrate, _path: &[&str]) -> String {
+        let mut html = String::from("<nav class=\"sidebar\">\n");
+        
+        // Logo/crate name
+        html.push_str(&format!(
+            "<div class=\"sidebar-crate\"><a href=\"/index.html\">{}</a></div>\n",
+            krate.name
+        ));
+        
+        // Search box
+        if self.config.enable_search {
+            html.push_str(r#"<div class="search-container">
+    <input type="search" id="search" placeholder="Search...">
+</div>
+"#);
+        }
+        
+        // Module tree
+        html.push_str("<div class=\"sidebar-items\">\n");
+        self.render_module_tree(&mut html, &krate.root_module, 0);
+        html.push_str("</div>\n");
+        
+        html.push_str("</nav>\n");
+        html
+    }
+    
+    fn render_module_tree(&self, html: &mut String, module: &DocModule, depth: usize) {
+        let indent = "  ".repeat(depth);
+        
+        if !module.modules.is_empty() {
+            html.push_str(&format!("{}  <ul class=\"module-tree\">\n", indent));
+            for submod in &module.modules {
+                if submod.visibility.is_public() || self.config.document_private {
+                    html.push_str(&format!(
+                        "{}    <li><a href=\"{}/index.html\">{}</a>\n",
+                        indent, submod.name, submod.name
+                    ));
+                    self.render_module_tree(html, submod, depth + 2);
+                    html.push_str(&format!("{}    </li>\n", indent));
+                }
+            }
+            html.push_str(&format!("{}  </ul>\n", indent));
+        }
+    }
+    
+    fn render_footer(&self) -> String {
+        format!(r#"<footer>
+    <p>Generated by <a href="https://quantalang.dev">quantadoc</a> for {} {}</p>
+</footer>
+<script src="/static/quanta.js"></script>
+"#, self.config.crate_name, self.config.crate_version)
+    }
+    
+    fn render_doc(&self, doc: &ParsedDoc) -> String {
+        if doc.is_empty() {
+            return String::new();
+        }
+        
+        let mut html = String::from("<div class=\"docblock\">\n");
+        
+        // Brief/description
+        if let Some(ref brief) = doc.brief {
+            html.push_str(&format!("<p class=\"brief\">{}</p>\n", self.render_markdown(brief)));
+        }
+        
+        if let Some(ref desc) = doc.description {
+            html.push_str(&format!("<div class=\"description\">{}</div>\n", self.render_markdown(desc)));
+        }
+        
+        // Standard sections
+        for (section, content) in &doc.sections {
+            let heading = section.heading();
+            let class = format!("section-{}", heading.to_lowercase().replace(' ', "-"));
+            html.push_str(&format!("<div class=\"{}\">\n", class));
+            html.push_str(&format!("<h3>{}</h3>\n", heading));
+            html.push_str(&self.render_markdown(content));
+            html.push_str("</div>\n");
+        }
+        
+        // Custom sections
+        for section in &doc.custom_sections {
+            html.push_str(&format!("<div class=\"section-custom\">\n"));
+            html.push_str(&format!("<h3>{}</h3>\n", self.escape_html(&section.heading)));
+            html.push_str(&self.render_markdown(&section.content));
+            html.push_str("</div>\n");
+        }
+        
+        html.push_str("</div>\n");
+        html
+    }
+    
+    fn render_markdown(&self, text: &str) -> String {
+        // Simple markdown rendering
+        let mut html = String::new();
+        let mut in_code_block = false;
+        let mut code_lang = String::new();
+        let mut code_content = Vec::new();
+        
+        for line in text.lines() {
+            if line.trim().starts_with("```") {
+                if in_code_block {
+                    // End code block
+                    html.push_str("<pre><code");
+                    if !code_lang.is_empty() {
+                        html.push_str(&format!(" class=\"language-{}\"", code_lang));
+                    }
+                    html.push_str(">");
+                    html.push_str(&self.escape_html(&code_content.join("\n")));
+                    html.push_str("</code></pre>\n");
+                    code_content.clear();
+                    code_lang.clear();
+                    in_code_block = false;
+                } else {
+                    // Start code block
+                    in_code_block = true;
+                    code_lang = line.trim()[3..].trim().to_string();
+                }
+                continue;
+            }
+            
+            if in_code_block {
+                code_content.push(line.to_string());
+                continue;
+            }
+            
+            // Handle inline formatting
+            let processed = self.process_inline_markdown(line);
+            
+            if !processed.is_empty() {
+                html.push_str(&format!("<p>{}</p>\n", processed));
+            }
+        }
+        
+        html
+    }
+    
+    fn process_inline_markdown(&self, text: &str) -> String {
+        let mut result = self.escape_html(text);
+        
+        // Inline code
+        let mut processed = String::new();
+        let mut in_code = false;
+        let mut chars = result.chars().peekable();
+        
+        while let Some(c) = chars.next() {
+            if c == '`' {
+                if in_code {
+                    processed.push_str("</code>");
+                } else {
+                    processed.push_str("<code>");
+                }
+                in_code = !in_code;
+            } else {
+                processed.push(c);
+            }
+        }
+        
+        result = processed;
+        
+        // Bold (**text**)
+        // Italic (*text*)
+        // Links [text](url)
+        // Doc links [`Type`]
+        
+        result
+    }
+    
+    fn render_function_signature(&self, func: &DocFunction) -> String {
+        let mut sig = String::new();
+        
+        if func.is_const {
+            sig.push_str("const ");
+        }
+        if func.is_async {
+            sig.push_str("async ");
+        }
+        if func.is_unsafe {
+            sig.push_str("unsafe ");
+        }
+        
+        if let Some(ref abi) = func.abi {
+            sig.push_str(&format!("extern \"{}\" ", abi));
+        }
+        
+        sig.push_str("fn ");
+        sig.push_str(&func.name);
+        sig.push_str(&func.generics.to_string());
+        sig.push('(');
+        
+        let mut params = Vec::new();
+        
+        if let Some(ref self_param) = func.signature.self_param {
+            let mut p = String::new();
+            if self_param.is_ref {
+                p.push('&');
+                if let Some(ref lt) = self_param.lifetime {
+                    p.push_str(lt);
+                    p.push(' ');
+                }
+                if self_param.is_mut {
+                    p.push_str("mut ");
+                }
+            }
+            p.push_str("self");
+            params.push(p);
+        }
+        
+        for param in &func.signature.params {
+            params.push(format!("{}: {}", param.name, param.ty.to_string()));
+        }
+        
+        sig.push_str(&params.join(", "));
+        sig.push(')');
+        
+        if let Some(ref ret) = func.signature.return_type {
+            sig.push_str(" -> ");
+            sig.push_str(&ret.to_string());
+        }
+        
+        if let Some(ref where_clause) = func.signature.where_clause {
+            sig.push_str("\nwhere ");
+            sig.push_str(where_clause);
+        }
+        
+        self.escape_html(&sig)
+    }
+    
+    fn render_struct_definition(&self, struc: &DocStruct) -> String {
+        let mut def = String::new();
+        
+        // Derives
+        if !struc.derives.is_empty() {
+            def.push_str(&format!("#[derive({})]\n", struc.derives.join(", ")));
+        }
+        
+        def.push_str("pub struct ");
+        def.push_str(&struc.name);
+        def.push_str(&struc.generics.to_string());
+        
+        match struc.kind {
+            StructKind::Unit => {
+                def.push(';');
+            }
+            StructKind::Tuple => {
+                def.push('(');
+                let fields: Vec<String> = struc.fields.iter()
+                    .map(|f| f.ty.to_string())
+                    .collect();
+                def.push_str(&fields.join(", "));
+                def.push_str(");");
+            }
+            StructKind::Regular => {
+                def.push_str(" {\n");
+                for field in &struc.fields {
+                    def.push_str("    ");
+                    if field.visibility.is_public() {
+                        def.push_str("pub ");
+                    }
+                    def.push_str(field.name.as_deref().unwrap_or("_"));
+                    def.push_str(": ");
+                    def.push_str(&field.ty.to_string());
+                    def.push_str(",\n");
+                }
+                def.push('}');
+            }
+        }
+        
+        self.escape_html(&def)
+    }
+    
+    fn render_enum_definition(&self, enm: &DocEnum) -> String {
+        let mut def = String::new();
+        
+        // Derives
+        if !enm.derives.is_empty() {
+            def.push_str(&format!("#[derive({})]\n", enm.derives.join(", ")));
+        }
+        
+        def.push_str("pub enum ");
+        def.push_str(&enm.name);
+        def.push_str(&enm.generics.to_string());
+        def.push_str(" {\n");
+        
+        for variant in &enm.variants {
+            def.push_str("    ");
+            def.push_str(&variant.name);
+            
+            match &variant.kind {
+                VariantKind::Unit => {}
+                VariantKind::Tuple(types) => {
+                    def.push('(');
+                    def.push_str(&types.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "));
+                    def.push(')');
+                }
+                VariantKind::Struct(fields) => {
+                    def.push_str(" { ");
+                    let field_strs: Vec<String> = fields.iter()
+                        .map(|f| format!("{}: {}", f.name.as_deref().unwrap_or("_"), f.ty.to_string()))
+                        .collect();
+                    def.push_str(&field_strs.join(", "));
+                    def.push_str(" }");
+                }
+            }
+            
+            if let Some(ref disc) = variant.discriminant {
+                def.push_str(&format!(" = {}", disc));
+            }
+            
+            def.push_str(",\n");
+        }
+        
+        def.push('}');
+        
+        self.escape_html(&def)
+    }
+    
+    fn render_trait_definition(&self, trt: &DocTrait) -> String {
+        let mut def = String::new();
+        
+        if trt.is_unsafe {
+            def.push_str("unsafe ");
+        }
+        if trt.is_auto {
+            def.push_str("auto ");
+        }
+        
+        def.push_str("pub trait ");
+        def.push_str(&trt.name);
+        def.push_str(&trt.generics.to_string());
+        
+        if !trt.super_traits.is_empty() {
+            def.push_str(": ");
+            def.push_str(&trt.super_traits.iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(" + "));
+        }
+        
+        def.push_str(" { ... }");
+        
+        self.escape_html(&def)
+    }
+    
+    fn escape_html(&self, s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SEARCH INDEX
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn generate_search_index(&mut self) -> Result<(), String> {
+        let mut js = String::from("window.SEARCH_INDEX = [\n");
+        
+        for entry in &self.search_index {
+            js.push_str(&format!(
+                "  {{\"name\":\"{}\",\"path\":\"{}\",\"kind\":\"{}\",\"desc\":\"{}\"}},\n",
+                self.escape_js(&entry.name),
+                self.escape_js(&entry.path),
+                entry.kind,
+                self.escape_js(&entry.description)
+            ));
+        }
+        
+        js.push_str("];\n");
+        
+        self.files.insert("search-index.js".to_string(), js);
+        Ok(())
+    }
+    
+    fn escape_js(&self, s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STATIC ASSETS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn generate_static_assets(&mut self) -> Result<(), String> {
+        // CSS
+        self.files.insert("static/quanta.css".to_string(), CSS_CONTENT.to_string());
+        
+        // JavaScript
+        self.files.insert("static/quanta.js".to_string(), JS_CONTENT.to_string());
+        
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATIC CONTENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const CSS_CONTENT: &str = r#"
+/* QuantaDoc CSS - Auto-generated */
+:root {
+    --bg-color: #ffffff;
+    --text-color: #333333;
+    --code-bg: #f5f5f5;
+    --link-color: #0066cc;
+    --border-color: #e0e0e0;
+    --sidebar-bg: #fafafa;
+    --heading-color: #222222;
+}
+
+.theme-dark {
+    --bg-color: #1e1e1e;
+    --text-color: #d4d4d4;
+    --code-bg: #2d2d2d;
+    --link-color: #4fc3f7;
+    --border-color: #404040;
+    --sidebar-bg: #252526;
+    --heading-color: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+    .theme-auto {
+        --bg-color: #1e1e1e;
+        --text-color: #d4d4d4;
+        --code-bg: #2d2d2d;
+        --link-color: #4fc3f7;
+        --border-color: #404040;
+        --sidebar-bg: #252526;
+        --heading-color: #ffffff;
+    }
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    background: var(--bg-color);
+    color: var(--text-color);
+}
+
+.quanta-doc {
+    display: flex;
+    min-height: 100vh;
+}
+
+nav.sidebar {
+    width: 280px;
+    flex-shrink: 0;
+    background: var(--sidebar-bg);
+    border-right: 1px solid var(--border-color);
+    padding: 20px;
+    overflow-y: auto;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+}
+
+.sidebar-crate {
+    font-size: 1.5em;
+    font-weight: bold;
+    margin-bottom: 20px;
+}
+
+.sidebar-crate a {
+    color: var(--heading-color);
+    text-decoration: none;
+}
+
+.search-container {
+    margin-bottom: 20px;
+}
+
+#search {
+    width: 100%;
+    padding: 8px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: var(--bg-color);
+    color: var(--text-color);
+}
+
+.module-tree {
+    list-style: none;
+    padding-left: 16px;
+    margin: 0;
+}
+
+.module-tree a {
+    color: var(--link-color);
+    text-decoration: none;
+}
+
+.module-tree a:hover {
+    text-decoration: underline;
+}
+
+main {
+    flex: 1;
+    padding: 40px;
+    max-width: 900px;
+}
+
+h1 { font-size: 2em; color: var(--heading-color); margin-bottom: 0.5em; }
+h2 { font-size: 1.5em; color: var(--heading-color); border-bottom: 1px solid var(--border-color); padding-bottom: 0.3em; }
+h3 { font-size: 1.25em; color: var(--heading-color); }
+
+a { color: var(--link-color); }
+
+code {
+    font-family: "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.9em;
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 3px;
+}
+
+pre {
+    background: var(--code-bg);
+    padding: 16px;
+    border-radius: 6px;
+    overflow-x: auto;
+}
+
+pre code {
+    background: transparent;
+    padding: 0;
+}
+
+.signature, .definition {
+    font-size: 1.1em;
+    margin: 20px 0;
+}
+
+.docblock {
+    margin: 20px 0;
+}
+
+.docblock .brief {
+    font-size: 1.1em;
+}
+
+.item-list {
+    list-style: none;
+    padding: 0;
+}
+
+.item-list li {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.item-list li:last-child {
+    border-bottom: none;
+}
+
+.fields, .variants {
+    margin: 20px 0;
+}
+
+.field, .variant {
+    padding: 12px;
+    margin: 8px 0;
+    background: var(--code-bg);
+    border-radius: 4px;
+}
+
+.section-examples { background: #e8f5e9; padding: 16px; border-radius: 6px; margin: 16px 0; }
+.theme-dark .section-examples { background: #1b5e20; }
+
+.section-panics { background: #ffebee; padding: 16px; border-radius: 6px; margin: 16px 0; }
+.theme-dark .section-panics { background: #b71c1c; }
+
+.section-safety { background: #fff3e0; padding: 16px; border-radius: 6px; margin: 16px 0; }
+.theme-dark .section-safety { background: #e65100; }
+
+footer {
+    text-align: center;
+    padding: 20px;
+    color: #888;
+    font-size: 0.9em;
+}
+
+@media (max-width: 768px) {
+    .quanta-doc { flex-direction: column; }
+    nav.sidebar { width: 100%; height: auto; position: relative; }
+    main { padding: 20px; }
+}
+"#;
+
+const JS_CONTENT: &str = r#"
+// QuantaDoc JavaScript - Auto-generated
+(function() {
+    'use strict';
+    
+    // Search functionality
+    const searchInput = document.getElementById('search');
+    if (searchInput && window.SEARCH_INDEX) {
+        searchInput.addEventListener('input', function(e) {
+            const query = e.target.value.toLowerCase();
+            if (query.length < 2) return;
+            
+            const results = window.SEARCH_INDEX.filter(item => 
+                item.name.toLowerCase().includes(query) ||
+                item.path.toLowerCase().includes(query)
+            ).slice(0, 10);
+            
+            // Show results (simplified)
+            console.log('Search results:', results);
+        });
+    }
+    
+    // Theme toggle
+    function setTheme(theme) {
+        document.documentElement.className = 'theme-' + theme;
+        localStorage.setItem('quanta-doc-theme', theme);
+    }
+    
+    // Load saved theme
+    const savedTheme = localStorage.getItem('quanta-doc-theme');
+    if (savedTheme) {
+        setTheme(savedTheme);
+    }
+    
+    // Syntax highlighting (basic)
+    document.querySelectorAll('pre code').forEach(block => {
+        // Add line numbers or highlighting as needed
+    });
+})();
+"#;

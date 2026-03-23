@@ -1,0 +1,1070 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ PACKAGE MANAGER — Registry Client
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// HTTP client for interacting with package registries.
+// Supports:
+// - Package search and discovery
+// - Version listing
+// - Package download with checksum verification
+// - Authentication for publishing
+// - Sparse index protocol (Git-free registry access)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::pkg::registry
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use core::fmt;
+use crate::pkg::version::Version;
+use crate::pkg::resolver::{Registry, PackageMetadata};
+use crate::pkg::lockfile::compute_checksum;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTRY CONFIG
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Default registry URL
+pub const DEFAULT_REGISTRY: &str = "https://registry.quantalang.dev";
+
+/// Registry API version
+pub const API_VERSION: &str = "v1";
+
+/// Registry configuration
+#[derive(Debug, Clone)]
+pub struct RegistryConfig {
+    /// Registry URL
+    pub url: String,
+    /// Authentication token
+    pub token: Option<String>,
+    /// Cache directory
+    pub cache_dir: String,
+    /// Request timeout in seconds
+    pub timeout: u64,
+    /// Maximum retries
+    pub max_retries: u32,
+    /// User agent string
+    pub user_agent: String,
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        RegistryConfig {
+            url: DEFAULT_REGISTRY.to_string(),
+            token: None,
+            cache_dir: dirs::cache_dir()
+                .map(|p| p.join("quanta/registry").to_string_lossy().to_string())
+                .unwrap_or_else(|| ".quanta/registry".to_string()),
+            timeout: 30,
+            max_retries: 3,
+            user_agent: format!("quanta/{}", crate::pkg::cli::VERSION),
+        }
+    }
+}
+
+/// Helper for platform-specific directories
+mod dirs {
+    use alloc::string::String;
+    use std::path::PathBuf;
+    
+    pub fn cache_dir() -> Option<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            std::env::var("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .ok()
+                .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".cache")))
+        }
+        
+        #[cfg(target_os = "macos")]
+        {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join("Library/Caches"))
+        }
+        
+        #[cfg(target_os = "windows")]
+        {
+            std::env::var("LOCALAPPDATA")
+                .ok()
+                .map(PathBuf::from)
+        }
+        
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            None
+        }
+    }
+    
+    pub fn config_dir() -> Option<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            std::env::var("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .ok()
+                .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
+        }
+        
+        #[cfg(target_os = "macos")]
+        {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join("Library/Application Support"))
+        }
+        
+        #[cfg(target_os = "windows")]
+        {
+            std::env::var("APPDATA")
+                .ok()
+                .map(PathBuf::from)
+        }
+        
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            None
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTRY CLIENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// HTTP client for package registry
+pub struct RegistryClient {
+    config: RegistryConfig,
+    /// In-memory cache of package metadata
+    metadata_cache: BTreeMap<String, Vec<PackageMetadata>>,
+}
+
+impl RegistryClient {
+    /// Create new registry client with default configuration
+    pub fn new() -> Self {
+        Self::with_config(RegistryConfig::default())
+    }
+    
+    /// Create registry client with custom configuration
+    pub fn with_config(config: RegistryConfig) -> Self {
+        RegistryClient {
+            config,
+            metadata_cache: BTreeMap::new(),
+        }
+    }
+    
+    /// Set authentication token
+    pub fn with_token(mut self, token: &str) -> Self {
+        self.config.token = Some(token.to_string());
+        self
+    }
+    
+    /// Search for packages
+    pub fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchResult>, RegistryError> {
+        let url = format!(
+            "{}/api/{}/search?q={}&per_page={}",
+            self.config.url, API_VERSION, 
+            urlencod(query), limit
+        );
+        
+        let response = self.get(&url)?;
+        self.parse_search_response(&response)
+    }
+    
+    /// Get package information
+    pub fn get_package(&self, name: &str) -> Result<PackageInfo, RegistryError> {
+        let url = format!(
+            "{}/api/{}/crates/{}",
+            self.config.url, API_VERSION, name
+        );
+        
+        let response = self.get(&url)?;
+        self.parse_package_response(&response)
+    }
+    
+    /// Get all versions of a package
+    pub fn get_versions(&self, name: &str) -> Result<Vec<VersionInfo>, RegistryError> {
+        let url = format!(
+            "{}/api/{}/crates/{}/versions",
+            self.config.url, API_VERSION, name
+        );
+        
+        let response = self.get(&url)?;
+        self.parse_versions_response(&response)
+    }
+    
+    /// Get specific version metadata
+    pub fn get_version(&self, name: &str, version: &Version) -> Result<VersionInfo, RegistryError> {
+        let url = format!(
+            "{}/api/{}/crates/{}/{}",
+            self.config.url, API_VERSION, name, version
+        );
+        
+        let response = self.get(&url)?;
+        self.parse_version_response(&response)
+    }
+    
+    /// Download package tarball
+    pub fn download(&self, name: &str, version: &Version) -> Result<Vec<u8>, RegistryError> {
+        let url = format!(
+            "{}/api/{}/crates/{}/{}/download",
+            self.config.url, API_VERSION, name, version
+        );
+        
+        // Check cache first
+        let cache_path = self.cache_path(name, version);
+        if let Ok(data) = std::fs::read(&cache_path) {
+            return Ok(data);
+        }
+        
+        // Download
+        let data = self.get_bytes(&url)?;
+        
+        // Verify checksum
+        let expected = self.get_version(name, version)?.checksum;
+        if let Some(expected_checksum) = expected {
+            let actual_checksum = compute_checksum(&data);
+            if actual_checksum != expected_checksum {
+                return Err(RegistryError::ChecksumMismatch {
+                    expected: expected_checksum,
+                    actual: actual_checksum,
+                });
+            }
+        }
+        
+        // Cache the download
+        if let Some(parent) = std::path::Path::new(&cache_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&cache_path, &data);
+        
+        Ok(data)
+    }
+    
+    /// Publish a package
+    pub fn publish(&self, tarball: &[u8], metadata: &PublishMetadata) -> Result<(), RegistryError> {
+        let token = self.config.token.as_ref()
+            .ok_or(RegistryError::AuthRequired)?;
+        
+        let url = format!(
+            "{}/api/{}/crates/new",
+            self.config.url, API_VERSION
+        );
+        
+        let body = self.build_publish_body(tarball, metadata);
+        self.put(&url, &body, token)?;
+        
+        Ok(())
+    }
+    
+    /// Yank a version
+    pub fn yank(&self, name: &str, version: &Version) -> Result<(), RegistryError> {
+        let token = self.config.token.as_ref()
+            .ok_or(RegistryError::AuthRequired)?;
+        
+        let url = format!(
+            "{}/api/{}/crates/{}/{}/yank",
+            self.config.url, API_VERSION, name, version
+        );
+        
+        self.delete(&url, token)?;
+        
+        Ok(())
+    }
+    
+    /// Unyank a version
+    pub fn unyank(&self, name: &str, version: &Version) -> Result<(), RegistryError> {
+        let token = self.config.token.as_ref()
+            .ok_or(RegistryError::AuthRequired)?;
+        
+        let url = format!(
+            "{}/api/{}/crates/{}/{}/unyank",
+            self.config.url, API_VERSION, name, version
+        );
+        
+        self.put(&url, &[], token)?;
+        
+        Ok(())
+    }
+    
+    /// Get owners of a package
+    pub fn get_owners(&self, name: &str) -> Result<Vec<Owner>, RegistryError> {
+        let url = format!(
+            "{}/api/{}/crates/{}/owners",
+            self.config.url, API_VERSION, name
+        );
+        
+        let response = self.get(&url)?;
+        self.parse_owners_response(&response)
+    }
+    
+    /// Add owner to a package
+    pub fn add_owner(&self, name: &str, login: &str) -> Result<(), RegistryError> {
+        let token = self.config.token.as_ref()
+            .ok_or(RegistryError::AuthRequired)?;
+        
+        let url = format!(
+            "{}/api/{}/crates/{}/owners",
+            self.config.url, API_VERSION, name
+        );
+        
+        let body = format!("{{\"users\":[\"{}\"]}}",  login);
+        self.put(&url, body.as_bytes(), token)?;
+        
+        Ok(())
+    }
+    
+    /// Remove owner from a package
+    pub fn remove_owner(&self, name: &str, login: &str) -> Result<(), RegistryError> {
+        let token = self.config.token.as_ref()
+            .ok_or(RegistryError::AuthRequired)?;
+        
+        let url = format!(
+            "{}/api/{}/crates/{}/owners/{}",
+            self.config.url, API_VERSION, name, login
+        );
+        
+        self.delete(&url, token)?;
+        
+        Ok(())
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SPARSE INDEX
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Fetch sparse index entry for a package
+    pub fn fetch_sparse_index(&self, name: &str) -> Result<SparseIndexEntry, RegistryError> {
+        let path = sparse_index_path(name);
+        let url = format!("{}/index/{}", self.config.url, path);
+        
+        let response = self.get(&url)?;
+        self.parse_sparse_index(&response)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HTTP HELPERS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn get(&self, url: &str) -> Result<String, RegistryError> {
+        self.request("GET", url, None, None)
+    }
+    
+    fn get_bytes(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
+        self.request_bytes("GET", url, None, None)
+    }
+    
+    fn put(&self, url: &str, body: &[u8], token: &str) -> Result<String, RegistryError> {
+        self.request("PUT", url, Some(body), Some(token))
+    }
+    
+    fn delete(&self, url: &str, token: &str) -> Result<String, RegistryError> {
+        self.request("DELETE", url, None, Some(token))
+    }
+    
+    fn request(
+        &self, 
+        method: &str, 
+        url: &str, 
+        body: Option<&[u8]>,
+        token: Option<&str>,
+    ) -> Result<String, RegistryError> {
+        let bytes = self.request_bytes(method, url, body, token)?;
+        String::from_utf8(bytes)
+            .map_err(|_| RegistryError::InvalidResponse("invalid UTF-8".to_string()))
+    }
+    
+    fn request_bytes(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&[u8]>,
+        token: Option<&str>,
+    ) -> Result<Vec<u8>, RegistryError> {
+        // Build HTTP request
+        // In production, use actual HTTP client (reqwest, ureq, etc.)
+        
+        #[cfg(feature = "http")]
+        {
+            use std::io::{Read, Write};
+            use std::net::TcpStream;
+            
+            let parsed = parse_url(url)?;
+            let host = &parsed.host;
+            let port = parsed.port;
+            let path = &parsed.path;
+            
+            let mut stream = TcpStream::connect(format!("{}:{}", host, port))
+                .map_err(|e| RegistryError::Network(e.to_string()))?;
+            
+            // Build request
+            let mut request = format!(
+                "{} {} HTTP/1.1\r\n\
+                 Host: {}\r\n\
+                 User-Agent: {}\r\n\
+                 Accept: application/json\r\n",
+                method, path, host, self.config.user_agent
+            );
+            
+            if let Some(t) = token {
+                request.push_str(&format!("Authorization: Bearer {}\r\n", t));
+            }
+            
+            if let Some(b) = body {
+                request.push_str(&format!("Content-Length: {}\r\n", b.len()));
+                request.push_str("Content-Type: application/json\r\n");
+            }
+            
+            request.push_str("Connection: close\r\n\r\n");
+            
+            stream.write_all(request.as_bytes())
+                .map_err(|e| RegistryError::Network(e.to_string()))?;
+            
+            if let Some(b) = body {
+                stream.write_all(b)
+                    .map_err(|e| RegistryError::Network(e.to_string()))?;
+            }
+            
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)
+                .map_err(|e| RegistryError::Network(e.to_string()))?;
+            
+            // Parse response
+            self.parse_http_response(&response)
+        }
+        
+        #[cfg(not(feature = "http"))]
+        {
+            // Stub for testing without HTTP
+            Err(RegistryError::Network("HTTP not available".to_string()))
+        }
+    }
+    
+    fn parse_http_response(&self, response: &[u8]) -> Result<Vec<u8>, RegistryError> {
+        // Find header/body boundary
+        let mut header_end = 0;
+        for i in 0..response.len().saturating_sub(3) {
+            if &response[i..i+4] == b"\r\n\r\n" {
+                header_end = i + 4;
+                break;
+            }
+        }
+        
+        if header_end == 0 {
+            return Err(RegistryError::InvalidResponse("no header boundary".to_string()));
+        }
+        
+        // Parse status line
+        let header = String::from_utf8_lossy(&response[..header_end]);
+        let status_line = header.lines().next()
+            .ok_or_else(|| RegistryError::InvalidResponse("no status line".to_string()))?;
+        
+        let parts: Vec<&str> = status_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            return Err(RegistryError::InvalidResponse("invalid status line".to_string()));
+        }
+        
+        let status: u16 = parts[1].parse()
+            .map_err(|_| RegistryError::InvalidResponse("invalid status code".to_string()))?;
+        
+        match status {
+            200..=299 => Ok(response[header_end..].to_vec()),
+            401 => Err(RegistryError::Unauthorized),
+            403 => Err(RegistryError::Forbidden),
+            404 => Err(RegistryError::NotFound),
+            429 => Err(RegistryError::RateLimited),
+            500..=599 => Err(RegistryError::ServerError(status)),
+            _ => Err(RegistryError::HttpError(status)),
+        }
+    }
+    
+    fn cache_path(&self, name: &str, version: &Version) -> String {
+        format!("{}/{}/{}-{}.crate", self.config.cache_dir, name, name, version)
+    }
+    
+    fn build_publish_body(&self, tarball: &[u8], metadata: &PublishMetadata) -> Vec<u8> {
+        // Build multipart body or JSON with embedded tarball
+        let json = serde_json_encode(metadata);
+        let json_len = json.len() as u32;
+        
+        let mut body = Vec::new();
+        body.extend_from_slice(&json_len.to_le_bytes());
+        body.extend_from_slice(json.as_bytes());
+        body.extend_from_slice(&(tarball.len() as u32).to_le_bytes());
+        body.extend_from_slice(tarball);
+        
+        body
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // RESPONSE PARSERS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn parse_search_response(&self, response: &str) -> Result<Vec<SearchResult>, RegistryError> {
+        // Simple JSON parsing (production would use serde)
+        let mut results = Vec::new();
+        
+        // Find "crates" array
+        if let Some(start) = response.find("\"crates\"") {
+            if let Some(arr_start) = response[start..].find('[') {
+                let arr_start = start + arr_start;
+                if let Some(arr_end) = response[arr_start..].find(']') {
+                    let arr = &response[arr_start + 1..arr_start + arr_end];
+                    
+                    // Parse each crate object
+                    for obj in arr.split("},") {
+                        if let Some(result) = self.parse_search_result(obj) {
+                            results.push(result);
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(results)
+    }
+    
+    fn parse_search_result(&self, json: &str) -> Option<SearchResult> {
+        let name = extract_json_string(json, "name")?;
+        let description = extract_json_string(json, "description");
+        let max_version = extract_json_string(json, "max_version")
+            .and_then(|v| Version::parse(&v).ok());
+        let downloads = extract_json_number(json, "downloads").unwrap_or(0);
+        
+        Some(SearchResult {
+            name,
+            description,
+            max_version,
+            downloads,
+        })
+    }
+    
+    fn parse_package_response(&self, response: &str) -> Result<PackageInfo, RegistryError> {
+        let name = extract_json_string(response, "name")
+            .ok_or_else(|| RegistryError::InvalidResponse("missing name".to_string()))?;
+        
+        Ok(PackageInfo {
+            name,
+            description: extract_json_string(response, "description"),
+            documentation: extract_json_string(response, "documentation"),
+            repository: extract_json_string(response, "repository"),
+            downloads: extract_json_number(response, "downloads").unwrap_or(0),
+            created_at: extract_json_string(response, "created_at"),
+            updated_at: extract_json_string(response, "updated_at"),
+        })
+    }
+    
+    fn parse_versions_response(&self, response: &str) -> Result<Vec<VersionInfo>, RegistryError> {
+        let mut versions = Vec::new();
+        
+        if let Some(start) = response.find("\"versions\"") {
+            if let Some(arr_start) = response[start..].find('[') {
+                let arr_start = start + arr_start;
+                if let Some(arr_end) = response[arr_start..].find(']') {
+                    let arr = &response[arr_start + 1..arr_start + arr_end];
+                    
+                    for obj in arr.split("},") {
+                        if let Some(info) = self.parse_version_info(obj) {
+                            versions.push(info);
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(versions)
+    }
+    
+    fn parse_version_response(&self, response: &str) -> Result<VersionInfo, RegistryError> {
+        self.parse_version_info(response)
+            .ok_or_else(|| RegistryError::InvalidResponse("invalid version info".to_string()))
+    }
+    
+    fn parse_version_info(&self, json: &str) -> Option<VersionInfo> {
+        let num = extract_json_string(json, "num")
+            .or_else(|| extract_json_string(json, "version"))?;
+        let version = Version::parse(&num).ok()?;
+        
+        Some(VersionInfo {
+            version,
+            checksum: extract_json_string(json, "checksum"),
+            yanked: extract_json_bool(json, "yanked").unwrap_or(false),
+            downloads: extract_json_number(json, "downloads").unwrap_or(0),
+            published_at: extract_json_string(json, "created_at"),
+            license: extract_json_string(json, "license"),
+            dependencies: Vec::new(), // Would parse deps array
+            features: BTreeMap::new(), // Would parse features
+        })
+    }
+    
+    fn parse_owners_response(&self, response: &str) -> Result<Vec<Owner>, RegistryError> {
+        let mut owners = Vec::new();
+        
+        if let Some(start) = response.find("\"users\"") {
+            if let Some(arr_start) = response[start..].find('[') {
+                let arr_start = start + arr_start;
+                if let Some(arr_end) = response[arr_start..].find(']') {
+                    let arr = &response[arr_start + 1..arr_start + arr_end];
+                    
+                    for obj in arr.split("},") {
+                        if let Some(login) = extract_json_string(obj, "login") {
+                            owners.push(Owner {
+                                login,
+                                name: extract_json_string(obj, "name"),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(owners)
+    }
+    
+    fn parse_sparse_index(&self, response: &str) -> Result<SparseIndexEntry, RegistryError> {
+        let mut entry = SparseIndexEntry {
+            name: String::new(),
+            versions: Vec::new(),
+        };
+        
+        // Sparse index is newline-delimited JSON
+        for line in response.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            
+            if entry.name.is_empty() {
+                entry.name = extract_json_string(line, "name")
+                    .ok_or_else(|| RegistryError::InvalidResponse("missing name".to_string()))?;
+            }
+            
+            if let Some(vers) = extract_json_string(line, "vers") {
+                if let Ok(version) = Version::parse(&vers) {
+                    entry.versions.push(SparseVersionEntry {
+                        version,
+                        checksum: extract_json_string(line, "cksum").unwrap_or_default(),
+                        yanked: extract_json_bool(line, "yanked").unwrap_or(false),
+                        features: BTreeMap::new(),
+                        dependencies: Vec::new(),
+                    });
+                }
+            }
+        }
+        
+        Ok(entry)
+    }
+}
+
+impl Default for RegistryClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Implement Registry trait for resolver
+impl Registry for RegistryClient {
+    fn get_versions(&self, name: &str) -> Result<Vec<Version>, String> {
+        self.get_versions(name)
+            .map(|v| v.into_iter().map(|vi| vi.version).collect())
+            .map_err(|e| e.to_string())
+    }
+    
+    fn get_metadata(&self, name: &str, version: &Version) -> Result<PackageMetadata, String> {
+        let info = self.get_version(name, version)
+            .map_err(|e| e.to_string())?;
+        
+        Ok(PackageMetadata {
+            name: name.to_string(),
+            version: version.clone(),
+            dependencies: info.dependencies.into_iter()
+                .map(|d| (d.name, d.req))
+                .collect(),
+            features: info.features,
+            checksum: info.checksum,
+        })
+    }
+    
+    fn download(&self, name: &str, version: &Version) -> Result<Vec<u8>, String> {
+        RegistryClient::download(self, name, version)
+            .map_err(|e| e.to_string())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DATA STRUCTURES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Search result
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub name: String,
+    pub description: Option<String>,
+    pub max_version: Option<Version>,
+    pub downloads: u64,
+}
+
+/// Package information
+#[derive(Debug, Clone)]
+pub struct PackageInfo {
+    pub name: String,
+    pub description: Option<String>,
+    pub documentation: Option<String>,
+    pub repository: Option<String>,
+    pub downloads: u64,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// Version information
+#[derive(Debug, Clone)]
+pub struct VersionInfo {
+    pub version: Version,
+    pub checksum: Option<String>,
+    pub yanked: bool,
+    pub downloads: u64,
+    pub published_at: Option<String>,
+    pub license: Option<String>,
+    pub dependencies: Vec<DependencyInfo>,
+    pub features: BTreeMap<String, Vec<String>>,
+}
+
+/// Dependency information from registry
+#[derive(Debug, Clone)]
+pub struct DependencyInfo {
+    pub name: String,
+    pub req: String,
+    pub features: Vec<String>,
+    pub optional: bool,
+    pub default_features: bool,
+    pub target: Option<String>,
+    pub kind: DependencyKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyKind {
+    Normal,
+    Dev,
+    Build,
+}
+
+/// Package owner
+#[derive(Debug, Clone)]
+pub struct Owner {
+    pub login: String,
+    pub name: Option<String>,
+}
+
+/// Metadata for publishing
+#[derive(Debug, Clone)]
+pub struct PublishMetadata {
+    pub name: String,
+    pub vers: String,
+    pub deps: Vec<PublishDependency>,
+    pub features: BTreeMap<String, Vec<String>>,
+    pub authors: Vec<String>,
+    pub description: Option<String>,
+    pub documentation: Option<String>,
+    pub homepage: Option<String>,
+    pub readme: Option<String>,
+    pub readme_file: Option<String>,
+    pub keywords: Vec<String>,
+    pub categories: Vec<String>,
+    pub license: Option<String>,
+    pub license_file: Option<String>,
+    pub repository: Option<String>,
+    pub badges: BTreeMap<String, BTreeMap<String, String>>,
+    pub links: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublishDependency {
+    pub name: String,
+    pub version_req: String,
+    pub features: Vec<String>,
+    pub optional: bool,
+    pub default_features: bool,
+    pub target: Option<String>,
+    pub kind: DependencyKind,
+    pub registry: Option<String>,
+    pub explicit_name_in_toml: Option<String>,
+}
+
+/// Sparse index entry
+#[derive(Debug, Clone)]
+pub struct SparseIndexEntry {
+    pub name: String,
+    pub versions: Vec<SparseVersionEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SparseVersionEntry {
+    pub version: Version,
+    pub checksum: String,
+    pub yanked: bool,
+    pub features: BTreeMap<String, Vec<String>>,
+    pub dependencies: Vec<DependencyInfo>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERROR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum RegistryError {
+    Network(String),
+    InvalidResponse(String),
+    NotFound,
+    Unauthorized,
+    Forbidden,
+    RateLimited,
+    ServerError(u16),
+    HttpError(u16),
+    AuthRequired,
+    ChecksumMismatch { expected: String, actual: String },
+    InvalidPackageName(String),
+}
+
+impl fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RegistryError::Network(msg) => write!(f, "network error: {}", msg),
+            RegistryError::InvalidResponse(msg) => write!(f, "invalid response: {}", msg),
+            RegistryError::NotFound => write!(f, "not found"),
+            RegistryError::Unauthorized => write!(f, "unauthorized"),
+            RegistryError::Forbidden => write!(f, "forbidden"),
+            RegistryError::RateLimited => write!(f, "rate limited"),
+            RegistryError::ServerError(code) => write!(f, "server error: {}", code),
+            RegistryError::HttpError(code) => write!(f, "HTTP error: {}", code),
+            RegistryError::AuthRequired => write!(f, "authentication required"),
+            RegistryError::ChecksumMismatch { expected, actual } => {
+                write!(f, "checksum mismatch: expected {}, got {}", expected, actual)
+            }
+            RegistryError::InvalidPackageName(name) => {
+                write!(f, "invalid package name: {}", name)
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// URL encode a string
+fn urlencod(s: &str) -> String {
+    let mut encoded = String::new();
+    for c in s.chars() {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => {
+                encoded.push(c);
+            }
+            ' ' => encoded.push('+'),
+            _ => {
+                for byte in c.to_string().bytes() {
+                    encoded.push_str(&format!("%{:02X}", byte));
+                }
+            }
+        }
+    }
+    encoded
+}
+
+/// Compute sparse index path for a package name
+fn sparse_index_path(name: &str) -> String {
+    let name = name.to_lowercase();
+    match name.len() {
+        1 => format!("1/{}", name),
+        2 => format!("2/{}", name),
+        3 => format!("3/{}/{}", &name[0..1], name),
+        _ => format!("{}/{}/{}", &name[0..2], &name[2..4], name),
+    }
+}
+
+/// Extract string value from JSON
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\"", key);
+    let start = json.find(&pattern)?;
+    let rest = &json[start + pattern.len()..];
+    
+    // Skip colon and whitespace
+    let rest = rest.trim_start();
+    if !rest.starts_with(':') {
+        return None;
+    }
+    let rest = rest[1..].trim_start();
+    
+    // Check for null
+    if rest.starts_with("null") {
+        return None;
+    }
+    
+    // Extract string value
+    if !rest.starts_with('"') {
+        return None;
+    }
+    let rest = &rest[1..];
+    let end = rest.find('"')?;
+    
+    Some(rest[..end].to_string())
+}
+
+/// Extract number value from JSON
+fn extract_json_number(json: &str, key: &str) -> Option<u64> {
+    let pattern = format!("\"{}\"", key);
+    let start = json.find(&pattern)?;
+    let rest = &json[start + pattern.len()..];
+    
+    let rest = rest.trim_start();
+    if !rest.starts_with(':') {
+        return None;
+    }
+    let rest = rest[1..].trim_start();
+    
+    let end = rest.find(|c: char| !c.is_ascii_digit())?;
+    rest[..end].parse().ok()
+}
+
+/// Extract boolean value from JSON
+fn extract_json_bool(json: &str, key: &str) -> Option<bool> {
+    let pattern = format!("\"{}\"", key);
+    let start = json.find(&pattern)?;
+    let rest = &json[start + pattern.len()..];
+    
+    let rest = rest.trim_start();
+    if !rest.starts_with(':') {
+        return None;
+    }
+    let rest = rest[1..].trim_start();
+    
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Simple JSON encoder for PublishMetadata
+fn serde_json_encode(metadata: &PublishMetadata) -> String {
+    let mut json = String::from("{");
+    
+    json.push_str(&format!("\"name\":\"{}\",", metadata.name));
+    json.push_str(&format!("\"vers\":\"{}\",", metadata.vers));
+    
+    // Dependencies
+    json.push_str("\"deps\":[");
+    for (i, dep) in metadata.deps.iter().enumerate() {
+        if i > 0 { json.push(','); }
+        json.push_str(&format!(
+            "{{\"name\":\"{}\",\"version_req\":\"{}\"}}",
+            dep.name, dep.version_req
+        ));
+    }
+    json.push_str("],");
+    
+    // Optional fields
+    if let Some(ref desc) = metadata.description {
+        json.push_str(&format!("\"description\":\"{}\",", desc));
+    }
+    if let Some(ref license) = metadata.license {
+        json.push_str(&format!("\"license\":\"{}\",", license));
+    }
+    
+    // Remove trailing comma and close
+    if json.ends_with(',') {
+        json.pop();
+    }
+    json.push('}');
+    
+    json
+}
+
+/// Parse URL into components
+struct ParsedUrl {
+    host: String,
+    port: u16,
+    path: String,
+}
+
+fn parse_url(url: &str) -> Result<ParsedUrl, RegistryError> {
+    let url = url.trim();
+    
+    let (scheme, rest) = if url.starts_with("https://") {
+        ("https", &url[8..])
+    } else if url.starts_with("http://") {
+        ("http", &url[7..])
+    } else {
+        return Err(RegistryError::Network("invalid URL scheme".to_string()));
+    };
+    
+    let (host_port, path) = match rest.find('/') {
+        Some(pos) => (&rest[..pos], &rest[pos..]),
+        None => (rest, "/"),
+    };
+    
+    let (host, port) = match host_port.find(':') {
+        Some(pos) => {
+            let port: u16 = host_port[pos + 1..].parse()
+                .map_err(|_| RegistryError::Network("invalid port".to_string()))?;
+            (&host_port[..pos], port)
+        }
+        None => (host_port, if scheme == "https" { 443 } else { 80 }),
+    };
+    
+    Ok(ParsedUrl {
+        host: host.to_string(),
+        port,
+        path: path.to_string(),
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_sparse_index_path() {
+        assert_eq!(sparse_index_path("a"), "1/a");
+        assert_eq!(sparse_index_path("ab"), "2/ab");
+        assert_eq!(sparse_index_path("abc"), "3/a/abc");
+        assert_eq!(sparse_index_path("abcd"), "ab/cd/abcd");
+        assert_eq!(sparse_index_path("serde"), "se/rd/serde");
+    }
+    
+    #[test]
+    fn test_extract_json_string() {
+        let json = r#"{"name": "test", "version": "1.0.0"}"#;
+        assert_eq!(extract_json_string(json, "name"), Some("test".to_string()));
+        assert_eq!(extract_json_string(json, "version"), Some("1.0.0".to_string()));
+        assert_eq!(extract_json_string(json, "missing"), None);
+    }
+    
+    #[test]
+    fn test_extract_json_number() {
+        let json = r#"{"downloads": 12345, "size": 0}"#;
+        assert_eq!(extract_json_number(json, "downloads"), Some(12345));
+        assert_eq!(extract_json_number(json, "size"), Some(0));
+    }
+    
+    #[test]
+    fn test_extract_json_bool() {
+        let json = r#"{"yanked": true, "active": false}"#;
+        assert_eq!(extract_json_bool(json, "yanked"), Some(true));
+        assert_eq!(extract_json_bool(json, "active"), Some(false));
+    }
+    
+    #[test]
+    fn test_urlencod() {
+        assert_eq!(urlencod("hello world"), "hello+world");
+        assert_eq!(urlencod("test@example"), "test%40example");
+        assert_eq!(urlencod("foo-bar_baz"), "foo-bar_baz");
+    }
+}

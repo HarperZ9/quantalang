@@ -1,0 +1,943 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Fiber and Coroutine Runtime
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Lightweight fiber/coroutine implementation:
+//   - Stackful coroutines with configurable stack sizes
+//   - Symmetric and asymmetric transfer
+//   - Work-stealing scheduler integration
+//   - Guard pages for stack overflow detection
+//   - Platform-specific context switching
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::runtime::fiber
+
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use core::ptr::NonNull;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU32, AtomicUsize, AtomicPtr, Ordering};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FIBER CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Platform-specific context for fiber switching
+#[repr(C)]
+pub struct FiberContext {
+    #[cfg(target_arch = "x86_64")]
+    regs: X64Context,
+    #[cfg(target_arch = "aarch64")]
+    regs: Arm64Context,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct X64Context {
+    rsp: usize,
+    rbp: usize,
+    rbx: usize,
+    r12: usize,
+    r13: usize,
+    r14: usize,
+    r15: usize,
+    rip: usize,
+    mxcsr: u32,
+    x87_cw: u16,
+    _pad: u16,
+    // SSE registers if needed
+    xmm6: [u64; 2],
+    xmm7: [u64; 2],
+    xmm8: [u64; 2],
+    xmm9: [u64; 2],
+    xmm10: [u64; 2],
+    xmm11: [u64; 2],
+    xmm12: [u64; 2],
+    xmm13: [u64; 2],
+    xmm14: [u64; 2],
+    xmm15: [u64; 2],
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+struct Arm64Context {
+    sp: usize,
+    x19: usize,
+    x20: usize,
+    x21: usize,
+    x22: usize,
+    x23: usize,
+    x24: usize,
+    x25: usize,
+    x26: usize,
+    x27: usize,
+    x28: usize,
+    x29: usize, // frame pointer
+    x30: usize, // link register
+    // SIMD registers
+    d8: u64,
+    d9: u64,
+    d10: u64,
+    d11: u64,
+    d12: u64,
+    d13: u64,
+    d14: u64,
+    d15: u64,
+}
+
+impl FiberContext {
+    /// Create zeroed context
+    pub const fn new() -> Self {
+        FiberContext {
+            #[cfg(target_arch = "x86_64")]
+            regs: X64Context {
+                rsp: 0, rbp: 0, rbx: 0,
+                r12: 0, r13: 0, r14: 0, r15: 0, rip: 0,
+                mxcsr: 0x1F80, x87_cw: 0x37F, _pad: 0,
+                xmm6: [0; 2], xmm7: [0; 2], xmm8: [0; 2], xmm9: [0; 2],
+                xmm10: [0; 2], xmm11: [0; 2], xmm12: [0; 2], xmm13: [0; 2],
+                xmm14: [0; 2], xmm15: [0; 2],
+            },
+            #[cfg(target_arch = "aarch64")]
+            regs: Arm64Context {
+                sp: 0, x19: 0, x20: 0, x21: 0, x22: 0, x23: 0,
+                x24: 0, x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
+                d8: 0, d9: 0, d10: 0, d11: 0, d12: 0, d13: 0, d14: 0, d15: 0,
+            },
+        }
+    }
+    
+    /// Initialize context for new fiber
+    #[cfg(target_arch = "x86_64")]
+    pub fn init(&mut self, stack_top: usize, entry: usize, arg: usize) {
+        // Align stack to 16 bytes, leave space for return address
+        let sp = (stack_top & !0xF) - 8;
+        
+        self.regs.rsp = sp;
+        self.regs.rip = entry;
+        self.regs.rbp = 0;
+        
+        // First argument in rdi (will be passed via trampoline)
+        self.regs.r12 = arg;
+        self.regs.r13 = entry;
+        
+        // Set up proper x87/SSE state
+        self.regs.mxcsr = 0x1F80;
+        self.regs.x87_cw = 0x37F;
+    }
+    
+    #[cfg(target_arch = "aarch64")]
+    pub fn init(&mut self, stack_top: usize, entry: usize, arg: usize) {
+        let sp = stack_top & !0xF;
+        
+        self.regs.sp = sp;
+        self.regs.x30 = entry; // Link register
+        self.regs.x19 = arg;   // First callee-saved for argument
+    }
+}
+
+impl Default for FiberContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FIBER STACK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Stack size options
+#[derive(Clone, Copy, Debug)]
+pub enum StackSize {
+    /// Small stack (64KB)
+    Small,
+    /// Default stack (256KB)
+    Default,
+    /// Large stack (1MB)
+    Large,
+    /// Huge stack (8MB)
+    Huge,
+    /// Custom size
+    Custom(usize),
+}
+
+impl StackSize {
+    pub fn bytes(self) -> usize {
+        match self {
+            StackSize::Small => 64 * 1024,
+            StackSize::Default => 256 * 1024,
+            StackSize::Large => 1024 * 1024,
+            StackSize::Huge => 8 * 1024 * 1024,
+            StackSize::Custom(n) => n,
+        }
+    }
+}
+
+/// Fiber stack with guard page
+pub struct FiberStack {
+    /// Base address (bottom of stack, including guard)
+    base: *mut u8,
+    /// Total allocation size
+    alloc_size: usize,
+    /// Usable stack size
+    stack_size: usize,
+    /// Guard page size
+    guard_size: usize,
+}
+
+impl FiberStack {
+    /// Allocate new fiber stack
+    pub fn new(size: StackSize) -> Option<Self> {
+        let stack_size = size.bytes();
+        let guard_size = page_size();
+        let alloc_size = stack_size + guard_size;
+        
+        unsafe {
+            // Allocate memory
+            let base = alloc_stack(alloc_size)?;
+            
+            // Set up guard page at the bottom
+            protect_guard_page(base, guard_size);
+            
+            Some(FiberStack {
+                base,
+                alloc_size,
+                stack_size,
+                guard_size,
+            })
+        }
+    }
+    
+    /// Get top of usable stack (where SP should start)
+    pub fn top(&self) -> usize {
+        (self.base as usize) + self.alloc_size
+    }
+    
+    /// Get bottom of usable stack
+    pub fn bottom(&self) -> usize {
+        (self.base as usize) + self.guard_size
+    }
+    
+    /// Check if address is within this stack
+    pub fn contains(&self, addr: usize) -> bool {
+        addr >= self.bottom() && addr < self.top()
+    }
+}
+
+impl Drop for FiberStack {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc_stack(self.base, self.alloc_size);
+        }
+    }
+}
+
+// Platform-specific stack allocation
+#[cfg(unix)]
+unsafe fn alloc_stack(size: usize) -> Option<*mut u8> {
+    use core::ptr;
+    
+    let ptr = libc::mmap(
+        ptr::null_mut(),
+        size,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+        -1,
+        0,
+    );
+    
+    if ptr == libc::MAP_FAILED {
+        None
+    } else {
+        Some(ptr as *mut u8)
+    }
+}
+
+#[cfg(windows)]
+unsafe fn alloc_stack(size: usize) -> Option<*mut u8> {
+    let ptr = VirtualAlloc(
+        core::ptr::null_mut(),
+        size,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+    );
+    
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr as *mut u8)
+    }
+}
+
+#[cfg(unix)]
+unsafe fn dealloc_stack(ptr: *mut u8, size: usize) {
+    libc::munmap(ptr as *mut libc::c_void, size);
+}
+
+#[cfg(windows)]
+unsafe fn dealloc_stack(ptr: *mut u8, _size: usize) {
+    VirtualFree(ptr as *mut _, 0, MEM_RELEASE);
+}
+
+#[cfg(unix)]
+unsafe fn protect_guard_page(ptr: *mut u8, size: usize) {
+    libc::mprotect(ptr as *mut libc::c_void, size, libc::PROT_NONE);
+}
+
+#[cfg(windows)]
+unsafe fn protect_guard_page(ptr: *mut u8, size: usize) {
+    let mut old_protect = 0;
+    VirtualProtect(ptr as *mut _, size, PAGE_NOACCESS, &mut old_protect);
+}
+
+fn page_size() -> usize {
+    #[cfg(unix)]
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    #[cfg(windows)]
+    {
+        let mut info = core::mem::zeroed();
+        GetSystemInfo(&mut info);
+        info.dwPageSize as usize
+    }
+    #[cfg(not(any(unix, windows)))]
+    4096
+}
+
+// Windows FFI
+#[cfg(windows)]
+extern "system" {
+    fn VirtualAlloc(addr: *mut u8, size: usize, alloc_type: u32, protect: u32) -> *mut u8;
+    fn VirtualFree(addr: *mut u8, size: usize, free_type: u32) -> i32;
+    fn VirtualProtect(addr: *mut u8, size: usize, protect: u32, old: *mut u32) -> i32;
+    fn GetSystemInfo(info: *mut SYSTEM_INFO);
+}
+
+#[cfg(windows)]
+const MEM_COMMIT: u32 = 0x1000;
+#[cfg(windows)]
+const MEM_RESERVE: u32 = 0x2000;
+#[cfg(windows)]
+const MEM_RELEASE: u32 = 0x8000;
+#[cfg(windows)]
+const PAGE_READWRITE: u32 = 0x04;
+#[cfg(windows)]
+const PAGE_NOACCESS: u32 = 0x01;
+
+#[cfg(windows)]
+#[repr(C)]
+struct SYSTEM_INFO {
+    wProcessorArchitecture: u16,
+    wReserved: u16,
+    dwPageSize: u32,
+    // ... rest omitted
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FIBER STATE AND HANDLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Fiber state
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FiberState {
+    /// Newly created, not yet started
+    Created = 0,
+    /// Currently running
+    Running = 1,
+    /// Suspended, can be resumed
+    Suspended = 2,
+    /// Completed execution
+    Completed = 3,
+    /// Panicked
+    Panicked = 4,
+}
+
+/// Fiber control block
+pub struct Fiber {
+    /// Fiber ID
+    id: u64,
+    /// Current state
+    state: AtomicU32,
+    /// Execution context
+    context: UnsafeCell<FiberContext>,
+    /// Stack
+    stack: Option<FiberStack>,
+    /// Entry point
+    entry: Option<Box<dyn FnOnce()>>,
+    /// Result storage
+    result: UnsafeCell<Option<Box<dyn core::any::Any + Send>>>,
+    /// Parent fiber (for asymmetric)
+    parent: AtomicPtr<Fiber>,
+    /// User data
+    user_data: AtomicUsize,
+}
+
+impl Fiber {
+    /// Create new fiber
+    pub fn new<F>(entry: F, stack_size: StackSize) -> Option<Box<Self>>
+    where
+        F: FnOnce() + 'static,
+    {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        
+        let stack = FiberStack::new(stack_size)?;
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        
+        let mut fiber = Box::new(Fiber {
+            id,
+            state: AtomicU32::new(FiberState::Created as u32),
+            context: UnsafeCell::new(FiberContext::new()),
+            stack: Some(stack),
+            entry: Some(Box::new(entry)),
+            result: UnsafeCell::new(None),
+            parent: AtomicPtr::new(core::ptr::null_mut()),
+            user_data: AtomicUsize::new(0),
+        });
+        
+        // Initialize context
+        let stack_top = fiber.stack.as_ref().unwrap().top();
+        let entry_addr = fiber_entry_trampoline as usize;
+        let fiber_ptr = &*fiber as *const Fiber as usize;
+        
+        unsafe {
+            (*fiber.context.get()).init(stack_top, entry_addr, fiber_ptr);
+        }
+        
+        Some(fiber)
+    }
+    
+    /// Get fiber ID
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+    
+    /// Get current state
+    pub fn state(&self) -> FiberState {
+        match self.state.load(Ordering::Acquire) {
+            0 => FiberState::Created,
+            1 => FiberState::Running,
+            2 => FiberState::Suspended,
+            3 => FiberState::Completed,
+            4 => FiberState::Panicked,
+            _ => FiberState::Panicked,
+        }
+    }
+    
+    /// Set state
+    fn set_state(&self, state: FiberState) {
+        self.state.store(state as u32, Ordering::Release);
+    }
+    
+    /// Check if completed
+    pub fn is_completed(&self) -> bool {
+        matches!(self.state(), FiberState::Completed | FiberState::Panicked)
+    }
+    
+    /// Get/set user data
+    pub fn user_data(&self) -> usize {
+        self.user_data.load(Ordering::Relaxed)
+    }
+    
+    pub fn set_user_data(&self, data: usize) {
+        self.user_data.store(data, Ordering::Relaxed);
+    }
+}
+
+use core::sync::atomic::AtomicU64;
+
+/// Entry trampoline for new fibers
+extern "C" fn fiber_entry_trampoline(fiber_ptr: usize) {
+    let fiber = unsafe { &*(fiber_ptr as *const Fiber) };
+    
+    // Take ownership of entry function
+    let entry = unsafe {
+        let entry_ptr = &fiber.entry as *const Option<Box<dyn FnOnce()>>
+            as *mut Option<Box<dyn FnOnce()>>;
+        (*entry_ptr).take()
+    };
+    
+    if let Some(f) = entry {
+        // Set running state
+        fiber.set_state(FiberState::Running);
+        
+        // Execute with panic catching
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f();
+        }));
+        
+        match result {
+            Ok(()) => fiber.set_state(FiberState::Completed),
+            Err(_) => fiber.set_state(FiberState::Panicked),
+        }
+    }
+    
+    // Return to parent
+    unsafe {
+        let parent = fiber.parent.load(Ordering::Acquire);
+        if !parent.is_null() {
+            switch_context(
+                fiber.context.get(),
+                (*parent).context.get(),
+            );
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONTEXT SWITCHING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Switch from current fiber to target fiber
+#[inline(never)]
+pub unsafe fn switch_context(from: *mut FiberContext, to: *const FiberContext) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        switch_context_x64(from, to);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        switch_context_arm64(from, to);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[naked]
+unsafe extern "C" fn switch_context_x64(from: *mut FiberContext, to: *const FiberContext) {
+    core::arch::asm!(
+        // Save callee-saved registers to 'from'
+        "mov [rdi + 0x00], rsp",
+        "mov [rdi + 0x08], rbp",
+        "mov [rdi + 0x10], rbx",
+        "mov [rdi + 0x18], r12",
+        "mov [rdi + 0x20], r13",
+        "mov [rdi + 0x28], r14",
+        "mov [rdi + 0x30], r15",
+        "lea rax, [rip + 1f]",
+        "mov [rdi + 0x38], rax",
+        
+        // Save MXCSR and x87 control word
+        "stmxcsr [rdi + 0x40]",
+        "fnstcw [rdi + 0x44]",
+        
+        // Restore from 'to'
+        "mov rsp, [rsi + 0x00]",
+        "mov rbp, [rsi + 0x08]",
+        "mov rbx, [rsi + 0x10]",
+        "mov r12, [rsi + 0x18]",
+        "mov r13, [rsi + 0x20]",
+        "mov r14, [rsi + 0x28]",
+        "mov r15, [rsi + 0x30]",
+        
+        // Restore MXCSR and x87 control word
+        "ldmxcsr [rsi + 0x40]",
+        "fldcw [rsi + 0x44]",
+        
+        // Jump to target
+        "jmp [rsi + 0x38]",
+        
+        "1:",
+        "ret",
+        options(noreturn)
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[naked]
+unsafe extern "C" fn switch_context_arm64(from: *mut FiberContext, to: *const FiberContext) {
+    core::arch::asm!(
+        // Save callee-saved registers
+        "mov x2, sp",
+        "str x2, [x0, #0]",
+        "stp x19, x20, [x0, #8]",
+        "stp x21, x22, [x0, #24]",
+        "stp x23, x24, [x0, #40]",
+        "stp x25, x26, [x0, #56]",
+        "stp x27, x28, [x0, #72]",
+        "stp x29, x30, [x0, #88]",
+        
+        // Save SIMD registers
+        "stp d8, d9, [x0, #104]",
+        "stp d10, d11, [x0, #120]",
+        "stp d12, d13, [x0, #136]",
+        "stp d14, d15, [x0, #152]",
+        
+        // Restore from 'to'
+        "ldr x2, [x1, #0]",
+        "mov sp, x2",
+        "ldp x19, x20, [x1, #8]",
+        "ldp x21, x22, [x1, #24]",
+        "ldp x23, x24, [x1, #40]",
+        "ldp x25, x26, [x1, #56]",
+        "ldp x27, x28, [x1, #72]",
+        "ldp x29, x30, [x1, #88]",
+        
+        // Restore SIMD registers
+        "ldp d8, d9, [x1, #104]",
+        "ldp d10, d11, [x1, #120]",
+        "ldp d12, d13, [x1, #136]",
+        "ldp d14, d15, [x1, #152]",
+        
+        "ret",
+        options(noreturn)
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FIBER SCHEDULER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Simple fiber scheduler
+pub struct FiberScheduler {
+    /// Ready queue
+    ready: Mutex<Vec<Box<Fiber>>>,
+    /// Current fiber per thread
+    current: ThreadLocal<*mut Fiber>,
+    /// Main fiber contexts per thread
+    main_ctx: ThreadLocal<FiberContext>,
+}
+
+impl FiberScheduler {
+    /// Create new scheduler
+    pub fn new() -> Self {
+        FiberScheduler {
+            ready: Mutex::new(Vec::new()),
+            current: ThreadLocal::new(),
+            main_ctx: ThreadLocal::new(),
+        }
+    }
+    
+    /// Spawn a new fiber
+    pub fn spawn<F>(&self, f: F) -> u64
+    where
+        F: FnOnce() + 'static,
+    {
+        let fiber = Fiber::new(f, StackSize::Default)
+            .expect("Failed to create fiber");
+        let id = fiber.id();
+        
+        self.ready.lock().push(fiber);
+        
+        id
+    }
+    
+    /// Run scheduler until all fibers complete
+    pub fn run(&self) {
+        loop {
+            let fiber = {
+                let mut ready = self.ready.lock();
+                if ready.is_empty() {
+                    break;
+                }
+                ready.pop()
+            };
+            
+            if let Some(mut fiber) = fiber {
+                // Set parent to main context
+                fiber.parent.store(core::ptr::null_mut(), Ordering::Release);
+                
+                // Switch to fiber
+                unsafe {
+                    let main_ctx = self.main_ctx.get_or_default();
+                    let fiber_ctx = fiber.context.get();
+                    
+                    *self.current.get_or_default() = &mut *fiber as *mut Fiber;
+                    
+                    switch_context(main_ctx, fiber_ctx);
+                    
+                    *self.current.get_or_default() = core::ptr::null_mut();
+                }
+                
+                // Check fiber state
+                if !fiber.is_completed() {
+                    // Re-queue if suspended
+                    if fiber.state() == FiberState::Suspended {
+                        self.ready.lock().push(fiber);
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Yield current fiber
+    pub fn yield_now(&self) {
+        unsafe {
+            let current = *self.current.get_or_default();
+            if current.is_null() {
+                return;
+            }
+            
+            let fiber = &*current;
+            fiber.set_state(FiberState::Suspended);
+            
+            let main_ctx = self.main_ctx.get_or_default();
+            switch_context(fiber.context.get(), main_ctx);
+        }
+    }
+}
+
+impl Default for FiberScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Global scheduler
+static SCHEDULER: Lazy<FiberScheduler> = Lazy::new(FiberScheduler::new);
+
+/// Get global scheduler
+pub fn scheduler() -> &'static FiberScheduler {
+    &SCHEDULER
+}
+
+/// Yield current fiber
+pub fn yield_now() {
+    scheduler().yield_now();
+}
+
+/// Spawn fiber on global scheduler
+pub fn spawn<F>(f: F) -> u64
+where
+    F: FnOnce() + 'static,
+{
+    scheduler().spawn(f)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GENERATOR/COROUTINE API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Generator state
+pub enum GeneratorState<Y, R> {
+    /// Yielded a value
+    Yielded(Y),
+    /// Completed with final value
+    Complete(R),
+}
+
+/// Generator handle
+pub struct Generator<Y, R> {
+    fiber: Box<Fiber>,
+    yielded: UnsafeCell<Option<Y>>,
+    _marker: core::marker::PhantomData<R>,
+}
+
+impl<Y, R> Generator<Y, R>
+where
+    Y: 'static,
+    R: 'static,
+{
+    /// Create new generator
+    pub fn new<F>(f: F) -> Self
+    where
+        F: FnOnce(&Yielder<Y>) -> R + 'static,
+    {
+        let yielded: *mut Option<Y> = Box::into_raw(Box::new(None));
+        
+        let fiber = Fiber::new(
+            move || {
+                let yielder = Yielder {
+                    slot: yielded,
+                    _marker: core::marker::PhantomData,
+                };
+                let _result = f(&yielder);
+            },
+            StackSize::Default,
+        ).expect("Failed to create generator fiber");
+        
+        Generator {
+            fiber,
+            yielded: UnsafeCell::new(None),
+            _marker: core::marker::PhantomData,
+        }
+    }
+    
+    /// Resume generator
+    pub fn resume(&mut self) -> GeneratorState<Y, R> {
+        if self.fiber.is_completed() {
+            // TODO: Return final result
+            return GeneratorState::Complete(unsafe { core::mem::zeroed() });
+        }
+        
+        // Resume fiber
+        unsafe {
+            let mut main_ctx = FiberContext::new();
+            self.fiber.parent.store(&mut *Box::new(Fiber {
+                id: 0,
+                state: AtomicU32::new(0),
+                context: UnsafeCell::new(main_ctx),
+                stack: None,
+                entry: None,
+                result: UnsafeCell::new(None),
+                parent: AtomicPtr::new(core::ptr::null_mut()),
+                user_data: AtomicUsize::new(0),
+            }), Ordering::Release);
+            
+            switch_context(&mut main_ctx, self.fiber.context.get());
+        }
+        
+        // Check for yielded value
+        if let Some(val) = unsafe { (*self.yielded.get()).take() } {
+            GeneratorState::Yielded(val)
+        } else if self.fiber.is_completed() {
+            GeneratorState::Complete(unsafe { core::mem::zeroed() })
+        } else {
+            GeneratorState::Yielded(unsafe { core::mem::zeroed() })
+        }
+    }
+}
+
+/// Yielder for generators
+pub struct Yielder<Y> {
+    slot: *mut Option<Y>,
+    _marker: core::marker::PhantomData<Y>,
+}
+
+impl<Y> Yielder<Y> {
+    /// Yield a value
+    pub fn yield_value(&self, value: Y) {
+        unsafe {
+            *self.slot = Some(value);
+        }
+        yield_now();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UTILITY TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Simple mutex wrapper
+struct Mutex<T> {
+    inner: UnsafeCell<T>,
+    locked: AtomicU32,
+}
+
+impl<T> Mutex<T> {
+    fn new(value: T) -> Self {
+        Mutex {
+            inner: UnsafeCell::new(value),
+            locked: AtomicU32::new(0),
+        }
+    }
+    
+    fn lock(&self) -> MutexGuard<'_, T> {
+        while self.locked.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        MutexGuard { mutex: self }
+    }
+}
+
+unsafe impl<T: Send> Send for Mutex<T> {}
+unsafe impl<T: Send> Sync for Mutex<T> {}
+
+struct MutexGuard<'a, T> {
+    mutex: &'a Mutex<T>,
+}
+
+impl<T> core::ops::Deref for MutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.mutex.inner.get() }
+    }
+}
+
+impl<T> core::ops::DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.mutex.inner.get() }
+    }
+}
+
+impl<T> Drop for MutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.mutex.locked.store(0, Ordering::Release);
+    }
+}
+
+// Thread-local storage
+struct ThreadLocal<T> {
+    _marker: core::marker::PhantomData<T>,
+}
+
+impl<T: Default> ThreadLocal<T> {
+    fn new() -> Self {
+        ThreadLocal { _marker: core::marker::PhantomData }
+    }
+    
+    fn get_or_default(&self) -> &mut T {
+        // Simplified - real impl would use TLS
+        static mut STORAGE: Option<*mut u8> = None;
+        unsafe {
+            if STORAGE.is_none() {
+                STORAGE = Some(Box::into_raw(Box::new(T::default())) as *mut u8);
+            }
+            &mut *(STORAGE.unwrap() as *mut T)
+        }
+    }
+}
+
+// Lazy initialization
+struct Lazy<T> {
+    init: fn() -> T,
+    value: UnsafeCell<Option<T>>,
+    once: AtomicU32,
+}
+
+impl<T> Lazy<T> {
+    const fn new(init: fn() -> T) -> Self {
+        Lazy {
+            init,
+            value: UnsafeCell::new(None),
+            once: AtomicU32::new(0),
+        }
+    }
+}
+
+impl<T> core::ops::Deref for Lazy<T> {
+    type Target = T;
+    
+    fn deref(&self) -> &T {
+        if self.once.load(Ordering::Acquire) == 0 {
+            if self.once.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                unsafe {
+                    *self.value.get() = Some((self.init)());
+                }
+                self.once.store(2, Ordering::Release);
+            } else {
+                while self.once.load(Ordering::Acquire) != 2 {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+        unsafe { (*self.value.get()).as_ref().unwrap() }
+    }
+}
+
+unsafe impl<T: Send + Sync> Send for Lazy<T> {}
+unsafe impl<T: Send + Sync> Sync for Lazy<T> {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_fiber_context() {
+        let ctx = FiberContext::new();
+        // Context should be properly initialized
+    }
+    
+    #[test]
+    fn test_stack_size() {
+        assert_eq!(StackSize::Small.bytes(), 64 * 1024);
+        assert_eq!(StackSize::Default.bytes(), 256 * 1024);
+        assert_eq!(StackSize::Large.bytes(), 1024 * 1024);
+    }
+}

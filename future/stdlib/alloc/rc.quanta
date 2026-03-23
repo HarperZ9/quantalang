@@ -1,0 +1,1137 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ ALLOC — Reference Counting Smart Pointers
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Rc<T>  — Single-threaded reference counting (NOT Send or Sync)
+// Arc<T> — Atomic reference counting (Send + Sync)
+//
+// Both provide shared ownership of heap-allocated data.
+// When the last reference is dropped, the data is deallocated.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#![no_std]
+
+module alloc::rc
+
+use core::ptr::{self, NonNull};
+use core::mem::{self, MaybeUninit, ManuallyDrop};
+use core::cell::{Cell, UnsafeCell};
+use core::ops::Deref;
+use core::marker::{PhantomData, Unpin};
+use core::cmp::{PartialEq, Eq, PartialOrd, Ord, Ordering};
+use core::hash::{Hash, Hasher};
+use core::fmt;
+use core::borrow::Borrow;
+use core::convert::From;
+use core::clone::Clone;
+use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+use crate::alloc::{Layout, Allocator, Global, AllocError, handle_alloc_error};
+use crate::boxed::Box;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RC<T> — Single-Threaded Reference Counting
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A single-threaded reference-counting pointer.
+/// 
+/// `Rc` provides shared ownership of a value of type `T`, allocated in the heap.
+/// Cloning an `Rc` increments the reference count; dropping decrements it.
+/// When the count reaches zero, the value is dropped and memory freed.
+/// 
+/// # Thread Safety
+/// `Rc` is NOT thread-safe (`!Send`, `!Sync`). For multi-threaded scenarios,
+/// use `Arc` instead.
+/// 
+/// # Cycles
+/// Reference cycles will cause memory leaks. Use `Weak` to break cycles.
+/// 
+/// # Memory Layout
+/// ```text
+/// ┌──────────────────────────────────────────┐
+/// │ RcBox<T>                                 │
+/// ├──────────────────────────────────────────┤
+/// │ strong: Cell<usize>  (strong ref count)  │
+/// │ weak: Cell<usize>    (weak ref count)    │
+/// │ value: T             (the actual data)   │
+/// └──────────────────────────────────────────┘
+/// ```
+pub struct Rc<T: ?Sized, A: Allocator = Global> {
+    ptr: NonNull<RcBox<T>>,
+    phantom: PhantomData<RcBox<T>>,
+    alloc: A,
+}
+
+struct RcBox<T: ?Sized> {
+    strong: Cell<usize>,
+    weak: Cell<usize>,
+    value: T,
+}
+
+impl<T> Rc<T> {
+    /// Constructs a new `Rc<T>`.
+    /// 
+    /// # Examples
+    /// ```
+    /// let five = Rc::new(5);
+    /// ```
+    #[inline]
+    pub fn new(value: T) -> Rc<T> {
+        Self::new_in(value, Global)
+    }
+    
+    /// Constructs a new `Rc<T>` with uninitialized contents.
+    pub fn new_uninit() -> Rc<MaybeUninit<T>> {
+        Self::new_uninit_in(Global)
+    }
+    
+    /// Constructs a new `Rc<T>` with zeroed contents.
+    pub fn new_zeroed() -> Rc<MaybeUninit<T>> {
+        Self::new_zeroed_in(Global)
+    }
+    
+    /// Constructs a new `Rc` in a cycle-collecting manner.
+    /// 
+    /// The constructor receives an `&Rc<T>` to the allocation,
+    /// allowing self-references during construction.
+    pub fn new_cyclic<F>(data_fn: F) -> Rc<T>
+    where
+        F: FnOnce(&Weak<T>) -> T,
+    {
+        Self::new_cyclic_in(data_fn, Global)
+    }
+    
+    /// Constructs a new pinned `Rc<T>`.
+    pub fn pin(value: T) -> core::pin::Pin<Rc<T>> {
+        unsafe { core::pin::Pin::new_unchecked(Rc::new(value)) }
+    }
+    
+    /// Attempts to allocate, returning `Err` on failure.
+    pub fn try_new(value: T) -> Result<Rc<T>, AllocError> {
+        Self::try_new_in(value, Global)
+    }
+}
+
+impl<T, A: Allocator> Rc<T, A> {
+    /// Constructs a new `Rc<T>` in the given allocator.
+    pub fn new_in(value: T, alloc: A) -> Rc<T, A> {
+        let ptr = Self::allocate_for_layout(
+            Layout::new::<RcBox<T>>(),
+            |layout| alloc.allocate(layout),
+            |ptr| unsafe {
+                ptr::write(ptr as *mut RcBox<T>, RcBox {
+                    strong: Cell::new(1),
+                    weak: Cell::new(1),
+                    value,
+                });
+            },
+        );
+        
+        Rc { ptr, phantom: PhantomData, alloc }
+    }
+    
+    /// Attempts to allocate in the given allocator.
+    pub fn try_new_in(value: T, alloc: A) -> Result<Rc<T, A>, AllocError> {
+        let ptr = Self::try_allocate_for_layout(
+            Layout::new::<RcBox<T>>(),
+            |layout| alloc.allocate(layout),
+            |ptr| unsafe {
+                ptr::write(ptr as *mut RcBox<T>, RcBox {
+                    strong: Cell::new(1),
+                    weak: Cell::new(1),
+                    value,
+                });
+            },
+        )?;
+        
+        Ok(Rc { ptr, phantom: PhantomData, alloc })
+    }
+    
+    /// Constructs uninitialized `Rc` in allocator.
+    pub fn new_uninit_in(alloc: A) -> Rc<MaybeUninit<T>, A> {
+        let ptr = Self::allocate_for_layout(
+            Layout::new::<RcBox<MaybeUninit<T>>>(),
+            |layout| alloc.allocate(layout),
+            |ptr| unsafe {
+                let rc_box = ptr as *mut RcBox<MaybeUninit<T>>;
+                (*rc_box).strong.set(1);
+                (*rc_box).weak.set(1);
+            },
+        );
+        
+        Rc { ptr: ptr.cast(), phantom: PhantomData, alloc }
+    }
+    
+    /// Constructs zeroed `Rc` in allocator.
+    pub fn new_zeroed_in(alloc: A) -> Rc<MaybeUninit<T>, A> {
+        let ptr = Self::allocate_for_layout(
+            Layout::new::<RcBox<MaybeUninit<T>>>(),
+            |layout| alloc.allocate_zeroed(layout),
+            |ptr| unsafe {
+                let rc_box = ptr as *mut RcBox<MaybeUninit<T>>;
+                (*rc_box).strong.set(1);
+                (*rc_box).weak.set(1);
+            },
+        );
+        
+        Rc { ptr: ptr.cast(), phantom: PhantomData, alloc }
+    }
+    
+    /// Constructs cyclic `Rc` in allocator.
+    pub fn new_cyclic_in<F>(data_fn: F, alloc: A) -> Rc<T, A>
+    where
+        F: FnOnce(&Weak<T, A>) -> T,
+        A: Clone,
+    {
+        // Allocate with strong=0, weak=1
+        let ptr = Self::allocate_for_layout(
+            Layout::new::<RcBox<MaybeUninit<T>>>(),
+            |layout| alloc.allocate(layout),
+            |ptr| unsafe {
+                let rc_box = ptr as *mut RcBox<MaybeUninit<T>>;
+                (*rc_box).strong.set(0);
+                (*rc_box).weak.set(1);
+            },
+        );
+        
+        let weak = Weak {
+            ptr: ptr.cast(),
+            alloc: alloc.clone(),
+        };
+        
+        // Initialize value
+        let value = data_fn(&weak);
+        unsafe {
+            let rc_box = ptr.as_ptr() as *mut RcBox<T>;
+            ptr::write(&mut (*rc_box).value, value);
+            (*rc_box).strong.set(1);
+        }
+        
+        mem::forget(weak);
+        
+        Rc { ptr: ptr.cast(), phantom: PhantomData, alloc }
+    }
+    
+    fn allocate_for_layout<F, G>(
+        layout: Layout,
+        allocate: F,
+        init: G,
+    ) -> NonNull<RcBox<T>>
+    where
+        F: FnOnce(Layout) -> Result<NonNull<[u8]>, AllocError>,
+        G: FnOnce(*mut u8),
+    {
+        let ptr = allocate(layout).unwrap_or_else(|_| handle_alloc_error(layout));
+        let ptr = ptr.as_ptr() as *mut u8;
+        init(ptr);
+        unsafe { NonNull::new_unchecked(ptr as *mut RcBox<T>) }
+    }
+    
+    fn try_allocate_for_layout<F, G>(
+        layout: Layout,
+        allocate: F,
+        init: G,
+    ) -> Result<NonNull<RcBox<T>>, AllocError>
+    where
+        F: FnOnce(Layout) -> Result<NonNull<[u8]>, AllocError>,
+        G: FnOnce(*mut u8),
+    {
+        let ptr = allocate(layout)?;
+        let ptr = ptr.as_ptr() as *mut u8;
+        init(ptr);
+        Ok(unsafe { NonNull::new_unchecked(ptr as *mut RcBox<T>) })
+    }
+    
+    /// Returns the inner value if there's exactly one strong reference.
+    pub fn try_unwrap(this: Self) -> Result<T, Self> {
+        if Rc::strong_count(&this) == 1 {
+            unsafe {
+                let val = ptr::read(&this.inner().value);
+                let alloc = ptr::read(&this.alloc);
+                
+                // Don't drop this, we're taking ownership
+                mem::forget(this);
+                
+                // Decrement weak count (was 1 for the strong references)
+                // If this was the last weak, deallocate
+                // ... simplified for now
+                
+                Ok(val)
+            }
+        } else {
+            Err(this)
+        }
+    }
+    
+    /// Consumes the `Rc`, returning the inner value.
+    /// 
+    /// # Panics
+    /// Panics if there are other strong references.
+    pub fn into_inner(this: Self) -> Option<T> {
+        Rc::try_unwrap(this).ok()
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Rc<T, A> {
+    /// Returns the number of strong references.
+    #[inline]
+    pub fn strong_count(this: &Self) -> usize {
+        this.inner().strong.get()
+    }
+    
+    /// Returns the number of weak references.
+    #[inline]
+    pub fn weak_count(this: &Self) -> usize {
+        this.inner().weak.get() - 1  // Subtract 1 for the implicit weak ref
+    }
+    
+    /// Returns a raw pointer to the inner value.
+    #[inline]
+    pub fn as_ptr(this: &Self) -> *const T {
+        &this.inner().value as *const T
+    }
+    
+    /// Creates a new `Weak` pointer to this allocation.
+    #[inline]
+    pub fn downgrade(this: &Self) -> Weak<T, A>
+    where
+        A: Clone,
+    {
+        this.inner().weak.set(this.inner().weak.get() + 1);
+        Weak {
+            ptr: this.ptr,
+            alloc: this.alloc.clone(),
+        }
+    }
+    
+    /// Returns `true` if two `Rc`s point to the same allocation.
+    #[inline]
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.ptr.as_ptr() == other.ptr.as_ptr()
+    }
+    
+    fn inner(&self) -> &RcBox<T> {
+        unsafe { self.ptr.as_ref() }
+    }
+    
+    /// Returns a mutable reference if there's exactly one strong reference.
+    #[inline]
+    pub fn get_mut(this: &mut Self) -> Option<&mut T> {
+        if Rc::is_unique(this) {
+            unsafe { Some(Self::get_mut_unchecked(this)) }
+        } else {
+            None
+        }
+    }
+    
+    /// Returns a mutable reference without checking uniqueness.
+    /// 
+    /// # Safety
+    /// Must be the only strong reference.
+    #[inline]
+    pub unsafe fn get_mut_unchecked(this: &mut Self) -> &mut T {
+        &mut (*this.ptr.as_ptr()).value
+    }
+    
+    fn is_unique(this: &Self) -> bool {
+        Rc::weak_count(this) == 0 && Rc::strong_count(this) == 1
+    }
+}
+
+impl<T> Rc<MaybeUninit<T>> {
+    /// Converts to `Rc<T>`.
+    /// 
+    /// # Safety
+    /// The value must have been initialized.
+    #[inline]
+    pub unsafe fn assume_init(self) -> Rc<T> {
+        let ptr = self.ptr.cast();
+        let alloc = ptr::read(&self.alloc);
+        mem::forget(self);
+        Rc { ptr, phantom: PhantomData, alloc: Global }
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Deref for Rc<T, A> {
+    type Target = T;
+    
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.inner().value
+    }
+}
+
+impl<T: ?Sized, A: Allocator + Clone> Clone for Rc<T, A> {
+    #[inline]
+    fn clone(&self) -> Self {
+        self.inner().strong.set(self.inner().strong.get() + 1);
+        Rc {
+            ptr: self.ptr,
+            phantom: PhantomData,
+            alloc: self.alloc.clone(),
+        }
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Drop for Rc<T, A> {
+    fn drop(&mut self) {
+        let count = self.inner().strong.get();
+        self.inner().strong.set(count - 1);
+        
+        if count == 1 {
+            // Drop the value
+            unsafe { ptr::drop_in_place(&mut (*self.ptr.as_ptr()).value); }
+            
+            // Decrement weak count
+            let weak = self.inner().weak.get();
+            self.inner().weak.set(weak - 1);
+            
+            if weak == 1 {
+                // Deallocate
+                unsafe {
+                    let layout = Layout::for_value(self.ptr.as_ref());
+                    self.alloc.deallocate(
+                        NonNull::new_unchecked(self.ptr.as_ptr() as *mut u8),
+                        layout,
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl<T: Default> Default for Rc<T> {
+    fn default() -> Self {
+        Rc::new(T::default())
+    }
+}
+
+impl<T: ?Sized + PartialEq, A: Allocator> PartialEq for Rc<T, A> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T: ?Sized + Eq, A: Allocator> Eq for Rc<T, A> {}
+
+impl<T: ?Sized + PartialOrd, A: Allocator> PartialOrd for Rc<T, A> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        (**self).partial_cmp(&**other)
+    }
+}
+
+impl<T: ?Sized + Ord, A: Allocator> Ord for Rc<T, A> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (**self).cmp(&**other)
+    }
+}
+
+impl<T: ?Sized + Hash, A: Allocator> Hash for Rc<T, A> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (**self).hash(state);
+    }
+}
+
+impl<T: ?Sized, A: Allocator> AsRef<T> for Rc<T, A> {
+    fn as_ref(&self) -> &T {
+        &**self
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Borrow<T> for Rc<T, A> {
+    fn borrow(&self) -> &T {
+        &**self
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Unpin for Rc<T, A> {}
+
+// Rc is !Send and !Sync
+impl<T: ?Sized, A: Allocator> !Send for Rc<T, A> {}
+impl<T: ?Sized, A: Allocator> !Sync for Rc<T, A> {}
+
+impl<T> From<T> for Rc<T> {
+    fn from(t: T) -> Self {
+        Rc::new(t)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WEAK<T> — Weak Reference
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A weak reference to an `Rc`-managed allocation.
+/// 
+/// Weak references don't prevent the value from being dropped.
+/// Call `upgrade()` to get a strong reference, which returns `None`
+/// if the value has been dropped.
+pub struct Weak<T: ?Sized, A: Allocator = Global> {
+    ptr: NonNull<RcBox<T>>,
+    alloc: A,
+}
+
+impl<T> Weak<T> {
+    /// Constructs a new `Weak<T>` without allocating.
+    /// 
+    /// `upgrade()` will always return `None`.
+    pub fn new() -> Weak<T> {
+        Weak::new_in(Global)
+    }
+}
+
+impl<T, A: Allocator + Default> Weak<T, A> {
+    /// Constructs a new `Weak<T>` in the given allocator.
+    pub fn new_in(alloc: A) -> Weak<T, A> {
+        Weak {
+            ptr: NonNull::dangling(),
+            alloc,
+        }
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Weak<T, A> {
+    /// Attempts to upgrade to an `Rc<T>`.
+    /// 
+    /// Returns `None` if the value has been dropped.
+    pub fn upgrade(&self) -> Option<Rc<T, A>>
+    where
+        A: Clone,
+    {
+        if self.ptr == NonNull::dangling() {
+            return None;
+        }
+        
+        let inner = unsafe { self.ptr.as_ref() };
+        let strong = inner.strong.get();
+        
+        if strong == 0 {
+            None
+        } else {
+            inner.strong.set(strong + 1);
+            Some(Rc {
+                ptr: self.ptr,
+                phantom: PhantomData,
+                alloc: self.alloc.clone(),
+            })
+        }
+    }
+    
+    /// Returns the number of strong references.
+    pub fn strong_count(&self) -> usize {
+        if self.ptr == NonNull::dangling() {
+            0
+        } else {
+            unsafe { self.ptr.as_ref().strong.get() }
+        }
+    }
+    
+    /// Returns the number of weak references.
+    pub fn weak_count(&self) -> usize {
+        if self.ptr == NonNull::dangling() {
+            0
+        } else {
+            unsafe { self.ptr.as_ref().weak.get() - 1 }
+        }
+    }
+    
+    /// Returns `true` if two `Weak`s point to the same allocation.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        self.ptr.as_ptr() == other.ptr.as_ptr()
+    }
+}
+
+impl<T: ?Sized, A: Allocator + Clone> Clone for Weak<T, A> {
+    fn clone(&self) -> Self {
+        if self.ptr != NonNull::dangling() {
+            let inner = unsafe { self.ptr.as_ref() };
+            inner.weak.set(inner.weak.get() + 1);
+        }
+        Weak {
+            ptr: self.ptr,
+            alloc: self.alloc.clone(),
+        }
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Drop for Weak<T, A> {
+    fn drop(&mut self) {
+        if self.ptr == NonNull::dangling() {
+            return;
+        }
+        
+        let inner = unsafe { self.ptr.as_ref() };
+        let weak = inner.weak.get();
+        inner.weak.set(weak - 1);
+        
+        if weak == 1 {
+            unsafe {
+                let layout = Layout::for_value(self.ptr.as_ref());
+                self.alloc.deallocate(
+                    NonNull::new_unchecked(self.ptr.as_ptr() as *mut u8),
+                    layout,
+                );
+            }
+        }
+    }
+}
+
+impl<T: ?Sized, A: Allocator + Default> Default for Weak<T, A> {
+    fn default() -> Self {
+        Weak::new_in(A::default())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ARC<T> — Atomic Reference Counting (Thread-Safe)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// An atomically reference-counted pointer.
+/// 
+/// `Arc` provides shared ownership with atomic reference counting,
+/// making it safe to share across threads (`Send + Sync`).
+/// 
+/// # Memory Ordering
+/// - Clone uses `Relaxed` for the increment (always succeeds)
+/// - Drop uses `Release` for decrement, `Acquire` fence before deallocation
+/// - This ensures proper synchronization of the value's destructor
+pub struct Arc<T: ?Sized, A: Allocator = Global> {
+    ptr: NonNull<ArcInner<T>>,
+    phantom: PhantomData<ArcInner<T>>,
+    alloc: A,
+}
+
+struct ArcInner<T: ?Sized> {
+    strong: AtomicUsize,
+    weak: AtomicUsize,
+    value: T,
+}
+
+impl<T> Arc<T> {
+    /// Constructs a new `Arc<T>`.
+    #[inline]
+    pub fn new(value: T) -> Arc<T> {
+        Self::new_in(value, Global)
+    }
+    
+    /// Constructs a new `Arc<T>` with uninitialized contents.
+    pub fn new_uninit() -> Arc<MaybeUninit<T>> {
+        Self::new_uninit_in(Global)
+    }
+    
+    /// Constructs a new pinned `Arc<T>`.
+    pub fn pin(value: T) -> core::pin::Pin<Arc<T>> {
+        unsafe { core::pin::Pin::new_unchecked(Arc::new(value)) }
+    }
+    
+    /// Attempts to allocate, returning `Err` on failure.
+    pub fn try_new(value: T) -> Result<Arc<T>, AllocError> {
+        Self::try_new_in(value, Global)
+    }
+}
+
+impl<T, A: Allocator> Arc<T, A> {
+    /// Constructs a new `Arc<T>` in the given allocator.
+    pub fn new_in(value: T, alloc: A) -> Arc<T, A> {
+        let layout = Layout::new::<ArcInner<T>>();
+        let ptr = alloc.allocate(layout).unwrap_or_else(|_| handle_alloc_error(layout));
+        let ptr = ptr.as_ptr() as *mut ArcInner<T>;
+        
+        unsafe {
+            ptr::write(ptr, ArcInner {
+                strong: AtomicUsize::new(1),
+                weak: AtomicUsize::new(1),
+                value,
+            });
+        }
+        
+        Arc {
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
+            phantom: PhantomData,
+            alloc,
+        }
+    }
+    
+    /// Attempts to allocate in the given allocator.
+    pub fn try_new_in(value: T, alloc: A) -> Result<Arc<T, A>, AllocError> {
+        let layout = Layout::new::<ArcInner<T>>();
+        let ptr = alloc.allocate(layout)?;
+        let ptr = ptr.as_ptr() as *mut ArcInner<T>;
+        
+        unsafe {
+            ptr::write(ptr, ArcInner {
+                strong: AtomicUsize::new(1),
+                weak: AtomicUsize::new(1),
+                value,
+            });
+        }
+        
+        Ok(Arc {
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
+            phantom: PhantomData,
+            alloc,
+        })
+    }
+    
+    /// Constructs uninitialized `Arc` in allocator.
+    pub fn new_uninit_in(alloc: A) -> Arc<MaybeUninit<T>, A> {
+        let layout = Layout::new::<ArcInner<MaybeUninit<T>>>();
+        let ptr = alloc.allocate(layout).unwrap_or_else(|_| handle_alloc_error(layout));
+        let ptr = ptr.as_ptr() as *mut ArcInner<MaybeUninit<T>>;
+        
+        unsafe {
+            (*ptr).strong = AtomicUsize::new(1);
+            (*ptr).weak = AtomicUsize::new(1);
+        }
+        
+        Arc {
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
+            phantom: PhantomData,
+            alloc,
+        }
+    }
+    
+    /// Returns the inner value if there's exactly one strong reference.
+    pub fn try_unwrap(this: Self) -> Result<T, Self> {
+        // Try to set strong count from 1 to 0
+        if this.inner().strong.compare_exchange(
+            1,
+            0,
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+        ).is_err() {
+            return Err(this);
+        }
+        
+        // Acquire fence to synchronize with the Release in drop
+        core::sync::atomic::fence(AtomicOrdering::Acquire);
+        
+        unsafe {
+            let val = ptr::read(&this.inner().value);
+            let alloc = ptr::read(&this.alloc);
+            
+            // Decrement weak count
+            let weak = this.inner().weak.fetch_sub(1, AtomicOrdering::Release);
+            
+            if weak == 1 {
+                core::sync::atomic::fence(AtomicOrdering::Acquire);
+                let layout = Layout::for_value(this.ptr.as_ref());
+                alloc.deallocate(
+                    NonNull::new_unchecked(this.ptr.as_ptr() as *mut u8),
+                    layout,
+                );
+            }
+            
+            mem::forget(this);
+            Ok(val)
+        }
+    }
+    
+    /// Consumes the `Arc`, returning the inner value.
+    pub fn into_inner(this: Self) -> Option<T> {
+        Arc::try_unwrap(this).ok()
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Arc<T, A> {
+    /// Returns the number of strong references.
+    #[inline]
+    pub fn strong_count(this: &Self) -> usize {
+        this.inner().strong.load(AtomicOrdering::SeqCst)
+    }
+    
+    /// Returns the number of weak references.
+    pub fn weak_count(this: &Self) -> usize {
+        let weak = this.inner().weak.load(AtomicOrdering::SeqCst);
+        if weak == usize::MAX { 0 } else { weak - 1 }
+    }
+    
+    /// Returns a raw pointer to the inner value.
+    #[inline]
+    pub fn as_ptr(this: &Self) -> *const T {
+        &this.inner().value as *const T
+    }
+    
+    /// Creates a new `Weak` pointer to this allocation.
+    pub fn downgrade(this: &Self) -> AWeak<T, A>
+    where
+        A: Clone,
+    {
+        // Increment weak count
+        let mut weak = this.inner().weak.load(AtomicOrdering::Relaxed);
+        loop {
+            if weak == usize::MAX {
+                core::hint::spin_loop();
+                weak = this.inner().weak.load(AtomicOrdering::Relaxed);
+                continue;
+            }
+            
+            match this.inner().weak.compare_exchange_weak(
+                weak,
+                weak + 1,
+                AtomicOrdering::Acquire,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(x) => weak = x,
+            }
+        }
+        
+        AWeak {
+            ptr: this.ptr,
+            alloc: this.alloc.clone(),
+        }
+    }
+    
+    /// Returns `true` if two `Arc`s point to the same allocation.
+    #[inline]
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.ptr.as_ptr() == other.ptr.as_ptr()
+    }
+    
+    fn inner(&self) -> &ArcInner<T> {
+        unsafe { self.ptr.as_ref() }
+    }
+    
+    /// Returns a mutable reference if there's exactly one strong reference.
+    pub fn get_mut(this: &mut Self) -> Option<&mut T> {
+        if Arc::is_unique(this) {
+            // Acquire fence
+            core::sync::atomic::fence(AtomicOrdering::Acquire);
+            unsafe { Some(Self::get_mut_unchecked(this)) }
+        } else {
+            None
+        }
+    }
+    
+    /// Returns a mutable reference without checking uniqueness.
+    /// 
+    /// # Safety
+    /// Must be the only strong reference.
+    pub unsafe fn get_mut_unchecked(this: &mut Self) -> &mut T {
+        &mut (*this.ptr.as_ptr()).value
+    }
+    
+    fn is_unique(this: &Self) -> bool {
+        Arc::weak_count(this) == 0 && Arc::strong_count(this) == 1
+    }
+}
+
+impl<T> Arc<MaybeUninit<T>> {
+    /// Converts to `Arc<T>`.
+    /// 
+    /// # Safety
+    /// The value must have been initialized.
+    #[inline]
+    pub unsafe fn assume_init(self) -> Arc<T> {
+        let ptr = self.ptr.cast();
+        mem::forget(self);
+        Arc { ptr, phantom: PhantomData, alloc: Global }
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Deref for Arc<T, A> {
+    type Target = T;
+    
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.inner().value
+    }
+}
+
+impl<T: ?Sized, A: Allocator + Clone> Clone for Arc<T, A> {
+    fn clone(&self) -> Self {
+        // Relaxed is sufficient because we're just incrementing
+        let old = self.inner().strong.fetch_add(1, AtomicOrdering::Relaxed);
+        
+        // Check for overflow (unlikely)
+        if old > isize::MAX as usize {
+            core::intrinsics::abort();
+        }
+        
+        Arc {
+            ptr: self.ptr,
+            phantom: PhantomData,
+            alloc: self.alloc.clone(),
+        }
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Drop for Arc<T, A> {
+    fn drop(&mut self) {
+        // Release ensures all previous writes are visible before we drop
+        let old = self.inner().strong.fetch_sub(1, AtomicOrdering::Release);
+        
+        if old != 1 {
+            return;
+        }
+        
+        // Acquire fence synchronizes with the Release above
+        core::sync::atomic::fence(AtomicOrdering::Acquire);
+        
+        unsafe {
+            // Drop the value
+            ptr::drop_in_place(&mut (*self.ptr.as_ptr()).value);
+        }
+        
+        // Now decrement weak count
+        let old = self.inner().weak.fetch_sub(1, AtomicOrdering::Release);
+        
+        if old == 1 {
+            core::sync::atomic::fence(AtomicOrdering::Acquire);
+            
+            unsafe {
+                let layout = Layout::for_value(self.ptr.as_ref());
+                self.alloc.deallocate(
+                    NonNull::new_unchecked(self.ptr.as_ptr() as *mut u8),
+                    layout,
+                );
+            }
+        }
+    }
+}
+
+impl<T: Default> Default for Arc<T> {
+    fn default() -> Self {
+        Arc::new(T::default())
+    }
+}
+
+impl<T: ?Sized + PartialEq, A: Allocator> PartialEq for Arc<T, A> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T: ?Sized + Eq, A: Allocator> Eq for Arc<T, A> {}
+
+impl<T: ?Sized + PartialOrd, A: Allocator> PartialOrd for Arc<T, A> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        (**self).partial_cmp(&**other)
+    }
+}
+
+impl<T: ?Sized + Ord, A: Allocator> Ord for Arc<T, A> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (**self).cmp(&**other)
+    }
+}
+
+impl<T: ?Sized + Hash, A: Allocator> Hash for Arc<T, A> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (**self).hash(state);
+    }
+}
+
+// Arc is Send + Sync if T is
+unsafe impl<T: ?Sized + Send + Sync, A: Allocator + Send> Send for Arc<T, A> {}
+unsafe impl<T: ?Sized + Send + Sync, A: Allocator + Sync> Sync for Arc<T, A> {}
+
+impl<T> From<T> for Arc<T> {
+    fn from(t: T) -> Self {
+        Arc::new(t)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AWEAK<T> — Weak Reference for Arc
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A weak reference to an `Arc`-managed allocation.
+pub struct AWeak<T: ?Sized, A: Allocator = Global> {
+    ptr: NonNull<ArcInner<T>>,
+    alloc: A,
+}
+
+impl<T> AWeak<T> {
+    /// Constructs a new `AWeak<T>` without allocating.
+    pub fn new() -> AWeak<T> {
+        AWeak {
+            ptr: NonNull::dangling(),
+            alloc: Global,
+        }
+    }
+}
+
+impl<T: ?Sized, A: Allocator> AWeak<T, A> {
+    /// Attempts to upgrade to an `Arc<T>`.
+    pub fn upgrade(&self) -> Option<Arc<T, A>>
+    where
+        A: Clone,
+    {
+        if self.ptr == NonNull::dangling() {
+            return None;
+        }
+        
+        let inner = unsafe { self.ptr.as_ref() };
+        let mut n = inner.strong.load(AtomicOrdering::Relaxed);
+        
+        loop {
+            if n == 0 {
+                return None;
+            }
+            
+            match inner.strong.compare_exchange_weak(
+                n,
+                n + 1,
+                AtomicOrdering::Acquire,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(Arc {
+                        ptr: self.ptr,
+                        phantom: PhantomData,
+                        alloc: self.alloc.clone(),
+                    });
+                }
+                Err(old) => n = old,
+            }
+        }
+    }
+    
+    /// Returns the number of strong references.
+    pub fn strong_count(&self) -> usize {
+        if self.ptr == NonNull::dangling() {
+            0
+        } else {
+            unsafe { self.ptr.as_ref().strong.load(AtomicOrdering::SeqCst) }
+        }
+    }
+}
+
+impl<T: ?Sized, A: Allocator + Clone> Clone for AWeak<T, A> {
+    fn clone(&self) -> Self {
+        if self.ptr != NonNull::dangling() {
+            let inner = unsafe { self.ptr.as_ref() };
+            inner.weak.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        AWeak {
+            ptr: self.ptr,
+            alloc: self.alloc.clone(),
+        }
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Drop for AWeak<T, A> {
+    fn drop(&mut self) {
+        if self.ptr == NonNull::dangling() {
+            return;
+        }
+        
+        let inner = unsafe { self.ptr.as_ref() };
+        let old = inner.weak.fetch_sub(1, AtomicOrdering::Release);
+        
+        if old == 1 {
+            core::sync::atomic::fence(AtomicOrdering::Acquire);
+            
+            unsafe {
+                let layout = Layout::for_value(self.ptr.as_ref());
+                self.alloc.deallocate(
+                    NonNull::new_unchecked(self.ptr.as_ptr() as *mut u8),
+                    layout,
+                );
+            }
+        }
+    }
+}
+
+// AWeak is Send + Sync if T is
+unsafe impl<T: ?Sized + Send + Sync, A: Allocator + Send> Send for AWeak<T, A> {}
+unsafe impl<T: ?Sized + Send + Sync, A: Allocator + Sync> Sync for AWeak<T, A> {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_rc_new() {
+        let rc = Rc::new(5);
+        assert_eq!(*rc, 5);
+        assert_eq!(Rc::strong_count(&rc), 1);
+    }
+    
+    #[test]
+    fn test_rc_clone() {
+        let rc1 = Rc::new(5);
+        let rc2 = rc1.clone();
+        
+        assert_eq!(*rc1, 5);
+        assert_eq!(*rc2, 5);
+        assert_eq!(Rc::strong_count(&rc1), 2);
+        assert_eq!(Rc::strong_count(&rc2), 2);
+    }
+    
+    #[test]
+    fn test_rc_drop() {
+        let rc1 = Rc::new(5);
+        let rc2 = rc1.clone();
+        
+        drop(rc1);
+        assert_eq!(Rc::strong_count(&rc2), 1);
+    }
+    
+    #[test]
+    fn test_rc_weak() {
+        let rc = Rc::new(5);
+        let weak = Rc::downgrade(&rc);
+        
+        assert_eq!(Rc::weak_count(&rc), 1);
+        assert!(weak.upgrade().is_some());
+        
+        drop(rc);
+        assert!(weak.upgrade().is_none());
+    }
+    
+    #[test]
+    fn test_arc_new() {
+        let arc = Arc::new(5);
+        assert_eq!(*arc, 5);
+        assert_eq!(Arc::strong_count(&arc), 1);
+    }
+    
+    #[test]
+    fn test_arc_clone() {
+        let arc1 = Arc::new(5);
+        let arc2 = arc1.clone();
+        
+        assert_eq!(*arc1, 5);
+        assert_eq!(*arc2, 5);
+        assert_eq!(Arc::strong_count(&arc1), 2);
+    }
+    
+    #[test]
+    fn test_arc_weak() {
+        let arc = Arc::new(5);
+        let weak = Arc::downgrade(&arc);
+        
+        assert!(weak.upgrade().is_some());
+        
+        drop(arc);
+        assert!(weak.upgrade().is_none());
+    }
+    
+    #[test]
+    fn test_arc_try_unwrap() {
+        let arc = Arc::new(5);
+        let result = Arc::try_unwrap(arc);
+        assert_eq!(result, Ok(5));
+    }
+    
+    #[test]
+    fn test_arc_try_unwrap_fail() {
+        let arc1 = Arc::new(5);
+        let arc2 = arc1.clone();
+        
+        let result = Arc::try_unwrap(arc1);
+        assert!(result.is_err());
+        drop(result);
+        drop(arc2);
+    }
+}

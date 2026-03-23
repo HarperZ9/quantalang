@@ -1,0 +1,622 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ CONCURRENT — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// High-performance concurrency primitives for QuantaLang.
+//
+// Features:
+// - Lock-free data structures (Queue, Stack, Deque)
+// - Work-stealing thread pool
+// - Extended atomic operations
+// - Parallel iterators (rayon-style)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang Concurrent
+//!
+//! High-performance concurrency primitives and parallel execution.
+//!
+//! ## Quick Start
+//!
+//! ```quanta
+//! use quantalang::concurrent::{spawn, join, par_iter};
+//!
+//! // Parallel iteration
+//! let data: Vec<i32> = (0..1000).collect();
+//! let sum: i32 = data.par_iter()
+//!     .map(|x| x * 2)
+//!     .sum();
+//!
+//! // Fork-join parallelism
+//! let (a, b) = join(
+//!     || expensive_computation_a(),
+//!     || expensive_computation_b(),
+//! );
+//! ```
+//!
+//! ## Lock-Free Structures
+//!
+//! ```quanta
+//! use quantalang::concurrent::lockfree::{MpMcQueue, MpMcStack};
+//!
+//! let queue = MpMcQueue::new();
+//! queue.push(42);
+//! assert_eq!(queue.pop(), Some(42));
+//! ```
+//!
+//! ## Thread Pool
+//!
+//! ```quanta
+//! use quantalang::concurrent::pool::ThreadPool;
+//!
+//! let pool = ThreadPool::with_threads(4);
+//! pool.submit(|| println!("Hello from worker!"));
+//! pool.shutdown();
+//! ```
+
+module quantalang::concurrent
+
+// Submodules
+pub mod lockfree;
+pub mod pool;
+pub mod atomic;
+pub mod parallel;
+
+// Re-exports from lockfree
+pub use lockfree::{
+    MpMcQueue, MpMcStack, WorkStealingDeque, Stealer, Steal,
+    SpscQueue, AtomicCell, SeqLock,
+};
+
+// Re-exports from pool
+pub use pool::{
+    ThreadPool, ThreadPoolConfig, Priority,
+    WorkerStats, PoolStats,
+    ScopedThreadPool, scope,
+    global_pool, spawn, spawn_with_priority,
+};
+
+// Re-exports from atomic
+pub use atomic::{
+    AtomicF32, AtomicF64, AtomicOption, AtomicArc,
+    Backoff, CachePadded, Parker, Unparker,
+    full_fence, acquire_fence, release_fence, compiler_barrier,
+};
+
+// Re-exports from parallel
+pub use parallel::{
+    ParallelIterator, IntoParallelIterator, FromParallelIterator,
+    Consumer, join, par_for_each, par_map, par_sort, par_sort_by,
+};
+
+use core::sync::atomic::Ordering;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONVENIENCE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Get number of available CPUs
+pub fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Hint to the CPU that we're in a spin loop
+#[inline]
+pub fn spin_loop_hint() {
+    std::hint::spin_loop();
+}
+
+/// Yield the current thread
+#[inline]
+pub fn yield_now() {
+    std::thread::yield_now();
+}
+
+/// Sleep for a duration
+pub fn sleep(duration: std::time::Duration) {
+    std::thread::sleep(duration);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ONCE / LAZY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use std::sync::Once;
+use core::cell::UnsafeCell;
+
+/// A value that is initialized exactly once
+pub struct OnceValue<T> {
+    once: Once,
+    value: UnsafeCell<Option<T>>,
+}
+
+unsafe impl<T: Send + Sync> Send for OnceValue<T> {}
+unsafe impl<T: Send + Sync> Sync for OnceValue<T> {}
+
+impl<T> OnceValue<T> {
+    /// Create a new uninitialized OnceValue
+    pub const fn new() -> Self {
+        OnceValue {
+            once: Once::new(),
+            value: UnsafeCell::new(None),
+        }
+    }
+    
+    /// Get the value, initializing if necessary
+    pub fn get_or_init<F: FnOnce() -> T>(&self, f: F) -> &T {
+        self.once.call_once(|| {
+            unsafe { *self.value.get() = Some(f()) };
+        });
+        
+        unsafe { (*self.value.get()).as_ref().unwrap() }
+    }
+    
+    /// Check if initialized
+    pub fn is_initialized(&self) -> bool {
+        self.once.is_completed()
+    }
+    
+    /// Get the value if initialized
+    pub fn get(&self) -> Option<&T> {
+        if self.is_initialized() {
+            unsafe { (*self.value.get()).as_ref() }
+        } else {
+            None
+        }
+    }
+}
+
+impl<T> Default for OnceValue<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Lazy initialization wrapper
+pub struct Lazy<T, F = fn() -> T> {
+    once: OnceValue<T>,
+    init: UnsafeCell<Option<F>>,
+}
+
+unsafe impl<T: Send + Sync, F: Send> Send for Lazy<T, F> {}
+unsafe impl<T: Send + Sync, F: Send> Sync for Lazy<T, F> {}
+
+impl<T, F: FnOnce() -> T> Lazy<T, F> {
+    /// Create a new lazy value
+    pub const fn new(f: F) -> Self {
+        Lazy {
+            once: OnceValue::new(),
+            init: UnsafeCell::new(Some(f)),
+        }
+    }
+    
+    /// Force initialization and get the value
+    pub fn force(this: &Self) -> &T {
+        this.once.get_or_init(|| {
+            let f = unsafe { (*this.init.get()).take().unwrap() };
+            f()
+        })
+    }
+}
+
+impl<T, F: FnOnce() -> T> std::ops::Deref for Lazy<T, F> {
+    type Target = T;
+    
+    fn deref(&self) -> &Self::Target {
+        Self::force(self)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCOPED THREADS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Run a closure with scoped threads
+pub fn thread_scope<'env, F, R>(f: F) -> R
+where
+    F: for<'scope> FnOnce(&'scope ThreadScope<'scope, 'env>) -> R,
+{
+    let scope = ThreadScope {
+        handles: std::sync::Mutex::new(Vec::new()),
+        _marker: std::marker::PhantomData,
+    };
+    
+    let result = f(&scope);
+    
+    // Join all spawned threads
+    for handle in scope.handles.into_inner().unwrap() {
+        let _ = handle.join();
+    }
+    
+    result
+}
+
+/// Scope for spawning threads with bounded lifetime
+pub struct ThreadScope<'scope, 'env: 'scope> {
+    handles: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    _marker: std::marker::PhantomData<(&'scope (), &'env ())>,
+}
+
+impl<'scope, 'env> ThreadScope<'scope, 'env> {
+    /// Spawn a scoped thread
+    pub fn spawn<F>(&'scope self, f: F) -> ScopedJoinHandle<'scope>
+    where
+        F: FnOnce() + Send + 'scope,
+    {
+        // Safety: We join all threads before 'scope ends
+        let f: Box<dyn FnOnce() + Send + 'scope> = Box::new(f);
+        let f: Box<dyn FnOnce() + Send + 'static> = unsafe {
+            std::mem::transmute(f)
+        };
+        
+        let handle = std::thread::spawn(f);
+        self.handles.lock().unwrap().push(handle);
+        
+        ScopedJoinHandle { _marker: std::marker::PhantomData }
+    }
+}
+
+/// Handle to a scoped thread
+pub struct ScopedJoinHandle<'scope> {
+    _marker: std::marker::PhantomData<&'scope ()>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SHARDED CONTAINERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A sharded counter for high-contention scenarios
+pub struct ShardedCounter {
+    shards: Vec<CachePadded<std::sync::atomic::AtomicI64>>,
+}
+
+impl ShardedCounter {
+    /// Create a new sharded counter
+    pub fn new() -> Self {
+        let num_shards = num_cpus() * 4;
+        let shards = (0..num_shards)
+            .map(|_| CachePadded::new(std::sync::atomic::AtomicI64::new(0)))
+            .collect();
+        
+        ShardedCounter { shards }
+    }
+    
+    /// Increment the counter
+    pub fn increment(&self) {
+        self.add(1);
+    }
+    
+    /// Decrement the counter
+    pub fn decrement(&self) {
+        self.add(-1);
+    }
+    
+    /// Add a value to the counter
+    pub fn add(&self, value: i64) {
+        let shard = self.get_shard();
+        self.shards[shard].fetch_add(value, Ordering::Relaxed);
+    }
+    
+    /// Get the current value (approximate)
+    pub fn get(&self) -> i64 {
+        self.shards.iter()
+            .map(|s| s.load(Ordering::Relaxed))
+            .sum()
+    }
+    
+    /// Reset all shards to zero
+    pub fn reset(&self) {
+        for shard in &self.shards {
+            shard.store(0, Ordering::Relaxed);
+        }
+    }
+    
+    fn get_shard(&self) -> usize {
+        // Use thread ID for shard selection
+        let thread_id = std::thread::current().id();
+        let hash = format!("{:?}", thread_id).len();
+        hash % self.shards.len()
+    }
+}
+
+impl Default for ShardedCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPIN MUTEX
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use core::sync::atomic::AtomicBool;
+
+/// A simple spin lock for short critical sections
+pub struct SpinLock<T> {
+    locked: AtomicBool,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for SpinLock<T> {}
+unsafe impl<T: Send> Sync for SpinLock<T> {}
+
+impl<T> SpinLock<T> {
+    /// Create a new spin lock
+    pub const fn new(value: T) -> Self {
+        SpinLock {
+            locked: AtomicBool::new(false),
+            data: UnsafeCell::new(value),
+        }
+    }
+    
+    /// Lock and get guard
+    pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        let mut backoff = Backoff::new();
+        
+        while self.locked.compare_exchange_weak(
+            false,
+            true,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ).is_err() {
+            backoff.snooze();
+        }
+        
+        SpinLockGuard { lock: self }
+    }
+    
+    /// Try to lock without spinning
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        if self.locked.compare_exchange(
+            false,
+            true,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ).is_ok() {
+            Some(SpinLockGuard { lock: self })
+        } else {
+            None
+        }
+    }
+    
+    /// Check if locked
+    pub fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::Relaxed)
+    }
+    
+    /// Get mutable reference without locking
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+    
+    /// Consume and return inner value
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+}
+
+/// Guard for SpinLock
+pub struct SpinLockGuard<'a, T> {
+    lock: &'a SpinLock<T>,
+}
+
+impl<'a, T> std::ops::Deref for SpinLockGuard<'a, T> {
+    type Target = T;
+    
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<'a, T> std::ops::DerefMut for SpinLockGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<'a, T> Drop for SpinLockGuard<'a, T> {
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TICKET LOCK (Fair Spin Lock)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use core::sync::atomic::AtomicUsize;
+
+/// A fair ticket-based spin lock
+pub struct TicketLock<T> {
+    next_ticket: AtomicUsize,
+    now_serving: AtomicUsize,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for TicketLock<T> {}
+unsafe impl<T: Send> Sync for TicketLock<T> {}
+
+impl<T> TicketLock<T> {
+    /// Create a new ticket lock
+    pub const fn new(value: T) -> Self {
+        TicketLock {
+            next_ticket: AtomicUsize::new(0),
+            now_serving: AtomicUsize::new(0),
+            data: UnsafeCell::new(value),
+        }
+    }
+    
+    /// Lock and get guard
+    pub fn lock(&self) -> TicketLockGuard<'_, T> {
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        
+        let mut backoff = Backoff::new();
+        while self.now_serving.load(Ordering::Acquire) != ticket {
+            backoff.snooze();
+        }
+        
+        TicketLockGuard { lock: self }
+    }
+    
+    /// Try to lock without waiting
+    pub fn try_lock(&self) -> Option<TicketLockGuard<'_, T>> {
+        let ticket = self.next_ticket.load(Ordering::Relaxed);
+        let serving = self.now_serving.load(Ordering::Acquire);
+        
+        if ticket == serving {
+            if self.next_ticket.compare_exchange(
+                ticket,
+                ticket + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ).is_ok() {
+                return Some(TicketLockGuard { lock: self });
+            }
+        }
+        
+        None
+    }
+}
+
+/// Guard for TicketLock
+pub struct TicketLockGuard<'a, T> {
+    lock: &'a TicketLock<T>,
+}
+
+impl<'a, T> std::ops::Deref for TicketLockGuard<'a, T> {
+    type Target = T;
+    
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<'a, T> std::ops::DerefMut for TicketLockGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<'a, T> Drop for TicketLockGuard<'a, T> {
+    fn drop(&mut self) {
+        self.lock.now_serving.fetch_add(1, Ordering::Release);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Common concurrent types and functions
+pub mod prelude {
+    pub use super::{
+        // Core functions
+        spawn, join, num_cpus, yield_now,
+        par_for_each, par_map, par_sort,
+        
+        // Thread pool
+        ThreadPool, global_pool,
+        
+        // Lock-free structures
+        MpMcQueue, MpMcStack, SpscQueue,
+        
+        // Atomics
+        AtomicF32, AtomicF64, CachePadded, Backoff,
+        
+        // Synchronization
+        SpinLock, TicketLock, OnceValue, Lazy,
+        
+        // Parallel iterators
+        ParallelIterator, IntoParallelIterator,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_once_value() {
+        let once: OnceValue<i32> = OnceValue::new();
+        assert!(!once.is_initialized());
+        
+        let value = once.get_or_init(|| 42);
+        assert_eq!(*value, 42);
+        assert!(once.is_initialized());
+        
+        let value2 = once.get_or_init(|| 100);
+        assert_eq!(*value2, 42);
+    }
+    
+    #[test]
+    fn test_lazy() {
+        static LAZY: Lazy<i32> = Lazy::new(|| 42);
+        assert_eq!(*LAZY, 42);
+    }
+    
+    #[test]
+    fn test_sharded_counter() {
+        let counter = ShardedCounter::new();
+        
+        for _ in 0..1000 {
+            counter.increment();
+        }
+        
+        assert_eq!(counter.get(), 1000);
+    }
+    
+    #[test]
+    fn test_spin_lock() {
+        let lock = SpinLock::new(0);
+        
+        {
+            let mut guard = lock.lock();
+            *guard = 42;
+        }
+        
+        assert_eq!(*lock.lock(), 42);
+    }
+    
+    #[test]
+    fn test_ticket_lock() {
+        let lock = TicketLock::new(0);
+        
+        {
+            let mut guard = lock.lock();
+            *guard = 42;
+        }
+        
+        assert_eq!(*lock.lock(), 42);
+    }
+    
+    #[test]
+    fn test_thread_scope() {
+        let mut data = vec![0; 10];
+        
+        thread_scope(|s| {
+            for (i, item) in data.iter_mut().enumerate() {
+                let ptr = item as *mut i32;
+                s.spawn(move || {
+                    unsafe { *ptr = i as i32 };
+                });
+            }
+        });
+        
+        assert_eq!(data, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+}

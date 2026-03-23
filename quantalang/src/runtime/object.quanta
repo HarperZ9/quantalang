@@ -1,0 +1,775 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Object Model Runtime
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Object model runtime:
+//   - Virtual dispatch tables
+//   - Interface dispatch
+//   - Runtime type information
+//   - Dynamic casting
+//   - Object layout
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::runtime::object
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::mem;
+use core::ptr::NonNull;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE IDENTIFIERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type ID
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TypeId(pub u64);
+
+impl TypeId {
+    /// Generate from type name
+    pub fn from_name(name: &str) -> Self {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in name.bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        TypeId(hash)
+    }
+    
+    pub const INVALID: TypeId = TypeId(0);
+    
+    pub fn is_valid(&self) -> bool {
+        self.0 != 0
+    }
+}
+
+/// Interface ID
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InterfaceId(pub u64);
+
+impl InterfaceId {
+    pub fn from_name(name: &str) -> Self {
+        InterfaceId(TypeId::from_name(name).0)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VTABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Virtual method table
+#[repr(C)]
+pub struct VTable {
+    /// Type information
+    pub type_info: *const TypeInfo,
+    /// Number of methods
+    pub num_methods: u32,
+    /// Destructor
+    pub destructor: Option<unsafe fn(*mut u8)>,
+    /// Method pointers (variable length)
+    pub methods: [*const u8; 0],
+}
+
+impl VTable {
+    /// Get method at index
+    pub unsafe fn get_method(&self, index: usize) -> *const u8 {
+        if index >= self.num_methods as usize {
+            return core::ptr::null();
+        }
+        
+        let methods_ptr = self.methods.as_ptr();
+        *methods_ptr.add(index)
+    }
+    
+    /// Get type info
+    pub fn type_info(&self) -> &TypeInfo {
+        unsafe { &*self.type_info }
+    }
+}
+
+/// Interface method table
+#[repr(C)]
+pub struct ITable {
+    /// Interface ID
+    pub interface_id: InterfaceId,
+    /// Offset to interface in object
+    pub offset: i32,
+    /// Number of methods
+    pub num_methods: u32,
+    /// Method pointers
+    pub methods: [*const u8; 0],
+}
+
+impl ITable {
+    pub unsafe fn get_method(&self, index: usize) -> *const u8 {
+        if index >= self.num_methods as usize {
+            return core::ptr::null();
+        }
+        
+        *self.methods.as_ptr().add(index)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE INFORMATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Runtime type information
+#[repr(C)]
+pub struct TypeInfo {
+    /// Type ID
+    pub id: TypeId,
+    /// Type name
+    pub name: *const u8,
+    /// Name length
+    pub name_len: u32,
+    /// Object size
+    pub size: u32,
+    /// Object alignment
+    pub align: u32,
+    /// Flags
+    pub flags: TypeFlags,
+    /// Base type (for single inheritance)
+    pub base: *const TypeInfo,
+    /// Base offset in object
+    pub base_offset: i32,
+    /// Interface tables
+    pub itables: *const ITableEntry,
+    /// Number of interfaces
+    pub num_interfaces: u32,
+    /// Field descriptors
+    pub fields: *const FieldInfo,
+    /// Number of fields
+    pub num_fields: u32,
+    /// GC trace info
+    pub gc_trace: *const GCTraceInfo,
+}
+
+/// Type flags
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+pub struct TypeFlags(pub u32);
+
+impl TypeFlags {
+    pub const NONE: TypeFlags = TypeFlags(0);
+    pub const ABSTRACT: TypeFlags = TypeFlags(1);
+    pub const FINAL: TypeFlags = TypeFlags(2);
+    pub const INTERFACE: TypeFlags = TypeFlags(4);
+    pub const VALUE_TYPE: TypeFlags = TypeFlags(8);
+    pub const PRIMITIVE: TypeFlags = TypeFlags(16);
+    pub const ARRAY: TypeFlags = TypeFlags(32);
+    pub const NULLABLE: TypeFlags = TypeFlags(64);
+    pub const HAS_FINALIZER: TypeFlags = TypeFlags(128);
+    
+    pub fn is_abstract(&self) -> bool { (self.0 & 1) != 0 }
+    pub fn is_final(&self) -> bool { (self.0 & 2) != 0 }
+    pub fn is_interface(&self) -> bool { (self.0 & 4) != 0 }
+    pub fn is_value_type(&self) -> bool { (self.0 & 8) != 0 }
+    pub fn is_primitive(&self) -> bool { (self.0 & 16) != 0 }
+    pub fn is_array(&self) -> bool { (self.0 & 32) != 0 }
+    pub fn is_nullable(&self) -> bool { (self.0 & 64) != 0 }
+    pub fn has_finalizer(&self) -> bool { (self.0 & 128) != 0 }
+}
+
+/// Interface table entry
+#[repr(C)]
+pub struct ITableEntry {
+    /// Interface ID
+    pub interface_id: InterfaceId,
+    /// Pointer to ITable
+    pub itable: *const ITable,
+}
+
+/// Field information
+#[repr(C)]
+pub struct FieldInfo {
+    /// Field name
+    pub name: *const u8,
+    /// Name length
+    pub name_len: u32,
+    /// Field type
+    pub type_info: *const TypeInfo,
+    /// Offset in object
+    pub offset: u32,
+    /// Field flags
+    pub flags: FieldFlags,
+}
+
+/// Field flags
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+pub struct FieldFlags(pub u32);
+
+impl FieldFlags {
+    pub const NONE: FieldFlags = FieldFlags(0);
+    pub const PUBLIC: FieldFlags = FieldFlags(1);
+    pub const PRIVATE: FieldFlags = FieldFlags(2);
+    pub const PROTECTED: FieldFlags = FieldFlags(4);
+    pub const STATIC: FieldFlags = FieldFlags(8);
+    pub const READONLY: FieldFlags = FieldFlags(16);
+    pub const REFERENCE: FieldFlags = FieldFlags(32);
+}
+
+/// GC trace information
+#[repr(C)]
+pub struct GCTraceInfo {
+    /// Number of reference fields
+    pub num_refs: u32,
+    /// Reference offsets
+    pub ref_offsets: [u32; 0],
+}
+
+impl TypeInfo {
+    /// Get type name as string
+    pub fn name_str(&self) -> &str {
+        unsafe {
+            let slice = core::slice::from_raw_parts(self.name, self.name_len as usize);
+            core::str::from_utf8_unchecked(slice)
+        }
+    }
+    
+    /// Check if type is subtype of another
+    pub fn is_subtype_of(&self, other: &TypeInfo) -> bool {
+        if self.id == other.id {
+            return true;
+        }
+        
+        // Walk base chain
+        let mut current = self.base;
+        while !current.is_null() {
+            let base = unsafe { &*current };
+            if base.id == other.id {
+                return true;
+            }
+            current = base.base;
+        }
+        
+        false
+    }
+    
+    /// Check if type implements interface
+    pub fn implements(&self, interface_id: InterfaceId) -> bool {
+        if self.itables.is_null() || self.num_interfaces == 0 {
+            return false;
+        }
+        
+        unsafe {
+            let entries = core::slice::from_raw_parts(self.itables, self.num_interfaces as usize);
+            entries.iter().any(|e| e.interface_id == interface_id)
+        }
+    }
+    
+    /// Get ITable for interface
+    pub fn get_itable(&self, interface_id: InterfaceId) -> Option<&ITable> {
+        if self.itables.is_null() {
+            return None;
+        }
+        
+        unsafe {
+            let entries = core::slice::from_raw_parts(self.itables, self.num_interfaces as usize);
+            entries.iter()
+                .find(|e| e.interface_id == interface_id)
+                .map(|e| &*e.itable)
+        }
+    }
+    
+    /// Get field by name
+    pub fn get_field(&self, name: &str) -> Option<&FieldInfo> {
+        if self.fields.is_null() {
+            return None;
+        }
+        
+        unsafe {
+            let fields = core::slice::from_raw_parts(self.fields, self.num_fields as usize);
+            fields.iter().find(|f| {
+                let field_name = core::slice::from_raw_parts(f.name, f.name_len as usize);
+                field_name == name.as_bytes()
+            })
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OBJECT HEADER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Object header
+#[repr(C)]
+pub struct ObjectHeader {
+    /// VTable pointer
+    pub vtable: *const VTable,
+    /// Monitor word (hash code + lock state)
+    pub monitor: AtomicUsize,
+}
+
+impl ObjectHeader {
+    pub const SIZE: usize = mem::size_of::<ObjectHeader>();
+    
+    /// Monitor word layout:
+    /// - Bits 0-1: Lock state (00=unlocked, 01=biased, 10=thin, 11=fat)
+    /// - Bits 2-31/63: Hash code or lock data
+    
+    const LOCK_MASK: usize = 0x3;
+    const UNLOCKED: usize = 0;
+    const BIASED: usize = 1;
+    const THIN_LOCK: usize = 2;
+    const FAT_LOCK: usize = 3;
+    
+    const HASH_SHIFT: usize = 2;
+    
+    pub fn new(vtable: *const VTable) -> Self {
+        ObjectHeader {
+            vtable,
+            monitor: AtomicUsize::new(0),
+        }
+    }
+    
+    /// Get data pointer
+    pub fn data(&self) -> *mut u8 {
+        unsafe {
+            (self as *const ObjectHeader as *mut u8).add(Self::SIZE)
+        }
+    }
+    
+    /// Get header from object pointer
+    pub unsafe fn from_ptr(ptr: *const u8) -> *const ObjectHeader {
+        ptr.sub(Self::SIZE) as *const ObjectHeader
+    }
+    
+    /// Get type info
+    pub fn type_info(&self) -> &TypeInfo {
+        unsafe { (*self.vtable).type_info() }
+    }
+    
+    /// Get hash code
+    pub fn hash_code(&self) -> u32 {
+        let monitor = self.monitor.load(Ordering::Relaxed);
+        let hash = (monitor >> Self::HASH_SHIFT) as u32;
+        
+        if hash == 0 {
+            // Generate and store hash code
+            let new_hash = self.generate_hash();
+            let new_monitor = (new_hash as usize) << Self::HASH_SHIFT;
+            
+            // CAS to store hash
+            let _ = self.monitor.compare_exchange(
+                monitor,
+                new_monitor | (monitor & Self::LOCK_MASK),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            
+            new_hash
+        } else {
+            hash
+        }
+    }
+    
+    fn generate_hash(&self) -> u32 {
+        // Use object address for hash
+        let addr = self as *const _ as usize;
+        ((addr >> 4) ^ (addr >> 20)) as u32
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DYNAMIC CASTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Dynamic cast result
+#[derive(Debug)]
+pub enum CastResult<T> {
+    Success(T),
+    Failure,
+}
+
+/// Dynamic cast to type
+pub unsafe fn dynamic_cast<T>(obj: *const u8, target_type: &TypeInfo) -> CastResult<*const u8> {
+    if obj.is_null() {
+        return CastResult::Failure;
+    }
+    
+    let header = ObjectHeader::from_ptr(obj);
+    let source_type = (*header).type_info();
+    
+    if source_type.is_subtype_of(target_type) {
+        // Upcast or same type
+        CastResult::Success(obj)
+    } else if target_type.is_subtype_of(source_type) {
+        // Downcast - need to verify at runtime
+        CastResult::Failure
+    } else {
+        CastResult::Failure
+    }
+}
+
+/// Interface cast
+pub unsafe fn interface_cast(obj: *const u8, interface_id: InterfaceId) -> CastResult<*const u8> {
+    if obj.is_null() {
+        return CastResult::Failure;
+    }
+    
+    let header = ObjectHeader::from_ptr(obj);
+    let type_info = (*header).type_info();
+    
+    if let Some(itable) = type_info.get_itable(interface_id) {
+        // Adjust pointer by interface offset
+        let adjusted = (obj as *mut u8).offset(itable.offset as isize);
+        CastResult::Success(adjusted)
+    } else {
+        CastResult::Failure
+    }
+}
+
+/// Is instance check
+pub unsafe fn is_instance(obj: *const u8, type_id: TypeId) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    
+    let header = ObjectHeader::from_ptr(obj);
+    let type_info = (*header).type_info();
+    
+    // Walk type hierarchy
+    if type_info.id == type_id {
+        return true;
+    }
+    
+    let mut current = type_info.base;
+    while !current.is_null() {
+        if (*current).id == type_id {
+            return true;
+        }
+        current = (*current).base;
+    }
+    
+    false
+}
+
+/// Is instance of interface
+pub unsafe fn is_instance_interface(obj: *const u8, interface_id: InterfaceId) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    
+    let header = ObjectHeader::from_ptr(obj);
+    let type_info = (*header).type_info();
+    
+    type_info.implements(interface_id)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VIRTUAL DISPATCH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Virtual method dispatch
+#[inline]
+pub unsafe fn virtual_call(obj: *const u8, method_index: usize) -> *const u8 {
+    let header = ObjectHeader::from_ptr(obj);
+    let vtable = (*header).vtable;
+    (*vtable).get_method(method_index)
+}
+
+/// Interface method dispatch
+#[inline]
+pub unsafe fn interface_call(
+    obj: *const u8,
+    interface_id: InterfaceId,
+    method_index: usize,
+) -> *const u8 {
+    let header = ObjectHeader::from_ptr(obj);
+    let type_info = (*header).type_info();
+    
+    if let Some(itable) = type_info.get_itable(interface_id) {
+        itable.get_method(method_index)
+    } else {
+        core::ptr::null()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OBJECT ALLOCATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Allocate object
+pub unsafe fn alloc_object(vtable: *const VTable) -> *mut u8 {
+    let type_info = (*vtable).type_info;
+    let size = (*type_info).size as usize + ObjectHeader::SIZE;
+    let align = (*type_info).align as usize;
+    
+    // Allocate from GC
+    let ptr = crate::runtime::allocator::alloc(size);
+    
+    if ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    
+    // Initialize header
+    let header = ptr as *mut ObjectHeader;
+    *header = ObjectHeader::new(vtable);
+    
+    // Zero initialize fields
+    let data = (*header).data();
+    core::ptr::write_bytes(data, 0, (*type_info).size as usize);
+    
+    data
+}
+
+/// Allocate array
+pub unsafe fn alloc_array(
+    element_vtable: *const VTable,
+    length: usize,
+) -> *mut u8 {
+    let element_info = (*element_vtable).type_info;
+    let element_size = (*element_info).size as usize;
+    
+    let header_size = ObjectHeader::SIZE + mem::size_of::<usize>(); // vtable + length
+    let data_size = element_size * length;
+    let total_size = header_size + data_size;
+    
+    let ptr = crate::runtime::allocator::alloc(total_size);
+    
+    if ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    
+    // Initialize array header
+    let header = ptr as *mut ObjectHeader;
+    *header = ObjectHeader::new(element_vtable);
+    
+    // Store length
+    let length_ptr = (ptr as *mut u8).add(ObjectHeader::SIZE) as *mut usize;
+    *length_ptr = length;
+    
+    // Zero initialize elements
+    let data = (ptr as *mut u8).add(header_size);
+    core::ptr::write_bytes(data, 0, data_size);
+    
+    data
+}
+
+/// Get array length
+pub unsafe fn array_length(array: *const u8) -> usize {
+    let length_ptr = array.sub(mem::size_of::<usize>()) as *const usize;
+    *length_ptr
+}
+
+/// Get array element
+pub unsafe fn array_get(array: *const u8, index: usize, element_size: usize) -> *const u8 {
+    array.add(index * element_size)
+}
+
+/// Set array element
+pub unsafe fn array_set(array: *mut u8, index: usize, element_size: usize, value: *const u8) {
+    let dest = array.add(index * element_size);
+    core::ptr::copy_nonoverlapping(value, dest, element_size);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OBJECT CLONING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Shallow clone object
+pub unsafe fn clone_shallow(obj: *const u8) -> *mut u8 {
+    let header = ObjectHeader::from_ptr(obj);
+    let vtable = (*header).vtable;
+    let type_info = (*vtable).type_info;
+    let size = (*type_info).size as usize;
+    
+    let new_obj = alloc_object(vtable);
+    
+    if !new_obj.is_null() {
+        core::ptr::copy_nonoverlapping(obj, new_obj, size);
+    }
+    
+    new_obj
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OBJECT LOCKING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Monitor for fat locking
+pub struct Monitor {
+    /// Owner thread ID
+    owner: AtomicUsize,
+    /// Recursion count
+    count: AtomicUsize,
+    /// Wait queue
+    wait_queue: AtomicPtr<WaitNode>,
+}
+
+struct WaitNode {
+    thread_id: usize,
+    next: *mut WaitNode,
+}
+
+impl Monitor {
+    pub fn new() -> Self {
+        Monitor {
+            owner: AtomicUsize::new(0),
+            count: AtomicUsize::new(0),
+            wait_queue: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+    
+    pub fn lock(&self, thread_id: usize) {
+        loop {
+            let owner = self.owner.load(Ordering::Relaxed);
+            
+            if owner == 0 {
+                if self.owner.compare_exchange(
+                    0,
+                    thread_id,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ).is_ok() {
+                    self.count.store(1, Ordering::Relaxed);
+                    return;
+                }
+            } else if owner == thread_id {
+                // Recursive lock
+                self.count.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            
+            // Spin or park
+            core::hint::spin_loop();
+        }
+    }
+    
+    pub fn unlock(&self, thread_id: usize) {
+        let owner = self.owner.load(Ordering::Relaxed);
+        
+        if owner != thread_id {
+            // Not owner - error
+            return;
+        }
+        
+        let count = self.count.fetch_sub(1, Ordering::Relaxed);
+        
+        if count == 1 {
+            self.owner.store(0, Ordering::Release);
+            // Wake up waiters
+        }
+    }
+    
+    pub fn try_lock(&self, thread_id: usize) -> bool {
+        let owner = self.owner.load(Ordering::Relaxed);
+        
+        if owner == 0 {
+            self.owner.compare_exchange(
+                0,
+                thread_id,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ).is_ok()
+        } else {
+            owner == thread_id
+        }
+    }
+}
+
+impl Default for Monitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Lock object
+pub unsafe fn lock_object(obj: *const u8, thread_id: usize) {
+    let header = obj.sub(ObjectHeader::SIZE) as *mut ObjectHeader;
+    
+    // Try thin lock first
+    let monitor = (*header).monitor.load(Ordering::Relaxed);
+    let lock_state = monitor & ObjectHeader::LOCK_MASK;
+    
+    if lock_state == ObjectHeader::UNLOCKED {
+        let new_monitor = (thread_id << 2) | ObjectHeader::THIN_LOCK;
+        
+        if (*header).monitor.compare_exchange(
+            monitor,
+            new_monitor,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ).is_ok() {
+            return;
+        }
+    }
+    
+    // Inflate to fat lock
+    inflate_lock(header, thread_id);
+}
+
+/// Unlock object
+pub unsafe fn unlock_object(obj: *const u8, thread_id: usize) {
+    let header = obj.sub(ObjectHeader::SIZE) as *mut ObjectHeader;
+    
+    let monitor = (*header).monitor.load(Ordering::Relaxed);
+    let lock_state = monitor & ObjectHeader::LOCK_MASK;
+    
+    if lock_state == ObjectHeader::THIN_LOCK {
+        let owner = monitor >> 2;
+        
+        if owner == thread_id {
+            (*header).monitor.store(
+                monitor & !ObjectHeader::LOCK_MASK,
+                Ordering::Release,
+            );
+        }
+    } else if lock_state == ObjectHeader::FAT_LOCK {
+        // Use monitor
+    }
+}
+
+fn inflate_lock(header: *mut ObjectHeader, thread_id: usize) {
+    // Inflate thin lock to fat lock
+    // Allocate monitor, etc.
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_type_id() {
+        let id1 = TypeId::from_name("MyClass");
+        let id2 = TypeId::from_name("MyClass");
+        let id3 = TypeId::from_name("OtherClass");
+        
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+        assert!(id1.is_valid());
+    }
+    
+    #[test]
+    fn test_type_flags() {
+        let flags = TypeFlags(TypeFlags::ABSTRACT.0 | TypeFlags::INTERFACE.0);
+        
+        assert!(flags.is_abstract());
+        assert!(flags.is_interface());
+        assert!(!flags.is_final());
+    }
+    
+    #[test]
+    fn test_monitor() {
+        let monitor = Monitor::new();
+        
+        assert!(monitor.try_lock(1));
+        assert!(monitor.try_lock(1)); // Recursive
+        
+        monitor.unlock(1);
+        monitor.unlock(1);
+    }
+}

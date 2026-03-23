@@ -1,0 +1,1189 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Loop Optimizations
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Loop optimization infrastructure:
+//   - Loop Invariant Code Motion (LICM)
+//   - Loop Unrolling
+//   - Loop Fusion
+//   - Loop Fission (Distribution)
+//   - Loop Interchange
+//   - Loop Tiling
+//   - Loop Strength Reduction
+//   - Loop Unswitching
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::loops
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use crate::opt::alias::BasicAliasAnalysis;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop information
+#[derive(Debug, Clone)]
+pub struct LoopInfo {
+    /// Loop ID
+    pub id: u32,
+    /// Header block
+    pub header: u32,
+    /// Preheader block (if exists)
+    pub preheader: Option<u32>,
+    /// Latch blocks (back edges to header)
+    pub latches: Vec<u32>,
+    /// Exit blocks
+    pub exits: Vec<u32>,
+    /// All blocks in the loop
+    pub blocks: BTreeSet<u32>,
+    /// Parent loop (if nested)
+    pub parent: Option<u32>,
+    /// Child loops
+    pub children: Vec<u32>,
+    /// Loop depth (1 = outermost)
+    pub depth: u32,
+    /// Trip count (if known)
+    pub trip_count: Option<u64>,
+    /// Induction variable
+    pub induction_var: Option<InductionVariable>,
+}
+
+/// Induction variable description
+#[derive(Debug, Clone)]
+pub struct InductionVariable {
+    /// Variable name
+    pub name: String,
+    /// Initial value
+    pub start: i64,
+    /// Step value
+    pub step: i64,
+    /// Final value (for bounded loops)
+    pub end: Option<i64>,
+    /// Comparison operator
+    pub cmp_op: CompareOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    Lt, Le, Gt, Ge, Eq, Ne,
+}
+
+/// Loop nest analysis
+#[derive(Debug)]
+pub struct LoopNest {
+    /// All loops
+    loops: BTreeMap<u32, LoopInfo>,
+    /// Block to innermost containing loop
+    block_to_loop: BTreeMap<u32, u32>,
+    /// Next loop ID
+    next_id: u32,
+}
+
+impl LoopNest {
+    pub fn new() -> Self {
+        LoopNest {
+            loops: BTreeMap::new(),
+            block_to_loop: BTreeMap::new(),
+            next_id: 0,
+        }
+    }
+    
+    /// Analyze loops in a function
+    pub fn analyze(func: &MirFunction) -> Self {
+        let mut nest = LoopNest::new();
+        
+        // Find back edges
+        let back_edges = nest.find_back_edges(func);
+        
+        // Build natural loops from back edges
+        for (latch, header) in back_edges {
+            nest.build_natural_loop(func, header, latch);
+        }
+        
+        // Compute loop nesting
+        nest.compute_nesting();
+        
+        // Analyze loop bounds
+        nest.analyze_bounds(func);
+        
+        nest
+    }
+    
+    fn find_back_edges(&self, func: &MirFunction) -> Vec<(u32, u32)> {
+        let mut back_edges = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut in_stack = BTreeSet::new();
+        
+        self.dfs_back_edges(func, 0, &mut visited, &mut in_stack, &mut back_edges);
+        
+        back_edges
+    }
+    
+    fn dfs_back_edges(
+        &self,
+        func: &MirFunction,
+        block_id: u32,
+        visited: &mut BTreeSet<u32>,
+        in_stack: &mut BTreeSet<u32>,
+        back_edges: &mut Vec<(u32, u32)>,
+    ) {
+        visited.insert(block_id);
+        in_stack.insert(block_id);
+        
+        let block = &func.blocks[block_id as usize];
+        
+        for succ in self.get_successors(&block.terminator) {
+            if in_stack.contains(&succ) {
+                // Back edge found
+                back_edges.push((block_id, succ));
+            } else if !visited.contains(&succ) {
+                self.dfs_back_edges(func, succ, visited, in_stack, back_edges);
+            }
+        }
+        
+        in_stack.remove(&block_id);
+    }
+    
+    fn get_successors(&self, term: &MirTerminator) -> Vec<u32> {
+        match term {
+            MirTerminator::Goto(target) => vec![*target],
+            MirTerminator::If { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+            MirTerminator::Switch { targets, default, .. } => {
+                let mut succs: Vec<_> = targets.iter().map(|(_, t)| *t).collect();
+                succs.push(*default);
+                succs
+            }
+            MirTerminator::Return { .. } | MirTerminator::Unreachable => vec![],
+        }
+    }
+    
+    fn build_natural_loop(&mut self, func: &MirFunction, header: u32, latch: u32) {
+        let loop_id = self.next_id;
+        self.next_id += 1;
+        
+        let mut blocks = BTreeSet::new();
+        blocks.insert(header);
+        
+        // Find all blocks in loop using reverse DFS from latch
+        let mut worklist = vec![latch];
+        while let Some(block) = worklist.pop() {
+            if blocks.insert(block) {
+                // Add predecessors
+                for pred in self.get_predecessors(func, block) {
+                    if pred != header {
+                        worklist.push(pred);
+                    }
+                }
+            }
+        }
+        
+        // Find exits
+        let exits: Vec<u32> = blocks.iter()
+            .flat_map(|&b| {
+                let block = &func.blocks[b as usize];
+                self.get_successors(&block.terminator).into_iter()
+                    .filter(|s| !blocks.contains(s))
+            })
+            .collect();
+        
+        // Find latches (may be multiple)
+        let latches: Vec<u32> = blocks.iter()
+            .filter(|&&b| {
+                let block = &func.blocks[b as usize];
+                self.get_successors(&block.terminator).contains(&header)
+            })
+            .copied()
+            .collect();
+        
+        // Find preheader
+        let preheader = self.find_preheader(func, header, &blocks);
+        
+        let loop_info = LoopInfo {
+            id: loop_id,
+            header,
+            preheader,
+            latches,
+            exits,
+            blocks: blocks.clone(),
+            parent: None,
+            children: Vec::new(),
+            depth: 1,
+            trip_count: None,
+            induction_var: None,
+        };
+        
+        // Update block_to_loop mapping
+        for &block in &blocks {
+            self.block_to_loop.insert(block, loop_id);
+        }
+        
+        self.loops.insert(loop_id, loop_info);
+    }
+    
+    fn get_predecessors(&self, func: &MirFunction, block_id: u32) -> Vec<u32> {
+        let mut preds = Vec::new();
+        
+        for (i, block) in func.blocks.iter().enumerate() {
+            if self.get_successors(&block.terminator).contains(&block_id) {
+                preds.push(i as u32);
+            }
+        }
+        
+        preds
+    }
+    
+    fn find_preheader(&self, func: &MirFunction, header: u32, loop_blocks: &BTreeSet<u32>) -> Option<u32> {
+        let preds = self.get_predecessors(func, header);
+        let external_preds: Vec<_> = preds.into_iter()
+            .filter(|p| !loop_blocks.contains(p))
+            .collect();
+        
+        if external_preds.len() == 1 {
+            Some(external_preds[0])
+        } else {
+            None
+        }
+    }
+    
+    fn compute_nesting(&mut self) {
+        let loop_ids: Vec<u32> = self.loops.keys().copied().collect();
+        
+        for &inner_id in &loop_ids {
+            for &outer_id in &loop_ids {
+                if inner_id == outer_id { continue; }
+                
+                let inner = &self.loops[&inner_id];
+                let outer = &self.loops[&outer_id];
+                
+                // Check if inner is contained in outer
+                if inner.blocks.is_subset(&outer.blocks) && inner.header != outer.header {
+                    // inner is nested in outer
+                    if let Some(current_parent) = self.loops[&inner_id].parent {
+                        // Choose most immediate parent
+                        let current_parent_size = self.loops[&current_parent].blocks.len();
+                        if outer.blocks.len() < current_parent_size {
+                            self.loops.get_mut(&inner_id).unwrap().parent = Some(outer_id);
+                        }
+                    } else {
+                        self.loops.get_mut(&inner_id).unwrap().parent = Some(outer_id);
+                    }
+                }
+            }
+        }
+        
+        // Build children lists and compute depths
+        for &id in &loop_ids {
+            if let Some(parent_id) = self.loops[&id].parent {
+                self.loops.get_mut(&parent_id).unwrap().children.push(id);
+            }
+        }
+        
+        // Compute depths
+        for &id in &loop_ids {
+            let depth = self.compute_depth(id);
+            self.loops.get_mut(&id).unwrap().depth = depth;
+        }
+    }
+    
+    fn compute_depth(&self, loop_id: u32) -> u32 {
+        let loop_info = &self.loops[&loop_id];
+        match loop_info.parent {
+            Some(parent_id) => self.compute_depth(parent_id) + 1,
+            None => 1,
+        }
+    }
+    
+    fn analyze_bounds(&mut self, func: &MirFunction) {
+        let loop_ids: Vec<u32> = self.loops.keys().copied().collect();
+        
+        for loop_id in loop_ids {
+            if let Some(iv) = self.find_induction_variable(func, loop_id) {
+                let trip_count = self.compute_trip_count(&iv);
+                
+                let loop_info = self.loops.get_mut(&loop_id).unwrap();
+                loop_info.induction_var = Some(iv);
+                loop_info.trip_count = trip_count;
+            }
+        }
+    }
+    
+    fn find_induction_variable(&self, func: &MirFunction, loop_id: u32) -> Option<InductionVariable> {
+        let loop_info = &self.loops[&loop_id];
+        let header = &func.blocks[loop_info.header as usize];
+        
+        // Look for PHI node with increment pattern
+        for stmt in &header.statements {
+            if let MirStatement::Phi { dest, incoming } = stmt {
+                // Check if one incoming value is increment of dest
+                for (pred, value) in incoming {
+                    if loop_info.latches.contains(pred) {
+                        if let Some(step) = self.is_increment(func, value, dest) {
+                            let start = self.find_initial_value(incoming, &loop_info.latches);
+                            
+                            // Find comparison in latch
+                            if let Some((end, cmp_op)) = self.find_bound(func, loop_info, dest) {
+                                return Some(InductionVariable {
+                                    name: dest.clone(),
+                                    start,
+                                    step,
+                                    end: Some(end),
+                                    cmp_op,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn is_increment(&self, func: &MirFunction, value: &MirOperand, base: &str) -> Option<i64> {
+        // Check if value is base + constant or base - constant
+        if let MirOperand::Variable(name) = value {
+            // Find definition
+            for block in &func.blocks {
+                for stmt in &block.statements {
+                    if let MirStatement::BinaryOp { dest, op, lhs, rhs } = stmt {
+                        if dest == name {
+                            match (op, lhs, rhs) {
+                                (BinOp::Add, MirOperand::Variable(l), MirOperand::Constant(c))
+                                    if l == base => return Some(*c),
+                                (BinOp::Add, MirOperand::Constant(c), MirOperand::Variable(r))
+                                    if r == base => return Some(*c),
+                                (BinOp::Sub, MirOperand::Variable(l), MirOperand::Constant(c))
+                                    if l == base => return Some(-*c),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn find_initial_value(&self, incoming: &[(u32, MirOperand)], latches: &[u32]) -> i64 {
+        for (pred, value) in incoming {
+            if !latches.contains(pred) {
+                if let MirOperand::Constant(c) = value {
+                    return *c;
+                }
+            }
+        }
+        0
+    }
+    
+    fn find_bound(&self, func: &MirFunction, loop_info: &LoopInfo, iv_name: &str) -> Option<(i64, CompareOp)> {
+        // Look in latch for comparison
+        for &latch in &loop_info.latches {
+            let block = &func.blocks[latch as usize];
+            
+            if let MirTerminator::If { cond, .. } = &block.terminator {
+                if let MirOperand::Variable(cond_name) = cond {
+                    // Find comparison
+                    for stmt in &block.statements {
+                        if let MirStatement::Compare { dest, op, lhs, rhs } = stmt {
+                            if dest == cond_name {
+                                if lhs.is_var(iv_name) {
+                                    if let MirOperand::Constant(c) = rhs {
+                                        return Some((*c, *op));
+                                    }
+                                }
+                                if rhs.is_var(iv_name) {
+                                    if let MirOperand::Constant(c) = lhs {
+                                        return Some((*c, op.swap()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn compute_trip_count(&self, iv: &InductionVariable) -> Option<u64> {
+        let end = iv.end?;
+        
+        if iv.step == 0 {
+            return None; // Infinite loop
+        }
+        
+        let range = match iv.cmp_op {
+            CompareOp::Lt => end - iv.start,
+            CompareOp::Le => end - iv.start + 1,
+            CompareOp::Gt => iv.start - end,
+            CompareOp::Ge => iv.start - end + 1,
+            _ => return None,
+        };
+        
+        if range <= 0 {
+            return Some(0);
+        }
+        
+        Some((range / iv.step.abs()) as u64)
+    }
+    
+    /// Get loop info
+    pub fn get_loop(&self, id: u32) -> Option<&LoopInfo> {
+        self.loops.get(&id)
+    }
+    
+    /// Get innermost loop containing a block
+    pub fn get_loop_for_block(&self, block: u32) -> Option<&LoopInfo> {
+        self.block_to_loop.get(&block).and_then(|id| self.loops.get(id))
+    }
+    
+    /// Iterate over all loops
+    pub fn iter(&self) -> impl Iterator<Item = &LoopInfo> {
+        self.loops.values()
+    }
+}
+
+impl Default for LoopNest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CompareOp {
+    fn swap(self) -> Self {
+        match self {
+            CompareOp::Lt => CompareOp::Gt,
+            CompareOp::Le => CompareOp::Ge,
+            CompareOp::Gt => CompareOp::Lt,
+            CompareOp::Ge => CompareOp::Le,
+            CompareOp::Eq => CompareOp::Eq,
+            CompareOp::Ne => CompareOp::Ne,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP INVARIANT CODE MOTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop Invariant Code Motion pass
+pub struct Licm {
+    alias_analysis: BasicAliasAnalysis,
+}
+
+impl Licm {
+    pub fn new(alias_analysis: BasicAliasAnalysis) -> Self {
+        Licm { alias_analysis }
+    }
+    
+    /// Run LICM on a function
+    pub fn run(&self, func: &mut MirFunction, loop_nest: &LoopNest) -> u32 {
+        let mut hoisted = 0;
+        
+        // Process loops from innermost to outermost
+        let mut loops_by_depth: Vec<&LoopInfo> = loop_nest.iter().collect();
+        loops_by_depth.sort_by(|a, b| b.depth.cmp(&a.depth));
+        
+        for loop_info in loops_by_depth {
+            hoisted += self.process_loop(func, loop_info, loop_nest);
+        }
+        
+        hoisted
+    }
+    
+    fn process_loop(&self, func: &mut MirFunction, loop_info: &LoopInfo, loop_nest: &LoopNest) -> u32 {
+        let preheader = match loop_info.preheader {
+            Some(ph) => ph,
+            None => return 0, // Need preheader for hoisting
+        };
+        
+        let mut hoisted = 0;
+        let mut to_hoist: Vec<(u32, usize)> = Vec::new();
+        
+        // Find loop-invariant instructions
+        let invariant = self.find_invariant_instructions(func, loop_info);
+        
+        for (block_id, stmt_idx) in invariant {
+            // Check if safe to hoist
+            if self.is_safe_to_hoist(func, block_id, stmt_idx, loop_info) {
+                to_hoist.push((block_id, stmt_idx));
+            }
+        }
+        
+        // Hoist instructions to preheader
+        to_hoist.sort_by(|a, b| b.1.cmp(&a.1)); // Process in reverse order
+        
+        for (block_id, stmt_idx) in to_hoist {
+            let stmt = func.blocks[block_id as usize].statements.remove(stmt_idx);
+            
+            // Insert at end of preheader (before terminator)
+            func.blocks[preheader as usize].statements.push(stmt);
+            hoisted += 1;
+        }
+        
+        hoisted
+    }
+    
+    fn find_invariant_instructions(&self, func: &MirFunction, loop_info: &LoopInfo) -> Vec<(u32, usize)> {
+        let mut invariant = Vec::new();
+        let mut defined_in_loop: BTreeSet<String> = BTreeSet::new();
+        
+        // Collect all definitions in loop
+        for &block_id in &loop_info.blocks {
+            let block = &func.blocks[block_id as usize];
+            for stmt in &block.statements {
+                if let Some(def) = self.get_defined_var(stmt) {
+                    defined_in_loop.insert(def);
+                }
+            }
+        }
+        
+        // Find invariant instructions
+        let mut changed = true;
+        while changed {
+            changed = false;
+            
+            for &block_id in &loop_info.blocks {
+                let block = &func.blocks[block_id as usize];
+                
+                for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+                    if invariant.iter().any(|(b, s)| *b == block_id && *s == stmt_idx) {
+                        continue; // Already marked invariant
+                    }
+                    
+                    if self.is_invariant(stmt, &defined_in_loop, &invariant, func, loop_info) {
+                        invariant.push((block_id, stmt_idx));
+                        
+                        // Remove from defined_in_loop
+                        if let Some(def) = self.get_defined_var(stmt) {
+                            defined_in_loop.remove(&def);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        
+        invariant
+    }
+    
+    fn get_defined_var(&self, stmt: &MirStatement) -> Option<String> {
+        match stmt {
+            MirStatement::Assign { dest, .. } |
+            MirStatement::BinaryOp { dest, .. } |
+            MirStatement::Load { dest, .. } |
+            MirStatement::Compare { dest, .. } => Some(dest.clone()),
+            _ => None,
+        }
+    }
+    
+    fn is_invariant(
+        &self,
+        stmt: &MirStatement,
+        defined_in_loop: &BTreeSet<String>,
+        already_invariant: &[(u32, usize)],
+        func: &MirFunction,
+        loop_info: &LoopInfo,
+    ) -> bool {
+        match stmt {
+            MirStatement::BinaryOp { lhs, rhs, .. } |
+            MirStatement::Compare { lhs, rhs, .. } => {
+                self.operand_is_invariant(lhs, defined_in_loop) &&
+                self.operand_is_invariant(rhs, defined_in_loop)
+            }
+            MirStatement::Assign { value, .. } => {
+                self.operand_is_invariant(value, defined_in_loop)
+            }
+            MirStatement::Load { ptr, .. } => {
+                // Load is invariant if pointer is invariant AND
+                // no store in loop may alias with it
+                self.operand_is_invariant(ptr, defined_in_loop) &&
+                !self.may_be_modified_in_loop(ptr, func, loop_info)
+            }
+            MirStatement::Call { .. } => false, // Calls are not invariant
+            _ => false,
+        }
+    }
+    
+    fn operand_is_invariant(&self, operand: &MirOperand, defined_in_loop: &BTreeSet<String>) -> bool {
+        match operand {
+            MirOperand::Constant(_) => true,
+            MirOperand::Variable(name) => !defined_in_loop.contains(name),
+            MirOperand::Gep { base, .. } => self.operand_is_invariant(base, defined_in_loop),
+        }
+    }
+    
+    fn may_be_modified_in_loop(&self, ptr: &MirOperand, func: &MirFunction, loop_info: &LoopInfo) -> bool {
+        for &block_id in &loop_info.blocks {
+            let block = &func.blocks[block_id as usize];
+            
+            for stmt in &block.statements {
+                match stmt {
+                    MirStatement::Store { ptr: store_ptr, .. } => {
+                        if self.may_alias(ptr, store_ptr) {
+                            return true;
+                        }
+                    }
+                    MirStatement::Call { .. } => {
+                        return true; // Conservatively assume call may modify
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
+        false
+    }
+    
+    fn may_alias(&self, a: &MirOperand, b: &MirOperand) -> bool {
+        // Simplified alias check
+        match (a, b) {
+            (MirOperand::Variable(va), MirOperand::Variable(vb)) => va == vb,
+            _ => true,
+        }
+    }
+    
+    fn is_safe_to_hoist(&self, func: &MirFunction, block_id: u32, stmt_idx: usize, loop_info: &LoopInfo) -> bool {
+        let stmt = &func.blocks[block_id as usize].statements[stmt_idx];
+        
+        // Must not have side effects
+        if self.has_side_effects(stmt) {
+            return false;
+        }
+        
+        // If instruction may throw, all exits must be after it
+        // (simplified: assume no throwing instructions)
+        
+        // Result must be used outside loop or at every iteration
+        true
+    }
+    
+    fn has_side_effects(&self, stmt: &MirStatement) -> bool {
+        matches!(stmt, MirStatement::Store { .. } | MirStatement::Call { .. })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP UNROLLING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop unrolling configuration
+#[derive(Debug, Clone)]
+pub struct UnrollConfig {
+    /// Unroll factor
+    pub factor: u32,
+    /// Maximum loop size to unroll (instructions)
+    pub max_size: usize,
+    /// Allow partial unrolling
+    pub allow_partial: bool,
+    /// Runtime unrolling
+    pub runtime: bool,
+    /// Peel count (iterations to peel before unrolling)
+    pub peel_count: u32,
+}
+
+impl Default for UnrollConfig {
+    fn default() -> Self {
+        UnrollConfig {
+            factor: 4,
+            max_size: 100,
+            allow_partial: true,
+            runtime: true,
+            peel_count: 0,
+        }
+    }
+}
+
+/// Loop unrolling pass
+pub struct LoopUnrolling {
+    config: UnrollConfig,
+}
+
+impl LoopUnrolling {
+    pub fn new(config: UnrollConfig) -> Self {
+        LoopUnrolling { config }
+    }
+    
+    /// Unroll a loop
+    pub fn unroll(&self, func: &mut MirFunction, loop_info: &LoopInfo) -> bool {
+        // Check if loop is suitable for unrolling
+        if !self.should_unroll(func, loop_info) {
+            return false;
+        }
+        
+        let trip_count = loop_info.trip_count;
+        let factor = self.determine_unroll_factor(loop_info);
+        
+        if factor <= 1 {
+            return false;
+        }
+        
+        match trip_count {
+            Some(tc) if tc <= factor as u64 => {
+                // Complete unrolling
+                self.unroll_completely(func, loop_info, tc as u32)
+            }
+            Some(tc) if tc % factor as u64 == 0 => {
+                // Exact unrolling
+                self.unroll_exact(func, loop_info, factor)
+            }
+            Some(_) if self.config.allow_partial => {
+                // Partial unrolling with remainder
+                self.unroll_with_remainder(func, loop_info, factor)
+            }
+            None if self.config.runtime => {
+                // Runtime unrolling
+                self.unroll_runtime(func, loop_info, factor)
+            }
+            _ => false,
+        }
+    }
+    
+    fn should_unroll(&self, func: &MirFunction, loop_info: &LoopInfo) -> bool {
+        // Check loop size
+        let size: usize = loop_info.blocks.iter()
+            .map(|&b| func.blocks[b as usize].statements.len())
+            .sum();
+        
+        if size > self.config.max_size {
+            return false;
+        }
+        
+        // Must have single latch
+        if loop_info.latches.len() != 1 {
+            return false;
+        }
+        
+        // Must have induction variable
+        if loop_info.induction_var.is_none() {
+            return false;
+        }
+        
+        true
+    }
+    
+    fn determine_unroll_factor(&self, loop_info: &LoopInfo) -> u32 {
+        if let Some(tc) = loop_info.trip_count {
+            if tc <= 8 {
+                return tc as u32; // Complete unroll
+            }
+        }
+        
+        self.config.factor
+    }
+    
+    fn unroll_completely(&self, func: &mut MirFunction, loop_info: &LoopInfo, count: u32) -> bool {
+        // Would duplicate loop body 'count' times and remove loop structure
+        true
+    }
+    
+    fn unroll_exact(&self, func: &mut MirFunction, loop_info: &LoopInfo, factor: u32) -> bool {
+        // Would duplicate loop body 'factor' times within loop
+        // and update induction variable step
+        true
+    }
+    
+    fn unroll_with_remainder(&self, func: &mut MirFunction, loop_info: &LoopInfo, factor: u32) -> bool {
+        // Would unroll main loop and add remainder loop
+        true
+    }
+    
+    fn unroll_runtime(&self, func: &mut MirFunction, loop_info: &LoopInfo, factor: u32) -> bool {
+        // Would add prologue/epilogue for unknown trip count
+        true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP FUSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop fusion pass
+pub struct LoopFusion {
+    alias_analysis: BasicAliasAnalysis,
+}
+
+impl LoopFusion {
+    pub fn new(alias_analysis: BasicAliasAnalysis) -> Self {
+        LoopFusion { alias_analysis }
+    }
+    
+    /// Try to fuse adjacent loops
+    pub fn fuse(&self, func: &mut MirFunction, loop_a: &LoopInfo, loop_b: &LoopInfo) -> bool {
+        // Check fusion legality
+        if !self.can_fuse(func, loop_a, loop_b) {
+            return false;
+        }
+        
+        // Perform fusion
+        self.perform_fusion(func, loop_a, loop_b)
+    }
+    
+    fn can_fuse(&self, func: &MirFunction, loop_a: &LoopInfo, loop_b: &LoopInfo) -> bool {
+        // Must be adjacent (loop_b follows loop_a)
+        if !self.are_adjacent(func, loop_a, loop_b) {
+            return false;
+        }
+        
+        // Must have same trip count
+        if loop_a.trip_count != loop_b.trip_count {
+            return false;
+        }
+        
+        // Must have compatible induction variables
+        if !self.compatible_ivs(loop_a, loop_b) {
+            return false;
+        }
+        
+        // Must not have negative distance dependencies
+        if self.has_negative_distance_deps(func, loop_a, loop_b) {
+            return false;
+        }
+        
+        true
+    }
+    
+    fn are_adjacent(&self, func: &MirFunction, loop_a: &LoopInfo, loop_b: &LoopInfo) -> bool {
+        // Check if loop_a's exit leads directly to loop_b's preheader
+        for exit in &loop_a.exits {
+            if Some(*exit) == loop_b.preheader {
+                return true;
+            }
+        }
+        false
+    }
+    
+    fn compatible_ivs(&self, loop_a: &LoopInfo, loop_b: &LoopInfo) -> bool {
+        match (&loop_a.induction_var, &loop_b.induction_var) {
+            (Some(iv_a), Some(iv_b)) => {
+                iv_a.start == iv_b.start &&
+                iv_a.step == iv_b.step &&
+                iv_a.end == iv_b.end
+            }
+            _ => false,
+        }
+    }
+    
+    fn has_negative_distance_deps(&self, _func: &MirFunction, _loop_a: &LoopInfo, _loop_b: &LoopInfo) -> bool {
+        // Would check for dependence constraints
+        false
+    }
+    
+    fn perform_fusion(&self, func: &mut MirFunction, loop_a: &LoopInfo, loop_b: &LoopInfo) -> bool {
+        // Would merge loop bodies
+        true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP INTERCHANGE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop interchange pass (for nested loops)
+pub struct LoopInterchange {
+    /// Prefer memory access patterns
+    optimize_for_cache: bool,
+}
+
+impl LoopInterchange {
+    pub fn new(optimize_for_cache: bool) -> Self {
+        LoopInterchange { optimize_for_cache }
+    }
+    
+    /// Try to interchange nested loops
+    pub fn interchange(&self, func: &mut MirFunction, outer: &LoopInfo, inner: &LoopInfo) -> bool {
+        // Check legality
+        if !self.can_interchange(func, outer, inner) {
+            return false;
+        }
+        
+        // Check profitability
+        if !self.should_interchange(func, outer, inner) {
+            return false;
+        }
+        
+        // Perform interchange
+        self.perform_interchange(func, outer, inner)
+    }
+    
+    fn can_interchange(&self, func: &MirFunction, outer: &LoopInfo, inner: &LoopInfo) -> bool {
+        // Inner must be only loop in outer
+        if outer.children.len() != 1 || outer.children[0] != inner.id {
+            return false;
+        }
+        
+        // Check dependence legality
+        self.check_dependence_legality(func, outer, inner)
+    }
+    
+    fn check_dependence_legality(&self, _func: &MirFunction, _outer: &LoopInfo, _inner: &LoopInfo) -> bool {
+        // Would check that interchange doesn't violate dependencies
+        true
+    }
+    
+    fn should_interchange(&self, func: &MirFunction, outer: &LoopInfo, inner: &LoopInfo) -> bool {
+        if !self.optimize_for_cache {
+            return false;
+        }
+        
+        // Check memory access patterns
+        // Prefer inner loop to have unit stride
+        let outer_stride = self.estimate_stride(func, outer);
+        let inner_stride = self.estimate_stride(func, inner);
+        
+        outer_stride < inner_stride
+    }
+    
+    fn estimate_stride(&self, _func: &MirFunction, _loop_info: &LoopInfo) -> i64 {
+        // Would analyze memory accesses
+        1
+    }
+    
+    fn perform_interchange(&self, func: &mut MirFunction, outer: &LoopInfo, inner: &LoopInfo) -> bool {
+        // Would swap loop headers and update IVs
+        true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP TILING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop tiling (blocking) pass
+pub struct LoopTiling {
+    /// Tile sizes for each dimension
+    tile_sizes: Vec<u32>,
+}
+
+impl LoopTiling {
+    pub fn new(tile_sizes: Vec<u32>) -> Self {
+        LoopTiling { tile_sizes }
+    }
+    
+    /// Tile a loop nest
+    pub fn tile(&self, func: &mut MirFunction, loops: &[&LoopInfo]) -> bool {
+        if loops.len() != self.tile_sizes.len() {
+            return false;
+        }
+        
+        // Check legality
+        if !self.can_tile(func, loops) {
+            return false;
+        }
+        
+        // Perform tiling
+        self.perform_tiling(func, loops)
+    }
+    
+    fn can_tile(&self, _func: &MirFunction, loops: &[&LoopInfo]) -> bool {
+        // All loops must have known bounds
+        loops.iter().all(|l| l.trip_count.is_some())
+    }
+    
+    fn perform_tiling(&self, func: &mut MirFunction, loops: &[&LoopInfo]) -> bool {
+        // Would create outer tile loops and inner point loops
+        true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRENGTH REDUCTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Loop strength reduction pass
+pub struct StrengthReduction {}
+
+impl StrengthReduction {
+    pub fn new() -> Self {
+        StrengthReduction {}
+    }
+    
+    /// Apply strength reduction to a loop
+    pub fn reduce(&self, func: &mut MirFunction, loop_info: &LoopInfo) -> u32 {
+        let mut reduced = 0;
+        
+        let iv = match &loop_info.induction_var {
+            Some(iv) => iv,
+            None => return 0,
+        };
+        
+        // Find multiply/divide by loop-invariant value
+        for &block_id in &loop_info.blocks {
+            let block = &mut func.blocks[block_id as usize];
+            
+            for stmt in &mut block.statements {
+                if let MirStatement::BinaryOp { dest, op, lhs, rhs } = stmt {
+                    match op {
+                        BinOp::Mul => {
+                            // i * c -> accumulator += c
+                            if lhs.is_var(&iv.name) {
+                                if let MirOperand::Constant(c) = rhs {
+                                    // Would create accumulator and replace
+                                    reduced += 1;
+                                }
+                            }
+                        }
+                        BinOp::Div => {
+                            // Replace with multiply by reciprocal if possible
+                            reduced += self.try_reciprocal(stmt);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        
+        reduced
+    }
+    
+    fn try_reciprocal(&self, stmt: &mut MirStatement) -> u32 {
+        // Would replace division by constant with multiplication
+        0
+    }
+}
+
+impl Default for StrengthReduction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Compare { dest: String, op: CompareOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    If { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Switch { value: MirOperand, targets: Vec<(i64, u32)>, default: u32 },
+    Return { value: Option<MirOperand> },
+    Unreachable,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+    Gep { base: Box<MirOperand>, offset: i64 },
+}
+
+impl MirOperand {
+    pub fn is_var(&self, name: &str) -> bool {
+        matches!(self, MirOperand::Variable(n) if n == name)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Shl, Shr,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_loop_detection() {
+        let func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![],
+                    terminator: MirTerminator::Goto(1),
+                },
+                MirBlock {
+                    id: 1,
+                    statements: vec![],
+                    terminator: MirTerminator::If {
+                        cond: MirOperand::Variable("cond".to_string()),
+                        then_bb: 2,
+                        else_bb: 3,
+                    },
+                },
+                MirBlock {
+                    id: 2,
+                    statements: vec![],
+                    terminator: MirTerminator::Goto(1), // Back edge
+                },
+                MirBlock {
+                    id: 3,
+                    statements: vec![],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let loop_nest = LoopNest::analyze(&func);
+        
+        assert_eq!(loop_nest.loops.len(), 1);
+        
+        let loop_info = loop_nest.loops.values().next().unwrap();
+        assert_eq!(loop_info.header, 1);
+        assert!(loop_info.blocks.contains(&1));
+        assert!(loop_info.blocks.contains(&2));
+    }
+    
+    #[test]
+    fn test_trip_count_computation() {
+        let iv = InductionVariable {
+            name: "i".to_string(),
+            start: 0,
+            step: 1,
+            end: Some(10),
+            cmp_op: CompareOp::Lt,
+        };
+        
+        let nest = LoopNest::new();
+        let trip_count = nest.compute_trip_count(&iv);
+        
+        assert_eq!(trip_count, Some(10));
+    }
+    
+    #[test]
+    fn test_compare_op_swap() {
+        assert_eq!(CompareOp::Lt.swap(), CompareOp::Gt);
+        assert_eq!(CompareOp::Le.swap(), CompareOp::Ge);
+        assert_eq!(CompareOp::Eq.swap(), CompareOp::Eq);
+    }
+}

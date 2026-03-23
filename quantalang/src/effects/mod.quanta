@@ -1,0 +1,466 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ EFFECTS — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+//! # Algebraic Effects System
+//!
+//! First-class effects with handlers for controlled side effects:
+//!
+//! - **Effect Declarations**: Define custom effects with operations
+//! - **Effect Handlers**: Implement effects with resumable continuations
+//! - **Effect Polymorphism**: Generic functions over effects
+//! - **Effect Inference**: Automatic effect tracking
+//!
+//! ## Built-in Effects
+//!
+//! | Effect | Operations | Description |
+//! |--------|------------|-------------|
+//! | `IO` | print, read_line, read_file, write_file | I/O operations |
+//! | `State<S>` | get, put, modify | Mutable state |
+//! | `Exception<E>` | raise | Exception handling |
+//! | `Async` | await, spawn | Asynchronous operations |
+//! | `NonDet` | choose, fail | Nondeterminism |
+//!
+//! ## Syntax
+//!
+//! ```quanta
+//! // Declare custom effect
+//! effect Logger {
+//!     fn log(level: Level, message: String) -> ()
+//!     fn set_level(level: Level) -> ()
+//! }
+//!
+//! // Use effect in function signature
+//! fn process(data: Data) -> Result<Output> / {IO, Logger} {
+//!     perform Logger.log(Info, "Processing...");
+//!     // ...
+//! }
+//!
+//! // Handle effect
+//! handle process(data) {
+//!     Logger.log(level, msg) => {
+//!         println!("[{:?}] {}", level, msg);
+//!         resume(())
+//!     }
+//!     Logger.set_level(level) => {
+//!         // Handle set_level
+//!         resume(())
+//!     }
+//! }
+//! ```
+//!
+//! ## Effect Handlers
+//!
+//! Handlers can:
+//! - **Resume**: Continue execution after handling
+//! - **Return early**: Abort the effectful computation
+//! - **Resume multiple times**: For backtracking/nondeterminism
+//! - **Capture continuation**: Store for later resumption
+
+module quantalang::effects
+
+pub mod system;
+
+pub use system::{
+    // Effects
+    EffectId, Effect, Operation, TypeParam, TypeBound,
+    
+    // Types
+    Type, IntSize, FloatSize, Mutability,
+    
+    // Effect sets
+    EffectSet,
+    
+    // Handlers
+    Handler, OpHandler, HandlerBody,
+    ReturnClause, FinallyClause,
+    
+    // Expressions
+    Expr, MatchArm, Pattern, Literal,
+    
+    // Continuations
+    Continuation, Frame, HandlerFrame, Value,
+    ClosureValue, ObjectValue,
+    
+    // Runtime
+    EffectRuntime, EffectError,
+};
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::collections::BTreeMap;
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EFFECT TYPE CHECKING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Effect type checker
+pub struct EffectChecker {
+    /// Known effects
+    effects: BTreeMap<EffectId, Effect>,
+    
+    /// Type environment
+    type_env: BTreeMap<String, Type>,
+    
+    /// Effect environment
+    effect_env: BTreeMap<String, EffectSet>,
+}
+
+impl EffectChecker {
+    pub fn new() -> Self {
+        EffectChecker {
+            effects: BTreeMap::new(),
+            type_env: BTreeMap::new(),
+            effect_env: BTreeMap::new(),
+        }
+    }
+    
+    /// Register effect
+    pub fn register_effect(&mut self, effect: Effect) {
+        self.effects.insert(effect.id.clone(), effect);
+    }
+    
+    /// Infer effects of expression
+    pub fn infer_effects(&self, expr: &Expr) -> Result<EffectSet, EffectCheckError> {
+        match expr {
+            Expr::Var(_) | Expr::Lit(_) => Ok(EffectSet::pure()),
+            
+            Expr::Perform(effect_id, _, args) => {
+                let mut effects = EffectSet::singleton(effect_id.clone());
+                
+                for arg in args {
+                    effects = effects.union(&self.infer_effects(arg)?);
+                }
+                
+                Ok(effects)
+            }
+            
+            Expr::Handle(body, handlers) => {
+                let body_effects = self.infer_effects(body)?;
+                
+                // Remove handled effects
+                let mut handled = EffectSet::new();
+                for handler in handlers {
+                    handled.add(handler.effect.clone());
+                }
+                
+                Ok(body_effects.difference(&handled))
+            }
+            
+            Expr::App(func, args) => {
+                let mut effects = self.infer_effects(func)?;
+                
+                for arg in args {
+                    effects = effects.union(&self.infer_effects(arg)?);
+                }
+                
+                // Would also include effects from function type
+                Ok(effects)
+            }
+            
+            Expr::Lambda(_, body) => {
+                // Lambda itself is pure, effects are in the type
+                Ok(EffectSet::pure())
+            }
+            
+            Expr::Let(_, value, body) => {
+                let value_effects = self.infer_effects(value)?;
+                let body_effects = self.infer_effects(body)?;
+                Ok(value_effects.union(&body_effects))
+            }
+            
+            Expr::If(cond, then_branch, else_branch) => {
+                let cond_effects = self.infer_effects(cond)?;
+                let then_effects = self.infer_effects(then_branch)?;
+                let else_effects = self.infer_effects(else_branch)?;
+                Ok(cond_effects.union(&then_effects).union(&else_effects))
+            }
+            
+            Expr::Match(scrutinee, arms) => {
+                let mut effects = self.infer_effects(scrutinee)?;
+                
+                for arm in arms {
+                    effects = effects.union(&self.infer_effects(&arm.body)?);
+                    if let Some(guard) = &arm.guard {
+                        effects = effects.union(&self.infer_effects(guard)?);
+                    }
+                }
+                
+                Ok(effects)
+            }
+            
+            Expr::Block(exprs) => {
+                let mut effects = EffectSet::pure();
+                for expr in exprs {
+                    effects = effects.union(&self.infer_effects(expr)?);
+                }
+                Ok(effects)
+            }
+            
+            Expr::Resume(_) => {
+                // Resume is effectful in the handler context
+                Ok(EffectSet::pure())
+            }
+        }
+    }
+    
+    /// Check that function's declared effects cover actual effects
+    pub fn check_effects(
+        &self,
+        declared: &EffectSet,
+        actual: &EffectSet,
+    ) -> Result<(), EffectCheckError> {
+        if actual.is_subset(declared) {
+            Ok(())
+        } else {
+            let missing = actual.difference(declared);
+            Err(EffectCheckError::MissingEffects(missing))
+        }
+    }
+    
+    /// Check handler covers all operations
+    pub fn check_handler(
+        &self,
+        handler: &Handler,
+    ) -> Result<(), EffectCheckError> {
+        let effect = self.effects.get(&handler.effect)
+            .ok_or_else(|| EffectCheckError::UnknownEffect(handler.effect.clone()))?;
+        
+        for op in &effect.operations {
+            if !handler.operations.contains_key(&op.name) {
+                return Err(EffectCheckError::MissingHandler(
+                    handler.effect.clone(),
+                    op.name.clone(),
+                ));
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+impl Default for EffectChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Effect check error
+#[derive(Debug)]
+pub enum EffectCheckError {
+    UnknownEffect(EffectId),
+    UnknownOperation(EffectId, String),
+    MissingEffects(EffectSet),
+    MissingHandler(EffectId, String),
+    TypeMismatch { expected: Type, found: Type },
+}
+
+impl std::fmt::Display for EffectCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownEffect(id) => write!(f, "unknown effect: {}", id),
+            Self::UnknownOperation(eff, op) => {
+                write!(f, "unknown operation: {}.{}", eff, op)
+            }
+            Self::MissingEffects(effects) => {
+                write!(f, "unhandled effects: {}", effects)
+            }
+            Self::MissingHandler(eff, op) => {
+                write!(f, "missing handler for {}.{}", eff, op)
+            }
+            Self::TypeMismatch { expected, found } => {
+                write!(f, "type mismatch: expected {:?}, found {:?}", expected, found)
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EFFECT TRANSFORMATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Transform effect handlers to CPS or other representations
+pub struct EffectTransform;
+
+impl EffectTransform {
+    /// Transform handle expression to CPS
+    pub fn to_cps(expr: &Expr) -> Expr {
+        match expr {
+            Expr::Handle(body, handlers) => {
+                // Transform to continuation-passing style
+                // This is a simplified sketch
+                let transformed_body = Self::to_cps(body);
+                Expr::Handle(Box::new(transformed_body), handlers.clone())
+            }
+            
+            Expr::Perform(effect, op, args) => {
+                // Transform perform to handler invocation
+                Expr::Perform(
+                    effect.clone(),
+                    op.clone(),
+                    args.iter().map(Self::to_cps).collect(),
+                )
+            }
+            
+            // Recursively transform other expressions
+            Expr::App(func, args) => {
+                Expr::App(
+                    Box::new(Self::to_cps(func)),
+                    args.iter().map(Self::to_cps).collect(),
+                )
+            }
+            
+            Expr::Let(name, value, body) => {
+                Expr::Let(
+                    name.clone(),
+                    Box::new(Self::to_cps(value)),
+                    Box::new(Self::to_cps(body)),
+                )
+            }
+            
+            Expr::If(cond, then_branch, else_branch) => {
+                Expr::If(
+                    Box::new(Self::to_cps(cond)),
+                    Box::new(Self::to_cps(then_branch)),
+                    Box::new(Self::to_cps(else_branch)),
+                )
+            }
+            
+            Expr::Block(exprs) => {
+                Expr::Block(exprs.iter().map(Self::to_cps).collect())
+            }
+            
+            // Base cases
+            other => other.clone(),
+        }
+    }
+    
+    /// Optimize handler chains
+    pub fn optimize_handlers(expr: &Expr) -> Expr {
+        match expr {
+            // Fuse nested handlers for same effect
+            Expr::Handle(inner, outer_handlers) => {
+                if let Expr::Handle(body, inner_handlers) = inner.as_ref() {
+                    // Check for fusable handlers
+                    let mut all_handlers = inner_handlers.clone();
+                    all_handlers.extend(outer_handlers.clone());
+                    
+                    return Expr::Handle(body.clone(), all_handlers);
+                }
+                
+                expr.clone()
+            }
+            
+            other => other.clone(),
+        }
+    }
+    
+    /// Inline pure handlers
+    pub fn inline_pure_handlers(expr: &Expr) -> Expr {
+        // Handlers that don't use continuation can be inlined
+        expr.clone()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub mod prelude {
+    pub use super::{
+        // Core
+        EffectId, Effect, Operation, EffectSet,
+        
+        // Handlers
+        Handler, OpHandler, HandlerBody,
+        
+        // Types
+        Type, Expr, Value, Continuation,
+        
+        // Runtime
+        EffectRuntime, EffectError,
+        
+        // Checking
+        EffectChecker, EffectCheckError,
+        
+        // Transforms
+        EffectTransform,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_effect_checker() {
+        let mut checker = EffectChecker::new();
+        
+        checker.register_effect(Effect {
+            id: EffectId::new("IO"),
+            operations: vec![
+                Operation {
+                    name: "print".to_string(),
+                    params: vec![Type::String],
+                    return_type: Type::Unit,
+                    resumable: true,
+                    doc: None,
+                },
+            ],
+            type_params: vec![],
+            doc: None,
+        });
+        
+        // Test effect inference
+        let expr = Expr::Perform(
+            EffectId::new("IO"),
+            "print".to_string(),
+            vec![Expr::Lit(Literal::String("hello".to_string()))],
+        );
+        
+        let effects = checker.infer_effects(&expr).unwrap();
+        assert!(effects.contains(&EffectId::new("IO")));
+    }
+    
+    #[test]
+    fn test_effect_subset_check() {
+        let checker = EffectChecker::new();
+        
+        let mut declared = EffectSet::new();
+        declared.add(EffectId::new("IO"));
+        declared.add(EffectId::new("State"));
+        
+        let mut actual = EffectSet::new();
+        actual.add(EffectId::new("IO"));
+        
+        assert!(checker.check_effects(&declared, &actual).is_ok());
+        
+        actual.add(EffectId::new("Exception"));
+        assert!(checker.check_effects(&declared, &actual).is_err());
+    }
+    
+    #[test]
+    fn test_handle_transforms() {
+        let body = Expr::Lit(Literal::Unit);
+        let handler = Handler {
+            effect: EffectId::new("IO"),
+            operations: BTreeMap::new(),
+            return_clause: None,
+            finally_clause: None,
+        };
+        
+        let expr = Expr::Handle(Box::new(body), vec![handler]);
+        let transformed = EffectTransform::to_cps(&expr);
+        
+        // Should still be a handle expression
+        assert!(matches!(transformed, Expr::Handle(_, _)));
+    }
+}

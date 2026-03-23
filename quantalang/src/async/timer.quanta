@@ -1,0 +1,753 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ ASYNC — Timer
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Async timer primitives: sleep, timeout, interval, deadline.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::async::timer
+
+use alloc::sync::Arc;
+use alloc::collections::BinaryHeap;
+use core::cmp::{Ordering, Reverse};
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
+use core::time::Duration;
+
+use std::sync::{Mutex, Condvar};
+use std::time::Instant;
+use std::thread;
+
+use super::waker::AtomicWaker;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLEEP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Sleep for a duration
+pub fn sleep(duration: Duration) -> Sleep {
+    Sleep::new(duration)
+}
+
+/// Sleep until a specific instant
+pub fn sleep_until(deadline: Instant) -> Sleep {
+    Sleep::until(deadline)
+}
+
+/// Future that completes after a duration
+pub struct Sleep {
+    deadline: Instant,
+    registered: bool,
+    entry: Option<Arc<TimerEntry>>,
+}
+
+impl Sleep {
+    /// Create a new sleep future
+    pub fn new(duration: Duration) -> Self {
+        Sleep {
+            deadline: Instant::now() + duration,
+            registered: false,
+            entry: None,
+        }
+    }
+    
+    /// Create a sleep until a deadline
+    pub fn until(deadline: Instant) -> Self {
+        Sleep {
+            deadline,
+            registered: false,
+            entry: None,
+        }
+    }
+    
+    /// Get the deadline
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+    
+    /// Check if the deadline has passed
+    pub fn is_elapsed(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+    
+    /// Reset the sleep with a new duration
+    pub fn reset(&mut self, duration: Duration) {
+        self.deadline = Instant::now() + duration;
+        self.registered = false;
+        self.entry = None;
+    }
+    
+    /// Reset to a specific deadline
+    pub fn reset_until(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+        self.registered = false;
+        self.entry = None;
+    }
+}
+
+impl Future for Sleep {
+    type Output = ();
+    
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Check if already elapsed
+        if self.is_elapsed() {
+            return Poll::Ready(());
+        }
+        
+        // Register with timer wheel if not already
+        if !self.registered {
+            let entry = Arc::new(TimerEntry::new(self.deadline));
+            entry.waker.register(cx.waker());
+            
+            TIMER_WHEEL.with(|wheel| {
+                wheel.register(Arc::clone(&entry));
+            });
+            
+            self.entry = Some(entry);
+            self.registered = true;
+        } else if let Some(ref entry) = self.entry {
+            entry.waker.register(cx.waker());
+        }
+        
+        Poll::Pending
+    }
+}
+
+impl Drop for Sleep {
+    fn drop(&mut self) {
+        // Cancel the timer entry
+        if let Some(ref entry) = self.entry {
+            entry.cancel();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIMEOUT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Wrap a future with a timeout
+pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
+    Timeout {
+        future,
+        sleep: Sleep::new(duration),
+    }
+}
+
+/// Wrap a future with a deadline
+pub fn timeout_at<F: Future>(deadline: Instant, future: F) -> Timeout<F> {
+    Timeout {
+        future,
+        sleep: Sleep::until(deadline),
+    }
+}
+
+/// Future that completes when either the inner future completes or the timeout elapses
+pub struct Timeout<F> {
+    future: F,
+    sleep: Sleep,
+}
+
+impl<F: Future> Timeout<F> {
+    /// Get the deadline
+    pub fn deadline(&self) -> Instant {
+        self.sleep.deadline()
+    }
+    
+    /// Get a reference to the inner future
+    pub fn get_ref(&self) -> &F {
+        &self.future
+    }
+    
+    /// Get a mutable reference to the inner future
+    pub fn get_mut(&mut self) -> &mut F {
+        &mut self.future
+    }
+    
+    /// Consume and return the inner future
+    pub fn into_inner(self) -> F {
+        self.future
+    }
+}
+
+impl<F: Future> Future for Timeout<F> {
+    type Output = Result<F::Output, TimeoutError>;
+    
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Safety: we don't move the inner future
+        let this = unsafe { self.get_unchecked_mut() };
+        
+        // Poll the inner future first
+        let future = unsafe { Pin::new_unchecked(&mut this.future) };
+        if let Poll::Ready(result) = future.poll(cx) {
+            return Poll::Ready(Ok(result));
+        }
+        
+        // Check timeout
+        let sleep = unsafe { Pin::new_unchecked(&mut this.sleep) };
+        if let Poll::Ready(()) = sleep.poll(cx) {
+            return Poll::Ready(Err(TimeoutError::Elapsed));
+        }
+        
+        Poll::Pending
+    }
+}
+
+/// Error returned when a timeout elapses
+#[derive(Debug, Clone, Copy)]
+pub enum TimeoutError {
+    Elapsed,
+}
+
+impl std::fmt::Display for TimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Elapsed => write!(f, "deadline elapsed"),
+        }
+    }
+}
+
+impl std::error::Error for TimeoutError {}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTERVAL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create a new interval
+pub fn interval(period: Duration) -> Interval {
+    Interval::new(period)
+}
+
+/// Create an interval starting at a specific time
+pub fn interval_at(start: Instant, period: Duration) -> Interval {
+    Interval::at(start, period)
+}
+
+/// A stream that yields at regular intervals
+pub struct Interval {
+    period: Duration,
+    next: Instant,
+    sleep: Option<Sleep>,
+    missed_tick_behavior: MissedTickBehavior,
+}
+
+impl Interval {
+    /// Create a new interval
+    pub fn new(period: Duration) -> Self {
+        Interval {
+            period,
+            next: Instant::now() + period,
+            sleep: None,
+            missed_tick_behavior: MissedTickBehavior::Burst,
+        }
+    }
+    
+    /// Create an interval starting at a specific time
+    pub fn at(start: Instant, period: Duration) -> Self {
+        Interval {
+            period,
+            next: start,
+            sleep: None,
+            missed_tick_behavior: MissedTickBehavior::Burst,
+        }
+    }
+    
+    /// Set missed tick behavior
+    pub fn set_missed_tick_behavior(&mut self, behavior: MissedTickBehavior) {
+        self.missed_tick_behavior = behavior;
+    }
+    
+    /// Get the period
+    pub fn period(&self) -> Duration {
+        self.period
+    }
+    
+    /// Wait for the next tick
+    pub async fn tick(&mut self) -> Instant {
+        let now = Instant::now();
+        
+        if now >= self.next {
+            // Already past the deadline
+            let tick_time = self.next;
+            
+            match self.missed_tick_behavior {
+                MissedTickBehavior::Burst => {
+                    // Return immediately, schedule next tick normally
+                    self.next = self.next + self.period;
+                }
+                MissedTickBehavior::Delay => {
+                    // Reset to now + period
+                    self.next = now + self.period;
+                }
+                MissedTickBehavior::Skip => {
+                    // Skip to the next future tick
+                    let elapsed = now - self.next;
+                    let periods = (elapsed.as_nanos() / self.period.as_nanos()) as u32 + 1;
+                    self.next = self.next + self.period * periods;
+                }
+            }
+            
+            return tick_time;
+        }
+        
+        // Wait until next tick
+        sleep_until(self.next).await;
+        
+        let tick_time = self.next;
+        self.next = self.next + self.period;
+        tick_time
+    }
+    
+    /// Reset the interval
+    pub fn reset(&mut self) {
+        self.next = Instant::now() + self.period;
+        self.sleep = None;
+    }
+}
+
+/// Behavior when ticks are missed
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissedTickBehavior {
+    /// Fire ticks as fast as possible to catch up
+    Burst,
+    /// Delay the next tick from now
+    Delay,
+    /// Skip missed ticks
+    Skip,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSTANT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Get the current instant
+pub fn now() -> Instant {
+    Instant::now()
+}
+
+/// An instant that implements Future (completes when reached)
+pub struct Deadline {
+    instant: Instant,
+    sleep: Sleep,
+}
+
+impl Deadline {
+    /// Create a deadline
+    pub fn new(instant: Instant) -> Self {
+        Deadline {
+            instant,
+            sleep: Sleep::until(instant),
+        }
+    }
+    
+    /// Create from duration
+    pub fn after(duration: Duration) -> Self {
+        Self::new(Instant::now() + duration)
+    }
+    
+    /// Get the instant
+    pub fn instant(&self) -> Instant {
+        self.instant
+    }
+    
+    /// Check if elapsed
+    pub fn is_elapsed(&self) -> bool {
+        Instant::now() >= self.instant
+    }
+}
+
+impl Future for Deadline {
+    type Output = Instant;
+    
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let sleep = unsafe { Pin::new_unchecked(&mut this.sleep) };
+        
+        match sleep.poll(cx) {
+            Poll::Ready(()) => Poll::Ready(this.instant),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIMER ENTRY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Entry in the timer wheel
+struct TimerEntry {
+    deadline: Instant,
+    waker: AtomicWaker,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl TimerEntry {
+    fn new(deadline: Instant) -> Self {
+        TimerEntry {
+            deadline,
+            waker: AtomicWaker::new(),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    
+    fn cancel(&self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::Release);
+    }
+    
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+    
+    fn fire(&self) {
+        if !self.is_cancelled() {
+            self.waker.wake();
+        }
+    }
+}
+
+impl PartialEq for TimerEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline
+    }
+}
+
+impl Eq for TimerEntry {}
+
+impl PartialOrd for TimerEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimerEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse order for min-heap
+        other.deadline.cmp(&self.deadline)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIMER WHEEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+thread_local! {
+    static TIMER_WHEEL: TimerWheel = TimerWheel::new();
+}
+
+/// Simple timer wheel implementation
+struct TimerWheel {
+    entries: Mutex<BinaryHeap<Arc<TimerEntry>>>,
+    condvar: Condvar,
+    running: std::sync::atomic::AtomicBool,
+}
+
+impl TimerWheel {
+    fn new() -> Self {
+        let wheel = TimerWheel {
+            entries: Mutex::new(BinaryHeap::new()),
+            condvar: Condvar::new(),
+            running: std::sync::atomic::AtomicBool::new(false),
+        };
+        
+        wheel.start_driver();
+        wheel
+    }
+    
+    fn register(&self, entry: Arc<TimerEntry>) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.push(entry);
+        self.condvar.notify_one();
+    }
+    
+    fn start_driver(&self) {
+        if self.running.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return; // Already running
+        }
+        
+        // Note: In a real implementation, this would be a proper driver thread
+        // For now, we use a simple polling approach
+    }
+    
+    fn poll_timers(&self) {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().unwrap();
+        
+        while let Some(entry) = entries.peek() {
+            if entry.deadline <= now {
+                let entry = entries.pop().unwrap();
+                entry.fire();
+            } else {
+                break;
+            }
+        }
+    }
+    
+    fn next_deadline(&self) -> Option<Instant> {
+        let entries = self.entries.lock().unwrap();
+        entries.peek().map(|e| e.deadline)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL TIMER DRIVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Global timer driver (background thread)
+pub struct TimerDriver {
+    entries: Arc<Mutex<BinaryHeap<Arc<TimerEntry>>>>,
+    condvar: Arc<Condvar>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl TimerDriver {
+    /// Create and start a new timer driver
+    pub fn new() -> Self {
+        let entries = Arc::new(Mutex::new(BinaryHeap::new()));
+        let condvar = Arc::new(Condvar::new());
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        
+        let entries_clone = Arc::clone(&entries);
+        let condvar_clone = Arc::clone(&condvar);
+        let shutdown_clone = Arc::clone(&shutdown);
+        
+        let handle = thread::Builder::new()
+            .name("quanta-timer".to_string())
+            .spawn(move || {
+                Self::driver_loop(entries_clone, condvar_clone, shutdown_clone);
+            })
+            .expect("failed to spawn timer driver");
+        
+        TimerDriver {
+            entries,
+            condvar,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+    
+    fn driver_loop(
+        entries: Arc<Mutex<BinaryHeap<Arc<TimerEntry>>>>,
+        condvar: Arc<Condvar>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            let now = Instant::now();
+            let wait_duration;
+            
+            {
+                let mut heap = entries.lock().unwrap();
+                
+                // Fire all expired timers
+                while let Some(entry) = heap.peek() {
+                    if entry.deadline <= now {
+                        let entry = heap.pop().unwrap();
+                        entry.fire();
+                    } else {
+                        break;
+                    }
+                }
+                
+                // Calculate next wait
+                wait_duration = heap.peek()
+                    .map(|e| e.deadline.saturating_duration_since(now))
+                    .unwrap_or(Duration::from_secs(1));
+            }
+            
+            // Wait for next timer or new registration
+            let _guard = entries.lock().unwrap();
+            let _ = condvar.wait_timeout(_guard, wait_duration);
+        }
+    }
+    
+    /// Register a timer
+    pub fn register(&self, entry: Arc<TimerEntry>) {
+        let mut heap = self.entries.lock().unwrap();
+        heap.push(entry);
+        self.condvar.notify_one();
+    }
+    
+    /// Shutdown the driver
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.condvar.notify_all();
+    }
+}
+
+impl Default for TimerDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for TimerDriver {
+    fn drop(&mut self) {
+        self.shutdown();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DELAY QUEUE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A queue where items become available after a delay
+pub struct DelayQueue<T> {
+    entries: BinaryHeap<Reverse<DelayedEntry<T>>>,
+}
+
+struct DelayedEntry<T> {
+    deadline: Instant,
+    value: T,
+}
+
+impl<T> PartialEq for DelayedEntry<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline
+    }
+}
+
+impl<T> Eq for DelayedEntry<T> {}
+
+impl<T> PartialOrd for DelayedEntry<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for DelayedEntry<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.deadline.cmp(&other.deadline)
+    }
+}
+
+impl<T> DelayQueue<T> {
+    /// Create a new delay queue
+    pub fn new() -> Self {
+        DelayQueue {
+            entries: BinaryHeap::new(),
+        }
+    }
+    
+    /// Insert an item with a delay
+    pub fn insert(&mut self, value: T, delay: Duration) {
+        self.entries.push(Reverse(DelayedEntry {
+            deadline: Instant::now() + delay,
+            value,
+        }));
+    }
+    
+    /// Insert an item with a deadline
+    pub fn insert_at(&mut self, value: T, deadline: Instant) {
+        self.entries.push(Reverse(DelayedEntry {
+            deadline,
+            value,
+        }));
+    }
+    
+    /// Pop the next available item (blocking)
+    pub fn pop(&mut self) -> Option<T> {
+        let now = Instant::now();
+        
+        if let Some(Reverse(entry)) = self.entries.peek() {
+            if entry.deadline <= now {
+                return self.entries.pop().map(|Reverse(e)| e.value);
+            }
+        }
+        
+        None
+    }
+    
+    /// Get the next deadline
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.entries.peek().map(|Reverse(e)| e.deadline)
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    
+    /// Get number of items
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl<T> Default for DelayQueue<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_sleep_is_elapsed() {
+        let sleep = Sleep::new(Duration::from_secs(0));
+        // Immediately after creation with 0 duration
+        assert!(sleep.is_elapsed());
+    }
+    
+    #[test]
+    fn test_sleep_deadline() {
+        let duration = Duration::from_millis(100);
+        let before = Instant::now();
+        let sleep = Sleep::new(duration);
+        let after = Instant::now();
+        
+        assert!(sleep.deadline() >= before + duration);
+        assert!(sleep.deadline() <= after + duration);
+    }
+    
+    #[test]
+    fn test_interval_period() {
+        let period = Duration::from_millis(50);
+        let interval = Interval::new(period);
+        assert_eq!(interval.period(), period);
+    }
+    
+    #[test]
+    fn test_deadline() {
+        let deadline = Deadline::after(Duration::from_millis(0));
+        assert!(deadline.is_elapsed());
+    }
+    
+    #[test]
+    fn test_delay_queue() {
+        let mut queue = DelayQueue::new();
+        
+        queue.insert("a", Duration::from_millis(0));
+        queue.insert("b", Duration::from_millis(100));
+        
+        assert_eq!(queue.len(), 2);
+        
+        // First item should be available immediately
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(queue.pop(), Some("a"));
+    }
+    
+    #[test]
+    fn test_missed_tick_behavior() {
+        let mut interval = Interval::new(Duration::from_millis(10));
+        
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        assert_eq!(interval.missed_tick_behavior, MissedTickBehavior::Skip);
+        
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        assert_eq!(interval.missed_tick_behavior, MissedTickBehavior::Delay);
+    }
+}

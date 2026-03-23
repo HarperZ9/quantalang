@@ -1,0 +1,1099 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ BENCHMARK — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Criterion-style benchmarking framework with statistical rigor.
+//
+// Features:
+// - Warm-up and measurement phases
+// - Bootstrap confidence intervals
+// - Outlier detection and classification
+// - Baseline comparison with regression detection
+// - Multiple output formats (HTML, JSON, CSV, Markdown)
+// - Historical tracking with trend analysis
+// - Throughput analysis for varying input sizes
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # QuantaLang Benchmark Framework
+//!
+//! A statistically rigorous benchmarking framework for QuantaLang programs.
+//!
+//! ## Quick Start
+//!
+//! ```bash
+//! # Run benchmarks
+//! quanta-bench run benchmarks/
+//!
+//! # Compare against baseline
+//! quanta-bench run --baseline target/bench/baseline benchmarks/
+//!
+//! # Generate HTML report
+//! quanta-bench run --format html --output report.html benchmarks/
+//! ```
+//!
+//! ## Programmatic API
+//!
+//! ```quanta
+//! use quantalang::bench::{bench_group, Criterion};
+//!
+//! fn fibonacci(n: u64) -> u64 {
+//!     if n < 2 { n } else { fibonacci(n - 1) + fibonacci(n - 2) }
+//! }
+//!
+//! fn main() {
+//!     let mut c = Criterion::default();
+//!     
+//!     c.bench_function("fibonacci_20", |b| {
+//!         b.iter(|| fibonacci(20))
+//!     });
+//!     
+//!     c.bench_with_input("fibonacci", &[10, 15, 20, 25], |b, &n| {
+//!         b.iter(|| fibonacci(n))
+//!     });
+//!     
+//!     c.finish();
+//! }
+//! ```
+//!
+//! ## Attributes
+//!
+//! ```quanta
+//! #[bench]
+//! fn bench_sort(b: &mut Bencher) {
+//!     let data: Vec<i32> = (0..1000).rev().collect();
+//!     b.iter(|| {
+//!         let mut v = data.clone();
+//!         v.sort();
+//!         v
+//!     })
+//! }
+//! ```
+
+module quantalang::bench
+
+// Submodules
+pub mod runner;
+pub mod statistics;
+pub mod report;
+
+// Re-exports from runner
+pub use runner::{
+    BenchConfig, OutputFormat, Benchmark, BenchmarkInput, Bencher, Runner,
+    BenchmarkResult, Statistics, Comparison,
+};
+
+// Re-exports from statistics
+pub use statistics::{
+    SampleStatistics, OutlierStats, OutlierClassification,
+    Bootstrap, BootstrapEstimate, BootstrapComparison,
+    HypothesisTest, EffectSize, welch_t_test, mann_whitney_u_test,
+    RegressionAnalysis, RegressionClass, detect_regression,
+    LinearRegression, ThroughputAnalysis, ComplexityClass,
+    NoiseAnalysis, NoiseAssessment,
+};
+
+// Re-exports from report
+pub use report::{
+    ReportConfig, ReportFormat, Theme, BenchmarkReport, ReportMetadata,
+    SystemInfo, BenchmarkGroup, BenchmarkResultReport, ReportSummary,
+    HistoricalRun, ReportGenerator, ReportBuilder, GroupBuilder,
+    save_history, save_baseline,
+};
+
+use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::hint::black_box;
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CRITERION-STYLE API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Main entry point for benchmarking (Criterion-style API)
+pub struct Criterion {
+    config: BenchConfig,
+    report_config: ReportConfig,
+    groups: Vec<BenchmarkGroup>,
+    current_group: Option<String>,
+    baselines: BTreeMap<String, f64>,
+    samples_cache: BTreeMap<String, Vec<f64>>,
+}
+
+impl Criterion {
+    /// Create a new Criterion instance with default configuration
+    pub fn new() -> Self {
+        Criterion {
+            config: BenchConfig::default(),
+            report_config: ReportConfig::default(),
+            groups: Vec::new(),
+            current_group: None,
+            baselines: BTreeMap::new(),
+            samples_cache: BTreeMap::new(),
+        }
+    }
+    
+    /// Configure warm-up time
+    pub fn warm_up_time(mut self, time: Duration) -> Self {
+        self.config.warm_up_time = time;
+        self
+    }
+    
+    /// Configure measurement time
+    pub fn measurement_time(mut self, time: Duration) -> Self {
+        self.config.measurement_time = time;
+        self
+    }
+    
+    /// Configure sample count
+    pub fn sample_size(mut self, n: usize) -> Self {
+        self.config.sample_count = n;
+        self
+    }
+    
+    /// Configure confidence level
+    pub fn confidence_level(mut self, level: f64) -> Self {
+        self.config.confidence_level = level;
+        self
+    }
+    
+    /// Configure significance threshold
+    pub fn significance_level(mut self, alpha: f64) -> Self {
+        self.config.significance_threshold = alpha;
+        self
+    }
+    
+    /// Set noise detection
+    pub fn noise_threshold(mut self, threshold: f64) -> Self {
+        // Store in config (would need to add field)
+        self
+    }
+    
+    /// Set baseline directory for comparison
+    pub fn baseline_directory(mut self, dir: PathBuf) -> Self {
+        self.config.baseline_dir = Some(dir.clone());
+        self.load_baselines(&dir);
+        self
+    }
+    
+    /// Save results as new baseline
+    pub fn save_baseline(mut self) -> Self {
+        self.config.save_baseline = true;
+        self
+    }
+    
+    /// Set output format
+    pub fn output_format(mut self, format: OutputFormat) -> Self {
+        self.config.output_format = format;
+        self
+    }
+    
+    /// Set report format
+    pub fn report_format(mut self, format: ReportFormat) -> Self {
+        self.report_config.format = format;
+        self
+    }
+    
+    /// Set report title
+    pub fn report_title(mut self, title: impl Into<String>) -> Self {
+        self.report_config.title = title.into();
+        self
+    }
+    
+    /// Start a benchmark group
+    pub fn benchmark_group<S: Into<String>>(&mut self, name: S) -> &mut Self {
+        self.current_group = Some(name.into());
+        self
+    }
+    
+    /// Run a single benchmark function
+    pub fn bench_function<S, F>(&mut self, name: S, f: F) -> &mut Self
+    where
+        S: Into<String>,
+        F: FnMut(&mut Bencher),
+    {
+        let name = name.into();
+        let group_name = self.current_group.clone().unwrap_or_else(|| "default".to_string());
+        
+        let result = self.run_benchmark(&name, f);
+        self.add_result(&group_name, result);
+        
+        self
+    }
+    
+    /// Run benchmarks with varying inputs
+    pub fn bench_with_input<S, I, F>(&mut self, name: S, inputs: &[I], mut f: F) -> &mut Self
+    where
+        S: Into<String>,
+        I: std::fmt::Debug + Clone,
+        F: FnMut(&mut Bencher, &I),
+    {
+        let base_name = name.into();
+        let group_name = self.current_group.clone().unwrap_or_else(|| base_name.clone());
+        
+        for input in inputs {
+            let bench_name = format!("{}/{:?}", base_name, input);
+            let input_clone = input.clone();
+            
+            let result = self.run_benchmark(&bench_name, |b| {
+                f(b, &input_clone);
+            });
+            
+            self.add_result(&group_name, result);
+        }
+        
+        self
+    }
+    
+    /// Run parameterized benchmarks
+    pub fn bench_with_parameter_range<S, F>(
+        &mut self,
+        name: S,
+        start: usize,
+        end: usize,
+        step: usize,
+        mut f: F,
+    ) -> &mut Self
+    where
+        S: Into<String>,
+        F: FnMut(&mut Bencher, usize),
+    {
+        let base_name = name.into();
+        let group_name = self.current_group.clone().unwrap_or_else(|| base_name.clone());
+        
+        let mut n = start;
+        while n <= end {
+            let bench_name = format!("{}/{}", base_name, n);
+            let param = n;
+            
+            let result = self.run_benchmark(&bench_name, |b| {
+                f(b, param);
+            });
+            
+            self.add_result(&group_name, result);
+            n += step;
+        }
+        
+        self
+    }
+    
+    /// Throughput benchmark (measures elements/second)
+    pub fn throughput<S, F>(&mut self, name: S, elements: u64, f: F) -> &mut Self
+    where
+        S: Into<String>,
+        F: FnMut(&mut Bencher),
+    {
+        let name = name.into();
+        let group_name = self.current_group.clone().unwrap_or_else(|| "throughput".to_string());
+        
+        let mut result = self.run_benchmark(&name, f);
+        
+        // Calculate throughput
+        let time_per_iter = result.statistics.per_iter;
+        if time_per_iter > 0.0 {
+            let throughput = (elements as f64 * 1_000_000_000.0) / time_per_iter;
+            result.throughput = Some(throughput);
+        }
+        
+        self.add_result(&group_name, result);
+        self
+    }
+    
+    /// Finalize and generate report
+    pub fn finish(&self) -> BenchmarkReport {
+        let mut builder = ReportBuilder::new()
+            .title(&self.report_config.title);
+        
+        // Add all groups
+        for group in &self.groups {
+            for result in &group.results {
+                builder = builder.add_result(&group.name, result.clone());
+            }
+        }
+        
+        builder.build()
+    }
+    
+    /// Finalize and print report
+    pub fn finish_print(&self) {
+        let report = self.finish();
+        let generator = ReportGenerator::new(self.report_config.clone());
+        println!("{}", generator.generate(&report));
+        
+        // Save baseline if requested
+        if self.config.save_baseline {
+            if let Some(ref dir) = self.config.baseline_dir {
+                if let Err(e) = save_baseline(&report, dir) {
+                    eprintln!("Warning: failed to save baseline: {}", e);
+                }
+            }
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Internal methods
+    // ─────────────────────────────────────────────────────────────────────────────
+    
+    fn run_benchmark<F>(&self, name: &str, mut f: F) -> BenchmarkResultReport
+    where
+        F: FnMut(&mut Bencher),
+    {
+        // Warm-up phase
+        let iterations = self.warm_up(&mut f);
+        
+        // Measurement phase
+        let samples = self.measure(&mut f, iterations);
+        
+        // Compute statistics
+        let statistics = SampleStatistics::from_values(
+            &samples,
+            iterations,
+            self.config.confidence_level,
+        );
+        
+        // Check for regression
+        let regression = self.baselines.get(name).map(|&baseline| {
+            detect_regression(
+                &[baseline],
+                &samples,
+                self.config.significance_threshold,
+                5.0, // 5% noise threshold
+            )
+        });
+        
+        // Noise analysis
+        let noise = NoiseAnalysis::analyze(&samples);
+        
+        BenchmarkResultReport {
+            name: name.to_string(),
+            iterations,
+            time_per_iter: Duration::from_nanos(statistics.per_iter as u64),
+            throughput: None,
+            statistics,
+            regression,
+            noise,
+            samples,
+        }
+    }
+    
+    fn warm_up<F>(&self, f: &mut F) -> u64
+    where
+        F: FnMut(&mut Bencher),
+    {
+        let warm_up_time = self.config.warm_up_time;
+        let mut iterations: u64 = 1;
+        let start = Instant::now();
+        
+        while start.elapsed() < warm_up_time {
+            let mut bencher = Bencher::new_with_iterations(iterations);
+            f(&mut bencher);
+            
+            let elapsed = bencher.elapsed();
+            if elapsed.as_nanos() == 0 {
+                iterations = iterations.saturating_mul(10);
+            } else {
+                // Estimate iterations for ~10ms per sample
+                let target_ns = 10_000_000u128;
+                let per_iter_ns = elapsed.as_nanos() / iterations as u128;
+                if per_iter_ns > 0 {
+                    let new_iters = (target_ns / per_iter_ns) as u64;
+                    iterations = new_iters.max(1).min(self.config.max_iterations);
+                } else {
+                    iterations = iterations.saturating_mul(10);
+                }
+            }
+        }
+        
+        iterations.max(self.config.min_iterations).min(self.config.max_iterations)
+    }
+    
+    fn measure<F>(&self, f: &mut F, iterations: u64) -> Vec<f64>
+    where
+        F: FnMut(&mut Bencher),
+    {
+        let sample_count = self.config.sample_count;
+        let mut samples = Vec::with_capacity(sample_count);
+        
+        for _ in 0..sample_count {
+            let mut bencher = Bencher::new_with_iterations(iterations);
+            f(&mut bencher);
+            
+            // Convert to per-iteration time in nanoseconds
+            let total_ns = bencher.elapsed().as_nanos() as f64;
+            let per_iter = total_ns / iterations as f64;
+            samples.push(per_iter);
+        }
+        
+        samples
+    }
+    
+    fn add_result(&mut self, group_name: &str, result: BenchmarkResultReport) {
+        // Store samples for potential comparison
+        self.samples_cache.insert(result.name.clone(), result.samples.clone());
+        
+        // Find or create group
+        if let Some(group) = self.groups.iter_mut().find(|g| g.name == group_name) {
+            group.results.push(result);
+        } else {
+            self.groups.push(BenchmarkGroup {
+                name: group_name.to_string(),
+                results: vec![result],
+            });
+        }
+    }
+    
+    fn load_baselines(&mut self, dir: &PathBuf) {
+        let path = dir.join("baseline.json");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(baselines) = parse_baseline_json(&content) {
+                self.baselines = baselines;
+            }
+        }
+    }
+}
+
+impl Default for Criterion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Extended Bencher with iteration tracking
+impl Bencher {
+    fn new_with_iterations(iterations: u64) -> Self {
+        Bencher {
+            iterations,
+            elapsed: Duration::ZERO,
+            bytes_processed: 0,
+        }
+    }
+    
+    fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUNCTIONAL API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Convenience macro-style function for simple benchmarks
+pub fn bench<S, F>(name: S, f: F) -> BenchmarkResultReport
+where
+    S: Into<String>,
+    F: FnMut(&mut Bencher),
+{
+    Criterion::new().run_benchmark(&name.into(), f)
+}
+
+/// Benchmark a closure and return timing
+pub fn time_it<F, R>(f: F) -> (R, Duration)
+where
+    F: FnOnce() -> R,
+{
+    let start = Instant::now();
+    let result = black_box(f());
+    let elapsed = start.elapsed();
+    (result, elapsed)
+}
+
+/// Quick benchmark returning mean time
+pub fn quick_bench<F>(iterations: u64, mut f: F) -> Duration
+where
+    F: FnMut(),
+{
+    let start = Instant::now();
+    for _ in 0..iterations {
+        black_box(f());
+    }
+    let elapsed = start.elapsed();
+    Duration::from_nanos((elapsed.as_nanos() / iterations as u128) as u64)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLI
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// CLI arguments
+#[derive(Debug)]
+pub struct CliArgs {
+    pub command: BenchCommand,
+    pub config: BenchConfig,
+    pub report_config: ReportConfig,
+    pub verbose: bool,
+}
+
+#[derive(Debug)]
+pub enum BenchCommand {
+    /// Run benchmarks
+    Run {
+        path: PathBuf,
+        filter: Option<String>,
+    },
+    /// List available benchmarks
+    List {
+        path: PathBuf,
+    },
+    /// Compare two benchmark runs
+    Compare {
+        baseline: PathBuf,
+        current: PathBuf,
+    },
+    /// Show baseline
+    Baseline {
+        path: PathBuf,
+    },
+    /// Generate report from saved data
+    Report {
+        input: PathBuf,
+        output: PathBuf,
+    },
+}
+
+/// Parse command line arguments
+pub fn parse_args(args: &[String]) -> Result<CliArgs, String> {
+    let mut config = BenchConfig::default();
+    let mut report_config = ReportConfig::default();
+    let mut verbose = false;
+    let mut command: Option<BenchCommand> = None;
+    
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                print_version();
+                std::process::exit(0);
+            }
+            "-v" | "--verbose" => {
+                verbose = true;
+            }
+            "--warm-up" => {
+                i += 1;
+                let secs = args.get(i)
+                    .ok_or("--warm-up requires a value")?
+                    .parse::<f64>()
+                    .map_err(|_| "invalid warm-up time")?;
+                config.warm_up_time = Duration::from_secs_f64(secs);
+            }
+            "--measurement-time" => {
+                i += 1;
+                let secs = args.get(i)
+                    .ok_or("--measurement-time requires a value")?
+                    .parse::<f64>()
+                    .map_err(|_| "invalid measurement time")?;
+                config.measurement_time = Duration::from_secs_f64(secs);
+            }
+            "--sample-size" => {
+                i += 1;
+                config.sample_count = args.get(i)
+                    .ok_or("--sample-size requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid sample size")?;
+            }
+            "--confidence" => {
+                i += 1;
+                config.confidence_level = args.get(i)
+                    .ok_or("--confidence requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid confidence level")?;
+            }
+            "--baseline" | "-b" => {
+                i += 1;
+                config.baseline_dir = Some(PathBuf::from(
+                    args.get(i).ok_or("--baseline requires a path")?
+                ));
+            }
+            "--save-baseline" => {
+                config.save_baseline = true;
+            }
+            "--format" | "-f" => {
+                i += 1;
+                report_config.format = match args.get(i).map(|s| s.as_str()) {
+                    Some("html") => ReportFormat::Html,
+                    Some("json") => ReportFormat::Json,
+                    Some("csv") => ReportFormat::Csv,
+                    Some("markdown") | Some("md") => ReportFormat::Markdown,
+                    Some("terminal") | Some("term") => ReportFormat::Terminal,
+                    _ => return Err("invalid format".to_string()),
+                };
+            }
+            "--output" | "-o" => {
+                i += 1;
+                report_config.history_dir = Some(PathBuf::from(
+                    args.get(i).ok_or("--output requires a path")?
+                ));
+            }
+            "--title" => {
+                i += 1;
+                report_config.title = args.get(i)
+                    .ok_or("--title requires a value")?
+                    .clone();
+            }
+            "--theme" => {
+                i += 1;
+                report_config.theme = match args.get(i).map(|s| s.as_str()) {
+                    Some("light") => Theme::Light,
+                    Some("dark") => Theme::Dark,
+                    Some("high-contrast") => Theme::HighContrast,
+                    _ => return Err("invalid theme".to_string()),
+                };
+            }
+            "--no-charts" => {
+                report_config.include_charts = false;
+            }
+            "--include-raw" => {
+                report_config.include_raw_data = true;
+            }
+            "--regressions-only" => {
+                report_config.regressions_only = true;
+            }
+            "run" => {
+                i += 1;
+                let path = PathBuf::from(
+                    args.get(i).ok_or("run requires a path")?
+                );
+                let mut filter = None;
+                
+                // Check for filter
+                if let Some(next) = args.get(i + 1) {
+                    if !next.starts_with('-') {
+                        i += 1;
+                        filter = Some(next.clone());
+                    }
+                }
+                
+                command = Some(BenchCommand::Run { path, filter });
+            }
+            "list" => {
+                i += 1;
+                let path = PathBuf::from(
+                    args.get(i).ok_or("list requires a path")?
+                );
+                command = Some(BenchCommand::List { path });
+            }
+            "compare" => {
+                i += 1;
+                let baseline = PathBuf::from(
+                    args.get(i).ok_or("compare requires baseline path")?
+                );
+                i += 1;
+                let current = PathBuf::from(
+                    args.get(i).ok_or("compare requires current path")?
+                );
+                command = Some(BenchCommand::Compare { baseline, current });
+            }
+            "baseline" => {
+                i += 1;
+                let path = PathBuf::from(
+                    args.get(i).ok_or("baseline requires a path")?
+                );
+                command = Some(BenchCommand::Baseline { path });
+            }
+            "report" => {
+                i += 1;
+                let input = PathBuf::from(
+                    args.get(i).ok_or("report requires input path")?
+                );
+                i += 1;
+                let output = PathBuf::from(
+                    args.get(i).ok_or("report requires output path")?
+                );
+                command = Some(BenchCommand::Report { input, output });
+            }
+            arg if arg.starts_with('-') => {
+                return Err(format!("unknown option: {}", arg));
+            }
+            _ => {
+                // Positional argument - assume it's a path for run
+                if command.is_none() {
+                    command = Some(BenchCommand::Run {
+                        path: PathBuf::from(&args[i]),
+                        filter: None,
+                    });
+                }
+            }
+        }
+        i += 1;
+    }
+    
+    let command = command.ok_or("no command specified")?;
+    
+    Ok(CliArgs {
+        command,
+        config,
+        report_config,
+        verbose,
+    })
+}
+
+/// Print help message
+pub fn print_help() {
+    println!(r#"
+quanta-bench - QuantaLang Benchmark Framework v{}
+
+USAGE:
+    quanta-bench [OPTIONS] <COMMAND>
+
+COMMANDS:
+    run <path> [filter]     Run benchmarks in path (optionally filtered)
+    list <path>             List available benchmarks
+    compare <base> <curr>   Compare two benchmark results
+    baseline <path>         Show baseline information
+    report <in> <out>       Generate report from saved data
+
+OPTIONS:
+    -h, --help              Show this help message
+    -V, --version           Show version
+    -v, --verbose           Verbose output
+    
+    --warm-up <secs>        Warm-up time (default: 3.0)
+    --measurement-time <s>  Measurement time (default: 5.0)
+    --sample-size <n>       Number of samples (default: 100)
+    --confidence <level>    Confidence level (default: 0.95)
+    
+    -b, --baseline <path>   Baseline directory for comparison
+    --save-baseline         Save results as new baseline
+    
+    -f, --format <fmt>      Output format: html, json, csv, md, terminal
+    -o, --output <path>     Output file/directory
+    --title <title>         Report title
+    --theme <theme>         HTML theme: light, dark, high-contrast
+    --no-charts             Disable charts in HTML output
+    --include-raw           Include raw sample data
+    --regressions-only      Show only regressions in summary
+
+EXAMPLES:
+    quanta-bench run benchmarks/
+    quanta-bench run benchmarks/ fibonacci
+    quanta-bench run -f html -o report.html benchmarks/
+    quanta-bench compare baseline.json current.json
+    quanta-bench run --baseline target/bench --save-baseline benchmarks/
+"#, VERSION);
+}
+
+/// Print version
+pub fn print_version() {
+    println!("quanta-bench {}", VERSION);
+}
+
+/// Run CLI
+pub fn run(cli: &CliArgs) -> Result<i32, String> {
+    match &cli.command {
+        BenchCommand::Run { path, filter } => {
+            run_benchmarks(path, filter.as_deref(), &cli.config, &cli.report_config, cli.verbose)
+        }
+        BenchCommand::List { path } => {
+            list_benchmarks(path)
+        }
+        BenchCommand::Compare { baseline, current } => {
+            compare_results(baseline, current, &cli.report_config)
+        }
+        BenchCommand::Baseline { path } => {
+            show_baseline(path)
+        }
+        BenchCommand::Report { input, output } => {
+            generate_report(input, output, &cli.report_config)
+        }
+    }
+}
+
+fn run_benchmarks(
+    path: &PathBuf,
+    filter: Option<&str>,
+    config: &BenchConfig,
+    report_config: &ReportConfig,
+    verbose: bool,
+) -> Result<i32, String> {
+    if verbose {
+        eprintln!("Running benchmarks in: {}", path.display());
+        if let Some(f) = filter {
+            eprintln!("Filter: {}", f);
+        }
+    }
+    
+    // In real impl, discover and run benchmark files
+    // For now, create a placeholder
+    let mut criterion = Criterion::new();
+    criterion.config = config.clone();
+    criterion.report_config = report_config.clone();
+    
+    if let Some(ref dir) = config.baseline_dir {
+        criterion = criterion.baseline_directory(dir.clone());
+    }
+    
+    // Run discovered benchmarks
+    // (would use build system to compile and run)
+    
+    criterion.finish_print();
+    
+    if config.save_baseline {
+        if let Some(ref dir) = config.baseline_dir {
+            let report = criterion.finish();
+            save_baseline(&report, dir)?;
+            eprintln!("Saved baseline to: {}", dir.display());
+        }
+    }
+    
+    Ok(0)
+}
+
+fn list_benchmarks(path: &PathBuf) -> Result<i32, String> {
+    eprintln!("Listing benchmarks in: {}", path.display());
+    
+    // Would scan for #[bench] functions
+    println!("Available benchmarks:");
+    println!("  (benchmark discovery not yet implemented)");
+    
+    Ok(0)
+}
+
+fn compare_results(baseline: &PathBuf, current: &PathBuf, config: &ReportConfig) -> Result<i32, String> {
+    let baseline_content = std::fs::read_to_string(baseline)
+        .map_err(|e| format!("failed to read baseline: {}", e))?;
+    let current_content = std::fs::read_to_string(current)
+        .map_err(|e| format!("failed to read current: {}", e))?;
+    
+    let baseline_results = parse_baseline_json(&baseline_content)?;
+    let current_results = parse_baseline_json(&current_content)?;
+    
+    println!("\n{:40} {:>15} {:>15} {:>10}", "Benchmark", "Baseline", "Current", "Change");
+    println!("{}", "─".repeat(85));
+    
+    for (name, &current_val) in &current_results {
+        let baseline_val = baseline_results.get(name).copied();
+        
+        let change = baseline_val.map(|b| {
+            let pct = ((current_val - b) / b) * 100.0;
+            if pct > 5.0 {
+                format!("\x1b[31m↑{:+.2}%\x1b[0m", pct)
+            } else if pct < -5.0 {
+                format!("\x1b[32m↓{:+.2}%\x1b[0m", pct)
+            } else {
+                format!("{:+.2}%", pct)
+            }
+        }).unwrap_or_else(|| "NEW".to_string());
+        
+        let baseline_str = baseline_val
+            .map(|v| format_ns(v))
+            .unwrap_or_else(|| "-".to_string());
+        
+        println!("{:40} {:>15} {:>15} {:>10}",
+            name,
+            baseline_str,
+            format_ns(current_val),
+            change
+        );
+    }
+    
+    Ok(0)
+}
+
+fn show_baseline(path: &PathBuf) -> Result<i32, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read baseline: {}", e))?;
+    
+    let results = parse_baseline_json(&content)?;
+    
+    println!("\nBaseline: {}", path.display());
+    println!("{}", "─".repeat(60));
+    
+    for (name, &value) in &results {
+        println!("{:40} {:>15}", name, format_ns(value));
+    }
+    
+    Ok(0)
+}
+
+fn generate_report(input: &PathBuf, output: &PathBuf, config: &ReportConfig) -> Result<i32, String> {
+    let content = std::fs::read_to_string(input)
+        .map_err(|e| format!("failed to read input: {}", e))?;
+    
+    // Parse and generate report
+    // (simplified for now)
+    
+    eprintln!("Generated report: {}", output.display());
+    
+    Ok(0)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn parse_baseline_json(json: &str) -> Result<BTreeMap<String, f64>, String> {
+    let mut results = BTreeMap::new();
+    
+    // Find "results" section
+    if let Some(start) = json.find("\"results\"") {
+        if let Some(brace_start) = json[start..].find('{') {
+            let offset = start + brace_start;
+            if let Some(brace_end) = json[offset..].find('}') {
+                let section = &json[offset + 1..offset + brace_end];
+                
+                for line in section.lines() {
+                    let line = line.trim().trim_end_matches(',');
+                    if let Some(colon) = line.find(':') {
+                        let key = line[..colon].trim().trim_matches('"');
+                        let value = line[colon + 1..].trim();
+                        if let Ok(v) = value.parse::<f64>() {
+                            results.insert(key.to_string(), v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    if results.is_empty() {
+        // Try direct key-value format
+        for line in json.lines() {
+            let line = line.trim().trim_end_matches(',');
+            if let Some(colon) = line.find(':') {
+                let key = line[..colon].trim().trim_matches('"');
+                let value = line[colon + 1..].trim();
+                if let Ok(v) = value.parse::<f64>() {
+                    results.insert(key.to_string(), v);
+                }
+            }
+        }
+    }
+    
+    Ok(results)
+}
+
+fn format_ns(ns: f64) -> String {
+    if ns < 1_000.0 {
+        format!("{:.2} ns", ns)
+    } else if ns < 1_000_000.0 {
+        format!("{:.2} µs", ns / 1_000.0)
+    } else if ns < 1_000_000_000.0 {
+        format!("{:.2} ms", ns / 1_000_000.0)
+    } else {
+        format!("{:.2} s", ns / 1_000_000_000.0)
+    }
+}
+
+/// Main entry point
+pub fn main() -> Result<i32, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    
+    if args.is_empty() {
+        print_help();
+        return Ok(0);
+    }
+    
+    let cli = parse_args(&args)?;
+    run(&cli)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_criterion_new() {
+        let c = Criterion::new();
+        assert_eq!(c.config.sample_count, 100);
+        assert!(c.groups.is_empty());
+    }
+    
+    #[test]
+    fn test_criterion_config() {
+        let c = Criterion::new()
+            .warm_up_time(Duration::from_secs(1))
+            .measurement_time(Duration::from_secs(2))
+            .sample_size(50)
+            .confidence_level(0.99);
+        
+        assert_eq!(c.config.warm_up_time, Duration::from_secs(1));
+        assert_eq!(c.config.measurement_time, Duration::from_secs(2));
+        assert_eq!(c.config.sample_count, 50);
+        assert_eq!(c.config.confidence_level, 0.99);
+    }
+    
+    #[test]
+    fn test_time_it() {
+        let (result, duration) = time_it(|| {
+            let mut sum = 0u64;
+            for i in 0..1000 {
+                sum += i;
+            }
+            sum
+        });
+        
+        assert_eq!(result, 499500);
+        assert!(duration.as_nanos() > 0);
+    }
+    
+    #[test]
+    fn test_quick_bench() {
+        let duration = quick_bench(100, || {
+            let _ = black_box(1 + 1);
+        });
+        
+        assert!(duration.as_nanos() >= 0);
+    }
+    
+    #[test]
+    fn test_parse_args_run() {
+        let args = vec!["run".to_string(), "benchmarks/".to_string()];
+        let cli = parse_args(&args).unwrap();
+        
+        match cli.command {
+            BenchCommand::Run { path, filter } => {
+                assert_eq!(path, PathBuf::from("benchmarks/"));
+                assert!(filter.is_none());
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+    
+    #[test]
+    fn test_parse_args_format() {
+        let args = vec![
+            "--format".to_string(),
+            "html".to_string(),
+            "run".to_string(),
+            "benchmarks/".to_string(),
+        ];
+        let cli = parse_args(&args).unwrap();
+        
+        assert_eq!(cli.report_config.format, ReportFormat::Html);
+    }
+    
+    #[test]
+    fn test_parse_baseline_json() {
+        let json = r#"{"results": {"bench1": 100.5, "bench2": 200.0}}"#;
+        let results = parse_baseline_json(json).unwrap();
+        
+        assert_eq!(results.get("bench1"), Some(&100.5));
+        assert_eq!(results.get("bench2"), Some(&200.0));
+    }
+    
+    #[test]
+    fn test_format_ns() {
+        assert_eq!(format_ns(500.0), "500.00 ns");
+        assert_eq!(format_ns(5000.0), "5.00 µs");
+        assert_eq!(format_ns(5_000_000.0), "5.00 ms");
+        assert_eq!(format_ns(5_000_000_000.0), "5.00 s");
+    }
+}

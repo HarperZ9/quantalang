@@ -1,0 +1,1023 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ LSP — Code Lens & Call Hierarchy
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Code Lens: Actionable annotations above code elements
+// - Reference counts
+// - Test runners
+// - Implementation counts
+// - Debug/run actions
+//
+// Call Hierarchy: Navigate function call relationships
+// - Incoming calls (who calls this?)
+// - Outgoing calls (what does this call?)
+// - Full call graph navigation
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::lsp::code_lens
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CODE LENS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Position in document
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Position {
+    pub line: u32,
+    pub character: u32,
+}
+
+/// Range in document
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Range {
+    pub start: Position,
+    pub end: Position,
+}
+
+impl Range {
+    pub fn new(start_line: u32, start_char: u32, end_line: u32, end_char: u32) -> Self {
+        Range {
+            start: Position { line: start_line, character: start_char },
+            end: Position { line: end_line, character: end_char },
+        }
+    }
+    
+    pub fn single_line(line: u32, start: u32, end: u32) -> Self {
+        Range::new(line, start, line, end)
+    }
+}
+
+/// Command to execute
+#[derive(Debug, Clone)]
+pub struct Command {
+    /// Display title
+    pub title: String,
+    /// Command identifier
+    pub command: String,
+    /// Command arguments (JSON serialized)
+    pub arguments: Vec<String>,
+}
+
+impl Command {
+    pub fn new(title: impl Into<String>, command: impl Into<String>) -> Self {
+        Command {
+            title: title.into(),
+            command: command.into(),
+            arguments: Vec::new(),
+        }
+    }
+    
+    pub fn with_args(mut self, args: Vec<String>) -> Self {
+        self.arguments = args;
+        self
+    }
+}
+
+/// Code lens item
+#[derive(Debug, Clone)]
+pub struct CodeLens {
+    /// Range where lens applies
+    pub range: Range,
+    /// Command to execute (None = resolve later)
+    pub command: Option<Command>,
+    /// Custom data for resolve
+    pub data: Option<CodeLensData>,
+}
+
+impl CodeLens {
+    pub fn new(range: Range) -> Self {
+        CodeLens {
+            range,
+            command: None,
+            data: None,
+        }
+    }
+    
+    pub fn with_command(mut self, command: Command) -> Self {
+        self.command = Some(command);
+        self
+    }
+    
+    pub fn with_data(mut self, data: CodeLensData) -> Self {
+        self.data = Some(data);
+        self
+    }
+    
+    /// Create reference count lens
+    pub fn references(range: Range, symbol_id: SymbolId) -> Self {
+        CodeLens::new(range).with_data(CodeLensData::References { symbol_id })
+    }
+    
+    /// Create implementations lens
+    pub fn implementations(range: Range, symbol_id: SymbolId) -> Self {
+        CodeLens::new(range).with_data(CodeLensData::Implementations { symbol_id })
+    }
+    
+    /// Create run test lens
+    pub fn run_test(range: Range, test_id: String) -> Self {
+        CodeLens::new(range).with_data(CodeLensData::RunTest { test_id })
+    }
+    
+    /// Create debug lens
+    pub fn debug(range: Range, target_id: String) -> Self {
+        CodeLens::new(range).with_data(CodeLensData::Debug { target_id })
+    }
+}
+
+/// Data for deferred code lens resolution
+#[derive(Debug, Clone)]
+pub enum CodeLensData {
+    /// Reference count
+    References { symbol_id: SymbolId },
+    /// Implementation count (for traits)
+    Implementations { symbol_id: SymbolId },
+    /// Run single test
+    RunTest { test_id: String },
+    /// Debug target
+    Debug { target_id: String },
+    /// Run main
+    RunMain { target_id: String },
+    /// Show type hierarchy
+    TypeHierarchy { symbol_id: SymbolId },
+}
+
+/// Symbol identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SymbolId(pub u64);
+
+/// Code lens configuration
+#[derive(Debug, Clone)]
+pub struct CodeLensConfig {
+    /// Show reference counts
+    pub references: bool,
+    /// Show implementation counts
+    pub implementations: bool,
+    /// Show run test lenses
+    pub run_tests: bool,
+    /// Show debug lenses
+    pub debug: bool,
+    /// Show run main lens
+    pub run_main: bool,
+    /// Minimum references to show (0 = always)
+    pub min_references: usize,
+}
+
+impl Default for CodeLensConfig {
+    fn default() -> Self {
+        CodeLensConfig {
+            references: true,
+            implementations: true,
+            run_tests: true,
+            debug: true,
+            run_main: true,
+            min_references: 0,
+        }
+    }
+}
+
+/// Code lens provider
+pub struct CodeLensProvider {
+    config: CodeLensConfig,
+    /// Reference database
+    refs_db: Arc<ReferencesDatabase>,
+}
+
+impl CodeLensProvider {
+    pub fn new(config: CodeLensConfig, refs_db: Arc<ReferencesDatabase>) -> Self {
+        CodeLensProvider { config, refs_db }
+    }
+    
+    /// Get code lenses for document
+    pub fn lenses(&self, doc: &DocumentAnalysis) -> Vec<CodeLens> {
+        let mut lenses = Vec::new();
+        
+        // Functions
+        for func in &doc.functions {
+            if self.config.references {
+                lenses.push(CodeLens::references(func.name_range, func.symbol_id));
+            }
+            
+            if func.is_test && self.config.run_tests {
+                lenses.push(CodeLens::run_test(func.name_range, func.test_id.clone()));
+            }
+            
+            if func.is_main && self.config.run_main {
+                lenses.push(CodeLens::new(func.name_range)
+                    .with_command(Command::new("▶ Run", "quantalang.runMain")));
+            }
+            
+            if func.is_main && self.config.debug {
+                lenses.push(CodeLens::debug(func.name_range, "main".to_string()));
+            }
+        }
+        
+        // Structs
+        for struct_ in &doc.structs {
+            if self.config.references {
+                lenses.push(CodeLens::references(struct_.name_range, struct_.symbol_id));
+            }
+        }
+        
+        // Traits
+        for trait_ in &doc.traits {
+            if self.config.references {
+                lenses.push(CodeLens::references(trait_.name_range, trait_.symbol_id));
+            }
+            
+            if self.config.implementations {
+                lenses.push(CodeLens::implementations(trait_.name_range, trait_.symbol_id));
+            }
+        }
+        
+        // Enums
+        for enum_ in &doc.enums {
+            if self.config.references {
+                lenses.push(CodeLens::references(enum_.name_range, enum_.symbol_id));
+            }
+        }
+        
+        // Test modules
+        for test_mod in &doc.test_modules {
+            if self.config.run_tests {
+                lenses.push(CodeLens::new(test_mod.range)
+                    .with_command(Command::new(
+                        "▶ Run Tests",
+                        "quantalang.runTests",
+                    ).with_args(vec![test_mod.name.clone()])));
+            }
+        }
+        
+        lenses
+    }
+    
+    /// Resolve code lens (fill in command)
+    pub fn resolve(&self, lens: CodeLens) -> CodeLens {
+        let data = match &lens.data {
+            Some(d) => d,
+            None => return lens,
+        };
+        
+        let command = match data {
+            CodeLensData::References { symbol_id } => {
+                let count = self.refs_db.reference_count(*symbol_id);
+                
+                if count < self.config.min_references {
+                    return lens; // Don't show
+                }
+                
+                let title = if count == 1 {
+                    "1 reference".to_string()
+                } else {
+                    format!("{} references", count)
+                };
+                
+                Command::new(title, "quantalang.showReferences")
+                    .with_args(vec![format!("{}", symbol_id.0)])
+            }
+            
+            CodeLensData::Implementations { symbol_id } => {
+                let count = self.refs_db.implementation_count(*symbol_id);
+                
+                let title = if count == 1 {
+                    "1 implementation".to_string()
+                } else {
+                    format!("{} implementations", count)
+                };
+                
+                Command::new(title, "quantalang.showImplementations")
+                    .with_args(vec![format!("{}", symbol_id.0)])
+            }
+            
+            CodeLensData::RunTest { test_id } => {
+                Command::new("▶ Run Test", "quantalang.runTest")
+                    .with_args(vec![test_id.clone()])
+            }
+            
+            CodeLensData::Debug { target_id } => {
+                Command::new("🐛 Debug", "quantalang.debug")
+                    .with_args(vec![target_id.clone()])
+            }
+            
+            CodeLensData::RunMain { target_id } => {
+                Command::new("▶ Run", "quantalang.runMain")
+                    .with_args(vec![target_id.clone()])
+            }
+            
+            CodeLensData::TypeHierarchy { symbol_id } => {
+                Command::new("◇ Type Hierarchy", "quantalang.showTypeHierarchy")
+                    .with_args(vec![format!("{}", symbol_id.0)])
+            }
+        };
+        
+        CodeLens {
+            range: lens.range,
+            command: Some(command),
+            data: lens.data,
+        }
+    }
+}
+
+/// Document analysis for code lens
+#[derive(Debug, Clone, Default)]
+pub struct DocumentAnalysis {
+    pub functions: Vec<FunctionInfo>,
+    pub structs: Vec<StructInfo>,
+    pub traits: Vec<TraitInfo>,
+    pub enums: Vec<EnumInfo>,
+    pub test_modules: Vec<TestModuleInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionInfo {
+    pub symbol_id: SymbolId,
+    pub name_range: Range,
+    pub is_test: bool,
+    pub is_main: bool,
+    pub test_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructInfo {
+    pub symbol_id: SymbolId,
+    pub name_range: Range,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraitInfo {
+    pub symbol_id: SymbolId,
+    pub name_range: Range,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumInfo {
+    pub symbol_id: SymbolId,
+    pub name_range: Range,
+}
+
+#[derive(Debug, Clone)]
+pub struct TestModuleInfo {
+    pub name: String,
+    pub range: Range,
+}
+
+/// References database
+pub struct ReferencesDatabase {
+    /// Reference counts per symbol
+    references: BTreeMap<SymbolId, usize>,
+    /// Implementation counts per trait
+    implementations: BTreeMap<SymbolId, usize>,
+}
+
+impl ReferencesDatabase {
+    pub fn new() -> Self {
+        ReferencesDatabase {
+            references: BTreeMap::new(),
+            implementations: BTreeMap::new(),
+        }
+    }
+    
+    pub fn reference_count(&self, symbol: SymbolId) -> usize {
+        self.references.get(&symbol).copied().unwrap_or(0)
+    }
+    
+    pub fn implementation_count(&self, symbol: SymbolId) -> usize {
+        self.implementations.get(&symbol).copied().unwrap_or(0)
+    }
+    
+    pub fn set_references(&mut self, symbol: SymbolId, count: usize) {
+        self.references.insert(symbol, count);
+    }
+    
+    pub fn set_implementations(&mut self, symbol: SymbolId, count: usize) {
+        self.implementations.insert(symbol, count);
+    }
+}
+
+impl Default for ReferencesDatabase {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CALL HIERARCHY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Call hierarchy item
+#[derive(Debug, Clone)]
+pub struct CallHierarchyItem {
+    /// Display name
+    pub name: String,
+    
+    /// Symbol kind
+    pub kind: SymbolKind,
+    
+    /// Tags (deprecated, etc.)
+    pub tags: Vec<SymbolTag>,
+    
+    /// Detail (signature, type, etc.)
+    pub detail: Option<String>,
+    
+    /// Document URI
+    pub uri: String,
+    
+    /// Range of the symbol
+    pub range: Range,
+    
+    /// Selection range (name)
+    pub selection_range: Range,
+    
+    /// Custom data
+    pub data: Option<CallHierarchyData>,
+}
+
+/// Symbol kind
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolKind {
+    File,
+    Module,
+    Namespace,
+    Package,
+    Class,
+    Method,
+    Property,
+    Field,
+    Constructor,
+    Enum,
+    Interface,
+    Function,
+    Variable,
+    Constant,
+    String,
+    Number,
+    Boolean,
+    Array,
+    Object,
+    Key,
+    Null,
+    EnumMember,
+    Struct,
+    Event,
+    Operator,
+    TypeParameter,
+}
+
+/// Symbol tag
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolTag {
+    Deprecated,
+}
+
+/// Custom data for call hierarchy
+#[derive(Debug, Clone)]
+pub struct CallHierarchyData {
+    pub symbol_id: SymbolId,
+    pub file_id: u64,
+}
+
+/// Incoming call
+#[derive(Debug, Clone)]
+pub struct CallHierarchyIncomingCall {
+    /// The item that makes the call
+    pub from: CallHierarchyItem,
+    
+    /// Ranges where calls occur (in `from`)
+    pub from_ranges: Vec<Range>,
+}
+
+/// Outgoing call
+#[derive(Debug, Clone)]
+pub struct CallHierarchyOutgoingCall {
+    /// The item being called
+    pub to: CallHierarchyItem,
+    
+    /// Ranges where calls occur (in current item)
+    pub from_ranges: Vec<Range>,
+}
+
+/// Call hierarchy provider
+pub struct CallHierarchyProvider {
+    /// Call graph database
+    call_graph: Arc<CallGraph>,
+    
+    /// Symbol database
+    symbols: Arc<SymbolDatabase>,
+}
+
+impl CallHierarchyProvider {
+    pub fn new(call_graph: Arc<CallGraph>, symbols: Arc<SymbolDatabase>) -> Self {
+        CallHierarchyProvider { call_graph, symbols }
+    }
+    
+    /// Prepare call hierarchy at position
+    pub fn prepare(
+        &self,
+        uri: &str,
+        position: Position,
+    ) -> Option<Vec<CallHierarchyItem>> {
+        // Find symbol at position
+        let symbol = self.symbols.symbol_at(uri, position)?;
+        
+        // Only functions/methods can be in call hierarchy
+        if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
+            return None;
+        }
+        
+        Some(vec![self.symbol_to_item(symbol)])
+    }
+    
+    /// Get incoming calls
+    pub fn incoming_calls(
+        &self,
+        item: &CallHierarchyItem,
+    ) -> Vec<CallHierarchyIncomingCall> {
+        let symbol_id = match &item.data {
+            Some(d) => d.symbol_id,
+            None => return Vec::new(),
+        };
+        
+        let callers = self.call_graph.callers(symbol_id);
+        
+        callers.into_iter()
+            .filter_map(|caller| {
+                let symbol = self.symbols.get(caller.caller_id)?;
+                let item = self.symbol_to_item(symbol);
+                
+                Some(CallHierarchyIncomingCall {
+                    from: item,
+                    from_ranges: caller.call_sites.clone(),
+                })
+            })
+            .collect()
+    }
+    
+    /// Get outgoing calls
+    pub fn outgoing_calls(
+        &self,
+        item: &CallHierarchyItem,
+    ) -> Vec<CallHierarchyOutgoingCall> {
+        let symbol_id = match &item.data {
+            Some(d) => d.symbol_id,
+            None => return Vec::new(),
+        };
+        
+        let callees = self.call_graph.callees(symbol_id);
+        
+        callees.into_iter()
+            .filter_map(|callee| {
+                let symbol = self.symbols.get(callee.callee_id)?;
+                let item = self.symbol_to_item(symbol);
+                
+                Some(CallHierarchyOutgoingCall {
+                    to: item,
+                    from_ranges: callee.call_sites.clone(),
+                })
+            })
+            .collect()
+    }
+    
+    fn symbol_to_item(&self, symbol: SymbolInfo) -> CallHierarchyItem {
+        CallHierarchyItem {
+            name: symbol.name.clone(),
+            kind: symbol.kind,
+            tags: if symbol.deprecated { vec![SymbolTag::Deprecated] } else { vec![] },
+            detail: symbol.detail.clone(),
+            uri: symbol.uri.clone(),
+            range: symbol.range,
+            selection_range: symbol.selection_range,
+            data: Some(CallHierarchyData {
+                symbol_id: symbol.id,
+                file_id: symbol.file_id,
+            }),
+        }
+    }
+}
+
+/// Call graph database
+pub struct CallGraph {
+    /// Callers: callee -> [caller]
+    callers: BTreeMap<SymbolId, Vec<CallerInfo>>,
+    
+    /// Callees: caller -> [callee]
+    callees: BTreeMap<SymbolId, Vec<CalleeInfo>>,
+}
+
+/// Caller information
+#[derive(Debug, Clone)]
+pub struct CallerInfo {
+    pub caller_id: SymbolId,
+    pub call_sites: Vec<Range>,
+}
+
+/// Callee information
+#[derive(Debug, Clone)]
+pub struct CalleeInfo {
+    pub callee_id: SymbolId,
+    pub call_sites: Vec<Range>,
+}
+
+impl CallGraph {
+    pub fn new() -> Self {
+        CallGraph {
+            callers: BTreeMap::new(),
+            callees: BTreeMap::new(),
+        }
+    }
+    
+    pub fn add_call(&mut self, caller: SymbolId, callee: SymbolId, site: Range) {
+        // Add to callers
+        self.callers.entry(callee)
+            .or_insert_with(Vec::new)
+            .push(CallerInfo {
+                caller_id: caller,
+                call_sites: vec![site],
+            });
+        
+        // Add to callees
+        self.callees.entry(caller)
+            .or_insert_with(Vec::new)
+            .push(CalleeInfo {
+                callee_id: callee,
+                call_sites: vec![site],
+            });
+    }
+    
+    pub fn callers(&self, symbol: SymbolId) -> Vec<CallerInfo> {
+        self.callers.get(&symbol).cloned().unwrap_or_default()
+    }
+    
+    pub fn callees(&self, symbol: SymbolId) -> Vec<CalleeInfo> {
+        self.callees.get(&symbol).cloned().unwrap_or_default()
+    }
+    
+    /// Build full call chain from function
+    pub fn call_chain(&self, start: SymbolId, max_depth: usize) -> CallChain {
+        let mut visited = BTreeSet::new();
+        let mut chain = CallChain {
+            root: start,
+            children: Vec::new(),
+        };
+        
+        self.build_chain_recursive(start, &mut chain.children, &mut visited, 0, max_depth);
+        
+        chain
+    }
+    
+    fn build_chain_recursive(
+        &self,
+        current: SymbolId,
+        children: &mut Vec<CallChainNode>,
+        visited: &mut BTreeSet<SymbolId>,
+        depth: usize,
+        max_depth: usize,
+    ) {
+        if depth >= max_depth || visited.contains(&current) {
+            return;
+        }
+        
+        visited.insert(current);
+        
+        for callee in self.callees(current) {
+            let mut node = CallChainNode {
+                symbol: callee.callee_id,
+                call_sites: callee.call_sites,
+                children: Vec::new(),
+                is_recursive: visited.contains(&callee.callee_id),
+            };
+            
+            if !node.is_recursive {
+                self.build_chain_recursive(
+                    callee.callee_id,
+                    &mut node.children,
+                    visited,
+                    depth + 1,
+                    max_depth,
+                );
+            }
+            
+            children.push(node);
+        }
+        
+        visited.remove(&current);
+    }
+}
+
+impl Default for CallGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Call chain tree
+#[derive(Debug, Clone)]
+pub struct CallChain {
+    pub root: SymbolId,
+    pub children: Vec<CallChainNode>,
+}
+
+/// Node in call chain
+#[derive(Debug, Clone)]
+pub struct CallChainNode {
+    pub symbol: SymbolId,
+    pub call_sites: Vec<Range>,
+    pub children: Vec<CallChainNode>,
+    pub is_recursive: bool,
+}
+
+/// Symbol database
+pub struct SymbolDatabase {
+    /// All symbols
+    symbols: BTreeMap<SymbolId, SymbolInfo>,
+    
+    /// Index: file -> position -> symbol
+    position_index: BTreeMap<String, Vec<(Range, SymbolId)>>,
+}
+
+/// Symbol information
+#[derive(Debug, Clone)]
+pub struct SymbolInfo {
+    pub id: SymbolId,
+    pub name: String,
+    pub kind: SymbolKind,
+    pub detail: Option<String>,
+    pub uri: String,
+    pub file_id: u64,
+    pub range: Range,
+    pub selection_range: Range,
+    pub deprecated: bool,
+}
+
+impl SymbolDatabase {
+    pub fn new() -> Self {
+        SymbolDatabase {
+            symbols: BTreeMap::new(),
+            position_index: BTreeMap::new(),
+        }
+    }
+    
+    pub fn add(&mut self, symbol: SymbolInfo) {
+        let id = symbol.id;
+        let uri = symbol.uri.clone();
+        let range = symbol.range;
+        
+        self.symbols.insert(id, symbol);
+        self.position_index.entry(uri)
+            .or_insert_with(Vec::new)
+            .push((range, id));
+    }
+    
+    pub fn get(&self, id: SymbolId) -> Option<SymbolInfo> {
+        self.symbols.get(&id).cloned()
+    }
+    
+    pub fn symbol_at(&self, uri: &str, pos: Position) -> Option<SymbolInfo> {
+        let symbols = self.position_index.get(uri)?;
+        
+        for (range, id) in symbols {
+            if pos.line >= range.start.line && pos.line <= range.end.line {
+                if pos.line == range.start.line && pos.character < range.start.character {
+                    continue;
+                }
+                if pos.line == range.end.line && pos.character > range.end.character {
+                    continue;
+                }
+                return self.symbols.get(id).cloned();
+            }
+        }
+        
+        None
+    }
+}
+
+impl Default for SymbolDatabase {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPE HIERARCHY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type hierarchy item
+#[derive(Debug, Clone)]
+pub struct TypeHierarchyItem {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub tags: Vec<SymbolTag>,
+    pub detail: Option<String>,
+    pub uri: String,
+    pub range: Range,
+    pub selection_range: Range,
+    pub data: Option<TypeHierarchyData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeHierarchyData {
+    pub symbol_id: SymbolId,
+}
+
+/// Type hierarchy provider
+pub struct TypeHierarchyProvider {
+    /// Type relationships
+    type_graph: Arc<TypeGraph>,
+    
+    /// Symbol database
+    symbols: Arc<SymbolDatabase>,
+}
+
+impl TypeHierarchyProvider {
+    pub fn new(type_graph: Arc<TypeGraph>, symbols: Arc<SymbolDatabase>) -> Self {
+        TypeHierarchyProvider { type_graph, symbols }
+    }
+    
+    /// Prepare type hierarchy at position
+    pub fn prepare(
+        &self,
+        uri: &str,
+        position: Position,
+    ) -> Option<Vec<TypeHierarchyItem>> {
+        let symbol = self.symbols.symbol_at(uri, position)?;
+        
+        // Only types can be in type hierarchy
+        if !matches!(symbol.kind, 
+            SymbolKind::Class | SymbolKind::Interface | 
+            SymbolKind::Struct | SymbolKind::Enum
+        ) {
+            return None;
+        }
+        
+        Some(vec![self.symbol_to_type_item(symbol)])
+    }
+    
+    /// Get supertypes
+    pub fn supertypes(&self, item: &TypeHierarchyItem) -> Vec<TypeHierarchyItem> {
+        let symbol_id = match &item.data {
+            Some(d) => d.symbol_id,
+            None => return Vec::new(),
+        };
+        
+        self.type_graph.supertypes(symbol_id)
+            .into_iter()
+            .filter_map(|id| self.symbols.get(id))
+            .map(|s| self.symbol_to_type_item(s))
+            .collect()
+    }
+    
+    /// Get subtypes
+    pub fn subtypes(&self, item: &TypeHierarchyItem) -> Vec<TypeHierarchyItem> {
+        let symbol_id = match &item.data {
+            Some(d) => d.symbol_id,
+            None => return Vec::new(),
+        };
+        
+        self.type_graph.subtypes(symbol_id)
+            .into_iter()
+            .filter_map(|id| self.symbols.get(id))
+            .map(|s| self.symbol_to_type_item(s))
+            .collect()
+    }
+    
+    fn symbol_to_type_item(&self, symbol: SymbolInfo) -> TypeHierarchyItem {
+        TypeHierarchyItem {
+            name: symbol.name,
+            kind: symbol.kind,
+            tags: if symbol.deprecated { vec![SymbolTag::Deprecated] } else { vec![] },
+            detail: symbol.detail,
+            uri: symbol.uri,
+            range: symbol.range,
+            selection_range: symbol.selection_range,
+            data: Some(TypeHierarchyData { symbol_id: symbol.id }),
+        }
+    }
+}
+
+/// Type graph for inheritance/implementation relationships
+pub struct TypeGraph {
+    /// Supertypes: type -> [supertypes]
+    supertypes: BTreeMap<SymbolId, Vec<SymbolId>>,
+    
+    /// Subtypes: type -> [subtypes]
+    subtypes: BTreeMap<SymbolId, Vec<SymbolId>>,
+}
+
+impl TypeGraph {
+    pub fn new() -> Self {
+        TypeGraph {
+            supertypes: BTreeMap::new(),
+            subtypes: BTreeMap::new(),
+        }
+    }
+    
+    pub fn add_supertype(&mut self, subtype: SymbolId, supertype: SymbolId) {
+        self.supertypes.entry(subtype)
+            .or_insert_with(Vec::new)
+            .push(supertype);
+        
+        self.subtypes.entry(supertype)
+            .or_insert_with(Vec::new)
+            .push(subtype);
+    }
+    
+    pub fn supertypes(&self, symbol: SymbolId) -> Vec<SymbolId> {
+        self.supertypes.get(&symbol).cloned().unwrap_or_default()
+    }
+    
+    pub fn subtypes(&self, symbol: SymbolId) -> Vec<SymbolId> {
+        self.subtypes.get(&symbol).cloned().unwrap_or_default()
+    }
+}
+
+impl Default for TypeGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_code_lens_creation() {
+        let lens = CodeLens::references(
+            Range::single_line(5, 4, 10),
+            SymbolId(42),
+        );
+        
+        assert!(lens.data.is_some());
+        assert!(lens.command.is_none()); // Not resolved yet
+    }
+    
+    #[test]
+    fn test_call_graph() {
+        let mut graph = CallGraph::new();
+        
+        let main = SymbolId(1);
+        let foo = SymbolId(2);
+        let bar = SymbolId(3);
+        
+        graph.add_call(main, foo, Range::single_line(10, 4, 7));
+        graph.add_call(main, bar, Range::single_line(11, 4, 7));
+        graph.add_call(foo, bar, Range::single_line(20, 4, 7));
+        
+        let main_callees = graph.callees(main);
+        assert_eq!(main_callees.len(), 2);
+        
+        let bar_callers = graph.callers(bar);
+        assert_eq!(bar_callers.len(), 2);
+    }
+    
+    #[test]
+    fn test_call_chain() {
+        let mut graph = CallGraph::new();
+        
+        let a = SymbolId(1);
+        let b = SymbolId(2);
+        let c = SymbolId(3);
+        
+        graph.add_call(a, b, Range::single_line(1, 0, 1));
+        graph.add_call(b, c, Range::single_line(2, 0, 1));
+        
+        let chain = graph.call_chain(a, 5);
+        
+        assert_eq!(chain.root, a);
+        assert_eq!(chain.children.len(), 1);
+        assert_eq!(chain.children[0].symbol, b);
+        assert_eq!(chain.children[0].children.len(), 1);
+        assert_eq!(chain.children[0].children[0].symbol, c);
+    }
+    
+    #[test]
+    fn test_type_graph() {
+        let mut graph = TypeGraph::new();
+        
+        let animal = SymbolId(1);
+        let dog = SymbolId(2);
+        let cat = SymbolId(3);
+        
+        graph.add_supertype(dog, animal);
+        graph.add_supertype(cat, animal);
+        
+        let animal_subtypes = graph.subtypes(animal);
+        assert_eq!(animal_subtypes.len(), 2);
+        
+        let dog_supertypes = graph.supertypes(dog);
+        assert_eq!(dog_supertypes.len(), 1);
+        assert_eq!(dog_supertypes[0], animal);
+    }
+}

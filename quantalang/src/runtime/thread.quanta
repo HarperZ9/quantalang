@@ -1,0 +1,986 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Thread Runtime
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Thread management runtime:
+//   - Thread creation and lifecycle
+//   - Thread-local storage
+//   - Stack management
+//   - Safepoint synchronization
+//   - Work stealing scheduler
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::runtime::thread
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicUsize, AtomicU64, AtomicBool, AtomicPtr, Ordering};
+use core::ptr::NonNull;
+use core::mem;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THREAD CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Thread configuration
+#[derive(Debug, Clone)]
+pub struct ThreadConfig {
+    /// Default stack size
+    pub stack_size: usize,
+    /// Guard page size
+    pub guard_size: usize,
+    /// Maximum threads
+    pub max_threads: usize,
+    /// Thread pool size
+    pub pool_size: usize,
+    /// Enable work stealing
+    pub work_stealing: bool,
+}
+
+impl Default for ThreadConfig {
+    fn default() -> Self {
+        ThreadConfig {
+            stack_size: 2 * 1024 * 1024,  // 2MB
+            guard_size: 4096,              // 4KB
+            max_threads: 1024,
+            pool_size: 0,                  // Auto-detect
+            work_stealing: true,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THREAD STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Thread execution state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ThreadState {
+    /// Thread is starting
+    Starting = 0,
+    /// Thread is running
+    Running = 1,
+    /// Thread is blocked
+    Blocked = 2,
+    /// Thread is waiting at safepoint
+    AtSafepoint = 3,
+    /// Thread is suspended
+    Suspended = 4,
+    /// Thread is terminating
+    Terminating = 5,
+    /// Thread has terminated
+    Terminated = 6,
+}
+
+/// Thread ID
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ThreadId(pub u64);
+
+impl ThreadId {
+    /// Invalid thread ID
+    pub const INVALID: ThreadId = ThreadId(0);
+    
+    /// Generate new unique ID
+    pub fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        ThreadId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+    
+    pub fn is_valid(&self) -> bool {
+        self.0 != 0
+    }
+}
+
+impl Default for ThreadId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STACK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Thread stack
+pub struct Stack {
+    /// Stack base (lowest address)
+    base: *mut u8,
+    /// Stack limit (highest address)
+    limit: *mut u8,
+    /// Current stack pointer
+    sp: AtomicPtr<u8>,
+    /// Guard page address
+    guard: *mut u8,
+    /// Stack size
+    size: usize,
+}
+
+impl Stack {
+    /// Create new stack
+    pub unsafe fn new(size: usize, guard_size: usize) -> Option<Self> {
+        let total_size = size + guard_size;
+        
+        // Allocate stack memory (platform-specific)
+        let base = Self::alloc_stack(total_size)?;
+        
+        // Set up guard page
+        let guard = base;
+        Self::protect_guard(guard, guard_size);
+        
+        let limit = base.add(total_size);
+        
+        Some(Stack {
+            base: base.add(guard_size),
+            limit,
+            sp: AtomicPtr::new(limit),
+            guard,
+            size,
+        })
+    }
+    
+    fn alloc_stack(size: usize) -> Option<*mut u8> {
+        // Platform-specific allocation
+        None
+    }
+    
+    fn protect_guard(addr: *mut u8, size: usize) {
+        // Set guard pages to no-access
+    }
+    
+    /// Get stack pointer
+    pub fn sp(&self) -> *mut u8 {
+        self.sp.load(Ordering::Relaxed)
+    }
+    
+    /// Check if address is within stack
+    pub fn contains(&self, addr: *const u8) -> bool {
+        addr >= self.base && addr < self.limit
+    }
+    
+    /// Check for stack overflow
+    pub fn check_overflow(&self, addr: *const u8) -> bool {
+        addr < self.base
+    }
+    
+    /// Available stack space
+    pub fn available(&self) -> usize {
+        let sp = self.sp.load(Ordering::Relaxed);
+        sp as usize - self.base as usize
+    }
+    
+    /// Used stack space
+    pub fn used(&self) -> usize {
+        let sp = self.sp.load(Ordering::Relaxed);
+        self.limit as usize - sp as usize
+    }
+}
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        // Free stack memory
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THREAD LOCAL STORAGE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// TLS key
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsKey(pub u32);
+
+/// TLS slot
+pub struct TlsSlot {
+    /// Value
+    value: AtomicPtr<u8>,
+    /// Destructor
+    destructor: Option<unsafe fn(*mut u8)>,
+}
+
+impl TlsSlot {
+    pub fn new() -> Self {
+        TlsSlot {
+            value: AtomicPtr::new(core::ptr::null_mut()),
+            destructor: None,
+        }
+    }
+    
+    pub fn get(&self) -> *mut u8 {
+        self.value.load(Ordering::Relaxed)
+    }
+    
+    pub fn set(&self, value: *mut u8) {
+        self.value.store(value, Ordering::Relaxed);
+    }
+}
+
+impl Default for TlsSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Thread-local storage manager
+pub struct TlsManager {
+    /// Next key
+    next_key: AtomicU32,
+    /// Destructors per key
+    destructors: Vec<Option<unsafe fn(*mut u8)>>,
+    /// Maximum slots
+    max_slots: usize,
+}
+
+use core::sync::atomic::AtomicU32;
+
+impl TlsManager {
+    pub fn new(max_slots: usize) -> Self {
+        TlsManager {
+            next_key: AtomicU32::new(0),
+            destructors: Vec::with_capacity(max_slots),
+            max_slots,
+        }
+    }
+    
+    /// Allocate TLS key
+    pub fn alloc_key(&mut self, destructor: Option<unsafe fn(*mut u8)>) -> Option<TlsKey> {
+        let key = self.next_key.fetch_add(1, Ordering::Relaxed);
+        
+        if key as usize >= self.max_slots {
+            return None;
+        }
+        
+        self.destructors.push(destructor);
+        Some(TlsKey(key))
+    }
+    
+    /// Get destructor for key
+    pub fn destructor(&self, key: TlsKey) -> Option<unsafe fn(*mut u8)> {
+        self.destructors.get(key.0 as usize).copied().flatten()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THREAD CONTROL BLOCK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Thread control block
+pub struct Thread {
+    /// Thread ID
+    pub id: ThreadId,
+    /// Thread state
+    state: AtomicU8,
+    /// Thread stack
+    stack: Stack,
+    /// Thread-local storage
+    tls: Vec<TlsSlot>,
+    /// GC thread cache
+    gc_cache: *mut u8,
+    /// Allocator thread cache
+    alloc_cache: *mut u8,
+    /// Saved context for safepoints
+    context: SavedContext,
+    /// Exception handler chain
+    exception_handlers: *mut ExceptionHandler,
+    /// Thread name
+    name: String,
+    /// Join handle
+    join_handle: AtomicPtr<JoinHandle>,
+    /// Parent thread
+    parent: Option<ThreadId>,
+    /// Statistics
+    stats: ThreadStats,
+}
+
+/// Saved register context
+#[repr(C)]
+pub struct SavedContext {
+    /// General purpose registers
+    pub gpr: [u64; 16],
+    /// Floating point registers
+    pub fpr: [u64; 16],
+    /// Stack pointer
+    pub sp: u64,
+    /// Instruction pointer
+    pub ip: u64,
+    /// Flags
+    pub flags: u64,
+}
+
+impl SavedContext {
+    pub fn new() -> Self {
+        SavedContext {
+            gpr: [0; 16],
+            fpr: [0; 16],
+            sp: 0,
+            ip: 0,
+            flags: 0,
+        }
+    }
+}
+
+impl Default for SavedContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Exception handler frame
+#[repr(C)]
+pub struct ExceptionHandler {
+    /// Previous handler
+    pub prev: *mut ExceptionHandler,
+    /// Handler address
+    pub handler: *const u8,
+    /// Frame pointer
+    pub frame: *const u8,
+    /// Exception filter
+    pub filter: Option<unsafe fn(*const ExceptionInfo) -> i32>,
+}
+
+/// Exception information
+#[repr(C)]
+pub struct ExceptionInfo {
+    /// Exception type
+    pub exception_type: u32,
+    /// Exception code
+    pub exception_code: u64,
+    /// Fault address
+    pub fault_address: *const u8,
+    /// Context
+    pub context: *const SavedContext,
+}
+
+/// Thread statistics
+#[derive(Debug, Clone, Default)]
+pub struct ThreadStats {
+    pub cpu_time_ns: u64,
+    pub wait_time_ns: u64,
+    pub allocations: usize,
+    pub gc_pauses: usize,
+    pub context_switches: usize,
+}
+
+/// Join handle
+pub struct JoinHandle {
+    /// Thread ID
+    thread_id: ThreadId,
+    /// Result value
+    result: AtomicPtr<u8>,
+    /// Completed flag
+    completed: AtomicBool,
+}
+
+impl Thread {
+    /// Create new thread
+    pub unsafe fn new(
+        config: &ThreadConfig,
+        name: String,
+        parent: Option<ThreadId>,
+    ) -> Option<Box<Self>> {
+        let stack = Stack::new(config.stack_size, config.guard_size)?;
+        
+        let mut tls = Vec::with_capacity(64);
+        for _ in 0..64 {
+            tls.push(TlsSlot::new());
+        }
+        
+        Some(Box::new(Thread {
+            id: ThreadId::new(),
+            state: AtomicU8::new(ThreadState::Starting as u8),
+            stack,
+            tls,
+            gc_cache: core::ptr::null_mut(),
+            alloc_cache: core::ptr::null_mut(),
+            context: SavedContext::new(),
+            exception_handlers: core::ptr::null_mut(),
+            name,
+            join_handle: AtomicPtr::new(core::ptr::null_mut()),
+            parent,
+            stats: ThreadStats::default(),
+        }))
+    }
+    
+    /// Get thread state
+    pub fn state(&self) -> ThreadState {
+        match self.state.load(Ordering::Acquire) {
+            0 => ThreadState::Starting,
+            1 => ThreadState::Running,
+            2 => ThreadState::Blocked,
+            3 => ThreadState::AtSafepoint,
+            4 => ThreadState::Suspended,
+            5 => ThreadState::Terminating,
+            _ => ThreadState::Terminated,
+        }
+    }
+    
+    /// Set thread state
+    pub fn set_state(&self, state: ThreadState) {
+        self.state.store(state as u8, Ordering::Release);
+    }
+    
+    /// Get TLS value
+    pub fn get_tls(&self, key: TlsKey) -> *mut u8 {
+        self.tls.get(key.0 as usize)
+            .map(|slot| slot.get())
+            .unwrap_or(core::ptr::null_mut())
+    }
+    
+    /// Set TLS value
+    pub fn set_tls(&self, key: TlsKey, value: *mut u8) {
+        if let Some(slot) = self.tls.get(key.0 as usize) {
+            slot.set(value);
+        }
+    }
+    
+    /// Push exception handler
+    pub fn push_exception_handler(&mut self, handler: *mut ExceptionHandler) {
+        unsafe {
+            (*handler).prev = self.exception_handlers;
+            self.exception_handlers = handler;
+        }
+    }
+    
+    /// Pop exception handler
+    pub fn pop_exception_handler(&mut self) -> *mut ExceptionHandler {
+        let handler = self.exception_handlers;
+        if !handler.is_null() {
+            self.exception_handlers = unsafe { (*handler).prev };
+        }
+        handler
+    }
+    
+    /// Check if at safepoint
+    pub fn is_at_safepoint(&self) -> bool {
+        self.state() == ThreadState::AtSafepoint
+    }
+    
+    /// Enter safepoint
+    pub fn enter_safepoint(&self) {
+        self.set_state(ThreadState::AtSafepoint);
+    }
+    
+    /// Leave safepoint
+    pub fn leave_safepoint(&self) {
+        self.set_state(ThreadState::Running);
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &ThreadStats {
+        &self.stats
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SAFEPOINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Global safepoint state
+pub struct SafepointManager {
+    /// Safepoint requested
+    requested: AtomicBool,
+    /// Number of threads at safepoint
+    at_safepoint: AtomicUsize,
+    /// Total threads
+    total_threads: AtomicUsize,
+    /// Safepoint operation
+    operation: AtomicPtr<SafepointOperation>,
+}
+
+/// Safepoint operation
+pub struct SafepointOperation {
+    /// Operation function
+    pub func: unsafe fn(*mut u8),
+    /// Operation data
+    pub data: *mut u8,
+    /// Completed
+    pub completed: AtomicBool,
+}
+
+impl SafepointManager {
+    pub fn new() -> Self {
+        SafepointManager {
+            requested: AtomicBool::new(false),
+            at_safepoint: AtomicUsize::new(0),
+            total_threads: AtomicUsize::new(0),
+            operation: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+    
+    /// Request safepoint
+    pub fn request(&self, op: *mut SafepointOperation) {
+        self.operation.store(op, Ordering::Release);
+        self.requested.store(true, Ordering::Release);
+    }
+    
+    /// Check if safepoint requested
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+    
+    /// Thread arrives at safepoint
+    pub fn arrive(&self) {
+        let count = self.at_safepoint.fetch_add(1, Ordering::AcqRel) + 1;
+        let total = self.total_threads.load(Ordering::Acquire);
+        
+        if count == total {
+            // All threads at safepoint, execute operation
+            let op = self.operation.load(Ordering::Acquire);
+            if !op.is_null() {
+                unsafe {
+                    ((*op).func)((*op).data);
+                    (*op).completed.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+    
+    /// Thread leaves safepoint
+    pub fn leave(&self) {
+        let count = self.at_safepoint.fetch_sub(1, Ordering::AcqRel) - 1;
+        
+        if count == 0 {
+            self.requested.store(false, Ordering::Release);
+            self.operation.store(core::ptr::null_mut(), Ordering::Release);
+        }
+    }
+    
+    /// Register thread
+    pub fn register_thread(&self) {
+        self.total_threads.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    /// Unregister thread
+    pub fn unregister_thread(&self) {
+        self.total_threads.fetch_sub(1, Ordering::Relaxed);
+    }
+    
+    /// Wait for all threads
+    pub fn wait_for_threads(&self) {
+        while self.at_safepoint.load(Ordering::Acquire) 
+            < self.total_threads.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+impl Default for SafepointManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WORK STEALING SCHEDULER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Work item
+pub struct WorkItem {
+    /// Function to execute
+    pub func: unsafe fn(*mut u8),
+    /// Data pointer
+    pub data: *mut u8,
+    /// Priority
+    pub priority: u32,
+}
+
+/// Work stealing deque (per-thread)
+pub struct WorkDeque {
+    /// Items
+    items: Vec<WorkItem>,
+    /// Top (owner pushes/pops here)
+    top: AtomicUsize,
+    /// Bottom (stealers steal from here)
+    bottom: AtomicUsize,
+    /// Capacity
+    capacity: usize,
+}
+
+impl WorkDeque {
+    pub fn new(capacity: usize) -> Self {
+        let mut items = Vec::with_capacity(capacity);
+        items.resize_with(capacity, || WorkItem {
+            func: |_| {},
+            data: core::ptr::null_mut(),
+            priority: 0,
+        });
+        
+        WorkDeque {
+            items,
+            top: AtomicUsize::new(0),
+            bottom: AtomicUsize::new(0),
+            capacity,
+        }
+    }
+    
+    /// Push work item (owner only)
+    pub fn push(&mut self, item: WorkItem) -> bool {
+        let bottom = self.bottom.load(Ordering::Relaxed);
+        let top = self.top.load(Ordering::Acquire);
+        
+        if bottom - top >= self.capacity {
+            return false;
+        }
+        
+        self.items[bottom % self.capacity] = item;
+        self.bottom.store(bottom + 1, Ordering::Release);
+        
+        true
+    }
+    
+    /// Pop work item (owner only)
+    pub fn pop(&mut self) -> Option<WorkItem> {
+        let bottom = self.bottom.load(Ordering::Relaxed);
+        
+        if bottom == 0 {
+            return None;
+        }
+        
+        let new_bottom = bottom - 1;
+        self.bottom.store(new_bottom, Ordering::Relaxed);
+        
+        core::sync::atomic::fence(Ordering::SeqCst);
+        
+        let top = self.top.load(Ordering::Relaxed);
+        
+        if top <= new_bottom {
+            // Safe to pop
+            let item = self.items[new_bottom % self.capacity].clone();
+            return Some(item);
+        }
+        
+        if top == bottom {
+            // Empty
+            self.bottom.store(bottom, Ordering::Relaxed);
+            return None;
+        }
+        
+        // Race with stealer
+        if self.top.compare_exchange(
+            top,
+            top + 1,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ).is_ok() {
+            return Some(self.items[new_bottom % self.capacity].clone());
+        }
+        
+        self.bottom.store(bottom, Ordering::Relaxed);
+        None
+    }
+    
+    /// Steal work item (other threads)
+    pub fn steal(&self) -> Option<WorkItem> {
+        loop {
+            let top = self.top.load(Ordering::Acquire);
+            let bottom = self.bottom.load(Ordering::Acquire);
+            
+            if top >= bottom {
+                return None;
+            }
+            
+            let item = self.items[top % self.capacity].clone();
+            
+            if self.top.compare_exchange_weak(
+                top,
+                top + 1,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ).is_ok() {
+                return Some(item);
+            }
+        }
+    }
+    
+    pub fn len(&self) -> usize {
+        let bottom = self.bottom.load(Ordering::Relaxed);
+        let top = self.top.load(Ordering::Relaxed);
+        bottom.saturating_sub(top)
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Clone for WorkItem {
+    fn clone(&self) -> Self {
+        WorkItem {
+            func: self.func,
+            data: self.data,
+            priority: self.priority,
+        }
+    }
+}
+
+/// Work stealing scheduler
+pub struct WorkStealingScheduler {
+    /// Per-thread deques
+    deques: Vec<WorkDeque>,
+    /// Global queue for overflow
+    global_queue: WorkDeque,
+    /// Number of workers
+    num_workers: usize,
+    /// Active workers
+    active: AtomicUsize,
+    /// Shutdown flag
+    shutdown: AtomicBool,
+}
+
+impl WorkStealingScheduler {
+    pub fn new(num_workers: usize) -> Self {
+        let mut deques = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            deques.push(WorkDeque::new(1024));
+        }
+        
+        WorkStealingScheduler {
+            deques,
+            global_queue: WorkDeque::new(4096),
+            num_workers,
+            active: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+        }
+    }
+    
+    /// Submit work to local queue
+    pub fn submit_local(&mut self, worker_id: usize, item: WorkItem) {
+        if worker_id < self.deques.len() {
+            if !self.deques[worker_id].push(item.clone()) {
+                // Overflow to global
+                self.global_queue.push(item);
+            }
+        }
+    }
+    
+    /// Get work for worker
+    pub fn get_work(&mut self, worker_id: usize) -> Option<WorkItem> {
+        // Try local queue first
+        if worker_id < self.deques.len() {
+            if let Some(item) = self.deques[worker_id].pop() {
+                return Some(item);
+            }
+        }
+        
+        // Try stealing from others
+        for i in 0..self.num_workers {
+            if i != worker_id {
+                if let Some(item) = self.deques[i].steal() {
+                    return Some(item);
+                }
+            }
+        }
+        
+        // Try global queue
+        self.global_queue.steal()
+    }
+    
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+    
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THREAD MANAGER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Global thread manager
+pub struct ThreadManager {
+    /// Configuration
+    config: ThreadConfig,
+    /// All threads
+    threads: BTreeMap<ThreadId, Box<Thread>>,
+    /// Current thread (per-thread)
+    current: AtomicPtr<Thread>,
+    /// TLS manager
+    tls: TlsManager,
+    /// Safepoint manager
+    safepoint: SafepointManager,
+    /// Scheduler
+    scheduler: Option<WorkStealingScheduler>,
+    /// Statistics
+    stats: ThreadManagerStats,
+}
+
+/// Thread manager statistics
+#[derive(Debug, Clone, Default)]
+pub struct ThreadManagerStats {
+    pub threads_created: usize,
+    pub threads_terminated: usize,
+    pub active_threads: usize,
+    pub peak_threads: usize,
+}
+
+impl ThreadManager {
+    pub fn new(config: ThreadConfig) -> Self {
+        let scheduler = if config.work_stealing {
+            let workers = if config.pool_size > 0 {
+                config.pool_size
+            } else {
+                num_cpus()
+            };
+            Some(WorkStealingScheduler::new(workers))
+        } else {
+            None
+        };
+        
+        ThreadManager {
+            config,
+            threads: BTreeMap::new(),
+            current: AtomicPtr::new(core::ptr::null_mut()),
+            tls: TlsManager::new(64),
+            safepoint: SafepointManager::new(),
+            scheduler,
+            stats: ThreadManagerStats::default(),
+        }
+    }
+    
+    /// Spawn new thread
+    pub fn spawn(&mut self, name: String, entry: unsafe fn(*mut u8), data: *mut u8) -> Option<ThreadId> {
+        let parent = self.current_id();
+        let thread = unsafe { Thread::new(&self.config, name, parent)? };
+        
+        let id = thread.id;
+        self.threads.insert(id, thread);
+        
+        self.safepoint.register_thread();
+        
+        self.stats.threads_created += 1;
+        self.stats.active_threads += 1;
+        self.stats.peak_threads = self.stats.peak_threads.max(self.stats.active_threads);
+        
+        // Platform-specific thread creation
+        
+        Some(id)
+    }
+    
+    /// Get current thread ID
+    pub fn current_id(&self) -> Option<ThreadId> {
+        let current = self.current.load(Ordering::Relaxed);
+        if current.is_null() {
+            None
+        } else {
+            Some(unsafe { (*current).id })
+        }
+    }
+    
+    /// Get current thread
+    pub fn current(&self) -> Option<&Thread> {
+        let current = self.current.load(Ordering::Relaxed);
+        if current.is_null() {
+            None
+        } else {
+            Some(unsafe { &*current })
+        }
+    }
+    
+    /// Get thread by ID
+    pub fn get(&self, id: ThreadId) -> Option<&Thread> {
+        self.threads.get(&id).map(|t| t.as_ref())
+    }
+    
+    /// Terminate thread
+    pub fn terminate(&mut self, id: ThreadId) {
+        if let Some(thread) = self.threads.get_mut(&id) {
+            thread.set_state(ThreadState::Terminating);
+            
+            self.safepoint.unregister_thread();
+            
+            self.stats.active_threads -= 1;
+            self.stats.threads_terminated += 1;
+        }
+    }
+    
+    /// Request safepoint
+    pub fn request_safepoint(&self, op: *mut SafepointOperation) {
+        self.safepoint.request(op);
+    }
+    
+    /// Check safepoint
+    pub fn check_safepoint(&self) {
+        if self.safepoint.is_requested() {
+            if let Some(thread) = self.current() {
+                thread.enter_safepoint();
+                self.safepoint.arrive();
+                
+                // Wait for safepoint to complete
+                while self.safepoint.is_requested() {
+                    core::hint::spin_loop();
+                }
+                
+                self.safepoint.leave();
+                thread.leave_safepoint();
+            }
+        }
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> &ThreadManagerStats {
+        &self.stats
+    }
+}
+
+fn num_cpus() -> usize {
+    // Platform-specific CPU count
+    4
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_thread_id() {
+        let id1 = ThreadId::new();
+        let id2 = ThreadId::new();
+        
+        assert_ne!(id1, id2);
+        assert!(id1.is_valid());
+        assert!(!ThreadId::INVALID.is_valid());
+    }
+    
+    #[test]
+    fn test_work_deque() {
+        let mut deque = WorkDeque::new(16);
+        
+        let item = WorkItem {
+            func: |_| {},
+            data: core::ptr::null_mut(),
+            priority: 0,
+        };
+        
+        assert!(deque.is_empty());
+        assert!(deque.push(item.clone()));
+        assert_eq!(deque.len(), 1);
+        
+        let popped = deque.pop();
+        assert!(popped.is_some());
+        assert!(deque.is_empty());
+    }
+    
+    #[test]
+    fn test_safepoint() {
+        let sp = SafepointManager::new();
+        
+        assert!(!sp.is_requested());
+        
+        sp.register_thread();
+        sp.register_thread();
+        
+        // Would need full test with actual threads
+    }
+}

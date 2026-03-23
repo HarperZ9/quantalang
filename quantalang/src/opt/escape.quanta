@@ -1,0 +1,843 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Escape Analysis
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Escape analysis for memory optimization:
+//   - Stack allocation promotion
+//   - Scalar replacement
+//   - Synchronization elimination
+//   - Connection graph analysis
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::escape
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ESCAPE STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Escape state of an allocation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EscapeState {
+    /// Does not escape - can be stack allocated
+    NoEscape,
+    /// Escapes only to arguments (partial escape)
+    ArgEscape,
+    /// Escapes to global memory or return
+    GlobalEscape,
+}
+
+impl EscapeState {
+    /// Merge two escape states (take the more escaped one)
+    pub fn merge(self, other: EscapeState) -> EscapeState {
+        self.max(other)
+    }
+    
+    /// Check if this state allows stack allocation
+    pub fn can_stack_allocate(&self) -> bool {
+        matches!(self, EscapeState::NoEscape)
+    }
+    
+    /// Check if synchronization can be eliminated
+    pub fn can_eliminate_sync(&self) -> bool {
+        matches!(self, EscapeState::NoEscape)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONNECTION GRAPH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Node in the connection graph
+#[derive(Debug, Clone)]
+pub enum CGNode {
+    /// Local variable
+    Local { name: String },
+    /// Heap allocation
+    Allocation { id: u32, ty: AllocType },
+    /// Field of an object
+    Field { base: Box<CGNode>, field: String },
+    /// Global variable
+    Global { name: String },
+    /// Return value
+    Return,
+    /// Parameter
+    Parameter { index: u32 },
+    /// Phantom node for unknown escapes
+    Phantom,
+}
+
+/// Allocation type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocType {
+    /// Object allocation
+    Object,
+    /// Array allocation
+    Array,
+    /// Box allocation
+    Box,
+}
+
+/// Edge type in connection graph
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeType {
+    /// Points-to edge (p -> o means p points to o)
+    PointsTo,
+    /// Deferred edge (for phi nodes)
+    Deferred,
+    /// Field edge (object -> field)
+    Field,
+}
+
+/// Edge in the connection graph
+#[derive(Debug, Clone)]
+pub struct CGEdge {
+    pub from: u32,
+    pub to: u32,
+    pub edge_type: EdgeType,
+}
+
+/// Connection graph for escape analysis
+pub struct ConnectionGraph {
+    /// Nodes in the graph
+    nodes: Vec<CGNode>,
+    /// Node indices by name
+    node_map: BTreeMap<String, u32>,
+    /// Edges
+    edges: Vec<CGEdge>,
+    /// Adjacency list (forward)
+    adj: BTreeMap<u32, Vec<(u32, EdgeType)>>,
+    /// Reverse adjacency list
+    rev_adj: BTreeMap<u32, Vec<(u32, EdgeType)>>,
+    /// Escape state of each node
+    escape_states: BTreeMap<u32, EscapeState>,
+}
+
+impl ConnectionGraph {
+    pub fn new() -> Self {
+        ConnectionGraph {
+            nodes: Vec::new(),
+            node_map: BTreeMap::new(),
+            edges: Vec::new(),
+            adj: BTreeMap::new(),
+            rev_adj: BTreeMap::new(),
+            escape_states: BTreeMap::new(),
+        }
+    }
+    
+    /// Add a node
+    pub fn add_node(&mut self, node: CGNode) -> u32 {
+        let id = self.nodes.len() as u32;
+        
+        // Track named nodes
+        match &node {
+            CGNode::Local { name } | CGNode::Global { name } => {
+                self.node_map.insert(name.clone(), id);
+            }
+            _ => {}
+        }
+        
+        self.nodes.push(node);
+        self.escape_states.insert(id, EscapeState::NoEscape);
+        id
+    }
+    
+    /// Add an edge
+    pub fn add_edge(&mut self, from: u32, to: u32, edge_type: EdgeType) {
+        self.edges.push(CGEdge { from, to, edge_type });
+        self.adj.entry(from).or_default().push((to, edge_type));
+        self.rev_adj.entry(to).or_default().push((from, edge_type));
+    }
+    
+    /// Get node by name
+    pub fn get_node(&self, name: &str) -> Option<u32> {
+        self.node_map.get(name).copied()
+    }
+    
+    /// Get node info
+    pub fn get_node_info(&self, id: u32) -> Option<&CGNode> {
+        self.nodes.get(id as usize)
+    }
+    
+    /// Get outgoing edges
+    pub fn get_edges(&self, from: u32) -> &[(u32, EdgeType)] {
+        self.adj.get(&from).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+    
+    /// Get incoming edges
+    pub fn get_reverse_edges(&self, to: u32) -> &[(u32, EdgeType)] {
+        self.rev_adj.get(&to).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+    
+    /// Set escape state
+    pub fn set_escape(&mut self, node: u32, state: EscapeState) {
+        let current = self.escape_states.get(&node).copied().unwrap_or(EscapeState::NoEscape);
+        self.escape_states.insert(node, current.merge(state));
+    }
+    
+    /// Get escape state
+    pub fn get_escape(&self, node: u32) -> EscapeState {
+        self.escape_states.get(&node).copied().unwrap_or(EscapeState::NoEscape)
+    }
+    
+    /// Follow points-to edges to find pointed objects
+    pub fn get_pointed_objects(&self, node: u32) -> Vec<u32> {
+        let mut objects = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut worklist = vec![node];
+        
+        while let Some(n) = worklist.pop() {
+            if visited.contains(&n) {
+                continue;
+            }
+            visited.insert(n);
+            
+            for (target, edge_type) in self.get_edges(n) {
+                match edge_type {
+                    EdgeType::PointsTo => {
+                        objects.push(*target);
+                    }
+                    EdgeType::Deferred => {
+                        worklist.push(*target);
+                    }
+                    EdgeType::Field => {}
+                }
+            }
+        }
+        
+        objects
+    }
+}
+
+impl Default for ConnectionGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ESCAPE ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Escape analysis pass
+pub struct EscapeAnalysis {
+    /// Connection graph
+    graph: ConnectionGraph,
+    /// Allocation counter
+    alloc_counter: u32,
+    /// Allocations that can be stack promoted
+    stack_promotable: Vec<u32>,
+    /// Allocations that can be scalar replaced
+    scalar_replaceable: Vec<u32>,
+    /// Synchronization eliminations
+    sync_eliminable: Vec<u32>,
+}
+
+impl EscapeAnalysis {
+    pub fn new() -> Self {
+        EscapeAnalysis {
+            graph: ConnectionGraph::new(),
+            alloc_counter: 0,
+            stack_promotable: Vec::new(),
+            scalar_replaceable: Vec::new(),
+            sync_eliminable: Vec::new(),
+        }
+    }
+    
+    /// Analyze a function
+    pub fn analyze(&mut self, func: &MirFunction) {
+        // Build connection graph
+        self.build_graph(func);
+        
+        // Propagate escape states
+        self.propagate_escape();
+        
+        // Find optimizable allocations
+        self.find_optimizations();
+    }
+    
+    fn build_graph(&mut self, func: &MirFunction) {
+        // Add return node
+        let return_node = self.graph.add_node(CGNode::Return);
+        self.graph.set_escape(return_node, EscapeState::GlobalEscape);
+        
+        // Add parameter nodes
+        for (i, _param) in func.params.iter().enumerate() {
+            let param_node = self.graph.add_node(CGNode::Parameter { index: i as u32 });
+            self.graph.set_escape(param_node, EscapeState::ArgEscape);
+        }
+        
+        // Process statements
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                self.process_statement(stmt);
+            }
+            
+            // Process terminator
+            if let MirTerminator::Return { value: Some(val) } = &block.terminator {
+                if let MirOperand::Variable(name) = val {
+                    if let Some(node) = self.graph.get_node(name) {
+                        self.graph.add_edge(return_node, node, EdgeType::Deferred);
+                    }
+                }
+            }
+        }
+    }
+    
+    fn process_statement(&mut self, stmt: &MirStatement) {
+        match stmt {
+            MirStatement::Assign { dest, value } => {
+                let dest_node = self.get_or_create_local(dest);
+                
+                match value {
+                    MirOperand::Variable(src) => {
+                        if let Some(src_node) = self.graph.get_node(src) {
+                            self.graph.add_edge(dest_node, src_node, EdgeType::Deferred);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            
+            MirStatement::Alloc { dest, ty, .. } => {
+                let alloc_id = self.alloc_counter;
+                self.alloc_counter += 1;
+                
+                let alloc_node = self.graph.add_node(CGNode::Allocation {
+                    id: alloc_id,
+                    ty: match ty.as_str() {
+                        "array" => AllocType::Array,
+                        "box" => AllocType::Box,
+                        _ => AllocType::Object,
+                    },
+                });
+                
+                let dest_node = self.get_or_create_local(dest);
+                self.graph.add_edge(dest_node, alloc_node, EdgeType::PointsTo);
+            }
+            
+            MirStatement::Store { ptr, value, .. } => {
+                if let MirOperand::Variable(ptr_name) = ptr {
+                    if let Some(ptr_node) = self.graph.get_node(ptr_name) {
+                        // Get pointed objects
+                        for obj in self.graph.get_pointed_objects(ptr_node) {
+                            if let MirOperand::Variable(val_name) = value {
+                                if let Some(val_node) = self.graph.get_node(val_name) {
+                                    // Object field points to value
+                                    self.graph.add_edge(obj, val_node, EdgeType::Field);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            MirStatement::Load { dest, ptr, .. } => {
+                let dest_node = self.get_or_create_local(dest);
+                
+                if let MirOperand::Variable(ptr_name) = ptr {
+                    if let Some(ptr_node) = self.graph.get_node(ptr_name) {
+                        // Load creates deferred edge
+                        self.graph.add_edge(dest_node, ptr_node, EdgeType::Deferred);
+                    }
+                }
+            }
+            
+            MirStatement::Call { callee, args, dest, .. } => {
+                // Arguments escape to the callee
+                for (i, arg) in args.iter().enumerate() {
+                    if let MirOperand::Variable(name) = arg {
+                        if let Some(node) = self.graph.get_node(name) {
+                            // Mark as escaping to argument
+                            self.graph.set_escape(node, EscapeState::ArgEscape);
+                            
+                            // Objects pointed to by args also escape
+                            for obj in self.graph.get_pointed_objects(node) {
+                                self.graph.set_escape(obj, EscapeState::ArgEscape);
+                            }
+                        }
+                    }
+                }
+                
+                // Return value could be anything
+                if let Some(d) = dest {
+                    let dest_node = self.get_or_create_local(d);
+                    // Create phantom node for unknown return
+                    let phantom = self.graph.add_node(CGNode::Phantom);
+                    self.graph.set_escape(phantom, EscapeState::GlobalEscape);
+                    self.graph.add_edge(dest_node, phantom, EdgeType::PointsTo);
+                }
+            }
+            
+            MirStatement::StoreGlobal { value, .. } => {
+                if let MirOperand::Variable(name) = value {
+                    if let Some(node) = self.graph.get_node(name) {
+                        self.graph.set_escape(node, EscapeState::GlobalEscape);
+                        
+                        for obj in self.graph.get_pointed_objects(node) {
+                            self.graph.set_escape(obj, EscapeState::GlobalEscape);
+                        }
+                    }
+                }
+            }
+            
+            MirStatement::Phi { dest, incoming } => {
+                let dest_node = self.get_or_create_local(dest);
+                
+                for (_, val) in incoming {
+                    if let MirOperand::Variable(name) = val {
+                        if let Some(src_node) = self.graph.get_node(name) {
+                            self.graph.add_edge(dest_node, src_node, EdgeType::Deferred);
+                        }
+                    }
+                }
+            }
+            
+            _ => {}
+        }
+    }
+    
+    fn get_or_create_local(&mut self, name: &str) -> u32 {
+        if let Some(node) = self.graph.get_node(name) {
+            node
+        } else {
+            self.graph.add_node(CGNode::Local { name: name.to_string() })
+        }
+    }
+    
+    fn propagate_escape(&mut self) {
+        // Fixed-point iteration to propagate escape states
+        let mut changed = true;
+        
+        while changed {
+            changed = false;
+            
+            // For each edge, propagate escape states
+            for edge in self.graph.edges.clone() {
+                let from_escape = self.graph.get_escape(edge.from);
+                let to_escape = self.graph.get_escape(edge.to);
+                
+                match edge.edge_type {
+                    EdgeType::PointsTo | EdgeType::Deferred => {
+                        // Pointed objects inherit escape state
+                        if from_escape > to_escape {
+                            self.graph.set_escape(edge.to, from_escape);
+                            changed = true;
+                        }
+                    }
+                    EdgeType::Field => {
+                        // Fields inherit from container
+                        if from_escape > to_escape {
+                            self.graph.set_escape(edge.to, from_escape);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    fn find_optimizations(&mut self) {
+        self.stack_promotable.clear();
+        self.scalar_replaceable.clear();
+        self.sync_eliminable.clear();
+        
+        for (i, node) in self.graph.nodes.iter().enumerate() {
+            let id = i as u32;
+            let escape = self.graph.get_escape(id);
+            
+            if let CGNode::Allocation { ty, .. } = node {
+                if escape.can_stack_allocate() {
+                    self.stack_promotable.push(id);
+                    
+                    // Check if scalar replaceable
+                    if self.can_scalar_replace(id) {
+                        self.scalar_replaceable.push(id);
+                    }
+                }
+                
+                if escape.can_eliminate_sync() {
+                    self.sync_eliminable.push(id);
+                }
+            }
+        }
+    }
+    
+    fn can_scalar_replace(&self, alloc: u32) -> bool {
+        // Check if all field accesses are known at compile time
+        if let Some(CGNode::Allocation { ty, .. }) = self.graph.get_node_info(alloc) {
+            // Arrays typically can't be scalar replaced
+            if *ty == AllocType::Array {
+                return false;
+            }
+            
+            // Check that the object isn't used in ways that prevent scalar replacement
+            for (target, edge_type) in self.graph.get_edges(alloc) {
+                if *edge_type == EdgeType::Field {
+                    // Must be constant field access
+                    if !matches!(self.graph.get_node_info(*target), Some(CGNode::Field { .. })) {
+                        return false;
+                    }
+                }
+            }
+            
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Get allocations that can be stack promoted
+    pub fn get_stack_promotable(&self) -> &[u32] {
+        &self.stack_promotable
+    }
+    
+    /// Get allocations that can be scalar replaced
+    pub fn get_scalar_replaceable(&self) -> &[u32] {
+        &self.scalar_replaceable
+    }
+    
+    /// Get synchronizations that can be eliminated
+    pub fn get_sync_eliminable(&self) -> &[u32] {
+        &self.sync_eliminable
+    }
+    
+    /// Check if an allocation escapes
+    pub fn escapes(&self, alloc: u32) -> bool {
+        self.graph.get_escape(alloc) != EscapeState::NoEscape
+    }
+    
+    /// Get escape state
+    pub fn get_escape_state(&self, alloc: u32) -> EscapeState {
+        self.graph.get_escape(alloc)
+    }
+}
+
+impl Default for EscapeAnalysis {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRANSFORMATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Stack promotion transformation
+pub struct StackPromotion {
+    /// Escape analysis results
+    escape: EscapeAnalysis,
+}
+
+impl StackPromotion {
+    pub fn new(escape: EscapeAnalysis) -> Self {
+        StackPromotion { escape }
+    }
+    
+    /// Transform allocations to stack allocations
+    pub fn transform(&self, func: &mut MirFunction) -> TransformStats {
+        let mut stats = TransformStats::default();
+        
+        for block in &mut func.blocks {
+            let mut new_statements = Vec::new();
+            
+            for stmt in block.statements.drain(..) {
+                match &stmt {
+                    MirStatement::Alloc { dest, ty, size } => {
+                        // Check if this allocation can be stack promoted
+                        if let Some(alloc_node) = self.escape.graph.get_node(dest) {
+                            if self.escape.get_escape_state(alloc_node).can_stack_allocate() {
+                                // Convert to stack allocation
+                                new_statements.push(MirStatement::StackAlloc {
+                                    dest: dest.clone(),
+                                    ty: ty.clone(),
+                                    size: *size,
+                                });
+                                stats.stack_promotions += 1;
+                                continue;
+                            }
+                        }
+                        new_statements.push(stmt);
+                    }
+                    _ => new_statements.push(stmt),
+                }
+            }
+            
+            block.statements = new_statements;
+        }
+        
+        stats
+    }
+}
+
+/// Scalar replacement transformation
+pub struct ScalarReplacement {
+    /// Escape analysis results
+    escape: EscapeAnalysis,
+    /// Field to local mapping
+    field_locals: BTreeMap<(u32, String), String>,
+    /// Counter for generated names
+    counter: u32,
+}
+
+impl ScalarReplacement {
+    pub fn new(escape: EscapeAnalysis) -> Self {
+        ScalarReplacement {
+            escape,
+            field_locals: BTreeMap::new(),
+            counter: 0,
+        }
+    }
+    
+    /// Transform allocations to scalar locals
+    pub fn transform(&mut self, func: &mut MirFunction) -> TransformStats {
+        let mut stats = TransformStats::default();
+        
+        // First pass: identify fields and create locals
+        for alloc in self.escape.get_scalar_replaceable() {
+            self.create_field_locals(*alloc, &func);
+        }
+        
+        // Second pass: transform statements
+        for block in &mut func.blocks {
+            let mut new_statements = Vec::new();
+            
+            for stmt in block.statements.drain(..) {
+                match &stmt {
+                    MirStatement::Alloc { dest, .. } => {
+                        if let Some(alloc_node) = self.escape.graph.get_node(dest) {
+                            if self.escape.get_scalar_replaceable().contains(&alloc_node) {
+                                // Remove allocation - fields are now scalars
+                                stats.scalar_replacements += 1;
+                                continue;
+                            }
+                        }
+                        new_statements.push(stmt);
+                    }
+                    MirStatement::FieldStore { base, field, value } => {
+                        if let MirOperand::Variable(base_name) = base {
+                            if let Some(alloc_node) = self.escape.graph.get_node(base_name) {
+                                if let Some(local) = self.field_locals.get(&(alloc_node, field.clone())) {
+                                    // Replace with assignment to local
+                                    new_statements.push(MirStatement::Assign {
+                                        dest: local.clone(),
+                                        value: value.clone(),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                        new_statements.push(stmt);
+                    }
+                    MirStatement::FieldLoad { dest, base, field } => {
+                        if let MirOperand::Variable(base_name) = base {
+                            if let Some(alloc_node) = self.escape.graph.get_node(base_name) {
+                                if let Some(local) = self.field_locals.get(&(alloc_node, field.clone())) {
+                                    // Replace with assignment from local
+                                    new_statements.push(MirStatement::Assign {
+                                        dest: dest.clone(),
+                                        value: MirOperand::Variable(local.clone()),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                        new_statements.push(stmt);
+                    }
+                    _ => new_statements.push(stmt),
+                }
+            }
+            
+            block.statements = new_statements;
+        }
+        
+        stats
+    }
+    
+    fn create_field_locals(&mut self, alloc: u32, func: &MirFunction) {
+        // Find all field accesses on this allocation
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                match stmt {
+                    MirStatement::FieldStore { base, field, .. } |
+                    MirStatement::FieldLoad { base, field, .. } => {
+                        if let MirOperand::Variable(base_name) = base {
+                            if self.escape.graph.get_node(base_name) == Some(alloc) {
+                                let key = (alloc, field.clone());
+                                if !self.field_locals.contains_key(&key) {
+                                    let name = format!("_sr_{}_{}", alloc, self.counter);
+                                    self.counter += 1;
+                                    self.field_locals.insert(key, name);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Transformation statistics
+#[derive(Debug, Default)]
+pub struct TransformStats {
+    pub stack_promotions: u32,
+    pub scalar_replacements: u32,
+    pub sync_eliminations: u32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub params: Vec<String>,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Alloc { dest: String, ty: String, size: usize },
+    StackAlloc { dest: String, ty: String, size: usize },
+    FieldStore { base: MirOperand, field: String, value: MirOperand },
+    FieldLoad { dest: String, base: MirOperand, field: String },
+    StoreGlobal { name: String, value: MirOperand },
+    Nop,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Return { value: Option<MirOperand> },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_escape_state_merge() {
+        assert_eq!(EscapeState::NoEscape.merge(EscapeState::NoEscape), EscapeState::NoEscape);
+        assert_eq!(EscapeState::NoEscape.merge(EscapeState::ArgEscape), EscapeState::ArgEscape);
+        assert_eq!(EscapeState::ArgEscape.merge(EscapeState::GlobalEscape), EscapeState::GlobalEscape);
+    }
+    
+    #[test]
+    fn test_connection_graph() {
+        let mut graph = ConnectionGraph::new();
+        
+        let local = graph.add_node(CGNode::Local { name: "x".to_string() });
+        let alloc = graph.add_node(CGNode::Allocation { id: 0, ty: AllocType::Object });
+        
+        graph.add_edge(local, alloc, EdgeType::PointsTo);
+        
+        let objects = graph.get_pointed_objects(local);
+        assert_eq!(objects, vec![alloc]);
+    }
+    
+    #[test]
+    fn test_no_escape_allocation() {
+        let func = MirFunction {
+            name: "test".to_string(),
+            params: vec![],
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::Alloc {
+                            dest: "obj".to_string(),
+                            ty: "Object".to_string(),
+                            size: 24,
+                        },
+                        MirStatement::FieldStore {
+                            base: MirOperand::Variable("obj".to_string()),
+                            field: "x".to_string(),
+                            value: MirOperand::Constant(42),
+                        },
+                    ],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let mut escape = EscapeAnalysis::new();
+        escape.analyze(&func);
+        
+        // Allocation should not escape
+        let promotable = escape.get_stack_promotable();
+        assert!(!promotable.is_empty());
+    }
+    
+    #[test]
+    fn test_global_escape() {
+        let func = MirFunction {
+            name: "test".to_string(),
+            params: vec![],
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::Alloc {
+                            dest: "obj".to_string(),
+                            ty: "Object".to_string(),
+                            size: 24,
+                        },
+                        MirStatement::StoreGlobal {
+                            name: "global".to_string(),
+                            value: MirOperand::Variable("obj".to_string()),
+                        },
+                    ],
+                    terminator: MirTerminator::Return { value: None },
+                },
+            ],
+        };
+        
+        let mut escape = EscapeAnalysis::new();
+        escape.analyze(&func);
+        
+        // Allocation should escape globally
+        let promotable = escape.get_stack_promotable();
+        assert!(promotable.is_empty());
+    }
+}

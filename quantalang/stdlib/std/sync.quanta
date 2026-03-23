@@ -1,0 +1,978 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ STANDARD LIBRARY — Synchronization Module
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Synchronization primitives:
+// - Mutex and RwLock
+// - Condvar (condition variable)
+// - Barrier
+// - Once (one-time initialization)
+// - Atomic types
+// - Channels (mpsc)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module std::sync
+
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::collections::VecDeque;
+use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::time::Duration;
+
+// Re-export Arc
+pub use alloc::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MUTEX
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Mutual exclusion lock
+pub struct Mutex<T: ?Sized> {
+    inner: crate::sys::Mutex,
+    poison: PoisonFlag,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
+unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
+
+impl<T> Mutex<T> {
+    /// Create a new mutex
+    pub fn new(t: T) -> Self {
+        Mutex {
+            inner: crate::sys::Mutex::new(),
+            poison: PoisonFlag::new(),
+            data: UnsafeCell::new(t),
+        }
+    }
+    
+    /// Consume the mutex and return the inner value
+    pub fn into_inner(self) -> LockResult<T> {
+        let data = self.data.into_inner();
+        if self.poison.get() {
+            Err(PoisonError::new(data))
+        } else {
+            Ok(data)
+        }
+    }
+}
+
+impl<T: ?Sized> Mutex<T> {
+    /// Acquire the lock
+    pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
+        unsafe {
+            self.inner.lock();
+        }
+        MutexGuard::new(self)
+    }
+    
+    /// Try to acquire the lock without blocking
+    pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, T>> {
+        unsafe {
+            if self.inner.try_lock() {
+                Ok(MutexGuard::new(self)?)
+            } else {
+                Err(TryLockError::WouldBlock)
+            }
+        }
+    }
+    
+    /// Check if the mutex is poisoned
+    pub fn is_poisoned(&self) -> bool {
+        self.poison.get()
+    }
+    
+    /// Clear the poison flag
+    pub fn clear_poison(&self) {
+        self.poison.clear();
+    }
+    
+    /// Get mutable reference to data
+    pub fn get_mut(&mut self) -> LockResult<&mut T> {
+        let data = unsafe { &mut *self.data.get() };
+        if self.poison.get() {
+            Err(PoisonError::new(data))
+        } else {
+            Ok(data)
+        }
+    }
+}
+
+impl<T: ?Sized + Default> Default for Mutex<T> {
+    fn default() -> Self {
+        Mutex::new(Default::default())
+    }
+}
+
+/// Mutex guard (RAII)
+pub struct MutexGuard<'a, T: ?Sized + 'a> {
+    lock: &'a Mutex<T>,
+    poison: PoisonGuard,
+}
+
+impl<'a, T: ?Sized> MutexGuard<'a, T> {
+    fn new(lock: &'a Mutex<T>) -> LockResult<Self> {
+        let guard = MutexGuard {
+            lock,
+            poison: PoisonGuard::new(&lock.poison),
+        };
+        
+        if lock.poison.get() {
+            Err(PoisonError::new(guard))
+        } else {
+            Ok(guard)
+        }
+    }
+}
+
+impl<T: ?Sized> Deref for MutexGuard<'_, T> {
+    type Target = T;
+    
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> Drop for MutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.poison.done();
+        unsafe {
+            self.lock.inner.unlock();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RWLOCK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Read-write lock
+pub struct RwLock<T: ?Sized> {
+    inner: crate::sys::RwLock,
+    poison: PoisonFlag,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: ?Sized + Send> Send for RwLock<T> {}
+unsafe impl<T: ?Sized + Send + Sync> Sync for RwLock<T> {}
+
+impl<T> RwLock<T> {
+    /// Create a new read-write lock
+    pub fn new(t: T) -> Self {
+        RwLock {
+            inner: crate::sys::RwLock::new(),
+            poison: PoisonFlag::new(),
+            data: UnsafeCell::new(t),
+        }
+    }
+    
+    /// Consume the lock and return the inner value
+    pub fn into_inner(self) -> LockResult<T> {
+        let data = self.data.into_inner();
+        if self.poison.get() {
+            Err(PoisonError::new(data))
+        } else {
+            Ok(data)
+        }
+    }
+}
+
+impl<T: ?Sized> RwLock<T> {
+    /// Acquire read access
+    pub fn read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
+        unsafe {
+            self.inner.read();
+        }
+        RwLockReadGuard::new(self)
+    }
+    
+    /// Try to acquire read access without blocking
+    pub fn try_read(&self) -> TryLockResult<RwLockReadGuard<'_, T>> {
+        unsafe {
+            if self.inner.try_read() {
+                Ok(RwLockReadGuard::new(self)?)
+            } else {
+                Err(TryLockError::WouldBlock)
+            }
+        }
+    }
+    
+    /// Acquire write access
+    pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, T>> {
+        unsafe {
+            self.inner.write();
+        }
+        RwLockWriteGuard::new(self)
+    }
+    
+    /// Try to acquire write access without blocking
+    pub fn try_write(&self) -> TryLockResult<RwLockWriteGuard<'_, T>> {
+        unsafe {
+            if self.inner.try_write() {
+                Ok(RwLockWriteGuard::new(self)?)
+            } else {
+                Err(TryLockError::WouldBlock)
+            }
+        }
+    }
+    
+    /// Check if the lock is poisoned
+    pub fn is_poisoned(&self) -> bool {
+        self.poison.get()
+    }
+    
+    /// Get mutable reference
+    pub fn get_mut(&mut self) -> LockResult<&mut T> {
+        let data = unsafe { &mut *self.data.get() };
+        if self.poison.get() {
+            Err(PoisonError::new(data))
+        } else {
+            Ok(data)
+        }
+    }
+}
+
+/// Read guard
+pub struct RwLockReadGuard<'a, T: ?Sized + 'a> {
+    lock: &'a RwLock<T>,
+}
+
+impl<'a, T: ?Sized> RwLockReadGuard<'a, T> {
+    fn new(lock: &'a RwLock<T>) -> LockResult<Self> {
+        let guard = RwLockReadGuard { lock };
+        
+        if lock.poison.get() {
+            Err(PoisonError::new(guard))
+        } else {
+            Ok(guard)
+        }
+    }
+}
+
+impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
+    type Target = T;
+    
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
+    fn drop(&mut self) {
+        unsafe {
+            self.lock.inner.read_unlock();
+        }
+    }
+}
+
+/// Write guard
+pub struct RwLockWriteGuard<'a, T: ?Sized + 'a> {
+    lock: &'a RwLock<T>,
+    poison: PoisonGuard,
+}
+
+impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
+    fn new(lock: &'a RwLock<T>) -> LockResult<Self> {
+        let guard = RwLockWriteGuard {
+            lock,
+            poison: PoisonGuard::new(&lock.poison),
+        };
+        
+        if lock.poison.get() {
+            Err(PoisonError::new(guard))
+        } else {
+            Ok(guard)
+        }
+    }
+}
+
+impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
+    type Target = T;
+    
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> DerefMut for RwLockWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        self.poison.done();
+        unsafe {
+            self.lock.inner.write_unlock();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONDVAR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Condition variable
+pub struct Condvar {
+    inner: crate::sys::Condvar,
+}
+
+impl Condvar {
+    /// Create a new condition variable
+    pub fn new() -> Self {
+        Condvar {
+            inner: crate::sys::Condvar::new(),
+        }
+    }
+    
+    /// Wait on the condition variable
+    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
+        let lock = guard.lock;
+        core::mem::forget(guard);
+        
+        unsafe {
+            self.inner.wait(&lock.inner);
+        }
+        
+        MutexGuard::new(lock)
+    }
+    
+    /// Wait with timeout
+    pub fn wait_timeout<'a, T>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        dur: Duration,
+    ) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)> {
+        let lock = guard.lock;
+        core::mem::forget(guard);
+        
+        let timed_out = unsafe { self.inner.wait_timeout(&lock.inner, dur) };
+        
+        let guard = MutexGuard::new(lock)?;
+        let result = WaitTimeoutResult(timed_out);
+        
+        Ok((guard, result))
+    }
+    
+    /// Wait while a predicate is true
+    pub fn wait_while<'a, T, F>(
+        &self,
+        mut guard: MutexGuard<'a, T>,
+        mut condition: F,
+    ) -> LockResult<MutexGuard<'a, T>>
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        while condition(&mut *guard) {
+            guard = self.wait(guard)?;
+        }
+        Ok(guard)
+    }
+    
+    /// Notify one waiting thread
+    pub fn notify_one(&self) {
+        unsafe {
+            self.inner.notify_one();
+        }
+    }
+    
+    /// Notify all waiting threads
+    pub fn notify_all(&self) {
+        unsafe {
+            self.inner.notify_all();
+        }
+    }
+}
+
+impl Default for Condvar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result of a timed wait
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitTimeoutResult(bool);
+
+impl WaitTimeoutResult {
+    /// Returns true if the wait timed out
+    pub fn timed_out(&self) -> bool {
+        self.0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BARRIER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Synchronization barrier
+pub struct Barrier {
+    lock: Mutex<BarrierState>,
+    cvar: Condvar,
+    num_threads: usize,
+}
+
+struct BarrierState {
+    count: usize,
+    generation_id: usize,
+}
+
+impl Barrier {
+    /// Create a new barrier
+    pub fn new(n: usize) -> Self {
+        Barrier {
+            lock: Mutex::new(BarrierState {
+                count: 0,
+                generation_id: 0,
+            }),
+            cvar: Condvar::new(),
+            num_threads: n,
+        }
+    }
+    
+    /// Wait at the barrier
+    pub fn wait(&self) -> BarrierWaitResult {
+        let mut lock = self.lock.lock().unwrap();
+        let local_gen = lock.generation_id;
+        
+        lock.count += 1;
+        
+        if lock.count < self.num_threads {
+            while local_gen == lock.generation_id {
+                lock = self.cvar.wait(lock).unwrap();
+            }
+            BarrierWaitResult(false)
+        } else {
+            lock.count = 0;
+            lock.generation_id = lock.generation_id.wrapping_add(1);
+            self.cvar.notify_all();
+            BarrierWaitResult(true)
+        }
+    }
+}
+
+/// Result of barrier wait
+#[derive(Debug)]
+pub struct BarrierWaitResult(bool);
+
+impl BarrierWaitResult {
+    /// Returns true if this thread is the "leader"
+    pub fn is_leader(&self) -> bool {
+        self.0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ONCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// One-time initialization
+pub struct Once {
+    state: AtomicUsize,
+}
+
+const ONCE_INCOMPLETE: usize = 0;
+const ONCE_RUNNING: usize = 1;
+const ONCE_COMPLETE: usize = 2;
+const ONCE_POISONED: usize = 3;
+
+impl Once {
+    /// Create a new Once
+    pub const fn new() -> Self {
+        Once {
+            state: AtomicUsize::new(ONCE_INCOMPLETE),
+        }
+    }
+    
+    /// Call a closure exactly once
+    pub fn call_once<F: FnOnce()>(&self, f: F) {
+        if self.is_completed() {
+            return;
+        }
+        
+        self.call_once_slow(f);
+    }
+    
+    #[cold]
+    fn call_once_slow<F: FnOnce()>(&self, f: F) {
+        match self.state.compare_exchange(
+            ONCE_INCOMPLETE,
+            ONCE_RUNNING,
+            Ordering::Acquire,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // Run the closure
+                struct Guard<'a>(&'a AtomicUsize);
+                impl Drop for Guard<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(ONCE_POISONED, Ordering::Release);
+                    }
+                }
+                
+                let guard = Guard(&self.state);
+                f();
+                core::mem::forget(guard);
+                self.state.store(ONCE_COMPLETE, Ordering::Release);
+            }
+            Err(ONCE_COMPLETE) => return,
+            Err(ONCE_POISONED) => panic!("Once poisoned"),
+            Err(_) => {
+                // Wait for completion
+                while self.state.load(Ordering::Acquire) == ONCE_RUNNING {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+    
+    /// Check if the Once has completed
+    pub fn is_completed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ONCE_COMPLETE
+    }
+}
+
+/// Once cell for lazy initialization
+pub struct OnceLock<T> {
+    once: Once,
+    value: UnsafeCell<Option<T>>,
+}
+
+unsafe impl<T: Send + Sync> Send for OnceLock<T> {}
+unsafe impl<T: Send + Sync> Sync for OnceLock<T> {}
+
+impl<T> OnceLock<T> {
+    /// Create a new OnceLock
+    pub const fn new() -> Self {
+        OnceLock {
+            once: Once::new(),
+            value: UnsafeCell::new(None),
+        }
+    }
+    
+    /// Get the value if initialized
+    pub fn get(&self) -> Option<&T> {
+        if self.once.is_completed() {
+            unsafe { (*self.value.get()).as_ref() }
+        } else {
+            None
+        }
+    }
+    
+    /// Get or initialize the value
+    pub fn get_or_init<F: FnOnce() -> T>(&self, f: F) -> &T {
+        self.once.call_once(|| {
+            unsafe {
+                *self.value.get() = Some(f());
+            }
+        });
+        
+        self.get().unwrap()
+    }
+    
+    /// Set the value
+    pub fn set(&self, value: T) -> Result<(), T> {
+        let mut value = Some(value);
+        self.once.call_once(|| {
+            unsafe {
+                *self.value.get() = value.take();
+            }
+        });
+        
+        match value {
+            None => Ok(()),
+            Some(v) => Err(v),
+        }
+    }
+}
+
+impl<T> Default for OnceLock<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POISON
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct PoisonFlag {
+    flag: AtomicBool,
+}
+
+impl PoisonFlag {
+    fn new() -> Self {
+        PoisonFlag {
+            flag: AtomicBool::new(false),
+        }
+    }
+    
+    fn get(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+    
+    fn set(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+    
+    fn clear(&self) {
+        self.flag.store(false, Ordering::Relaxed);
+    }
+}
+
+struct PoisonGuard {
+    flag: *const PoisonFlag,
+    panicking: bool,
+}
+
+impl PoisonGuard {
+    fn new(flag: &PoisonFlag) -> Self {
+        PoisonGuard {
+            flag,
+            panicking: crate::thread::panicking(),
+        }
+    }
+    
+    fn done(&self) {
+        if !self.panicking && crate::thread::panicking() {
+            unsafe {
+                (*self.flag).set();
+            }
+        }
+    }
+}
+
+/// Lock result type
+pub type LockResult<Guard> = Result<Guard, PoisonError<Guard>>;
+
+/// Try lock result type
+pub type TryLockResult<Guard> = Result<Guard, TryLockError<Guard>>;
+
+/// Poison error
+#[derive(Debug)]
+pub struct PoisonError<T> {
+    guard: T,
+}
+
+impl<T> PoisonError<T> {
+    /// Create a new poison error
+    pub fn new(guard: T) -> Self {
+        PoisonError { guard }
+    }
+    
+    /// Get the underlying data
+    pub fn into_inner(self) -> T {
+        self.guard
+    }
+    
+    /// Get a reference to the underlying data
+    pub fn get_ref(&self) -> &T {
+        &self.guard
+    }
+    
+    /// Get a mutable reference to the underlying data
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+/// Try lock error
+#[derive(Debug)]
+pub enum TryLockError<T> {
+    /// Lock is poisoned
+    Poisoned(PoisonError<T>),
+    /// Lock would block
+    WouldBlock,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MPSC CHANNEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create an unbounded channel
+pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    let inner = Arc::new(ChannelInner {
+        queue: Mutex::new(VecDeque::new()),
+        not_empty: Condvar::new(),
+        disconnected: AtomicBool::new(false),
+        sender_count: AtomicUsize::new(1),
+    });
+    
+    (
+        Sender { inner: inner.clone() },
+        Receiver { inner },
+    )
+}
+
+/// Create a bounded channel
+pub fn sync_channel<T>(bound: usize) -> (SyncSender<T>, Receiver<T>) {
+    let inner = Arc::new(SyncChannelInner {
+        queue: Mutex::new(VecDeque::new()),
+        not_empty: Condvar::new(),
+        not_full: Condvar::new(),
+        disconnected: AtomicBool::new(false),
+        sender_count: AtomicUsize::new(1),
+        bound,
+    });
+    
+    (
+        SyncSender { inner: inner.clone() },
+        Receiver { inner: Arc::new(ChannelInner {
+            queue: Mutex::new(VecDeque::new()),
+            not_empty: Condvar::new(),
+            disconnected: AtomicBool::new(false),
+            sender_count: AtomicUsize::new(1),
+        })},
+    )
+}
+
+struct ChannelInner<T> {
+    queue: Mutex<VecDeque<T>>,
+    not_empty: Condvar,
+    disconnected: AtomicBool,
+    sender_count: AtomicUsize,
+}
+
+struct SyncChannelInner<T> {
+    queue: Mutex<VecDeque<T>>,
+    not_empty: Condvar,
+    not_full: Condvar,
+    disconnected: AtomicBool,
+    sender_count: AtomicUsize,
+    bound: usize,
+}
+
+/// Sending half of a channel
+pub struct Sender<T> {
+    inner: Arc<ChannelInner<T>>,
+}
+
+impl<T> Sender<T> {
+    /// Send a value
+    pub fn send(&self, t: T) -> Result<(), SendError<T>> {
+        if self.inner.disconnected.load(Ordering::SeqCst) {
+            return Err(SendError(t));
+        }
+        
+        let mut queue = self.inner.queue.lock().unwrap();
+        queue.push_back(t);
+        self.inner.not_empty.notify_one();
+        Ok(())
+    }
+}
+
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        self.inner.sender_count.fetch_add(1, Ordering::SeqCst);
+        Sender {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        if self.inner.sender_count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.inner.disconnected.store(true, Ordering::SeqCst);
+            self.inner.not_empty.notify_all();
+        }
+    }
+}
+
+/// Synchronous sender
+pub struct SyncSender<T> {
+    inner: Arc<SyncChannelInner<T>>,
+}
+
+impl<T> SyncSender<T> {
+    /// Send a value (blocking if full)
+    pub fn send(&self, t: T) -> Result<(), SendError<T>> {
+        if self.inner.disconnected.load(Ordering::SeqCst) {
+            return Err(SendError(t));
+        }
+        
+        let mut queue = self.inner.queue.lock().unwrap();
+        
+        while queue.len() >= self.inner.bound {
+            if self.inner.disconnected.load(Ordering::SeqCst) {
+                return Err(SendError(t));
+            }
+            queue = self.inner.not_full.wait(queue).unwrap();
+        }
+        
+        queue.push_back(t);
+        self.inner.not_empty.notify_one();
+        Ok(())
+    }
+    
+    /// Try to send without blocking
+    pub fn try_send(&self, t: T) -> Result<(), TrySendError<T>> {
+        if self.inner.disconnected.load(Ordering::SeqCst) {
+            return Err(TrySendError::Disconnected(t));
+        }
+        
+        let mut queue = self.inner.queue.lock().unwrap();
+        
+        if queue.len() >= self.inner.bound {
+            return Err(TrySendError::Full(t));
+        }
+        
+        queue.push_back(t);
+        self.inner.not_empty.notify_one();
+        Ok(())
+    }
+}
+
+/// Receiving half of a channel
+pub struct Receiver<T> {
+    inner: Arc<ChannelInner<T>>,
+}
+
+impl<T> Receiver<T> {
+    /// Receive a value (blocking)
+    pub fn recv(&self) -> Result<T, RecvError> {
+        let mut queue = self.inner.queue.lock().unwrap();
+        
+        loop {
+            if let Some(t) = queue.pop_front() {
+                return Ok(t);
+            }
+            
+            if self.inner.disconnected.load(Ordering::SeqCst) {
+                return Err(RecvError);
+            }
+            
+            queue = self.inner.not_empty.wait(queue).unwrap();
+        }
+    }
+    
+    /// Try to receive without blocking
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let mut queue = self.inner.queue.lock().unwrap();
+        
+        if let Some(t) = queue.pop_front() {
+            return Ok(t);
+        }
+        
+        if self.inner.disconnected.load(Ordering::SeqCst) {
+            Err(TryRecvError::Disconnected)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+    
+    /// Receive with timeout
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
+        let mut queue = self.inner.queue.lock().unwrap();
+        
+        if let Some(t) = queue.pop_front() {
+            return Ok(t);
+        }
+        
+        let (mut queue, result) = self.inner.not_empty.wait_timeout(queue, timeout).unwrap();
+        
+        if let Some(t) = queue.pop_front() {
+            return Ok(t);
+        }
+        
+        if result.timed_out() {
+            Err(RecvTimeoutError::Timeout)
+        } else if self.inner.disconnected.load(Ordering::SeqCst) {
+            Err(RecvTimeoutError::Disconnected)
+        } else {
+            Err(RecvTimeoutError::Timeout)
+        }
+    }
+    
+    /// Create an iterator
+    pub fn iter(&self) -> Iter<'_, T> {
+        Iter { rx: self }
+    }
+    
+    /// Create a try iterator
+    pub fn try_iter(&self) -> TryIter<'_, T> {
+        TryIter { rx: self }
+    }
+}
+
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        self.inner.disconnected.store(true, Ordering::SeqCst);
+    }
+}
+
+impl<T> Iterator for Receiver<T> {
+    type Item = T;
+    
+    fn next(&mut self) -> Option<T> {
+        self.recv().ok()
+    }
+}
+
+/// Blocking iterator
+pub struct Iter<'a, T> {
+    rx: &'a Receiver<T>,
+}
+
+impl<T> Iterator for Iter<'_, T> {
+    type Item = T;
+    
+    fn next(&mut self) -> Option<T> {
+        self.rx.recv().ok()
+    }
+}
+
+/// Non-blocking iterator
+pub struct TryIter<'a, T> {
+    rx: &'a Receiver<T>,
+}
+
+impl<T> Iterator for TryIter<'_, T> {
+    type Item = T;
+    
+    fn next(&mut self) -> Option<T> {
+        self.rx.try_recv().ok()
+    }
+}
+
+/// Send error
+#[derive(Debug)]
+pub struct SendError<T>(pub T);
+
+/// Try send error
+#[derive(Debug)]
+pub enum TrySendError<T> {
+    Full(T),
+    Disconnected(T),
+}
+
+/// Receive error
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecvError;
+
+/// Try receive error
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryRecvError {
+    Empty,
+    Disconnected,
+}
+
+/// Receive timeout error
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvTimeoutError {
+    Timeout,
+    Disconnected,
+}

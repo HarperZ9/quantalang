@@ -1,0 +1,877 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ MLIR — Optimization Framework
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// High-level optimization framework for MLIR:
+//   - Pattern-based rewriting
+//   - Dialect conversion
+//   - Analysis infrastructure
+//   - Cost modeling
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::mlir::optimizer
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use super::dialect::{MlirContext, MlirType, TypeId};
+use super::ir::{Module, Operation, Block, Region, Value, BlockId};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PATTERN REWRITING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Rewrite pattern for transforming operations
+pub trait RewritePattern: Send + Sync {
+    /// Pattern name
+    fn name(&self) -> &str;
+    
+    /// Benefit of applying this pattern (higher = more desirable)
+    fn benefit(&self) -> PatternBenefit;
+    
+    /// Root operation name this pattern matches
+    fn root_op(&self) -> &str;
+    
+    /// Check if pattern matches the operation
+    fn matches(&self, op: &Operation, ctx: &MlirContext) -> bool;
+    
+    /// Apply the pattern, returning replacement operation(s)
+    fn rewrite(&self, op: &Operation, ctx: &mut MlirContext) -> Option<Vec<Operation>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PatternBenefit(pub u32);
+
+impl PatternBenefit {
+    pub const IMPOSSIBLE: PatternBenefit = PatternBenefit(0);
+    pub const LOW: PatternBenefit = PatternBenefit(1);
+    pub const MEDIUM: PatternBenefit = PatternBenefit(5);
+    pub const HIGH: PatternBenefit = PatternBenefit(10);
+    pub const MAXIMUM: PatternBenefit = PatternBenefit(u32::MAX);
+}
+
+/// Pattern set for rewriting
+pub struct RewritePatternSet {
+    patterns: Vec<Box<dyn RewritePattern>>,
+}
+
+impl RewritePatternSet {
+    pub fn new() -> Self {
+        RewritePatternSet { patterns: Vec::new() }
+    }
+    
+    pub fn add<P: RewritePattern + 'static>(&mut self, pattern: P) {
+        self.patterns.push(Box::new(pattern));
+    }
+    
+    pub fn add_boxed(&mut self, pattern: Box<dyn RewritePattern>) {
+        self.patterns.push(pattern);
+    }
+    
+    /// Get patterns sorted by benefit (highest first)
+    pub fn sorted_patterns(&self) -> Vec<&dyn RewritePattern> {
+        let mut patterns: Vec<&dyn RewritePattern> = self.patterns.iter()
+            .map(|p| p.as_ref())
+            .collect();
+        patterns.sort_by(|a, b| b.benefit().cmp(&a.benefit()));
+        patterns
+    }
+}
+
+impl Default for RewritePatternSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Greedy pattern rewriter
+pub struct GreedyRewriter {
+    max_iterations: usize,
+    max_pattern_applications: usize,
+}
+
+impl GreedyRewriter {
+    pub fn new() -> Self {
+        GreedyRewriter {
+            max_iterations: 10,
+            max_pattern_applications: 1000,
+        }
+    }
+    
+    pub fn with_max_iterations(mut self, max: usize) -> Self {
+        self.max_iterations = max;
+        self
+    }
+    
+    /// Apply patterns greedily until fixpoint
+    pub fn apply(
+        &self,
+        module: &mut Module,
+        patterns: &RewritePatternSet,
+        ctx: &mut MlirContext,
+    ) -> RewriteResult {
+        let mut total_applications = 0;
+        let sorted_patterns = patterns.sorted_patterns();
+        
+        for iteration in 0..self.max_iterations {
+            let mut changed = false;
+            
+            for block in &mut module.body.blocks {
+                let mut i = 0;
+                while i < block.operations.len() {
+                    let op = &block.operations[i];
+                    
+                    // Try each pattern
+                    for pattern in &sorted_patterns {
+                        if pattern.root_op() == op.name && pattern.matches(op, ctx) {
+                            if let Some(replacements) = pattern.rewrite(op, ctx) {
+                                // Remove old operation
+                                block.operations.remove(i);
+                                
+                                // Insert replacements
+                                for (j, replacement) in replacements.into_iter().enumerate() {
+                                    block.operations.insert(i + j, replacement);
+                                }
+                                
+                                changed = true;
+                                total_applications += 1;
+                                
+                                if total_applications >= self.max_pattern_applications {
+                                    return RewriteResult {
+                                        success: true,
+                                        applications: total_applications,
+                                        reached_limit: true,
+                                    };
+                                }
+                                
+                                break;
+                            }
+                        }
+                    }
+                    
+                    i += 1;
+                }
+            }
+            
+            if !changed {
+                return RewriteResult {
+                    success: true,
+                    applications: total_applications,
+                    reached_limit: false,
+                };
+            }
+        }
+        
+        RewriteResult {
+            success: true,
+            applications: total_applications,
+            reached_limit: true,
+        }
+    }
+}
+
+impl Default for GreedyRewriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
+pub struct RewriteResult {
+    pub success: bool,
+    pub applications: usize,
+    pub reached_limit: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DIALECT CONVERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type converter for dialect conversion
+pub trait TypeConverter: Send + Sync {
+    /// Convert a type
+    fn convert_type(&self, ty: &MlirType) -> Option<MlirType>;
+    
+    /// Check if type is legal (already converted)
+    fn is_legal(&self, ty: &MlirType) -> bool;
+}
+
+/// Conversion target specification
+pub struct ConversionTarget {
+    /// Legal dialects
+    legal_dialects: BTreeSet<String>,
+    /// Legal operations
+    legal_ops: BTreeSet<String>,
+    /// Illegal operations
+    illegal_ops: BTreeSet<String>,
+    /// Dynamically legal operations
+    dynamic_legal_ops: BTreeMap<String, Box<dyn Fn(&Operation) -> bool + Send + Sync>>,
+}
+
+impl ConversionTarget {
+    pub fn new() -> Self {
+        ConversionTarget {
+            legal_dialects: BTreeSet::new(),
+            legal_ops: BTreeSet::new(),
+            illegal_ops: BTreeSet::new(),
+            dynamic_legal_ops: BTreeMap::new(),
+        }
+    }
+    
+    pub fn add_legal_dialect(&mut self, dialect: impl Into<String>) {
+        self.legal_dialects.insert(dialect.into());
+    }
+    
+    pub fn add_legal_op(&mut self, op: impl Into<String>) {
+        self.legal_ops.insert(op.into());
+    }
+    
+    pub fn add_illegal_op(&mut self, op: impl Into<String>) {
+        self.illegal_ops.insert(op.into());
+    }
+    
+    pub fn add_dynamically_legal_op<F>(&mut self, op: impl Into<String>, callback: F)
+    where
+        F: Fn(&Operation) -> bool + Send + Sync + 'static,
+    {
+        self.dynamic_legal_ops.insert(op.into(), Box::new(callback));
+    }
+    
+    pub fn is_legal(&self, op: &Operation) -> bool {
+        // Check if explicitly illegal
+        if self.illegal_ops.contains(&op.name) {
+            return false;
+        }
+        
+        // Check if explicitly legal
+        if self.legal_ops.contains(&op.name) {
+            return true;
+        }
+        
+        // Check dynamic legality
+        if let Some(callback) = self.dynamic_legal_ops.get(&op.name) {
+            return callback(op);
+        }
+        
+        // Check dialect legality
+        if let Some(pos) = op.name.find('.') {
+            let dialect = &op.name[..pos];
+            return self.legal_dialects.contains(dialect);
+        }
+        
+        false
+    }
+}
+
+impl Default for ConversionTarget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Conversion pattern for dialect conversion
+pub trait ConversionPattern: Send + Sync {
+    /// Pattern name
+    fn name(&self) -> &str;
+    
+    /// Source operation name
+    fn source_op(&self) -> &str;
+    
+    /// Convert the operation
+    fn convert(
+        &self,
+        op: &Operation,
+        type_converter: &dyn TypeConverter,
+        ctx: &mut MlirContext,
+    ) -> Option<Vec<Operation>>;
+}
+
+/// Dialect converter
+pub struct DialectConverter {
+    patterns: Vec<Box<dyn ConversionPattern>>,
+    type_converter: Box<dyn TypeConverter>,
+    target: ConversionTarget,
+}
+
+impl DialectConverter {
+    pub fn new(
+        type_converter: Box<dyn TypeConverter>,
+        target: ConversionTarget,
+    ) -> Self {
+        DialectConverter {
+            patterns: Vec::new(),
+            type_converter,
+            target,
+        }
+    }
+    
+    pub fn add_pattern<P: ConversionPattern + 'static>(&mut self, pattern: P) {
+        self.patterns.push(Box::new(pattern));
+    }
+    
+    pub fn convert_module(&self, module: &mut Module, ctx: &mut MlirContext) -> ConversionResult {
+        let mut converted = 0;
+        let mut failed = 0;
+        
+        for block in &mut module.body.blocks {
+            let mut i = 0;
+            while i < block.operations.len() {
+                let op = &block.operations[i];
+                
+                if self.target.is_legal(op) {
+                    i += 1;
+                    continue;
+                }
+                
+                // Find matching pattern
+                let mut found = false;
+                for pattern in &self.patterns {
+                    if pattern.source_op() == op.name {
+                        if let Some(replacements) = pattern.convert(
+                            op,
+                            self.type_converter.as_ref(),
+                            ctx,
+                        ) {
+                            block.operations.remove(i);
+                            for (j, replacement) in replacements.into_iter().enumerate() {
+                                block.operations.insert(i + j, replacement);
+                            }
+                            converted += 1;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                
+                if !found {
+                    failed += 1;
+                }
+                
+                i += 1;
+            }
+        }
+        
+        ConversionResult {
+            success: failed == 0,
+            converted,
+            failed,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ConversionResult {
+    pub success: bool,
+    pub converted: usize,
+    pub failed: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ANALYSIS INFRASTRUCTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Analysis result trait
+pub trait Analysis: Send + Sync {
+    fn name(&self) -> &str;
+    fn invalidate(&mut self);
+}
+
+/// Analysis manager
+pub struct AnalysisManager {
+    analyses: BTreeMap<String, Box<dyn Analysis>>,
+}
+
+impl AnalysisManager {
+    pub fn new() -> Self {
+        AnalysisManager {
+            analyses: BTreeMap::new(),
+        }
+    }
+    
+    pub fn get<A: Analysis + Default + 'static>(&mut self, module: &Module) -> &A {
+        let name = std::any::type_name::<A>();
+        
+        if !self.analyses.contains_key(name) {
+            let analysis = A::default();
+            self.analyses.insert(name.to_string(), Box::new(analysis));
+        }
+        
+        // Safe because we just inserted it
+        let analysis = self.analyses.get(name).unwrap();
+        // Downcast
+        unsafe { &*(analysis.as_ref() as *const dyn Analysis as *const A) }
+    }
+    
+    pub fn invalidate<A: Analysis + 'static>(&mut self) {
+        let name = std::any::type_name::<A>();
+        if let Some(analysis) = self.analyses.get_mut(name) {
+            analysis.invalidate();
+        }
+    }
+    
+    pub fn invalidate_all(&mut self) {
+        for analysis in self.analyses.values_mut() {
+            analysis.invalidate();
+        }
+    }
+}
+
+impl Default for AnalysisManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Dominance analysis
+#[derive(Debug, Default)]
+pub struct DominanceAnalysis {
+    /// Map from block to its immediate dominator
+    idom: BTreeMap<u64, u64>,
+    /// Map from block to blocks it dominates
+    dominates: BTreeMap<u64, BTreeSet<u64>>,
+    valid: bool,
+}
+
+impl DominanceAnalysis {
+    pub fn compute(&mut self, module: &Module) {
+        self.idom.clear();
+        self.dominates.clear();
+        
+        // Simple dominance computation using iterative dataflow
+        // Entry block dominates itself
+        if let Some(entry) = module.body.blocks.first() {
+            self.idom.insert(entry.id.0, entry.id.0);
+            self.dominates.insert(entry.id.0, BTreeSet::new());
+            self.dominates.get_mut(&entry.id.0).unwrap().insert(entry.id.0);
+        }
+        
+        // Compute dominators for other blocks
+        let mut changed = true;
+        while changed {
+            changed = false;
+            
+            for block in module.body.blocks.iter().skip(1) {
+                // Would need predecessor info to compute properly
+                // Simplified: assume entry dominates all
+                if let Some(entry) = module.body.blocks.first() {
+                    if !self.idom.contains_key(&block.id.0) {
+                        self.idom.insert(block.id.0, entry.id.0);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        
+        self.valid = true;
+    }
+    
+    pub fn dominates(&self, a: BlockId, b: BlockId) -> bool {
+        if a == b {
+            return true;
+        }
+        
+        self.dominates.get(&a.0)
+            .map(|set| set.contains(&b.0))
+            .unwrap_or(false)
+    }
+    
+    pub fn immediate_dominator(&self, block: BlockId) -> Option<BlockId> {
+        self.idom.get(&block.0).map(|id| BlockId(*id))
+    }
+}
+
+impl Analysis for DominanceAnalysis {
+    fn name(&self) -> &str { "dominance" }
+    
+    fn invalidate(&mut self) {
+        self.valid = false;
+        self.idom.clear();
+        self.dominates.clear();
+    }
+}
+
+/// Loop analysis
+#[derive(Debug, Default)]
+pub struct LoopAnalysis {
+    loops: Vec<LoopInfo>,
+    valid: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoopInfo {
+    pub header: BlockId,
+    pub blocks: BTreeSet<u64>,
+    pub back_edges: Vec<(BlockId, BlockId)>,
+    pub exit_blocks: BTreeSet<u64>,
+    pub depth: u32,
+    pub parent: Option<usize>,
+}
+
+impl LoopAnalysis {
+    pub fn compute(&mut self, module: &Module) {
+        self.loops.clear();
+        
+        // Find back edges and natural loops
+        // Simplified implementation
+        
+        for block in &module.body.blocks {
+            for op in &block.operations {
+                // Check for loop operations
+                if op.name == "scf.for" || op.name == "scf.while" || op.name == "quanta.loop" {
+                    self.loops.push(LoopInfo {
+                        header: block.id,
+                        blocks: [block.id.0].into_iter().collect(),
+                        back_edges: vec![],
+                        exit_blocks: BTreeSet::new(),
+                        depth: 1,
+                        parent: None,
+                    });
+                }
+            }
+        }
+        
+        self.valid = true;
+    }
+    
+    pub fn get_loops(&self) -> &[LoopInfo] {
+        &self.loops
+    }
+    
+    pub fn get_loop_for_block(&self, block: BlockId) -> Option<&LoopInfo> {
+        self.loops.iter().find(|l| l.blocks.contains(&block.0))
+    }
+    
+    pub fn loop_depth(&self, block: BlockId) -> u32 {
+        self.get_loop_for_block(block).map(|l| l.depth).unwrap_or(0)
+    }
+}
+
+impl Analysis for LoopAnalysis {
+    fn name(&self) -> &str { "loops" }
+    
+    fn invalidate(&mut self) {
+        self.valid = false;
+        self.loops.clear();
+    }
+}
+
+/// Alias analysis
+#[derive(Debug, Default)]
+pub struct AliasAnalysis {
+    valid: bool,
+}
+
+impl AliasAnalysis {
+    pub fn may_alias(&self, a: Value, b: Value) -> AliasResult {
+        // Conservative: assume may alias
+        AliasResult::MayAlias
+    }
+    
+    pub fn must_alias(&self, a: Value, b: Value) -> bool {
+        a == b
+    }
+}
+
+impl Analysis for AliasAnalysis {
+    fn name(&self) -> &str { "alias" }
+    
+    fn invalidate(&mut self) {
+        self.valid = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasResult {
+    NoAlias,
+    MayAlias,
+    MustAlias,
+    PartialAlias,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COST MODELING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cost model for operations
+pub trait CostModel: Send + Sync {
+    /// Get cost of an operation
+    fn operation_cost(&self, op: &Operation) -> OperationCost;
+    
+    /// Get cost of a function
+    fn function_cost(&self, ops: &[Operation]) -> FunctionCost {
+        let mut total = FunctionCost::default();
+        
+        for op in ops {
+            let cost = self.operation_cost(op);
+            total.latency += cost.latency;
+            total.throughput = total.throughput.max(cost.throughput);
+            total.code_size += cost.code_size;
+        }
+        
+        total
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OperationCost {
+    /// Cycles of latency
+    pub latency: u32,
+    /// Reciprocal throughput
+    pub throughput: f32,
+    /// Code size in bytes
+    pub code_size: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FunctionCost {
+    pub latency: u32,
+    pub throughput: f32,
+    pub code_size: u32,
+}
+
+/// Generic cost model
+pub struct GenericCostModel;
+
+impl CostModel for GenericCostModel {
+    fn operation_cost(&self, op: &Operation) -> OperationCost {
+        match op.name.as_str() {
+            // Arithmetic
+            "arith.addi" | "arith.subi" | "llvm.add" | "llvm.sub" => {
+                OperationCost { latency: 1, throughput: 0.25, code_size: 4 }
+            }
+            "arith.muli" | "llvm.mul" => {
+                OperationCost { latency: 3, throughput: 1.0, code_size: 4 }
+            }
+            "arith.divsi" | "arith.divui" | "llvm.sdiv" | "llvm.udiv" => {
+                OperationCost { latency: 20, throughput: 10.0, code_size: 4 }
+            }
+            
+            // Memory
+            "memref.load" | "llvm.load" => {
+                OperationCost { latency: 4, throughput: 0.5, code_size: 8 }
+            }
+            "memref.store" | "llvm.store" => {
+                OperationCost { latency: 1, throughput: 0.5, code_size: 8 }
+            }
+            
+            // Control flow
+            "func.call" | "llvm.call" => {
+                OperationCost { latency: 5, throughput: 1.0, code_size: 8 }
+            }
+            "cf.br" | "llvm.br" => {
+                OperationCost { latency: 1, throughput: 0.5, code_size: 4 }
+            }
+            "cf.cond_br" | "llvm.cond_br" => {
+                OperationCost { latency: 1, throughput: 0.5, code_size: 8 }
+            }
+            
+            // Default
+            _ => OperationCost { latency: 1, throughput: 1.0, code_size: 4 }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OPTIMIZATION PIPELINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// High-level optimization pipeline
+pub struct OptimizationPipeline {
+    stages: Vec<OptimizationStage>,
+}
+
+pub enum OptimizationStage {
+    Canonicalize,
+    Cse,
+    Dce,
+    Inline(InlineConfig),
+    LoopOptimize(LoopOptConfig),
+    Vectorize(VectorizeConfig),
+    Custom(Box<dyn Fn(&mut Module, &mut MlirContext) + Send + Sync>),
+}
+
+#[derive(Debug, Clone)]
+pub struct InlineConfig {
+    pub threshold: u32,
+    pub always_inline_size: u32,
+}
+
+impl Default for InlineConfig {
+    fn default() -> Self {
+        InlineConfig {
+            threshold: 100,
+            always_inline_size: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LoopOptConfig {
+    pub unroll_factor: u32,
+    pub enable_licm: bool,
+    pub enable_fusion: bool,
+}
+
+impl Default for LoopOptConfig {
+    fn default() -> Self {
+        LoopOptConfig {
+            unroll_factor: 4,
+            enable_licm: true,
+            enable_fusion: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VectorizeConfig {
+    pub vector_width: u32,
+    pub enable_slp: bool,
+}
+
+impl Default for VectorizeConfig {
+    fn default() -> Self {
+        VectorizeConfig {
+            vector_width: 4,
+            enable_slp: true,
+        }
+    }
+}
+
+impl OptimizationPipeline {
+    pub fn new() -> Self {
+        OptimizationPipeline { stages: Vec::new() }
+    }
+    
+    pub fn add(&mut self, stage: OptimizationStage) {
+        self.stages.push(stage);
+    }
+    
+    pub fn run(&self, module: &mut Module, ctx: &mut MlirContext) {
+        for stage in &self.stages {
+            match stage {
+                OptimizationStage::Canonicalize => {
+                    // Apply canonicalization patterns
+                }
+                OptimizationStage::Cse => {
+                    // Run CSE
+                }
+                OptimizationStage::Dce => {
+                    // Run DCE
+                }
+                OptimizationStage::Inline(config) => {
+                    // Run inlining
+                }
+                OptimizationStage::LoopOptimize(config) => {
+                    // Run loop optimizations
+                }
+                OptimizationStage::Vectorize(config) => {
+                    // Run vectorization
+                }
+                OptimizationStage::Custom(f) => {
+                    f(module, ctx);
+                }
+            }
+        }
+    }
+    
+    /// Create O0 pipeline (no optimizations)
+    pub fn o0() -> Self {
+        OptimizationPipeline::new()
+    }
+    
+    /// Create O1 pipeline (basic optimizations)
+    pub fn o1() -> Self {
+        let mut pipeline = OptimizationPipeline::new();
+        pipeline.add(OptimizationStage::Canonicalize);
+        pipeline.add(OptimizationStage::Cse);
+        pipeline.add(OptimizationStage::Dce);
+        pipeline
+    }
+    
+    /// Create O2 pipeline (standard optimizations)
+    pub fn o2() -> Self {
+        let mut pipeline = Self::o1();
+        pipeline.add(OptimizationStage::Inline(InlineConfig::default()));
+        pipeline.add(OptimizationStage::LoopOptimize(LoopOptConfig::default()));
+        pipeline.add(OptimizationStage::Canonicalize);
+        pipeline
+    }
+    
+    /// Create O3 pipeline (aggressive optimizations)
+    pub fn o3() -> Self {
+        let mut pipeline = Self::o2();
+        pipeline.add(OptimizationStage::Vectorize(VectorizeConfig::default()));
+        pipeline.add(OptimizationStage::LoopOptimize(LoopOptConfig {
+            unroll_factor: 8,
+            enable_licm: true,
+            enable_fusion: true,
+        }));
+        pipeline
+    }
+}
+
+impl Default for OptimizationPipeline {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_pattern_benefit() {
+        assert!(PatternBenefit::HIGH > PatternBenefit::LOW);
+        assert!(PatternBenefit::MAXIMUM > PatternBenefit::HIGH);
+    }
+    
+    #[test]
+    fn test_pattern_set() {
+        let set = RewritePatternSet::new();
+        assert!(set.patterns.is_empty());
+    }
+    
+    #[test]
+    fn test_conversion_target() {
+        let mut target = ConversionTarget::new();
+        target.add_legal_dialect("llvm");
+        target.add_illegal_op("quanta.box.alloc");
+        
+        let legal_op = Operation::new("llvm.add", super::super::ir::Location::Unknown);
+        assert!(target.is_legal(&legal_op));
+        
+        let illegal_op = Operation::new("quanta.box.alloc", super::super::ir::Location::Unknown);
+        assert!(!target.is_legal(&illegal_op));
+    }
+    
+    #[test]
+    fn test_cost_model() {
+        let model = GenericCostModel;
+        
+        let add_op = Operation::new("arith.addi", super::super::ir::Location::Unknown);
+        let cost = model.operation_cost(&add_op);
+        assert_eq!(cost.latency, 1);
+        
+        let div_op = Operation::new("arith.divsi", super::super::ir::Location::Unknown);
+        let cost = model.operation_cost(&div_op);
+        assert!(cost.latency > 10);
+    }
+    
+    #[test]
+    fn test_optimization_pipeline() {
+        let pipeline = OptimizationPipeline::o2();
+        assert!(pipeline.stages.len() >= 4);
+    }
+}

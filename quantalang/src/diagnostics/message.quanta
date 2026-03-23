@@ -1,0 +1,952 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DIAGNOSTICS — Diagnostic Messages
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Rich diagnostic message types:
+// - Severity levels (Error, Warning, Info, Hint)
+// - Primary and secondary labels
+// - Fix suggestions with applicability
+// - Related information and notes
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::diagnostics::message
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+
+use super::source::{Span, LocatedSpan, FileId};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SEVERITY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Diagnostic severity level
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Severity {
+    /// Critical error that prevents compilation
+    Error,
+    
+    /// Warning about potential issues
+    Warning,
+    
+    /// Informational message
+    Info,
+    
+    /// Suggestion or hint
+    Hint,
+}
+
+impl Severity {
+    /// Get display name
+    pub fn name(&self) -> &'static str {
+        match self {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Info => "info",
+            Severity::Hint => "hint",
+        }
+    }
+    
+    /// Get ANSI color code
+    pub fn color(&self) -> &'static str {
+        match self {
+            Severity::Error => "\x1b[1;31m",   // Bold red
+            Severity::Warning => "\x1b[1;33m", // Bold yellow
+            Severity::Info => "\x1b[1;36m",    // Bold cyan
+            Severity::Hint => "\x1b[1;32m",    // Bold green
+        }
+    }
+    
+    /// Check if this is an error
+    pub fn is_error(&self) -> bool {
+        matches!(self, Severity::Error)
+    }
+    
+    /// Check if this is a warning or error
+    pub fn is_warning_or_error(&self) -> bool {
+        matches!(self, Severity::Error | Severity::Warning)
+    }
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DIAGNOSTIC CODE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Diagnostic error code
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DiagnosticCode {
+    /// Code prefix (e.g., "E", "W")
+    pub prefix: String,
+    
+    /// Numeric code
+    pub number: u32,
+}
+
+impl DiagnosticCode {
+    /// Create a new diagnostic code
+    pub fn new(prefix: impl Into<String>, number: u32) -> Self {
+        DiagnosticCode {
+            prefix: prefix.into(),
+            number,
+        }
+    }
+    
+    /// Create an error code (E0001)
+    pub fn error(number: u32) -> Self {
+        Self::new("E", number)
+    }
+    
+    /// Create a warning code (W0001)
+    pub fn warning(number: u32) -> Self {
+        Self::new("W", number)
+    }
+    
+    /// Create a lint code (L0001)
+    pub fn lint(number: u32) -> Self {
+        Self::new("L", number)
+    }
+}
+
+impl std::fmt::Display for DiagnosticCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{:04}", self.prefix, self.number)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LABEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Label style
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelStyle {
+    /// Primary label (typically the main error location)
+    Primary,
+    
+    /// Secondary label (related locations)
+    Secondary,
+}
+
+impl LabelStyle {
+    /// Get underline character
+    pub fn underline_char(&self) -> char {
+        match self {
+            LabelStyle::Primary => '^',
+            LabelStyle::Secondary => '-',
+        }
+    }
+    
+    /// Get ANSI color
+    pub fn color(&self) -> &'static str {
+        match self {
+            LabelStyle::Primary => "\x1b[1;31m",  // Bold red
+            LabelStyle::Secondary => "\x1b[1;34m", // Bold blue
+        }
+    }
+}
+
+/// A label pointing to a source location
+#[derive(Debug, Clone)]
+pub struct Label {
+    /// Label style
+    pub style: LabelStyle,
+    
+    /// Source span
+    pub span: LocatedSpan,
+    
+    /// Label message
+    pub message: Option<String>,
+}
+
+impl Label {
+    /// Create a primary label
+    pub fn primary(span: LocatedSpan) -> Self {
+        Label {
+            style: LabelStyle::Primary,
+            span,
+            message: None,
+        }
+    }
+    
+    /// Create a secondary label
+    pub fn secondary(span: LocatedSpan) -> Self {
+        Label {
+            style: LabelStyle::Secondary,
+            span,
+            message: None,
+        }
+    }
+    
+    /// Add message to label
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SUGGESTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// How applicable a suggestion is
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applicability {
+    /// Can be applied automatically with high confidence
+    MachineApplicable,
+    
+    /// Can be applied but may need human review
+    MaybeIncorrect,
+    
+    /// Has placeholders that need filling in
+    HasPlaceholders,
+    
+    /// Only informational, should not be applied
+    Unspecified,
+}
+
+impl Applicability {
+    /// Check if machine-applicable
+    pub fn is_machine_applicable(&self) -> bool {
+        matches!(self, Applicability::MachineApplicable)
+    }
+}
+
+/// A single substitution in a suggestion
+#[derive(Debug, Clone)]
+pub struct Substitution {
+    /// Span to replace
+    pub span: LocatedSpan,
+    
+    /// Replacement text
+    pub replacement: String,
+}
+
+impl Substitution {
+    pub fn new(span: LocatedSpan, replacement: impl Into<String>) -> Self {
+        Substitution {
+            span,
+            replacement: replacement.into(),
+        }
+    }
+}
+
+/// A suggested fix for a diagnostic
+#[derive(Debug, Clone)]
+pub struct Suggestion {
+    /// Description of the fix
+    pub message: String,
+    
+    /// Substitutions to apply
+    pub substitutions: Vec<Substitution>,
+    
+    /// How applicable this suggestion is
+    pub applicability: Applicability,
+}
+
+impl Suggestion {
+    /// Create a new suggestion
+    pub fn new(message: impl Into<String>) -> Self {
+        Suggestion {
+            message: message.into(),
+            substitutions: Vec::new(),
+            applicability: Applicability::Unspecified,
+        }
+    }
+    
+    /// Add a substitution
+    pub fn with_substitution(mut self, span: LocatedSpan, replacement: impl Into<String>) -> Self {
+        self.substitutions.push(Substitution::new(span, replacement));
+        self
+    }
+    
+    /// Set applicability
+    pub fn with_applicability(mut self, applicability: Applicability) -> Self {
+        self.applicability = applicability;
+        self
+    }
+    
+    /// Create a simple replacement suggestion
+    pub fn replace(
+        message: impl Into<String>,
+        span: LocatedSpan,
+        replacement: impl Into<String>,
+    ) -> Self {
+        Suggestion::new(message)
+            .with_substitution(span, replacement)
+            .with_applicability(Applicability::MachineApplicable)
+    }
+    
+    /// Create an insertion suggestion
+    pub fn insert(
+        message: impl Into<String>,
+        position: LocatedSpan,
+        text: impl Into<String>,
+    ) -> Self {
+        let insertion_span = LocatedSpan::new(
+            position.file,
+            Span::new(position.span.start, position.span.start),
+        );
+        Suggestion::new(message)
+            .with_substitution(insertion_span, text)
+            .with_applicability(Applicability::MachineApplicable)
+    }
+    
+    /// Create a deletion suggestion
+    pub fn delete(message: impl Into<String>, span: LocatedSpan) -> Self {
+        Suggestion::new(message)
+            .with_substitution(span, "")
+            .with_applicability(Applicability::MachineApplicable)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DIAGNOSTIC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A complete diagnostic message
+#[derive(Debug, Clone)]
+pub struct Diagnostic {
+    /// Severity level
+    pub severity: Severity,
+    
+    /// Error code
+    pub code: Option<DiagnosticCode>,
+    
+    /// Main message
+    pub message: String,
+    
+    /// Labels pointing to source locations
+    pub labels: Vec<Label>,
+    
+    /// Additional notes
+    pub notes: Vec<String>,
+    
+    /// Suggested fixes
+    pub suggestions: Vec<Suggestion>,
+    
+    /// Related diagnostics
+    pub related: Vec<Diagnostic>,
+}
+
+impl Diagnostic {
+    /// Create a new error diagnostic
+    pub fn error(message: impl Into<String>) -> Self {
+        Diagnostic {
+            severity: Severity::Error,
+            code: None,
+            message: message.into(),
+            labels: Vec::new(),
+            notes: Vec::new(),
+            suggestions: Vec::new(),
+            related: Vec::new(),
+        }
+    }
+    
+    /// Create a new warning diagnostic
+    pub fn warning(message: impl Into<String>) -> Self {
+        Diagnostic {
+            severity: Severity::Warning,
+            code: None,
+            message: message.into(),
+            labels: Vec::new(),
+            notes: Vec::new(),
+            suggestions: Vec::new(),
+            related: Vec::new(),
+        }
+    }
+    
+    /// Create a new info diagnostic
+    pub fn info(message: impl Into<String>) -> Self {
+        Diagnostic {
+            severity: Severity::Info,
+            code: None,
+            message: message.into(),
+            labels: Vec::new(),
+            notes: Vec::new(),
+            suggestions: Vec::new(),
+            related: Vec::new(),
+        }
+    }
+    
+    /// Create a new hint diagnostic
+    pub fn hint(message: impl Into<String>) -> Self {
+        Diagnostic {
+            severity: Severity::Hint,
+            code: None,
+            message: message.into(),
+            labels: Vec::new(),
+            notes: Vec::new(),
+            suggestions: Vec::new(),
+            related: Vec::new(),
+        }
+    }
+    
+    /// Set diagnostic code
+    pub fn with_code(mut self, code: DiagnosticCode) -> Self {
+        self.code = Some(code);
+        self
+    }
+    
+    /// Add a primary label
+    pub fn with_primary_label(mut self, span: LocatedSpan) -> Self {
+        self.labels.push(Label::primary(span));
+        self
+    }
+    
+    /// Add a primary label with message
+    pub fn with_primary_label_message(
+        mut self,
+        span: LocatedSpan,
+        message: impl Into<String>,
+    ) -> Self {
+        self.labels.push(Label::primary(span).with_message(message));
+        self
+    }
+    
+    /// Add a secondary label
+    pub fn with_secondary_label(mut self, span: LocatedSpan) -> Self {
+        self.labels.push(Label::secondary(span));
+        self
+    }
+    
+    /// Add a secondary label with message
+    pub fn with_secondary_label_message(
+        mut self,
+        span: LocatedSpan,
+        message: impl Into<String>,
+    ) -> Self {
+        self.labels.push(Label::secondary(span).with_message(message));
+        self
+    }
+    
+    /// Add a label
+    pub fn with_label(mut self, label: Label) -> Self {
+        self.labels.push(label);
+        self
+    }
+    
+    /// Add multiple labels
+    pub fn with_labels(mut self, labels: impl IntoIterator<Item = Label>) -> Self {
+        self.labels.extend(labels);
+        self
+    }
+    
+    /// Add a note
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into());
+        self
+    }
+    
+    /// Add multiple notes
+    pub fn with_notes<I, S>(mut self, notes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for note in notes {
+            self.notes.push(note.into());
+        }
+        self
+    }
+    
+    /// Add a suggestion
+    pub fn with_suggestion(mut self, suggestion: Suggestion) -> Self {
+        self.suggestions.push(suggestion);
+        self
+    }
+    
+    /// Add multiple suggestions
+    pub fn with_suggestions(mut self, suggestions: impl IntoIterator<Item = Suggestion>) -> Self {
+        self.suggestions.extend(suggestions);
+        self
+    }
+    
+    /// Add a related diagnostic
+    pub fn with_related(mut self, related: Diagnostic) -> Self {
+        self.related.push(related);
+        self
+    }
+    
+    /// Check if this is an error
+    pub fn is_error(&self) -> bool {
+        self.severity.is_error()
+    }
+    
+    /// Get the primary span (if any)
+    pub fn primary_span(&self) -> Option<LocatedSpan> {
+        self.labels.iter()
+            .find(|l| l.style == LabelStyle::Primary)
+            .map(|l| l.span)
+    }
+    
+    /// Get all file IDs referenced
+    pub fn referenced_files(&self) -> Vec<FileId> {
+        let mut files: Vec<FileId> = self.labels.iter()
+            .map(|l| l.span.file)
+            .collect();
+        
+        for suggestion in &self.suggestions {
+            for sub in &suggestion.substitutions {
+                files.push(sub.span.file);
+            }
+        }
+        
+        for related in &self.related {
+            files.extend(related.referenced_files());
+        }
+        
+        files.sort();
+        files.dedup();
+        files
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DIAGNOSTIC BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Builder for creating diagnostics with a fluent API
+pub struct DiagnosticBuilder {
+    diagnostic: Diagnostic,
+}
+
+impl DiagnosticBuilder {
+    /// Create an error builder
+    pub fn error(message: impl Into<String>) -> Self {
+        DiagnosticBuilder {
+            diagnostic: Diagnostic::error(message),
+        }
+    }
+    
+    /// Create a warning builder
+    pub fn warning(message: impl Into<String>) -> Self {
+        DiagnosticBuilder {
+            diagnostic: Diagnostic::warning(message),
+        }
+    }
+    
+    /// Create an info builder
+    pub fn info(message: impl Into<String>) -> Self {
+        DiagnosticBuilder {
+            diagnostic: Diagnostic::info(message),
+        }
+    }
+    
+    /// Create a hint builder
+    pub fn hint(message: impl Into<String>) -> Self {
+        DiagnosticBuilder {
+            diagnostic: Diagnostic::hint(message),
+        }
+    }
+    
+    /// Set error code
+    pub fn code(mut self, prefix: &str, number: u32) -> Self {
+        self.diagnostic.code = Some(DiagnosticCode::new(prefix, number));
+        self
+    }
+    
+    /// Add primary span
+    pub fn span(mut self, span: LocatedSpan) -> Self {
+        self.diagnostic.labels.push(Label::primary(span));
+        self
+    }
+    
+    /// Add primary span with message
+    pub fn span_msg(mut self, span: LocatedSpan, message: impl Into<String>) -> Self {
+        self.diagnostic.labels.push(Label::primary(span).with_message(message));
+        self
+    }
+    
+    /// Add secondary span
+    pub fn secondary(mut self, span: LocatedSpan) -> Self {
+        self.diagnostic.labels.push(Label::secondary(span));
+        self
+    }
+    
+    /// Add secondary span with message
+    pub fn secondary_msg(mut self, span: LocatedSpan, message: impl Into<String>) -> Self {
+        self.diagnostic.labels.push(Label::secondary(span).with_message(message));
+        self
+    }
+    
+    /// Add note
+    pub fn note(mut self, note: impl Into<String>) -> Self {
+        self.diagnostic.notes.push(note.into());
+        self
+    }
+    
+    /// Add help text
+    pub fn help(mut self, help: impl Into<String>) -> Self {
+        self.diagnostic.notes.push(format!("help: {}", help.into()));
+        self
+    }
+    
+    /// Add suggestion to replace span with text
+    pub fn suggest_replace(
+        mut self,
+        message: impl Into<String>,
+        span: LocatedSpan,
+        replacement: impl Into<String>,
+    ) -> Self {
+        self.diagnostic.suggestions.push(Suggestion::replace(message, span, replacement));
+        self
+    }
+    
+    /// Add suggestion to insert text
+    pub fn suggest_insert(
+        mut self,
+        message: impl Into<String>,
+        span: LocatedSpan,
+        text: impl Into<String>,
+    ) -> Self {
+        self.diagnostic.suggestions.push(Suggestion::insert(message, span, text));
+        self
+    }
+    
+    /// Add suggestion to delete span
+    pub fn suggest_delete(mut self, message: impl Into<String>, span: LocatedSpan) -> Self {
+        self.diagnostic.suggestions.push(Suggestion::delete(message, span));
+        self
+    }
+    
+    /// Build the diagnostic
+    pub fn build(self) -> Diagnostic {
+        self.diagnostic
+    }
+    
+    /// Emit directly to a handler
+    pub fn emit(self, handler: &DiagnosticHandler) {
+        handler.emit(self.diagnostic);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DIAGNOSTIC HANDLER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Handler for collecting and managing diagnostics
+pub struct DiagnosticHandler {
+    diagnostics: std::sync::Mutex<Vec<Diagnostic>>,
+    error_count: std::sync::atomic::AtomicUsize,
+    warning_count: std::sync::atomic::AtomicUsize,
+    treat_warnings_as_errors: bool,
+}
+
+impl DiagnosticHandler {
+    /// Create a new handler
+    pub fn new() -> Self {
+        DiagnosticHandler {
+            diagnostics: std::sync::Mutex::new(Vec::new()),
+            error_count: std::sync::atomic::AtomicUsize::new(0),
+            warning_count: std::sync::atomic::AtomicUsize::new(0),
+            treat_warnings_as_errors: false,
+        }
+    }
+    
+    /// Create with warnings treated as errors
+    pub fn with_warnings_as_errors(mut self) -> Self {
+        self.treat_warnings_as_errors = true;
+        self
+    }
+    
+    /// Emit a diagnostic
+    pub fn emit(&self, diagnostic: Diagnostic) {
+        use std::sync::atomic::Ordering;
+        
+        let severity = if self.treat_warnings_as_errors && diagnostic.severity == Severity::Warning {
+            self.error_count.fetch_add(1, Ordering::Relaxed);
+            Severity::Error
+        } else {
+            match diagnostic.severity {
+                Severity::Error => {
+                    self.error_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Severity::Warning => {
+                    self.warning_count.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            diagnostic.severity
+        };
+        
+        let mut diag = diagnostic;
+        diag.severity = severity;
+        self.diagnostics.lock().unwrap().push(diag);
+    }
+    
+    /// Emit an error
+    pub fn error(&self, message: impl Into<String>) -> DiagnosticBuilder {
+        DiagnosticBuilder::error(message)
+    }
+    
+    /// Emit a warning
+    pub fn warning(&self, message: impl Into<String>) -> DiagnosticBuilder {
+        DiagnosticBuilder::warning(message)
+    }
+    
+    /// Check if there are any errors
+    pub fn has_errors(&self) -> bool {
+        self.error_count.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+    
+    /// Get error count
+    pub fn error_count(&self) -> usize {
+        self.error_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    
+    /// Get warning count
+    pub fn warning_count(&self) -> usize {
+        self.warning_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    
+    /// Get all diagnostics
+    pub fn diagnostics(&self) -> Vec<Diagnostic> {
+        self.diagnostics.lock().unwrap().clone()
+    }
+    
+    /// Clear all diagnostics
+    pub fn clear(&self) {
+        use std::sync::atomic::Ordering;
+        
+        self.diagnostics.lock().unwrap().clear();
+        self.error_count.store(0, Ordering::Relaxed);
+        self.warning_count.store(0, Ordering::Relaxed);
+    }
+    
+    /// Abort if there are errors
+    pub fn abort_if_errors(&self) -> Result<(), DiagnosticAbort> {
+        if self.has_errors() {
+            Err(DiagnosticAbort {
+                error_count: self.error_count(),
+                warning_count: self.warning_count(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Default for DiagnosticHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Error indicating compilation was aborted due to errors
+#[derive(Debug)]
+pub struct DiagnosticAbort {
+    pub error_count: usize,
+    pub warning_count: usize,
+}
+
+impl std::fmt::Display for DiagnosticAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "aborting due to {} previous error{}",
+            self.error_count,
+            if self.error_count == 1 { "" } else { "s" }
+        )?;
+        if self.warning_count > 0 {
+            write!(
+                f,
+                "; {} warning{} emitted",
+                self.warning_count,
+                if self.warning_count == 1 { "" } else { "s" }
+            )?;
+        }
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMMON ERROR CONSTRUCTORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Common diagnostic types
+pub mod common {
+    use super::*;
+    
+    /// Type mismatch error
+    pub fn type_mismatch(
+        span: LocatedSpan,
+        expected: &str,
+        found: &str,
+    ) -> Diagnostic {
+        Diagnostic::error(format!("mismatched types"))
+            .with_code(DiagnosticCode::error(308))
+            .with_primary_label_message(span, format!("expected `{}`, found `{}`", expected, found))
+    }
+    
+    /// Undefined variable error
+    pub fn undefined_variable(span: LocatedSpan, name: &str) -> Diagnostic {
+        Diagnostic::error(format!("cannot find value `{}` in this scope", name))
+            .with_code(DiagnosticCode::error(425))
+            .with_primary_label_message(span, "not found in this scope")
+    }
+    
+    /// Undefined function error
+    pub fn undefined_function(span: LocatedSpan, name: &str) -> Diagnostic {
+        Diagnostic::error(format!("cannot find function `{}` in this scope", name))
+            .with_code(DiagnosticCode::error(425))
+            .with_primary_label_message(span, "not found in this scope")
+    }
+    
+    /// Duplicate definition error
+    pub fn duplicate_definition(
+        span: LocatedSpan,
+        name: &str,
+        original: LocatedSpan,
+    ) -> Diagnostic {
+        Diagnostic::error(format!("the name `{}` is defined multiple times", name))
+            .with_code(DiagnosticCode::error(428))
+            .with_primary_label_message(span, format!("`{}` redefined here", name))
+            .with_secondary_label_message(original, "previous definition here")
+    }
+    
+    /// Argument count mismatch
+    pub fn wrong_argument_count(
+        span: LocatedSpan,
+        expected: usize,
+        found: usize,
+        fn_name: &str,
+    ) -> Diagnostic {
+        Diagnostic::error(format!(
+            "this function takes {} argument{} but {} {} supplied",
+            expected,
+            if expected == 1 { "" } else { "s" },
+            found,
+            if found == 1 { "was" } else { "were" },
+        ))
+        .with_code(DiagnosticCode::error(61))
+        .with_primary_label_message(span, format!(
+            "expected {} argument{}",
+            expected,
+            if expected == 1 { "" } else { "s" },
+        ))
+    }
+    
+    /// Missing field error
+    pub fn missing_field(span: LocatedSpan, struct_name: &str, field_name: &str) -> Diagnostic {
+        Diagnostic::error(format!("missing field `{}` in initializer of `{}`", field_name, struct_name))
+            .with_code(DiagnosticCode::error(63))
+            .with_primary_label_message(span, format!("missing `{}`", field_name))
+    }
+    
+    /// Unknown field error
+    pub fn unknown_field(span: LocatedSpan, struct_name: &str, field_name: &str) -> Diagnostic {
+        Diagnostic::error(format!("no field `{}` on type `{}`", field_name, struct_name))
+            .with_code(DiagnosticCode::error(609))
+            .with_primary_label_message(span, "unknown field")
+    }
+    
+    /// Syntax error
+    pub fn syntax_error(span: LocatedSpan, message: impl Into<String>) -> Diagnostic {
+        Diagnostic::error(message)
+            .with_code(DiagnosticCode::error(1))
+            .with_primary_label(span)
+    }
+    
+    /// Parse error with expected tokens
+    pub fn parse_error(span: LocatedSpan, expected: &[&str], found: &str) -> Diagnostic {
+        let expected_str = if expected.len() == 1 {
+            format!("`{}`", expected[0])
+        } else {
+            let mut s = String::new();
+            for (i, e) in expected.iter().enumerate() {
+                if i > 0 {
+                    if i == expected.len() - 1 {
+                        s.push_str(", or ");
+                    } else {
+                        s.push_str(", ");
+                    }
+                }
+                s.push('`');
+                s.push_str(e);
+                s.push('`');
+            }
+            s
+        };
+        
+        Diagnostic::error(format!("expected {}, found `{}`", expected_str, found))
+            .with_code(DiagnosticCode::error(1))
+            .with_primary_label_message(span, format!("expected {}", expected_str))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_severity() {
+        assert!(Severity::Error > Severity::Warning);
+        assert!(Severity::Warning > Severity::Info);
+        assert!(Severity::Info > Severity::Hint);
+    }
+    
+    #[test]
+    fn test_diagnostic_code() {
+        let code = DiagnosticCode::error(42);
+        assert_eq!(code.to_string(), "E0042");
+        
+        let code = DiagnosticCode::warning(7);
+        assert_eq!(code.to_string(), "W0007");
+    }
+    
+    #[test]
+    fn test_diagnostic_builder() {
+        let span = LocatedSpan::new(FileId(0), Span::new(10, 20));
+        
+        let diag = DiagnosticBuilder::error("test error")
+            .code("E", 1)
+            .span(span)
+            .note("this is a note")
+            .help("try this instead")
+            .build();
+        
+        assert!(diag.is_error());
+        assert_eq!(diag.code.unwrap().number, 1);
+        assert_eq!(diag.labels.len(), 1);
+        assert_eq!(diag.notes.len(), 2);
+    }
+    
+    #[test]
+    fn test_handler() {
+        let handler = DiagnosticHandler::new();
+        
+        handler.emit(Diagnostic::error("error 1"));
+        handler.emit(Diagnostic::warning("warning 1"));
+        handler.emit(Diagnostic::error("error 2"));
+        
+        assert!(handler.has_errors());
+        assert_eq!(handler.error_count(), 2);
+        assert_eq!(handler.warning_count(), 1);
+    }
+    
+    #[test]
+    fn test_suggestion() {
+        let span = LocatedSpan::new(FileId(0), Span::new(5, 10));
+        
+        let suggestion = Suggestion::replace("rename to `foo`", span, "foo");
+        
+        assert!(suggestion.applicability.is_machine_applicable());
+        assert_eq!(suggestion.substitutions.len(), 1);
+    }
+}

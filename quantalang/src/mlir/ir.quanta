@@ -1,0 +1,1141 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ MLIR — IR Builder & Operations
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// MLIR Operation representation and IR construction utilities.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::mlir::ir
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use super::dialect::{MlirContext, MlirType, MlirAttribute, TypeId, ValueId};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VALUE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SSA Value reference
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Value {
+    pub id: ValueId,
+}
+
+impl Value {
+    pub fn new(id: ValueId) -> Self {
+        Value { id }
+    }
+}
+
+/// Value with type information
+#[derive(Debug, Clone)]
+pub struct TypedValue {
+    pub value: Value,
+    pub ty: MlirType,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOCATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Source location for debugging
+#[derive(Debug, Clone)]
+pub enum Location {
+    Unknown,
+    FileLineCol {
+        file: String,
+        line: u32,
+        column: u32,
+    },
+    Name {
+        name: String,
+        child: Box<Location>,
+    },
+    Fused {
+        locations: Vec<Location>,
+        metadata: Option<MlirAttribute>,
+    },
+    CallSite {
+        callee: Box<Location>,
+        caller: Box<Location>,
+    },
+}
+
+impl Location {
+    pub fn unknown() -> Self {
+        Location::Unknown
+    }
+    
+    pub fn file(file: impl Into<String>, line: u32, column: u32) -> Self {
+        Location::FileLineCol {
+            file: file.into(),
+            line,
+            column,
+        }
+    }
+    
+    pub fn named(name: impl Into<String>, child: Location) -> Self {
+        Location::Name {
+            name: name.into(),
+            child: Box::new(child),
+        }
+    }
+}
+
+impl Default for Location {
+    fn default() -> Self {
+        Location::Unknown
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OPERATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Operation ID
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OperationId(pub u64);
+
+/// MLIR Operation
+#[derive(Debug, Clone)]
+pub struct Operation {
+    /// Unique ID
+    pub id: OperationId,
+    
+    /// Operation name (e.g., "arith.addi", "func.func")
+    pub name: String,
+    
+    /// Location for debugging
+    pub location: Location,
+    
+    /// Operand values
+    pub operands: Vec<Value>,
+    
+    /// Result values
+    pub results: Vec<TypedValue>,
+    
+    /// Attributes
+    pub attributes: BTreeMap<String, MlirAttribute>,
+    
+    /// Regions (for ops with nested structure)
+    pub regions: Vec<Region>,
+    
+    /// Successor blocks (for terminators)
+    pub successors: Vec<BlockId>,
+}
+
+impl Operation {
+    pub fn new(name: impl Into<String>, location: Location) -> Self {
+        Operation {
+            id: OperationId(0),
+            name: name.into(),
+            location,
+            operands: Vec::new(),
+            results: Vec::new(),
+            attributes: BTreeMap::new(),
+            regions: Vec::new(),
+            successors: Vec::new(),
+        }
+    }
+    
+    pub fn with_operands(mut self, operands: Vec<Value>) -> Self {
+        self.operands = operands;
+        self
+    }
+    
+    pub fn with_results(mut self, results: Vec<TypedValue>) -> Self {
+        self.results = results;
+        self
+    }
+    
+    pub fn with_attribute(mut self, name: impl Into<String>, attr: MlirAttribute) -> Self {
+        self.attributes.insert(name.into(), attr);
+        self
+    }
+    
+    pub fn with_region(mut self, region: Region) -> Self {
+        self.regions.push(region);
+        self
+    }
+    
+    pub fn with_successor(mut self, block: BlockId) -> Self {
+        self.successors.push(block);
+        self
+    }
+    
+    pub fn is_terminator(&self) -> bool {
+        // Check if this operation is a terminator
+        matches!(
+            self.name.as_str(),
+            "func.return" | "scf.yield" | "cf.br" | "cf.cond_br" |
+            "llvm.return" | "quanta.break" | "quanta.continue" |
+            "quanta.match.case"
+        )
+    }
+    
+    pub fn has_side_effects(&self) -> bool {
+        // Conservative: assume operations have side effects unless known pure
+        !matches!(
+            self.name.as_str(),
+            "arith.constant" | "arith.addi" | "arith.subi" | "arith.muli" |
+            "arith.andi" | "arith.ori" | "arith.xori" | "arith.cmpi" |
+            "quanta.struct.get" | "quanta.tuple.get" | "quanta.enum.is"
+        )
+    }
+    
+    pub fn get_result(&self, index: usize) -> Option<Value> {
+        self.results.get(index).map(|r| r.value)
+    }
+    
+    pub fn get_attribute(&self, name: &str) -> Option<&MlirAttribute> {
+        self.attributes.get(name)
+    }
+    
+    pub fn num_results(&self) -> usize {
+        self.results.len()
+    }
+    
+    pub fn num_operands(&self) -> usize {
+        self.operands.len()
+    }
+    
+    pub fn num_regions(&self) -> usize {
+        self.regions.len()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BLOCK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Block ID
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockId(pub u64);
+
+/// Basic block
+#[derive(Debug, Clone)]
+pub struct Block {
+    /// Unique ID
+    pub id: BlockId,
+    
+    /// Block arguments (SSA parameters)
+    pub arguments: Vec<TypedValue>,
+    
+    /// Operations in the block
+    pub operations: Vec<Operation>,
+}
+
+impl Block {
+    pub fn new(id: BlockId) -> Self {
+        Block {
+            id,
+            arguments: Vec::new(),
+            operations: Vec::new(),
+        }
+    }
+    
+    pub fn with_argument(mut self, arg: TypedValue) -> Self {
+        self.arguments.push(arg);
+        self
+    }
+    
+    pub fn add_argument(&mut self, arg: TypedValue) {
+        self.arguments.push(arg);
+    }
+    
+    pub fn push_operation(&mut self, op: Operation) {
+        self.operations.push(op);
+    }
+    
+    pub fn terminator(&self) -> Option<&Operation> {
+        self.operations.last().filter(|op| op.is_terminator())
+    }
+    
+    pub fn is_terminated(&self) -> bool {
+        self.terminator().is_some()
+    }
+    
+    pub fn get_argument(&self, index: usize) -> Option<Value> {
+        self.arguments.get(index).map(|a| a.value)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Region containing blocks
+#[derive(Debug, Clone)]
+pub struct Region {
+    /// Blocks in the region
+    pub blocks: Vec<Block>,
+}
+
+impl Region {
+    pub fn new() -> Self {
+        Region { blocks: Vec::new() }
+    }
+    
+    pub fn with_block(mut self, block: Block) -> Self {
+        self.blocks.push(block);
+        self
+    }
+    
+    pub fn push_block(&mut self, block: Block) {
+        self.blocks.push(block);
+    }
+    
+    pub fn entry_block(&self) -> Option<&Block> {
+        self.blocks.first()
+    }
+    
+    pub fn entry_block_mut(&mut self) -> Option<&mut Block> {
+        self.blocks.first_mut()
+    }
+    
+    pub fn get_block(&self, id: BlockId) -> Option<&Block> {
+        self.blocks.iter().find(|b| b.id == id)
+    }
+    
+    pub fn get_block_mut(&mut self, id: BlockId) -> Option<&mut Block> {
+        self.blocks.iter_mut().find(|b| b.id == id)
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
+impl Default for Region {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODULE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Top-level MLIR module
+#[derive(Debug, Clone)]
+pub struct Module {
+    /// Module name
+    pub name: Option<String>,
+    
+    /// Module body (single region)
+    pub body: Region,
+    
+    /// Module attributes
+    pub attributes: BTreeMap<String, MlirAttribute>,
+}
+
+impl Module {
+    pub fn new() -> Self {
+        let mut body = Region::new();
+        body.push_block(Block::new(BlockId(0)));
+        
+        Module {
+            name: None,
+            body,
+            attributes: BTreeMap::new(),
+        }
+    }
+    
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+    
+    pub fn push_operation(&mut self, op: Operation) {
+        if let Some(block) = self.body.entry_block_mut() {
+            block.push_operation(op);
+        }
+    }
+    
+    pub fn operations(&self) -> impl Iterator<Item = &Operation> {
+        self.body.blocks.iter().flat_map(|b| b.operations.iter())
+    }
+    
+    pub fn get_function(&self, name: &str) -> Option<&Operation> {
+        self.operations().find(|op| {
+            (op.name == "func.func" || op.name == "llvm.func") &&
+            op.get_attribute("sym_name")
+                .and_then(|a| match &a.kind {
+                    super::dialect::MlirAttrKind::String(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                == Some(name)
+        })
+    }
+}
+
+impl Default for Module {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// IR BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// IR Builder for constructing MLIR operations
+pub struct IrBuilder<'ctx> {
+    context: &'ctx mut MlirContext,
+    
+    /// Current insertion point
+    insertion_block: Option<BlockId>,
+    insertion_index: usize,
+    
+    /// Next IDs
+    next_op_id: u64,
+    next_block_id: u64,
+    
+    /// Current location
+    location: Location,
+}
+
+impl<'ctx> IrBuilder<'ctx> {
+    pub fn new(context: &'ctx mut MlirContext) -> Self {
+        IrBuilder {
+            context,
+            insertion_block: None,
+            insertion_index: 0,
+            next_op_id: 0,
+            next_block_id: 1, // 0 is reserved for entry block
+            location: Location::Unknown,
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INSERTION POINT
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    pub fn set_insertion_point(&mut self, block: BlockId) {
+        self.insertion_block = Some(block);
+        self.insertion_index = usize::MAX; // Append to end
+    }
+    
+    pub fn set_insertion_point_before(&mut self, block: BlockId, index: usize) {
+        self.insertion_block = Some(block);
+        self.insertion_index = index;
+    }
+    
+    pub fn set_location(&mut self, location: Location) {
+        self.location = location;
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BLOCK CREATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    pub fn create_block(&mut self) -> BlockId {
+        let id = BlockId(self.next_block_id);
+        self.next_block_id += 1;
+        id
+    }
+    
+    pub fn create_block_with_args(&mut self, arg_types: &[MlirType]) -> (BlockId, Vec<Value>) {
+        let block_id = self.create_block();
+        let args: Vec<Value> = arg_types.iter()
+            .map(|_| {
+                let value_id = self.context.next_value_id();
+                Value::new(value_id)
+            })
+            .collect();
+        
+        (block_id, args)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // OPERATION CREATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn create_op(&mut self, name: &str) -> Operation {
+        let id = OperationId(self.next_op_id);
+        self.next_op_id += 1;
+        
+        let mut op = Operation::new(name, self.location.clone());
+        op.id = id;
+        op
+    }
+    
+    fn create_result(&mut self, ty: MlirType) -> TypedValue {
+        TypedValue {
+            value: Value::new(self.context.next_value_id()),
+            ty,
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ARITH OPERATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    pub fn constant_int(&mut self, value: i64, ty: MlirType) -> (Operation, Value) {
+        let result = self.create_result(ty.clone());
+        let result_value = result.value;
+        
+        let op = self.create_op("arith.constant")
+            .with_results(vec![result])
+            .with_attribute("value", MlirAttribute {
+                kind: super::dialect::MlirAttrKind::Integer { value: value as i128, ty },
+            });
+        
+        (op, result_value)
+    }
+    
+    pub fn constant_float(&mut self, value: f64, ty: MlirType) -> (Operation, Value) {
+        let result = self.create_result(ty.clone());
+        let result_value = result.value;
+        
+        let op = self.create_op("arith.constant")
+            .with_results(vec![result])
+            .with_attribute("value", MlirAttribute {
+                kind: super::dialect::MlirAttrKind::Float { value, ty },
+            });
+        
+        (op, result_value)
+    }
+    
+    pub fn addi(&mut self, lhs: Value, rhs: Value, ty: MlirType) -> (Operation, Value) {
+        let result = self.create_result(ty);
+        let result_value = result.value;
+        
+        let op = self.create_op("arith.addi")
+            .with_operands(vec![lhs, rhs])
+            .with_results(vec![result]);
+        
+        (op, result_value)
+    }
+    
+    pub fn subi(&mut self, lhs: Value, rhs: Value, ty: MlirType) -> (Operation, Value) {
+        let result = self.create_result(ty);
+        let result_value = result.value;
+        
+        let op = self.create_op("arith.subi")
+            .with_operands(vec![lhs, rhs])
+            .with_results(vec![result]);
+        
+        (op, result_value)
+    }
+    
+    pub fn muli(&mut self, lhs: Value, rhs: Value, ty: MlirType) -> (Operation, Value) {
+        let result = self.create_result(ty);
+        let result_value = result.value;
+        
+        let op = self.create_op("arith.muli")
+            .with_operands(vec![lhs, rhs])
+            .with_results(vec![result]);
+        
+        (op, result_value)
+    }
+    
+    pub fn divsi(&mut self, lhs: Value, rhs: Value, ty: MlirType) -> (Operation, Value) {
+        let result = self.create_result(ty);
+        let result_value = result.value;
+        
+        let op = self.create_op("arith.divsi")
+            .with_operands(vec![lhs, rhs])
+            .with_results(vec![result]);
+        
+        (op, result_value)
+    }
+    
+    pub fn cmpi(&mut self, predicate: CmpIPredicate, lhs: Value, rhs: Value) -> (Operation, Value) {
+        let result = self.create_result(MlirType {
+            id: TypeId(0),
+            kind: super::dialect::MlirTypeKind::Integer { width: 1, signed: false },
+        });
+        let result_value = result.value;
+        
+        let op = self.create_op("arith.cmpi")
+            .with_operands(vec![lhs, rhs])
+            .with_results(vec![result])
+            .with_attribute("predicate", MlirAttribute {
+                kind: super::dialect::MlirAttrKind::Integer {
+                    value: predicate as i128,
+                    ty: MlirType {
+                        id: TypeId(0),
+                        kind: super::dialect::MlirTypeKind::Integer { width: 64, signed: false },
+                    },
+                },
+            });
+        
+        (op, result_value)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FUNC OPERATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    pub fn func(
+        &mut self,
+        name: &str,
+        inputs: Vec<MlirType>,
+        results: Vec<MlirType>,
+    ) -> Operation {
+        let func_type = MlirType {
+            id: TypeId(0),
+            kind: super::dialect::MlirTypeKind::Function { inputs, results },
+        };
+        
+        self.create_op("func.func")
+            .with_attribute("sym_name", MlirAttribute {
+                kind: super::dialect::MlirAttrKind::String(name.to_string()),
+            })
+            .with_attribute("function_type", MlirAttribute {
+                kind: super::dialect::MlirAttrKind::Type(func_type),
+            })
+    }
+    
+    pub fn call(&mut self, callee: &str, operands: Vec<Value>, result_types: Vec<MlirType>) -> (Operation, Vec<Value>) {
+        let results: Vec<TypedValue> = result_types.into_iter()
+            .map(|ty| self.create_result(ty))
+            .collect();
+        
+        let result_values: Vec<Value> = results.iter().map(|r| r.value).collect();
+        
+        let op = self.create_op("func.call")
+            .with_operands(operands)
+            .with_results(results)
+            .with_attribute("callee", MlirAttribute {
+                kind: super::dialect::MlirAttrKind::FlatSymbolRef(callee.to_string()),
+            });
+        
+        (op, result_values)
+    }
+    
+    pub fn return_op(&mut self, operands: Vec<Value>) -> Operation {
+        self.create_op("func.return")
+            .with_operands(operands)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SCF OPERATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    pub fn if_op(&mut self, condition: Value, result_types: Vec<MlirType>) -> (Operation, Vec<Value>) {
+        let results: Vec<TypedValue> = result_types.into_iter()
+            .map(|ty| self.create_result(ty))
+            .collect();
+        
+        let result_values: Vec<Value> = results.iter().map(|r| r.value).collect();
+        
+        let op = self.create_op("scf.if")
+            .with_operands(vec![condition])
+            .with_results(results)
+            .with_region(Region::new())
+            .with_region(Region::new());
+        
+        (op, result_values)
+    }
+    
+    pub fn for_op(
+        &mut self,
+        lower: Value,
+        upper: Value,
+        step: Value,
+        init_args: Vec<Value>,
+        result_types: Vec<MlirType>,
+    ) -> (Operation, Vec<Value>) {
+        let results: Vec<TypedValue> = result_types.into_iter()
+            .map(|ty| self.create_result(ty))
+            .collect();
+        
+        let result_values: Vec<Value> = results.iter().map(|r| r.value).collect();
+        
+        let mut operands = vec![lower, upper, step];
+        operands.extend(init_args);
+        
+        let op = self.create_op("scf.for")
+            .with_operands(operands)
+            .with_results(results)
+            .with_region(Region::new());
+        
+        (op, result_values)
+    }
+    
+    pub fn yield_op(&mut self, results: Vec<Value>) -> Operation {
+        self.create_op("scf.yield")
+            .with_operands(results)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MEMREF OPERATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    pub fn alloc(&mut self, memref_type: MlirType, dynamic_sizes: Vec<Value>) -> (Operation, Value) {
+        let result = self.create_result(memref_type);
+        let result_value = result.value;
+        
+        let op = self.create_op("memref.alloc")
+            .with_operands(dynamic_sizes)
+            .with_results(vec![result]);
+        
+        (op, result_value)
+    }
+    
+    pub fn dealloc(&mut self, memref: Value) -> Operation {
+        self.create_op("memref.dealloc")
+            .with_operands(vec![memref])
+    }
+    
+    pub fn load(&mut self, memref: Value, indices: Vec<Value>, element_type: MlirType) -> (Operation, Value) {
+        let result = self.create_result(element_type);
+        let result_value = result.value;
+        
+        let mut operands = vec![memref];
+        operands.extend(indices);
+        
+        let op = self.create_op("memref.load")
+            .with_operands(operands)
+            .with_results(vec![result]);
+        
+        (op, result_value)
+    }
+    
+    pub fn store(&mut self, value: Value, memref: Value, indices: Vec<Value>) -> Operation {
+        let mut operands = vec![value, memref];
+        operands.extend(indices);
+        
+        self.create_op("memref.store")
+            .with_operands(operands)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // QUANTA OPERATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    pub fn box_alloc(&mut self, value: Value, box_type: MlirType) -> (Operation, Value) {
+        let result = self.create_result(box_type);
+        let result_value = result.value;
+        
+        let op = self.create_op("quanta.box.alloc")
+            .with_operands(vec![value])
+            .with_results(vec![result]);
+        
+        (op, result_value)
+    }
+    
+    pub fn box_dealloc(&mut self, box_val: Value) -> Operation {
+        self.create_op("quanta.box.dealloc")
+            .with_operands(vec![box_val])
+    }
+    
+    pub fn rc_inc(&mut self, rc: Value) -> Operation {
+        self.create_op("quanta.rc.inc")
+            .with_operands(vec![rc])
+    }
+    
+    pub fn rc_dec(&mut self, rc: Value) -> Operation {
+        self.create_op("quanta.rc.dec")
+            .with_operands(vec![rc])
+    }
+    
+    pub fn struct_construct(
+        &mut self,
+        fields: Vec<Value>,
+        field_names: Vec<String>,
+        struct_type: MlirType,
+    ) -> (Operation, Value) {
+        let result = self.create_result(struct_type);
+        let result_value = result.value;
+        
+        let names_attr = MlirAttribute {
+            kind: super::dialect::MlirAttrKind::Array(
+                field_names.into_iter()
+                    .map(|n| MlirAttribute {
+                        kind: super::dialect::MlirAttrKind::String(n),
+                    })
+                    .collect()
+            ),
+        };
+        
+        let op = self.create_op("quanta.struct.construct")
+            .with_operands(fields)
+            .with_results(vec![result])
+            .with_attribute("field_names", names_attr);
+        
+        (op, result_value)
+    }
+    
+    pub fn struct_get(
+        &mut self,
+        struct_val: Value,
+        field: &str,
+        index: u32,
+        field_type: MlirType,
+    ) -> (Operation, Value) {
+        let result = self.create_result(field_type);
+        let result_value = result.value;
+        
+        let op = self.create_op("quanta.struct.get")
+            .with_operands(vec![struct_val])
+            .with_results(vec![result])
+            .with_attribute("field", MlirAttribute {
+                kind: super::dialect::MlirAttrKind::String(field.to_string()),
+            })
+            .with_attribute("index", MlirAttribute {
+                kind: super::dialect::MlirAttrKind::Integer {
+                    value: index as i128,
+                    ty: MlirType {
+                        id: TypeId(0),
+                        kind: super::dialect::MlirTypeKind::Integer { width: 32, signed: false },
+                    },
+                },
+            });
+        
+        (op, result_value)
+    }
+    
+    pub fn match_op(&mut self, scrutinee: Value, result_type: MlirType) -> (Operation, Value) {
+        let result = self.create_result(result_type);
+        let result_value = result.value;
+        
+        let op = self.create_op("quanta.match")
+            .with_operands(vec![scrutinee])
+            .with_results(vec![result])
+            .with_region(Region::new());
+        
+        (op, result_value)
+    }
+    
+    pub fn effect_perform(&mut self, effect: &str, args: Vec<Value>, result_type: MlirType) -> (Operation, Value) {
+        let result = self.create_result(result_type);
+        let result_value = result.value;
+        
+        let op = self.create_op("quanta.effect.perform")
+            .with_operands(args)
+            .with_results(vec![result])
+            .with_attribute("effect", MlirAttribute {
+                kind: super::dialect::MlirAttrKind::String(effect.to_string()),
+            });
+        
+        (op, result_value)
+    }
+    
+    pub fn async_call(&mut self, callee: &str, args: Vec<Value>, future_type: MlirType) -> (Operation, Value) {
+        let result = self.create_result(future_type);
+        let result_value = result.value;
+        
+        let op = self.create_op("quanta.async.call")
+            .with_operands(args)
+            .with_results(vec![result])
+            .with_attribute("callee", MlirAttribute {
+                kind: super::dialect::MlirAttrKind::SymbolRef(callee.to_string()),
+            });
+        
+        (op, result_value)
+    }
+    
+    pub fn async_await(&mut self, future: Value, result_type: MlirType) -> (Operation, Value) {
+        let result = self.create_result(result_type);
+        let result_value = result.value;
+        
+        let op = self.create_op("quanta.async.await")
+            .with_operands(vec![future])
+            .with_results(vec![result]);
+        
+        (op, result_value)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPARISON PREDICATES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum CmpIPredicate {
+    Eq = 0,
+    Ne = 1,
+    Slt = 2,
+    Sle = 3,
+    Sgt = 4,
+    Sge = 5,
+    Ult = 6,
+    Ule = 7,
+    Ugt = 8,
+    Uge = 9,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum CmpFPredicate {
+    False = 0,
+    Oeq = 1,
+    Ogt = 2,
+    Oge = 3,
+    Olt = 4,
+    Ole = 5,
+    One = 6,
+    Ord = 7,
+    Ueq = 8,
+    Ugt = 9,
+    Uge = 10,
+    Ult = 11,
+    Ule = 12,
+    Une = 13,
+    Uno = 14,
+    True = 15,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// IR PRINTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Print MLIR to string
+pub struct IrPrinter {
+    output: String,
+    indent: usize,
+}
+
+impl IrPrinter {
+    pub fn new() -> Self {
+        IrPrinter {
+            output: String::new(),
+            indent: 0,
+        }
+    }
+    
+    pub fn print_module(&mut self, module: &Module) -> String {
+        self.output.clear();
+        
+        self.output.push_str("module");
+        if let Some(name) = &module.name {
+            self.output.push_str(&format!(" @{}", name));
+        }
+        self.output.push_str(" {\n");
+        
+        self.indent += 2;
+        for block in &module.body.blocks {
+            for op in &block.operations {
+                self.print_operation(op);
+            }
+        }
+        self.indent -= 2;
+        
+        self.output.push_str("}\n");
+        
+        self.output.clone()
+    }
+    
+    fn print_operation(&mut self, op: &Operation) {
+        self.print_indent();
+        
+        // Print results
+        if !op.results.is_empty() {
+            let results: Vec<String> = op.results.iter()
+                .map(|r| format!("%{}", r.value.id.0))
+                .collect();
+            self.output.push_str(&results.join(", "));
+            self.output.push_str(" = ");
+        }
+        
+        // Print operation name
+        self.output.push_str(&format!("\"{}\"", op.name));
+        
+        // Print operands
+        self.output.push('(');
+        let operands: Vec<String> = op.operands.iter()
+            .map(|v| format!("%{}", v.id.0))
+            .collect();
+        self.output.push_str(&operands.join(", "));
+        self.output.push(')');
+        
+        // Print attributes
+        if !op.attributes.is_empty() {
+            self.output.push_str(" {");
+            let attrs: Vec<String> = op.attributes.iter()
+                .map(|(k, v)| format!("{} = {}", k, self.format_attribute(v)))
+                .collect();
+            self.output.push_str(&attrs.join(", "));
+            self.output.push('}');
+        }
+        
+        // Print regions
+        for region in &op.regions {
+            self.output.push_str(" {\n");
+            self.indent += 2;
+            for block in &region.blocks {
+                self.print_block(block);
+            }
+            self.indent -= 2;
+            self.print_indent();
+            self.output.push('}');
+        }
+        
+        // Print result types
+        if !op.results.is_empty() {
+            self.output.push_str(" : ");
+            let types: Vec<String> = op.results.iter()
+                .map(|r| self.format_type(&r.ty))
+                .collect();
+            self.output.push_str(&types.join(", "));
+        }
+        
+        self.output.push('\n');
+    }
+    
+    fn print_block(&mut self, block: &Block) {
+        self.print_indent();
+        self.output.push_str(&format!("^bb{}", block.id.0));
+        
+        if !block.arguments.is_empty() {
+            self.output.push('(');
+            let args: Vec<String> = block.arguments.iter()
+                .map(|a| format!("%{}: {}", a.value.id.0, self.format_type(&a.ty)))
+                .collect();
+            self.output.push_str(&args.join(", "));
+            self.output.push(')');
+        }
+        
+        self.output.push_str(":\n");
+        self.indent += 2;
+        
+        for op in &block.operations {
+            self.print_operation(op);
+        }
+        
+        self.indent -= 2;
+    }
+    
+    fn print_indent(&mut self) {
+        for _ in 0..self.indent {
+            self.output.push(' ');
+        }
+    }
+    
+    fn format_attribute(&self, attr: &MlirAttribute) -> String {
+        match &attr.kind {
+            super::dialect::MlirAttrKind::Unit => "unit".to_string(),
+            super::dialect::MlirAttrKind::Bool(b) => b.to_string(),
+            super::dialect::MlirAttrKind::Integer { value, .. } => value.to_string(),
+            super::dialect::MlirAttrKind::Float { value, .. } => format!("{:.6}", value),
+            super::dialect::MlirAttrKind::String(s) => format!("\"{}\"", s),
+            super::dialect::MlirAttrKind::SymbolRef(s) => format!("@{}", s),
+            super::dialect::MlirAttrKind::FlatSymbolRef(s) => format!("@{}", s),
+            super::dialect::MlirAttrKind::Type(t) => self.format_type(t),
+            super::dialect::MlirAttrKind::Array(arr) => {
+                let items: Vec<String> = arr.iter()
+                    .map(|a| self.format_attribute(a))
+                    .collect();
+                format!("[{}]", items.join(", "))
+            }
+            super::dialect::MlirAttrKind::Dictionary(dict) => {
+                let items: Vec<String> = dict.iter()
+                    .map(|(k, v)| format!("{} = {}", k, self.format_attribute(v)))
+                    .collect();
+                format!("{{{}}}", items.join(", "))
+            }
+        }
+    }
+    
+    fn format_type(&self, ty: &MlirType) -> String {
+        match &ty.kind {
+            super::dialect::MlirTypeKind::Index => "index".to_string(),
+            super::dialect::MlirTypeKind::Integer { width, signed } => {
+                if *signed { format!("i{}", width) } else { format!("ui{}", width) }
+            }
+            super::dialect::MlirTypeKind::Float { width } => format!("f{}", width),
+            super::dialect::MlirTypeKind::Function { inputs, results } => {
+                let ins: Vec<String> = inputs.iter().map(|t| self.format_type(t)).collect();
+                let outs: Vec<String> = results.iter().map(|t| self.format_type(t)).collect();
+                format!("({}) -> ({})", ins.join(", "), outs.join(", "))
+            }
+            super::dialect::MlirTypeKind::MemRef { element, dims, .. } => {
+                let dims_str: Vec<String> = dims.iter()
+                    .map(|d| d.map_or("?".to_string(), |n| n.to_string()))
+                    .collect();
+                format!("memref<{}x{}>", dims_str.join("x"), self.format_type(element))
+            }
+            super::dialect::MlirTypeKind::LlvmPtr => "!llvm.ptr".to_string(),
+            super::dialect::MlirTypeKind::LlvmVoid => "!llvm.void".to_string(),
+            super::dialect::MlirTypeKind::QuantaBox(inner) => {
+                format!("!quanta.box<{}>", self.format_type(inner))
+            }
+            super::dialect::MlirTypeKind::QuantaSlice(inner) => {
+                format!("!quanta.slice<{}>", self.format_type(inner))
+            }
+            _ => format!("{:?}", ty.kind),
+        }
+    }
+}
+
+impl Default for IrPrinter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_operation_creation() {
+        let mut ctx = MlirContext::new();
+        let mut builder = IrBuilder::new(&mut ctx);
+        
+        let i32_ty = MlirType {
+            id: TypeId(0),
+            kind: super::super::dialect::MlirTypeKind::Integer { width: 32, signed: true },
+        };
+        
+        let (const_op, val) = builder.constant_int(42, i32_ty);
+        
+        assert_eq!(const_op.name, "arith.constant");
+        assert_eq!(const_op.results.len(), 1);
+    }
+    
+    #[test]
+    fn test_block_creation() {
+        let mut ctx = MlirContext::new();
+        let mut builder = IrBuilder::new(&mut ctx);
+        
+        let block_id = builder.create_block();
+        assert_eq!(block_id.0, 1); // 0 is reserved
+    }
+    
+    #[test]
+    fn test_module_creation() {
+        let module = Module::new().with_name("test");
+        
+        assert_eq!(module.name, Some("test".to_string()));
+        assert!(!module.body.is_empty());
+    }
+    
+    #[test]
+    fn test_ir_printer() {
+        let mut ctx = MlirContext::new();
+        let mut builder = IrBuilder::new(&mut ctx);
+        
+        let i32_ty = MlirType {
+            id: TypeId(0),
+            kind: super::super::dialect::MlirTypeKind::Integer { width: 32, signed: true },
+        };
+        
+        let (const_op, _) = builder.constant_int(42, i32_ty);
+        
+        let mut module = Module::new().with_name("test");
+        module.push_operation(const_op);
+        
+        let mut printer = IrPrinter::new();
+        let output = printer.print_module(&module);
+        
+        assert!(output.contains("module @test"));
+        assert!(output.contains("arith.constant"));
+    }
+}

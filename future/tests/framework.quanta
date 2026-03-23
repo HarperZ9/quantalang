@@ -1,0 +1,1029 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Integration Test Framework
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// This module provides the integration test harness for QuantaLang.
+// Tests are structured as:
+//   1. Lexer tests (tokenization)
+//   2. Parser tests (AST construction)
+//   3. Type checker tests (semantic analysis)
+//   4. Codegen tests (IR and machine code)
+//   5. End-to-end tests (compile and run)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::tests::framework
+
+use std::process::{Command, Output, ExitStatus};
+use std::path::{Path, PathBuf};
+use std::fs;
+use std::io::{self, Write};
+use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEST RESULT TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Result of a single test case
+#[derive(Debug, Clone)]
+pub enum TestResult {
+    /// Test passed successfully
+    Pass { duration: Duration },
+    
+    /// Test failed with a message
+    Fail { message: String, duration: Duration },
+    
+    /// Test was skipped
+    Skip { reason: String },
+    
+    /// Test panicked or crashed
+    Error { error: String, duration: Duration },
+    
+    /// Test timed out
+    Timeout { limit: Duration },
+}
+
+impl TestResult {
+    pub fn is_pass(&self) -> bool {
+        matches!(self, TestResult::Pass { .. })
+    }
+    
+    pub fn is_fail(&self) -> bool {
+        matches!(self, TestResult::Fail { .. } | TestResult::Error { .. } | TestResult::Timeout { .. })
+    }
+    
+    pub fn duration(&self) -> Option<Duration> {
+        match self {
+            TestResult::Pass { duration } => Some(*duration),
+            TestResult::Fail { duration, .. } => Some(*duration),
+            TestResult::Error { duration, .. } => Some(*duration),
+            TestResult::Timeout { limit } => Some(*limit),
+            TestResult::Skip { .. } => None,
+        }
+    }
+}
+
+/// A single test case
+#[derive(Debug, Clone)]
+pub struct TestCase {
+    pub name: String,
+    pub category: TestCategory,
+    pub source: String,
+    pub expected: Expected,
+    pub timeout: Duration,
+    pub attributes: TestAttributes,
+}
+
+/// Test category
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestCategory {
+    Lexer,
+    Parser,
+    TypeCheck,
+    BorrowCheck,
+    Codegen,
+    EndToEnd,
+    Optimization,
+    Stdlib,
+}
+
+impl TestCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TestCategory::Lexer => "lexer",
+            TestCategory::Parser => "parser",
+            TestCategory::TypeCheck => "typecheck",
+            TestCategory::BorrowCheck => "borrowcheck",
+            TestCategory::Codegen => "codegen",
+            TestCategory::EndToEnd => "e2e",
+            TestCategory::Optimization => "opt",
+            TestCategory::Stdlib => "stdlib",
+        }
+    }
+}
+
+/// Expected test outcome
+#[derive(Debug, Clone)]
+pub enum Expected {
+    /// Should compile successfully and produce output
+    CompileSuccess { stdout: Option<String>, exit_code: i32 },
+    
+    /// Should fail to compile with specific error
+    CompileError { error_code: String, message_contains: Option<String> },
+    
+    /// Should fail at a specific phase
+    PhaseError { phase: CompilePhase, error_contains: String },
+    
+    /// Should produce specific tokens
+    Tokens(Vec<ExpectedToken>),
+    
+    /// Should produce specific AST structure
+    Ast(String),
+    
+    /// Should produce specific IR
+    Ir { hir: Option<String>, mir: Option<String> },
+    
+    /// Should produce specific assembly
+    Asm { contains: Vec<String>, excludes: Vec<String> },
+}
+
+/// Compilation phase
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompilePhase {
+    Lex,
+    Parse,
+    TypeCheck,
+    BorrowCheck,
+    HirLower,
+    MirLower,
+    Codegen,
+    Link,
+}
+
+/// Expected token
+#[derive(Debug, Clone)]
+pub struct ExpectedToken {
+    pub kind: String,
+    pub lexeme: Option<String>,
+    pub line: Option<u32>,
+}
+
+/// Test attributes/flags
+#[derive(Debug, Clone, Default)]
+pub struct TestAttributes {
+    pub ignore: bool,
+    pub only_on: Vec<String>,        // Target triples
+    pub not_on: Vec<String>,         // Target triples to skip
+    pub needs_std: bool,             // Requires std library
+    pub needs_alloc: bool,           // Requires alloc library
+    pub optimization: Option<u8>,    // Required optimization level
+    pub edition: Option<String>,     // Language edition
+    pub aux_files: Vec<String>,      // Additional source files
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEST RUNNER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Configuration for test runner
+#[derive(Debug, Clone)]
+pub struct TestConfig {
+    pub compiler_path: PathBuf,
+    pub target: String,
+    pub optimization: u8,
+    pub verbose: bool,
+    pub jobs: usize,
+    pub timeout: Duration,
+    pub filter: Option<String>,
+    pub categories: Vec<TestCategory>,
+    pub output_dir: PathBuf,
+}
+
+impl Default for TestConfig {
+    fn default() -> Self {
+        TestConfig {
+            compiler_path: PathBuf::from("./quantac"),
+            target: "x86_64-unknown-linux-gnu".to_string(),
+            optimization: 0,
+            verbose: false,
+            jobs: num_cpus(),
+            timeout: Duration::from_secs(60),
+            filter: None,
+            categories: vec![
+                TestCategory::Lexer,
+                TestCategory::Parser,
+                TestCategory::TypeCheck,
+                TestCategory::BorrowCheck,
+                TestCategory::Codegen,
+                TestCategory::EndToEnd,
+            ],
+            output_dir: PathBuf::from("./target/test"),
+        }
+    }
+}
+
+/// Test runner
+pub struct TestRunner {
+    config: TestConfig,
+    tests: Vec<TestCase>,
+    results: Arc<Mutex<Vec<(TestCase, TestResult)>>>,
+}
+
+impl TestRunner {
+    pub fn new(config: TestConfig) -> Self {
+        TestRunner {
+            config,
+            tests: Vec::new(),
+            results: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+    
+    /// Adds a test case
+    pub fn add_test(&mut self, test: TestCase) {
+        self.tests.push(test);
+    }
+    
+    /// Loads tests from a directory
+    pub fn load_tests(&mut self, dir: &Path) -> io::Result<usize> {
+        let mut count = 0;
+        
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.is_file() && path.extension().map(|e| e == "quanta").unwrap_or(false) {
+                if let Ok(test) = self.parse_test_file(&path) {
+                    self.tests.push(test);
+                    count += 1;
+                }
+            } else if path.is_dir() {
+                count += self.load_tests(&path)?;
+            }
+        }
+        
+        Ok(count)
+    }
+    
+    /// Parses a test file with embedded directives
+    fn parse_test_file(&self, path: &Path) -> io::Result<TestCase> {
+        let source = fs::read_to_string(path)?;
+        let name = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        
+        let mut category = TestCategory::EndToEnd;
+        let mut expected = Expected::CompileSuccess { stdout: None, exit_code: 0 };
+        let mut timeout = self.config.timeout;
+        let mut attributes = TestAttributes::default();
+        
+        // Parse directives from comments
+        for line in source.lines() {
+            let line = line.trim();
+            
+            if let Some(directive) = line.strip_prefix("//@ ") {
+                self.parse_directive(directive, &mut category, &mut expected, 
+                                     &mut timeout, &mut attributes);
+            } else if let Some(directive) = line.strip_prefix("//@") {
+                self.parse_directive(directive.trim(), &mut category, &mut expected,
+                                     &mut timeout, &mut attributes);
+            } else if !line.starts_with("//") && !line.is_empty() {
+                break;  // Stop at first non-comment line
+            }
+        }
+        
+        Ok(TestCase {
+            name,
+            category,
+            source,
+            expected,
+            timeout,
+            attributes,
+        })
+    }
+    
+    fn parse_directive(&self, directive: &str, category: &mut TestCategory,
+                       expected: &mut Expected, timeout: &mut Duration,
+                       attributes: &mut TestAttributes) {
+        let parts: Vec<&str> = directive.splitn(2, ':').collect();
+        let key = parts[0].trim();
+        let value = parts.get(1).map(|v| v.trim()).unwrap_or("");
+        
+        match key {
+            "category" => {
+                *category = match value {
+                    "lexer" => TestCategory::Lexer,
+                    "parser" => TestCategory::Parser,
+                    "typecheck" => TestCategory::TypeCheck,
+                    "borrowcheck" => TestCategory::BorrowCheck,
+                    "codegen" => TestCategory::Codegen,
+                    "e2e" | "run" => TestCategory::EndToEnd,
+                    "opt" => TestCategory::Optimization,
+                    "stdlib" => TestCategory::Stdlib,
+                    _ => TestCategory::EndToEnd,
+                };
+            }
+            "check" | "compile-pass" => {
+                *expected = Expected::CompileSuccess { stdout: None, exit_code: 0 };
+            }
+            "run-pass" => {
+                *expected = Expected::CompileSuccess { 
+                    stdout: if value.is_empty() { None } else { Some(value.to_string()) },
+                    exit_code: 0,
+                };
+            }
+            "run-fail" => {
+                let code = value.parse().unwrap_or(1);
+                *expected = Expected::CompileSuccess { stdout: None, exit_code: code };
+            }
+            "compile-fail" => {
+                *expected = Expected::CompileError { 
+                    error_code: value.to_string(),
+                    message_contains: None,
+                };
+            }
+            "error" => {
+                if let Expected::CompileError { message_contains, .. } = expected {
+                    *message_contains = Some(value.to_string());
+                }
+            }
+            "timeout" => {
+                if let Ok(secs) = value.parse::<u64>() {
+                    *timeout = Duration::from_secs(secs);
+                }
+            }
+            "ignore" => {
+                attributes.ignore = true;
+            }
+            "only-on" => {
+                attributes.only_on.push(value.to_string());
+            }
+            "not-on" => {
+                attributes.not_on.push(value.to_string());
+            }
+            "needs-std" => {
+                attributes.needs_std = true;
+            }
+            "needs-alloc" => {
+                attributes.needs_alloc = true;
+            }
+            "opt-level" => {
+                attributes.optimization = value.parse().ok();
+            }
+            "aux-file" => {
+                attributes.aux_files.push(value.to_string());
+            }
+            "stdout" => {
+                if let Expected::CompileSuccess { stdout, .. } = expected {
+                    *stdout = Some(value.to_string());
+                }
+            }
+            "asm-contains" => {
+                if let Expected::Asm { contains, .. } = expected {
+                    contains.push(value.to_string());
+                } else {
+                    *expected = Expected::Asm {
+                        contains: vec![value.to_string()],
+                        excludes: Vec::new(),
+                    };
+                }
+            }
+            "asm-excludes" => {
+                if let Expected::Asm { excludes, .. } = expected {
+                    excludes.push(value.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    /// Runs all tests
+    pub fn run(&mut self) -> TestSummary {
+        let start = Instant::now();
+        
+        // Ensure output directory exists
+        fs::create_dir_all(&self.config.output_dir).ok();
+        
+        // Filter tests
+        let tests: Vec<_> = self.tests.iter()
+            .filter(|t| self.should_run(t))
+            .cloned()
+            .collect();
+        
+        let total = tests.len();
+        
+        if self.config.verbose {
+            println!("\nrunning {} tests", total);
+        }
+        
+        // Run tests (parallel or sequential)
+        if self.config.jobs > 1 {
+            self.run_parallel(tests);
+        } else {
+            self.run_sequential(tests);
+        }
+        
+        // Collect results
+        let results = self.results.lock().unwrap();
+        
+        let mut passed = 0;
+        let mut failed = 0;
+        let mut skipped = 0;
+        let mut failures = Vec::new();
+        
+        for (test, result) in results.iter() {
+            match result {
+                TestResult::Pass { .. } => passed += 1,
+                TestResult::Skip { .. } => skipped += 1,
+                _ => {
+                    failed += 1;
+                    failures.push((test.clone(), result.clone()));
+                }
+            }
+        }
+        
+        TestSummary {
+            total,
+            passed,
+            failed,
+            skipped,
+            duration: start.elapsed(),
+            failures,
+        }
+    }
+    
+    fn should_run(&self, test: &TestCase) -> bool {
+        // Check ignore flag
+        if test.attributes.ignore {
+            return false;
+        }
+        
+        // Check category filter
+        if !self.config.categories.contains(&test.category) {
+            return false;
+        }
+        
+        // Check name filter
+        if let Some(ref filter) = self.config.filter {
+            if !test.name.contains(filter) {
+                return false;
+            }
+        }
+        
+        // Check target constraints
+        if !test.attributes.only_on.is_empty() {
+            if !test.attributes.only_on.iter().any(|t| self.config.target.contains(t)) {
+                return false;
+            }
+        }
+        
+        if test.attributes.not_on.iter().any(|t| self.config.target.contains(t)) {
+            return false;
+        }
+        
+        true
+    }
+    
+    fn run_sequential(&self, tests: Vec<TestCase>) {
+        for test in tests {
+            let result = self.run_single(&test);
+            self.report_result(&test, &result);
+            self.results.lock().unwrap().push((test, result));
+        }
+    }
+    
+    fn run_parallel(&self, tests: Vec<TestCase>) {
+        let tests = Arc::new(Mutex::new(tests.into_iter()));
+        let mut handles = Vec::new();
+        
+        for _ in 0..self.config.jobs {
+            let tests = Arc::clone(&tests);
+            let results = Arc::clone(&self.results);
+            let config = self.config.clone();
+            
+            let handle = thread::spawn(move || {
+                loop {
+                    let test = {
+                        let mut tests = tests.lock().unwrap();
+                        tests.next()
+                    };
+                    
+                    match test {
+                        Some(test) => {
+                            let runner = TestRunner::new(config.clone());
+                            let result = runner.run_single(&test);
+                            results.lock().unwrap().push((test, result));
+                        }
+                        None => break,
+                    }
+                }
+            });
+            
+            handles.push(handle);
+        }
+        
+        for handle in handles {
+            handle.join().ok();
+        }
+    }
+    
+    /// Runs a single test case
+    fn run_single(&self, test: &TestCase) -> TestResult {
+        let start = Instant::now();
+        
+        // Create temp directory for this test
+        let test_dir = self.config.output_dir.join(&test.name);
+        fs::create_dir_all(&test_dir).ok();
+        
+        // Write source file
+        let source_path = test_dir.join("input.quanta");
+        if let Err(e) = fs::write(&source_path, &test.source) {
+            return TestResult::Error {
+                error: format!("Failed to write source: {}", e),
+                duration: start.elapsed(),
+            };
+        }
+        
+        // Run the appropriate test based on category
+        match test.category {
+            TestCategory::Lexer => self.run_lexer_test(test, &source_path, start),
+            TestCategory::Parser => self.run_parser_test(test, &source_path, start),
+            TestCategory::TypeCheck => self.run_typecheck_test(test, &source_path, start),
+            TestCategory::BorrowCheck => self.run_borrowcheck_test(test, &source_path, start),
+            TestCategory::Codegen => self.run_codegen_test(test, &source_path, start),
+            TestCategory::EndToEnd | TestCategory::Stdlib => {
+                self.run_e2e_test(test, &source_path, &test_dir, start)
+            }
+            TestCategory::Optimization => self.run_opt_test(test, &source_path, start),
+        }
+    }
+    
+    fn run_lexer_test(&self, test: &TestCase, source: &Path, start: Instant) -> TestResult {
+        let output = Command::new(&self.config.compiler_path)
+            .arg("--emit").arg("tokens")
+            .arg(source)
+            .output();
+        
+        match output {
+            Ok(output) => self.check_lexer_output(test, &output, start),
+            Err(e) => TestResult::Error {
+                error: format!("Failed to run compiler: {}", e),
+                duration: start.elapsed(),
+            },
+        }
+    }
+    
+    fn run_parser_test(&self, test: &TestCase, source: &Path, start: Instant) -> TestResult {
+        let output = Command::new(&self.config.compiler_path)
+            .arg("--emit").arg("ast")
+            .arg(source)
+            .output();
+        
+        match output {
+            Ok(output) => self.check_parser_output(test, &output, start),
+            Err(e) => TestResult::Error {
+                error: format!("Failed to run compiler: {}", e),
+                duration: start.elapsed(),
+            },
+        }
+    }
+    
+    fn run_typecheck_test(&self, test: &TestCase, source: &Path, start: Instant) -> TestResult {
+        let output = Command::new(&self.config.compiler_path)
+            .arg("--emit").arg("hir")
+            .arg(source)
+            .output();
+        
+        match output {
+            Ok(output) => self.check_compile_output(test, &output, start),
+            Err(e) => TestResult::Error {
+                error: format!("Failed to run compiler: {}", e),
+                duration: start.elapsed(),
+            },
+        }
+    }
+    
+    fn run_borrowcheck_test(&self, test: &TestCase, source: &Path, start: Instant) -> TestResult {
+        let output = Command::new(&self.config.compiler_path)
+            .arg("--emit").arg("mir")
+            .arg(source)
+            .output();
+        
+        match output {
+            Ok(output) => self.check_compile_output(test, &output, start),
+            Err(e) => TestResult::Error {
+                error: format!("Failed to run compiler: {}", e),
+                duration: start.elapsed(),
+            },
+        }
+    }
+    
+    fn run_codegen_test(&self, test: &TestCase, source: &Path, start: Instant) -> TestResult {
+        let output = Command::new(&self.config.compiler_path)
+            .arg("-S")  // Emit assembly
+            .arg("-O").arg(self.config.optimization.to_string())
+            .arg("--target").arg(&self.config.target)
+            .arg(source)
+            .output();
+        
+        match output {
+            Ok(output) => self.check_asm_output(test, &output, start),
+            Err(e) => TestResult::Error {
+                error: format!("Failed to run compiler: {}", e),
+                duration: start.elapsed(),
+            },
+        }
+    }
+    
+    fn run_e2e_test(&self, test: &TestCase, source: &Path, 
+                    test_dir: &Path, start: Instant) -> TestResult {
+        let exe_path = test_dir.join("a.out");
+        
+        // Compile
+        let compile = Command::new(&self.config.compiler_path)
+            .arg("-o").arg(&exe_path)
+            .arg("-O").arg(self.config.optimization.to_string())
+            .arg("--target").arg(&self.config.target)
+            .arg(source)
+            .output();
+        
+        let compile_output = match compile {
+            Ok(o) => o,
+            Err(e) => return TestResult::Error {
+                error: format!("Failed to run compiler: {}", e),
+                duration: start.elapsed(),
+            },
+        };
+        
+        // Check compilation result
+        match &test.expected {
+            Expected::CompileError { error_code, message_contains } => {
+                return self.check_compile_error(
+                    &compile_output, error_code, message_contains.as_deref(), start
+                );
+            }
+            Expected::CompileSuccess { .. } if !compile_output.status.success() => {
+                return TestResult::Fail {
+                    message: format!(
+                        "Expected compilation success, got failure:\n{}",
+                        String::from_utf8_lossy(&compile_output.stderr)
+                    ),
+                    duration: start.elapsed(),
+                };
+            }
+            _ => {}
+        }
+        
+        // Run executable
+        let run = Command::new(&exe_path)
+            .output();
+        
+        match run {
+            Ok(run_output) => self.check_run_output(test, &run_output, start),
+            Err(e) => TestResult::Error {
+                error: format!("Failed to run executable: {}", e),
+                duration: start.elapsed(),
+            },
+        }
+    }
+    
+    fn run_opt_test(&self, test: &TestCase, source: &Path, start: Instant) -> TestResult {
+        // Run at multiple optimization levels and check consistency
+        let mut results = Vec::new();
+        
+        for opt in 0..=3 {
+            let output = Command::new(&self.config.compiler_path)
+                .arg("-S")
+                .arg("-O").arg(opt.to_string())
+                .arg(source)
+                .output();
+            
+            if let Ok(o) = output {
+                results.push((opt, o));
+            }
+        }
+        
+        // Check that all produce valid output
+        for (opt, output) in &results {
+            if !output.status.success() {
+                return TestResult::Fail {
+                    message: format!("Failed at -O{}", opt),
+                    duration: start.elapsed(),
+                };
+            }
+        }
+        
+        TestResult::Pass { duration: start.elapsed() }
+    }
+    
+    fn check_lexer_output(&self, test: &TestCase, output: &Output, start: Instant) -> TestResult {
+        if let Expected::Tokens(expected_tokens) = &test.expected {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            
+            for expected in expected_tokens {
+                if !stdout.contains(&expected.kind) {
+                    return TestResult::Fail {
+                        message: format!("Expected token {} not found", expected.kind),
+                        duration: start.elapsed(),
+                    };
+                }
+            }
+        }
+        
+        if output.status.success() {
+            TestResult::Pass { duration: start.elapsed() }
+        } else {
+            TestResult::Fail {
+                message: String::from_utf8_lossy(&output.stderr).to_string(),
+                duration: start.elapsed(),
+            }
+        }
+    }
+    
+    fn check_parser_output(&self, test: &TestCase, output: &Output, start: Instant) -> TestResult {
+        if let Expected::Ast(expected_ast) = &test.expected {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if !stdout.contains(expected_ast) {
+                return TestResult::Fail {
+                    message: format!("AST mismatch:\nExpected: {}\nGot: {}", expected_ast, stdout),
+                    duration: start.elapsed(),
+                };
+            }
+        }
+        
+        if output.status.success() {
+            TestResult::Pass { duration: start.elapsed() }
+        } else {
+            TestResult::Fail {
+                message: String::from_utf8_lossy(&output.stderr).to_string(),
+                duration: start.elapsed(),
+            }
+        }
+    }
+    
+    fn check_compile_output(&self, test: &TestCase, output: &Output, start: Instant) -> TestResult {
+        match &test.expected {
+            Expected::CompileSuccess { .. } => {
+                if output.status.success() {
+                    TestResult::Pass { duration: start.elapsed() }
+                } else {
+                    TestResult::Fail {
+                        message: String::from_utf8_lossy(&output.stderr).to_string(),
+                        duration: start.elapsed(),
+                    }
+                }
+            }
+            Expected::CompileError { error_code, message_contains } => {
+                self.check_compile_error(output, error_code, message_contains.as_deref(), start)
+            }
+            Expected::PhaseError { phase, error_contains } => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !output.status.success() && stderr.contains(error_contains) {
+                    TestResult::Pass { duration: start.elapsed() }
+                } else {
+                    TestResult::Fail {
+                        message: format!(
+                            "Expected error at {:?} containing '{}', got:\n{}",
+                            phase, error_contains, stderr
+                        ),
+                        duration: start.elapsed(),
+                    }
+                }
+            }
+            _ => TestResult::Pass { duration: start.elapsed() },
+        }
+    }
+    
+    fn check_compile_error(&self, output: &Output, error_code: &str,
+                           message_contains: Option<&str>, start: Instant) -> TestResult {
+        if output.status.success() {
+            return TestResult::Fail {
+                message: "Expected compilation to fail, but it succeeded".to_string(),
+                duration: start.elapsed(),
+            };
+        }
+        
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        
+        if !stderr.contains(error_code) {
+            return TestResult::Fail {
+                message: format!(
+                    "Expected error code '{}' not found in:\n{}",
+                    error_code, stderr
+                ),
+                duration: start.elapsed(),
+            };
+        }
+        
+        if let Some(msg) = message_contains {
+            if !stderr.contains(msg) {
+                return TestResult::Fail {
+                    message: format!(
+                        "Expected error message containing '{}' not found in:\n{}",
+                        msg, stderr
+                    ),
+                    duration: start.elapsed(),
+                };
+            }
+        }
+        
+        TestResult::Pass { duration: start.elapsed() }
+    }
+    
+    fn check_asm_output(&self, test: &TestCase, output: &Output, start: Instant) -> TestResult {
+        if let Expected::Asm { contains, excludes } = &test.expected {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            
+            for pattern in contains {
+                if !stdout.contains(pattern) {
+                    return TestResult::Fail {
+                        message: format!("Expected assembly pattern '{}' not found", pattern),
+                        duration: start.elapsed(),
+                    };
+                }
+            }
+            
+            for pattern in excludes {
+                if stdout.contains(pattern) {
+                    return TestResult::Fail {
+                        message: format!("Unexpected assembly pattern '{}' found", pattern),
+                        duration: start.elapsed(),
+                    };
+                }
+            }
+        }
+        
+        if output.status.success() {
+            TestResult::Pass { duration: start.elapsed() }
+        } else {
+            TestResult::Fail {
+                message: String::from_utf8_lossy(&output.stderr).to_string(),
+                duration: start.elapsed(),
+            }
+        }
+    }
+    
+    fn check_run_output(&self, test: &TestCase, output: &Output, start: Instant) -> TestResult {
+        if let Expected::CompileSuccess { stdout, exit_code } = &test.expected {
+            // Check exit code
+            let actual_code = output.status.code().unwrap_or(-1);
+            if actual_code != *exit_code {
+                return TestResult::Fail {
+                    message: format!(
+                        "Expected exit code {}, got {}",
+                        exit_code, actual_code
+                    ),
+                    duration: start.elapsed(),
+                };
+            }
+            
+            // Check stdout
+            if let Some(expected_stdout) = stdout {
+                let actual_stdout = String::from_utf8_lossy(&output.stdout);
+                if actual_stdout.trim() != expected_stdout.trim() {
+                    return TestResult::Fail {
+                        message: format!(
+                            "Stdout mismatch:\nExpected: {}\nGot: {}",
+                            expected_stdout, actual_stdout
+                        ),
+                        duration: start.elapsed(),
+                    };
+                }
+            }
+            
+            TestResult::Pass { duration: start.elapsed() }
+        } else {
+            TestResult::Pass { duration: start.elapsed() }
+        }
+    }
+    
+    fn report_result(&self, test: &TestCase, result: &TestResult) {
+        if !self.config.verbose {
+            match result {
+                TestResult::Pass { .. } => print!("."),
+                TestResult::Fail { .. } => print!("F"),
+                TestResult::Skip { .. } => print!("s"),
+                TestResult::Error { .. } => print!("E"),
+                TestResult::Timeout { .. } => print!("T"),
+            }
+            io::stdout().flush().ok();
+            return;
+        }
+        
+        let status = match result {
+            TestResult::Pass { duration } => {
+                format!("\x1b[32mok\x1b[0m ({:.2?})", duration)
+            }
+            TestResult::Fail { message, duration } => {
+                format!("\x1b[31mFAILED\x1b[0m ({:.2?})\n  {}", duration, message)
+            }
+            TestResult::Skip { reason } => {
+                format!("\x1b[33mskipped\x1b[0m ({})", reason)
+            }
+            TestResult::Error { error, duration } => {
+                format!("\x1b[31merror\x1b[0m ({:.2?})\n  {}", duration, error)
+            }
+            TestResult::Timeout { limit } => {
+                format!("\x1b[31mtimeout\x1b[0m ({:.2?})", limit)
+            }
+        };
+        
+        println!("test {}::{} ... {}", test.category.as_str(), test.name, status);
+    }
+}
+
+/// Test summary
+#[derive(Debug)]
+pub struct TestSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub duration: Duration,
+    pub failures: Vec<(TestCase, TestResult)>,
+}
+
+impl TestSummary {
+    pub fn print(&self) {
+        println!("\n{}", "=".repeat(70));
+        
+        if self.failed > 0 {
+            println!("\n\x1b[31mfailures:\x1b[0m");
+            for (test, result) in &self.failures {
+                println!("\n---- {}::{} ----", test.category.as_str(), test.name);
+                match result {
+                    TestResult::Fail { message, .. } => println!("{}", message),
+                    TestResult::Error { error, .. } => println!("{}", error),
+                    TestResult::Timeout { limit } => println!("timed out after {:?}", limit),
+                    _ => {}
+                }
+            }
+        }
+        
+        println!("\ntest result: {}. {} passed; {} failed; {} skipped; finished in {:.2?}",
+            if self.failed == 0 { "\x1b[32mok\x1b[0m" } else { "\x1b[31mFAILED\x1b[0m" },
+            self.passed, self.failed, self.skipped, self.duration
+        );
+    }
+    
+    pub fn exit_code(&self) -> i32 {
+        if self.failed > 0 { 1 } else { 0 }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Runs the test suite
+pub fn main() -> i32 {
+    let args: Vec<String> = std::env::args().collect();
+    
+    let mut config = TestConfig::default();
+    
+    // Parse command-line arguments
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-v" | "--verbose" => config.verbose = true,
+            "-j" | "--jobs" => {
+                i += 1;
+                if i < args.len() {
+                    config.jobs = args[i].parse().unwrap_or(1);
+                }
+            }
+            "--filter" => {
+                i += 1;
+                if i < args.len() {
+                    config.filter = Some(args[i].clone());
+                }
+            }
+            "--target" => {
+                i += 1;
+                if i < args.len() {
+                    config.target = args[i].clone();
+                }
+            }
+            "-O" | "--opt-level" => {
+                i += 1;
+                if i < args.len() {
+                    config.optimization = args[i].parse().unwrap_or(0);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    let mut runner = TestRunner::new(config);
+    
+    // Load tests
+    let test_dir = Path::new("tests");
+    if test_dir.exists() {
+        match runner.load_tests(test_dir) {
+            Ok(count) => println!("Loaded {} tests", count),
+            Err(e) => eprintln!("Failed to load tests: {}", e),
+        }
+    }
+    
+    // Run tests
+    let summary = runner.run();
+    summary.print();
+    summary.exit_code()
+}

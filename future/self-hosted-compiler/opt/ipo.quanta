@@ -1,0 +1,1004 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Interprocedural Optimization (IPO)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Interprocedural optimization infrastructure:
+//   - Call graph construction
+//   - Interprocedural constant propagation
+//   - Interprocedural alias analysis
+//   - Argument promotion
+//   - Dead argument elimination
+//   - Function merging
+//   - Partial inlining
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::ipo
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CALL GRAPH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Call graph node representing a function
+#[derive(Debug, Clone)]
+pub struct CallGraphNode {
+    /// Function name
+    pub name: String,
+    /// Node ID
+    pub id: u32,
+    /// Direct callees
+    pub callees: Vec<CallEdge>,
+    /// Direct callers
+    pub callers: Vec<u32>,
+    /// Is external
+    pub is_external: bool,
+    /// Is address taken
+    pub address_taken: bool,
+    /// Attributes
+    pub attributes: FunctionAttributes,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallEdge {
+    /// Callee node ID
+    pub callee_id: u32,
+    /// Call site ID
+    pub call_site: u32,
+    /// Is indirect call
+    pub is_indirect: bool,
+    /// Call count from profiling
+    pub count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FunctionAttributes {
+    /// Function never returns
+    pub no_return: bool,
+    /// Function doesn't throw
+    pub no_unwind: bool,
+    /// Function is pure (no side effects, reads memory)
+    pub read_only: bool,
+    /// Function is const (no side effects, no memory reads)
+    pub read_none: bool,
+    /// Function doesn't recurse
+    pub no_recurse: bool,
+    /// Function must be inlined
+    pub always_inline: bool,
+    /// Function must not be inlined
+    pub no_inline: bool,
+    /// Function is a leaf (makes no calls)
+    pub is_leaf: bool,
+    /// Estimated instruction count
+    pub instruction_count: u32,
+}
+
+/// Call graph for a module
+#[derive(Debug)]
+pub struct CallGraph {
+    /// Function nodes
+    nodes: Vec<CallGraphNode>,
+    /// Name to node ID mapping
+    name_map: BTreeMap<String, u32>,
+    /// Entry points (main, constructors, etc.)
+    entry_points: Vec<u32>,
+    /// External function node
+    external_node: u32,
+}
+
+impl CallGraph {
+    pub fn new() -> Self {
+        let mut graph = CallGraph {
+            nodes: Vec::new(),
+            name_map: BTreeMap::new(),
+            entry_points: Vec::new(),
+            external_node: 0,
+        };
+        
+        // Add external node for unknown callees
+        graph.external_node = graph.add_node("__external__", true);
+        
+        graph
+    }
+    
+    /// Add a function node
+    pub fn add_node(&mut self, name: impl Into<String>, is_external: bool) -> u32 {
+        let name = name.into();
+        
+        if let Some(&id) = self.name_map.get(&name) {
+            return id;
+        }
+        
+        let id = self.nodes.len() as u32;
+        
+        self.nodes.push(CallGraphNode {
+            name: name.clone(),
+            id,
+            callees: Vec::new(),
+            callers: Vec::new(),
+            is_external,
+            address_taken: false,
+            attributes: FunctionAttributes::default(),
+        });
+        
+        self.name_map.insert(name, id);
+        id
+    }
+    
+    /// Add a call edge
+    pub fn add_edge(&mut self, caller: u32, callee: u32, call_site: u32, is_indirect: bool) {
+        self.nodes[caller as usize].callees.push(CallEdge {
+            callee_id: callee,
+            call_site,
+            is_indirect,
+            count: None,
+        });
+        
+        self.nodes[callee as usize].callers.push(caller);
+    }
+    
+    /// Get node by name
+    pub fn get_node(&self, name: &str) -> Option<&CallGraphNode> {
+        self.name_map.get(name).map(|&id| &self.nodes[id as usize])
+    }
+    
+    /// Get mutable node by name
+    pub fn get_node_mut(&mut self, name: &str) -> Option<&mut CallGraphNode> {
+        self.name_map.get(name).map(|&id| &mut self.nodes[id as usize])
+    }
+    
+    /// Get node by ID
+    pub fn node(&self, id: u32) -> &CallGraphNode {
+        &self.nodes[id as usize]
+    }
+    
+    /// Get SCC (strongly connected components)
+    pub fn compute_sccs(&self) -> Vec<Vec<u32>> {
+        // Tarjan's algorithm
+        let mut index = 0;
+        let mut stack = Vec::new();
+        let mut indices: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut lowlinks: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut on_stack: BTreeSet<u32> = BTreeSet::new();
+        let mut sccs = Vec::new();
+        
+        for id in 0..self.nodes.len() as u32 {
+            if !indices.contains_key(&id) {
+                self.strongconnect(
+                    id, 
+                    &mut index, 
+                    &mut stack, 
+                    &mut indices, 
+                    &mut lowlinks, 
+                    &mut on_stack,
+                    &mut sccs
+                );
+            }
+        }
+        
+        sccs
+    }
+    
+    fn strongconnect(
+        &self,
+        v: u32,
+        index: &mut u32,
+        stack: &mut Vec<u32>,
+        indices: &mut BTreeMap<u32, u32>,
+        lowlinks: &mut BTreeMap<u32, u32>,
+        on_stack: &mut BTreeSet<u32>,
+        sccs: &mut Vec<Vec<u32>>,
+    ) {
+        indices.insert(v, *index);
+        lowlinks.insert(v, *index);
+        *index += 1;
+        stack.push(v);
+        on_stack.insert(v);
+        
+        for edge in &self.nodes[v as usize].callees {
+            let w = edge.callee_id;
+            
+            if !indices.contains_key(&w) {
+                self.strongconnect(w, index, stack, indices, lowlinks, on_stack, sccs);
+                let lw = *lowlinks.get(&w).unwrap();
+                let lv = lowlinks.get_mut(&v).unwrap();
+                *lv = (*lv).min(lw);
+            } else if on_stack.contains(&w) {
+                let iw = *indices.get(&w).unwrap();
+                let lv = lowlinks.get_mut(&v).unwrap();
+                *lv = (*lv).min(iw);
+            }
+        }
+        
+        if lowlinks.get(&v) == indices.get(&v) {
+            let mut scc = Vec::new();
+            loop {
+                let w = stack.pop().unwrap();
+                on_stack.remove(&w);
+                scc.push(w);
+                if w == v { break; }
+            }
+            sccs.push(scc);
+        }
+    }
+    
+    /// Get bottom-up traversal order
+    pub fn bottom_up_order(&self) -> Vec<u32> {
+        let sccs = self.compute_sccs();
+        sccs.into_iter().flatten().collect()
+    }
+    
+    /// Check if function is recursive
+    pub fn is_recursive(&self, func_id: u32) -> bool {
+        self.nodes[func_id as usize].callees.iter()
+            .any(|e| self.reaches(e.callee_id, func_id))
+    }
+    
+    fn reaches(&self, from: u32, to: u32) -> bool {
+        let mut visited = BTreeSet::new();
+        let mut queue = vec![from];
+        
+        while let Some(node) = queue.pop() {
+            if node == to {
+                return true;
+            }
+            
+            if visited.insert(node) {
+                for edge in &self.nodes[node as usize].callees {
+                    queue.push(edge.callee_id);
+                }
+            }
+        }
+        
+        false
+    }
+}
+
+impl Default for CallGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTERPROCEDURAL CONSTANT PROPAGATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Interprocedural constant propagation pass
+pub struct IpConstProp {
+    /// Call graph
+    call_graph: Arc<CallGraph>,
+    /// Constant values for function parameters
+    param_constants: BTreeMap<(u32, u32), ConstValue>,
+    /// Constant return values
+    return_constants: BTreeMap<u32, ConstValue>,
+    /// Worklist
+    worklist: Vec<u32>,
+}
+
+/// Constant value lattice
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstValue {
+    /// Top (unknown)
+    Top,
+    /// Constant value
+    Constant(i64),
+    /// Bottom (undefined/multiple values)
+    Bottom,
+}
+
+impl ConstValue {
+    /// Meet operation (lattice join)
+    pub fn meet(&self, other: &ConstValue) -> ConstValue {
+        match (self, other) {
+            (ConstValue::Top, v) | (v, ConstValue::Top) => v.clone(),
+            (ConstValue::Bottom, _) | (_, ConstValue::Bottom) => ConstValue::Bottom,
+            (ConstValue::Constant(a), ConstValue::Constant(b)) => {
+                if a == b {
+                    ConstValue::Constant(*a)
+                } else {
+                    ConstValue::Bottom
+                }
+            }
+        }
+    }
+    
+    pub fn is_constant(&self) -> bool {
+        matches!(self, ConstValue::Constant(_))
+    }
+}
+
+impl IpConstProp {
+    pub fn new(call_graph: Arc<CallGraph>) -> Self {
+        IpConstProp {
+            call_graph,
+            param_constants: BTreeMap::new(),
+            return_constants: BTreeMap::new(),
+            worklist: Vec::new(),
+        }
+    }
+    
+    /// Run interprocedural constant propagation
+    pub fn run(&mut self, module: &mut MirModule) {
+        // Initialize worklist with all functions
+        for func in &module.functions {
+            if let Some(node) = self.call_graph.get_node(&func.name) {
+                self.worklist.push(node.id);
+            }
+        }
+        
+        // Process worklist until fixed point
+        while let Some(func_id) = self.worklist.pop() {
+            let changed = self.analyze_function(func_id, module);
+            
+            if changed {
+                // Add callers to worklist
+                for &caller in &self.call_graph.node(func_id).callers {
+                    if !self.worklist.contains(&caller) {
+                        self.worklist.push(caller);
+                    }
+                }
+            }
+        }
+        
+        // Apply transformations
+        self.transform(module);
+    }
+    
+    fn analyze_function(&mut self, func_id: u32, module: &MirModule) -> bool {
+        let node = self.call_graph.node(func_id);
+        let func = match module.functions.iter().find(|f| f.name == node.name) {
+            Some(f) => f,
+            None => return false,
+        };
+        
+        let mut changed = false;
+        
+        // Analyze parameter constants
+        for (param_idx, _param) in func.params.iter().enumerate() {
+            let mut value = ConstValue::Top;
+            
+            // Check all call sites
+            for &caller_id in &node.callers {
+                let caller = self.call_graph.node(caller_id);
+                for edge in &caller.callees {
+                    if edge.callee_id == func_id {
+                        // Get argument value at call site
+                        let arg_value = self.get_argument_value(caller_id, edge.call_site, param_idx, module);
+                        value = value.meet(&arg_value);
+                    }
+                }
+            }
+            
+            let key = (func_id, param_idx as u32);
+            let old_value = self.param_constants.get(&key).cloned().unwrap_or(ConstValue::Top);
+            
+            if value != old_value {
+                self.param_constants.insert(key, value);
+                changed = true;
+            }
+        }
+        
+        // Analyze return value
+        let return_value = self.analyze_return_value(func);
+        let old_return = self.return_constants.get(&func_id).cloned().unwrap_or(ConstValue::Top);
+        
+        if return_value != old_return {
+            self.return_constants.insert(func_id, return_value);
+            changed = true;
+        }
+        
+        changed
+    }
+    
+    fn get_argument_value(&self, _caller_id: u32, _call_site: u32, _arg_idx: usize, _module: &MirModule) -> ConstValue {
+        // Would analyze actual argument value
+        ConstValue::Top
+    }
+    
+    fn analyze_return_value(&self, func: &MirFunction) -> ConstValue {
+        let mut result = ConstValue::Top;
+        
+        for block in &func.blocks {
+            if let MirTerminator::Return { value: Some(value) } = &block.terminator {
+                let value_const = self.get_operand_constant(value);
+                result = result.meet(&value_const);
+            }
+        }
+        
+        result
+    }
+    
+    fn get_operand_constant(&self, operand: &MirOperand) -> ConstValue {
+        match operand {
+            MirOperand::Constant(c) => ConstValue::Constant(*c),
+            _ => ConstValue::Top,
+        }
+    }
+    
+    fn transform(&self, module: &mut MirModule) {
+        // Propagate constants to parameters
+        for func in &mut module.functions {
+            if let Some(node) = self.call_graph.get_node(&func.name) {
+                for (param_idx, _param) in func.params.iter().enumerate() {
+                    let key = (node.id, param_idx as u32);
+                    if let Some(ConstValue::Constant(c)) = self.param_constants.get(&key) {
+                        // Replace parameter uses with constant
+                        self.replace_param_with_constant(func, param_idx, *c);
+                    }
+                }
+            }
+        }
+        
+        // Propagate constant returns
+        for func in &mut module.functions {
+            for block in &mut func.blocks {
+                for stmt in &mut block.statements {
+                    if let MirStatement::Call { callee, dest: Some(dest), .. } = stmt {
+                        if let Some(callee_node) = self.call_graph.get_node(callee) {
+                            if let Some(ConstValue::Constant(c)) = self.return_constants.get(&callee_node.id) {
+                                // Replace call result with constant
+                                *stmt = MirStatement::Assign {
+                                    dest: dest.clone(),
+                                    value: MirOperand::Constant(*c),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    fn replace_param_with_constant(&self, _func: &mut MirFunction, _param_idx: usize, _value: i64) {
+        // Would replace all uses of parameter with constant
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEAD ARGUMENT ELIMINATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Dead argument elimination pass
+pub struct DeadArgElimination {
+    call_graph: Arc<CallGraph>,
+    /// Arguments that are live
+    live_args: BTreeMap<u32, BTreeSet<u32>>,
+    /// Return values that are live
+    live_returns: BTreeSet<u32>,
+}
+
+impl DeadArgElimination {
+    pub fn new(call_graph: Arc<CallGraph>) -> Self {
+        DeadArgElimination {
+            call_graph,
+            live_args: BTreeMap::new(),
+            live_returns: BTreeSet::new(),
+        }
+    }
+    
+    /// Run dead argument elimination
+    pub fn run(&mut self, module: &mut MirModule) {
+        // Step 1: Analyze liveness
+        self.analyze_liveness(module);
+        
+        // Step 2: Transform
+        self.transform(module);
+    }
+    
+    fn analyze_liveness(&mut self, module: &MirModule) {
+        // Initialize all args as dead
+        for func in &module.functions {
+            if let Some(node) = self.call_graph.get_node(&func.name) {
+                self.live_args.insert(node.id, BTreeSet::new());
+            }
+        }
+        
+        // Mark used arguments as live
+        for func in &module.functions {
+            if let Some(node) = self.call_graph.get_node(&func.name) {
+                for (param_idx, param) in func.params.iter().enumerate() {
+                    if self.is_param_used(func, param_idx) {
+                        self.live_args.get_mut(&node.id).unwrap().insert(param_idx as u32);
+                    }
+                }
+                
+                // Mark return as live if used at any call site
+                for &caller_id in &node.callers {
+                    let caller = self.call_graph.node(caller_id);
+                    for edge in &caller.callees {
+                        if edge.callee_id == node.id {
+                            if self.is_return_used(caller_id, edge.call_site, module) {
+                                self.live_returns.insert(node.id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    fn is_param_used(&self, func: &MirFunction, param_idx: usize) -> bool {
+        let param_name = &func.params[param_idx];
+        
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if self.uses_variable(stmt, param_name) {
+                    return true;
+                }
+            }
+        }
+        
+        false
+    }
+    
+    fn uses_variable(&self, stmt: &MirStatement, name: &str) -> bool {
+        match stmt {
+            MirStatement::BinaryOp { lhs, rhs, .. } => {
+                lhs.is_var(name) || rhs.is_var(name)
+            }
+            MirStatement::Call { args, .. } => {
+                args.iter().any(|a| a.is_var(name))
+            }
+            MirStatement::Load { ptr, .. } => ptr.is_var(name),
+            MirStatement::Store { ptr, value, .. } => {
+                ptr.is_var(name) || value.is_var(name)
+            }
+            _ => false,
+        }
+    }
+    
+    fn is_return_used(&self, _caller_id: u32, _call_site: u32, _module: &MirModule) -> bool {
+        // Would check if return value is used
+        true
+    }
+    
+    fn transform(&self, module: &mut MirModule) {
+        // Remove dead arguments
+        for func in &mut module.functions {
+            if let Some(node) = self.call_graph.get_node(&func.name) {
+                if node.address_taken || node.is_external {
+                    continue; // Can't modify external/address-taken functions
+                }
+                
+                let live = self.live_args.get(&node.id);
+                
+                if let Some(live) = live {
+                    let dead_indices: Vec<_> = (0..func.params.len() as u32)
+                        .filter(|i| !live.contains(i))
+                        .collect();
+                    
+                    // Remove dead params
+                    for &idx in dead_indices.iter().rev() {
+                        func.params.remove(idx as usize);
+                    }
+                    
+                    // Update call sites
+                    self.update_call_sites(node.id, &dead_indices, module);
+                }
+            }
+        }
+    }
+    
+    fn update_call_sites(&self, _callee_id: u32, _dead_indices: &[u32], _module: &mut MirModule) {
+        // Would remove dead arguments from call sites
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ARGUMENT PROMOTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Argument promotion pass (byref → byval for small structs)
+pub struct ArgumentPromotion {
+    call_graph: Arc<CallGraph>,
+    /// Maximum struct size to promote (bytes)
+    max_size: usize,
+}
+
+impl ArgumentPromotion {
+    pub fn new(call_graph: Arc<CallGraph>, max_size: usize) -> Self {
+        ArgumentPromotion { call_graph, max_size }
+    }
+    
+    /// Run argument promotion
+    pub fn run(&mut self, module: &mut MirModule) {
+        for func in &mut module.functions {
+            if let Some(node) = self.call_graph.get_node(&func.name) {
+                if node.address_taken || node.is_external {
+                    continue;
+                }
+                
+                self.promote_arguments(func, node.id);
+            }
+        }
+    }
+    
+    fn promote_arguments(&self, func: &mut MirFunction, _func_id: u32) {
+        // Find pointer parameters that can be promoted
+        let promotable: Vec<_> = func.params.iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                if self.can_promote_param(func, i) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        // Promote each promotable parameter
+        for idx in promotable.iter().rev() {
+            self.promote_param(func, *idx);
+        }
+    }
+    
+    fn can_promote_param(&self, func: &MirFunction, param_idx: usize) -> bool {
+        let param = &func.params[param_idx];
+        
+        // Check if parameter is only loaded (not stored or escaped)
+        // This is a simplified check
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                match stmt {
+                    MirStatement::Store { ptr, .. } if ptr.is_var(param) => {
+                        return false; // Written to
+                    }
+                    MirStatement::Call { args, .. } => {
+                        if args.iter().any(|a| a.is_var(param)) {
+                            return false; // Passed to another function
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
+        true
+    }
+    
+    fn promote_param(&self, _func: &mut MirFunction, _param_idx: usize) {
+        // Would replace pointer parameter with value parameter(s)
+        // and update all uses
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUNCTION MERGING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Function merging pass (merge identical functions)
+pub struct FunctionMerging {
+    /// Function hashes for deduplication
+    hashes: BTreeMap<u64, Vec<u32>>,
+}
+
+impl FunctionMerging {
+    pub fn new() -> Self {
+        FunctionMerging {
+            hashes: BTreeMap::new(),
+        }
+    }
+    
+    /// Run function merging
+    pub fn run(&mut self, module: &mut MirModule) {
+        // Step 1: Compute hashes for all functions
+        for (idx, func) in module.functions.iter().enumerate() {
+            let hash = self.compute_hash(func);
+            self.hashes.entry(hash).or_default().push(idx as u32);
+        }
+        
+        // Step 2: Find and merge duplicates
+        let mut to_merge: Vec<(u32, u32)> = Vec::new();
+        
+        for candidates in self.hashes.values() {
+            if candidates.len() < 2 {
+                continue;
+            }
+            
+            // Compare each pair
+            for i in 0..candidates.len() {
+                for j in (i + 1)..candidates.len() {
+                    let func_i = &module.functions[candidates[i] as usize];
+                    let func_j = &module.functions[candidates[j] as usize];
+                    
+                    if self.are_equivalent(func_i, func_j) {
+                        to_merge.push((candidates[i], candidates[j]));
+                    }
+                }
+            }
+        }
+        
+        // Step 3: Merge functions
+        for (keep, remove) in to_merge {
+            self.merge_functions(module, keep, remove);
+        }
+    }
+    
+    fn compute_hash(&self, func: &MirFunction) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        
+        // Hash structure
+        hash = hash.wrapping_mul(0x100000001b3);
+        hash ^= func.params.len() as u64;
+        
+        hash = hash.wrapping_mul(0x100000001b3);
+        hash ^= func.blocks.len() as u64;
+        
+        for block in &func.blocks {
+            hash = hash.wrapping_mul(0x100000001b3);
+            hash ^= block.statements.len() as u64;
+        }
+        
+        hash
+    }
+    
+    fn are_equivalent(&self, func_a: &MirFunction, func_b: &MirFunction) -> bool {
+        // Quick checks
+        if func_a.params.len() != func_b.params.len() {
+            return false;
+        }
+        
+        if func_a.blocks.len() != func_b.blocks.len() {
+            return false;
+        }
+        
+        // Detailed comparison would normalize variable names and compare
+        true // Simplified
+    }
+    
+    fn merge_functions(&self, module: &mut MirModule, keep: u32, remove: u32) {
+        let keep_name = module.functions[keep as usize].name.clone();
+        let remove_name = module.functions[remove as usize].name.clone();
+        
+        // Replace all references to 'remove' with 'keep'
+        for func in &mut module.functions {
+            for block in &mut func.blocks {
+                for stmt in &mut block.statements {
+                    if let MirStatement::Call { callee, .. } = stmt {
+                        if callee == &remove_name {
+                            *callee = keep_name.clone();
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Mark removed function as deleted (would actually remove)
+        module.functions[remove as usize].blocks.clear();
+    }
+}
+
+impl Default for FunctionMerging {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PARTIAL INLINING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Partial inlining pass (inline hot paths only)
+pub struct PartialInlining {
+    call_graph: Arc<CallGraph>,
+    /// Minimum benefit to inline
+    min_benefit: u32,
+    /// Maximum code growth percentage
+    max_growth: f32,
+}
+
+impl PartialInlining {
+    pub fn new(call_graph: Arc<CallGraph>) -> Self {
+        PartialInlining {
+            call_graph,
+            min_benefit: 10,
+            max_growth: 15.0,
+        }
+    }
+    
+    /// Run partial inlining
+    pub fn run(&mut self, module: &mut MirModule) {
+        // Find candidates for partial inlining
+        let candidates: Vec<_> = module.functions.iter()
+            .filter_map(|f| self.is_partial_inline_candidate(f))
+            .collect();
+        
+        for candidate in candidates {
+            self.partially_inline(&candidate, module);
+        }
+    }
+    
+    fn is_partial_inline_candidate(&self, func: &MirFunction) -> Option<PartialInlineCandidate> {
+        // Look for functions with early returns that guard expensive code
+        if func.blocks.len() < 2 {
+            return None;
+        }
+        
+        // Check for early return pattern
+        let entry = &func.blocks[0];
+        
+        if let MirTerminator::If { then_bb, else_bb, .. } = &entry.terminator {
+            // Check if one branch leads to return
+            let then_returns = self.leads_to_return(*then_bb, func);
+            let else_returns = self.leads_to_return(*else_bb, func);
+            
+            if then_returns && !else_returns {
+                return Some(PartialInlineCandidate {
+                    func_name: func.name.clone(),
+                    inline_region: InlineRegion::Prefix(*then_bb),
+                    benefit: 20,
+                });
+            } else if else_returns && !then_returns {
+                return Some(PartialInlineCandidate {
+                    func_name: func.name.clone(),
+                    inline_region: InlineRegion::Prefix(*else_bb),
+                    benefit: 20,
+                });
+            }
+        }
+        
+        None
+    }
+    
+    fn leads_to_return(&self, block_id: u32, func: &MirFunction) -> bool {
+        if let Some(block) = func.blocks.iter().find(|b| b.id == block_id) {
+            matches!(&block.terminator, MirTerminator::Return { .. })
+        } else {
+            false
+        }
+    }
+    
+    fn partially_inline(&self, candidate: &PartialInlineCandidate, module: &mut MirModule) {
+        // Would extract the hot path and inline just that part
+        // creating a thunk for the cold path
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PartialInlineCandidate {
+    func_name: String,
+    inline_region: InlineRegion,
+    benefit: u32,
+}
+
+#[derive(Debug, Clone)]
+enum InlineRegion {
+    Prefix(u32), // Blocks up to this one
+    Suffix(u32), // Blocks from this one
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirModule {
+    pub functions: Vec<MirFunction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub params: Vec<String>,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Nop,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Return { value: Option<MirOperand> },
+    Goto(u32),
+    If { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Unreachable,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+}
+
+impl MirOperand {
+    pub fn is_var(&self, name: &str) -> bool {
+        matches!(self, MirOperand::Variable(n) if n == name)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add, Sub, Mul, Div,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_call_graph_construction() {
+        let mut cg = CallGraph::new();
+        
+        let main = cg.add_node("main", false);
+        let foo = cg.add_node("foo", false);
+        let bar = cg.add_node("bar", false);
+        
+        cg.add_edge(main, foo, 0, false);
+        cg.add_edge(main, bar, 1, false);
+        cg.add_edge(foo, bar, 0, false);
+        
+        assert_eq!(cg.node(main).callees.len(), 2);
+        assert_eq!(cg.node(bar).callers.len(), 2);
+    }
+    
+    #[test]
+    fn test_scc_computation() {
+        let mut cg = CallGraph::new();
+        
+        let a = cg.add_node("a", false);
+        let b = cg.add_node("b", false);
+        let c = cg.add_node("c", false);
+        
+        // Create cycle: a -> b -> c -> a
+        cg.add_edge(a, b, 0, false);
+        cg.add_edge(b, c, 0, false);
+        cg.add_edge(c, a, 0, false);
+        
+        let sccs = cg.compute_sccs();
+        
+        // All three should be in one SCC
+        assert!(sccs.iter().any(|scc| scc.len() == 3));
+    }
+    
+    #[test]
+    fn test_const_value_meet() {
+        let a = ConstValue::Constant(42);
+        let b = ConstValue::Constant(42);
+        let c = ConstValue::Constant(10);
+        
+        assert_eq!(a.meet(&b), ConstValue::Constant(42));
+        assert_eq!(a.meet(&c), ConstValue::Bottom);
+        assert_eq!(ConstValue::Top.meet(&a), ConstValue::Constant(42));
+    }
+    
+    #[test]
+    fn test_recursive_detection() {
+        let mut cg = CallGraph::new();
+        
+        let main = cg.add_node("main", false);
+        let factorial = cg.add_node("factorial", false);
+        
+        cg.add_edge(main, factorial, 0, false);
+        cg.add_edge(factorial, factorial, 0, false); // Self-recursive
+        
+        assert!(!cg.is_recursive(main));
+        assert!(cg.is_recursive(factorial));
+    }
+}

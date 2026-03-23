@@ -1,0 +1,1165 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ LANGUAGE SERVER PROTOCOL — Server Implementation
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Main LSP server implementation with request/notification handlers.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::lsp::server
+
+use std::io::{self, Read, Write, stdin, stdout};
+use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+
+use crate::lsp::protocol::*;
+use crate::lsp::types::*;
+use crate::lsp::documents::*;
+use crate::lsp::analysis::*;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SERVER STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Server initialization state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerState {
+    Uninitialized,
+    Initializing,
+    Initialized,
+    ShuttingDown,
+}
+
+/// Server capabilities
+#[derive(Debug, Clone)]
+pub struct ServerCapabilities {
+    pub text_document_sync: TextDocumentSyncKind,
+    pub completion_provider: bool,
+    pub hover_provider: bool,
+    pub signature_help_provider: bool,
+    pub definition_provider: bool,
+    pub references_provider: bool,
+    pub document_symbol_provider: bool,
+    pub workspace_symbol_provider: bool,
+    pub code_action_provider: bool,
+    pub rename_provider: bool,
+    pub formatting_provider: bool,
+    pub semantic_tokens_provider: bool,
+}
+
+impl Default for ServerCapabilities {
+    fn default() -> Self {
+        ServerCapabilities {
+            text_document_sync: TextDocumentSyncKind::Incremental,
+            completion_provider: true,
+            hover_provider: true,
+            signature_help_provider: true,
+            definition_provider: true,
+            references_provider: true,
+            document_symbol_provider: true,
+            workspace_symbol_provider: true,
+            code_action_provider: true,
+            rename_provider: true,
+            formatting_provider: true,
+            semantic_tokens_provider: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TextDocumentSyncKind {
+    None = 0,
+    Full = 1,
+    Incremental = 2,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LANGUAGE SERVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The QuantaLang Language Server
+pub struct LanguageServer<R: Read, W: Write> {
+    /// Transport layer
+    transport: Transport<R, W>,
+    /// Server state
+    state: ServerState,
+    /// Server capabilities
+    capabilities: ServerCapabilities,
+    /// Document manager
+    documents: Arc<DocumentManager>,
+    /// Analysis cache
+    cache: Arc<AnalysisCache>,
+    /// Analysis engine
+    analysis: AnalysisEngine,
+    /// Client capabilities
+    client_capabilities: Option<ClientCapabilities>,
+    /// Workspace root
+    workspace_root: Option<String>,
+}
+
+/// Client capabilities (simplified)
+#[derive(Debug, Clone, Default)]
+pub struct ClientCapabilities {
+    pub supports_dynamic_registration: bool,
+    pub supports_workspace_edit: bool,
+    pub supports_snippet: bool,
+    pub supports_markdown: bool,
+    pub supports_code_action_literals: bool,
+    pub supports_hierarchical_symbols: bool,
+}
+
+impl<R: Read, W: Write> LanguageServer<R, W> {
+    pub fn new(reader: R, writer: W) -> Self {
+        LanguageServer {
+            transport: Transport::new(reader, writer),
+            state: ServerState::Uninitialized,
+            capabilities: ServerCapabilities::default(),
+            documents: Arc::new(DocumentManager::new()),
+            cache: Arc::new(AnalysisCache::new()),
+            analysis: AnalysisEngine::new(),
+            client_capabilities: None,
+            workspace_root: None,
+        }
+    }
+    
+    /// Run the server main loop
+    pub fn run(&mut self) -> io::Result<()> {
+        loop {
+            let message = self.transport.read_message()?;
+            
+            match message {
+                Message::Request(req) => {
+                    self.handle_request(req)?;
+                }
+                Message::Notification(notif) => {
+                    if notif.method == "exit" {
+                        return Ok(());
+                    }
+                    self.handle_notification(notif)?;
+                }
+                Message::Response(_) => {
+                    // We don't send requests, so ignore responses
+                }
+            }
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REQUEST HANDLERS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn handle_request(&mut self, req: Request) -> io::Result<()> {
+        // Check state
+        if self.state == ServerState::Uninitialized && req.method != "initialize" {
+            return self.transport.send_error(
+                req.id,
+                SERVER_NOT_INITIALIZED,
+                "Server not initialized",
+            );
+        }
+        
+        match req.method.as_str() {
+            "initialize" => self.handle_initialize(req),
+            "shutdown" => self.handle_shutdown(req),
+            "textDocument/completion" => self.handle_completion(req),
+            "textDocument/hover" => self.handle_hover(req),
+            "textDocument/signatureHelp" => self.handle_signature_help(req),
+            "textDocument/definition" => self.handle_definition(req),
+            "textDocument/references" => self.handle_references(req),
+            "textDocument/documentSymbol" => self.handle_document_symbol(req),
+            "textDocument/codeAction" => self.handle_code_action(req),
+            "textDocument/rename" => self.handle_rename(req),
+            "textDocument/formatting" => self.handle_formatting(req),
+            "textDocument/semanticTokens/full" => self.handle_semantic_tokens(req),
+            "workspace/symbol" => self.handle_workspace_symbol(req),
+            _ => self.transport.send_error(
+                req.id,
+                METHOD_NOT_FOUND,
+                &format!("Method not found: {}", req.method),
+            ),
+        }
+    }
+    
+    fn handle_initialize(&mut self, req: Request) -> io::Result<()> {
+        self.state = ServerState::Initializing;
+        
+        // Parse client capabilities
+        if let Some(params) = &req.params {
+            self.client_capabilities = Some(self.parse_client_capabilities(params));
+            
+            if let Some(root) = params.get_str("rootUri") {
+                self.workspace_root = Some(root.to_string());
+            }
+        }
+        
+        // Build response
+        let result = self.build_initialize_result();
+        self.transport.send_response(req.id, result)?;
+        
+        self.state = ServerState::Initialized;
+        Ok(())
+    }
+    
+    fn parse_client_capabilities(&self, params: &JsonValue) -> ClientCapabilities {
+        let mut caps = ClientCapabilities::default();
+        
+        if let Some(client_caps) = params.get("capabilities") {
+            // Text document capabilities
+            if let Some(text_doc) = client_caps.get("textDocument") {
+                // Completion
+                if let Some(completion) = text_doc.get("completion") {
+                    if let Some(item) = completion.get("completionItem") {
+                        caps.supports_snippet = item.get_bool("snippetSupport").unwrap_or(false);
+                    }
+                }
+                
+                // Hover
+                if let Some(hover) = text_doc.get("hover") {
+                    if let Some(formats) = hover.get("contentFormat") {
+                        if let Some(arr) = formats.as_array() {
+                            caps.supports_markdown = arr.iter()
+                                .any(|v| v.as_str() == Some("markdown"));
+                        }
+                    }
+                }
+                
+                // Document symbols
+                if let Some(symbols) = text_doc.get("documentSymbol") {
+                    caps.supports_hierarchical_symbols = 
+                        symbols.get_bool("hierarchicalDocumentSymbolSupport").unwrap_or(false);
+                }
+            }
+            
+            // Workspace capabilities
+            if let Some(workspace) = client_caps.get("workspace") {
+                if let Some(edit) = workspace.get("workspaceEdit") {
+                    caps.supports_workspace_edit = 
+                        edit.get_bool("documentChanges").unwrap_or(false);
+                }
+            }
+        }
+        
+        caps
+    }
+    
+    fn build_initialize_result(&self) -> JsonValue {
+        let mut caps = HashMap::new();
+        
+        // Text document sync
+        caps.insert("textDocumentSync".to_string(), 
+            JsonValue::Number(self.capabilities.text_document_sync as u8 as f64));
+        
+        // Completion
+        if self.capabilities.completion_provider {
+            let mut completion = HashMap::new();
+            completion.insert("triggerCharacters".to_string(), 
+                JsonValue::Array(vec![
+                    JsonValue::String(".".to_string()),
+                    JsonValue::String(":".to_string()),
+                ]));
+            completion.insert("resolveProvider".to_string(), JsonValue::Bool(false));
+            caps.insert("completionProvider".to_string(), JsonValue::Object(completion));
+        }
+        
+        // Hover
+        if self.capabilities.hover_provider {
+            caps.insert("hoverProvider".to_string(), JsonValue::Bool(true));
+        }
+        
+        // Signature help
+        if self.capabilities.signature_help_provider {
+            let mut sig_help = HashMap::new();
+            sig_help.insert("triggerCharacters".to_string(),
+                JsonValue::Array(vec![
+                    JsonValue::String("(".to_string()),
+                    JsonValue::String(",".to_string()),
+                ]));
+            caps.insert("signatureHelpProvider".to_string(), JsonValue::Object(sig_help));
+        }
+        
+        // Definition
+        if self.capabilities.definition_provider {
+            caps.insert("definitionProvider".to_string(), JsonValue::Bool(true));
+        }
+        
+        // References
+        if self.capabilities.references_provider {
+            caps.insert("referencesProvider".to_string(), JsonValue::Bool(true));
+        }
+        
+        // Document symbol
+        if self.capabilities.document_symbol_provider {
+            caps.insert("documentSymbolProvider".to_string(), JsonValue::Bool(true));
+        }
+        
+        // Workspace symbol
+        if self.capabilities.workspace_symbol_provider {
+            caps.insert("workspaceSymbolProvider".to_string(), JsonValue::Bool(true));
+        }
+        
+        // Code action
+        if self.capabilities.code_action_provider {
+            caps.insert("codeActionProvider".to_string(), JsonValue::Bool(true));
+        }
+        
+        // Rename
+        if self.capabilities.rename_provider {
+            let mut rename = HashMap::new();
+            rename.insert("prepareProvider".to_string(), JsonValue::Bool(true));
+            caps.insert("renameProvider".to_string(), JsonValue::Object(rename));
+        }
+        
+        // Formatting
+        if self.capabilities.formatting_provider {
+            caps.insert("documentFormattingProvider".to_string(), JsonValue::Bool(true));
+        }
+        
+        // Semantic tokens
+        if self.capabilities.semantic_tokens_provider {
+            let mut semantic = HashMap::new();
+            let mut legend = HashMap::new();
+            
+            // Token types
+            let token_types = vec![
+                "namespace", "type", "class", "enum", "interface", "struct",
+                "typeParameter", "parameter", "variable", "property", "enumMember",
+                "event", "function", "method", "macro", "keyword", "modifier",
+                "comment", "string", "number", "regexp", "operator",
+            ];
+            legend.insert("tokenTypes".to_string(),
+                JsonValue::Array(token_types.into_iter().map(|s| JsonValue::String(s.to_string())).collect()));
+            
+            // Token modifiers
+            let token_modifiers = vec![
+                "declaration", "definition", "readonly", "static", "deprecated",
+                "abstract", "async", "modification", "documentation", "defaultLibrary",
+            ];
+            legend.insert("tokenModifiers".to_string(),
+                JsonValue::Array(token_modifiers.into_iter().map(|s| JsonValue::String(s.to_string())).collect()));
+            
+            semantic.insert("legend".to_string(), JsonValue::Object(legend));
+            semantic.insert("full".to_string(), JsonValue::Bool(true));
+            caps.insert("semanticTokensProvider".to_string(), JsonValue::Object(semantic));
+        }
+        
+        // Build result
+        let mut result = HashMap::new();
+        result.insert("capabilities".to_string(), JsonValue::Object(caps));
+        
+        let mut server_info = HashMap::new();
+        server_info.insert("name".to_string(), JsonValue::String("quantalang-lsp".to_string()));
+        server_info.insert("version".to_string(), JsonValue::String("1.0.0".to_string()));
+        result.insert("serverInfo".to_string(), JsonValue::Object(server_info));
+        
+        JsonValue::Object(result)
+    }
+    
+    fn handle_shutdown(&mut self, req: Request) -> io::Result<()> {
+        self.state = ServerState::ShuttingDown;
+        self.transport.send_response(req.id, JsonValue::Null)
+    }
+    
+    fn handle_completion(&mut self, req: Request) -> io::Result<()> {
+        let params = req.params.as_ref();
+        
+        let uri = params.and_then(|p| p.get("textDocument"))
+            .and_then(|td| td.get_str("uri"));
+        let position = params.and_then(|p| p.get("position"))
+            .and_then(Position::from_json);
+        
+        let (uri, position) = match (uri, position) {
+            (Some(u), Some(p)) => (u, p),
+            _ => return self.transport.send_error(req.id, INVALID_PARAMS, "Invalid params"),
+        };
+        
+        let doc = match self.documents.get(uri) {
+            Some(d) => d,
+            None => return self.transport.send_response(req.id, JsonValue::Null),
+        };
+        
+        // Get type info from cache
+        let cache = self.cache.get(uri, doc.version);
+        let type_info = cache.as_ref().and_then(|c| c.types.as_ref()).map(|t| t.as_ref());
+        
+        let completions = self.analysis.complete(&doc, position, type_info);
+        self.transport.send_response(req.id, completions.to_json())
+    }
+    
+    fn handle_hover(&mut self, req: Request) -> io::Result<()> {
+        let params = req.params.as_ref();
+        
+        let uri = params.and_then(|p| p.get("textDocument"))
+            .and_then(|td| td.get_str("uri"));
+        let position = params.and_then(|p| p.get("position"))
+            .and_then(Position::from_json);
+        
+        let (uri, position) = match (uri, position) {
+            (Some(u), Some(p)) => (u, p),
+            _ => return self.transport.send_error(req.id, INVALID_PARAMS, "Invalid params"),
+        };
+        
+        let doc = match self.documents.get(uri) {
+            Some(d) => d,
+            None => return self.transport.send_response(req.id, JsonValue::Null),
+        };
+        
+        let cache = self.cache.get(uri, doc.version);
+        let type_info = cache.as_ref().and_then(|c| c.types.as_ref()).map(|t| t.as_ref());
+        
+        match self.analysis.hover(&doc, position, type_info) {
+            Some(hover) => self.transport.send_response(req.id, hover.to_json()),
+            None => self.transport.send_response(req.id, JsonValue::Null),
+        }
+    }
+    
+    fn handle_signature_help(&mut self, req: Request) -> io::Result<()> {
+        let params = req.params.as_ref();
+        
+        let uri = params.and_then(|p| p.get("textDocument"))
+            .and_then(|td| td.get_str("uri"));
+        let position = params.and_then(|p| p.get("position"))
+            .and_then(Position::from_json);
+        
+        let (uri, position) = match (uri, position) {
+            (Some(u), Some(p)) => (u, p),
+            _ => return self.transport.send_error(req.id, INVALID_PARAMS, "Invalid params"),
+        };
+        
+        let doc = match self.documents.get(uri) {
+            Some(d) => d,
+            None => return self.transport.send_response(req.id, JsonValue::Null),
+        };
+        
+        let cache = self.cache.get(uri, doc.version);
+        let type_info = cache.as_ref().and_then(|c| c.types.as_ref()).map(|t| t.as_ref());
+        
+        match self.analysis.signature_help(&doc, position, type_info) {
+            Some(help) => self.transport.send_response(req.id, help.to_json()),
+            None => self.transport.send_response(req.id, JsonValue::Null),
+        }
+    }
+    
+    fn handle_definition(&mut self, req: Request) -> io::Result<()> {
+        let params = req.params.as_ref();
+        
+        let uri = params.and_then(|p| p.get("textDocument"))
+            .and_then(|td| td.get_str("uri"));
+        let position = params.and_then(|p| p.get("position"))
+            .and_then(Position::from_json);
+        
+        let (uri, position) = match (uri, position) {
+            (Some(u), Some(p)) => (u, p),
+            _ => return self.transport.send_error(req.id, INVALID_PARAMS, "Invalid params"),
+        };
+        
+        let doc = match self.documents.get(uri) {
+            Some(d) => d,
+            None => return self.transport.send_response(req.id, JsonValue::Null),
+        };
+        
+        let cache = self.cache.get(uri, doc.version);
+        let type_info = cache.as_ref().and_then(|c| c.types.as_ref()).map(|t| t.as_ref());
+        
+        match self.analysis.goto_definition(&doc, position, type_info) {
+            Some(location) => self.transport.send_response(req.id, location.to_json()),
+            None => self.transport.send_response(req.id, JsonValue::Null),
+        }
+    }
+    
+    fn handle_references(&mut self, req: Request) -> io::Result<()> {
+        let params = req.params.as_ref();
+        
+        let uri = params.and_then(|p| p.get("textDocument"))
+            .and_then(|td| td.get_str("uri"));
+        let position = params.and_then(|p| p.get("position"))
+            .and_then(Position::from_json);
+        let include_declaration = params
+            .and_then(|p| p.get("context"))
+            .and_then(|c| c.get_bool("includeDeclaration"))
+            .unwrap_or(true);
+        
+        let (uri, position) = match (uri, position) {
+            (Some(u), Some(p)) => (u, p),
+            _ => return self.transport.send_error(req.id, INVALID_PARAMS, "Invalid params"),
+        };
+        
+        let doc = match self.documents.get(uri) {
+            Some(d) => d,
+            None => return self.transport.send_response(req.id, JsonValue::Array(vec![])),
+        };
+        
+        let cache = self.cache.get(uri, doc.version);
+        let type_info = cache.as_ref().and_then(|c| c.types.as_ref()).map(|t| t.as_ref());
+        
+        let refs = self.analysis.find_references(&doc, position, type_info, include_declaration);
+        let json_refs: Vec<JsonValue> = refs.iter().map(|r| r.to_json()).collect();
+        
+        self.transport.send_response(req.id, JsonValue::Array(json_refs))
+    }
+    
+    fn handle_document_symbol(&mut self, req: Request) -> io::Result<()> {
+        let params = req.params.as_ref();
+        
+        let uri = params.and_then(|p| p.get("textDocument"))
+            .and_then(|td| td.get_str("uri"));
+        
+        let uri = match uri {
+            Some(u) => u,
+            _ => return self.transport.send_error(req.id, INVALID_PARAMS, "Invalid params"),
+        };
+        
+        let doc = match self.documents.get(uri) {
+            Some(d) => d,
+            None => return self.transport.send_response(req.id, JsonValue::Array(vec![])),
+        };
+        
+        let cache = self.cache.get(uri, doc.version);
+        let type_info = cache.as_ref().and_then(|c| c.types.as_ref()).map(|t| t.as_ref());
+        
+        let symbols = self.analysis.document_symbols(&doc, type_info);
+        let json_symbols: Vec<JsonValue> = symbols.iter().map(|s| s.to_json()).collect();
+        
+        self.transport.send_response(req.id, JsonValue::Array(json_symbols))
+    }
+    
+    fn handle_code_action(&mut self, req: Request) -> io::Result<()> {
+        let params = req.params.as_ref();
+        
+        let uri = params.and_then(|p| p.get("textDocument"))
+            .and_then(|td| td.get_str("uri"));
+        let range = params.and_then(|p| p.get("range"))
+            .and_then(Range::from_json);
+        
+        let (uri, range) = match (uri, range) {
+            (Some(u), Some(r)) => (u, r),
+            _ => return self.transport.send_error(req.id, INVALID_PARAMS, "Invalid params"),
+        };
+        
+        let doc = match self.documents.get(uri) {
+            Some(d) => d,
+            None => return self.transport.send_response(req.id, JsonValue::Array(vec![])),
+        };
+        
+        // Get diagnostics for this range
+        let cache = self.cache.get(uri, doc.version);
+        let diagnostics = cache.map(|c| c.diagnostics).unwrap_or_default();
+        
+        let mut actions = Vec::new();
+        
+        // Generate quick fixes for diagnostics in range
+        for diag in diagnostics.iter().filter(|d| ranges_overlap(d.range, range)) {
+            if let Some(action) = self.generate_quick_fix(&doc, diag) {
+                actions.push(action.to_json());
+            }
+        }
+        
+        self.transport.send_response(req.id, JsonValue::Array(actions))
+    }
+    
+    fn generate_quick_fix(&self, doc: &Document, diag: &Diagnostic) -> Option<CodeAction> {
+        // Simple quick fixes based on error messages
+        let message = &diag.message;
+        
+        // Missing semicolon
+        if message.contains("missing semicolon") {
+            let mut edit = WorkspaceEdit::new();
+            edit.add_edit(
+                doc.uri.clone(),
+                TextEdit::insert(diag.range.end, ";".to_string()),
+            );
+            return Some(CodeAction::quick_fix("Add missing semicolon".to_string(), edit));
+        }
+        
+        // Unused variable
+        if message.contains("unused variable") {
+            if let Some(var_name) = extract_identifier(message) {
+                let mut edit = WorkspaceEdit::new();
+                edit.add_edit(
+                    doc.uri.clone(),
+                    TextEdit::new(
+                        diag.range,
+                        format!("_{}", var_name),
+                    ),
+                );
+                return Some(CodeAction::quick_fix(
+                    format!("Prefix {} with underscore", var_name),
+                    edit,
+                ));
+            }
+        }
+        
+        // Missing import
+        if message.contains("not found in this scope") {
+            if let Some(name) = extract_identifier(message) {
+                // Try to suggest common imports
+                if let Some(path) = suggest_import(name) {
+                    let mut edit = WorkspaceEdit::new();
+                    edit.add_edit(
+                        doc.uri.clone(),
+                        TextEdit::insert(
+                            Position::new(0, 0),
+                            format!("use {};\n", path),
+                        ),
+                    );
+                    return Some(CodeAction::quick_fix(
+                        format!("Import {}", path),
+                        edit,
+                    ));
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn handle_rename(&mut self, req: Request) -> io::Result<()> {
+        let params = req.params.as_ref();
+        
+        let uri = params.and_then(|p| p.get("textDocument"))
+            .and_then(|td| td.get_str("uri"));
+        let position = params.and_then(|p| p.get("position"))
+            .and_then(Position::from_json);
+        let new_name = params.and_then(|p| p.get_str("newName"));
+        
+        let (uri, position, new_name) = match (uri, position, new_name) {
+            (Some(u), Some(p), Some(n)) => (u, p, n),
+            _ => return self.transport.send_error(req.id, INVALID_PARAMS, "Invalid params"),
+        };
+        
+        let doc = match self.documents.get(uri) {
+            Some(d) => d,
+            None => return self.transport.send_response(req.id, JsonValue::Null),
+        };
+        
+        let cache = self.cache.get(uri, doc.version);
+        let type_info = cache.as_ref().and_then(|c| c.types.as_ref()).map(|t| t.as_ref());
+        
+        // Find all references
+        let refs = self.analysis.find_references(&doc, position, type_info, true);
+        
+        if refs.is_empty() {
+            return self.transport.send_response(req.id, JsonValue::Null);
+        }
+        
+        // Build workspace edit
+        let mut edit = WorkspaceEdit::new();
+        for location in refs {
+            edit.add_edit(
+                location.uri,
+                TextEdit::new(location.range, new_name.to_string()),
+            );
+        }
+        
+        self.transport.send_response(req.id, edit.to_json())
+    }
+    
+    fn handle_formatting(&mut self, req: Request) -> io::Result<()> {
+        let params = req.params.as_ref();
+        
+        let uri = params.and_then(|p| p.get("textDocument"))
+            .and_then(|td| td.get_str("uri"));
+        
+        let uri = match uri {
+            Some(u) => u,
+            _ => return self.transport.send_error(req.id, INVALID_PARAMS, "Invalid params"),
+        };
+        
+        let doc = match self.documents.get(uri) {
+            Some(d) => d,
+            None => return self.transport.send_response(req.id, JsonValue::Array(vec![])),
+        };
+        
+        // Simple formatting: normalize indentation
+        let formatted = format_document(&doc.text);
+        
+        if formatted == doc.text {
+            return self.transport.send_response(req.id, JsonValue::Array(vec![]));
+        }
+        
+        let edit = TextEdit::new(
+            Range::new(Position::new(0, 0), doc.end_position()),
+            formatted,
+        );
+        
+        self.transport.send_response(req.id, JsonValue::Array(vec![edit.to_json()]))
+    }
+    
+    fn handle_semantic_tokens(&mut self, req: Request) -> io::Result<()> {
+        let params = req.params.as_ref();
+        
+        let uri = params.and_then(|p| p.get("textDocument"))
+            .and_then(|td| td.get_str("uri"));
+        
+        let uri = match uri {
+            Some(u) => u,
+            _ => return self.transport.send_error(req.id, INVALID_PARAMS, "Invalid params"),
+        };
+        
+        let doc = match self.documents.get(uri) {
+            Some(d) => d,
+            None => return self.transport.send_response(req.id, SemanticTokens::new().to_json()),
+        };
+        
+        let tokens = compute_semantic_tokens(&doc.text);
+        self.transport.send_response(req.id, tokens.to_json())
+    }
+    
+    fn handle_workspace_symbol(&mut self, req: Request) -> io::Result<()> {
+        let params = req.params.as_ref();
+        let query = params.and_then(|p| p.get_str("query")).unwrap_or("");
+        
+        let mut symbols = Vec::new();
+        
+        // Search all open documents
+        for uri in self.documents.uris() {
+            if let Some(doc) = self.documents.get(&uri) {
+                let cache = self.cache.get(&uri, doc.version);
+                let type_info = cache.as_ref().and_then(|c| c.types.as_ref()).map(|t| t.as_ref());
+                
+                let doc_symbols = self.analysis.document_symbols(&doc, type_info);
+                
+                // Filter by query
+                for sym in doc_symbols {
+                    if query.is_empty() || sym.name.contains(query) {
+                        symbols.push(sym.to_json());
+                    }
+                }
+            }
+        }
+        
+        self.transport.send_response(req.id, JsonValue::Array(symbols))
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // NOTIFICATION HANDLERS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn handle_notification(&mut self, notif: Notification) -> io::Result<()> {
+        match notif.method.as_str() {
+            "initialized" => {
+                // Client acknowledged initialization
+                Ok(())
+            }
+            "textDocument/didOpen" => self.handle_did_open(notif),
+            "textDocument/didChange" => self.handle_did_change(notif),
+            "textDocument/didClose" => self.handle_did_close(notif),
+            "textDocument/didSave" => self.handle_did_save(notif),
+            "$/cancelRequest" => {
+                // TODO: Implement request cancellation
+                Ok(())
+            }
+            _ => Ok(()), // Ignore unknown notifications
+        }
+    }
+    
+    fn handle_did_open(&mut self, notif: Notification) -> io::Result<()> {
+        let params = match notif.params {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        
+        let text_doc = match params.get("textDocument") {
+            Some(td) => td,
+            None => return Ok(()),
+        };
+        
+        let uri = text_doc.get_str("uri").unwrap_or("").to_string();
+        let language_id = text_doc.get_str("languageId").unwrap_or("quanta").to_string();
+        let version = text_doc.get_i64("version").unwrap_or(0) as i32;
+        let text = text_doc.get_str("text").unwrap_or("").to_string();
+        
+        self.documents.open(uri.clone(), language_id, version, text);
+        
+        // Analyze and publish diagnostics
+        self.analyze_document(&uri)?;
+        
+        Ok(())
+    }
+    
+    fn handle_did_change(&mut self, notif: Notification) -> io::Result<()> {
+        let params = match notif.params {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        
+        let text_doc = match params.get("textDocument") {
+            Some(td) => td,
+            None => return Ok(()),
+        };
+        
+        let uri = text_doc.get_str("uri").unwrap_or("");
+        let version = text_doc.get_i64("version").unwrap_or(0) as i32;
+        
+        let changes: Vec<TextDocumentContentChange> = params
+            .get("contentChanges")
+            .and_then(|c| c.as_array())
+            .map(|arr| arr.iter().filter_map(TextDocumentContentChange::from_json).collect())
+            .unwrap_or_default();
+        
+        self.documents.update(uri, version, changes);
+        
+        // Re-analyze
+        self.analyze_document(uri)?;
+        
+        Ok(())
+    }
+    
+    fn handle_did_close(&mut self, notif: Notification) -> io::Result<()> {
+        let params = match notif.params {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        
+        let uri = params.get("textDocument")
+            .and_then(|td| td.get_str("uri"))
+            .unwrap_or("");
+        
+        self.documents.close(uri);
+        self.cache.invalidate(uri);
+        
+        // Clear diagnostics
+        self.publish_diagnostics(uri, vec![])?;
+        
+        Ok(())
+    }
+    
+    fn handle_did_save(&mut self, notif: Notification) -> io::Result<()> {
+        let params = match notif.params {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        
+        let uri = params.get("textDocument")
+            .and_then(|td| td.get_str("uri"))
+            .unwrap_or("");
+        
+        // Full re-analysis on save
+        self.analyze_document(uri)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ANALYSIS
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    fn analyze_document(&mut self, uri: &str) -> io::Result<()> {
+        let doc = match self.documents.get(uri) {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        
+        // Parse and analyze
+        let diagnostics = analyze_source(&doc.text);
+        
+        // Update cache
+        let mut cache = self.cache.get_or_create(uri, doc.version);
+        cache.diagnostics = diagnostics.clone();
+        self.cache.update(uri, cache);
+        
+        // Publish diagnostics
+        self.publish_diagnostics(uri, diagnostics)
+    }
+    
+    fn publish_diagnostics(&mut self, uri: &str, diagnostics: Vec<Diagnostic>) -> io::Result<()> {
+        let mut params = HashMap::new();
+        params.insert("uri".to_string(), JsonValue::String(uri.to_string()));
+        
+        let diags: Vec<JsonValue> = diagnostics.iter().map(|d| d.to_json()).collect();
+        params.insert("diagnostics".to_string(), JsonValue::Array(diags));
+        
+        self.transport.send_notification("textDocument/publishDiagnostics", JsonValue::Object(params))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn ranges_overlap(a: Range, b: Range) -> bool {
+    !(a.end.line < b.start.line || 
+      (a.end.line == b.start.line && a.end.character < b.start.character) ||
+      b.end.line < a.start.line ||
+      (b.end.line == a.start.line && b.end.character < a.start.character))
+}
+
+fn extract_identifier(message: &str) -> Option<&str> {
+    // Extract identifier from error message like "variable `foo` is unused"
+    let start = message.find('`')? + 1;
+    let end = message[start..].find('`')? + start;
+    Some(&message[start..end])
+}
+
+fn suggest_import(name: &str) -> Option<&'static str> {
+    match name {
+        "HashMap" => Some("std::collections::HashMap"),
+        "HashSet" => Some("std::collections::HashSet"),
+        "BTreeMap" => Some("std::collections::BTreeMap"),
+        "BTreeSet" => Some("std::collections::BTreeSet"),
+        "VecDeque" => Some("std::collections::VecDeque"),
+        "Rc" => Some("std::rc::Rc"),
+        "Arc" => Some("std::sync::Arc"),
+        "Mutex" => Some("std::sync::Mutex"),
+        "RwLock" => Some("std::sync::RwLock"),
+        "Cell" => Some("std::cell::Cell"),
+        "RefCell" => Some("std::cell::RefCell"),
+        "File" => Some("std::fs::File"),
+        "Path" => Some("std::path::Path"),
+        "PathBuf" => Some("std::path::PathBuf"),
+        _ => None,
+    }
+}
+
+fn format_document(source: &str) -> String {
+    // Simple formatter: normalize indentation to 4 spaces
+    let mut result = String::new();
+    let mut indent_level = 0;
+    
+    for line in source.lines() {
+        let trimmed = line.trim();
+        
+        // Decrease indent before closing brace
+        if trimmed.starts_with('}') || trimmed.starts_with(')') || trimmed.starts_with(']') {
+            indent_level = indent_level.saturating_sub(1);
+        }
+        
+        // Add indentation
+        if !trimmed.is_empty() {
+            for _ in 0..indent_level {
+                result.push_str("    ");
+            }
+            result.push_str(trimmed);
+        }
+        result.push('\n');
+        
+        // Increase indent after opening brace
+        if trimmed.ends_with('{') || trimmed.ends_with('(') && !trimmed.contains(')') 
+           || trimmed.ends_with('[') && !trimmed.contains(']') {
+            indent_level += 1;
+        }
+    }
+    
+    result
+}
+
+fn analyze_source(source: &str) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    
+    // Simple syntax checks
+    let mut brace_count = 0i32;
+    let mut paren_count = 0i32;
+    let mut bracket_count = 0i32;
+    
+    for (line_num, line) in source.lines().enumerate() {
+        let line_num = line_num as u32;
+        
+        for (col, c) in line.char_indices() {
+            match c {
+                '{' => brace_count += 1,
+                '}' => {
+                    brace_count -= 1;
+                    if brace_count < 0 {
+                        diagnostics.push(Diagnostic::error(
+                            Range::new(
+                                Position::new(line_num, col as u32),
+                                Position::new(line_num, col as u32 + 1),
+                            ),
+                            "Unmatched closing brace".to_string(),
+                        ).with_code("E0001"));
+                        brace_count = 0;
+                    }
+                }
+                '(' => paren_count += 1,
+                ')' => {
+                    paren_count -= 1;
+                    if paren_count < 0 {
+                        diagnostics.push(Diagnostic::error(
+                            Range::new(
+                                Position::new(line_num, col as u32),
+                                Position::new(line_num, col as u32 + 1),
+                            ),
+                            "Unmatched closing parenthesis".to_string(),
+                        ).with_code("E0002"));
+                        paren_count = 0;
+                    }
+                }
+                '[' => bracket_count += 1,
+                ']' => {
+                    bracket_count -= 1;
+                    if bracket_count < 0 {
+                        diagnostics.push(Diagnostic::error(
+                            Range::new(
+                                Position::new(line_num, col as u32),
+                                Position::new(line_num, col as u32 + 1),
+                            ),
+                            "Unmatched closing bracket".to_string(),
+                        ).with_code("E0003"));
+                        bracket_count = 0;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    // Check for unclosed delimiters at end
+    let last_line = source.lines().count().saturating_sub(1) as u32;
+    let last_col = source.lines().last().map(|l| l.len()).unwrap_or(0) as u32;
+    let end_pos = Position::new(last_line, last_col);
+    
+    if brace_count > 0 {
+        diagnostics.push(Diagnostic::error(
+            Range::point(end_pos),
+            format!("{} unclosed brace(s)", brace_count),
+        ).with_code("E0004"));
+    }
+    
+    if paren_count > 0 {
+        diagnostics.push(Diagnostic::error(
+            Range::point(end_pos),
+            format!("{} unclosed parenthesis(es)", paren_count),
+        ).with_code("E0005"));
+    }
+    
+    if bracket_count > 0 {
+        diagnostics.push(Diagnostic::error(
+            Range::point(end_pos),
+            format!("{} unclosed bracket(s)", bracket_count),
+        ).with_code("E0006"));
+    }
+    
+    diagnostics
+}
+
+fn compute_semantic_tokens(source: &str) -> SemanticTokens {
+    let mut tokens = SemanticTokens::new();
+    let mut prev_line = 0u32;
+    let mut prev_char = 0u32;
+    
+    // Simple tokenization for semantic highlighting
+    let keywords = [
+        "fn", "let", "mut", "const", "static", "struct", "enum", "trait",
+        "impl", "pub", "use", "mod", "if", "else", "match", "for", "while",
+        "loop", "return", "break", "continue", "self", "Self", "async",
+        "await", "unsafe", "where", "in", "as", "ref", "move", "dyn",
+        "extern", "crate", "super", "type",
+    ];
+    
+    for (line_num, line) in source.lines().enumerate() {
+        let line_num = line_num as u32;
+        let mut col = 0usize;
+        
+        while col < line.len() {
+            let rest = &line[col..];
+            
+            // Skip whitespace
+            if rest.starts_with(char::is_whitespace) {
+                col += 1;
+                continue;
+            }
+            
+            // Comments
+            if rest.starts_with("//") {
+                let delta_line = line_num - prev_line;
+                let delta_char = if delta_line == 0 { col as u32 - prev_char } else { col as u32 };
+                tokens.push(delta_line, delta_char, (line.len() - col) as u32,
+                           SemanticTokenType::Comment, 0);
+                prev_line = line_num;
+                prev_char = col as u32;
+                break;
+            }
+            
+            // String literals
+            if rest.starts_with('"') {
+                let end = rest[1..].find('"').map(|i| i + 2).unwrap_or(rest.len());
+                let delta_line = line_num - prev_line;
+                let delta_char = if delta_line == 0 { col as u32 - prev_char } else { col as u32 };
+                tokens.push(delta_line, delta_char, end as u32,
+                           SemanticTokenType::String, 0);
+                prev_line = line_num;
+                prev_char = col as u32;
+                col += end;
+                continue;
+            }
+            
+            // Numbers
+            if rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+                    .unwrap_or(rest.len());
+                let delta_line = line_num - prev_line;
+                let delta_char = if delta_line == 0 { col as u32 - prev_char } else { col as u32 };
+                tokens.push(delta_line, delta_char, end as u32,
+                           SemanticTokenType::Number, 0);
+                prev_line = line_num;
+                prev_char = col as u32;
+                col += end;
+                continue;
+            }
+            
+            // Identifiers and keywords
+            if rest.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) {
+                let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                let word = &rest[..end];
+                
+                let token_type = if keywords.contains(&word) {
+                    SemanticTokenType::Keyword
+                } else if word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    SemanticTokenType::Type
+                } else {
+                    // Check if it's a function call
+                    if rest[end..].trim_start().starts_with('(') {
+                        SemanticTokenType::Function
+                    } else {
+                        SemanticTokenType::Variable
+                    }
+                };
+                
+                let delta_line = line_num - prev_line;
+                let delta_char = if delta_line == 0 { col as u32 - prev_char } else { col as u32 };
+                tokens.push(delta_line, delta_char, end as u32, token_type, 0);
+                prev_line = line_num;
+                prev_char = col as u32;
+                col += end;
+                continue;
+            }
+            
+            // Operators
+            if "+-*/%&|^!<>=".contains(rest.chars().next().unwrap_or(' ')) {
+                let end = rest.find(|c: char| !"+-*/%&|^!<>=".contains(c))
+                    .unwrap_or(rest.len());
+                let delta_line = line_num - prev_line;
+                let delta_char = if delta_line == 0 { col as u32 - prev_char } else { col as u32 };
+                tokens.push(delta_line, delta_char, end as u32,
+                           SemanticTokenType::Operator, 0);
+                prev_line = line_num;
+                prev_char = col as u32;
+                col += end;
+                continue;
+            }
+            
+            // Skip other characters
+            col += 1;
+        }
+    }
+    
+    tokens
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub fn main() {
+    let stdin = stdin();
+    let stdout = stdout();
+    
+    let mut server = LanguageServer::new(stdin.lock(), stdout.lock());
+    
+    if let Err(e) = server.run() {
+        eprintln!("Server error: {}", e);
+        std::process::exit(1);
+    }
+}

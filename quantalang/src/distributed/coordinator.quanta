@@ -1,0 +1,995 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DISTRIBUTED — Build Farm Coordinator
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Distributed compilation infrastructure:
+// - Build farm coordination
+// - Work distribution and load balancing
+// - Remote artifact caching
+// - Fault tolerance and recovery
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::distributed::coordinator
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::sync::Arc;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::net::{SocketAddr, TcpStream, TcpListener};
+use std::sync::{RwLock, Mutex, Condvar};
+use std::time::{SystemTime, Duration, Instant};
+use std::path::PathBuf;
+use std::thread;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WORKER NODE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unique worker identifier
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WorkerId(pub String);
+
+impl WorkerId {
+    pub fn new(id: impl Into<String>) -> Self {
+        WorkerId(id.into())
+    }
+    
+    pub fn generate() -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        WorkerId(format!("worker-{:016x}", nanos))
+    }
+}
+
+impl std::fmt::Display for WorkerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Worker node information
+#[derive(Debug, Clone)]
+pub struct WorkerInfo {
+    /// Worker ID
+    pub id: WorkerId,
+    
+    /// Network address
+    pub address: SocketAddr,
+    
+    /// Worker capabilities
+    pub capabilities: WorkerCapabilities,
+    
+    /// Current status
+    pub status: WorkerStatus,
+    
+    /// Current load (0.0 - 1.0)
+    pub load: f64,
+    
+    /// Active jobs
+    pub active_jobs: usize,
+    
+    /// Jobs completed
+    pub jobs_completed: u64,
+    
+    /// Last heartbeat
+    pub last_heartbeat: SystemTime,
+    
+    /// Registration time
+    pub registered_at: SystemTime,
+}
+
+/// Worker capabilities
+#[derive(Debug, Clone)]
+pub struct WorkerCapabilities {
+    /// Number of CPU cores
+    pub cores: u32,
+    
+    /// Available memory (bytes)
+    pub memory: u64,
+    
+    /// Available disk (bytes)
+    pub disk: u64,
+    
+    /// Supported targets
+    pub targets: Vec<String>,
+    
+    /// Has GPU
+    pub gpu: bool,
+    
+    /// Maximum concurrent jobs
+    pub max_jobs: u32,
+    
+    /// Features/extensions
+    pub features: BTreeSet<String>,
+}
+
+impl Default for WorkerCapabilities {
+    fn default() -> Self {
+        WorkerCapabilities {
+            cores: 4,
+            memory: 8 * 1024 * 1024 * 1024,
+            disk: 100 * 1024 * 1024 * 1024,
+            targets: vec!["x86_64-unknown-linux".to_string()],
+            gpu: false,
+            max_jobs: 4,
+            features: BTreeSet::new(),
+        }
+    }
+}
+
+/// Worker status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerStatus {
+    /// Ready to accept jobs
+    Idle,
+    /// Currently processing jobs
+    Busy,
+    /// Draining (finishing current jobs, not accepting new)
+    Draining,
+    /// Offline or unresponsive
+    Offline,
+    /// Error state
+    Error,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOB DEFINITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unique job identifier
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct JobId(pub String);
+
+impl JobId {
+    pub fn new(id: impl Into<String>) -> Self {
+        JobId(id.into())
+    }
+    
+    pub fn generate() -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        JobId(format!("job-{:016x}", nanos))
+    }
+}
+
+/// Compilation job
+#[derive(Debug, Clone)]
+pub struct CompilationJob {
+    /// Job ID
+    pub id: JobId,
+    
+    /// Source unit identifier
+    pub unit_id: String,
+    
+    /// Source content hash
+    pub source_hash: [u8; 32],
+    
+    /// Target triple
+    pub target: String,
+    
+    /// Optimization level
+    pub opt_level: OptLevel,
+    
+    /// Dependencies (other job IDs)
+    pub dependencies: Vec<JobId>,
+    
+    /// Priority (higher = more important)
+    pub priority: i32,
+    
+    /// Job requirements
+    pub requirements: JobRequirements,
+    
+    /// Created timestamp
+    pub created_at: SystemTime,
+    
+    /// Deadline (if any)
+    pub deadline: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptLevel {
+    O0, O1, O2, O3, Os, Oz,
+}
+
+/// Job requirements
+#[derive(Debug, Clone, Default)]
+pub struct JobRequirements {
+    /// Minimum memory
+    pub min_memory: Option<u64>,
+    
+    /// Required features
+    pub features: BTreeSet<String>,
+    
+    /// Requires GPU
+    pub gpu: bool,
+    
+    /// Estimated duration
+    pub estimated_duration: Option<Duration>,
+}
+
+/// Job status
+#[derive(Debug, Clone)]
+pub enum JobStatus {
+    /// Waiting for dependencies
+    Pending { blocked_by: Vec<JobId> },
+    /// Queued for execution
+    Queued,
+    /// Assigned to worker
+    Assigned { worker: WorkerId, assigned_at: SystemTime },
+    /// Currently executing
+    Running { worker: WorkerId, started_at: SystemTime, progress: f32 },
+    /// Completed successfully
+    Completed { worker: WorkerId, duration: Duration, artifacts: Vec<ArtifactRef> },
+    /// Failed
+    Failed { worker: Option<WorkerId>, error: String, retries: u32 },
+    /// Cancelled
+    Cancelled { reason: String },
+}
+
+/// Reference to compiled artifact
+#[derive(Debug, Clone)]
+pub struct ArtifactRef {
+    /// Artifact hash
+    pub hash: [u8; 32],
+    /// Artifact type
+    pub kind: ArtifactKind,
+    /// Size in bytes
+    pub size: u64,
+    /// Cache location
+    pub location: ArtifactLocation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactKind {
+    Object,
+    Metadata,
+    Mir,
+    Debug,
+}
+
+#[derive(Debug, Clone)]
+pub enum ArtifactLocation {
+    /// Cached on coordinator
+    Coordinator { path: PathBuf },
+    /// Cached on worker
+    Worker { worker: WorkerId, path: PathBuf },
+    /// In distributed cache
+    RemoteCache { url: String },
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCHEDULER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Job scheduler
+pub struct Scheduler {
+    /// Pending jobs
+    pending: Mutex<VecDeque<JobId>>,
+    
+    /// Ready queue (dependencies satisfied)
+    ready: Mutex<VecDeque<JobId>>,
+    
+    /// All jobs
+    jobs: RwLock<BTreeMap<JobId, (CompilationJob, JobStatus)>>,
+    
+    /// Scheduling policy
+    policy: SchedulingPolicy,
+    
+    /// Condition variable for new work
+    work_available: Condvar,
+}
+
+/// Scheduling policy
+#[derive(Debug, Clone)]
+pub struct SchedulingPolicy {
+    /// Priority weight
+    pub priority_weight: f64,
+    
+    /// Deadline weight
+    pub deadline_weight: f64,
+    
+    /// Locality weight (prefer workers with cached deps)
+    pub locality_weight: f64,
+    
+    /// Load balancing weight
+    pub load_weight: f64,
+    
+    /// Maximum retries
+    pub max_retries: u32,
+    
+    /// Retry delay
+    pub retry_delay: Duration,
+    
+    /// Job timeout
+    pub timeout: Duration,
+}
+
+impl Default for SchedulingPolicy {
+    fn default() -> Self {
+        SchedulingPolicy {
+            priority_weight: 1.0,
+            deadline_weight: 2.0,
+            locality_weight: 0.5,
+            load_weight: 1.0,
+            max_retries: 3,
+            retry_delay: Duration::from_secs(5),
+            timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+impl Scheduler {
+    pub fn new(policy: SchedulingPolicy) -> Self {
+        Scheduler {
+            pending: Mutex::new(VecDeque::new()),
+            ready: Mutex::new(VecDeque::new()),
+            jobs: RwLock::new(BTreeMap::new()),
+            policy,
+            work_available: Condvar::new(),
+        }
+    }
+    
+    /// Submit new job
+    pub fn submit(&self, job: CompilationJob) -> JobId {
+        let id = job.id.clone();
+        
+        // Determine initial status
+        let status = if job.dependencies.is_empty() {
+            JobStatus::Queued
+        } else {
+            JobStatus::Pending {
+                blocked_by: job.dependencies.clone(),
+            }
+        };
+        
+        {
+            let mut jobs = self.jobs.write().unwrap();
+            jobs.insert(id.clone(), (job, status.clone()));
+        }
+        
+        // Add to appropriate queue
+        match status {
+            JobStatus::Queued => {
+                let mut ready = self.ready.lock().unwrap();
+                ready.push_back(id.clone());
+                self.work_available.notify_one();
+            }
+            JobStatus::Pending { .. } => {
+                let mut pending = self.pending.lock().unwrap();
+                pending.push_back(id.clone());
+            }
+            _ => {}
+        }
+        
+        id
+    }
+    
+    /// Get next job for worker
+    pub fn next_job(&self, worker: &WorkerInfo) -> Option<CompilationJob> {
+        let mut ready = self.ready.lock().unwrap();
+        
+        // Find best matching job
+        let mut best_idx = None;
+        let mut best_score = f64::NEG_INFINITY;
+        
+        for (i, job_id) in ready.iter().enumerate() {
+            let jobs = self.jobs.read().unwrap();
+            if let Some((job, _)) = jobs.get(job_id) {
+                if self.can_run_on(job, worker) {
+                    let score = self.score_job(job, worker);
+                    if score > best_score {
+                        best_score = score;
+                        best_idx = Some(i);
+                    }
+                }
+            }
+        }
+        
+        if let Some(idx) = best_idx {
+            let job_id = ready.remove(idx).unwrap();
+            
+            // Update status
+            let mut jobs = self.jobs.write().unwrap();
+            if let Some((job, status)) = jobs.get_mut(&job_id) {
+                *status = JobStatus::Assigned {
+                    worker: worker.id.clone(),
+                    assigned_at: SystemTime::now(),
+                };
+                return Some(job.clone());
+            }
+        }
+        
+        None
+    }
+    
+    /// Wait for next job
+    pub fn wait_for_job(&self, worker: &WorkerInfo, timeout: Duration) -> Option<CompilationJob> {
+        let start = Instant::now();
+        
+        loop {
+            if let Some(job) = self.next_job(worker) {
+                return Some(job);
+            }
+            
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return None;
+            }
+            
+            let remaining = timeout - elapsed;
+            let ready = self.ready.lock().unwrap();
+            let _ = self.work_available.wait_timeout(ready, remaining);
+        }
+    }
+    
+    /// Mark job as completed
+    pub fn complete(&self, job_id: &JobId, artifacts: Vec<ArtifactRef>, duration: Duration) {
+        let worker = {
+            let jobs = self.jobs.read().unwrap();
+            match jobs.get(job_id) {
+                Some((_, JobStatus::Running { worker, .. })) |
+                Some((_, JobStatus::Assigned { worker, .. })) => Some(worker.clone()),
+                _ => None,
+            }
+        };
+        
+        if let Some(worker) = worker {
+            let mut jobs = self.jobs.write().unwrap();
+            if let Some((_, status)) = jobs.get_mut(job_id) {
+                *status = JobStatus::Completed {
+                    worker,
+                    duration,
+                    artifacts,
+                };
+            }
+        }
+        
+        // Unblock dependent jobs
+        self.unblock_dependents(job_id);
+    }
+    
+    /// Mark job as failed
+    pub fn fail(&self, job_id: &JobId, error: String) {
+        let (worker, retries) = {
+            let jobs = self.jobs.read().unwrap();
+            match jobs.get(job_id) {
+                Some((_, JobStatus::Failed { worker, retries, .. })) => {
+                    (worker.clone(), *retries + 1)
+                }
+                Some((_, JobStatus::Running { worker, .. })) => {
+                    (Some(worker.clone()), 1)
+                }
+                _ => (None, 1),
+            }
+        };
+        
+        let mut jobs = self.jobs.write().unwrap();
+        if let Some((job, status)) = jobs.get_mut(job_id) {
+            if retries <= self.policy.max_retries {
+                // Re-queue for retry
+                *status = JobStatus::Queued;
+                drop(jobs);
+                
+                let mut ready = self.ready.lock().unwrap();
+                ready.push_back(job_id.clone());
+                self.work_available.notify_one();
+            } else {
+                *status = JobStatus::Failed {
+                    worker,
+                    error,
+                    retries,
+                };
+            }
+        }
+    }
+    
+    /// Check if job can run on worker
+    fn can_run_on(&self, job: &CompilationJob, worker: &WorkerInfo) -> bool {
+        // Check target support
+        if !worker.capabilities.targets.contains(&job.target) {
+            return false;
+        }
+        
+        // Check GPU requirement
+        if job.requirements.gpu && !worker.capabilities.gpu {
+            return false;
+        }
+        
+        // Check memory
+        if let Some(min_mem) = job.requirements.min_memory {
+            if worker.capabilities.memory < min_mem {
+                return false;
+            }
+        }
+        
+        // Check features
+        for feature in &job.requirements.features {
+            if !worker.capabilities.features.contains(feature) {
+                return false;
+            }
+        }
+        
+        // Check load
+        if worker.active_jobs >= worker.capabilities.max_jobs as usize {
+            return false;
+        }
+        
+        true
+    }
+    
+    /// Score job for worker (higher = better match)
+    fn score_job(&self, job: &CompilationJob, worker: &WorkerInfo) -> f64 {
+        let mut score = 0.0;
+        
+        // Priority
+        score += job.priority as f64 * self.policy.priority_weight;
+        
+        // Deadline urgency
+        if let Some(deadline) = job.deadline {
+            if let Ok(remaining) = deadline.duration_since(SystemTime::now()) {
+                let urgency = 1.0 / (remaining.as_secs_f64() + 1.0);
+                score += urgency * self.policy.deadline_weight;
+            }
+        }
+        
+        // Load balancing (prefer less loaded workers)
+        score += (1.0 - worker.load) * self.policy.load_weight;
+        
+        score
+    }
+    
+    /// Unblock jobs waiting on completed job
+    fn unblock_dependents(&self, completed_id: &JobId) {
+        let mut to_ready = Vec::new();
+        
+        {
+            let mut jobs = self.jobs.write().unwrap();
+            let mut pending = self.pending.lock().unwrap();
+            
+            pending.retain(|job_id| {
+                if let Some((_, status)) = jobs.get_mut(job_id) {
+                    if let JobStatus::Pending { blocked_by } = status {
+                        blocked_by.retain(|dep| dep != completed_id);
+                        
+                        if blocked_by.is_empty() {
+                            *status = JobStatus::Queued;
+                            to_ready.push(job_id.clone());
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+        }
+        
+        // Move to ready queue
+        if !to_ready.is_empty() {
+            let mut ready = self.ready.lock().unwrap();
+            for id in to_ready {
+                ready.push_back(id);
+            }
+            self.work_available.notify_all();
+        }
+    }
+    
+    /// Get job status
+    pub fn status(&self, job_id: &JobId) -> Option<JobStatus> {
+        let jobs = self.jobs.read().unwrap();
+        jobs.get(job_id).map(|(_, s)| s.clone())
+    }
+    
+    /// Get all jobs count by status
+    pub fn stats(&self) -> SchedulerStats {
+        let jobs = self.jobs.read().unwrap();
+        
+        let mut stats = SchedulerStats::default();
+        
+        for (_, (_, status)) in jobs.iter() {
+            match status {
+                JobStatus::Pending { .. } => stats.pending += 1,
+                JobStatus::Queued => stats.queued += 1,
+                JobStatus::Assigned { .. } => stats.assigned += 1,
+                JobStatus::Running { .. } => stats.running += 1,
+                JobStatus::Completed { .. } => stats.completed += 1,
+                JobStatus::Failed { .. } => stats.failed += 1,
+                JobStatus::Cancelled { .. } => stats.cancelled += 1,
+            }
+        }
+        
+        stats
+    }
+}
+
+/// Scheduler statistics
+#[derive(Debug, Clone, Default)]
+pub struct SchedulerStats {
+    pub pending: usize,
+    pub queued: usize,
+    pub assigned: usize,
+    pub running: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COORDINATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Build farm coordinator
+pub struct Coordinator {
+    /// Configuration
+    config: CoordinatorConfig,
+    
+    /// Registered workers
+    workers: RwLock<BTreeMap<WorkerId, WorkerInfo>>,
+    
+    /// Job scheduler
+    scheduler: Arc<Scheduler>,
+    
+    /// Remote artifact cache
+    cache: Arc<RemoteCache>,
+    
+    /// Statistics
+    stats: RwLock<CoordinatorStats>,
+    
+    /// Running flag
+    running: RwLock<bool>,
+}
+
+/// Coordinator configuration
+#[derive(Debug, Clone)]
+pub struct CoordinatorConfig {
+    /// Listen address
+    pub listen_addr: SocketAddr,
+    
+    /// Worker heartbeat interval
+    pub heartbeat_interval: Duration,
+    
+    /// Worker timeout
+    pub worker_timeout: Duration,
+    
+    /// Maximum workers
+    pub max_workers: usize,
+    
+    /// Cache configuration
+    pub cache_url: Option<String>,
+    
+    /// Scheduling policy
+    pub scheduling: SchedulingPolicy,
+}
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        CoordinatorConfig {
+            listen_addr: "0.0.0.0:9876".parse().unwrap(),
+            heartbeat_interval: Duration::from_secs(5),
+            worker_timeout: Duration::from_secs(30),
+            max_workers: 1000,
+            cache_url: None,
+            scheduling: SchedulingPolicy::default(),
+        }
+    }
+}
+
+/// Coordinator statistics
+#[derive(Debug, Clone, Default)]
+pub struct CoordinatorStats {
+    pub total_jobs_submitted: u64,
+    pub total_jobs_completed: u64,
+    pub total_jobs_failed: u64,
+    pub total_workers_registered: u64,
+    pub current_workers: usize,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub uptime: Duration,
+}
+
+/// Remote artifact cache
+pub struct RemoteCache {
+    url: Option<String>,
+    local_cache: PathBuf,
+}
+
+impl RemoteCache {
+    pub fn new(url: Option<String>, local_path: PathBuf) -> Self {
+        RemoteCache {
+            url,
+            local_cache: local_path,
+        }
+    }
+    
+    /// Get artifact
+    pub fn get(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        // Try local cache first
+        let hex = hash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let path = self.local_cache.join(&hex);
+        
+        if path.exists() {
+            return std::fs::read(&path).ok();
+        }
+        
+        // Try remote
+        if let Some(_url) = &self.url {
+            // Would fetch from remote cache
+        }
+        
+        None
+    }
+    
+    /// Put artifact
+    pub fn put(&self, hash: [u8; 32], data: &[u8]) -> std::io::Result<()> {
+        let hex = hash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let path = self.local_cache.join(&hex);
+        
+        std::fs::create_dir_all(&self.local_cache)?;
+        std::fs::write(path, data)?;
+        
+        // Push to remote asynchronously
+        if let Some(_url) = &self.url {
+            // Would push to remote cache
+        }
+        
+        Ok(())
+    }
+}
+
+impl Coordinator {
+    /// Create new coordinator
+    pub fn new(config: CoordinatorConfig) -> std::io::Result<Self> {
+        let cache = RemoteCache::new(
+            config.cache_url.clone(),
+            PathBuf::from("/tmp/quanta-cache"),
+        );
+        
+        Ok(Coordinator {
+            scheduler: Arc::new(Scheduler::new(config.scheduling.clone())),
+            config,
+            workers: RwLock::new(BTreeMap::new()),
+            cache: Arc::new(cache),
+            stats: RwLock::new(CoordinatorStats::default()),
+            running: RwLock::new(false),
+        })
+    }
+    
+    /// Start coordinator
+    pub fn start(&self) -> std::io::Result<()> {
+        *self.running.write().unwrap() = true;
+        
+        // Start heartbeat checker
+        let workers = Arc::new(&self.workers);
+        let timeout = self.config.worker_timeout;
+        
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(5));
+                Self::check_heartbeats_static(&workers, timeout);
+            }
+        });
+        
+        Ok(())
+    }
+    
+    fn check_heartbeats_static(
+        workers: &RwLock<BTreeMap<WorkerId, WorkerInfo>>,
+        timeout: Duration,
+    ) {
+        let now = SystemTime::now();
+        let mut workers = workers.write().unwrap();
+        
+        for (_, worker) in workers.iter_mut() {
+            if let Ok(elapsed) = now.duration_since(worker.last_heartbeat) {
+                if elapsed > timeout {
+                    worker.status = WorkerStatus::Offline;
+                }
+            }
+        }
+    }
+    
+    /// Register worker
+    pub fn register_worker(&self, info: WorkerInfo) -> Result<(), CoordinatorError> {
+        let mut workers = self.workers.write().unwrap();
+        
+        if workers.len() >= self.config.max_workers {
+            return Err(CoordinatorError::TooManyWorkers);
+        }
+        
+        workers.insert(info.id.clone(), info);
+        
+        let mut stats = self.stats.write().unwrap();
+        stats.total_workers_registered += 1;
+        stats.current_workers = workers.len();
+        
+        Ok(())
+    }
+    
+    /// Unregister worker
+    pub fn unregister_worker(&self, id: &WorkerId) {
+        let mut workers = self.workers.write().unwrap();
+        workers.remove(id);
+        
+        let mut stats = self.stats.write().unwrap();
+        stats.current_workers = workers.len();
+    }
+    
+    /// Worker heartbeat
+    pub fn heartbeat(&self, id: &WorkerId, load: f64, active_jobs: usize) {
+        let mut workers = self.workers.write().unwrap();
+        
+        if let Some(worker) = workers.get_mut(id) {
+            worker.last_heartbeat = SystemTime::now();
+            worker.load = load;
+            worker.active_jobs = active_jobs;
+            
+            if worker.status == WorkerStatus::Offline {
+                worker.status = WorkerStatus::Idle;
+            }
+        }
+    }
+    
+    /// Submit compilation job
+    pub fn submit_job(&self, job: CompilationJob) -> JobId {
+        let id = self.scheduler.submit(job);
+        
+        let mut stats = self.stats.write().unwrap();
+        stats.total_jobs_submitted += 1;
+        
+        id
+    }
+    
+    /// Get job status
+    pub fn job_status(&self, id: &JobId) -> Option<JobStatus> {
+        self.scheduler.status(id)
+    }
+    
+    /// Get available workers
+    pub fn available_workers(&self) -> Vec<WorkerInfo> {
+        let workers = self.workers.read().unwrap();
+        workers.values()
+            .filter(|w| matches!(w.status, WorkerStatus::Idle | WorkerStatus::Busy))
+            .filter(|w| w.active_jobs < w.capabilities.max_jobs as usize)
+            .cloned()
+            .collect()
+    }
+    
+    /// Get statistics
+    pub fn stats(&self) -> CoordinatorStats {
+        self.stats.read().unwrap().clone()
+    }
+    
+    /// Get scheduler
+    pub fn scheduler(&self) -> &Arc<Scheduler> {
+        &self.scheduler
+    }
+}
+
+/// Coordinator error
+#[derive(Debug)]
+pub enum CoordinatorError {
+    TooManyWorkers,
+    WorkerNotFound(WorkerId),
+    JobNotFound(JobId),
+    NetworkError(String),
+    CacheError(String),
+}
+
+impl std::fmt::Display for CoordinatorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyWorkers => write!(f, "too many workers registered"),
+            Self::WorkerNotFound(id) => write!(f, "worker not found: {}", id),
+            Self::JobNotFound(id) => write!(f, "job not found: {:?}", id),
+            Self::NetworkError(m) => write!(f, "network error: {}", m),
+            Self::CacheError(m) => write!(f, "cache error: {}", m),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_worker_id() {
+        let id = WorkerId::generate();
+        assert!(id.0.starts_with("worker-"));
+    }
+    
+    #[test]
+    fn test_job_id() {
+        let id = JobId::generate();
+        assert!(id.0.starts_with("job-"));
+    }
+    
+    #[test]
+    fn test_scheduler_submit() {
+        let scheduler = Scheduler::new(SchedulingPolicy::default());
+        
+        let job = CompilationJob {
+            id: JobId::new("test-job"),
+            unit_id: "main".to_string(),
+            source_hash: [0; 32],
+            target: "x86_64-unknown-linux".to_string(),
+            opt_level: OptLevel::O2,
+            dependencies: vec![],
+            priority: 0,
+            requirements: JobRequirements::default(),
+            created_at: SystemTime::now(),
+            deadline: None,
+        };
+        
+        let id = scheduler.submit(job);
+        assert_eq!(id.0, "test-job");
+        
+        let status = scheduler.status(&id).unwrap();
+        assert!(matches!(status, JobStatus::Queued));
+    }
+    
+    #[test]
+    fn test_scheduler_dependencies() {
+        let scheduler = Scheduler::new(SchedulingPolicy::default());
+        
+        let dep_job = CompilationJob {
+            id: JobId::new("dep"),
+            unit_id: "dep".to_string(),
+            source_hash: [0; 32],
+            target: "x86_64-unknown-linux".to_string(),
+            opt_level: OptLevel::O2,
+            dependencies: vec![],
+            priority: 0,
+            requirements: JobRequirements::default(),
+            created_at: SystemTime::now(),
+            deadline: None,
+        };
+        
+        let main_job = CompilationJob {
+            id: JobId::new("main"),
+            unit_id: "main".to_string(),
+            source_hash: [0; 32],
+            target: "x86_64-unknown-linux".to_string(),
+            opt_level: OptLevel::O2,
+            dependencies: vec![JobId::new("dep")],
+            priority: 0,
+            requirements: JobRequirements::default(),
+            created_at: SystemTime::now(),
+            deadline: None,
+        };
+        
+        scheduler.submit(dep_job);
+        scheduler.submit(main_job);
+        
+        // Main should be pending
+        let status = scheduler.status(&JobId::new("main")).unwrap();
+        assert!(matches!(status, JobStatus::Pending { .. }));
+        
+        // Complete dep
+        scheduler.complete(&JobId::new("dep"), vec![], Duration::from_secs(1));
+        
+        // Main should now be queued
+        let status = scheduler.status(&JobId::new("main")).unwrap();
+        assert!(matches!(status, JobStatus::Queued));
+    }
+    
+    #[test]
+    fn test_worker_capabilities() {
+        let caps = WorkerCapabilities::default();
+        assert_eq!(caps.cores, 4);
+        assert!(caps.targets.contains(&"x86_64-unknown-linux".to_string()));
+    }
+}

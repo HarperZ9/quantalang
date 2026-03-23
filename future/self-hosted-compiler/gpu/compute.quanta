@@ -1,0 +1,1053 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ GPU — Compute Shader Compiler
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// GPU compute shader compilation and kernel management:
+// - MIR to SPIR-V lowering
+// - Workgroup configuration
+// - Shared memory management
+// - Barrier synchronization
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::gpu::compute
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::collections::BTreeMap;
+use std::sync::Arc;
+
+use super::spirv::{
+    SpirvBuilder, Instruction, Op, Capability, ExecutionModel, ExecutionMode,
+    AddressingModel, MemoryModel, StorageClass, Decoration, BuiltIn,
+    EntryPoint, Function, BasicBlock,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPUTE KERNEL DEFINITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// GPU compute kernel
+#[derive(Debug, Clone)]
+pub struct ComputeKernel {
+    /// Kernel name
+    pub name: String,
+    
+    /// Local workgroup size (x, y, z)
+    pub workgroup_size: WorkgroupSize,
+    
+    /// Shared memory declarations
+    pub shared_memory: Vec<SharedMemoryDecl>,
+    
+    /// Buffer bindings
+    pub buffers: Vec<BufferBinding>,
+    
+    /// Uniform bindings
+    pub uniforms: Vec<UniformBinding>,
+    
+    /// Push constants
+    pub push_constants: Option<PushConstantBlock>,
+    
+    /// Kernel body (MIR)
+    pub body: KernelBody,
+    
+    /// Required capabilities
+    pub capabilities: Vec<Capability>,
+    
+    /// Specialization constants
+    pub spec_constants: Vec<SpecConstant>,
+}
+
+/// Workgroup size configuration
+#[derive(Debug, Clone, Copy)]
+pub struct WorkgroupSize {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+impl WorkgroupSize {
+    pub fn new(x: u32, y: u32, z: u32) -> Self {
+        WorkgroupSize { x, y, z }
+    }
+    
+    pub fn flat(size: u32) -> Self {
+        WorkgroupSize { x: size, y: 1, z: 1 }
+    }
+    
+    pub fn square(size: u32) -> Self {
+        WorkgroupSize { x: size, y: size, z: 1 }
+    }
+    
+    pub fn total(&self) -> u32 {
+        self.x * self.y * self.z
+    }
+}
+
+impl Default for WorkgroupSize {
+    fn default() -> Self {
+        // 64 is a good default for most GPUs
+        WorkgroupSize { x: 64, y: 1, z: 1 }
+    }
+}
+
+/// Shared memory declaration
+#[derive(Debug, Clone)]
+pub struct SharedMemoryDecl {
+    pub name: String,
+    pub element_type: GpuType,
+    pub size: SharedMemorySize,
+}
+
+/// Shared memory size
+#[derive(Debug, Clone)]
+pub enum SharedMemorySize {
+    /// Fixed size array
+    Fixed(u32),
+    /// Dynamically sized (via spec constant)
+    Dynamic(String),
+}
+
+/// Buffer binding
+#[derive(Debug, Clone)]
+pub struct BufferBinding {
+    pub name: String,
+    pub set: u32,
+    pub binding: u32,
+    pub element_type: GpuType,
+    pub access: BufferAccess,
+    pub is_runtime_array: bool,
+}
+
+/// Buffer access mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferAccess {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+/// Uniform binding
+#[derive(Debug, Clone)]
+pub struct UniformBinding {
+    pub name: String,
+    pub set: u32,
+    pub binding: u32,
+    pub members: Vec<UniformMember>,
+}
+
+/// Uniform struct member
+#[derive(Debug, Clone)]
+pub struct UniformMember {
+    pub name: String,
+    pub ty: GpuType,
+    pub offset: u32,
+}
+
+/// Push constant block
+#[derive(Debug, Clone)]
+pub struct PushConstantBlock {
+    pub members: Vec<UniformMember>,
+    pub size: u32,
+}
+
+/// Specialization constant
+#[derive(Debug, Clone)]
+pub struct SpecConstant {
+    pub name: String,
+    pub id: u32,
+    pub ty: GpuType,
+    pub default_value: SpecConstantValue,
+}
+
+#[derive(Debug, Clone)]
+pub enum SpecConstantValue {
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+}
+
+/// Kernel body (simplified MIR representation)
+#[derive(Debug, Clone)]
+pub struct KernelBody {
+    pub blocks: Vec<KernelBlock>,
+    pub locals: Vec<LocalDecl>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KernelBlock {
+    pub id: u32,
+    pub statements: Vec<KernelStmt>,
+    pub terminator: KernelTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum KernelStmt {
+    /// Load from buffer
+    Load {
+        dest: u32,
+        buffer: String,
+        index: KernelExpr,
+    },
+    
+    /// Store to buffer
+    Store {
+        buffer: String,
+        index: KernelExpr,
+        value: KernelExpr,
+    },
+    
+    /// Load from shared memory
+    SharedLoad {
+        dest: u32,
+        shared: String,
+        index: KernelExpr,
+    },
+    
+    /// Store to shared memory
+    SharedStore {
+        shared: String,
+        index: KernelExpr,
+        value: KernelExpr,
+    },
+    
+    /// Binary operation
+    BinOp {
+        dest: u32,
+        op: BinaryOp,
+        lhs: KernelExpr,
+        rhs: KernelExpr,
+    },
+    
+    /// Unary operation
+    UnaryOp {
+        dest: u32,
+        op: UnaryOp,
+        operand: KernelExpr,
+    },
+    
+    /// Intrinsic call
+    Intrinsic {
+        dest: Option<u32>,
+        intrinsic: GpuIntrinsic,
+        args: Vec<KernelExpr>,
+    },
+    
+    /// Workgroup barrier
+    Barrier(BarrierKind),
+    
+    /// Memory barrier
+    MemoryBarrier(MemoryScope),
+    
+    /// Atomic operation
+    Atomic {
+        dest: u32,
+        op: AtomicOp,
+        ptr: KernelExpr,
+        value: KernelExpr,
+    },
+    
+    /// Assign local
+    Assign {
+        dest: u32,
+        value: KernelExpr,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum KernelTerminator {
+    Return,
+    Branch(u32),
+    CondBranch {
+        condition: KernelExpr,
+        true_block: u32,
+        false_block: u32,
+    },
+    Switch {
+        value: KernelExpr,
+        default: u32,
+        cases: Vec<(i64, u32)>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum KernelExpr {
+    Local(u32),
+    Const(ConstValue),
+    BuiltIn(GpuBuiltIn),
+    BinOp(Box<KernelExpr>, BinaryOp, Box<KernelExpr>),
+    UnaryOp(UnaryOp, Box<KernelExpr>),
+    VectorConstruct(Vec<KernelExpr>),
+    VectorExtract(Box<KernelExpr>, u32),
+    Cast(Box<KernelExpr>, GpuType),
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalDecl {
+    pub id: u32,
+    pub ty: GpuType,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConstValue {
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    Vec2([f32; 2]),
+    Vec3([f32; 3]),
+    Vec4([f32; 4]),
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GPU TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// GPU shader types
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuType {
+    Void,
+    Bool,
+    Int32,
+    Int64,
+    UInt32,
+    UInt64,
+    Float32,
+    Float64,
+    Vec2(Box<GpuType>),
+    Vec3(Box<GpuType>),
+    Vec4(Box<GpuType>),
+    Mat2x2,
+    Mat3x3,
+    Mat4x4,
+    Array(Box<GpuType>, u32),
+    RuntimeArray(Box<GpuType>),
+    Struct(Vec<GpuType>),
+    Pointer(StorageClass, Box<GpuType>),
+}
+
+impl GpuType {
+    pub fn size_bytes(&self) -> u32 {
+        match self {
+            GpuType::Void => 0,
+            GpuType::Bool => 4, // SPIR-V uses 32-bit bools
+            GpuType::Int32 | GpuType::UInt32 | GpuType::Float32 => 4,
+            GpuType::Int64 | GpuType::UInt64 | GpuType::Float64 => 8,
+            GpuType::Vec2(t) => t.size_bytes() * 2,
+            GpuType::Vec3(t) => t.size_bytes() * 3,
+            GpuType::Vec4(t) => t.size_bytes() * 4,
+            GpuType::Mat2x2 => 16,
+            GpuType::Mat3x3 => 36,
+            GpuType::Mat4x4 => 64,
+            GpuType::Array(t, n) => t.size_bytes() * n,
+            GpuType::RuntimeArray(_) => 0, // Unknown at compile time
+            GpuType::Struct(members) => members.iter().map(|t| t.size_bytes()).sum(),
+            GpuType::Pointer(_, _) => 8,
+        }
+    }
+    
+    pub fn alignment(&self) -> u32 {
+        match self {
+            GpuType::Void => 1,
+            GpuType::Bool | GpuType::Int32 | GpuType::UInt32 | GpuType::Float32 => 4,
+            GpuType::Int64 | GpuType::UInt64 | GpuType::Float64 => 8,
+            GpuType::Vec2(t) => t.size_bytes() * 2,
+            GpuType::Vec3(t) | GpuType::Vec4(t) => t.size_bytes() * 4,
+            GpuType::Mat2x2 | GpuType::Mat3x3 | GpuType::Mat4x4 => 16,
+            GpuType::Array(t, _) => t.alignment(),
+            GpuType::RuntimeArray(t) => t.alignment(),
+            GpuType::Struct(members) => members.iter().map(|t| t.alignment()).max().unwrap_or(1),
+            GpuType::Pointer(_, _) => 8,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OPERATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    Add, Sub, Mul, Div, Mod,
+    And, Or, Xor,
+    Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+    LogicalAnd, LogicalOr,
+    Min, Max,
+    Dot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg, Not, BitNot,
+    Abs, Sign,
+    Floor, Ceil, Round, Trunc, Fract,
+    Sqrt, InverseSqrt,
+    Exp, Exp2, Log, Log2,
+    Sin, Cos, Tan, Asin, Acos, Atan,
+    Length, Normalize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicOp {
+    Exchange,
+    CompareExchange,
+    Add, Sub,
+    Min, Max,
+    And, Or, Xor,
+    Inc, Dec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierKind {
+    Workgroup,
+    Subgroup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryScope {
+    Workgroup,
+    Device,
+    QueueFamily,
+    Invocation,
+}
+
+/// GPU built-in variables
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuBuiltIn {
+    GlobalInvocationId,
+    LocalInvocationId,
+    WorkgroupId,
+    NumWorkgroups,
+    WorkgroupSize,
+    LocalInvocationIndex,
+    SubgroupId,
+    SubgroupSize,
+    SubgroupLocalInvocationId,
+    NumSubgroups,
+}
+
+impl GpuBuiltIn {
+    pub fn to_spirv(&self) -> BuiltIn {
+        match self {
+            GpuBuiltIn::GlobalInvocationId => BuiltIn::GlobalInvocationId,
+            GpuBuiltIn::LocalInvocationId => BuiltIn::LocalInvocationId,
+            GpuBuiltIn::WorkgroupId => BuiltIn::WorkgroupId,
+            GpuBuiltIn::NumWorkgroups => BuiltIn::NumWorkgroups,
+            GpuBuiltIn::WorkgroupSize => BuiltIn::WorkgroupSize,
+            GpuBuiltIn::LocalInvocationIndex => BuiltIn::LocalInvocationIndex,
+            GpuBuiltIn::SubgroupId => BuiltIn::SubgroupId,
+            GpuBuiltIn::SubgroupSize => BuiltIn::SubgroupSize,
+            GpuBuiltIn::SubgroupLocalInvocationId => BuiltIn::SubgroupLocalInvocationId,
+            GpuBuiltIn::NumSubgroups => BuiltIn::NumSubgroups,
+        }
+    }
+    
+    pub fn result_type(&self) -> GpuType {
+        match self {
+            GpuBuiltIn::GlobalInvocationId |
+            GpuBuiltIn::LocalInvocationId |
+            GpuBuiltIn::WorkgroupId |
+            GpuBuiltIn::NumWorkgroups |
+            GpuBuiltIn::WorkgroupSize => GpuType::Vec3(Box::new(GpuType::UInt32)),
+            
+            GpuBuiltIn::LocalInvocationIndex |
+            GpuBuiltIn::SubgroupId |
+            GpuBuiltIn::SubgroupSize |
+            GpuBuiltIn::SubgroupLocalInvocationId |
+            GpuBuiltIn::NumSubgroups => GpuType::UInt32,
+        }
+    }
+}
+
+/// GPU intrinsic functions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuIntrinsic {
+    // Math
+    Abs, Sign, Floor, Ceil, Round, Trunc, Fract,
+    Min, Max, Clamp, Mix, Step, SmoothStep,
+    Sqrt, InverseSqrt, Pow,
+    Exp, Exp2, Log, Log2,
+    Sin, Cos, Tan, Asin, Acos, Atan, Atan2,
+    Sinh, Cosh, Tanh,
+    
+    // Vector
+    Length, Distance, Normalize, Dot, Cross,
+    Reflect, Refract, FaceForward,
+    
+    // Matrix
+    Transpose, Determinant, Inverse,
+    MatrixCompMult, OuterProduct,
+    
+    // Bitwise
+    BitCount, BitReverse, FindLSB, FindMSB,
+    
+    // Texture (for future)
+    TextureSample, TextureLoad, TextureStore,
+    
+    // Subgroup operations
+    SubgroupBroadcast, SubgroupBroadcastFirst,
+    SubgroupAll, SubgroupAny, SubgroupAllEqual,
+    SubgroupAdd, SubgroupMul, SubgroupMin, SubgroupMax,
+    SubgroupAnd, SubgroupOr, SubgroupXor,
+    SubgroupShuffle, SubgroupShuffleXor,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPUTE SHADER COMPILER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compute shader compiler
+pub struct ComputeCompiler {
+    /// SPIR-V builder
+    builder: SpirvBuilder,
+    
+    /// Type ID mapping
+    type_ids: BTreeMap<GpuType, u32>,
+    
+    /// Buffer variable IDs
+    buffer_ids: BTreeMap<String, u32>,
+    
+    /// Shared memory IDs
+    shared_ids: BTreeMap<String, u32>,
+    
+    /// Uniform block IDs
+    uniform_ids: BTreeMap<String, u32>,
+    
+    /// Built-in variable IDs
+    builtin_ids: BTreeMap<GpuBuiltIn, u32>,
+    
+    /// Local variable IDs
+    local_ids: BTreeMap<u32, u32>,
+    
+    /// GLSL.std.450 import ID
+    glsl_ext: u32,
+    
+    /// Current function ID
+    current_function: u32,
+    
+    /// Block label IDs
+    block_labels: BTreeMap<u32, u32>,
+}
+
+impl ComputeCompiler {
+    pub fn new() -> Self {
+        ComputeCompiler {
+            builder: SpirvBuilder::new(),
+            type_ids: BTreeMap::new(),
+            buffer_ids: BTreeMap::new(),
+            shared_ids: BTreeMap::new(),
+            uniform_ids: BTreeMap::new(),
+            builtin_ids: BTreeMap::new(),
+            local_ids: BTreeMap::new(),
+            glsl_ext: 0,
+            current_function: 0,
+            block_labels: BTreeMap::new(),
+        }
+    }
+    
+    /// Compile compute kernel to SPIR-V
+    pub fn compile(&mut self, kernel: &ComputeKernel) -> Result<Vec<u32>, CompileError> {
+        // Setup capabilities
+        self.builder.add_capability(Capability::Shader);
+        for cap in &kernel.capabilities {
+            self.builder.add_capability(*cap);
+        }
+        
+        // Memory model
+        self.builder.set_memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        
+        // Import GLSL.std.450
+        self.glsl_ext = self.builder.import_ext_inst("GLSL.std.450");
+        
+        // Declare types
+        self.declare_types(kernel)?;
+        
+        // Declare built-ins
+        self.declare_builtins(kernel)?;
+        
+        // Declare buffers
+        self.declare_buffers(kernel)?;
+        
+        // Declare shared memory
+        self.declare_shared_memory(kernel)?;
+        
+        // Declare uniforms
+        self.declare_uniforms(kernel)?;
+        
+        // Create main function
+        let func_id = self.compile_main(kernel)?;
+        
+        // Add entry point
+        let mut interface: Vec<u32> = self.builtin_ids.values().cloned().collect();
+        interface.extend(self.buffer_ids.values().cloned());
+        
+        self.builder.add_entry_point(EntryPoint {
+            execution_model: ExecutionModel::GLCompute,
+            function_id: func_id,
+            name: kernel.name.clone(),
+            interface,
+        });
+        
+        // Set workgroup size
+        self.builder.add_execution_mode(
+            func_id,
+            ExecutionMode::LocalSize,
+            vec![kernel.workgroup_size.x, kernel.workgroup_size.y, kernel.workgroup_size.z],
+        );
+        
+        Ok(self.builder.build())
+    }
+    
+    /// Declare all required types
+    fn declare_types(&mut self, kernel: &ComputeKernel) -> Result<(), CompileError> {
+        // Void type
+        let void_id = self.builder.type_void();
+        self.type_ids.insert(GpuType::Void, void_id);
+        
+        // Boolean
+        let bool_id = self.builder.type_bool();
+        self.type_ids.insert(GpuType::Bool, bool_id);
+        
+        // Integers
+        let i32_id = self.builder.type_int(32, true);
+        let u32_id = self.builder.type_int(32, false);
+        self.type_ids.insert(GpuType::Int32, i32_id);
+        self.type_ids.insert(GpuType::UInt32, u32_id);
+        
+        // Floats
+        let f32_id = self.builder.type_float(32);
+        self.type_ids.insert(GpuType::Float32, f32_id);
+        
+        // Common vectors
+        let uvec3_id = self.builder.type_vector(u32_id, 3);
+        self.type_ids.insert(GpuType::Vec3(Box::new(GpuType::UInt32)), uvec3_id);
+        
+        let vec2_id = self.builder.type_vector(f32_id, 2);
+        let vec3_id = self.builder.type_vector(f32_id, 3);
+        let vec4_id = self.builder.type_vector(f32_id, 4);
+        self.type_ids.insert(GpuType::Vec2(Box::new(GpuType::Float32)), vec2_id);
+        self.type_ids.insert(GpuType::Vec3(Box::new(GpuType::Float32)), vec3_id);
+        self.type_ids.insert(GpuType::Vec4(Box::new(GpuType::Float32)), vec4_id);
+        
+        // Buffer element types
+        for buffer in &kernel.buffers {
+            self.get_or_create_type(&buffer.element_type)?;
+        }
+        
+        // Shared memory types
+        for shared in &kernel.shared_memory {
+            self.get_or_create_type(&shared.element_type)?;
+        }
+        
+        // Local types
+        for local in &kernel.body.locals {
+            self.get_or_create_type(&local.ty)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Get or create type ID
+    fn get_or_create_type(&mut self, ty: &GpuType) -> Result<u32, CompileError> {
+        if let Some(&id) = self.type_ids.get(ty) {
+            return Ok(id);
+        }
+        
+        let id = match ty {
+            GpuType::Void => self.builder.type_void(),
+            GpuType::Bool => self.builder.type_bool(),
+            GpuType::Int32 => self.builder.type_int(32, true),
+            GpuType::Int64 => self.builder.type_int(64, true),
+            GpuType::UInt32 => self.builder.type_int(32, false),
+            GpuType::UInt64 => self.builder.type_int(64, false),
+            GpuType::Float32 => self.builder.type_float(32),
+            GpuType::Float64 => self.builder.type_float(64),
+            GpuType::Vec2(elem) => {
+                let elem_id = self.get_or_create_type(elem)?;
+                self.builder.type_vector(elem_id, 2)
+            }
+            GpuType::Vec3(elem) => {
+                let elem_id = self.get_or_create_type(elem)?;
+                self.builder.type_vector(elem_id, 3)
+            }
+            GpuType::Vec4(elem) => {
+                let elem_id = self.get_or_create_type(elem)?;
+                self.builder.type_vector(elem_id, 4)
+            }
+            GpuType::Array(elem, size) => {
+                let elem_id = self.get_or_create_type(elem)?;
+                let size_id = self.const_u32(*size);
+                self.builder.type_array(elem_id, size_id)
+            }
+            GpuType::RuntimeArray(elem) => {
+                let elem_id = self.get_or_create_type(elem)?;
+                self.builder.type_runtime_array(elem_id)
+            }
+            GpuType::Struct(members) => {
+                let member_ids: Vec<u32> = members.iter()
+                    .map(|m| self.get_or_create_type(m))
+                    .collect::<Result<_, _>>()?;
+                self.builder.type_struct(member_ids)
+            }
+            GpuType::Pointer(storage, pointee) => {
+                let pointee_id = self.get_or_create_type(pointee)?;
+                self.builder.type_pointer(*storage, pointee_id)
+            }
+            _ => return Err(CompileError::UnsupportedType(format!("{:?}", ty))),
+        };
+        
+        self.type_ids.insert(ty.clone(), id);
+        Ok(id)
+    }
+    
+    /// Declare built-in variables
+    fn declare_builtins(&mut self, kernel: &ComputeKernel) -> Result<(), CompileError> {
+        // Always declare GlobalInvocationId
+        self.declare_builtin(GpuBuiltIn::GlobalInvocationId)?;
+        self.declare_builtin(GpuBuiltIn::LocalInvocationId)?;
+        self.declare_builtin(GpuBuiltIn::WorkgroupId)?;
+        
+        Ok(())
+    }
+    
+    fn declare_builtin(&mut self, builtin: GpuBuiltIn) -> Result<u32, CompileError> {
+        let ty = builtin.result_type();
+        let type_id = self.get_or_create_type(&ty)?;
+        let ptr_type = self.builder.type_pointer(StorageClass::Input, type_id);
+        
+        let var_id = self.builder.global_variable(ptr_type, StorageClass::Input, None);
+        
+        self.builder.decorate(var_id, Decoration::BuiltIn, vec![builtin.to_spirv() as u32]);
+        
+        self.builtin_ids.insert(builtin, var_id);
+        Ok(var_id)
+    }
+    
+    /// Declare buffer bindings
+    fn declare_buffers(&mut self, kernel: &ComputeKernel) -> Result<(), CompileError> {
+        for buffer in &kernel.buffers {
+            let elem_type_id = self.get_or_create_type(&buffer.element_type)?;
+            
+            // Create runtime array type for buffer
+            let array_type = if buffer.is_runtime_array {
+                self.builder.type_runtime_array(elem_type_id)
+            } else {
+                elem_type_id
+            };
+            
+            // Buffer struct
+            let struct_id = self.builder.type_struct(vec![array_type]);
+            self.builder.decorate(struct_id, Decoration::Block, vec![]);
+            self.builder.decorate_member(struct_id, 0, Decoration::Offset, vec![0]);
+            
+            if buffer.is_runtime_array {
+                self.builder.decorate(array_type, Decoration::ArrayStride, 
+                    vec![buffer.element_type.size_bytes()]);
+            }
+            
+            // Pointer to buffer
+            let ptr_type = self.builder.type_pointer(StorageClass::StorageBuffer, struct_id);
+            
+            let var_id = self.builder.global_variable(ptr_type, StorageClass::StorageBuffer, None);
+            
+            // Decorations
+            self.builder.decorate(var_id, Decoration::DescriptorSet, vec![buffer.set]);
+            self.builder.decorate(var_id, Decoration::Binding, vec![buffer.binding]);
+            
+            if buffer.access == BufferAccess::ReadOnly {
+                self.builder.decorate(var_id, Decoration::NonWritable, vec![]);
+            }
+            
+            self.builder.set_name(var_id, &buffer.name);
+            self.buffer_ids.insert(buffer.name.clone(), var_id);
+        }
+        
+        Ok(())
+    }
+    
+    /// Declare shared memory
+    fn declare_shared_memory(&mut self, kernel: &ComputeKernel) -> Result<(), CompileError> {
+        for shared in &kernel.shared_memory {
+            let elem_type_id = self.get_or_create_type(&shared.element_type)?;
+            
+            let array_size = match &shared.size {
+                SharedMemorySize::Fixed(n) => *n,
+                SharedMemorySize::Dynamic(_) => {
+                    // Use spec constant for dynamic size
+                    1024 // Default
+                }
+            };
+            
+            let size_const = self.const_u32(array_size);
+            let array_type = self.builder.type_array(elem_type_id, size_const);
+            let ptr_type = self.builder.type_pointer(StorageClass::Workgroup, array_type);
+            
+            let var_id = self.builder.global_variable(ptr_type, StorageClass::Workgroup, None);
+            
+            self.builder.set_name(var_id, &shared.name);
+            self.shared_ids.insert(shared.name.clone(), var_id);
+        }
+        
+        Ok(())
+    }
+    
+    /// Declare uniform bindings
+    fn declare_uniforms(&mut self, kernel: &ComputeKernel) -> Result<(), CompileError> {
+        for uniform in &kernel.uniforms {
+            let member_types: Vec<u32> = uniform.members.iter()
+                .map(|m| self.get_or_create_type(&m.ty))
+                .collect::<Result<_, _>>()?;
+            
+            let struct_id = self.builder.type_struct(member_types);
+            self.builder.decorate(struct_id, Decoration::Block, vec![]);
+            
+            for (i, member) in uniform.members.iter().enumerate() {
+                self.builder.decorate_member(struct_id, i as u32, Decoration::Offset, vec![member.offset]);
+                self.builder.set_member_name(struct_id, i as u32, &member.name);
+            }
+            
+            let ptr_type = self.builder.type_pointer(StorageClass::Uniform, struct_id);
+            let var_id = self.builder.global_variable(ptr_type, StorageClass::Uniform, None);
+            
+            self.builder.decorate(var_id, Decoration::DescriptorSet, vec![uniform.set]);
+            self.builder.decorate(var_id, Decoration::Binding, vec![uniform.binding]);
+            
+            self.builder.set_name(var_id, &uniform.name);
+            self.uniform_ids.insert(uniform.name.clone(), var_id);
+        }
+        
+        Ok(())
+    }
+    
+    /// Compile main function
+    fn compile_main(&mut self, kernel: &ComputeKernel) -> Result<u32, CompileError> {
+        let void_type = *self.type_ids.get(&GpuType::Void).unwrap();
+        let func_type = self.builder.type_function(void_type, vec![]);
+        
+        let func_id = self.builder.alloc_id();
+        self.current_function = func_id;
+        
+        self.builder.set_name(func_id, &kernel.name);
+        
+        // Allocate block labels
+        for block in &kernel.body.blocks {
+            let label_id = self.builder.alloc_id();
+            self.block_labels.insert(block.id, label_id);
+        }
+        
+        // Compile blocks
+        let mut spirv_blocks = Vec::new();
+        for block in &kernel.body.blocks {
+            let label_id = *self.block_labels.get(&block.id).unwrap();
+            
+            let mut instructions = Vec::new();
+            
+            // Compile statements
+            for stmt in &block.statements {
+                self.compile_stmt(stmt, &mut instructions)?;
+            }
+            
+            // Compile terminator
+            let terminator = self.compile_terminator(&block.terminator)?;
+            
+            spirv_blocks.push(BasicBlock {
+                label_id,
+                instructions,
+                terminator,
+            });
+        }
+        
+        self.builder.add_function(Function {
+            return_type: void_type,
+            function_type: func_type,
+            function_id: func_id,
+            control: 0,
+            parameters: vec![],
+            blocks: spirv_blocks,
+        });
+        
+        Ok(func_id)
+    }
+    
+    /// Compile statement
+    fn compile_stmt(&mut self, stmt: &KernelStmt, out: &mut Vec<Instruction>) -> Result<(), CompileError> {
+        match stmt {
+            KernelStmt::Barrier(kind) => {
+                let scope = match kind {
+                    BarrierKind::Workgroup => 2, // Workgroup scope
+                    BarrierKind::Subgroup => 3,  // Subgroup scope
+                };
+                
+                out.push(Instruction::new(Op::OpControlBarrier)
+                    .with_operands(vec![
+                        scope,
+                        scope,
+                        0x100 | 0x200, // AcquireRelease | WorkgroupMemory
+                    ]));
+            }
+            
+            KernelStmt::MemoryBarrier(scope) => {
+                let scope_val = match scope {
+                    MemoryScope::Workgroup => 2,
+                    MemoryScope::Device => 1,
+                    MemoryScope::QueueFamily => 5,
+                    MemoryScope::Invocation => 4,
+                };
+                
+                out.push(Instruction::new(Op::OpMemoryBarrier)
+                    .with_operands(vec![
+                        scope_val,
+                        0x100 | 0x200,
+                    ]));
+            }
+            
+            // Other statement types would be implemented here
+            _ => {}
+        }
+        
+        Ok(())
+    }
+    
+    /// Compile terminator
+    fn compile_terminator(&mut self, term: &KernelTerminator) -> Result<Instruction, CompileError> {
+        match term {
+            KernelTerminator::Return => {
+                Ok(Instruction::new(Op::OpReturn))
+            }
+            KernelTerminator::Branch(target) => {
+                let label = *self.block_labels.get(target)
+                    .ok_or(CompileError::UnknownBlock(*target))?;
+                Ok(Instruction::new(Op::OpBranch)
+                    .with_operands(vec![label]))
+            }
+            KernelTerminator::CondBranch { condition: _, true_block, false_block } => {
+                let true_label = *self.block_labels.get(true_block)
+                    .ok_or(CompileError::UnknownBlock(*true_block))?;
+                let false_label = *self.block_labels.get(false_block)
+                    .ok_or(CompileError::UnknownBlock(*false_block))?;
+                
+                // Simplified - would need to compile condition
+                Ok(Instruction::new(Op::OpBranch)
+                    .with_operands(vec![true_label]))
+            }
+            KernelTerminator::Switch { value: _, default, cases: _ } => {
+                let default_label = *self.block_labels.get(default)
+                    .ok_or(CompileError::UnknownBlock(*default))?;
+                Ok(Instruction::new(Op::OpBranch)
+                    .with_operands(vec![default_label]))
+            }
+        }
+    }
+    
+    /// Create u32 constant
+    fn const_u32(&mut self, value: u32) -> u32 {
+        let u32_type = *self.type_ids.get(&GpuType::UInt32).unwrap();
+        self.builder.const_int(u32_type, value as i64)
+    }
+}
+
+impl Default for ComputeCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum CompileError {
+    UnsupportedType(String),
+    UnsupportedOp(String),
+    UnknownBuffer(String),
+    UnknownShared(String),
+    UnknownLocal(u32),
+    UnknownBlock(u32),
+    InvalidWorkgroupSize,
+    TooMuchSharedMemory(u32),
+}
+
+impl std::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedType(t) => write!(f, "unsupported GPU type: {}", t),
+            Self::UnsupportedOp(op) => write!(f, "unsupported operation: {}", op),
+            Self::UnknownBuffer(n) => write!(f, "unknown buffer: {}", n),
+            Self::UnknownShared(n) => write!(f, "unknown shared memory: {}", n),
+            Self::UnknownLocal(id) => write!(f, "unknown local: {}", id),
+            Self::UnknownBlock(id) => write!(f, "unknown block: {}", id),
+            Self::InvalidWorkgroupSize => write!(f, "invalid workgroup size"),
+            Self::TooMuchSharedMemory(n) => write!(f, "too much shared memory: {} bytes", n),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_workgroup_size() {
+        let ws = WorkgroupSize::square(16);
+        assert_eq!(ws.total(), 256);
+        
+        let ws2 = WorkgroupSize::new(8, 8, 4);
+        assert_eq!(ws2.total(), 256);
+    }
+    
+    #[test]
+    fn test_gpu_type_size() {
+        assert_eq!(GpuType::Float32.size_bytes(), 4);
+        assert_eq!(GpuType::Vec4(Box::new(GpuType::Float32)).size_bytes(), 16);
+        assert_eq!(GpuType::Mat4x4.size_bytes(), 64);
+    }
+    
+    #[test]
+    fn test_builtin_types() {
+        let bi = GpuBuiltIn::GlobalInvocationId;
+        assert_eq!(bi.result_type(), GpuType::Vec3(Box::new(GpuType::UInt32)));
+    }
+    
+    #[test]
+    fn test_basic_kernel_compile() {
+        let kernel = ComputeKernel {
+            name: "test_kernel".to_string(),
+            workgroup_size: WorkgroupSize::flat(64),
+            shared_memory: vec![],
+            buffers: vec![],
+            uniforms: vec![],
+            push_constants: None,
+            body: KernelBody {
+                blocks: vec![KernelBlock {
+                    id: 0,
+                    statements: vec![],
+                    terminator: KernelTerminator::Return,
+                }],
+                locals: vec![],
+            },
+            capabilities: vec![],
+            spec_constants: vec![],
+        };
+        
+        let mut compiler = ComputeCompiler::new();
+        let result = compiler.compile(&kernel);
+        assert!(result.is_ok());
+        
+        let spirv = result.unwrap();
+        assert!(!spirv.is_empty());
+        assert_eq!(spirv[0], super::super::spirv::SPIRV_MAGIC);
+    }
+}

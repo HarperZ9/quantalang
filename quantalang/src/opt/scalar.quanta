@@ -1,0 +1,1245 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ — Scalar Optimizations
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Scalar optimization passes:
+//   - Global Value Numbering (GVN)
+//   - Sparse Conditional Constant Propagation (SCCP)
+//   - Dead Code Elimination (DCE)
+//   - Common Subexpression Elimination (CSE)
+//   - Copy Propagation
+//   - Constant Folding
+//   - Algebraic Simplification
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::opt::scalar
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL VALUE NUMBERING (GVN)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Global Value Numbering pass
+pub struct GVN {
+    /// Value number assignments
+    value_numbers: BTreeMap<String, u32>,
+    /// Expression to value number mapping
+    expression_numbers: BTreeMap<Expression, u32>,
+    /// Next value number
+    next_vn: u32,
+    /// Leader for each value number
+    leaders: BTreeMap<u32, String>,
+}
+
+/// Normalized expression for value numbering
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Expression {
+    Constant(i64),
+    Binary(BinOp, u32, u32), // op, vn1, vn2
+    Phi(Vec<u32>),           // value numbers of incoming values
+    Load(u32, usize),        // ptr_vn, size
+    Call(String, Vec<u32>),  // callee, arg vns
+}
+
+impl GVN {
+    pub fn new() -> Self {
+        GVN {
+            value_numbers: BTreeMap::new(),
+            expression_numbers: BTreeMap::new(),
+            next_vn: 0,
+            leaders: BTreeMap::new(),
+        }
+    }
+    
+    /// Run GVN on a function
+    pub fn run(&mut self, func: &mut MirFunction) -> u32 {
+        let mut eliminated = 0;
+        
+        // Process blocks in RPO (Reverse Post Order)
+        let rpo = self.compute_rpo(func);
+        
+        for block_id in rpo {
+            if let Some(block) = func.blocks.iter_mut().find(|b| b.id == block_id) {
+                eliminated += self.process_block(block);
+            }
+        }
+        
+        eliminated
+    }
+    
+    fn compute_rpo(&self, func: &MirFunction) -> Vec<u32> {
+        let mut visited = BTreeSet::new();
+        let mut post_order = Vec::new();
+        
+        if let Some(entry) = func.blocks.first() {
+            self.dfs_post_order(entry.id, func, &mut visited, &mut post_order);
+        }
+        
+        post_order.reverse();
+        post_order
+    }
+    
+    fn dfs_post_order(
+        &self,
+        block_id: u32,
+        func: &MirFunction,
+        visited: &mut BTreeSet<u32>,
+        post_order: &mut Vec<u32>,
+    ) {
+        if visited.contains(&block_id) {
+            return;
+        }
+        
+        visited.insert(block_id);
+        
+        if let Some(block) = func.blocks.iter().find(|b| b.id == block_id) {
+            for succ in self.get_successors(block) {
+                self.dfs_post_order(succ, func, visited, post_order);
+            }
+            
+            post_order.push(block_id);
+        }
+    }
+    
+    fn get_successors(&self, block: &MirBlock) -> Vec<u32> {
+        match &block.terminator {
+            MirTerminator::Goto(t) => vec![*t],
+            MirTerminator::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+            MirTerminator::Switch { targets, default, .. } => {
+                let mut succs: Vec<_> = targets.iter().map(|(_, t)| *t).collect();
+                succs.push(*default);
+                succs
+            }
+            _ => vec![],
+        }
+    }
+    
+    fn process_block(&mut self, block: &mut MirBlock) -> u32 {
+        let mut eliminated = 0;
+        let mut replacements: Vec<(usize, String, String)> = Vec::new();
+        
+        for (i, stmt) in block.statements.iter().enumerate() {
+            match stmt {
+                MirStatement::Assign { dest, value } => {
+                    let vn = self.get_operand_vn(value);
+                    
+                    if let Some(leader) = self.leaders.get(&vn) {
+                        if leader != dest {
+                            replacements.push((i, dest.clone(), leader.clone()));
+                            eliminated += 1;
+                        }
+                    } else {
+                        self.value_numbers.insert(dest.clone(), vn);
+                        self.leaders.insert(vn, dest.clone());
+                    }
+                }
+                MirStatement::BinaryOp { dest, op, lhs, rhs } => {
+                    let lhs_vn = self.get_operand_vn(lhs);
+                    let rhs_vn = self.get_operand_vn(rhs);
+                    
+                    // Normalize commutative operations
+                    let (vn1, vn2) = if op.is_commutative() && lhs_vn > rhs_vn {
+                        (rhs_vn, lhs_vn)
+                    } else {
+                        (lhs_vn, rhs_vn)
+                    };
+                    
+                    let expr = Expression::Binary(*op, vn1, vn2);
+                    
+                    if let Some(&existing_vn) = self.expression_numbers.get(&expr) {
+                        if let Some(leader) = self.leaders.get(&existing_vn) {
+                            replacements.push((i, dest.clone(), leader.clone()));
+                            eliminated += 1;
+                            self.value_numbers.insert(dest.clone(), existing_vn);
+                            continue;
+                        }
+                    }
+                    
+                    let vn = self.next_vn;
+                    self.next_vn += 1;
+                    
+                    self.expression_numbers.insert(expr, vn);
+                    self.value_numbers.insert(dest.clone(), vn);
+                    self.leaders.insert(vn, dest.clone());
+                }
+                MirStatement::Load { dest, ptr, size } => {
+                    let ptr_vn = self.get_operand_vn(ptr);
+                    let expr = Expression::Load(ptr_vn, *size);
+                    
+                    if let Some(&existing_vn) = self.expression_numbers.get(&expr) {
+                        if let Some(leader) = self.leaders.get(&existing_vn) {
+                            // Can reuse if no intervening store
+                            replacements.push((i, dest.clone(), leader.clone()));
+                            eliminated += 1;
+                            self.value_numbers.insert(dest.clone(), existing_vn);
+                            continue;
+                        }
+                    }
+                    
+                    let vn = self.next_vn;
+                    self.next_vn += 1;
+                    
+                    self.expression_numbers.insert(expr, vn);
+                    self.value_numbers.insert(dest.clone(), vn);
+                    self.leaders.insert(vn, dest.clone());
+                }
+                MirStatement::Store { .. } => {
+                    // Invalidate loads that might alias
+                    self.invalidate_loads();
+                }
+                MirStatement::Call { dest, callee, args } => {
+                    // Invalidate memory if call might write
+                    if !self.is_pure_function(callee) {
+                        self.invalidate_loads();
+                    }
+                    
+                    if let Some(d) = dest {
+                        let vn = self.next_vn;
+                        self.next_vn += 1;
+                        self.value_numbers.insert(d.clone(), vn);
+                        self.leaders.insert(vn, d.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        // Apply replacements
+        for (idx, dest, leader) in replacements {
+            block.statements[idx] = MirStatement::Assign {
+                dest,
+                value: MirOperand::Variable(leader),
+            };
+        }
+        
+        eliminated
+    }
+    
+    fn get_operand_vn(&mut self, operand: &MirOperand) -> u32 {
+        match operand {
+            MirOperand::Constant(c) => {
+                let expr = Expression::Constant(*c);
+                
+                if let Some(&vn) = self.expression_numbers.get(&expr) {
+                    vn
+                } else {
+                    let vn = self.next_vn;
+                    self.next_vn += 1;
+                    self.expression_numbers.insert(expr, vn);
+                    vn
+                }
+            }
+            MirOperand::Variable(name) => {
+                if let Some(&vn) = self.value_numbers.get(name) {
+                    vn
+                } else {
+                    let vn = self.next_vn;
+                    self.next_vn += 1;
+                    self.value_numbers.insert(name.clone(), vn);
+                    self.leaders.insert(vn, name.clone());
+                    vn
+                }
+            }
+            MirOperand::Gep { .. } => {
+                // Simplified - would handle GEP properly
+                let vn = self.next_vn;
+                self.next_vn += 1;
+                vn
+            }
+        }
+    }
+    
+    fn invalidate_loads(&mut self) {
+        self.expression_numbers.retain(|expr, _| !matches!(expr, Expression::Load(_, _)));
+    }
+    
+    fn is_pure_function(&self, callee: &str) -> bool {
+        matches!(callee, "sqrt" | "sin" | "cos" | "exp" | "log" | "abs" |
+                        "min" | "max" | "floor" | "ceil")
+    }
+}
+
+impl Default for GVN {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPARSE CONDITIONAL CONSTANT PROPAGATION (SCCP)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Lattice value for SCCP
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LatticeValue {
+    /// Top (undefined, not yet computed)
+    Top,
+    /// Constant value
+    Constant(i64),
+    /// Bottom (overdefined, multiple values possible)
+    Bottom,
+}
+
+impl LatticeValue {
+    /// Meet operation (lattice join)
+    pub fn meet(&self, other: &LatticeValue) -> LatticeValue {
+        match (self, other) {
+            (LatticeValue::Top, v) | (v, LatticeValue::Top) => v.clone(),
+            (LatticeValue::Bottom, _) | (_, LatticeValue::Bottom) => LatticeValue::Bottom,
+            (LatticeValue::Constant(a), LatticeValue::Constant(b)) => {
+                if a == b {
+                    LatticeValue::Constant(*a)
+                } else {
+                    LatticeValue::Bottom
+                }
+            }
+        }
+    }
+    
+    pub fn is_constant(&self) -> bool {
+        matches!(self, LatticeValue::Constant(_))
+    }
+}
+
+/// Sparse Conditional Constant Propagation pass
+pub struct SCCP {
+    /// Value lattice for each variable
+    values: BTreeMap<String, LatticeValue>,
+    /// Executable edges (from, to)
+    executable_edges: BTreeSet<(u32, u32)>,
+    /// Executable blocks
+    executable_blocks: BTreeSet<u32>,
+    /// SSA worklist
+    ssa_worklist: Vec<String>,
+    /// CFG worklist
+    cfg_worklist: Vec<(u32, u32)>,
+}
+
+impl SCCP {
+    pub fn new() -> Self {
+        SCCP {
+            values: BTreeMap::new(),
+            executable_edges: BTreeSet::new(),
+            executable_blocks: BTreeSet::new(),
+            ssa_worklist: Vec::new(),
+            cfg_worklist: Vec::new(),
+        }
+    }
+    
+    /// Run SCCP on a function
+    pub fn run(&mut self, func: &mut MirFunction) -> u32 {
+        // Initialize
+        if let Some(entry) = func.blocks.first() {
+            self.executable_blocks.insert(entry.id);
+            self.cfg_worklist.push((u32::MAX, entry.id)); // Entry edge
+        }
+        
+        // Process worklists until empty
+        while !self.cfg_worklist.is_empty() || !self.ssa_worklist.is_empty() {
+            // Process CFG worklist
+            while let Some((from, to)) = self.cfg_worklist.pop() {
+                if !self.executable_edges.contains(&(from, to)) {
+                    self.executable_edges.insert((from, to));
+                    self.executable_blocks.insert(to);
+                    
+                    if let Some(block) = func.blocks.iter().find(|b| b.id == to) {
+                        self.visit_block(block.clone(), func);
+                    }
+                }
+            }
+            
+            // Process SSA worklist
+            while let Some(var) = self.ssa_worklist.pop() {
+                self.visit_uses(&var, func);
+            }
+        }
+        
+        // Apply transformations
+        self.transform(func)
+    }
+    
+    fn visit_block(&mut self, block: MirBlock, func: &MirFunction) {
+        for stmt in &block.statements {
+            self.visit_statement(stmt, block.id, func);
+        }
+        
+        self.visit_terminator(&block.terminator, block.id, func);
+    }
+    
+    fn visit_statement(&mut self, stmt: &MirStatement, block_id: u32, func: &MirFunction) {
+        match stmt {
+            MirStatement::Assign { dest, value } => {
+                let val = self.evaluate_operand(value);
+                self.update_value(dest, val);
+            }
+            MirStatement::BinaryOp { dest, op, lhs, rhs } => {
+                let lhs_val = self.evaluate_operand(lhs);
+                let rhs_val = self.evaluate_operand(rhs);
+                
+                let result = self.evaluate_binary(*op, &lhs_val, &rhs_val);
+                self.update_value(dest, result);
+            }
+            MirStatement::Phi { dest, incoming } => {
+                let mut result = LatticeValue::Top;
+                
+                for (pred, value) in incoming {
+                    if self.executable_edges.contains(&(*pred, block_id)) {
+                        let val = self.evaluate_operand(value);
+                        result = result.meet(&val);
+                    }
+                }
+                
+                self.update_value(dest, result);
+            }
+            MirStatement::Load { dest, .. } => {
+                // Conservative: loads are bottom (could be any value)
+                self.update_value(dest, LatticeValue::Bottom);
+            }
+            MirStatement::Call { dest, .. } => {
+                if let Some(d) = dest {
+                    // Conservative: calls return bottom
+                    self.update_value(d, LatticeValue::Bottom);
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    fn visit_terminator(&mut self, term: &MirTerminator, block_id: u32, func: &MirFunction) {
+        match term {
+            MirTerminator::Goto(target) => {
+                self.cfg_worklist.push((block_id, *target));
+            }
+            MirTerminator::Branch { cond, then_bb, else_bb } => {
+                let cond_val = self.evaluate_operand(cond);
+                
+                match cond_val {
+                    LatticeValue::Constant(0) => {
+                        // Condition is false
+                        self.cfg_worklist.push((block_id, *else_bb));
+                    }
+                    LatticeValue::Constant(_) => {
+                        // Condition is true
+                        self.cfg_worklist.push((block_id, *then_bb));
+                    }
+                    _ => {
+                        // Both edges are executable
+                        self.cfg_worklist.push((block_id, *then_bb));
+                        self.cfg_worklist.push((block_id, *else_bb));
+                    }
+                }
+            }
+            MirTerminator::Switch { value, targets, default } => {
+                let val = self.evaluate_operand(value);
+                
+                match val {
+                    LatticeValue::Constant(c) => {
+                        // Find matching case
+                        let target = targets.iter()
+                            .find(|(v, _)| *v == c)
+                            .map(|(_, t)| *t)
+                            .unwrap_or(*default);
+                        
+                        self.cfg_worklist.push((block_id, target));
+                    }
+                    _ => {
+                        // All edges are executable
+                        for (_, target) in targets {
+                            self.cfg_worklist.push((block_id, *target));
+                        }
+                        self.cfg_worklist.push((block_id, *default));
+                    }
+                }
+            }
+            MirTerminator::Return { .. } | MirTerminator::Unreachable => {}
+        }
+    }
+    
+    fn evaluate_operand(&self, operand: &MirOperand) -> LatticeValue {
+        match operand {
+            MirOperand::Constant(c) => LatticeValue::Constant(*c),
+            MirOperand::Variable(name) => {
+                self.values.get(name).cloned().unwrap_or(LatticeValue::Top)
+            }
+            MirOperand::Gep { .. } => LatticeValue::Bottom,
+        }
+    }
+    
+    fn evaluate_binary(&self, op: BinOp, lhs: &LatticeValue, rhs: &LatticeValue) -> LatticeValue {
+        match (lhs, rhs) {
+            (LatticeValue::Bottom, _) | (_, LatticeValue::Bottom) => LatticeValue::Bottom,
+            (LatticeValue::Top, _) | (_, LatticeValue::Top) => LatticeValue::Top,
+            (LatticeValue::Constant(a), LatticeValue::Constant(b)) => {
+                let result = match op {
+                    BinOp::Add => a.wrapping_add(*b),
+                    BinOp::Sub => a.wrapping_sub(*b),
+                    BinOp::Mul => a.wrapping_mul(*b),
+                    BinOp::Div => {
+                        if *b == 0 {
+                            return LatticeValue::Bottom; // Undefined
+                        }
+                        a.wrapping_div(*b)
+                    }
+                    BinOp::Rem => {
+                        if *b == 0 {
+                            return LatticeValue::Bottom;
+                        }
+                        a.wrapping_rem(*b)
+                    }
+                    BinOp::And => a & b,
+                    BinOp::Or => a | b,
+                    BinOp::Xor => a ^ b,
+                    BinOp::Shl => a.wrapping_shl(*b as u32),
+                    BinOp::Shr => a.wrapping_shr(*b as u32),
+                    BinOp::Eq => if a == b { 1 } else { 0 },
+                    BinOp::Ne => if a != b { 1 } else { 0 },
+                    BinOp::Lt => if a < b { 1 } else { 0 },
+                    BinOp::Le => if a <= b { 1 } else { 0 },
+                    BinOp::Gt => if a > b { 1 } else { 0 },
+                    BinOp::Ge => if a >= b { 1 } else { 0 },
+                };
+                
+                LatticeValue::Constant(result)
+            }
+        }
+    }
+    
+    fn update_value(&mut self, name: &str, value: LatticeValue) {
+        let old = self.values.get(name).cloned().unwrap_or(LatticeValue::Top);
+        let new = old.meet(&value);
+        
+        if new != self.values.get(name).cloned().unwrap_or(LatticeValue::Top) {
+            self.values.insert(name.to_string(), new);
+            self.ssa_worklist.push(name.to_string());
+        }
+    }
+    
+    fn visit_uses(&mut self, var: &str, func: &MirFunction) {
+        for block in &func.blocks {
+            if !self.executable_blocks.contains(&block.id) {
+                continue;
+            }
+            
+            for stmt in &block.statements {
+                if self.uses_variable(stmt, var) {
+                    self.visit_statement(stmt, block.id, func);
+                }
+            }
+        }
+    }
+    
+    fn uses_variable(&self, stmt: &MirStatement, var: &str) -> bool {
+        match stmt {
+            MirStatement::Assign { value, .. } => value.is_var(var),
+            MirStatement::BinaryOp { lhs, rhs, .. } => lhs.is_var(var) || rhs.is_var(var),
+            MirStatement::Phi { incoming, .. } => {
+                incoming.iter().any(|(_, v)| v.is_var(var))
+            }
+            MirStatement::Load { ptr, .. } => ptr.is_var(var),
+            MirStatement::Store { ptr, value, .. } => ptr.is_var(var) || value.is_var(var),
+            MirStatement::Call { args, .. } => args.iter().any(|a| a.is_var(var)),
+            _ => false,
+        }
+    }
+    
+    fn transform(&self, func: &mut MirFunction) -> u32 {
+        let mut transformed = 0;
+        
+        // Replace constant variables
+        for block in &mut func.blocks {
+            for stmt in &mut block.statements {
+                match stmt {
+                    MirStatement::Assign { dest, value } => {
+                        if let Some(LatticeValue::Constant(c)) = self.values.get(dest) {
+                            *value = MirOperand::Constant(*c);
+                            transformed += 1;
+                        }
+                    }
+                    MirStatement::BinaryOp { dest, lhs, rhs, .. } => {
+                        if let MirOperand::Variable(name) = lhs {
+                            if let Some(LatticeValue::Constant(c)) = self.values.get(name) {
+                                *lhs = MirOperand::Constant(*c);
+                                transformed += 1;
+                            }
+                        }
+                        if let MirOperand::Variable(name) = rhs {
+                            if let Some(LatticeValue::Constant(c)) = self.values.get(name) {
+                                *rhs = MirOperand::Constant(*c);
+                                transformed += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
+        // Remove unreachable blocks
+        let unreachable: Vec<_> = func.blocks.iter()
+            .filter(|b| !self.executable_blocks.contains(&b.id))
+            .map(|b| b.id)
+            .collect();
+        
+        func.blocks.retain(|b| self.executable_blocks.contains(&b.id));
+        transformed += unreachable.len() as u32;
+        
+        transformed
+    }
+}
+
+impl Default for SCCP {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEAD CODE ELIMINATION (DCE)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Dead Code Elimination pass
+pub struct DCE {
+    /// Live variables
+    live: BTreeSet<String>,
+}
+
+impl DCE {
+    pub fn new() -> Self {
+        DCE {
+            live: BTreeSet::new(),
+        }
+    }
+    
+    /// Run DCE on a function
+    pub fn run(&mut self, func: &mut MirFunction) -> u32 {
+        // Mark phase: find live instructions
+        self.mark(func);
+        
+        // Sweep phase: remove dead instructions
+        self.sweep(func)
+    }
+    
+    fn mark(&mut self, func: &MirFunction) {
+        self.live.clear();
+        
+        // Initialize with critical instructions
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if self.is_critical(stmt) {
+                    self.mark_live(stmt);
+                }
+            }
+            
+            // Return values are live
+            if let MirTerminator::Return { value: Some(val) } = &block.terminator {
+                if let MirOperand::Variable(name) = val {
+                    self.live.insert(name.clone());
+                }
+            }
+        }
+        
+        // Propagate liveness
+        let mut changed = true;
+        while changed {
+            changed = false;
+            
+            for block in &func.blocks {
+                for stmt in &block.statements {
+                    if self.is_stmt_live(stmt) {
+                        let old_size = self.live.len();
+                        self.mark_operands_live(stmt);
+                        
+                        if self.live.len() > old_size {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    fn is_critical(&self, stmt: &MirStatement) -> bool {
+        matches!(stmt,
+            MirStatement::Store { .. } |
+            MirStatement::Call { .. }
+        )
+    }
+    
+    fn mark_live(&mut self, stmt: &MirStatement) {
+        if let Some(def) = self.get_definition(stmt) {
+            self.live.insert(def.to_string());
+        }
+        self.mark_operands_live(stmt);
+    }
+    
+    fn mark_operands_live(&mut self, stmt: &MirStatement) {
+        match stmt {
+            MirStatement::Assign { value, .. } => {
+                if let MirOperand::Variable(name) = value {
+                    self.live.insert(name.clone());
+                }
+            }
+            MirStatement::BinaryOp { lhs, rhs, .. } => {
+                if let MirOperand::Variable(name) = lhs {
+                    self.live.insert(name.clone());
+                }
+                if let MirOperand::Variable(name) = rhs {
+                    self.live.insert(name.clone());
+                }
+            }
+            MirStatement::Load { ptr, .. } => {
+                if let MirOperand::Variable(name) = ptr {
+                    self.live.insert(name.clone());
+                }
+            }
+            MirStatement::Store { ptr, value, .. } => {
+                if let MirOperand::Variable(name) = ptr {
+                    self.live.insert(name.clone());
+                }
+                if let MirOperand::Variable(name) = value {
+                    self.live.insert(name.clone());
+                }
+            }
+            MirStatement::Call { args, .. } => {
+                for arg in args {
+                    if let MirOperand::Variable(name) = arg {
+                        self.live.insert(name.clone());
+                    }
+                }
+            }
+            MirStatement::Phi { incoming, .. } => {
+                for (_, val) in incoming {
+                    if let MirOperand::Variable(name) = val {
+                        self.live.insert(name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    fn is_stmt_live(&self, stmt: &MirStatement) -> bool {
+        if self.is_critical(stmt) {
+            return true;
+        }
+        
+        if let Some(def) = self.get_definition(stmt) {
+            return self.live.contains(def);
+        }
+        
+        false
+    }
+    
+    fn get_definition<'a>(&self, stmt: &'a MirStatement) -> Option<&'a str> {
+        match stmt {
+            MirStatement::Assign { dest, .. } |
+            MirStatement::BinaryOp { dest, .. } |
+            MirStatement::Load { dest, .. } |
+            MirStatement::Phi { dest, .. } => Some(dest.as_str()),
+            MirStatement::Call { dest: Some(d), .. } => Some(d.as_str()),
+            _ => None,
+        }
+    }
+    
+    fn sweep(&self, func: &mut MirFunction) -> u32 {
+        let mut eliminated = 0;
+        
+        for block in &mut func.blocks {
+            let old_len = block.statements.len();
+            
+            block.statements.retain(|stmt| {
+                if self.is_critical(stmt) {
+                    return true;
+                }
+                
+                if let Some(def) = self.get_definition(stmt) {
+                    return self.live.contains(def);
+                }
+                
+                false
+            });
+            
+            eliminated += (old_len - block.statements.len()) as u32;
+        }
+        
+        eliminated
+    }
+}
+
+impl Default for DCE {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALGEBRAIC SIMPLIFICATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Algebraic simplification pass
+pub struct AlgebraicSimplification;
+
+impl AlgebraicSimplification {
+    pub fn new() -> Self {
+        AlgebraicSimplification
+    }
+    
+    /// Run algebraic simplification on a function
+    pub fn run(&self, func: &mut MirFunction) -> u32 {
+        let mut simplified = 0;
+        
+        for block in &mut func.blocks {
+            for stmt in &mut block.statements {
+                if let Some(new_stmt) = self.simplify(stmt) {
+                    *stmt = new_stmt;
+                    simplified += 1;
+                }
+            }
+        }
+        
+        simplified
+    }
+    
+    fn simplify(&self, stmt: &MirStatement) -> Option<MirStatement> {
+        if let MirStatement::BinaryOp { dest, op, lhs, rhs } = stmt {
+            return self.simplify_binary(dest, *op, lhs, rhs);
+        }
+        
+        None
+    }
+    
+    fn simplify_binary(&self, dest: &str, op: BinOp, lhs: &MirOperand, rhs: &MirOperand) -> Option<MirStatement> {
+        // Identity simplifications
+        match op {
+            BinOp::Add => {
+                // x + 0 = x
+                if rhs == &MirOperand::Constant(0) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                // 0 + x = x
+                if lhs == &MirOperand::Constant(0) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: rhs.clone(),
+                    });
+                }
+            }
+            BinOp::Sub => {
+                // x - 0 = x
+                if rhs == &MirOperand::Constant(0) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                // x - x = 0
+                if lhs == rhs {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+            }
+            BinOp::Mul => {
+                // x * 0 = 0
+                if rhs == &MirOperand::Constant(0) || lhs == &MirOperand::Constant(0) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+                // x * 1 = x
+                if rhs == &MirOperand::Constant(1) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                // 1 * x = x
+                if lhs == &MirOperand::Constant(1) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: rhs.clone(),
+                    });
+                }
+                // x * 2 = x << 1
+                if let MirOperand::Constant(c) = rhs {
+                    if c.is_power_of_two() {
+                        return Some(MirStatement::BinaryOp {
+                            dest: dest.to_string(),
+                            op: BinOp::Shl,
+                            lhs: lhs.clone(),
+                            rhs: MirOperand::Constant(c.trailing_zeros() as i64),
+                        });
+                    }
+                }
+            }
+            BinOp::Div => {
+                // x / 1 = x
+                if rhs == &MirOperand::Constant(1) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                // 0 / x = 0
+                if lhs == &MirOperand::Constant(0) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+            }
+            BinOp::And => {
+                // x & 0 = 0
+                if rhs == &MirOperand::Constant(0) || lhs == &MirOperand::Constant(0) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+                // x & -1 = x (all ones)
+                if rhs == &MirOperand::Constant(-1) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                // x & x = x
+                if lhs == rhs {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+            }
+            BinOp::Or => {
+                // x | 0 = x
+                if rhs == &MirOperand::Constant(0) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                if lhs == &MirOperand::Constant(0) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: rhs.clone(),
+                    });
+                }
+                // x | x = x
+                if lhs == rhs {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+            }
+            BinOp::Xor => {
+                // x ^ 0 = x
+                if rhs == &MirOperand::Constant(0) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+                // x ^ x = 0
+                if lhs == rhs {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: MirOperand::Constant(0),
+                    });
+                }
+            }
+            BinOp::Shl | BinOp::Shr => {
+                // x << 0 = x, x >> 0 = x
+                if rhs == &MirOperand::Constant(0) {
+                    return Some(MirStatement::Assign {
+                        dest: dest.to_string(),
+                        value: lhs.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        
+        None
+    }
+}
+
+impl Default for AlgebraicSimplification {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COPY PROPAGATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Copy propagation pass
+pub struct CopyPropagation {
+    /// Copy chains: a = b mapping
+    copies: BTreeMap<String, String>,
+}
+
+impl CopyPropagation {
+    pub fn new() -> Self {
+        CopyPropagation {
+            copies: BTreeMap::new(),
+        }
+    }
+    
+    /// Run copy propagation on a function
+    pub fn run(&mut self, func: &mut MirFunction) -> u32 {
+        self.copies.clear();
+        let mut propagated = 0;
+        
+        // First pass: collect copies
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let MirStatement::Assign { dest, value: MirOperand::Variable(src) } = stmt {
+                    self.copies.insert(dest.clone(), src.clone());
+                }
+            }
+        }
+        
+        // Second pass: propagate copies
+        for block in &mut func.blocks {
+            for stmt in &mut block.statements {
+                propagated += self.propagate_copies(stmt);
+            }
+        }
+        
+        propagated
+    }
+    
+    fn propagate_copies(&self, stmt: &mut MirStatement) -> u32 {
+        let mut propagated = 0;
+        
+        match stmt {
+            MirStatement::Assign { value, .. } => {
+                propagated += self.propagate_operand(value);
+            }
+            MirStatement::BinaryOp { lhs, rhs, .. } => {
+                propagated += self.propagate_operand(lhs);
+                propagated += self.propagate_operand(rhs);
+            }
+            MirStatement::Load { ptr, .. } => {
+                propagated += self.propagate_operand(ptr);
+            }
+            MirStatement::Store { ptr, value, .. } => {
+                propagated += self.propagate_operand(ptr);
+                propagated += self.propagate_operand(value);
+            }
+            MirStatement::Call { args, .. } => {
+                for arg in args {
+                    propagated += self.propagate_operand(arg);
+                }
+            }
+            _ => {}
+        }
+        
+        propagated
+    }
+    
+    fn propagate_operand(&self, operand: &mut MirOperand) -> u32 {
+        if let MirOperand::Variable(name) = operand {
+            if let Some(src) = self.get_root(name) {
+                if src != *name {
+                    *name = src;
+                    return 1;
+                }
+            }
+        }
+        0
+    }
+    
+    fn get_root(&self, name: &str) -> Option<String> {
+        let mut current = name.to_string();
+        let mut visited = BTreeSet::new();
+        
+        while let Some(next) = self.copies.get(&current) {
+            if visited.contains(next) {
+                break; // Cycle detected
+            }
+            visited.insert(current.clone());
+            current = next.clone();
+        }
+        
+        Some(current)
+    }
+}
+
+impl Default for CopyPropagation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIR TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct MirFunction {
+    pub name: String,
+    pub blocks: Vec<MirBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MirBlock {
+    pub id: u32,
+    pub statements: Vec<MirStatement>,
+    pub terminator: MirTerminator,
+}
+
+#[derive(Debug, Clone)]
+pub enum MirStatement {
+    Assign { dest: String, value: MirOperand },
+    BinaryOp { dest: String, op: BinOp, lhs: MirOperand, rhs: MirOperand },
+    Load { dest: String, ptr: MirOperand, size: usize },
+    Store { ptr: MirOperand, value: MirOperand, size: usize },
+    Call { callee: String, args: Vec<MirOperand>, dest: Option<String> },
+    Phi { dest: String, incoming: Vec<(u32, MirOperand)> },
+    Nop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirOperand {
+    Variable(String),
+    Constant(i64),
+    Gep { base: Box<MirOperand>, offset: i64 },
+}
+
+impl MirOperand {
+    pub fn is_var(&self, name: &str) -> bool {
+        matches!(self, MirOperand::Variable(n) if n == name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem,
+    And, Or, Xor, Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+}
+
+impl BinOp {
+    pub fn is_commutative(&self) -> bool {
+        matches!(self, BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor |
+                      BinOp::Eq | BinOp::Ne)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum MirTerminator {
+    Goto(u32),
+    Branch { cond: MirOperand, then_bb: u32, else_bb: u32 },
+    Switch { value: MirOperand, targets: Vec<(i64, u32)>, default: u32 },
+    Return { value: Option<MirOperand> },
+    Unreachable,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_lattice_meet() {
+        let a = LatticeValue::Constant(42);
+        let b = LatticeValue::Constant(42);
+        let c = LatticeValue::Constant(10);
+        
+        assert_eq!(a.meet(&b), LatticeValue::Constant(42));
+        assert_eq!(a.meet(&c), LatticeValue::Bottom);
+        assert_eq!(LatticeValue::Top.meet(&a), LatticeValue::Constant(42));
+    }
+    
+    #[test]
+    fn test_algebraic_simplification() {
+        let simp = AlgebraicSimplification::new();
+        
+        let stmt = MirStatement::BinaryOp {
+            dest: "x".to_string(),
+            op: BinOp::Add,
+            lhs: MirOperand::Variable("y".to_string()),
+            rhs: MirOperand::Constant(0),
+        };
+        
+        let simplified = simp.simplify(&stmt);
+        assert!(simplified.is_some());
+        
+        if let Some(MirStatement::Assign { dest, value }) = simplified {
+            assert_eq!(dest, "x");
+            assert_eq!(value, MirOperand::Variable("y".to_string()));
+        }
+    }
+    
+    #[test]
+    fn test_mul_to_shift() {
+        let simp = AlgebraicSimplification::new();
+        
+        let stmt = MirStatement::BinaryOp {
+            dest: "x".to_string(),
+            op: BinOp::Mul,
+            lhs: MirOperand::Variable("y".to_string()),
+            rhs: MirOperand::Constant(8),
+        };
+        
+        let simplified = simp.simplify(&stmt);
+        assert!(simplified.is_some());
+        
+        if let Some(MirStatement::BinaryOp { op, rhs, .. }) = simplified {
+            assert_eq!(op, BinOp::Shl);
+            assert_eq!(rhs, MirOperand::Constant(3));
+        }
+    }
+    
+    #[test]
+    fn test_dce() {
+        let mut dce = DCE::new();
+        
+        let mut func = MirFunction {
+            name: "test".to_string(),
+            blocks: vec![
+                MirBlock {
+                    id: 0,
+                    statements: vec![
+                        MirStatement::Assign {
+                            dest: "unused".to_string(),
+                            value: MirOperand::Constant(42),
+                        },
+                        MirStatement::Assign {
+                            dest: "used".to_string(),
+                            value: MirOperand::Constant(1),
+                        },
+                    ],
+                    terminator: MirTerminator::Return {
+                        value: Some(MirOperand::Variable("used".to_string())),
+                    },
+                },
+            ],
+        };
+        
+        let eliminated = dce.run(&mut func);
+        
+        assert_eq!(eliminated, 1);
+        assert_eq!(func.blocks[0].statements.len(), 1);
+    }
+}

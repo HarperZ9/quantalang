@@ -1,0 +1,900 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ BUILD SYSTEM — Compiler Driver
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Compiler invocation, process management, and output parsing.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::build::compiler
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio, Child, Output, ExitStatus};
+use std::io::{self, BufRead, BufReader, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use crate::build::config::{
+    BuildConfig, BuildTarget, Profile, OptLevel, Lto, PanicStrategy, DebugInfo,
+    TargetTriple, CrateType, Edition,
+};
+use crate::build::graph::{Unit, UnitId};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPILER INVOCATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compiler invocation builder
+pub struct CompilerInvocation {
+    /// Source file
+    source: PathBuf,
+    
+    /// Output file
+    output: Option<PathBuf>,
+    
+    /// Output directory
+    out_dir: Option<PathBuf>,
+    
+    /// Crate name
+    crate_name: Option<String>,
+    
+    /// Crate type
+    crate_types: Vec<CrateType>,
+    
+    /// Edition
+    edition: Edition,
+    
+    /// Target triple
+    target: Option<TargetTriple>,
+    
+    /// Profile settings
+    opt_level: OptLevel,
+    debug_info: DebugInfo,
+    debug_assertions: bool,
+    overflow_checks: bool,
+    lto: Lto,
+    panic: PanicStrategy,
+    codegen_units: Option<usize>,
+    incremental: Option<PathBuf>,
+    
+    /// External crate paths
+    externs: Vec<(String, PathBuf)>,
+    
+    /// Link arguments
+    link_args: Vec<String>,
+    
+    /// Extra codegen options
+    codegen_opts: Vec<String>,
+    
+    /// Feature flags (cfg)
+    cfg_flags: Vec<String>,
+    
+    /// Search paths
+    library_paths: Vec<PathBuf>,
+    
+    /// Emit types
+    emit: Vec<EmitType>,
+    
+    /// Error format
+    error_format: ErrorFormat,
+    
+    /// JSON message format
+    json_messages: bool,
+    
+    /// Color output
+    color: ColorOutput,
+    
+    /// Verbose
+    verbose: bool,
+    
+    /// Environment variables
+    env: BTreeMap<String, String>,
+    
+    /// Extra arguments
+    extra_args: Vec<String>,
+}
+
+impl CompilerInvocation {
+    /// Create new invocation for source file
+    pub fn new(source: &Path) -> Self {
+        CompilerInvocation {
+            source: source.to_path_buf(),
+            output: None,
+            out_dir: None,
+            crate_name: None,
+            crate_types: Vec::new(),
+            edition: Edition::Edition2025,
+            target: None,
+            opt_level: OptLevel::O0,
+            debug_info: DebugInfo::Full,
+            debug_assertions: true,
+            overflow_checks: true,
+            lto: Lto::Off,
+            panic: PanicStrategy::Unwind,
+            codegen_units: None,
+            incremental: None,
+            externs: Vec::new(),
+            link_args: Vec::new(),
+            codegen_opts: Vec::new(),
+            cfg_flags: Vec::new(),
+            library_paths: Vec::new(),
+            emit: Vec::new(),
+            error_format: ErrorFormat::Human,
+            json_messages: false,
+            color: ColorOutput::Auto,
+            verbose: false,
+            env: BTreeMap::new(),
+            extra_args: Vec::new(),
+        }
+    }
+    
+    /// Create from build config and unit
+    pub fn from_unit(unit: &Unit, config: &BuildConfig) -> Self {
+        let source = unit.sources.first()
+            .map(|s| s.path.clone())
+            .unwrap_or_default();
+        
+        let mut inv = Self::new(&source);
+        
+        inv.crate_name = Some(unit.id.target.clone());
+        inv.edition = Edition::Edition2025;
+        inv.target = Some(config.target.clone());
+        
+        // Apply profile settings
+        inv.opt_level = config.profile.opt_level;
+        inv.debug_info = config.profile.debug;
+        inv.debug_assertions = config.profile.debug_assertions;
+        inv.overflow_checks = config.profile.overflow_checks;
+        inv.lto = config.profile.lto;
+        inv.panic = config.profile.panic;
+        inv.codegen_units = config.profile.codegen_units;
+        
+        if config.incremental {
+            inv.incremental = Some(config.incremental_dir());
+        }
+        
+        inv.out_dir = Some(config.output_dir());
+        
+        // Features as cfg flags
+        for feature in &config.features {
+            inv.cfg_flags.push(format!("feature=\"{}\"", feature));
+        }
+        
+        inv.verbose = config.verbose;
+        inv.env = config.env.clone();
+        inv.extra_args = config.extra_flags.clone();
+        
+        inv
+    }
+    
+    // Builder methods
+    
+    pub fn output(mut self, path: &Path) -> Self {
+        self.output = Some(path.to_path_buf());
+        self
+    }
+    
+    pub fn out_dir(mut self, dir: &Path) -> Self {
+        self.out_dir = Some(dir.to_path_buf());
+        self
+    }
+    
+    pub fn crate_name(mut self, name: &str) -> Self {
+        self.crate_name = Some(name.to_string());
+        self
+    }
+    
+    pub fn crate_type(mut self, crate_type: CrateType) -> Self {
+        self.crate_types.push(crate_type);
+        self
+    }
+    
+    pub fn edition(mut self, edition: Edition) -> Self {
+        self.edition = edition;
+        self
+    }
+    
+    pub fn target(mut self, target: TargetTriple) -> Self {
+        self.target = Some(target);
+        self
+    }
+    
+    pub fn opt_level(mut self, level: OptLevel) -> Self {
+        self.opt_level = level;
+        self
+    }
+    
+    pub fn debug_info(mut self, debug: DebugInfo) -> Self {
+        self.debug_info = debug;
+        self
+    }
+    
+    pub fn extern_crate(mut self, name: &str, path: &Path) -> Self {
+        self.externs.push((name.to_string(), path.to_path_buf()));
+        self
+    }
+    
+    pub fn link_arg(mut self, arg: &str) -> Self {
+        self.link_args.push(arg.to_string());
+        self
+    }
+    
+    pub fn codegen_opt(mut self, opt: &str) -> Self {
+        self.codegen_opts.push(opt.to_string());
+        self
+    }
+    
+    pub fn cfg(mut self, flag: &str) -> Self {
+        self.cfg_flags.push(flag.to_string());
+        self
+    }
+    
+    pub fn library_path(mut self, path: &Path) -> Self {
+        self.library_paths.push(path.to_path_buf());
+        self
+    }
+    
+    pub fn emit(mut self, emit_type: EmitType) -> Self {
+        self.emit.push(emit_type);
+        self
+    }
+    
+    pub fn json_messages(mut self, enable: bool) -> Self {
+        self.json_messages = enable;
+        if enable {
+            self.error_format = ErrorFormat::Json;
+        }
+        self
+    }
+    
+    pub fn color(mut self, color: ColorOutput) -> Self {
+        self.color = color;
+        self
+    }
+    
+    pub fn verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+    
+    pub fn env(mut self, key: &str, value: &str) -> Self {
+        self.env.insert(key.to_string(), value.to_string());
+        self
+    }
+    
+    pub fn arg(mut self, arg: &str) -> Self {
+        self.extra_args.push(arg.to_string());
+        self
+    }
+    
+    /// Build command-line arguments
+    pub fn build_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        
+        // Source file
+        args.push(self.source.to_string_lossy().into_owned());
+        
+        // Crate name
+        if let Some(ref name) = self.crate_name {
+            args.push("--crate-name".to_string());
+            args.push(name.clone());
+        }
+        
+        // Crate types
+        for ct in &self.crate_types {
+            args.push("--crate-type".to_string());
+            args.push(ct.as_str().to_string());
+        }
+        
+        // Edition
+        args.push("--edition".to_string());
+        args.push(self.edition.as_str().to_string());
+        
+        // Target
+        if let Some(ref target) = self.target {
+            args.push("--target".to_string());
+            args.push(target.triple().to_string());
+        }
+        
+        // Output
+        if let Some(ref output) = self.output {
+            args.push("-o".to_string());
+            args.push(output.to_string_lossy().into_owned());
+        }
+        
+        // Output directory
+        if let Some(ref out_dir) = self.out_dir {
+            args.push("--out-dir".to_string());
+            args.push(out_dir.to_string_lossy().into_owned());
+        }
+        
+        // Optimization level
+        args.push("-C".to_string());
+        args.push(format!("opt-level={}", self.opt_level.as_str()));
+        
+        // Debug info
+        match self.debug_info {
+            DebugInfo::None => {}
+            DebugInfo::LineDirectivesOnly => {
+                args.push("-C".to_string());
+                args.push("debuginfo=line-directives-only".to_string());
+            }
+            DebugInfo::LineTablesOnly => {
+                args.push("-C".to_string());
+                args.push("debuginfo=line-tables-only".to_string());
+            }
+            DebugInfo::Limited => {
+                args.push("-C".to_string());
+                args.push("debuginfo=1".to_string());
+            }
+            DebugInfo::Full => {
+                args.push("-C".to_string());
+                args.push("debuginfo=2".to_string());
+            }
+        }
+        
+        // Debug assertions
+        if !self.debug_assertions {
+            args.push("-C".to_string());
+            args.push("debug-assertions=no".to_string());
+        }
+        
+        // Overflow checks
+        if !self.overflow_checks {
+            args.push("-C".to_string());
+            args.push("overflow-checks=no".to_string());
+        }
+        
+        // LTO
+        match self.lto {
+            Lto::Off => {}
+            Lto::Thin => {
+                args.push("-C".to_string());
+                args.push("lto=thin".to_string());
+            }
+            Lto::Fat => {
+                args.push("-C".to_string());
+                args.push("lto=fat".to_string());
+            }
+        }
+        
+        // Panic strategy
+        match self.panic {
+            PanicStrategy::Unwind => {}
+            PanicStrategy::Abort => {
+                args.push("-C".to_string());
+                args.push("panic=abort".to_string());
+            }
+        }
+        
+        // Codegen units
+        if let Some(units) = self.codegen_units {
+            args.push("-C".to_string());
+            args.push(format!("codegen-units={}", units));
+        }
+        
+        // Incremental
+        if let Some(ref dir) = self.incremental {
+            args.push("-C".to_string());
+            args.push(format!("incremental={}", dir.display()));
+        }
+        
+        // External crates
+        for (name, path) in &self.externs {
+            args.push("--extern".to_string());
+            args.push(format!("{}={}", name, path.display()));
+        }
+        
+        // Link arguments
+        for arg in &self.link_args {
+            args.push("-C".to_string());
+            args.push(format!("link-arg={}", arg));
+        }
+        
+        // Codegen options
+        for opt in &self.codegen_opts {
+            args.push("-C".to_string());
+            args.push(opt.clone());
+        }
+        
+        // Cfg flags
+        for flag in &self.cfg_flags {
+            args.push("--cfg".to_string());
+            args.push(flag.clone());
+        }
+        
+        // Library paths
+        for path in &self.library_paths {
+            args.push("-L".to_string());
+            args.push(path.to_string_lossy().into_owned());
+        }
+        
+        // Emit
+        if !self.emit.is_empty() {
+            let emit_str = self.emit.iter()
+                .map(|e| e.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            args.push("--emit".to_string());
+            args.push(emit_str);
+        }
+        
+        // Error format
+        args.push("--error-format".to_string());
+        args.push(self.error_format.as_str().to_string());
+        
+        // JSON messages
+        if self.json_messages {
+            args.push("--json".to_string());
+            args.push("diagnostic-rendered-ansi,artifacts,future-incompat".to_string());
+        }
+        
+        // Color
+        args.push("--color".to_string());
+        args.push(self.color.as_str().to_string());
+        
+        // Extra args
+        args.extend(self.extra_args.clone());
+        
+        args
+    }
+    
+    /// Execute compilation
+    pub fn execute(&self) -> CompileResult {
+        let compiler = find_compiler();
+        let args = self.build_args();
+        
+        if self.verbose {
+            eprintln!("Running: {} {}", compiler.display(), args.join(" "));
+        }
+        
+        let start = Instant::now();
+        
+        let mut cmd = Command::new(&compiler);
+        cmd.args(&args);
+        
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+        
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        
+        match cmd.spawn() {
+            Ok(child) => {
+                match wait_with_output(child) {
+                    Ok((status, stdout, stderr)) => {
+                        let duration = start.elapsed();
+                        
+                        let messages = if self.json_messages {
+                            parse_json_messages(&stderr)
+                        } else {
+                            parse_human_messages(&stderr)
+                        };
+                        
+                        CompileResult {
+                            success: status.success(),
+                            exit_code: status.code(),
+                            stdout,
+                            stderr,
+                            messages,
+                            duration,
+                            invocation: args,
+                        }
+                    }
+                    Err(e) => CompileResult::error(&format!("process error: {}", e), args),
+                }
+            }
+            Err(e) => CompileResult::error(&format!("failed to spawn compiler: {}", e), args),
+        }
+    }
+    
+    /// Execute asynchronously
+    pub fn spawn(&self) -> io::Result<CompileProcess> {
+        let compiler = find_compiler();
+        let args = self.build_args();
+        
+        let mut cmd = Command::new(&compiler);
+        cmd.args(&args);
+        
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+        
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        
+        let child = cmd.spawn()?;
+        
+        Ok(CompileProcess {
+            child,
+            args,
+            start: Instant::now(),
+            json_messages: self.json_messages,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmitType {
+    Asm,
+    LlvmBc,
+    LlvmIr,
+    Obj,
+    Metadata,
+    Link,
+    DepInfo,
+    Mir,
+}
+
+impl EmitType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EmitType::Asm => "asm",
+            EmitType::LlvmBc => "llvm-bc",
+            EmitType::LlvmIr => "llvm-ir",
+            EmitType::Obj => "obj",
+            EmitType::Metadata => "metadata",
+            EmitType::Link => "link",
+            EmitType::DepInfo => "dep-info",
+            EmitType::Mir => "mir",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorFormat {
+    Human,
+    Short,
+    Json,
+}
+
+impl ErrorFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ErrorFormat::Human => "human",
+            ErrorFormat::Short => "short",
+            ErrorFormat::Json => "json",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorOutput {
+    Auto,
+    Always,
+    Never,
+}
+
+impl ColorOutput {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ColorOutput::Auto => "auto",
+            ColorOutput::Always => "always",
+            ColorOutput::Never => "never",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPILE RESULT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Result of compilation
+#[derive(Debug)]
+pub struct CompileResult {
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub messages: Vec<CompilerMessage>,
+    pub duration: Duration,
+    pub invocation: Vec<String>,
+}
+
+impl CompileResult {
+    fn error(message: &str, args: Vec<String>) -> Self {
+        CompileResult {
+            success: false,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: message.to_string(),
+            messages: vec![CompilerMessage {
+                level: MessageLevel::Error,
+                message: message.to_string(),
+                code: None,
+                spans: Vec::new(),
+                children: Vec::new(),
+                rendered: Some(message.to_string()),
+            }],
+            duration: Duration::ZERO,
+            invocation: args,
+        }
+    }
+    
+    pub fn error_count(&self) -> usize {
+        self.messages.iter()
+            .filter(|m| matches!(m.level, MessageLevel::Error | MessageLevel::Ice))
+            .count()
+    }
+    
+    pub fn warning_count(&self) -> usize {
+        self.messages.iter()
+            .filter(|m| matches!(m.level, MessageLevel::Warning))
+            .count()
+    }
+}
+
+/// Running compilation process
+pub struct CompileProcess {
+    child: Child,
+    args: Vec<String>,
+    start: Instant,
+    json_messages: bool,
+}
+
+impl CompileProcess {
+    /// Wait for completion
+    pub fn wait(self) -> CompileResult {
+        match wait_with_output(self.child) {
+            Ok((status, stdout, stderr)) => {
+                let messages = if self.json_messages {
+                    parse_json_messages(&stderr)
+                } else {
+                    parse_human_messages(&stderr)
+                };
+                
+                CompileResult {
+                    success: status.success(),
+                    exit_code: status.code(),
+                    stdout,
+                    stderr,
+                    messages,
+                    duration: self.start.elapsed(),
+                    invocation: self.args,
+                }
+            }
+            Err(e) => CompileResult::error(&format!("process error: {}", e), self.args),
+        }
+    }
+    
+    /// Check if still running
+    pub fn try_wait(&mut self) -> io::Result<Option<CompileResult>> {
+        match self.child.try_wait()? {
+            Some(_) => {
+                // Process finished, but we need to consume it properly
+                // This is a simplified version
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+    
+    /// Kill process
+    pub fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPILER MESSAGES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct CompilerMessage {
+    pub level: MessageLevel,
+    pub message: String,
+    pub code: Option<DiagnosticCode>,
+    pub spans: Vec<DiagnosticSpan>,
+    pub children: Vec<CompilerMessage>,
+    pub rendered: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageLevel {
+    Ice,        // Internal Compiler Error
+    Error,
+    Warning,
+    Note,
+    Help,
+    FailureNote,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiagnosticCode {
+    pub code: String,
+    pub explanation: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiagnosticSpan {
+    pub file_name: String,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub column_start: usize,
+    pub column_end: usize,
+    pub is_primary: bool,
+    pub label: Option<String>,
+    pub suggested_replacement: Option<String>,
+}
+
+/// Parse JSON compiler messages
+fn parse_json_messages(output: &str) -> Vec<CompilerMessage> {
+    let mut messages = Vec::new();
+    
+    for line in output.lines() {
+        if line.starts_with('{') {
+            if let Some(msg) = parse_json_message(line) {
+                messages.push(msg);
+            }
+        }
+    }
+    
+    messages
+}
+
+fn parse_json_message(json: &str) -> Option<CompilerMessage> {
+    // Simplified JSON parsing - in production use a proper JSON parser
+    let level = if json.contains("\"level\":\"error\"") {
+        MessageLevel::Error
+    } else if json.contains("\"level\":\"warning\"") {
+        MessageLevel::Warning
+    } else if json.contains("\"level\":\"note\"") {
+        MessageLevel::Note
+    } else if json.contains("\"level\":\"help\"") {
+        MessageLevel::Help
+    } else if json.contains("\"level\":\"ice\"") {
+        MessageLevel::Ice
+    } else {
+        return None;
+    };
+    
+    // Extract message
+    let message = extract_json_string(json, "message").unwrap_or_default();
+    
+    // Extract rendered
+    let rendered = extract_json_string(json, "rendered");
+    
+    Some(CompilerMessage {
+        level,
+        message,
+        code: None,
+        spans: Vec::new(),
+        children: Vec::new(),
+        rendered,
+    })
+}
+
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\":\"", key);
+    let start = json.find(&pattern)? + pattern.len();
+    let end = json[start..].find('"')? + start;
+    Some(json[start..end].to_string())
+}
+
+/// Parse human-readable compiler messages
+fn parse_human_messages(output: &str) -> Vec<CompilerMessage> {
+    let mut messages = Vec::new();
+    
+    for line in output.lines() {
+        if line.starts_with("error") {
+            messages.push(CompilerMessage {
+                level: MessageLevel::Error,
+                message: line.to_string(),
+                code: None,
+                spans: Vec::new(),
+                children: Vec::new(),
+                rendered: Some(line.to_string()),
+            });
+        } else if line.starts_with("warning") {
+            messages.push(CompilerMessage {
+                level: MessageLevel::Warning,
+                message: line.to_string(),
+                code: None,
+                spans: Vec::new(),
+                children: Vec::new(),
+                rendered: Some(line.to_string()),
+            });
+        }
+    }
+    
+    messages
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn find_compiler() -> PathBuf {
+    // Check environment variable first
+    if let Ok(path) = std::env::var("QUANTAC") {
+        return PathBuf::from(path);
+    }
+    
+    // Check PATH
+    if let Ok(output) = Command::new("which").arg("quantac").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return PathBuf::from(path);
+            }
+        }
+    }
+    
+    // Default
+    PathBuf::from("quantac")
+}
+
+fn wait_with_output(mut child: Child) -> io::Result<(ExitStatus, String, String)> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    
+    let stdout_str = stdout
+        .map(|s| {
+            let reader = BufReader::new(s);
+            reader.lines().filter_map(|l| l.ok()).collect::<Vec<_>>().join("\n")
+        })
+        .unwrap_or_default();
+    
+    let stderr_str = stderr
+        .map(|s| {
+            let reader = BufReader::new(s);
+            reader.lines().filter_map(|l| l.ok()).collect::<Vec<_>>().join("\n")
+        })
+        .unwrap_or_default();
+    
+    let status = child.wait()?;
+    
+    Ok((status, stdout_str, stderr_str))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_invocation_builder() {
+        let inv = CompilerInvocation::new(Path::new("main.quanta"))
+            .crate_name("myapp")
+            .crate_type(CrateType::Bin)
+            .opt_level(OptLevel::O2)
+            .output(Path::new("myapp"));
+        
+        let args = inv.build_args();
+        
+        assert!(args.contains(&"main.quanta".to_string()));
+        assert!(args.contains(&"--crate-name".to_string()));
+        assert!(args.contains(&"myapp".to_string()));
+    }
+    
+    #[test]
+    fn test_emit_types() {
+        let inv = CompilerInvocation::new(Path::new("lib.quanta"))
+            .emit(EmitType::Obj)
+            .emit(EmitType::DepInfo);
+        
+        let args = inv.build_args();
+        
+        assert!(args.contains(&"--emit".to_string()));
+        assert!(args.iter().any(|a| a.contains("obj") && a.contains("dep-info")));
+    }
+    
+    #[test]
+    fn test_parse_json_message() {
+        let json = r#"{"level":"error","message":"test error"}"#;
+        let msg = parse_json_message(json).unwrap();
+        
+        assert_eq!(msg.level, MessageLevel::Error);
+        assert_eq!(msg.message, "test error");
+    }
+}

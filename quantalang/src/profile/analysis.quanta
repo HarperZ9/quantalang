@@ -1,0 +1,735 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ PROFILER — Analysis & Reporting
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Profile data analysis, aggregation, and report generation.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::profile::analysis
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use std::time::Duration;
+use std::io::Write;
+use crate::profile::sampler::{
+    Sample, StackFrame, Span, ProfilerConfig, OutputFormat,
+    AllocationStats, AllocationInfo,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROFILE ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Analyzed profile data
+#[derive(Debug, Clone)]
+pub struct ProfileAnalysis {
+    /// Total samples collected
+    pub total_samples: u64,
+    
+    /// Profiling duration
+    pub duration: Duration,
+    
+    /// Samples per second
+    pub sample_rate: f64,
+    
+    /// Per-function statistics
+    pub functions: Vec<FunctionStats>,
+    
+    /// Call graph
+    pub call_graph: CallGraph,
+    
+    /// Hot paths
+    pub hot_paths: Vec<HotPath>,
+    
+    /// Thread breakdown
+    pub threads: BTreeMap<u64, ThreadStats>,
+    
+    /// Memory statistics (if enabled)
+    pub memory: Option<MemoryAnalysis>,
+}
+
+/// Statistics for a single function
+#[derive(Debug, Clone)]
+pub struct FunctionStats {
+    /// Function name
+    pub name: String,
+    
+    /// Module/file
+    pub module: Option<String>,
+    
+    /// Self samples (time in this function only)
+    pub self_samples: u64,
+    
+    /// Total samples (including callees)
+    pub total_samples: u64,
+    
+    /// Self percentage
+    pub self_percent: f64,
+    
+    /// Total percentage
+    pub total_percent: f64,
+    
+    /// Call sites
+    pub call_sites: Vec<CallSite>,
+    
+    /// Source locations
+    pub source_locations: Vec<SourceLocation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallSite {
+    pub caller: String,
+    pub count: u64,
+    pub percent: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceLocation {
+    pub file: String,
+    pub line: u32,
+    pub samples: u64,
+}
+
+/// Call graph representation
+#[derive(Debug, Clone)]
+pub struct CallGraph {
+    pub nodes: BTreeMap<String, CallGraphNode>,
+    pub edges: Vec<CallGraphEdge>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallGraphNode {
+    pub name: String,
+    pub self_samples: u64,
+    pub total_samples: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallGraphEdge {
+    pub caller: String,
+    pub callee: String,
+    pub count: u64,
+    pub percent: f64,
+}
+
+/// Hot execution path
+#[derive(Debug, Clone)]
+pub struct HotPath {
+    pub frames: Vec<String>,
+    pub samples: u64,
+    pub percent: f64,
+}
+
+/// Per-thread statistics
+#[derive(Debug, Clone)]
+pub struct ThreadStats {
+    pub thread_id: u64,
+    pub thread_name: Option<String>,
+    pub samples: u64,
+    pub percent: f64,
+    pub top_functions: Vec<(String, u64)>,
+}
+
+/// Memory analysis
+#[derive(Debug, Clone)]
+pub struct MemoryAnalysis {
+    pub stats: AllocationStats,
+    pub top_allocators: Vec<AllocatorInfo>,
+    pub potential_leaks: Vec<LeakInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AllocatorInfo {
+    pub name: String,
+    pub allocation_count: u64,
+    pub total_bytes: u64,
+    pub percent: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LeakInfo {
+    pub address: u64,
+    pub size: u64,
+    pub stack: Vec<String>,
+    pub age: Duration,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ANALYZER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Profile analyzer
+pub struct Analyzer {
+    config: ProfilerConfig,
+}
+
+impl Analyzer {
+    pub fn new(config: ProfilerConfig) -> Self {
+        Analyzer { config }
+    }
+    
+    /// Analyze collected samples
+    pub fn analyze(&self, samples: &[Sample], duration: Duration) -> ProfileAnalysis {
+        let total_samples = samples.len() as u64;
+        let sample_rate = if duration.as_secs_f64() > 0.0 {
+            total_samples as f64 / duration.as_secs_f64()
+        } else {
+            0.0
+        };
+        
+        // Aggregate function statistics
+        let mut self_counts: BTreeMap<String, u64> = BTreeMap::new();
+        let mut total_counts: BTreeMap<String, u64> = BTreeMap::new();
+        let mut call_edges: BTreeMap<(String, String), u64> = BTreeMap::new();
+        let mut thread_samples: BTreeMap<u64, (Option<String>, u64)> = BTreeMap::new();
+        let mut path_counts: BTreeMap<Vec<String>, u64> = BTreeMap::new();
+        
+        for sample in samples {
+            // Thread stats
+            let entry = thread_samples.entry(sample.thread_id).or_insert((sample.thread_name.clone(), 0));
+            entry.1 += 1;
+            
+            if sample.stack.is_empty() {
+                continue;
+            }
+            
+            // Self time: top of stack
+            let top_name = sample.stack[0].display_name();
+            *self_counts.entry(top_name.clone()).or_insert(0) += 1;
+            
+            // Total time: all frames in stack
+            let mut seen = std::collections::HashSet::new();
+            for frame in &sample.stack {
+                let name = frame.display_name();
+                if seen.insert(name.clone()) {
+                    *total_counts.entry(name).or_insert(0) += 1;
+                }
+            }
+            
+            // Call edges
+            for i in 1..sample.stack.len() {
+                let caller = sample.stack[i].display_name();
+                let callee = sample.stack[i-1].display_name();
+                *call_edges.entry((caller, callee)).or_insert(0) += 1;
+            }
+            
+            // Hot paths (top 5 frames)
+            let path: Vec<String> = sample.stack.iter()
+                .take(5)
+                .map(|f| f.display_name())
+                .collect();
+            *path_counts.entry(path).or_insert(0) += 1;
+        }
+        
+        // Build function stats
+        let mut functions: Vec<FunctionStats> = self_counts.keys()
+            .chain(total_counts.keys())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .map(|name| {
+                let self_samples = *self_counts.get(name).unwrap_or(&0);
+                let total_samples = *total_counts.get(name).unwrap_or(&0);
+                
+                FunctionStats {
+                    name: name.clone(),
+                    module: None,
+                    self_samples,
+                    total_samples,
+                    self_percent: (self_samples as f64 / samples.len() as f64) * 100.0,
+                    total_percent: (total_samples as f64 / samples.len() as f64) * 100.0,
+                    call_sites: Vec::new(),
+                    source_locations: Vec::new(),
+                }
+            })
+            .collect();
+        
+        // Sort by self samples descending
+        functions.sort_by(|a, b| b.self_samples.cmp(&a.self_samples));
+        
+        // Apply minimum samples filter
+        functions.retain(|f| f.self_samples >= self.config.min_samples);
+        
+        // Build call graph
+        let mut nodes = BTreeMap::new();
+        for (name, &self_count) in &self_counts {
+            let total = *total_counts.get(name).unwrap_or(&0);
+            nodes.insert(name.clone(), CallGraphNode {
+                name: name.clone(),
+                self_samples: self_count,
+                total_samples: total,
+            });
+        }
+        
+        let edges: Vec<CallGraphEdge> = call_edges.iter()
+            .map(|((caller, callee), &count)| {
+                CallGraphEdge {
+                    caller: caller.clone(),
+                    callee: callee.clone(),
+                    count,
+                    percent: (count as f64 / samples.len() as f64) * 100.0,
+                }
+            })
+            .collect();
+        
+        let call_graph = CallGraph { nodes, edges };
+        
+        // Hot paths
+        let mut hot_paths: Vec<HotPath> = path_counts.into_iter()
+            .map(|(frames, count)| HotPath {
+                frames,
+                samples: count,
+                percent: (count as f64 / samples.len() as f64) * 100.0,
+            })
+            .collect();
+        
+        hot_paths.sort_by(|a, b| b.samples.cmp(&a.samples));
+        hot_paths.truncate(10);
+        
+        // Thread stats
+        let threads: BTreeMap<u64, ThreadStats> = thread_samples.into_iter()
+            .map(|(id, (name, count))| {
+                (id, ThreadStats {
+                    thread_id: id,
+                    thread_name: name,
+                    samples: count,
+                    percent: (count as f64 / samples.len() as f64) * 100.0,
+                    top_functions: Vec::new(),
+                })
+            })
+            .collect();
+        
+        ProfileAnalysis {
+            total_samples,
+            duration,
+            sample_rate,
+            functions,
+            call_graph,
+            hot_paths,
+            threads,
+            memory: None,
+        }
+    }
+    
+    /// Analyze instrumentation spans
+    pub fn analyze_spans(&self, spans: &[Span]) -> SpanAnalysis {
+        let mut function_times: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
+        
+        for span in spans {
+            function_times.entry(span.name.clone())
+                .or_default()
+                .push(span.duration);
+        }
+        
+        let mut functions: Vec<SpanFunctionStats> = function_times.into_iter()
+            .map(|(name, times)| {
+                let count = times.len() as u64;
+                let total: Duration = times.iter().sum();
+                let mean = total / count as u32;
+                
+                let mut sorted = times.clone();
+                sorted.sort();
+                
+                let median = sorted[sorted.len() / 2];
+                let min = *sorted.first().unwrap();
+                let max = *sorted.last().unwrap();
+                
+                // Standard deviation
+                let mean_nanos = mean.as_nanos() as f64;
+                let variance: f64 = times.iter()
+                    .map(|t| {
+                        let diff = t.as_nanos() as f64 - mean_nanos;
+                        diff * diff
+                    })
+                    .sum::<f64>() / count as f64;
+                let std_dev = Duration::from_nanos(variance.sqrt() as u64);
+                
+                // Percentiles
+                let p50 = sorted[sorted.len() * 50 / 100];
+                let p90 = sorted[sorted.len() * 90 / 100];
+                let p99 = sorted[sorted.len() * 99 / 100];
+                
+                SpanFunctionStats {
+                    name,
+                    call_count: count,
+                    total_time: total,
+                    mean_time: mean,
+                    median_time: median,
+                    min_time: min,
+                    max_time: max,
+                    std_dev,
+                    p50,
+                    p90,
+                    p99,
+                }
+            })
+            .collect();
+        
+        functions.sort_by(|a, b| b.total_time.cmp(&a.total_time));
+        
+        let total_time: Duration = functions.iter().map(|f| f.total_time).sum();
+        
+        SpanAnalysis {
+            total_spans: spans.len() as u64,
+            total_time,
+            functions,
+        }
+    }
+}
+
+/// Span analysis results
+#[derive(Debug, Clone)]
+pub struct SpanAnalysis {
+    pub total_spans: u64,
+    pub total_time: Duration,
+    pub functions: Vec<SpanFunctionStats>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpanFunctionStats {
+    pub name: String,
+    pub call_count: u64,
+    pub total_time: Duration,
+    pub mean_time: Duration,
+    pub median_time: Duration,
+    pub min_time: Duration,
+    pub max_time: Duration,
+    pub std_dev: Duration,
+    pub p50: Duration,
+    pub p90: Duration,
+    pub p99: Duration,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REPORT GENERATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Report generator
+pub struct ReportGenerator {
+    config: ProfilerConfig,
+}
+
+impl ReportGenerator {
+    pub fn new(config: ProfilerConfig) -> Self {
+        ReportGenerator { config }
+    }
+    
+    /// Generate report in configured format
+    pub fn generate(&self, analysis: &ProfileAnalysis) -> String {
+        match self.config.output_format {
+            OutputFormat::Text => self.generate_text(analysis),
+            OutputFormat::Json => self.generate_json(analysis),
+            OutputFormat::Flamegraph => self.generate_flamegraph_data(analysis),
+            OutputFormat::Callgrind => self.generate_callgrind(analysis),
+            OutputFormat::Pprof => self.generate_pprof(analysis),
+            OutputFormat::Chrome => self.generate_chrome_trace(analysis),
+        }
+    }
+    
+    fn generate_text(&self, analysis: &ProfileAnalysis) -> String {
+        let mut output = String::new();
+        
+        // Header
+        output.push_str("═══════════════════════════════════════════════════════════════\n");
+        output.push_str("                    QUANTALANG PROFILE REPORT                   \n");
+        output.push_str("═══════════════════════════════════════════════════════════════\n\n");
+        
+        // Summary
+        output.push_str("SUMMARY\n");
+        output.push_str("───────────────────────────────────────────────────────────────\n");
+        output.push_str(&format!("  Duration:     {:?}\n", analysis.duration));
+        output.push_str(&format!("  Samples:      {}\n", analysis.total_samples));
+        output.push_str(&format!("  Sample Rate:  {:.1} samples/sec\n", analysis.sample_rate));
+        output.push_str(&format!("  Threads:      {}\n\n", analysis.threads.len()));
+        
+        // Top functions by self time
+        output.push_str("TOP FUNCTIONS (by self time)\n");
+        output.push_str("───────────────────────────────────────────────────────────────\n");
+        output.push_str("  Self%   Total%  Samples  Function\n");
+        output.push_str("  ─────   ──────  ───────  ────────\n");
+        
+        for func in analysis.functions.iter().take(20) {
+            output.push_str(&format!(
+                "  {:5.1}%  {:5.1}%  {:7}  {}\n",
+                func.self_percent,
+                func.total_percent,
+                func.self_samples,
+                func.name
+            ));
+        }
+        output.push('\n');
+        
+        // Hot paths
+        if !analysis.hot_paths.is_empty() {
+            output.push_str("HOT PATHS\n");
+            output.push_str("───────────────────────────────────────────────────────────────\n");
+            
+            for (i, path) in analysis.hot_paths.iter().take(5).enumerate() {
+                output.push_str(&format!(
+                    "  #{} ({:.1}%, {} samples)\n",
+                    i + 1, path.percent, path.samples
+                ));
+                for (j, frame) in path.frames.iter().enumerate() {
+                    output.push_str(&format!("    {}─ {}\n", 
+                        if j == path.frames.len() - 1 { "└" } else { "├" },
+                        frame
+                    ));
+                }
+                output.push('\n');
+            }
+        }
+        
+        // Thread breakdown
+        if analysis.threads.len() > 1 {
+            output.push_str("THREAD BREAKDOWN\n");
+            output.push_str("───────────────────────────────────────────────────────────────\n");
+            
+            for (_, thread) in &analysis.threads {
+                let name = thread.thread_name.as_deref().unwrap_or("unnamed");
+                output.push_str(&format!(
+                    "  Thread {} ({}): {} samples ({:.1}%)\n",
+                    thread.thread_id, name, thread.samples, thread.percent
+                ));
+            }
+            output.push('\n');
+        }
+        
+        // Call graph edges (top)
+        if !analysis.call_graph.edges.is_empty() {
+            output.push_str("TOP CALL EDGES\n");
+            output.push_str("───────────────────────────────────────────────────────────────\n");
+            
+            let mut edges = analysis.call_graph.edges.clone();
+            edges.sort_by(|a, b| b.count.cmp(&a.count));
+            
+            for edge in edges.iter().take(10) {
+                output.push_str(&format!(
+                    "  {} → {} ({} calls, {:.1}%)\n",
+                    edge.caller, edge.callee, edge.count, edge.percent
+                ));
+            }
+        }
+        
+        output
+    }
+    
+    fn generate_json(&self, analysis: &ProfileAnalysis) -> String {
+        let mut json = String::from("{\n");
+        
+        json.push_str(&format!("  \"total_samples\": {},\n", analysis.total_samples));
+        json.push_str(&format!("  \"duration_ms\": {},\n", analysis.duration.as_millis()));
+        json.push_str(&format!("  \"sample_rate\": {:.2},\n", analysis.sample_rate));
+        
+        // Functions
+        json.push_str("  \"functions\": [\n");
+        for (i, func) in analysis.functions.iter().enumerate() {
+            json.push_str(&format!(
+                "    {{\"name\": \"{}\", \"self_samples\": {}, \"total_samples\": {}, \"self_percent\": {:.2}, \"total_percent\": {:.2}}}",
+                escape_json(&func.name), func.self_samples, func.total_samples, func.self_percent, func.total_percent
+            ));
+            if i < analysis.functions.len() - 1 {
+                json.push(',');
+            }
+            json.push('\n');
+        }
+        json.push_str("  ],\n");
+        
+        // Hot paths
+        json.push_str("  \"hot_paths\": [\n");
+        for (i, path) in analysis.hot_paths.iter().enumerate() {
+            let frames: Vec<String> = path.frames.iter()
+                .map(|f| format!("\"{}\"", escape_json(f)))
+                .collect();
+            json.push_str(&format!(
+                "    {{\"frames\": [{}], \"samples\": {}, \"percent\": {:.2}}}",
+                frames.join(", "), path.samples, path.percent
+            ));
+            if i < analysis.hot_paths.len() - 1 {
+                json.push(',');
+            }
+            json.push('\n');
+        }
+        json.push_str("  ]\n");
+        
+        json.push_str("}\n");
+        json
+    }
+    
+    fn generate_flamegraph_data(&self, analysis: &ProfileAnalysis) -> String {
+        // Folded stack format for flamegraph.pl
+        // Each line: stack;frame;frame count
+        
+        let mut lines = Vec::new();
+        
+        for path in &analysis.hot_paths {
+            let stack = path.frames.iter().rev().collect::<Vec<_>>().join(";");
+            lines.push(format!("{} {}", stack, path.samples));
+        }
+        
+        lines.join("\n")
+    }
+    
+    fn generate_callgrind(&self, analysis: &ProfileAnalysis) -> String {
+        // Callgrind format for KCachegrind visualization
+        let mut output = String::new();
+        
+        output.push_str("# callgrind format\n");
+        output.push_str("version: 1\n");
+        output.push_str("creator: quantalang-profiler\n");
+        output.push_str("positions: line\n");
+        output.push_str("events: Samples\n\n");
+        
+        for func in &analysis.functions {
+            output.push_str(&format!("fn={}\n", func.name));
+            output.push_str(&format!("0 {}\n\n", func.self_samples));
+        }
+        
+        for edge in &analysis.call_graph.edges {
+            output.push_str(&format!("fn={}\n", edge.caller));
+            output.push_str(&format!("cfn={}\n", edge.callee));
+            output.push_str("calls=1 0\n");
+            output.push_str(&format!("0 {}\n\n", edge.count));
+        }
+        
+        output
+    }
+    
+    fn generate_pprof(&self, _analysis: &ProfileAnalysis) -> String {
+        // Google pprof format (protobuf would be used in practice)
+        "pprof format requires protobuf encoding".to_string()
+    }
+    
+    fn generate_chrome_trace(&self, analysis: &ProfileAnalysis) -> String {
+        // Chrome trace format (JSON)
+        let mut json = String::from("{\"traceEvents\": [\n");
+        
+        let mut events = Vec::new();
+        let mut ts = 0u64;
+        
+        for path in &analysis.hot_paths {
+            for (i, frame) in path.frames.iter().enumerate() {
+                let dur = (path.samples * 1000) / path.frames.len() as u64;
+                events.push(format!(
+                    "  {{\"name\": \"{}\", \"ph\": \"X\", \"ts\": {}, \"dur\": {}, \"pid\": 1, \"tid\": 1}}",
+                    escape_json(frame), ts, dur
+                ));
+                ts += dur;
+            }
+        }
+        
+        json.push_str(&events.join(",\n"));
+        json.push_str("\n]}\n");
+        json
+    }
+    
+    /// Generate span analysis report
+    pub fn generate_span_report(&self, analysis: &SpanAnalysis) -> String {
+        let mut output = String::new();
+        
+        output.push_str("═══════════════════════════════════════════════════════════════\n");
+        output.push_str("                   INSTRUMENTATION REPORT                       \n");
+        output.push_str("═══════════════════════════════════════════════════════════════\n\n");
+        
+        output.push_str(&format!("Total Spans: {}\n", analysis.total_spans));
+        output.push_str(&format!("Total Time:  {:?}\n\n", analysis.total_time));
+        
+        output.push_str("FUNCTION TIMING\n");
+        output.push_str("───────────────────────────────────────────────────────────────\n");
+        output.push_str("  Calls    Total       Mean       P50        P99        Function\n");
+        output.push_str("  ─────    ─────       ────       ───        ───        ────────\n");
+        
+        for func in &analysis.functions {
+            output.push_str(&format!(
+                "  {:5}    {:>9}   {:>9}  {:>9}  {:>9}  {}\n",
+                func.call_count,
+                format_duration(func.total_time),
+                format_duration(func.mean_time),
+                format_duration(func.p50),
+                format_duration(func.p99),
+                func.name
+            ));
+        }
+        
+        output
+    }
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn format_duration(d: Duration) -> String {
+    if d.as_secs() > 0 {
+        format!("{:.2}s", d.as_secs_f64())
+    } else if d.as_millis() > 0 {
+        format!("{:.2}ms", d.as_secs_f64() * 1000.0)
+    } else if d.as_micros() > 0 {
+        format!("{:.2}µs", d.as_secs_f64() * 1_000_000.0)
+    } else {
+        format!("{}ns", d.as_nanos())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::sampler::CpuState;
+    use std::time::Instant;
+    
+    fn make_sample(stack: Vec<&str>) -> Sample {
+        Sample {
+            timestamp: Instant::now(),
+            thread_id: 1,
+            thread_name: Some("main".to_string()),
+            stack: stack.into_iter()
+                .map(|s| StackFrame::new(0).with_symbol(s))
+                .collect(),
+            cpu_state: CpuState::Running,
+            memory_usage: None,
+        }
+    }
+    
+    #[test]
+    fn test_analysis() {
+        let config = ProfilerConfig::default();
+        let analyzer = Analyzer::new(config);
+        
+        let samples = vec![
+            make_sample(vec!["foo", "bar", "main"]),
+            make_sample(vec!["foo", "bar", "main"]),
+            make_sample(vec!["baz", "bar", "main"]),
+        ];
+        
+        let analysis = analyzer.analyze(&samples, Duration::from_secs(1));
+        
+        assert_eq!(analysis.total_samples, 3);
+        assert!(analysis.functions.iter().any(|f| f.name == "foo" && f.self_samples == 2));
+    }
+    
+    #[test]
+    fn test_text_report() {
+        let config = ProfilerConfig::default();
+        let analyzer = Analyzer::new(config.clone());
+        let generator = ReportGenerator::new(config);
+        
+        let samples = vec![
+            make_sample(vec!["hot_function", "caller", "main"]),
+        ];
+        
+        let analysis = analyzer.analyze(&samples, Duration::from_secs(1));
+        let report = generator.generate(&analysis);
+        
+        assert!(report.contains("QUANTALANG PROFILE REPORT"));
+        assert!(report.contains("hot_function"));
+    }
+}

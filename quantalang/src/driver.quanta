@@ -1,0 +1,1181 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTAC™ — QuantaLang Compiler Driver
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Usage: quantac [OPTIONS] <INPUT>
+//
+// The quantac driver orchestrates the full compilation pipeline:
+//   Source → Lexer → Parser → Type Check → HIR → MIR → Codegen → Object/Exe
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantac::driver
+
+use std::env;
+use std::fs;
+use std::io::{self, Write, BufWriter};
+use std::path::{Path, PathBuf};
+use std::process::{self, Command, ExitCode};
+use std::time::Instant;
+
+use quantalang::lexer::{Lexer, Token, TokenKind};
+use quantalang::parser::Parser;
+use quantalang::types::TypeChecker;
+use quantalang::hir::HirLowering;
+use quantalang::mir::MirLowering;
+use quantalang::codegen::CodeGenerator;
+use quantalang::codegen_x86_64::{X86_64Backend, ElfWriter};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION AND METADATA
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const VERSION: &str = "1.0.0";
+const COMMIT: &str = env!("GIT_COMMIT", "unknown");
+const BUILD_DATE: &str = env!("BUILD_DATE", "unknown");
+
+const USAGE: &str = r#"
+USAGE:
+    quantac [OPTIONS] <INPUT>
+
+ARGS:
+    <INPUT>    Source file to compile (.quanta)
+
+OPTIONS:
+    -o, --output <FILE>      Output file name
+    -c                       Compile to object file only (no linking)
+    -S                       Compile to assembly only
+    --emit <TYPE>            Emit intermediate representation:
+                               tokens, ast, hir, mir, llvm-ir, asm, obj
+    
+    -O, --opt-level <N>      Optimization level (0-3, default: 2)
+    -g, --debug              Include debug information
+    
+    --target <TRIPLE>        Target triple (default: host)
+    --cpu <CPU>              Target CPU (default: native)
+    --features <FEATURES>    Target features (+avx2,-sse4.1)
+    
+    -L <PATH>                Add library search path
+    -l <NAME>                Link with library
+    --sysroot <PATH>         System root for cross-compilation
+    
+    -W <WARN>                Enable warning
+    -A <WARN>                Allow (disable) warning
+    -D <WARN>                Deny warning (treat as error)
+    --deny-warnings          Treat all warnings as errors
+    
+    --color <WHEN>           Color output: auto, always, never
+    -v, --verbose            Verbose output
+    -q, --quiet              Suppress non-error output
+    --time-passes            Print timing for each compilation pass
+    
+    -h, --help               Print help information
+    -V, --version            Print version information
+
+ENVIRONMENT:
+    QUANTA_SYSROOT           Default sysroot path
+    QUANTA_TARGET            Default target triple
+    CC                       C compiler for linking
+    LD                       Linker to use
+
+EXAMPLES:
+    quantac hello.quanta                    # Compile to executable
+    quantac -c lib.quanta -o lib.o          # Compile to object file
+    quantac -S main.quanta                  # Compile to assembly
+    quantac --emit mir main.quanta          # Dump MIR
+    quantac -O3 --target aarch64 app.quanta # Cross-compile with optimization
+"#;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMMAND-LINE ARGUMENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct CompilerOptions {
+    // Input/Output
+    pub input: PathBuf,
+    pub output: Option<PathBuf>,
+    pub output_type: OutputType,
+    pub emit: Vec<EmitType>,
+    
+    // Optimization
+    pub opt_level: OptLevel,
+    pub debug_info: bool,
+    pub lto: LtoMode,
+    
+    // Target
+    pub target: TargetTriple,
+    pub cpu: String,
+    pub features: Vec<String>,
+    
+    // Linking
+    pub lib_paths: Vec<PathBuf>,
+    pub libs: Vec<String>,
+    pub sysroot: Option<PathBuf>,
+    pub linker: Option<PathBuf>,
+    
+    // Diagnostics
+    pub warnings: WarningConfig,
+    pub color: ColorChoice,
+    pub verbose: bool,
+    pub quiet: bool,
+    pub time_passes: bool,
+    
+    // Internal
+    pub incremental: Option<PathBuf>,
+    pub jobs: usize,
+}
+
+impl Default for CompilerOptions {
+    fn default() -> Self {
+        CompilerOptions {
+            input: PathBuf::new(),
+            output: None,
+            output_type: OutputType::Executable,
+            emit: Vec::new(),
+            
+            opt_level: OptLevel::Default,
+            debug_info: false,
+            lto: LtoMode::None,
+            
+            target: TargetTriple::host(),
+            cpu: "native".to_string(),
+            features: Vec::new(),
+            
+            lib_paths: Vec::new(),
+            libs: Vec::new(),
+            sysroot: env::var_os("QUANTA_SYSROOT").map(PathBuf::from),
+            linker: None,
+            
+            warnings: WarningConfig::default(),
+            color: ColorChoice::Auto,
+            verbose: false,
+            quiet: false,
+            time_passes: false,
+            
+            incremental: None,
+            jobs: num_cpus(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputType {
+    Executable,
+    Object,
+    Assembly,
+    StaticLib,
+    DynamicLib,
+}
+
+impl OutputType {
+    pub fn extension(&self, target: &TargetTriple) -> &'static str {
+        match self {
+            OutputType::Executable => if target.is_windows() { "exe" } else { "" },
+            OutputType::Object => "o",
+            OutputType::Assembly => "s",
+            OutputType::StaticLib => "a",
+            OutputType::DynamicLib => if target.is_windows() { "dll" } 
+                                      else if target.is_macos() { "dylib" }
+                                      else { "so" },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmitType {
+    Tokens,
+    Ast,
+    Hir,
+    Mir,
+    LlvmIr,
+    Asm,
+    Obj,
+    Metadata,
+    DepInfo,
+}
+
+impl EmitType {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "tokens" => Some(EmitType::Tokens),
+            "ast" => Some(EmitType::Ast),
+            "hir" => Some(EmitType::Hir),
+            "mir" => Some(EmitType::Mir),
+            "llvm-ir" | "llvm" => Some(EmitType::LlvmIr),
+            "asm" | "assembly" => Some(EmitType::Asm),
+            "obj" | "object" => Some(EmitType::Obj),
+            "metadata" => Some(EmitType::Metadata),
+            "dep-info" => Some(EmitType::DepInfo),
+            _ => None,
+        }
+    }
+    
+    fn extension(&self) -> &'static str {
+        match self {
+            EmitType::Tokens => "tokens",
+            EmitType::Ast => "ast.json",
+            EmitType::Hir => "hir",
+            EmitType::Mir => "mir",
+            EmitType::LlvmIr => "ll",
+            EmitType::Asm => "s",
+            EmitType::Obj => "o",
+            EmitType::Metadata => "qmeta",
+            EmitType::DepInfo => "d",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptLevel {
+    None,       // -O0: No optimization
+    Less,       // -O1: Quick optimizations
+    Default,    // -O2: Standard optimizations (default)
+    Aggressive, // -O3: Aggressive optimizations
+    Size,       // -Os: Optimize for size
+    SizeMin,    // -Oz: Minimize size
+}
+
+impl OptLevel {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "0" => Some(OptLevel::None),
+            "1" => Some(OptLevel::Less),
+            "2" => Some(OptLevel::Default),
+            "3" => Some(OptLevel::Aggressive),
+            "s" => Some(OptLevel::Size),
+            "z" => Some(OptLevel::SizeMin),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LtoMode {
+    None,
+    Thin,
+    Fat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorChoice {
+    Auto,
+    Always,
+    Never,
+}
+
+impl ColorChoice {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(ColorChoice::Auto),
+            "always" | "yes" => Some(ColorChoice::Always),
+            "never" | "no" => Some(ColorChoice::Never),
+            _ => None,
+        }
+    }
+    
+    fn should_color(&self) -> bool {
+        match self {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => atty::is(atty::Stream::Stderr),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WarningConfig {
+    pub deny_all: bool,
+    pub enabled: Vec<String>,
+    pub disabled: Vec<String>,
+    pub denied: Vec<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TARGET TRIPLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetTriple {
+    pub arch: Arch,
+    pub vendor: String,
+    pub os: Os,
+    pub env: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    X86_64,
+    Aarch64,
+    Riscv64,
+    Wasm32,
+    Wasm64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Os {
+    Linux,
+    Windows,
+    MacOs,
+    FreeBsd,
+    None,       // Bare metal
+    QuantaOs,   // Quanta OS kernel
+    Wasi,
+}
+
+impl TargetTriple {
+    pub fn host() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        let arch = Arch::X86_64;
+        #[cfg(target_arch = "aarch64")]
+        let arch = Arch::Aarch64;
+        
+        #[cfg(target_os = "linux")]
+        let os = Os::Linux;
+        #[cfg(target_os = "windows")]
+        let os = Os::Windows;
+        #[cfg(target_os = "macos")]
+        let os = Os::MacOs;
+        
+        #[cfg(target_vendor = "apple")]
+        let vendor = "apple".to_string();
+        #[cfg(not(target_vendor = "apple"))]
+        let vendor = "unknown".to_string();
+        
+        TargetTriple { arch, vendor, os, env: None }
+    }
+    
+    pub fn from_str(s: &str) -> Option<Self> {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() < 2 { return None; }
+        
+        let arch = match parts[0] {
+            "x86_64" | "amd64" => Arch::X86_64,
+            "aarch64" | "arm64" => Arch::Aarch64,
+            "riscv64" => Arch::Riscv64,
+            "wasm32" => Arch::Wasm32,
+            "wasm64" => Arch::Wasm64,
+            _ => return None,
+        };
+        
+        let (vendor, os_idx) = if parts.len() >= 3 {
+            (parts[1].to_string(), 2)
+        } else {
+            ("unknown".to_string(), 1)
+        };
+        
+        let os = if os_idx < parts.len() {
+            match parts[os_idx] {
+                "linux" => Os::Linux,
+                "windows" | "win32" => Os::Windows,
+                "darwin" | "macos" => Os::MacOs,
+                "freebsd" => Os::FreeBsd,
+                "none" | "unknown" => Os::None,
+                "quanta" | "quantaos" => Os::QuantaOs,
+                "wasi" => Os::Wasi,
+                _ => return None,
+            }
+        } else {
+            Os::None
+        };
+        
+        let env = parts.get(os_idx + 1).map(|s| s.to_string());
+        
+        Some(TargetTriple { arch, vendor, os, env })
+    }
+    
+    pub fn to_string(&self) -> String {
+        let arch = match self.arch {
+            Arch::X86_64 => "x86_64",
+            Arch::Aarch64 => "aarch64",
+            Arch::Riscv64 => "riscv64",
+            Arch::Wasm32 => "wasm32",
+            Arch::Wasm64 => "wasm64",
+        };
+        
+        let os = match self.os {
+            Os::Linux => "linux",
+            Os::Windows => "windows",
+            Os::MacOs => "darwin",
+            Os::FreeBsd => "freebsd",
+            Os::None => "none",
+            Os::QuantaOs => "quanta",
+            Os::Wasi => "wasi",
+        };
+        
+        match &self.env {
+            Some(env) => format!("{}-{}-{}-{}", arch, self.vendor, os, env),
+            None => format!("{}-{}-{}", arch, self.vendor, os),
+        }
+    }
+    
+    pub fn is_windows(&self) -> bool { self.os == Os::Windows }
+    pub fn is_macos(&self) -> bool { self.os == Os::MacOs }
+    pub fn is_linux(&self) -> bool { self.os == Os::Linux }
+    pub fn is_bare_metal(&self) -> bool { self.os == Os::None || self.os == Os::QuantaOs }
+    pub fn pointer_width(&self) -> u32 {
+        match self.arch {
+            Arch::X86_64 | Arch::Aarch64 | Arch::Riscv64 | Arch::Wasm64 => 64,
+            Arch::Wasm32 => 32,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ARGUMENT PARSER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub fn parse_args() -> Result<CompilerOptions, String> {
+    let args: Vec<String> = env::args().collect();
+    let mut opts = CompilerOptions::default();
+    let mut i = 1;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                process::exit(0);
+            }
+            "-V" | "--version" => {
+                print_version();
+                process::exit(0);
+            }
+            "-o" | "--output" => {
+                i += 1;
+                opts.output = Some(PathBuf::from(args.get(i).ok_or("missing output path")?));
+            }
+            "-c" => {
+                opts.output_type = OutputType::Object;
+            }
+            "-S" => {
+                opts.output_type = OutputType::Assembly;
+            }
+            "--emit" => {
+                i += 1;
+                let emit_str = args.get(i).ok_or("missing emit type")?;
+                for e in emit_str.split(',') {
+                    opts.emit.push(EmitType::from_str(e)
+                        .ok_or_else(|| format!("unknown emit type: {}", e))?);
+                }
+            }
+            "-O" | "--opt-level" => {
+                i += 1;
+                let level = args.get(i).ok_or("missing optimization level")?;
+                opts.opt_level = OptLevel::from_str(level)
+                    .ok_or_else(|| format!("invalid optimization level: {}", level))?;
+            }
+            arg if arg.starts_with("-O") => {
+                opts.opt_level = OptLevel::from_str(&arg[2..])
+                    .ok_or_else(|| format!("invalid optimization level: {}", arg))?;
+            }
+            "-g" | "--debug" => {
+                opts.debug_info = true;
+            }
+            "--target" => {
+                i += 1;
+                let target = args.get(i).ok_or("missing target triple")?;
+                opts.target = TargetTriple::from_str(target)
+                    .ok_or_else(|| format!("invalid target: {}", target))?;
+            }
+            "--cpu" => {
+                i += 1;
+                opts.cpu = args.get(i).ok_or("missing CPU name")?.clone();
+            }
+            "--features" => {
+                i += 1;
+                let features = args.get(i).ok_or("missing features")?;
+                opts.features = features.split(',').map(String::from).collect();
+            }
+            "-L" => {
+                i += 1;
+                opts.lib_paths.push(PathBuf::from(args.get(i).ok_or("missing library path")?));
+            }
+            arg if arg.starts_with("-L") => {
+                opts.lib_paths.push(PathBuf::from(&arg[2..]));
+            }
+            "-l" => {
+                i += 1;
+                opts.libs.push(args.get(i).ok_or("missing library name")?.clone());
+            }
+            arg if arg.starts_with("-l") => {
+                opts.libs.push(arg[2..].to_string());
+            }
+            "--sysroot" => {
+                i += 1;
+                opts.sysroot = Some(PathBuf::from(args.get(i).ok_or("missing sysroot")?));
+            }
+            "--linker" => {
+                i += 1;
+                opts.linker = Some(PathBuf::from(args.get(i).ok_or("missing linker")?));
+            }
+            "-W" => {
+                i += 1;
+                opts.warnings.enabled.push(args.get(i).ok_or("missing warning")?.clone());
+            }
+            "-A" => {
+                i += 1;
+                opts.warnings.disabled.push(args.get(i).ok_or("missing warning")?.clone());
+            }
+            "-D" => {
+                i += 1;
+                opts.warnings.denied.push(args.get(i).ok_or("missing warning")?.clone());
+            }
+            "--deny-warnings" => {
+                opts.warnings.deny_all = true;
+            }
+            "--color" => {
+                i += 1;
+                let color = args.get(i).ok_or("missing color choice")?;
+                opts.color = ColorChoice::from_str(color)
+                    .ok_or_else(|| format!("invalid color choice: {}", color))?;
+            }
+            "-v" | "--verbose" => {
+                opts.verbose = true;
+            }
+            "-q" | "--quiet" => {
+                opts.quiet = true;
+            }
+            "--time-passes" => {
+                opts.time_passes = true;
+            }
+            "-j" | "--jobs" => {
+                i += 1;
+                opts.jobs = args.get(i).ok_or("missing job count")?
+                    .parse().map_err(|_| "invalid job count")?;
+            }
+            "--lto" => {
+                i += 1;
+                let mode = args.get(i).ok_or("missing LTO mode")?;
+                opts.lto = match mode.as_str() {
+                    "thin" => LtoMode::Thin,
+                    "fat" | "full" => LtoMode::Fat,
+                    "none" | "off" => LtoMode::None,
+                    _ => return Err(format!("invalid LTO mode: {}", mode)),
+                };
+            }
+            arg if arg.starts_with('-') => {
+                return Err(format!("unknown option: {}", arg));
+            }
+            _ => {
+                if opts.input.as_os_str().is_empty() {
+                    opts.input = PathBuf::from(arg);
+                } else {
+                    return Err(format!("unexpected argument: {}", arg));
+                }
+            }
+        }
+        i += 1;
+    }
+    
+    if opts.input.as_os_str().is_empty() {
+        return Err("no input file specified".to_string());
+    }
+    
+    // Default output name
+    if opts.output.is_none() {
+        let stem = opts.input.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("a.out");
+        let ext = opts.output_type.extension(&opts.target);
+        opts.output = Some(if ext.is_empty() {
+            PathBuf::from(stem)
+        } else {
+            PathBuf::from(format!("{}.{}", stem, ext))
+        });
+    }
+    
+    Ok(opts)
+}
+
+fn print_help() {
+    println!("quantac {} — QuantaLang Compiler", VERSION);
+    println!("{}", USAGE);
+}
+
+fn print_version() {
+    println!("quantac {}", VERSION);
+    println!("commit: {}", COMMIT);
+    println!("build: {}", BUILD_DATE);
+    println!("host: {}", TargetTriple::host().to_string());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPILATION PIPELINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct Compiler {
+    opts: CompilerOptions,
+    diagnostics: DiagnosticEngine,
+    timings: Vec<(String, std::time::Duration)>,
+}
+
+impl Compiler {
+    pub fn new(opts: CompilerOptions) -> Self {
+        let use_color = opts.color.should_color();
+        Compiler {
+            opts,
+            diagnostics: DiagnosticEngine::new(use_color),
+            timings: Vec::new(),
+        }
+    }
+    
+    pub fn compile(&mut self) -> Result<(), CompileError> {
+        let total_start = Instant::now();
+        
+        // Read source
+        let source = self.timed("read source", || {
+            fs::read_to_string(&self.opts.input)
+                .map_err(|e| CompileError::Io(e.to_string()))
+        })?;
+        
+        let filename = self.opts.input.to_string_lossy().to_string();
+        
+        // Lexing
+        let tokens = self.timed("lexing", || {
+            let mut lexer = Lexer::new(&source, &filename);
+            let mut tokens = Vec::new();
+            loop {
+                let tok = lexer.next_token();
+                let is_eof = tok.kind == TokenKind::Eof;
+                tokens.push(tok);
+                if is_eof { break; }
+            }
+            Ok(tokens)
+        })?;
+        
+        if self.opts.emit.contains(&EmitType::Tokens) {
+            self.emit_tokens(&tokens)?;
+        }
+        
+        // Parsing
+        let ast = self.timed("parsing", || {
+            let mut parser = Parser::new(tokens);
+            parser.parse_module()
+                .map_err(|e| CompileError::Parse(format!("{:?}", e)))
+        })?;
+        
+        if self.opts.emit.contains(&EmitType::Ast) {
+            self.emit_ast(&ast)?;
+        }
+        
+        // Type checking
+        let typed_ast = self.timed("type checking", || {
+            let mut checker = TypeChecker::new();
+            checker.check_module(&ast)
+                .map_err(|e| CompileError::Type(format!("{:?}", e)))
+        })?;
+        
+        // HIR lowering
+        let hir = self.timed("HIR lowering", || {
+            let mut lowering = HirLowering::new();
+            Ok(lowering.lower_module(&typed_ast))
+        })?;
+        
+        if self.opts.emit.contains(&EmitType::Hir) {
+            self.emit_hir(&hir)?;
+        }
+        
+        // MIR lowering
+        let mir = self.timed("MIR lowering", || {
+            let mut lowering = MirLowering::new();
+            lowering.lower_module(&hir)
+                .map_err(|e| CompileError::Borrow(format!("{:?}", e)))
+        })?;
+        
+        if self.opts.emit.contains(&EmitType::Mir) {
+            self.emit_mir(&mir)?;
+        }
+        
+        // Codegen
+        let object = self.timed("code generation", || {
+            match self.opts.target.arch {
+                Arch::X86_64 => {
+                    let mut backend = X86_64Backend::new(&self.opts);
+                    backend.compile(&mir)
+                        .map_err(|e| CompileError::Codegen(format!("{:?}", e)))
+                }
+                _ => Err(CompileError::Codegen(
+                    format!("unsupported target: {:?}", self.opts.target.arch)
+                )),
+            }
+        })?;
+        
+        // Emit intermediate formats
+        if self.opts.emit.contains(&EmitType::Asm) {
+            self.emit_asm(&object)?;
+        }
+        
+        // Write object file
+        if self.opts.output_type == OutputType::Object || 
+           self.opts.emit.contains(&EmitType::Obj) {
+            self.timed("write object", || {
+                self.write_object(&object)
+            })?;
+        }
+        
+        // Link
+        if self.opts.output_type == OutputType::Executable {
+            self.timed("linking", || {
+                self.link(&object)
+            })?;
+        }
+        
+        // Print timings
+        let total_time = total_start.elapsed();
+        if self.opts.time_passes {
+            self.print_timings(total_time);
+        }
+        
+        if !self.opts.quiet {
+            let output = self.opts.output.as_ref().unwrap();
+            eprintln!("   \x1b[32;1mCompiled\x1b[0m {} -> {}",
+                self.opts.input.display(),
+                output.display());
+        }
+        
+        Ok(())
+    }
+    
+    fn timed<T, F: FnOnce() -> Result<T, CompileError>>(
+        &mut self, 
+        name: &str, 
+        f: F
+    ) -> Result<T, CompileError> {
+        let start = Instant::now();
+        let result = f();
+        let elapsed = start.elapsed();
+        
+        if self.opts.verbose {
+            eprintln!("  {:>12} {:>8.2}ms  {}", 
+                "\x1b[34m•\x1b[0m", 
+                elapsed.as_secs_f64() * 1000.0,
+                name);
+        }
+        
+        self.timings.push((name.to_string(), elapsed));
+        result
+    }
+    
+    fn print_timings(&self, total: std::time::Duration) {
+        eprintln!("\n\x1b[1mTiming Report\x1b[0m");
+        eprintln!("─────────────────────────────────────");
+        for (name, duration) in &self.timings {
+            let pct = duration.as_secs_f64() / total.as_secs_f64() * 100.0;
+            eprintln!("  {:20} {:>8.2}ms  ({:>5.1}%)", 
+                name,
+                duration.as_secs_f64() * 1000.0,
+                pct);
+        }
+        eprintln!("─────────────────────────────────────");
+        eprintln!("  {:20} {:>8.2}ms", "Total", total.as_secs_f64() * 1000.0);
+    }
+    
+    fn emit_tokens(&self, tokens: &[Token]) -> Result<(), CompileError> {
+        let path = self.emit_path(EmitType::Tokens);
+        let mut f = fs::File::create(&path)
+            .map_err(|e| CompileError::Io(e.to_string()))?;
+        
+        for tok in tokens {
+            writeln!(f, "{:?}", tok)
+                .map_err(|e| CompileError::Io(e.to_string()))?;
+        }
+        
+        if self.opts.verbose {
+            eprintln!("  Emitted tokens to {}", path.display());
+        }
+        Ok(())
+    }
+    
+    fn emit_ast(&self, ast: &impl std::fmt::Debug) -> Result<(), CompileError> {
+        let path = self.emit_path(EmitType::Ast);
+        let mut f = fs::File::create(&path)
+            .map_err(|e| CompileError::Io(e.to_string()))?;
+        
+        writeln!(f, "{:#?}", ast)
+            .map_err(|e| CompileError::Io(e.to_string()))?;
+        
+        if self.opts.verbose {
+            eprintln!("  Emitted AST to {}", path.display());
+        }
+        Ok(())
+    }
+    
+    fn emit_hir(&self, hir: &impl std::fmt::Debug) -> Result<(), CompileError> {
+        let path = self.emit_path(EmitType::Hir);
+        let mut f = fs::File::create(&path)
+            .map_err(|e| CompileError::Io(e.to_string()))?;
+        
+        writeln!(f, "{:#?}", hir)
+            .map_err(|e| CompileError::Io(e.to_string()))?;
+        
+        if self.opts.verbose {
+            eprintln!("  Emitted HIR to {}", path.display());
+        }
+        Ok(())
+    }
+    
+    fn emit_mir(&self, mir: &impl std::fmt::Debug) -> Result<(), CompileError> {
+        let path = self.emit_path(EmitType::Mir);
+        let mut f = fs::File::create(&path)
+            .map_err(|e| CompileError::Io(e.to_string()))?;
+        
+        writeln!(f, "{:#?}", mir)
+            .map_err(|e| CompileError::Io(e.to_string()))?;
+        
+        if self.opts.verbose {
+            eprintln!("  Emitted MIR to {}", path.display());
+        }
+        Ok(())
+    }
+    
+    fn emit_asm(&self, _object: &CompiledObject) -> Result<(), CompileError> {
+        let path = self.emit_path(EmitType::Asm);
+        // TODO: Disassemble object code to assembly
+        fs::write(&path, "; Assembly output not yet implemented\n")
+            .map_err(|e| CompileError::Io(e.to_string()))?;
+        
+        if self.opts.verbose {
+            eprintln!("  Emitted assembly to {}", path.display());
+        }
+        Ok(())
+    }
+    
+    fn write_object(&self, object: &CompiledObject) -> Result<(), CompileError> {
+        let path = if self.opts.output_type == OutputType::Object {
+            self.opts.output.clone().unwrap()
+        } else {
+            self.emit_path(EmitType::Obj)
+        };
+        
+        let mut writer = ElfWriter::new();
+        writer.add_text_section(&object.code);
+        if !object.data.is_empty() {
+            writer.add_data_section(&object.data);
+        }
+        
+        for sym in &object.symbols {
+            writer.add_symbol(&sym.name, sym.offset, sym.size, sym.is_func);
+        }
+        
+        let elf_bytes = writer.write();
+        fs::write(&path, &elf_bytes)
+            .map_err(|e| CompileError::Io(e.to_string()))?;
+        
+        if self.opts.verbose {
+            eprintln!("  Wrote object file to {}", path.display());
+        }
+        Ok(())
+    }
+    
+    fn link(&self, object: &CompiledObject) -> Result<(), CompileError> {
+        let output = self.opts.output.as_ref().unwrap();
+        
+        // Write temporary object file
+        let obj_path = output.with_extension("o");
+        self.write_object(object)?;
+        
+        // Find linker
+        let linker = self.opts.linker.clone()
+            .or_else(|| env::var_os("LD").map(PathBuf::from))
+            .or_else(|| env::var_os("CC").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("cc"));
+        
+        let mut cmd = Command::new(&linker);
+        
+        // Output
+        cmd.arg("-o").arg(output);
+        
+        // Object files
+        cmd.arg(&obj_path);
+        
+        // Library paths
+        for path in &self.opts.lib_paths {
+            cmd.arg("-L").arg(path);
+        }
+        
+        // Libraries
+        for lib in &self.opts.libs {
+            cmd.arg(format!("-l{}", lib));
+        }
+        
+        // Sysroot
+        if let Some(ref sysroot) = self.opts.sysroot {
+            cmd.arg(format!("--sysroot={}", sysroot.display()));
+        }
+        
+        // Target-specific flags
+        if self.opts.target.is_bare_metal() {
+            cmd.arg("-nostdlib");
+            cmd.arg("-static");
+        }
+        
+        if self.opts.verbose {
+            eprintln!("  Running: {:?}", cmd);
+        }
+        
+        let status = cmd.status()
+            .map_err(|e| CompileError::Link(format!("failed to run linker: {}", e)))?;
+        
+        if !status.success() {
+            return Err(CompileError::Link(format!("linker failed with {}", status)));
+        }
+        
+        // Clean up temporary object file
+        let _ = fs::remove_file(&obj_path);
+        
+        Ok(())
+    }
+    
+    fn emit_path(&self, emit_type: EmitType) -> PathBuf {
+        let stem = self.opts.input.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        PathBuf::from(format!("{}.{}", stem, emit_type.extension()))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPILED OUTPUT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct CompiledObject {
+    pub code: Vec<u8>,
+    pub data: Vec<u8>,
+    pub symbols: Vec<Symbol>,
+    pub relocations: Vec<Relocation>,
+}
+
+pub struct Symbol {
+    pub name: String,
+    pub offset: u64,
+    pub size: u64,
+    pub is_func: bool,
+}
+
+pub struct Relocation {
+    pub offset: u64,
+    pub symbol: String,
+    pub kind: RelocKind,
+    pub addend: i64,
+}
+
+pub enum RelocKind {
+    Abs64,
+    Pc32,
+    Got32,
+    Plt32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DIAGNOSTICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub struct DiagnosticEngine {
+    use_color: bool,
+    error_count: usize,
+    warning_count: usize,
+}
+
+impl DiagnosticEngine {
+    pub fn new(use_color: bool) -> Self {
+        DiagnosticEngine {
+            use_color,
+            error_count: 0,
+            warning_count: 0,
+        }
+    }
+    
+    pub fn error(&mut self, msg: &str, loc: Option<&SourceLoc>) {
+        self.error_count += 1;
+        self.emit(Severity::Error, msg, loc);
+    }
+    
+    pub fn warning(&mut self, msg: &str, loc: Option<&SourceLoc>) {
+        self.warning_count += 1;
+        self.emit(Severity::Warning, msg, loc);
+    }
+    
+    pub fn note(&self, msg: &str, loc: Option<&SourceLoc>) {
+        self.emit(Severity::Note, msg, loc);
+    }
+    
+    fn emit(&self, severity: Severity, msg: &str, loc: Option<&SourceLoc>) {
+        let (label, color) = match severity {
+            Severity::Error => ("error", "\x1b[31;1m"),
+            Severity::Warning => ("warning", "\x1b[33;1m"),
+            Severity::Note => ("note", "\x1b[36;1m"),
+        };
+        
+        let reset = if self.use_color { "\x1b[0m" } else { "" };
+        let color = if self.use_color { color } else { "" };
+        
+        if let Some(loc) = loc {
+            eprintln!("{}{}:{}: {}{}: {}{}", 
+                color, loc.file, loc.line, label, reset, msg, reset);
+        } else {
+            eprintln!("{}{}{}: {}{}", color, label, reset, msg, reset);
+        }
+    }
+    
+    pub fn has_errors(&self) -> bool {
+        self.error_count > 0
+    }
+    
+    pub fn summary(&self) {
+        if self.error_count > 0 || self.warning_count > 0 {
+            eprintln!("{} error(s), {} warning(s)", 
+                self.error_count, self.warning_count);
+        }
+    }
+}
+
+enum Severity {
+    Error,
+    Warning,
+    Note,
+}
+
+pub struct SourceLoc {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ERRORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub enum CompileError {
+    Io(String),
+    Parse(String),
+    Type(String),
+    Borrow(String),
+    Codegen(String),
+    Link(String),
+}
+
+impl std::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            CompileError::Io(s) => write!(f, "I/O error: {}", s),
+            CompileError::Parse(s) => write!(f, "parse error: {}", s),
+            CompileError::Type(s) => write!(f, "type error: {}", s),
+            CompileError::Borrow(s) => write!(f, "borrow error: {}", s),
+            CompileError::Codegen(s) => write!(f, "codegen error: {}", s),
+            CompileError::Link(s) => write!(f, "link error: {}", s),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+mod atty {
+    pub enum Stream { Stderr }
+    pub fn is(_: Stream) -> bool {
+        // Check if stderr is a terminal
+        #[cfg(unix)]
+        unsafe {
+            libc::isatty(2) != 0
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use std::io;
+            let handle = io::stderr().as_raw_handle();
+            // Simplified check
+            !handle.is_null()
+        }
+        #[cfg(not(any(unix, windows)))]
+        false
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub fn main() -> ExitCode {
+    let opts = match parse_args() {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("\x1b[31;1merror\x1b[0m: {}", e);
+            eprintln!("\nRun `quantac --help` for usage.");
+            return ExitCode::from(1);
+        }
+    };
+    
+    let mut compiler = Compiler::new(opts);
+    
+    match compiler.compile() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("\x1b[31;1merror\x1b[0m: {}", e);
+            ExitCode::from(1)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_target_triple_parse() {
+        let t = TargetTriple::from_str("x86_64-unknown-linux-gnu").unwrap();
+        assert_eq!(t.arch, Arch::X86_64);
+        assert_eq!(t.os, Os::Linux);
+        assert_eq!(t.env, Some("gnu".to_string()));
+        
+        let t = TargetTriple::from_str("aarch64-apple-darwin").unwrap();
+        assert_eq!(t.arch, Arch::Aarch64);
+        assert_eq!(t.vendor, "apple");
+        assert_eq!(t.os, Os::MacOs);
+        
+        let t = TargetTriple::from_str("x86_64-none").unwrap();
+        assert_eq!(t.arch, Arch::X86_64);
+        assert_eq!(t.os, Os::None);
+    }
+    
+    #[test]
+    fn test_opt_level_parse() {
+        assert_eq!(OptLevel::from_str("0"), Some(OptLevel::None));
+        assert_eq!(OptLevel::from_str("2"), Some(OptLevel::Default));
+        assert_eq!(OptLevel::from_str("s"), Some(OptLevel::Size));
+    }
+    
+    #[test]
+    fn test_emit_type_parse() {
+        assert_eq!(EmitType::from_str("mir"), Some(EmitType::Mir));
+        assert_eq!(EmitType::from_str("asm"), Some(EmitType::Asm));
+        assert_eq!(EmitType::from_str("invalid"), None);
+    }
+    
+    #[test]
+    fn test_output_extension() {
+        let linux = TargetTriple::from_str("x86_64-unknown-linux").unwrap();
+        let windows = TargetTriple::from_str("x86_64-pc-windows").unwrap();
+        
+        assert_eq!(OutputType::Executable.extension(&linux), "");
+        assert_eq!(OutputType::Executable.extension(&windows), "exe");
+        assert_eq!(OutputType::Object.extension(&linux), "o");
+        assert_eq!(OutputType::DynamicLib.extension(&linux), "so");
+    }
+}

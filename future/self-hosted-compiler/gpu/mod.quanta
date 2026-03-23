@@ -1,0 +1,550 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ GPU — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+//! # GPU Compute Framework
+//!
+//! High-performance GPU compute shader compilation:
+//!
+//! - **SPIR-V 1.6**: Full Vulkan/OpenCL compute support
+//! - **Workgroups**: Automatic sizing and optimization
+//! - **Shared Memory**: Efficient intra-workgroup communication
+//! - **Atomics**: Full atomic operation support
+//! - **Subgroups**: SIMD-within-SIMT operations
+//!
+//! ## Example
+//!
+//! ```quanta
+//! @compute(workgroup_size = [256, 1, 1])
+//! fn vector_add(
+//!     @buffer(set = 0, binding = 0, readonly) a: &[f32],
+//!     @buffer(set = 0, binding = 1, readonly) b: &[f32],
+//!     @buffer(set = 0, binding = 2) result: &mut [f32],
+//! ) {
+//!     let idx = global_invocation_id().x;
+//!     result[idx] = a[idx] + b[idx];
+//! }
+//! ```
+
+module quantalang::gpu
+
+pub mod spirv;
+pub mod compute;
+
+pub use spirv::{
+    // Builder
+    SpirvBuilder, Instruction, Op,
+    
+    // Capabilities
+    Capability, ExecutionModel, ExecutionMode,
+    AddressingModel, MemoryModel, StorageClass,
+    Decoration, BuiltIn,
+    
+    // Structures
+    EntryPoint, Function, BasicBlock, DecorationInst,
+    
+    // Constants
+    SPIRV_MAGIC, SPIRV_VERSION_1_6, GENERATOR_MAGIC,
+};
+
+pub use compute::{
+    // Kernel definition
+    ComputeKernel, WorkgroupSize,
+    SharedMemoryDecl, SharedMemorySize,
+    BufferBinding, BufferAccess,
+    UniformBinding, UniformMember,
+    PushConstantBlock, SpecConstant, SpecConstantValue,
+    
+    // Kernel body
+    KernelBody, KernelBlock, KernelStmt, KernelTerminator,
+    KernelExpr, LocalDecl, ConstValue,
+    
+    // Types
+    GpuType, GpuBuiltIn, GpuIntrinsic,
+    
+    // Operations
+    BinaryOp, UnaryOp, AtomicOp, BarrierKind, MemoryScope,
+    
+    // Compiler
+    ComputeCompiler, CompileError,
+};
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use std::path::Path;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GPU DEVICE CAPABILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// GPU device capabilities
+#[derive(Debug, Clone)]
+pub struct GpuCapabilities {
+    /// Vendor name
+    pub vendor: String,
+    
+    /// Device name
+    pub device_name: String,
+    
+    /// Driver version
+    pub driver_version: String,
+    
+    /// Maximum workgroup size
+    pub max_workgroup_size: [u32; 3],
+    
+    /// Maximum workgroup invocations
+    pub max_workgroup_invocations: u32,
+    
+    /// Maximum compute shared memory (bytes)
+    pub max_shared_memory: u32,
+    
+    /// Maximum push constant size (bytes)
+    pub max_push_constant_size: u32,
+    
+    /// Maximum bound descriptor sets
+    pub max_bound_descriptor_sets: u32,
+    
+    /// Subgroup size
+    pub subgroup_size: u32,
+    
+    /// Supported subgroup operations
+    pub subgroup_operations: SubgroupOperations,
+    
+    /// Supports 16-bit storage
+    pub storage_16bit: bool,
+    
+    /// Supports 8-bit storage
+    pub storage_8bit: bool,
+    
+    /// Supports 64-bit integers
+    pub int64: bool,
+    
+    /// Supports 64-bit floats
+    pub float64: bool,
+    
+    /// Supports 16-bit floats
+    pub float16: bool,
+}
+
+/// Subgroup operation support
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubgroupOperations {
+    pub basic: bool,
+    pub vote: bool,
+    pub arithmetic: bool,
+    pub ballot: bool,
+    pub shuffle: bool,
+    pub shuffle_relative: bool,
+    pub clustered: bool,
+    pub quad: bool,
+}
+
+impl Default for GpuCapabilities {
+    fn default() -> Self {
+        GpuCapabilities {
+            vendor: "Unknown".to_string(),
+            device_name: "Unknown GPU".to_string(),
+            driver_version: "0.0.0".to_string(),
+            max_workgroup_size: [1024, 1024, 64],
+            max_workgroup_invocations: 1024,
+            max_shared_memory: 32768,
+            max_push_constant_size: 128,
+            max_bound_descriptor_sets: 4,
+            subgroup_size: 32,
+            subgroup_operations: SubgroupOperations::default(),
+            storage_16bit: false,
+            storage_8bit: false,
+            int64: true,
+            float64: true,
+            float16: false,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SHADER MODULE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compiled shader module
+#[derive(Debug, Clone)]
+pub struct ShaderModule {
+    /// Module name
+    pub name: String,
+    
+    /// SPIR-V binary
+    pub spirv: Vec<u32>,
+    
+    /// Entry points
+    pub entry_points: Vec<ShaderEntryPoint>,
+    
+    /// Resource bindings
+    pub bindings: Vec<ResourceBinding>,
+    
+    /// Push constant range
+    pub push_constants: Option<PushConstantRange>,
+    
+    /// Specialization constants
+    pub specializations: Vec<SpecializationInfo>,
+}
+
+/// Shader entry point info
+#[derive(Debug, Clone)]
+pub struct ShaderEntryPoint {
+    pub name: String,
+    pub stage: ShaderStage,
+    pub workgroup_size: Option<WorkgroupSize>,
+}
+
+/// Shader stage
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShaderStage {
+    Compute,
+    Vertex,
+    Fragment,
+    Geometry,
+    TessControl,
+    TessEval,
+    RayGen,
+    RayMiss,
+    RayClosestHit,
+    RayAnyHit,
+    RayIntersection,
+    Task,
+    Mesh,
+}
+
+/// Resource binding info
+#[derive(Debug, Clone)]
+pub struct ResourceBinding {
+    pub name: String,
+    pub set: u32,
+    pub binding: u32,
+    pub descriptor_type: DescriptorType,
+    pub count: u32,
+    pub stages: Vec<ShaderStage>,
+}
+
+/// Descriptor type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorType {
+    Sampler,
+    CombinedImageSampler,
+    SampledImage,
+    StorageImage,
+    UniformTexelBuffer,
+    StorageTexelBuffer,
+    UniformBuffer,
+    StorageBuffer,
+    UniformBufferDynamic,
+    StorageBufferDynamic,
+    InputAttachment,
+    AccelerationStructure,
+}
+
+/// Push constant range
+#[derive(Debug, Clone)]
+pub struct PushConstantRange {
+    pub stages: Vec<ShaderStage>,
+    pub offset: u32,
+    pub size: u32,
+}
+
+/// Specialization constant info
+#[derive(Debug, Clone)]
+pub struct SpecializationInfo {
+    pub name: String,
+    pub constant_id: u32,
+    pub size: u32,
+    pub offset: u32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KERNEL BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Builder for compute kernels
+pub struct KernelBuilder {
+    name: String,
+    workgroup_size: WorkgroupSize,
+    buffers: Vec<BufferBinding>,
+    uniforms: Vec<UniformBinding>,
+    shared: Vec<SharedMemoryDecl>,
+    push_constants: Option<PushConstantBlock>,
+    capabilities: Vec<Capability>,
+}
+
+impl KernelBuilder {
+    pub fn new(name: impl Into<String>) -> Self {
+        KernelBuilder {
+            name: name.into(),
+            workgroup_size: WorkgroupSize::default(),
+            buffers: Vec::new(),
+            uniforms: Vec::new(),
+            shared: Vec::new(),
+            push_constants: None,
+            capabilities: Vec::new(),
+        }
+    }
+    
+    /// Set workgroup size
+    pub fn workgroup_size(mut self, x: u32, y: u32, z: u32) -> Self {
+        self.workgroup_size = WorkgroupSize::new(x, y, z);
+        self
+    }
+    
+    /// Add storage buffer
+    pub fn storage_buffer(
+        mut self,
+        name: impl Into<String>,
+        set: u32,
+        binding: u32,
+        element_type: GpuType,
+        access: BufferAccess,
+    ) -> Self {
+        self.buffers.push(BufferBinding {
+            name: name.into(),
+            set,
+            binding,
+            element_type,
+            access,
+            is_runtime_array: true,
+        });
+        self
+    }
+    
+    /// Add uniform buffer
+    pub fn uniform_buffer(
+        mut self,
+        name: impl Into<String>,
+        set: u32,
+        binding: u32,
+        members: Vec<UniformMember>,
+    ) -> Self {
+        self.uniforms.push(UniformBinding {
+            name: name.into(),
+            set,
+            binding,
+            members,
+        });
+        self
+    }
+    
+    /// Add shared memory
+    pub fn shared_memory(
+        mut self,
+        name: impl Into<String>,
+        element_type: GpuType,
+        size: u32,
+    ) -> Self {
+        self.shared.push(SharedMemoryDecl {
+            name: name.into(),
+            element_type,
+            size: SharedMemorySize::Fixed(size),
+        });
+        self
+    }
+    
+    /// Add capability
+    pub fn capability(mut self, cap: Capability) -> Self {
+        self.capabilities.push(cap);
+        self
+    }
+    
+    /// Build kernel (without body - must be set separately)
+    pub fn build(self) -> ComputeKernel {
+        ComputeKernel {
+            name: self.name,
+            workgroup_size: self.workgroup_size,
+            shared_memory: self.shared,
+            buffers: self.buffers,
+            uniforms: self.uniforms,
+            push_constants: self.push_constants,
+            body: KernelBody {
+                blocks: vec![KernelBlock {
+                    id: 0,
+                    statements: vec![],
+                    terminator: KernelTerminator::Return,
+                }],
+                locals: vec![],
+            },
+            capabilities: self.capabilities,
+            spec_constants: vec![],
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPIRV UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Read SPIR-V from file
+pub fn read_spirv(path: &Path) -> Result<Vec<u32>, std::io::Error> {
+    let bytes = std::fs::read(path)?;
+    
+    if bytes.len() % 4 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SPIR-V file size not multiple of 4",
+        ));
+    }
+    
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    
+    if words.is_empty() || words[0] != SPIRV_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid SPIR-V magic number",
+        ));
+    }
+    
+    Ok(words)
+}
+
+/// Write SPIR-V to file
+pub fn write_spirv(path: &Path, spirv: &[u32]) -> Result<(), std::io::Error> {
+    let bytes: Vec<u8> = spirv
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    
+    std::fs::write(path, bytes)
+}
+
+/// Validate SPIR-V binary (basic validation)
+pub fn validate_spirv(spirv: &[u32]) -> Result<(), ValidationError> {
+    if spirv.len() < 5 {
+        return Err(ValidationError::TooShort);
+    }
+    
+    if spirv[0] != SPIRV_MAGIC {
+        return Err(ValidationError::InvalidMagic(spirv[0]));
+    }
+    
+    let version = spirv[1];
+    let major = (version >> 16) & 0xFF;
+    let minor = (version >> 8) & 0xFF;
+    
+    if major > 1 || (major == 1 && minor > 6) {
+        return Err(ValidationError::UnsupportedVersion(major as u8, minor as u8));
+    }
+    
+    let bound = spirv[3];
+    if bound == 0 || bound > 0x400000 {
+        return Err(ValidationError::InvalidBound(bound));
+    }
+    
+    Ok(())
+}
+
+#[derive(Debug)]
+pub enum ValidationError {
+    TooShort,
+    InvalidMagic(u32),
+    UnsupportedVersion(u8, u8),
+    InvalidBound(u32),
+    InvalidInstruction(u32, String),
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort => write!(f, "SPIR-V binary too short"),
+            Self::InvalidMagic(m) => write!(f, "invalid magic: 0x{:08X}", m),
+            Self::UnsupportedVersion(maj, min) => {
+                write!(f, "unsupported SPIR-V version: {}.{}", maj, min)
+            }
+            Self::InvalidBound(b) => write!(f, "invalid ID bound: {}", b),
+            Self::InvalidInstruction(off, msg) => {
+                write!(f, "invalid instruction at {}: {}", off, msg)
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub mod prelude {
+    pub use super::{
+        // Core
+        ComputeKernel, ComputeCompiler, WorkgroupSize,
+        GpuType, GpuBuiltIn, GpuIntrinsic,
+        BufferBinding, BufferAccess,
+        
+        // Builder
+        KernelBuilder,
+        
+        // Shader module
+        ShaderModule, ShaderStage, ShaderEntryPoint,
+        
+        // Capabilities
+        GpuCapabilities, SubgroupOperations,
+        
+        // Operations
+        BinaryOp, UnaryOp, AtomicOp, BarrierKind,
+        
+        // SPIR-V
+        SpirvBuilder, Capability,
+        
+        // Utilities
+        read_spirv, write_spirv, validate_spirv,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_kernel_builder() {
+        let kernel = KernelBuilder::new("test")
+            .workgroup_size(64, 1, 1)
+            .storage_buffer("input", 0, 0, GpuType::Float32, BufferAccess::ReadOnly)
+            .storage_buffer("output", 0, 1, GpuType::Float32, BufferAccess::WriteOnly)
+            .build();
+        
+        assert_eq!(kernel.name, "test");
+        assert_eq!(kernel.workgroup_size.total(), 64);
+        assert_eq!(kernel.buffers.len(), 2);
+    }
+    
+    #[test]
+    fn test_validate_spirv() {
+        let valid = vec![
+            SPIRV_MAGIC,
+            SPIRV_VERSION_1_6,
+            0,
+            10, // bound
+            0,  // reserved
+        ];
+        
+        assert!(validate_spirv(&valid).is_ok());
+        
+        let invalid_magic = vec![0x12345678, 0, 0, 10, 0];
+        assert!(validate_spirv(&invalid_magic).is_err());
+    }
+    
+    #[test]
+    fn test_gpu_capabilities() {
+        let caps = GpuCapabilities::default();
+        assert_eq!(caps.max_workgroup_invocations, 1024);
+        assert_eq!(caps.subgroup_size, 32);
+    }
+}

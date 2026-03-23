@@ -1,0 +1,777 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ REPL — CLI Driver
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Command-line interface and session management for the REPL.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::repl::cli
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use std::io::{self, Write};
+use std::path::PathBuf;
+use crate::repl::config::{ReplConfig, Value};
+use crate::repl::eval::{Evaluator, Environment};
+use crate::repl::readline::{
+    LineEditor, History, Key, read_key,
+    enable_raw_mode, disable_raw_mode,
+    KeywordCompleter, Completer,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLI OPTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct CliArgs {
+    /// Execute expression and exit
+    pub execute: Option<String>,
+    
+    /// Execute file and exit
+    pub file: Option<PathBuf>,
+    
+    /// Interactive mode (default)
+    pub interactive: bool,
+    
+    /// No history
+    pub no_history: bool,
+    
+    /// No color
+    pub no_color: bool,
+    
+    /// Quiet mode
+    pub quiet: bool,
+    
+    /// Show help
+    pub help: bool,
+    
+    /// Show version
+    pub version: bool,
+    
+    /// Debug mode
+    pub debug: bool,
+    
+    /// Strict mode
+    pub strict: bool,
+    
+    /// Config file
+    pub config: Option<PathBuf>,
+}
+
+impl Default for CliArgs {
+    fn default() -> Self {
+        CliArgs {
+            execute: None,
+            file: None,
+            interactive: true,
+            no_history: false,
+            no_color: false,
+            quiet: false,
+            help: false,
+            version: false,
+            debug: false,
+            strict: false,
+            config: None,
+        }
+    }
+}
+
+/// Parse command-line arguments
+pub fn parse_args(args: &[String]) -> Result<CliArgs, String> {
+    let mut cli = CliArgs::default();
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        
+        match arg.as_str() {
+            "-h" | "--help" => cli.help = true,
+            "-V" | "--version" => cli.version = true,
+            "-q" | "--quiet" => cli.quiet = true,
+            "--debug" => cli.debug = true,
+            "--strict" => cli.strict = true,
+            "--no-history" => cli.no_history = true,
+            "--no-color" => cli.no_color = true,
+            
+            "-e" | "--execute" => {
+                i += 1;
+                cli.execute = Some(
+                    args.get(i).ok_or("missing value for --execute")?.clone()
+                );
+                cli.interactive = false;
+            }
+            
+            "-c" | "--config" => {
+                i += 1;
+                cli.config = Some(PathBuf::from(
+                    args.get(i).ok_or("missing value for --config")?
+                ));
+            }
+            
+            _ if arg.starts_with('-') => {
+                return Err(format!("unknown option: {}", arg));
+            }
+            
+            _ => {
+                // Positional argument (file to execute)
+                cli.file = Some(PathBuf::from(arg));
+                cli.interactive = false;
+            }
+        }
+        
+        i += 1;
+    }
+    
+    Ok(cli)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn print_help() {
+    println!(r#"quanta-repl - QuantaLang Interactive REPL
+
+USAGE:
+    quanta-repl [OPTIONS] [FILE]
+
+ARGS:
+    [FILE]    Execute file and exit
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version
+    -e, --execute <EXPR>  Execute expression and exit
+    -c, --config <FILE>   Path to config file
+    -q, --quiet         Minimal output
+    --debug             Enable debug mode
+    --strict            Enable strict mode
+    --no-history        Don't save history
+    --no-color          Disable color output
+
+REPL COMMANDS:
+    :help               Show REPL commands
+    :quit, :q           Exit the REPL
+    :clear              Clear the screen
+    :reset              Reset environment
+    :history            Show history
+    :type <expr>        Show expression type
+    :load <file>        Load and execute file
+    :save <file>        Save session to file
+    :env                Show all bindings
+    :set <opt> <val>    Set option
+    :time <expr>        Time expression evaluation
+
+EXAMPLES:
+    quanta-repl                      Start interactive REPL
+    quanta-repl -e "2 + 2"           Evaluate expression
+    quanta-repl script.quanta        Execute file
+"#);
+}
+
+fn print_version() {
+    println!("quanta-repl {}", VERSION);
+}
+
+fn print_banner() {
+    println!(r#"
+╔═══════════════════════════════════════════════════════════╗
+║   QuantaLang REPL v{}                                  ║
+║   Type :help for commands, :quit to exit                  ║
+╚═══════════════════════════════════════════════════════════╝
+"#, VERSION);
+}
+
+fn print_repl_help() {
+    println!(r#"REPL Commands:
+    :help, :h           Show this help
+    :quit, :q           Exit the REPL
+    :clear, :cls        Clear the screen
+    :reset              Reset environment
+    :history            Show command history
+    :type <expr>        Show expression type
+    :load <file>        Load and execute file
+    :save <file>        Save session to file
+    :env                Show all bindings
+    :set <opt> <val>    Set option
+    :unset <opt>        Unset option
+    :time <expr>        Time expression evaluation
+    :debug <expr>       Evaluate with debug output
+
+Available options for :set:
+    color               Enable/disable color (true/false)
+    types               Show type annotations (true/false)
+    timing              Show evaluation time (true/false)
+    prompt              Set prompt string
+"#);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REPL SESSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// REPL session
+pub struct Session {
+    config: ReplConfig,
+    evaluator: Evaluator,
+    editor: LineEditor,
+    completer: KeywordCompleter,
+    running: bool,
+    line_count: usize,
+}
+
+impl Session {
+    pub fn new(config: ReplConfig) -> Self {
+        let mut history = History::new(config.max_history);
+        
+        // Load history
+        if let Some(ref path) = config.history_file {
+            let _ = history.load(path);
+        }
+        
+        let editor = LineEditor::new().with_history(history);
+        let evaluator = Evaluator::new(config.clone());
+        
+        Session {
+            config,
+            evaluator,
+            editor,
+            completer: KeywordCompleter::new(),
+            running: true,
+            line_count: 0,
+        }
+    }
+    
+    /// Run the REPL loop
+    pub fn run(&mut self) -> Result<i32, String> {
+        if !self.config.quiet {
+            print_banner();
+        }
+        
+        // Enable raw mode for line editing
+        let original_termios = enable_raw_mode()
+            .map_err(|e| format!("failed to enable raw mode: {}", e))?;
+        
+        let result = self.run_loop();
+        
+        // Restore terminal
+        let _ = disable_raw_mode(&original_termios);
+        
+        // Save history
+        if let Some(ref path) = self.config.history_file {
+            let _ = self.editor.history().save();
+        }
+        
+        result
+    }
+    
+    fn run_loop(&mut self) -> Result<i32, String> {
+        while self.running {
+            // Print prompt
+            self.print_prompt();
+            
+            // Read input
+            let input = match self.read_line()? {
+                Some(line) => line,
+                None => {
+                    println!();
+                    break;
+                }
+            };
+            
+            if input.is_empty() {
+                continue;
+            }
+            
+            // Handle REPL commands
+            if input.starts_with(':') {
+                self.handle_command(&input);
+                continue;
+            }
+            
+            // Evaluate
+            self.evaluate(&input);
+        }
+        
+        if !self.config.quiet {
+            println!("Goodbye!");
+        }
+        
+        Ok(0)
+    }
+    
+    fn print_prompt(&self) {
+        print!("{}", self.config.prompt);
+        let _ = io::stdout().flush();
+    }
+    
+    fn read_line(&mut self) -> Result<Option<String>, String> {
+        self.editor.clear();
+        
+        loop {
+            let key = read_key().map_err(|e| e.to_string())?;
+            
+            match key {
+                Key::Enter => {
+                    println!();
+                    
+                    // Check for continuation
+                    if !self.editor.is_complete() {
+                        print!("{}", self.config.continuation_prompt);
+                        let _ = io::stdout().flush();
+                        self.editor.insert('\n');
+                        continue;
+                    }
+                    
+                    return Ok(Some(self.editor.submit()));
+                }
+                
+                Key::CtrlC => {
+                    println!("^C");
+                    self.editor.clear();
+                    self.print_prompt();
+                }
+                
+                Key::CtrlD => {
+                    if self.editor.buffer().is_empty() {
+                        return Ok(None);
+                    }
+                    self.editor.delete();
+                    self.redraw_line();
+                }
+                
+                Key::Tab => {
+                    let completions = self.completer.complete(
+                        self.editor.buffer(),
+                        self.editor.cursor(),
+                    );
+                    
+                    if !completions.is_empty() {
+                        self.editor.set_completions(completions);
+                        self.editor.complete_next();
+                        self.redraw_line();
+                    }
+                }
+                
+                Key::Backspace => {
+                    if self.editor.backspace() {
+                        self.redraw_line();
+                    }
+                }
+                
+                Key::Delete => {
+                    if self.editor.delete() {
+                        self.redraw_line();
+                    }
+                }
+                
+                Key::Left | Key::CtrlB => {
+                    if self.editor.move_left() {
+                        self.redraw_line();
+                    }
+                }
+                
+                Key::Right | Key::CtrlF => {
+                    if self.editor.move_right() {
+                        self.redraw_line();
+                    }
+                }
+                
+                Key::Up | Key::CtrlP => {
+                    self.editor.history_prev();
+                    self.redraw_line();
+                }
+                
+                Key::Down | Key::CtrlN => {
+                    self.editor.history_next();
+                    self.redraw_line();
+                }
+                
+                Key::Home | Key::CtrlA => {
+                    self.editor.move_home();
+                    self.redraw_line();
+                }
+                
+                Key::End | Key::CtrlE => {
+                    self.editor.move_end();
+                    self.redraw_line();
+                }
+                
+                Key::CtrlK => {
+                    self.editor.kill_line();
+                    self.redraw_line();
+                }
+                
+                Key::CtrlU => {
+                    self.editor.kill_line_before();
+                    self.redraw_line();
+                }
+                
+                Key::CtrlW => {
+                    self.editor.delete_word();
+                    self.redraw_line();
+                }
+                
+                Key::CtrlT => {
+                    self.editor.transpose();
+                    self.redraw_line();
+                }
+                
+                Key::CtrlL => {
+                    print!("\x1B[2J\x1B[H");
+                    self.print_prompt();
+                    self.redraw_line();
+                }
+                
+                Key::AltB => {
+                    self.editor.move_word_left();
+                    self.redraw_line();
+                }
+                
+                Key::AltF => {
+                    self.editor.move_word_right();
+                    self.redraw_line();
+                }
+                
+                Key::Char(c) => {
+                    self.editor.insert(c);
+                    self.redraw_line();
+                }
+                
+                _ => {}
+            }
+        }
+    }
+    
+    fn redraw_line(&self) {
+        // Clear line and redraw
+        print!("\r\x1B[K{}{}", self.config.prompt, self.editor.buffer());
+        
+        // Position cursor
+        let cursor_pos = self.config.prompt.len() + self.editor.cursor();
+        print!("\r\x1B[{}C", cursor_pos);
+        
+        let _ = io::stdout().flush();
+    }
+    
+    fn handle_command(&mut self, input: &str) {
+        let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
+        let cmd = parts[0];
+        let arg = parts.get(1).map(|s| s.trim());
+        
+        match cmd {
+            "help" | "h" => print_repl_help(),
+            "quit" | "q" | "exit" => self.running = false,
+            
+            "clear" | "cls" => {
+                print!("\x1B[2J\x1B[H");
+                let _ = io::stdout().flush();
+            }
+            
+            "reset" => {
+                self.evaluator = Evaluator::new(self.config.clone());
+                println!("Environment reset.");
+            }
+            
+            "history" => {
+                for (i, entry) in self.editor.history().entries().iter().enumerate() {
+                    println!("{:4}  {}", i + 1, entry);
+                }
+            }
+            
+            "type" => {
+                if let Some(expr) = arg {
+                    let result = self.evaluator.eval(expr);
+                    match result.value {
+                        Ok(v) => println!(": {}", v.type_name()),
+                        Err(e) => println!("Error: {}", e),
+                    }
+                } else {
+                    println!("Usage: :type <expr>");
+                }
+            }
+            
+            "load" => {
+                if let Some(path) = arg {
+                    self.load_file(path);
+                } else {
+                    println!("Usage: :load <file>");
+                }
+            }
+            
+            "save" => {
+                if let Some(path) = arg {
+                    self.save_session(path);
+                } else {
+                    println!("Usage: :save <file>");
+                }
+            }
+            
+            "env" => {
+                let bindings = self.evaluator.env().borrow().list_bindings();
+                if bindings.is_empty() {
+                    println!("No bindings.");
+                } else {
+                    for (name, ty) in bindings {
+                        println!("  {}: {}", name, ty);
+                    }
+                }
+            }
+            
+            "set" => {
+                if let Some(rest) = arg {
+                    let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        self.set_option(parts[0], parts[1]);
+                    } else {
+                        println!("Usage: :set <option> <value>");
+                    }
+                } else {
+                    println!("Usage: :set <option> <value>");
+                }
+            }
+            
+            "time" => {
+                if let Some(expr) = arg {
+                    let result = self.evaluator.eval(expr);
+                    match result.value {
+                        Ok(v) => {
+                            if self.config.auto_print {
+                                println!("{}", v);
+                            }
+                            println!("Time: {:?}", result.duration);
+                        }
+                        Err(e) => println!("Error: {}", e),
+                    }
+                } else {
+                    println!("Usage: :time <expr>");
+                }
+            }
+            
+            "debug" => {
+                if let Some(expr) = arg {
+                    let old_debug = self.config.debug;
+                    self.config.debug = true;
+                    self.evaluate(expr);
+                    self.config.debug = old_debug;
+                } else {
+                    println!("Usage: :debug <expr>");
+                }
+            }
+            
+            _ => {
+                println!("Unknown command: :{}", cmd);
+                println!("Type :help for available commands.");
+            }
+        }
+    }
+    
+    fn evaluate(&mut self, input: &str) {
+        self.line_count += 1;
+        
+        let result = self.evaluator.eval(input);
+        
+        match result.value {
+            Ok(value) => {
+                if self.config.auto_print && !matches!(value, Value::Unit) {
+                    if self.config.show_types {
+                        println!("{} : {}", value.pretty_print(self.config.width), value.type_name());
+                    } else {
+                        println!("{}", value.pretty_print(self.config.width));
+                    }
+                }
+                
+                if self.config.timing {
+                    println!("({:?})", result.duration);
+                }
+            }
+            Err(e) => {
+                if self.config.color {
+                    println!("\x1B[31mError:\x1B[0m {}", e);
+                } else {
+                    println!("Error: {}", e);
+                }
+            }
+        }
+    }
+    
+    fn load_file(&mut self, path: &str) {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                for line in content.lines() {
+                    let line = line.trim();
+                    if !line.is_empty() && !line.starts_with("//") {
+                        if self.config.debug {
+                            println!("> {}", line);
+                        }
+                        self.evaluate(line);
+                    }
+                }
+                println!("Loaded: {}", path);
+            }
+            Err(e) => println!("Error loading file: {}", e),
+        }
+    }
+    
+    fn save_session(&self, path: &str) {
+        let history = self.editor.history().entries();
+        
+        match std::fs::write(path, history.join("\n")) {
+            Ok(()) => println!("Session saved to: {}", path),
+            Err(e) => println!("Error saving session: {}", e),
+        }
+    }
+    
+    fn set_option(&mut self, option: &str, value: &str) {
+        match option {
+            "color" => {
+                self.config.color = value == "true" || value == "on" || value == "1";
+                println!("color = {}", self.config.color);
+            }
+            "types" => {
+                self.config.show_types = value == "true" || value == "on" || value == "1";
+                println!("types = {}", self.config.show_types);
+            }
+            "timing" => {
+                self.config.timing = value == "true" || value == "on" || value == "1";
+                println!("timing = {}", self.config.timing);
+            }
+            "prompt" => {
+                self.config.prompt = value.to_string();
+                println!("prompt = \"{}\"", self.config.prompt);
+            }
+            "debug" => {
+                self.config.debug = value == "true" || value == "on" || value == "1";
+                println!("debug = {}", self.config.debug);
+            }
+            _ => {
+                println!("Unknown option: {}", option);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN EXECUTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Run REPL from CLI args
+pub fn run(args: &CliArgs) -> Result<i32, String> {
+    if args.help {
+        print_help();
+        return Ok(0);
+    }
+    
+    if args.version {
+        print_version();
+        return Ok(0);
+    }
+    
+    // Build config
+    let mut config = if let Some(ref path) = args.config {
+        ReplConfig::load(path)?
+    } else {
+        ReplConfig::default()
+    };
+    
+    // Apply CLI overrides
+    if args.no_color {
+        config.color = false;
+    }
+    if args.no_history {
+        config.history_file = None;
+    }
+    if args.debug {
+        config.debug = true;
+    }
+    if args.strict {
+        config.strict = true;
+    }
+    config.quiet = args.quiet;
+    
+    // Execute expression
+    if let Some(ref expr) = args.execute {
+        let mut evaluator = Evaluator::new(config);
+        let result = evaluator.eval(expr);
+        
+        match result.value {
+            Ok(value) => {
+                if !matches!(value, Value::Unit) {
+                    println!("{}", value);
+                }
+                return Ok(0);
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                return Ok(1);
+            }
+        }
+    }
+    
+    // Execute file
+    if let Some(ref path) = args.file {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read file: {}", e))?;
+        
+        let mut evaluator = Evaluator::new(config);
+        
+        for line in content.lines() {
+            let line = line.trim();
+            if !line.is_empty() && !line.starts_with("//") {
+                let result = evaluator.eval(line);
+                if let Err(e) = result.value {
+                    eprintln!("Error: {}", e);
+                    return Ok(1);
+                }
+            }
+        }
+        
+        return Ok(0);
+    }
+    
+    // Interactive REPL
+    let mut session = Session::new(config);
+    session.run()
+}
+
+/// Main entry point
+pub fn main() -> Result<i32, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = parse_args(&args)?;
+    run(&cli)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_parse_args() {
+        let args = vec!["-e".to_string(), "2 + 2".to_string()];
+        let cli = parse_args(&args).unwrap();
+        assert_eq!(cli.execute, Some("2 + 2".to_string()));
+        assert!(!cli.interactive);
+    }
+    
+    #[test]
+    fn test_parse_args_help() {
+        let args = vec!["--help".to_string()];
+        let cli = parse_args(&args).unwrap();
+        assert!(cli.help);
+    }
+}

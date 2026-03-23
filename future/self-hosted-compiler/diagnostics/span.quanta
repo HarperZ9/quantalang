@@ -1,0 +1,857 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ DIAGNOSTICS — Source Spans
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Source code location tracking:
+// - Byte spans with file associations
+// - Line/column computation
+// - Multi-span support for complex errors
+// - Source map integration
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module quantalang::diagnostics::span
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::rc::Rc;
+use core::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+use std::collections::HashMap;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BYTE POSITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Absolute byte position in source
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct BytePos(pub u32);
+
+impl BytePos {
+    pub const DUMMY: BytePos = BytePos(0);
+    
+    pub fn new(pos: u32) -> Self {
+        BytePos(pos)
+    }
+    
+    pub fn to_usize(self) -> usize {
+        self.0 as usize
+    }
+    
+    pub fn offset(self, offset: i32) -> BytePos {
+        BytePos((self.0 as i32 + offset) as u32)
+    }
+}
+
+impl From<u32> for BytePos {
+    fn from(val: u32) -> Self {
+        BytePos(val)
+    }
+}
+
+impl From<usize> for BytePos {
+    fn from(val: usize) -> Self {
+        BytePos(val as u32)
+    }
+}
+
+impl std::ops::Add<u32> for BytePos {
+    type Output = BytePos;
+    fn add(self, rhs: u32) -> BytePos {
+        BytePos(self.0 + rhs)
+    }
+}
+
+impl std::ops::Sub for BytePos {
+    type Output = u32;
+    fn sub(self, rhs: BytePos) -> u32 {
+        self.0 - rhs.0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPAN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A span of source code
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Span {
+    pub lo: BytePos,
+    pub hi: BytePos,
+}
+
+impl Span {
+    /// Dummy span for generated code
+    pub const DUMMY: Span = Span {
+        lo: BytePos::DUMMY,
+        hi: BytePos::DUMMY,
+    };
+    
+    /// Create a new span
+    pub fn new(lo: BytePos, hi: BytePos) -> Self {
+        Span { lo, hi }
+    }
+    
+    /// Create from byte range
+    pub fn from_range(range: Range<usize>) -> Self {
+        Span {
+            lo: BytePos(range.start as u32),
+            hi: BytePos(range.end as u32),
+        }
+    }
+    
+    /// Check if this is a dummy span
+    pub fn is_dummy(&self) -> bool {
+        self.lo == BytePos::DUMMY && self.hi == BytePos::DUMMY
+    }
+    
+    /// Get the byte length
+    pub fn len(&self) -> u32 {
+        self.hi - self.lo
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.lo == self.hi
+    }
+    
+    /// Merge with another span (union)
+    pub fn merge(self, other: Span) -> Span {
+        if self.is_dummy() {
+            return other;
+        }
+        if other.is_dummy() {
+            return self;
+        }
+        Span {
+            lo: if self.lo < other.lo { self.lo } else { other.lo },
+            hi: if self.hi > other.hi { self.hi } else { other.hi },
+        }
+    }
+    
+    /// Get intersection with another span
+    pub fn intersect(self, other: Span) -> Option<Span> {
+        let lo = if self.lo > other.lo { self.lo } else { other.lo };
+        let hi = if self.hi < other.hi { self.hi } else { other.hi };
+        if lo < hi {
+            Some(Span { lo, hi })
+        } else {
+            None
+        }
+    }
+    
+    /// Check if contains a position
+    pub fn contains(&self, pos: BytePos) -> bool {
+        self.lo <= pos && pos < self.hi
+    }
+    
+    /// Check if contains another span
+    pub fn contains_span(&self, other: Span) -> bool {
+        self.lo <= other.lo && other.hi <= self.hi
+    }
+    
+    /// Get start position
+    pub fn start(&self) -> BytePos {
+        self.lo
+    }
+    
+    /// Get end position
+    pub fn end(&self) -> BytePos {
+        self.hi
+    }
+    
+    /// Shrink to first N bytes
+    pub fn shrink_to_lo(self, len: u32) -> Span {
+        Span {
+            lo: self.lo,
+            hi: BytePos(self.lo.0.saturating_add(len).min(self.hi.0)),
+        }
+    }
+    
+    /// Shrink to last N bytes
+    pub fn shrink_to_hi(self, len: u32) -> Span {
+        Span {
+            lo: BytePos(self.hi.0.saturating_sub(len).max(self.lo.0)),
+            hi: self.hi,
+        }
+    }
+    
+    /// Create span between two spans (exclusive)
+    pub fn between(self, end: Span) -> Span {
+        Span {
+            lo: self.hi,
+            hi: end.lo,
+        }
+    }
+    
+    /// Create span until another span starts
+    pub fn until(self, end: Span) -> Span {
+        Span {
+            lo: self.lo,
+            hi: end.lo,
+        }
+    }
+    
+    /// Convert to byte range
+    pub fn to_range(&self) -> Range<usize> {
+        self.lo.to_usize()..self.hi.to_usize()
+    }
+    
+    /// Create with file context
+    pub fn with_file(self, file_id: FileId) -> SpannedFile {
+        SpannedFile {
+            span: self,
+            file_id,
+        }
+    }
+}
+
+/// Span with associated file
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpannedFile {
+    pub span: Span,
+    pub file_id: FileId,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINE/COLUMN LOCATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 1-indexed line number
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LineNumber(pub u32);
+
+impl LineNumber {
+    pub fn new(line: u32) -> Self {
+        LineNumber(line)
+    }
+    
+    pub fn to_zero_indexed(&self) -> u32 {
+        self.0.saturating_sub(1)
+    }
+}
+
+impl std::fmt::Display for LineNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// 1-indexed column number (in characters, not bytes)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ColumnNumber(pub u32);
+
+impl ColumnNumber {
+    pub fn new(col: u32) -> Self {
+        ColumnNumber(col)
+    }
+    
+    pub fn to_zero_indexed(&self) -> u32 {
+        self.0.saturating_sub(1)
+    }
+}
+
+impl std::fmt::Display for ColumnNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Human-readable source location
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    pub file: PathBuf,
+    pub line: LineNumber,
+    pub column: ColumnNumber,
+}
+
+impl Location {
+    pub fn new(file: PathBuf, line: u32, column: u32) -> Self {
+        Location {
+            file,
+            line: LineNumber(line),
+            column: ColumnNumber(column),
+        }
+    }
+}
+
+impl std::fmt::Display for Location {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}:{}", self.file.display(), self.line, self.column)
+    }
+}
+
+/// Location range (start and end)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocationRange {
+    pub file: PathBuf,
+    pub start_line: LineNumber,
+    pub start_column: ColumnNumber,
+    pub end_line: LineNumber,
+    pub end_column: ColumnNumber,
+}
+
+impl LocationRange {
+    pub fn start(&self) -> Location {
+        Location {
+            file: self.file.clone(),
+            line: self.start_line,
+            column: self.start_column,
+        }
+    }
+    
+    pub fn end(&self) -> Location {
+        Location {
+            file: self.file.clone(),
+            line: self.end_line,
+            column: self.end_column,
+        }
+    }
+    
+    pub fn is_single_line(&self) -> bool {
+        self.start_line == self.end_line
+    }
+}
+
+impl std::fmt::Display for LocationRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_single_line() {
+            write!(
+                f, "{}:{}:{}-{}",
+                self.file.display(),
+                self.start_line,
+                self.start_column,
+                self.end_column
+            )
+        } else {
+            write!(
+                f, "{}:{}:{}-{}:{}",
+                self.file.display(),
+                self.start_line,
+                self.start_column,
+                self.end_line,
+                self.end_column
+            )
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FILE ID
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unique file identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileId(u32);
+
+impl FileId {
+    pub const DUMMY: FileId = FileId(u32::MAX);
+    
+    pub fn new(id: u32) -> Self {
+        FileId(id)
+    }
+    
+    pub fn to_u32(self) -> u32 {
+        self.0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOURCE FILE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A source file with line index
+pub struct SourceFile {
+    /// File identifier
+    pub id: FileId,
+    
+    /// File path
+    pub path: PathBuf,
+    
+    /// File name for display
+    pub name: String,
+    
+    /// Source content
+    pub source: String,
+    
+    /// Byte offset of each line start
+    line_starts: Vec<BytePos>,
+    
+    /// Length in bytes
+    pub len: u32,
+}
+
+impl SourceFile {
+    /// Create a new source file
+    pub fn new(id: FileId, path: PathBuf, source: String) -> Self {
+        let name = path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "<unknown>".into());
+        
+        let len = source.len() as u32;
+        let line_starts = Self::compute_line_starts(&source);
+        
+        SourceFile {
+            id,
+            path,
+            name,
+            source,
+            line_starts,
+            len,
+        }
+    }
+    
+    /// Compute line start positions
+    fn compute_line_starts(source: &str) -> Vec<BytePos> {
+        let mut starts = vec![BytePos(0)];
+        
+        for (i, c) in source.char_indices() {
+            if c == '\n' {
+                starts.push(BytePos((i + 1) as u32));
+            }
+        }
+        
+        starts
+    }
+    
+    /// Get number of lines
+    pub fn line_count(&self) -> usize {
+        self.line_starts.len()
+    }
+    
+    /// Get line number for byte position
+    pub fn lookup_line(&self, pos: BytePos) -> LineNumber {
+        let line_idx = self.line_starts
+            .binary_search(&pos)
+            .unwrap_or_else(|i| i.saturating_sub(1));
+        LineNumber((line_idx + 1) as u32)
+    }
+    
+    /// Get column for byte position
+    pub fn lookup_column(&self, pos: BytePos) -> ColumnNumber {
+        let line = self.lookup_line(pos);
+        let line_start = self.line_starts[line.to_zero_indexed() as usize];
+        
+        // Count characters (not bytes) from line start
+        let line_prefix = &self.source[line_start.to_usize()..pos.to_usize()];
+        let col = line_prefix.chars().count() + 1;
+        
+        ColumnNumber(col as u32)
+    }
+    
+    /// Get full location for byte position
+    pub fn lookup_location(&self, pos: BytePos) -> Location {
+        Location {
+            file: self.path.clone(),
+            line: self.lookup_line(pos),
+            column: self.lookup_column(pos),
+        }
+    }
+    
+    /// Get location range for span
+    pub fn lookup_span(&self, span: Span) -> LocationRange {
+        let start = self.lookup_location(span.lo);
+        let end = self.lookup_location(span.hi);
+        
+        LocationRange {
+            file: self.path.clone(),
+            start_line: start.line,
+            start_column: start.column,
+            end_line: end.line,
+            end_column: end.column,
+        }
+    }
+    
+    /// Get byte position for line start
+    pub fn line_start(&self, line: LineNumber) -> Option<BytePos> {
+        self.line_starts.get(line.to_zero_indexed() as usize).copied()
+    }
+    
+    /// Get line content
+    pub fn line_content(&self, line: LineNumber) -> Option<&str> {
+        let start = self.line_start(line)?;
+        let end = self.line_starts
+            .get(line.0 as usize)
+            .copied()
+            .unwrap_or(BytePos(self.len));
+        
+        let content = &self.source[start.to_usize()..end.to_usize()];
+        Some(content.trim_end_matches('\n').trim_end_matches('\r'))
+    }
+    
+    /// Get span content
+    pub fn span_content(&self, span: Span) -> &str {
+        &self.source[span.to_range()]
+    }
+    
+    /// Get lines for span (inclusive)
+    pub fn span_lines(&self, span: Span) -> Vec<LineNumber> {
+        let start_line = self.lookup_line(span.lo);
+        let end_line = self.lookup_line(span.hi);
+        
+        (start_line.0..=end_line.0)
+            .map(LineNumber)
+            .collect()
+    }
+    
+    /// Get context lines around a span
+    pub fn context_lines(&self, span: Span, context: u32) -> Vec<(LineNumber, &str)> {
+        let start_line = self.lookup_line(span.lo);
+        let end_line = self.lookup_line(span.hi);
+        
+        let first = start_line.0.saturating_sub(context).max(1);
+        let last = (end_line.0 + context).min(self.line_count() as u32);
+        
+        (first..=last)
+            .filter_map(|n| {
+                let line = LineNumber(n);
+                self.line_content(line).map(|c| (line, c))
+            })
+            .collect()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOURCE MAP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Source file collection
+pub struct SourceMap {
+    files: RwLock<Vec<Arc<SourceFile>>>,
+    file_index: RwLock<HashMap<PathBuf, FileId>>,
+    next_id: RwLock<u32>,
+}
+
+impl SourceMap {
+    /// Create a new source map
+    pub fn new() -> Arc<Self> {
+        Arc::new(SourceMap {
+            files: RwLock::new(Vec::new()),
+            file_index: RwLock::new(HashMap::new()),
+            next_id: RwLock::new(0),
+        })
+    }
+    
+    /// Add a file
+    pub fn add_file(&self, path: PathBuf, source: String) -> Arc<SourceFile> {
+        let mut files = self.files.write().unwrap();
+        let mut index = self.file_index.write().unwrap();
+        let mut next_id = self.next_id.write().unwrap();
+        
+        // Check if already loaded
+        if let Some(&id) = index.get(&path) {
+            return files[id.0 as usize].clone();
+        }
+        
+        let id = FileId(*next_id);
+        *next_id += 1;
+        
+        let file = Arc::new(SourceFile::new(id, path.clone(), source));
+        files.push(file.clone());
+        index.insert(path, id);
+        
+        file
+    }
+    
+    /// Load file from disk
+    pub fn load_file(&self, path: &Path) -> std::io::Result<Arc<SourceFile>> {
+        let source = std::fs::read_to_string(path)?;
+        Ok(self.add_file(path.to_path_buf(), source))
+    }
+    
+    /// Get file by ID
+    pub fn get_file(&self, id: FileId) -> Option<Arc<SourceFile>> {
+        self.files.read().unwrap().get(id.0 as usize).cloned()
+    }
+    
+    /// Get file by path
+    pub fn get_file_by_path(&self, path: &Path) -> Option<Arc<SourceFile>> {
+        let index = self.file_index.read().unwrap();
+        let id = index.get(path)?;
+        self.get_file(*id)
+    }
+    
+    /// Lookup location for a span
+    pub fn lookup_span(&self, file_id: FileId, span: Span) -> Option<LocationRange> {
+        let file = self.get_file(file_id)?;
+        Some(file.lookup_span(span))
+    }
+    
+    /// Get span content
+    pub fn span_content(&self, file_id: FileId, span: Span) -> Option<&str> {
+        // Note: This would need interior mutability or different design in real impl
+        // For now, get the file and return owned string
+        None // Simplified for demo
+    }
+    
+    /// Get all files
+    pub fn files(&self) -> Vec<Arc<SourceFile>> {
+        self.files.read().unwrap().clone()
+    }
+    
+    /// Number of files
+    pub fn file_count(&self) -> usize {
+        self.files.read().unwrap().len()
+    }
+}
+
+impl Default for SourceMap {
+    fn default() -> Arc<Self> {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MULTI-SPAN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A labeled span for highlighting
+#[derive(Debug, Clone)]
+pub struct LabeledSpan {
+    pub span: Span,
+    pub file_id: FileId,
+    pub label: Option<String>,
+    pub style: SpanStyle,
+}
+
+impl LabeledSpan {
+    pub fn primary(span: Span, file_id: FileId) -> Self {
+        LabeledSpan {
+            span,
+            file_id,
+            label: None,
+            style: SpanStyle::Primary,
+        }
+    }
+    
+    pub fn secondary(span: Span, file_id: FileId) -> Self {
+        LabeledSpan {
+            span,
+            file_id,
+            label: None,
+            style: SpanStyle::Secondary,
+        }
+    }
+    
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+}
+
+/// Span highlighting style
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanStyle {
+    Primary,   // Main error location (^^^)
+    Secondary, // Related location (---)
+    Note,      // Additional info (...)
+}
+
+/// Collection of related spans
+#[derive(Debug, Clone, Default)]
+pub struct MultiSpan {
+    pub spans: Vec<LabeledSpan>,
+}
+
+impl MultiSpan {
+    pub fn new() -> Self {
+        MultiSpan { spans: Vec::new() }
+    }
+    
+    pub fn single(span: Span, file_id: FileId) -> Self {
+        let mut ms = Self::new();
+        ms.push_primary(span, file_id);
+        ms
+    }
+    
+    pub fn push_primary(&mut self, span: Span, file_id: FileId) {
+        self.spans.push(LabeledSpan::primary(span, file_id));
+    }
+    
+    pub fn push_secondary(&mut self, span: Span, file_id: FileId) {
+        self.spans.push(LabeledSpan::secondary(span, file_id));
+    }
+    
+    pub fn push_labeled(&mut self, span: Span, file_id: FileId, label: impl Into<String>) {
+        self.spans.push(LabeledSpan::primary(span, file_id).with_label(label));
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+    
+    pub fn primary_spans(&self) -> impl Iterator<Item = &LabeledSpan> {
+        self.spans.iter().filter(|s| s.style == SpanStyle::Primary)
+    }
+    
+    pub fn secondary_spans(&self) -> impl Iterator<Item = &LabeledSpan> {
+        self.spans.iter().filter(|s| s.style == SpanStyle::Secondary)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPANNED VALUE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A value with associated span
+#[derive(Debug, Clone)]
+pub struct Spanned<T> {
+    pub node: T,
+    pub span: Span,
+}
+
+impl<T> Spanned<T> {
+    pub fn new(node: T, span: Span) -> Self {
+        Spanned { node, span }
+    }
+    
+    pub fn dummy(node: T) -> Self {
+        Spanned { node, span: Span::DUMMY }
+    }
+    
+    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Spanned<U> {
+        Spanned {
+            node: f(self.node),
+            span: self.span,
+        }
+    }
+    
+    pub fn as_ref(&self) -> Spanned<&T> {
+        Spanned {
+            node: &self.node,
+            span: self.span,
+        }
+    }
+}
+
+impl<T: PartialEq> PartialEq for Spanned<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node
+    }
+}
+
+impl<T: Eq> Eq for Spanned<T> {}
+
+impl<T: std::hash::Hash> std::hash::Hash for Spanned<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.node.hash(state);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_span_operations() {
+        let s1 = Span::new(BytePos(10), BytePos(20));
+        let s2 = Span::new(BytePos(15), BytePos(25));
+        
+        let merged = s1.merge(s2);
+        assert_eq!(merged.lo, BytePos(10));
+        assert_eq!(merged.hi, BytePos(25));
+        
+        let intersect = s1.intersect(s2).unwrap();
+        assert_eq!(intersect.lo, BytePos(15));
+        assert_eq!(intersect.hi, BytePos(20));
+    }
+    
+    #[test]
+    fn test_source_file_lines() {
+        let source = "line one\nline two\nline three";
+        let file = SourceFile::new(
+            FileId(0),
+            PathBuf::from("test.quanta"),
+            source.to_string(),
+        );
+        
+        assert_eq!(file.line_count(), 3);
+        assert_eq!(file.lookup_line(BytePos(0)), LineNumber(1));
+        assert_eq!(file.lookup_line(BytePos(10)), LineNumber(2));
+        assert_eq!(file.lookup_line(BytePos(20)), LineNumber(3));
+    }
+    
+    #[test]
+    fn test_source_file_columns() {
+        let source = "fn main() {}";
+        let file = SourceFile::new(
+            FileId(0),
+            PathBuf::from("test.quanta"),
+            source.to_string(),
+        );
+        
+        assert_eq!(file.lookup_column(BytePos(0)), ColumnNumber(1));
+        assert_eq!(file.lookup_column(BytePos(3)), ColumnNumber(4));
+    }
+    
+    #[test]
+    fn test_source_map() {
+        let map = SourceMap::new();
+        let file1 = map.add_file(
+            PathBuf::from("a.quanta"),
+            "fn a() {}".to_string(),
+        );
+        let file2 = map.add_file(
+            PathBuf::from("b.quanta"),
+            "fn b() {}".to_string(),
+        );
+        
+        assert_eq!(map.file_count(), 2);
+        assert_eq!(file1.id, FileId(0));
+        assert_eq!(file2.id, FileId(1));
+    }
+    
+    #[test]
+    fn test_line_content() {
+        let source = "let x = 1;\nlet y = 2;\nlet z = 3;";
+        let file = SourceFile::new(
+            FileId(0),
+            PathBuf::from("test.quanta"),
+            source.to_string(),
+        );
+        
+        assert_eq!(file.line_content(LineNumber(1)), Some("let x = 1;"));
+        assert_eq!(file.line_content(LineNumber(2)), Some("let y = 2;"));
+        assert_eq!(file.line_content(LineNumber(3)), Some("let z = 3;"));
+    }
+    
+    #[test]
+    fn test_span_content() {
+        let source = "let x = 42;";
+        let file = SourceFile::new(
+            FileId(0),
+            PathBuf::from("test.quanta"),
+            source.to_string(),
+        );
+        
+        let span = Span::new(BytePos(4), BytePos(5)); // 'x'
+        assert_eq!(file.span_content(span), "x");
+        
+        let span = Span::new(BytePos(8), BytePos(10)); // '42'
+        assert_eq!(file.span_content(span), "42");
+    }
+    
+    #[test]
+    fn test_unicode_columns() {
+        let source = "let 日本語 = 1;";
+        let file = SourceFile::new(
+            FileId(0),
+            PathBuf::from("test.quanta"),
+            source.to_string(),
+        );
+        
+        // Column should count characters, not bytes
+        // "let " = 4 chars, "日本語" = 3 chars
+        let pos = BytePos(4 + 3 * 3); // After 日本語 (3 UTF-8 bytes each)
+        assert_eq!(file.lookup_column(pos), ColumnNumber(8)); // 1 + 4 + 3
+    }
+}

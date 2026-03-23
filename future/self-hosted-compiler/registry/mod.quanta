@@ -1,0 +1,703 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUANTALANG™ REGISTRY — Module Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
+// Copyright © 2024-2025 Zain Dana Harper. All Rights Reserved.
+// CONFIDENTIAL — Trade Secret — Patent Pending
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Package registry system:
+// - Package publishing and discovery
+// - Dependency resolution
+// - Version management
+// - Caching and synchronization
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//! # Package Registry
+//!
+//! Complete package registry implementation for QuantaLang.
+//!
+//! ## Features
+//!
+//! - **Publishing**: Publish packages to the registry
+//! - **Discovery**: Search and browse packages
+//! - **Resolution**: Resolve dependency graphs
+//! - **Caching**: Local package caching
+//!
+//! ## Quick Start
+//!
+//! ```quanta
+//! use quantalang::registry::prelude::*;
+//!
+//! // Create registry client
+//! let client = RegistryClient::default_registry();
+//!
+//! // Search for packages
+//! let results = client.search("json", 10)?;
+//!
+//! // Download a package
+//! let tarball = client.download(
+//!     &PackageName::parse("serde")?,
+//!     &Version::parse("1.0.0")?,
+//! )?;
+//! ```
+
+module quantalang::registry
+
+pub mod index;
+pub mod client;
+
+// Re-exports
+pub use index::{
+    PackageName, NameError,
+    Version, VersionError, Prerelease, PrereleaseId,
+    VersionReq, Comparator, Op,
+    PackageMetadata, Dependency, IndexEntry, PackageIndex,
+};
+
+pub use client::{
+    RegistryConfig, DEFAULT_REGISTRY,
+    Credentials, RegistryClient, RegistryError,
+    UserInfo, SearchResult, PackageCache,
+};
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::format;
+use alloc::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VERSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const VERSION: &str = "1.0.0";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEPENDENCY RESOLUTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Resolved package (specific version selected)
+#[derive(Debug, Clone)]
+pub struct ResolvedPackage {
+    pub name: PackageName,
+    pub version: Version,
+    pub dependencies: Vec<PackageName>,
+    pub features: Vec<String>,
+    pub checksum: Option<String>,
+}
+
+/// Dependency graph (resolved)
+#[derive(Debug, Clone)]
+pub struct DependencyGraph {
+    /// Resolved packages
+    pub packages: BTreeMap<String, ResolvedPackage>,
+    
+    /// Root packages
+    pub roots: Vec<String>,
+    
+    /// Topological order (dependencies before dependents)
+    pub order: Vec<String>,
+}
+
+impl DependencyGraph {
+    /// Create empty graph
+    pub fn new() -> Self {
+        DependencyGraph {
+            packages: BTreeMap::new(),
+            roots: Vec::new(),
+            order: Vec::new(),
+        }
+    }
+    
+    /// Get package by name
+    pub fn get(&self, name: &str) -> Option<&ResolvedPackage> {
+        self.packages.get(name)
+    }
+    
+    /// Iterate in dependency order
+    pub fn iter_ordered(&self) -> impl Iterator<Item = &ResolvedPackage> {
+        self.order.iter().filter_map(|n| self.packages.get(n))
+    }
+    
+    /// Get total package count
+    pub fn len(&self) -> usize {
+        self.packages.len()
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.packages.is_empty()
+    }
+}
+
+impl Default for DependencyGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Dependency resolver
+pub struct Resolver {
+    client: Arc<RegistryClient>,
+    /// Package versions being considered
+    candidates: BTreeMap<String, Vec<Version>>,
+    /// Selected versions
+    selected: BTreeMap<String, Version>,
+    /// Activated features per package
+    features: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Resolver {
+    /// Create new resolver
+    pub fn new(client: Arc<RegistryClient>) -> Self {
+        Resolver {
+            client,
+            candidates: BTreeMap::new(),
+            selected: BTreeMap::new(),
+            features: BTreeMap::new(),
+        }
+    }
+    
+    /// Resolve dependencies from root requirements
+    pub fn resolve(&mut self, requirements: &[Dependency]) -> Result<DependencyGraph, ResolveError> {
+        // Clear previous state
+        self.candidates.clear();
+        self.selected.clear();
+        self.features.clear();
+        
+        // Queue of packages to process
+        let mut queue: Vec<Dependency> = requirements.to_vec();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        
+        // Root package names
+        let roots: Vec<String> = requirements.iter()
+            .map(|d| d.name.as_str().to_string())
+            .collect();
+        
+        // Phase 1: Collect all candidates
+        while let Some(dep) = queue.pop() {
+            let name = dep.name.as_str().to_string();
+            
+            if visited.contains(&name) {
+                continue;
+            }
+            visited.insert(name.clone());
+            
+            // Get package from registry
+            let entry = self.client.get_package(&name)?
+                .ok_or_else(|| ResolveError::PackageNotFound(name.clone()))?;
+            
+            // Get versions matching requirement
+            let matching = entry.matching_versions(&dep.version_req);
+            
+            if matching.is_empty() {
+                return Err(ResolveError::NoMatchingVersion {
+                    package: name,
+                    requirement: dep.version_req.to_string(),
+                });
+            }
+            
+            // Store candidates
+            let versions: Vec<Version> = matching.iter()
+                .map(|m| m.version.clone())
+                .collect();
+            self.candidates.insert(name.clone(), versions);
+            
+            // Add features
+            let mut pkg_features = self.features.entry(name.clone())
+                .or_insert_with(BTreeSet::new);
+            
+            if dep.default_features {
+                if let Some(latest) = entry.latest() {
+                    for f in &latest.default_features {
+                        pkg_features.insert(f.clone());
+                    }
+                }
+            }
+            
+            for f in &dep.features {
+                pkg_features.insert(f.clone());
+            }
+            
+            // Queue transitive dependencies
+            if let Some(best) = entry.best_match(&dep.version_req) {
+                for trans_dep in &best.dependencies {
+                    if !visited.contains(trans_dep.name.as_str()) {
+                        queue.push(trans_dep.clone());
+                    }
+                }
+            }
+        }
+        
+        // Phase 2: Version selection (PubGrub-style)
+        self.select_versions()?;
+        
+        // Phase 3: Build graph
+        let graph = self.build_graph(&roots)?;
+        
+        Ok(graph)
+    }
+    
+    /// Select versions using backtracking
+    fn select_versions(&mut self) -> Result<(), ResolveError> {
+        let packages: Vec<String> = self.candidates.keys().cloned().collect();
+        
+        for name in packages {
+            let candidates = self.candidates.get(&name).unwrap().clone();
+            
+            // Try versions from newest to oldest
+            let mut found = false;
+            for version in candidates.iter().rev() {
+                if self.is_compatible(&name, version)? {
+                    self.selected.insert(name.clone(), version.clone());
+                    found = true;
+                    break;
+                }
+            }
+            
+            if !found {
+                return Err(ResolveError::IncompatibleVersions {
+                    package: name,
+                    versions: candidates.iter().map(|v| v.to_string()).collect(),
+                });
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Check if version is compatible with already selected
+    fn is_compatible(&self, name: &str, version: &Version) -> Result<bool, ResolveError> {
+        // Get metadata for this version
+        let pkg_name = PackageName::parse(name)
+            .map_err(|e| ResolveError::InvalidPackage(e.to_string()))?;
+        
+        let metadata = self.client.get_version(&pkg_name, version)?;
+        
+        if let Some(meta) = metadata {
+            // Check each dependency
+            for dep in &meta.dependencies {
+                let dep_name = dep.name.as_str();
+                
+                // If we've selected a version for this dependency, check compatibility
+                if let Some(selected_ver) = self.selected.get(dep_name) {
+                    if !dep.version_req.matches(selected_ver) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        
+        Ok(true)
+    }
+    
+    /// Build dependency graph from selected versions
+    fn build_graph(&self, roots: &[String]) -> Result<DependencyGraph, ResolveError> {
+        let mut graph = DependencyGraph::new();
+        graph.roots = roots.to_vec();
+        
+        // Add resolved packages
+        for (name, version) in &self.selected {
+            let pkg_name = PackageName::parse(name)
+                .map_err(|e| ResolveError::InvalidPackage(e.to_string()))?;
+            
+            let metadata = self.client.get_version(&pkg_name, version)?;
+            
+            let dependencies: Vec<PackageName> = metadata
+                .as_ref()
+                .map(|m| m.dependencies.iter().map(|d| d.name.clone()).collect())
+                .unwrap_or_default();
+            
+            let features: Vec<String> = self.features.get(name)
+                .map(|f| f.iter().cloned().collect())
+                .unwrap_or_default();
+            
+            let checksum = metadata.as_ref()
+                .and_then(|m| m.checksum.clone());
+            
+            graph.packages.insert(name.clone(), ResolvedPackage {
+                name: pkg_name,
+                version: version.clone(),
+                dependencies,
+                features,
+                checksum,
+            });
+        }
+        
+        // Compute topological order
+        graph.order = self.topological_sort(&graph)?;
+        
+        Ok(graph)
+    }
+    
+    /// Topological sort for build order
+    fn topological_sort(&self, graph: &DependencyGraph) -> Result<Vec<String>, ResolveError> {
+        let mut result = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut temp_mark = BTreeSet::new();
+        
+        fn visit(
+            name: &str,
+            graph: &DependencyGraph,
+            visited: &mut BTreeSet<String>,
+            temp_mark: &mut BTreeSet<String>,
+            result: &mut Vec<String>,
+        ) -> Result<(), ResolveError> {
+            if temp_mark.contains(name) {
+                return Err(ResolveError::CyclicDependency(name.to_string()));
+            }
+            
+            if visited.contains(name) {
+                return Ok(());
+            }
+            
+            temp_mark.insert(name.to_string());
+            
+            if let Some(pkg) = graph.packages.get(name) {
+                for dep in &pkg.dependencies {
+                    visit(dep.as_str(), graph, visited, temp_mark, result)?;
+                }
+            }
+            
+            temp_mark.remove(name);
+            visited.insert(name.to_string());
+            result.push(name.to_string());
+            
+            Ok(())
+        }
+        
+        for name in graph.packages.keys() {
+            visit(name, graph, &mut visited, &mut temp_mark, &mut result)?;
+        }
+        
+        Ok(result)
+    }
+}
+
+/// Resolution error
+#[derive(Debug)]
+pub enum ResolveError {
+    PackageNotFound(String),
+    NoMatchingVersion { package: String, requirement: String },
+    IncompatibleVersions { package: String, versions: Vec<String> },
+    CyclicDependency(String),
+    InvalidPackage(String),
+    Registry(RegistryError),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PackageNotFound(n) => write!(f, "package not found: {}", n),
+            Self::NoMatchingVersion { package, requirement } => {
+                write!(f, "no version of {} matches {}", package, requirement)
+            }
+            Self::IncompatibleVersions { package, versions } => {
+                write!(f, "incompatible versions for {}: {:?}", package, versions)
+            }
+            Self::CyclicDependency(n) => write!(f, "cyclic dependency: {}", n),
+            Self::InvalidPackage(e) => write!(f, "invalid package: {}", e),
+            Self::Registry(e) => write!(f, "registry error: {}", e),
+        }
+    }
+}
+
+impl From<RegistryError> for ResolveError {
+    fn from(err: RegistryError) -> Self {
+        ResolveError::Registry(err)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOCKFILE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Lockfile for reproducible builds
+#[derive(Debug, Clone)]
+pub struct Lockfile {
+    /// Lockfile version
+    pub version: u32,
+    
+    /// Locked packages
+    pub packages: Vec<LockedPackage>,
+    
+    /// Metadata
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// Locked package entry
+#[derive(Debug, Clone)]
+pub struct LockedPackage {
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub checksum: Option<String>,
+    pub dependencies: Vec<String>,
+}
+
+impl Lockfile {
+    /// Current lockfile version
+    pub const CURRENT_VERSION: u32 = 1;
+    
+    /// Create from dependency graph
+    pub fn from_graph(graph: &DependencyGraph) -> Self {
+        let packages: Vec<LockedPackage> = graph.order.iter()
+            .filter_map(|name| graph.packages.get(name))
+            .map(|pkg| LockedPackage {
+                name: pkg.name.as_str().to_string(),
+                version: pkg.version.to_string(),
+                source: "registry+https://registry.quantalang.dev".to_string(),
+                checksum: pkg.checksum.clone(),
+                dependencies: pkg.dependencies.iter()
+                    .map(|d| d.as_str().to_string())
+                    .collect(),
+            })
+            .collect();
+        
+        Lockfile {
+            version: Self::CURRENT_VERSION,
+            packages,
+            metadata: BTreeMap::new(),
+        }
+    }
+    
+    /// Parse from TOML string
+    pub fn parse(content: &str) -> Result<Self, LockfileError> {
+        // Simple TOML-like parser
+        let mut lockfile = Lockfile {
+            version: Self::CURRENT_VERSION,
+            packages: Vec::new(),
+            metadata: BTreeMap::new(),
+        };
+        
+        let mut current_package: Option<LockedPackage> = None;
+        
+        for line in content.lines() {
+            let line = line.trim();
+            
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            
+            if line == "[[package]]" {
+                if let Some(pkg) = current_package.take() {
+                    lockfile.packages.push(pkg);
+                }
+                current_package = Some(LockedPackage {
+                    name: String::new(),
+                    version: String::new(),
+                    source: String::new(),
+                    checksum: None,
+                    dependencies: Vec::new(),
+                });
+                continue;
+            }
+            
+            if let Some(ref mut pkg) = current_package {
+                if let Some((key, value)) = line.split_once('=') {
+                    let key = key.trim();
+                    let value = value.trim().trim_matches('"');
+                    
+                    match key {
+                        "name" => pkg.name = value.to_string(),
+                        "version" => pkg.version = value.to_string(),
+                        "source" => pkg.source = value.to_string(),
+                        "checksum" => pkg.checksum = Some(value.to_string()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        
+        if let Some(pkg) = current_package {
+            lockfile.packages.push(pkg);
+        }
+        
+        Ok(lockfile)
+    }
+    
+    /// Serialize to TOML string
+    pub fn to_toml(&self) -> String {
+        let mut output = String::new();
+        
+        output.push_str("# This file is automatically generated by Quanta.\n");
+        output.push_str("# Do not edit manually.\n");
+        output.push_str(&format!("version = {}\n\n", self.version));
+        
+        for pkg in &self.packages {
+            output.push_str("[[package]]\n");
+            output.push_str(&format!("name = \"{}\"\n", pkg.name));
+            output.push_str(&format!("version = \"{}\"\n", pkg.version));
+            output.push_str(&format!("source = \"{}\"\n", pkg.source));
+            
+            if let Some(ref checksum) = pkg.checksum {
+                output.push_str(&format!("checksum = \"{}\"\n", checksum));
+            }
+            
+            if !pkg.dependencies.is_empty() {
+                output.push_str("dependencies = [\n");
+                for dep in &pkg.dependencies {
+                    output.push_str(&format!("    \"{}\",\n", dep));
+                }
+                output.push_str("]\n");
+            }
+            
+            output.push('\n');
+        }
+        
+        output
+    }
+    
+    /// Load from file
+    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, LockfileError> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| LockfileError::Io(e.to_string()))?;
+        Self::parse(&content)
+    }
+    
+    /// Save to file
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), LockfileError> {
+        let content = self.to_toml();
+        std::fs::write(path, content)
+            .map_err(|e| LockfileError::Io(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Lockfile error
+#[derive(Debug)]
+pub enum LockfileError {
+    Parse(String),
+    Io(String),
+    VersionMismatch { expected: u32, found: u32 },
+}
+
+impl std::fmt::Display for LockfileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(e) => write!(f, "parse error: {}", e),
+            Self::Io(e) => write!(f, "I/O error: {}", e),
+            Self::VersionMismatch { expected, found } => {
+                write!(f, "lockfile version mismatch: expected {}, found {}", expected, found)
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONVENIENCE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Create default registry client
+pub fn default_client() -> RegistryClient {
+    RegistryClient::default_registry()
+}
+
+/// Resolve dependencies
+pub fn resolve(
+    client: Arc<RegistryClient>,
+    requirements: &[Dependency],
+) -> Result<DependencyGraph, ResolveError> {
+    let mut resolver = Resolver::new(client);
+    resolver.resolve(requirements)
+}
+
+/// Quick search
+pub fn search(query: &str, limit: usize) -> Result<Vec<SearchResult>, RegistryError> {
+    let client = default_client();
+    client.search(query, limit)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRELUDE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub mod prelude {
+    pub use super::{
+        // Names and versions
+        PackageName, Version, VersionReq, Prerelease,
+        
+        // Metadata
+        PackageMetadata, Dependency, IndexEntry,
+        
+        // Client
+        RegistryConfig, RegistryClient, Credentials,
+        RegistryError, UserInfo, SearchResult,
+        
+        // Resolution
+        Resolver, ResolveError, DependencyGraph, ResolvedPackage,
+        
+        // Lockfile
+        Lockfile, LockedPackage, LockfileError,
+        
+        // Functions
+        default_client, resolve, search,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_lockfile_serialization() {
+        let mut lockfile = Lockfile {
+            version: 1,
+            packages: vec![
+                LockedPackage {
+                    name: "serde".to_string(),
+                    version: "1.0.0".to_string(),
+                    source: "registry+https://registry.quantalang.dev".to_string(),
+                    checksum: Some("abc123".to_string()),
+                    dependencies: vec!["serde_derive".to_string()],
+                },
+            ],
+            metadata: BTreeMap::new(),
+        };
+        
+        let toml = lockfile.to_toml();
+        assert!(toml.contains("[[package]]"));
+        assert!(toml.contains("serde"));
+        assert!(toml.contains("1.0.0"));
+    }
+    
+    #[test]
+    fn test_lockfile_parse() {
+        let content = r#"
+version = 1
+
+[[package]]
+name = "test"
+version = "1.0.0"
+source = "registry"
+"#;
+        
+        let lockfile = Lockfile::parse(content).unwrap();
+        assert_eq!(lockfile.packages.len(), 1);
+        assert_eq!(lockfile.packages[0].name, "test");
+    }
+    
+    #[test]
+    fn test_dependency_graph() {
+        let mut graph = DependencyGraph::new();
+        
+        let pkg = ResolvedPackage {
+            name: PackageName::parse("test").unwrap(),
+            version: Version::new(1, 0, 0),
+            dependencies: vec![],
+            features: vec![],
+            checksum: None,
+        };
+        
+        graph.packages.insert("test".to_string(), pkg);
+        graph.order.push("test".to_string());
+        
+        assert_eq!(graph.len(), 1);
+        assert!(graph.get("test").is_some());
+    }
+}
