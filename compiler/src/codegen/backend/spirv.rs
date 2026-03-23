@@ -1992,8 +1992,16 @@ impl SpirvBackend {
                 // Return zero constant of the appropriate type
                 Ok(self.get_const_id(&MirConst::Int(0, ty.clone())))
             }
+            MirRValue::Deref { ptr, pointee_ty } => {
+                // Dereference a pointer: OpLoad through the pointer value
+                let ptr_id = self.gen_value(ptr, func)?;
+                let ty_id = self.get_type_id(pointee_ty);
+                let result_id = self.alloc_id();
+                self.emit(SpvOp::OpLoad, &[ty_id, result_id, ptr_id]);
+                Ok(result_id)
+            }
             _ => {
-                // Remaining operations — return zero as fallback
+                // Truly unknown operations — return zero as safe fallback
                 let zero = self.get_const_id(&MirConst::Int(0, MirType::i32()));
                 Ok(zero)
             }
