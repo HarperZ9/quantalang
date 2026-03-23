@@ -996,11 +996,16 @@ impl<'ctx> MirLowerer<'ctx> {
             let mut builder = MirBuilder::new(f.name.name.clone(), sig);
             self.var_map.clear();
 
-            // Map parameters to locals and set their names
+            // Map parameters to locals and set their names + annotations
             for (i, param) in f.sig.params.iter().enumerate() {
                 if let ast::PatternKind::Ident { name, .. } = &param.pattern.kind {
                     let local_id = builder.param_local(i);
                     builder.set_param_name(i, name.name.clone());
+                    // Extract type annotations (e.g., `with ColorSpace<Linear>`)
+                    let annotations = Self::extract_type_annotations(&param.ty);
+                    if !annotations.is_empty() {
+                        builder.set_param_annotations(i, annotations);
+                    }
                     self.var_map.insert(name.name.clone(), local_id);
                 }
             }
@@ -5568,12 +5573,30 @@ impl<'ctx> MirLowerer<'ctx> {
                     MirType::TraitObject(Arc::from("Unknown"))
                 }
             }
-            ast::TypeKind::WithEffect { ty: inner, .. } => {
+            ast::TypeKind::WithEffect { ty: inner, effects: _ } => {
                 // `with` annotations are compile-time metadata — the runtime
                 // type is the base type. Lower through to the inner type.
+                // Effects are preserved via extract_type_annotations() for shader output.
                 self.lower_type_from_ast(inner)
             }
             _ => MirType::i32(),
+        }
+    }
+
+    /// Extract type annotations from an AST type (e.g., `f64 with ColorSpace<Linear>`).
+    /// Returns a list of annotation strings like `["ColorSpace:Linear"]`.
+    fn extract_type_annotations(ty: &ast::Type) -> Vec<Arc<str>> {
+        match &ty.kind {
+            ast::TypeKind::WithEffect { effects, .. } => {
+                effects.iter().map(|path| {
+                    // Format effect path as "Category:Value" (e.g., "ColorSpace:Linear")
+                    let segments: Vec<&str> = path.segments.iter()
+                        .map(|seg| seg.ident.name.as_ref())
+                        .collect();
+                    Arc::from(segments.join(":"))
+                }).collect()
+            }
+            _ => Vec::new(),
         }
     }
 

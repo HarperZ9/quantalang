@@ -144,6 +144,13 @@ impl MirBuilder {
         }
     }
 
+    /// Set type annotations on a parameter local (e.g., ColorSpace, Precision).
+    pub fn set_param_annotations(&mut self, index: usize, annotations: Vec<Arc<str>>) {
+        if let Some(local) = self.func.locals.get_mut(index) {
+            local.annotations = annotations;
+        }
+    }
+
     // =========================================================================
     // STATEMENTS
     // =========================================================================
