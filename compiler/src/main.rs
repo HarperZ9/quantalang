@@ -9,7 +9,7 @@
 //! This is the main entry point for the QuantaLang compiler command-line tool.
 
 use clap::{Parser as ClapParser, Subcommand};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -1175,6 +1175,59 @@ fn cmd_fmt(file: &PathBuf, check: bool, write: bool) -> Result<(), i32> {
     Ok(())
 }
 
+// =============================================================================
+// LOCAL PACKAGE REGISTRY
+// =============================================================================
+
+/// An entry in the local registry index (registry/index.json).
+#[derive(Debug, serde::Deserialize)]
+struct LocalRegistryEntry {
+    version: String,
+    description: String,
+    #[allow(dead_code)]
+    author: String,
+    #[allow(dead_code)]
+    checksum: String,
+    #[allow(dead_code)]
+    path: String,
+}
+
+/// Top-level shape of registry/index.json.
+#[derive(Debug, serde::Deserialize)]
+struct LocalRegistryIndex {
+    packages: HashMap<String, LocalRegistryEntry>,
+}
+
+/// Load the local file-based package registry.
+///
+/// Searches for `registry/index.json` relative to the compiler executable, then
+/// falls back to the compile-time `CARGO_MANIFEST_DIR` path (good for `cargo run`).
+fn load_local_registry_index() -> HashMap<String, LocalRegistryEntry> {
+    // Try relative to the running executable first
+    let candidates: Vec<std::path::PathBuf> = vec![
+        // Works when invoked via `cargo run` from compiler/
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("registry")
+            .join("index.json"),
+        // Works for an installed binary next to a registry/ sibling
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("../registry/index.json")))
+            .unwrap_or_default(),
+    ];
+
+    for path in &candidates {
+        if let Ok(data) = std::fs::read_to_string(path) {
+            if let Ok(index) = serde_json::from_str::<LocalRegistryIndex>(&data) {
+                return index.packages;
+            }
+        }
+    }
+    HashMap::new()
+}
+
 fn cmd_pkg(cmd: PkgCommands) -> Result<(), i32> {
     match cmd {
         PkgCommands::Init { path } => {
@@ -1228,13 +1281,56 @@ fn cmd_pkg(cmd: PkgCommands) -> Result<(), i32> {
                 1
             })?;
             println!("Manifest loaded ({} bytes)", content.len());
-            println!("Note: Package registry not yet available. Dependencies are resolved locally.");
+
+            // Check dependencies against the local registry
+            let index = load_local_registry_index();
+            // Parse [dependencies] lines from the manifest
+            let mut in_deps = false;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed == "[dependencies]" {
+                    in_deps = true;
+                    continue;
+                }
+                if trimmed.starts_with('[') {
+                    in_deps = false;
+                    continue;
+                }
+                if in_deps {
+                    if let Some((name, _ver)) = trimmed.split_once('=') {
+                        let dep_name = name.trim();
+                        if dep_name.is_empty() { continue; }
+                        if let Some(entry) = index.get(dep_name) {
+                            println!("  {} = {} ... found ({})", dep_name, entry.version, entry.description);
+                        } else {
+                            println!("  {} ... NOT FOUND in local registry", dep_name);
+                        }
+                    }
+                }
+            }
+            println!("Resolution complete.");
             Ok(())
         }
         PkgCommands::Search { query } => {
-            println!("Searching for '{}'...", query);
-            println!("Note: Package registry (pkg.quantalang.org) not yet available.");
-            println!("Local packages can be added with: quantac pkg add <name> --version <ver>");
+            let index = load_local_registry_index();
+            let query_lower = query.to_lowercase();
+            let mut found = 0u32;
+
+            println!("Searching local registry for '{}'...", query);
+            for (name, entry) in &index {
+                if name.to_lowercase().contains(&query_lower)
+                    || entry.description.to_lowercase().contains(&query_lower)
+                {
+                    println!("  {} v{} - {}", name, entry.version, entry.description);
+                    found += 1;
+                }
+            }
+
+            if found == 0 {
+                println!("No packages found matching '{}'.", query);
+            } else {
+                println!("{} package(s) found.", found);
+            }
             Ok(())
         }
     }
@@ -1802,6 +1898,46 @@ fn cmd_compile(
                 println!("To compile: clang {} -o {} -lm", output_path.display(), exe_path.display());
             }
         }
+    }
+
+    // x86-64: try nasm → ld pipeline for native executable
+    if target == Target::X86_64 {
+        let obj_path = input.with_extension("o");
+        let exe_path = input.with_extension(if cfg!(windows) { "exe" } else { "" });
+        let nasm_ok = std::process::Command::new("nasm").arg("--version")
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
+        if nasm_ok {
+            let fmt = if cfg!(windows) { "win64" } else { "elf64" };
+            if let Ok(r) = std::process::Command::new("nasm").args(["-f", fmt])
+                .arg(&output_path).arg("-o").arg(&obj_path).output() {
+                if r.status.success() {
+                    println!("Assembled -> {}", obj_path.display());
+                    let lr = if cfg!(windows) {
+                        std::process::Command::new("link.exe")
+                            .args(["/entry:main", "/subsystem:console"])
+                            .arg(&obj_path).arg(&format!("/out:{}", exe_path.display())).output()
+                    } else {
+                        std::process::Command::new("ld")
+                            .arg(&obj_path).arg("-o").arg(&exe_path).arg("-lc").output()
+                    };
+                    if let Ok(r) = lr { if r.status.success() {
+                        println!("Linked -> {}", exe_path.display());
+                    }}
+                }
+            }
+        } else {
+            println!("\nx86-64 assembly at {}. Install nasm to build native.", output_path.display());
+        }
+    }
+
+    // WASM: detect wasmtime/wasmer and show run instructions
+    if target == Target::Wasm {
+        let wt = std::process::Command::new("wasmtime").arg("--version")
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
+        if wt { println!("Run: wasmtime {}", output_path.display()); }
+        else { println!("\nWASM at {}. Install wasmtime to run.", output_path.display()); }
     }
 
     Ok(())
