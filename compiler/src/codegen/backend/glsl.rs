@@ -25,6 +25,15 @@ pub struct GlslBackend {
     output: String,
     /// Indentation level.
     indent: usize,
+    /// Inlined expression strings for single-use temps (interior mutability for &self access).
+    inlined_exprs: std::cell::RefCell<std::collections::HashMap<u32, String>>,
+    /// Locals identified as single-use temps that will be inlined.
+    single_use_temps: std::collections::HashSet<u32>,
+    /// Locals whose declaration can be folded into their first assignment.
+    /// (assigned exactly once, at function body top level)
+    fold_decl: std::collections::HashSet<u32>,
+    /// Locals that have already been declared (via folded assignment).
+    declared: std::collections::HashSet<u32>,
 }
 
 impl GlslBackend {
@@ -32,7 +41,126 @@ impl GlslBackend {
         Self {
             output: String::new(),
             indent: 0,
+            inlined_exprs: std::cell::RefCell::new(std::collections::HashMap::new()),
+            single_use_temps: std::collections::HashSet::new(),
+            fold_decl: std::collections::HashSet::new(),
+            declared: std::collections::HashSet::new(),
         }
+    }
+
+    /// Count how many times each local is used across all blocks.
+    fn compute_use_counts(blocks: &[MirBlock]) -> std::collections::HashMap<u32, u32> {
+        let mut counts = std::collections::HashMap::new();
+
+        fn count_value(val: &MirValue, counts: &mut std::collections::HashMap<u32, u32>) {
+            if let MirValue::Local(id) = val {
+                *counts.entry(id.0).or_insert(0) += 1;
+            }
+        }
+
+        fn count_rvalue(rv: &MirRValue, counts: &mut std::collections::HashMap<u32, u32>) {
+            match rv {
+                MirRValue::Use(v) => count_value(v, counts),
+                MirRValue::BinaryOp { left, right, .. } => {
+                    count_value(left, counts);
+                    count_value(right, counts);
+                }
+                MirRValue::UnaryOp { operand, .. } => count_value(operand, counts),
+                MirRValue::Aggregate { operands, .. } => {
+                    for op in operands { count_value(op, counts); }
+                }
+                MirRValue::FieldAccess { base, .. } => count_value(base, counts),
+                MirRValue::Cast { value, .. } => count_value(value, counts),
+                _ => {}
+            }
+        }
+
+        for block in blocks {
+            for stmt in &block.stmts {
+                if let MirStmtKind::Assign { value, .. } = &stmt.kind {
+                    count_rvalue(value, &mut counts);
+                }
+            }
+            if let Some(term) = &block.terminator {
+                match term {
+                    MirTerminator::Return(Some(v)) => count_value(v, &mut counts),
+                    MirTerminator::If { cond, .. } => count_value(cond, &mut counts),
+                    MirTerminator::Call { args, .. } => {
+                        for a in args { count_value(a, &mut counts); }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        counts
+    }
+
+    /// Identify single-use temporaries that can be inlined.
+    /// A local is inlineable iff: assigned exactly once, used exactly once, is a temp, and is pure.
+    fn compute_inlineable_temps(
+        blocks: &[MirBlock],
+        locals: &[MirLocal],
+        use_counts: &std::collections::HashMap<u32, u32>,
+    ) -> std::collections::HashSet<u32> {
+        // Count how many times each local is ASSIGNED (must be exactly 1 for safe inlining)
+        let mut assign_counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for block in blocks {
+            for stmt in &block.stmts {
+                if let MirStmtKind::Assign { dest, .. } = &stmt.kind {
+                    *assign_counts.entry(dest.0).or_insert(0) += 1;
+                }
+            }
+            if let Some(MirTerminator::Call { dest: Some(dest_id), .. }) = &block.terminator {
+                *assign_counts.entry(dest_id.0).or_insert(0) += 1;
+            }
+        }
+
+        let mut inlineable = std::collections::HashSet::new();
+        for block in blocks {
+            for stmt in &block.stmts {
+                if let MirStmtKind::Assign { dest, value } = &stmt.kind {
+                    let use_count = use_counts.get(&dest.0).copied().unwrap_or(0);
+                    let def_count = assign_counts.get(&dest.0).copied().unwrap_or(0);
+                    if use_count == 1 && def_count == 1 {
+                        // Check it's a compiler temp (name starts with _)
+                        let name = locals.iter()
+                            .find(|l| l.id == *dest)
+                            .and_then(|l| l.name.as_ref());
+                        let is_temp = match name {
+                            Some(n) => n.starts_with('_') || n.as_ref().chars().next().map_or(true, |c| c == '_'),
+                            None => true, // unnamed locals are temps
+                        };
+                        // Only inline pure expressions (not used for control flow side effects)
+                        let is_pure = matches!(value,
+                            MirRValue::Use(_) | MirRValue::BinaryOp { .. } |
+                            MirRValue::UnaryOp { .. } | MirRValue::FieldAccess { .. } |
+                            MirRValue::Cast { .. } | MirRValue::Aggregate { .. }
+                        );
+                        if is_temp && is_pure {
+                            inlineable.insert(dest.0);
+                        }
+                    }
+                }
+            }
+            // Also check Call terminator destinations (single-use call results)
+            if let Some(MirTerminator::Call { dest: Some(dest_id), .. }) = &block.terminator {
+                let use_count = use_counts.get(&dest_id.0).copied().unwrap_or(0);
+                let def_count = assign_counts.get(&dest_id.0).copied().unwrap_or(0);
+                if use_count == 1 && def_count == 1 {
+                    let name = locals.iter()
+                        .find(|l| l.id == *dest_id)
+                        .and_then(|l| l.name.as_ref());
+                    let is_temp = match name {
+                        Some(n) => n.starts_with('_') || n.as_ref().starts_with('_'),
+                        None => true,
+                    };
+                    if is_temp {
+                        inlineable.insert(dest_id.0);
+                    }
+                }
+            }
+        }
+        inlineable
     }
 
     fn write_indent(&mut self) {
@@ -130,12 +258,83 @@ impl GlslBackend {
             ret_ty, func.name, params.join(", ")));
         self.indent += 1;
 
-        // Local variable declarations (skip unused return slot, void types)
+        // Deep expression inlining: identify single-use temps and inline them
+        self.inlined_exprs.borrow_mut().clear();
+        self.single_use_temps.clear();
+        self.fold_decl.clear();
+        self.declared.clear();
+        if let Some(blocks) = &func.blocks {
+            let use_counts = Self::compute_use_counts(blocks);
+            self.single_use_temps = Self::compute_inlineable_temps(blocks, &func.locals, &use_counts);
+
+            // Identify locals that can have declaration folded into first assignment.
+            // Compute the "entry chain" — blocks reachable from block 0 via linear
+            // Call/Goto continuations (no branches). Assignments in this chain are top-level.
+            let mut entry_chain: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            entry_chain.insert(0);
+            let mut chain_idx = 0usize;
+            loop {
+                if chain_idx >= blocks.len() { break; }
+                match &blocks[chain_idx].terminator {
+                    Some(MirTerminator::Call { target: Some(t), .. }) => {
+                        if let Some(idx) = blocks.iter().position(|b| b.id == *t) {
+                            entry_chain.insert(idx);
+                            chain_idx = idx;
+                            continue;
+                        }
+                    }
+                    Some(MirTerminator::Goto(t)) => {
+                        if let Some(idx) = blocks.iter().position(|b| b.id == *t) {
+                            if idx > chain_idx {
+                                entry_chain.insert(idx);
+                                chain_idx = idx;
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                break;
+            }
+
+            let mut assign_counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            let mut entry_assigned: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for (bi, block) in blocks.iter().enumerate() {
+                let in_entry = entry_chain.contains(&bi);
+                for stmt in &block.stmts {
+                    if let MirStmtKind::Assign { dest, .. } = &stmt.kind {
+                        *assign_counts.entry(dest.0).or_insert(0) += 1;
+                        if in_entry { entry_assigned.insert(dest.0); }
+                    }
+                }
+                if let Some(MirTerminator::Call { dest: Some(dest_id), .. }) = &block.terminator {
+                    *assign_counts.entry(dest_id.0).or_insert(0) += 1;
+                    if in_entry { entry_assigned.insert(dest_id.0); }
+                }
+            }
+            for local in &func.locals {
+                if local.is_param { continue; }
+                if matches!(local.ty, MirType::Void) { continue; }
+                if self.single_use_temps.contains(&local.id.0) { continue; }
+                let name = self.local_name(local.id, &func.locals);
+                if name == "_ret" { continue; }
+                let count = assign_counts.get(&local.id.0).copied().unwrap_or(0);
+                // Fold declaration for ANY single-assignment variable
+                // (GLSL 4.5 allows declarations at any point in any scope)
+                if count == 1 {
+                    self.fold_decl.insert(local.id.0);
+                }
+            }
+        }
+
+        // Local variable declarations — only for locals that can't be folded
         for local in &func.locals {
             if !local.is_param {
                 if matches!(local.ty, MirType::Void) { continue; }
                 let name = self.local_name(local.id, &func.locals);
                 if name == "_ret" { continue; }
+                if self.single_use_temps.contains(&local.id.0) { continue; }
+                if self.fold_decl.contains(&local.id.0) { continue; }
                 let ty_str = self.type_to_glsl(&local.ty);
                 self.writeln(&format!("{} {};", ty_str, name));
             }
@@ -180,8 +379,16 @@ impl GlslBackend {
         }
         emitted.insert(block.id.0);
 
-        // Emit statements
+        // Emit statements with deep expression inlining
         for stmt in &block.stmts {
+            if let MirStmtKind::Assign { dest, value } = &stmt.kind {
+                if self.single_use_temps.contains(&dest.0) {
+                    // Don't emit — store the expression for inlining at use site
+                    let expr_str = self.rvalue_to_glsl(value, func);
+                    self.inlined_exprs.borrow_mut().insert(dest.0, expr_str);
+                    continue;
+                }
+            }
             self.generate_statement(stmt, func)?;
         }
 
@@ -206,20 +413,20 @@ impl GlslBackend {
                             self.generate_block_structured(eb, all_blocks, func, emitted)?;
                         }
                     } else {
-                    self.writeln(&format!("if ({}) {{", cond_str));
-                    self.indent += 1;
-                    if let Some(tb) = all_blocks.iter().find(|b| b.id == *then_block) {
-                        self.generate_block_structured(tb, all_blocks, func, emitted)?;
+                        self.writeln(&format!("if ({}) {{", cond_str));
+                        self.indent += 1;
+                        if let Some(tb) = all_blocks.iter().find(|b| b.id == *then_block) {
+                            self.generate_block_structured(tb, all_blocks, func, emitted)?;
+                        }
+                        self.indent -= 1;
+                        self.writeln("} else {");
+                        self.indent += 1;
+                        if let Some(eb) = all_blocks.iter().find(|b| b.id == *else_block) {
+                            self.generate_block_structured(eb, all_blocks, func, emitted)?;
+                        }
+                        self.indent -= 1;
+                        self.writeln("}");
                     }
-                    self.indent -= 1;
-                    self.writeln("} else {");
-                    self.indent += 1;
-                    if let Some(eb) = all_blocks.iter().find(|b| b.id == *else_block) {
-                        self.generate_block_structured(eb, all_blocks, func, emitted)?;
-                    }
-                    self.indent -= 1;
-                    self.writeln("}");
-                    } // end if is_while else
                 }
                 MirTerminator::Goto(target) => {
                     if let Some(tb) = all_blocks.iter().find(|b| b.id == *target) {
@@ -229,8 +436,25 @@ impl GlslBackend {
                 MirTerminator::Call { func: callee, args, dest, target, .. } => {
                     let call_expr = self.generate_call_expr(callee, args, &func.locals);
                     if let Some(dest_id) = dest {
-                        let dest_name = self.local_name(*dest_id, &func.locals);
-                        self.writeln(&format!("{} = {};", dest_name, call_expr));
+                        if self.single_use_temps.contains(&dest_id.0) {
+                            // Inline: store call expression for later substitution
+                            self.inlined_exprs.borrow_mut().insert(dest_id.0, call_expr);
+                        } else {
+                            let dest_name = self.local_name(*dest_id, &func.locals);
+                            // Fold declaration with Call result assignment
+                            if self.fold_decl.contains(&dest_id.0) && !self.declared.contains(&dest_id.0) {
+                                let dest_ty = func.locals.iter().find(|l| l.id == *dest_id).map(|l| &l.ty);
+                                if let Some(ty) = dest_ty {
+                                    let ty_str = self.type_to_glsl(ty);
+                                    self.writeln(&format!("{} {} = {};", ty_str, dest_name, call_expr));
+                                    self.declared.insert(dest_id.0);
+                                } else {
+                                    self.writeln(&format!("{} = {};", dest_name, call_expr));
+                                }
+                            } else {
+                                self.writeln(&format!("{} = {};", dest_name, call_expr));
+                            }
+                        }
                     } else {
                         self.writeln(&format!("{};", call_expr));
                     }
@@ -238,6 +462,30 @@ impl GlslBackend {
                         if let Some(tb) = all_blocks.iter().find(|b| b.id == *target_id) {
                             self.generate_block_structured(tb, all_blocks, func, emitted)?;
                         }
+                    }
+                }
+                MirTerminator::Return(Some(val)) => {
+                    // Peephole: "temp = expr; return temp;" → "return expr;"
+                    let val_str = self.value_to_glsl(val, &func.locals);
+                    let mut folded = false;
+                    let search_pat = format!("{} = ", val_str);
+                    let trimmed_len = self.output.trim_end().len();
+                    if trimmed_len > 0 {
+                        let last_nl = self.output[..trimmed_len].rfind('\n').unwrap_or(0);
+                        let line_start = if last_nl == 0 { 0 } else { last_nl + 1 };
+                        let last_line = self.output[line_start..trimmed_len].trim();
+                        if last_line.contains(&search_pat) && last_line.ends_with(';') {
+                            if let Some(eq_pos) = last_line.find(" = ") {
+                                let rhs = &last_line[eq_pos+3..last_line.len()-1];
+                                let rhs_owned = rhs.to_string();
+                                self.output.truncate(line_start);
+                                self.writeln(&format!("return {};", rhs_owned));
+                                folded = true;
+                            }
+                        }
+                    }
+                    if !folded {
+                        self.writeln(&format!("return {};", val_str));
                     }
                 }
                 _ => {
@@ -251,11 +499,19 @@ impl GlslBackend {
     fn generate_statement(&mut self, stmt: &MirStmt, func: &MirFunction) -> CodegenResult<()> {
         match &stmt.kind {
             MirStmtKind::Assign { dest, value } => {
+                // Skip void-typed assignments (unit values, no-ops)
                 let dest_ty = func.locals.iter().find(|l| l.id == *dest).map(|l| &l.ty);
                 if matches!(dest_ty, Some(MirType::Void)) { return Ok(()); }
                 let dest_name = self.local_name(*dest, &func.locals);
                 let val_str = self.rvalue_to_glsl(value, func);
-                self.writeln(&format!("{} = {};", dest_name, val_str));
+                // Fold declaration with first assignment if eligible
+                if self.fold_decl.contains(&dest.0) && !self.declared.contains(&dest.0) {
+                    let ty_str = self.type_to_glsl(dest_ty.unwrap());
+                    self.writeln(&format!("{} {} = {};", ty_str, dest_name, val_str));
+                    self.declared.insert(dest.0);
+                } else {
+                    self.writeln(&format!("{} = {};", dest_name, val_str));
+                }
             }
             _ => {}
         }
@@ -350,7 +606,13 @@ impl GlslBackend {
 
     fn value_to_glsl(&self, value: &MirValue, locals: &[MirLocal]) -> String {
         match value {
-            MirValue::Local(id) => self.local_name(*id, locals),
+            MirValue::Local(id) => {
+                // Check for inlined expression (single-use temp)
+                if let Some(expr) = self.inlined_exprs.borrow().get(&id.0) {
+                    return expr.clone();
+                }
+                self.local_name(*id, locals)
+            }
             MirValue::Const(c) => self.const_to_glsl(c),
             MirValue::Global(name) | MirValue::Function(name) => {
                 // Map C runtime functions to GLSL equivalents

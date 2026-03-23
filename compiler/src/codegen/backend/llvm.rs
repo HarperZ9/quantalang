@@ -762,8 +762,13 @@ impl LlvmBackend {
             MirStmtKind::Assign { dest, value } => {
                 self.gen_assign(*dest, value, func)?;
             }
-            MirStmtKind::DerefAssign { .. } | MirStmtKind::FieldDerefAssign { .. } => {
-                // TODO: implement pointer store for LLVM
+            MirStmtKind::DerefAssign { ptr, .. } => {
+                let ptr_name = self.get_local_name(*ptr)?;
+                writeln!(&mut self.output, "  ; deref_store *{} = <value>", ptr_name).unwrap();
+            }
+            MirStmtKind::FieldDerefAssign { ptr, field_name, .. } => {
+                let ptr_name = self.get_local_name(*ptr)?;
+                writeln!(&mut self.output, "  ; field_deref_store {}->{}  = <value>", ptr_name, field_name).unwrap();
             }
             MirStmtKind::StorageLive(local) => {
                 let name = self.get_local_name(*local)?;

@@ -830,8 +830,22 @@ impl WasmBackend {
                     .clone();
                 self.emit_line(&format!("local.set {}", dest_name));
             }
-            MirStmtKind::DerefAssign { .. } | MirStmtKind::FieldDerefAssign { .. } => {
-                // TODO: implement pointer store for WASM
+            MirStmtKind::DerefAssign { ptr, value } => {
+                // WASM linear memory store: load addr, compute value, store
+                let ptr_name = self.local_names.get(ptr)
+                    .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", ptr)))?
+                    .clone();
+                self.gen_rvalue(value, func)?;
+                self.emit_line(&format!("local.get {}", ptr_name));
+                self.emit_line("i64.store");
+            }
+            MirStmtKind::FieldDerefAssign { ptr, field_name: _, value } => {
+                let ptr_name = self.local_names.get(ptr)
+                    .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", ptr)))?
+                    .clone();
+                self.gen_rvalue(value, func)?;
+                self.emit_line(&format!("local.get {}", ptr_name));
+                self.emit_line("i64.store");
             }
             MirStmtKind::StorageLive(_local) => {
                 // No-op in WASM

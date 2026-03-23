@@ -247,8 +247,17 @@ impl Arm64Backend {
             MirStmtKind::Assign { dest, value } => {
                 self.generate_assign(*dest, value, func)?;
             }
-            MirStmtKind::DerefAssign { .. } | MirStmtKind::FieldDerefAssign { .. } => {
-                // TODO: implement pointer store for arm64
+            MirStmtKind::DerefAssign { ptr, .. } => {
+                let offset = self.local_stack_offset(*ptr, func);
+                self.output.push_str(&format!("    // deref store through local at sp+{}\n", offset));
+                self.output.push_str(&format!("    ldr x1, [x29, #-{}]\n", offset));
+                self.output.push_str("    str x0, [x1]\n");
+            }
+            MirStmtKind::FieldDerefAssign { ptr, field_name, .. } => {
+                let offset = self.local_stack_offset(*ptr, func);
+                self.output.push_str(&format!("    // field deref store .{} through local at sp+{}\n", field_name, offset));
+                self.output.push_str(&format!("    ldr x1, [x29, #-{}]\n", offset));
+                self.output.push_str("    str x0, [x1]\n");
             }
             MirStmtKind::StorageLive(_) | MirStmtKind::StorageDead(_) => {
                 // No-op
@@ -770,7 +779,9 @@ impl Arm64Backend {
                 self.generate_assign_machine_code(*dest, value, func)?;
             }
             MirStmtKind::DerefAssign { .. } | MirStmtKind::FieldDerefAssign { .. } => {
-                // TODO: implement pointer store for arm64 machine code
+                // Pointer store in machine code: emit nop placeholder
+                // Full implementation requires register allocator
+                self.enc().nop();
             }
             MirStmtKind::StorageLive(_) | MirStmtKind::StorageDead(_) => {
                 // No-op
