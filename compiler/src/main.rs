@@ -409,12 +409,108 @@ fn print_item_summary(item: &quantalang::ast::Item, indent: usize) {
     }
 }
 
+// =============================================================================
+// IMPORT RESOLUTION (simple `// import <pkg>` and `use <pkg>;` directives)
+// =============================================================================
+
+/// Scan `source` for lines matching `// import <name>` or `use <name>;`.
+/// For each match, look for `registry/packages/<name>/src/lib.quanta` relative
+/// to the repo root (derived from `input_file`).  If found, prepend its contents
+/// to the source so the combined text can be parsed as a single compilation unit.
+///
+/// Name normalisation: underscores in the import name are converted to hyphens
+/// when looking up the package directory (e.g. `use std_math;` maps to
+/// `registry/packages/std-math/src/lib.quanta`).
+fn resolve_imports(source: &str, input_file: &Path) -> Result<String, i32> {
+    // Try to locate the registry directory.
+    // Walk up from the input file looking for a directory that contains
+    // `registry/packages`.
+    let registry_dir = {
+        let mut dir = input_file.parent();
+        let mut found: Option<PathBuf> = None;
+        while let Some(d) = dir {
+            let candidate = d.join("registry").join("packages");
+            if candidate.is_dir() {
+                found = Some(candidate);
+                break;
+            }
+            dir = d.parent();
+        }
+        found
+    };
+
+    let mut prepended = String::new();
+    let mut found_any = false;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+
+        // Match `// import <name>`
+        let import_name = if let Some(rest) = trimmed.strip_prefix("// import ") {
+            Some(rest.trim().to_string())
+        }
+        // Match `use <name>;`
+        else if let Some(rest) = trimmed.strip_prefix("use ") {
+            let rest = rest.trim();
+            if let Some(name) = rest.strip_suffix(';') {
+                let name = name.trim();
+                // Skip complex use paths like `std::collections::HashMap` — we
+                // only handle bare package names (no `::` separators).
+                if !name.contains("::") && !name.contains('{') {
+                    Some(name.to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(name) = import_name {
+            if let Some(ref reg) = registry_dir {
+                // Normalise: underscores -> hyphens for the directory name.
+                let pkg_dir_name = name.replace('_', "-");
+                let lib_path = reg.join(&pkg_dir_name).join("src").join("lib.quanta");
+                if lib_path.exists() {
+                    let contents = std::fs::read_to_string(&lib_path).map_err(|e| {
+                        eprintln!("Error reading import '{}' from '{}': {}",
+                                  name, lib_path.display(), e);
+                        1
+                    })?;
+                    // Prepend with a separator comment for clarity.
+                    prepended.push_str(&format!(
+                        "// === imported from registry: {} ===\n{}\n// === end import: {} ===\n\n",
+                        name, contents, name
+                    ));
+                    found_any = true;
+                } else {
+                    eprintln!("Warning: import '{}' not found at '{}'", name, lib_path.display());
+                }
+            } else {
+                eprintln!("Warning: import '{}' requested but no registry directory found", name);
+            }
+        }
+    }
+
+    if found_any {
+        prepended.push_str(source);
+        Ok(prepended)
+    } else {
+        Ok(source.to_string())
+    }
+}
+
 fn cmd_check(file: &PathBuf) -> Result<(), i32> {
     // Read source file
     let source = std::fs::read_to_string(file).map_err(|e| {
         eprintln!("Error reading file '{}': {}", file.display(), e);
         1
     })?;
+
+    // Resolve `// import <pkg>` and `use <pkg>;` directives
+    let source = resolve_imports(&source, file)?;
 
     let source_file = SourceFile::new(file.to_string_lossy(), source);
 
@@ -630,6 +726,9 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
         eprintln!("Error reading file '{}': {}", main_path.display(), e);
         1
     })?;
+
+    // Resolve `// import <pkg>` and `use <pkg>;` directives
+    let source = resolve_imports(&source, &main_path)?;
 
     let source_file = SourceFile::new(main_path.to_string_lossy(), source);
 
@@ -1724,6 +1823,9 @@ fn cmd_compile(
         1
     })?;
 
+    // Resolve `// import <pkg>` and `use <pkg>;` directives
+    let source = resolve_imports(&source, input)?;
+
     let source_file = SourceFile::new(input.to_string_lossy(), source);
 
     // Tokenize
@@ -2072,6 +2174,10 @@ fn cmd_watch(path: &PathBuf, target_str: &str) -> Result<(), i32> {
 fn compile_single_file(input: &Path, output: &Path) -> Result<(), String> {
     let source = std::fs::read_to_string(input)
         .map_err(|e| format!("read error: {}", e))?;
+
+    // Resolve `// import <pkg>` and `use <pkg>;` directives
+    let source = resolve_imports(&source, input)
+        .map_err(|code| format!("import resolution failed (exit {})", code))?;
 
     let source_file = SourceFile::new(input.to_string_lossy(), source);
 

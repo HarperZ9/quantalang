@@ -644,7 +644,22 @@ impl<'ctx> TypeInfer<'ctx> {
         }
 
         // Handle qualified paths (e.g., std::vec::Vec, Type::method)
-        // First, try to resolve as a type path
+
+        // Check for associated function: Type::func (2-segment path)
+        let segments: Vec<&str> = path.segments.iter()
+            .map(|s| s.ident.name.as_ref())
+            .collect();
+        if segments.len() == 2 {
+            let type_name = segments[0];
+            let func_name = segments[1];
+            // Look up as an inherent method/associated function
+            if let Some(method) = self.ctx.lookup_inherent_method(type_name, func_name) {
+                let param_tys: Vec<Ty> = method.sig.params.iter().map(|(_, ty)| ty.clone()).collect();
+                return Ty::function(param_tys, method.sig.ret.clone());
+            }
+        }
+
+        // Try to resolve the last segment as a type or function
         if let Some(last) = path.last_ident() {
             let name = last.name.as_ref();
 
