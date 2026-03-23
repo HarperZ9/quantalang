@@ -165,7 +165,33 @@ impl<'ctx> TypeChecker<'ctx> {
             ItemKind::Function(f) => self.collect_function(f, item.span),
             ItemKind::Effect(e) => self.collect_effect(e, item.span),
             ItemKind::ExternBlock(eb) => self.collect_extern_block(eb, item.span),
+            ItemKind::Impl(impl_) => self.collect_impl(impl_, item.span),
             _ => {}
+        }
+    }
+
+    /// Collect inherent impl methods during the first pass so they're
+    /// available for method resolution when function bodies are checked.
+    fn collect_impl(&mut self, impl_: &ast::ImplDef, span: Span) {
+        // Only collect inherent impls (no trait). Trait impls are handled in check_impl.
+        if impl_.trait_ref.is_some() {
+            return;
+        }
+
+        let self_ty = self.lower_type(&impl_.self_ty);
+        let type_name = Self::extract_type_name_from_ast(&impl_.self_ty);
+
+        for item in &impl_.items {
+            if let ImplItemKind::Function(f) = &item.kind {
+                if let Some(ref tname) = type_name {
+                    let sig = self.build_fn_sig_from_ast(f);
+                    self.ctx.register_inherent_method(
+                        Arc::from(tname.as_str()),
+                        f.name.name.clone(),
+                        sig,
+                    );
+                }
+            }
         }
     }
 
