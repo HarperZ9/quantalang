@@ -549,7 +549,7 @@ impl Executor {
         let parent = self.inner.get_task(parent_id)?;
         let task_id = self.spawn(priority);
 
-        if let Some(task) = self.inner.get_task(task_id) {
+        if let Some(_task) = self.inner.get_task(task_id) {
             // Link parent-child
             parent.add_child(task_id);
         }

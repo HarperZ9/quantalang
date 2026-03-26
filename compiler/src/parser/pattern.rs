@@ -36,8 +36,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a primary pattern (without or).
-    fn parse_pattern_primary(&mut self) -> ParseResult<Pattern> {
+    /// Parse a primary pattern (without or-alternatives).
+    /// Public for use by closure parameter parsing where `|` is a delimiter.
+    pub fn parse_pattern_primary(&mut self) -> ParseResult<Pattern> {
         let start = self.current_span();
 
         match self.current_kind().clone() {
@@ -212,14 +213,22 @@ impl<'a> Parser<'a> {
             // PATH / IDENTIFIER / STRUCT / TUPLE STRUCT PATTERNS
             // =================================================================
             TokenKind::Ident | TokenKind::RawIdent | TokenKind::ColonColon
-            | TokenKind::Keyword(Keyword::Crate | Keyword::Super | Keyword::Self_ | Keyword::SelfType) => {
+            | TokenKind::Keyword(Keyword::Crate | Keyword::Super | Keyword::Self_ | Keyword::SelfType)
+            | TokenKind::Keyword(Keyword::Default | Keyword::Module) => {
                 self.parse_path_pattern()
             }
 
             // =================================================================
             // ERROR
             // =================================================================
-            _ => Err(self.error_expected("pattern")),
+            _ => {
+                // Last resort: if it's any keyword, try treating as an identifier pattern
+                if matches!(self.current_kind(), TokenKind::Keyword(_)) {
+                    self.parse_path_pattern()
+                } else {
+                    Err(self.error_expected("pattern"))
+                }
+            }
         }
     }
 
@@ -228,8 +237,8 @@ impl<'a> Parser<'a> {
         let start = self.current_span();
 
         // Try to parse as simple identifier first
-        let is_simple_ident = self.check_ident()
-            && !matches!(self.peek().kind, TokenKind::ColonColon | TokenKind::OpenDelim(_) | TokenKind::OpenDelim(Delimiter::Brace));
+        let is_simple_ident = (self.check_ident() || self.is_contextual_keyword())
+            && !matches!(self.peek().kind, TokenKind::ColonColon | TokenKind::OpenDelim(_));
 
         if is_simple_ident && !matches!(self.peek().kind, TokenKind::OpenDelim(_)) {
             let name = self.expect_ident()?;

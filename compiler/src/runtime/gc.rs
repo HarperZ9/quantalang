@@ -20,11 +20,9 @@
 //! - Zero-cost for non-GC code paths
 
 use std::alloc::{alloc, dealloc, Layout};
-use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
 
 // =============================================================================
 // REFERENCE COUNTED TYPES

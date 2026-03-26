@@ -13,10 +13,8 @@
 //!
 //! Based on the C backend with HLSL-specific type mappings and shader semantics.
 
-use std::fmt::Write;
-use std::sync::Arc;
 
-use super::{CodegenError, CodegenResult};
+use super::CodegenResult;
 use crate::codegen::ir::*;
 
 /// HLSL backend for code generation.

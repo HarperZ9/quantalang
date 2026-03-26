@@ -202,13 +202,6 @@ impl<'a> Parser<'a> {
             }
 
             // =================================================================
-            // FN TRAITS: Fn, FnMut, FnOnce
-            // =================================================================
-            TokenKind::Keyword(Keyword::Fn) => {
-                self.parse_fn_trait_type(FnTraitKind::Fn)
-            }
-
-            // =================================================================
             // PATH TYPES (including primitives)
             // =================================================================
             TokenKind::Ident | TokenKind::RawIdent | TokenKind::ColonColon

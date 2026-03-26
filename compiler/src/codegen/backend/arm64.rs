@@ -25,11 +25,11 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use super::{Backend, Target, CodegenError, CodegenResult};
-use super::arm64_enc::{Arm64Encoder, Reg64, Reg32, RegD, RegS, Cond};
+use super::{Backend, Target, CodegenResult};
+use super::arm64_enc::{Arm64Encoder, Reg64, Cond};
 use crate::codegen::ir::*;
 use crate::codegen::{GeneratedCode, OutputFormat};
-use crate::codegen::debug::{DwarfGenerator, LineEntry, AddressRange};
+use crate::codegen::debug::DwarfGenerator;
 
 /// Output mode for the ARM64 backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,7 +203,7 @@ impl Arm64Backend {
         Ok(())
     }
 
-    fn save_callee_saved(&mut self, func: &MirFunction) -> CodegenResult<()> {
+    fn save_callee_saved(&mut self, _func: &MirFunction) -> CodegenResult<()> {
         // TODO: Save X19-X28 as needed based on register allocation
         Ok(())
     }
@@ -602,6 +602,9 @@ impl Arm64Backend {
             // Opaque GPU types — treat as pointer-sized handles
             MirType::Texture2D(_) | MirType::Sampler | MirType::SampledImage(_) => 8,
             MirType::TraitObject(_) => 16, // fat pointer: data ptr + vtable ptr
+            MirType::Vec(_) => 8, // QuantaVecHandle is a pointer
+            MirType::Tuple(elems) => elems.iter().map(|e| self.type_size(e)).sum(),
+            MirType::Map(_, _) => 8, // QuantaMapHandle is a pointer
         }
     }
 
@@ -704,7 +707,7 @@ impl Arm64Backend {
         let mut param_idx = 0;
         for local in &func.locals {
             if local.is_param && param_idx < param_regs.len() {
-                let offset = self.local_offsets.get(&local.id).copied().unwrap_or(8) as u16;
+                let _offset = self.local_offsets.get(&local.id).copied().unwrap_or(8) as u16;
                 // Use STUR for potentially unaligned negative offsets
                 self.enc().str(param_regs[param_idx], Reg64::FP, 0);
                 // Adjust using sub for negative offset
@@ -836,7 +839,7 @@ impl Arm64Backend {
                     self.store_reg_to_local(Reg64::X0, dest)?;
                 }
             }
-            MirRValue::Cast { value, ty, .. } => {
+            MirRValue::Cast { value, ty: _, .. } => {
                 self.load_value_to_reg(value, Reg64::X0, func)?;
                 // Most casts are no-ops at machine code level
                 self.store_reg_to_local(Reg64::X0, dest)?;
@@ -851,7 +854,7 @@ impl Arm64Backend {
     }
 
     /// Load a value into a register.
-    fn load_value_to_reg(&mut self, value: &MirValue, reg: Reg64, func: &MirFunction) -> CodegenResult<()> {
+    fn load_value_to_reg(&mut self, value: &MirValue, reg: Reg64, _func: &MirFunction) -> CodegenResult<()> {
         match value {
             MirValue::Local(id) => {
                 let offset = self.local_offsets.get(id).copied().unwrap_or(16) as u16;
@@ -891,12 +894,12 @@ impl Arm64Backend {
                     }
                 }
             }
-            MirValue::Global(name) => {
+            MirValue::Global(_name) => {
                 // ADRP + ADD for global symbol
                 self.enc().adrp(reg, 0);
                 // Note: actual relocation would be needed here
             }
-            MirValue::Function(name) => {
+            MirValue::Function(_name) => {
                 // ADRP + ADD for function symbol
                 self.enc().adrp(reg, 0);
             }

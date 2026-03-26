@@ -11,7 +11,7 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use super::{Backend, Target, CodegenError, CodegenResult};
+use super::{Backend, Target, CodegenResult};
 use crate::codegen::ir::*;
 use crate::codegen::runtime;
 use crate::codegen::{GeneratedCode, OutputFormat};
@@ -137,10 +137,16 @@ impl CBackend {
                         let field_name = name.as_ref()
                             .map(|n| n.to_string())
                             .unwrap_or_else(|| format!("field{}", i));
-                        write!(self.output, "{} {};\n",
-                            self.type_to_c(field_ty),
-                            field_name
-                        ).unwrap();
+                        if matches!(field_ty, MirType::Array(_, _)) {
+                            write!(self.output, "{};\n",
+                                self.fmt_array_decl(field_ty, &field_name)
+                            ).unwrap();
+                        } else {
+                            write!(self.output, "{} {};\n",
+                                self.type_to_c(field_ty),
+                                field_name
+                            ).unwrap();
+                        }
                     }
                     self.indent -= 1;
                     write!(self.output, "}} {};\n\n", ty.name).unwrap();
@@ -192,10 +198,16 @@ impl CBackend {
                                 let field_name = fname.as_ref()
                                     .map(|n| n.to_string())
                                     .unwrap_or_else(|| format!("f{}", i));
-                                write!(self.output, "{} {};\n",
-                                    self.type_to_c(fty),
-                                    field_name
-                                ).unwrap();
+                                if matches!(fty, MirType::Array(_, _)) {
+                                    write!(self.output, "{};\n",
+                                        self.fmt_array_decl(fty, &field_name)
+                                    ).unwrap();
+                                } else {
+                                    write!(self.output, "{} {};\n",
+                                        self.type_to_c(fty),
+                                        field_name
+                                    ).unwrap();
+                                }
                             }
                             self.indent -= 1;
                             self.write_indent();
@@ -369,8 +381,10 @@ impl CBackend {
                 "exit", "abort", "atexit",
                 "qsort", "bsearch",
                 "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
-                "sqrt", "pow", "exp", "log", "log10", "log2",
-                "ceil", "floor", "round", "fabs", "fmod",
+                "sinh", "cosh", "tanh",
+                "sqrt", "cbrt", "pow", "exp", "exp2", "log", "log10", "log2",
+                "ceil", "floor", "round", "trunc", "fabs", "fmod",
+                "fmax", "fmin", "hypot", "copysign",
                 "sinf", "cosf", "tanf", "sqrtf", "powf", "expf", "logf",
                 "ceilf", "floorf", "roundf", "fabsf", "fmodf",
                 "time", "clock",
@@ -379,6 +393,12 @@ impl CBackend {
                 "quanta_gfx_init", "quanta_gfx_load_shader", "quanta_gfx_create_pipeline",
                 "quanta_gfx_begin_frame", "quanta_gfx_clear", "quanta_gfx_draw",
                 "quanta_gfx_end_frame", "quanta_gfx_should_close", "quanta_gfx_shutdown",
+                // Directory traversal (provided by runtime)
+                "quanta_list_dir", "quanta_is_dir", "quanta_file_size",
+                // String vec handle (provided by runtime)
+                "quanta_hvec_new_str", "quanta_hvec_push_str", "quanta_hvec_get_str",
+                // TCP socket functions (provided by runtime)
+                "quanta_tcp_connect", "quanta_tcp_send", "quanta_tcp_recv", "quanta_tcp_close",
             ];
 
             let non_std: Vec<_> = extern_fns.iter()
@@ -397,10 +417,14 @@ impl CBackend {
         }
 
         // Regular forward declarations for QuantaLang-defined functions.
+        // Skip declaration-only functions (no body) — they have no param info
+        // and would generate incorrect `func(void)` forward declarations.
         self.output.push_str("// Forward declarations\n");
         for func in regular_fns {
-            self.generate_function_signature(func)?;
-            self.output.push_str(";\n");
+            if !func.is_declaration() {
+                self.generate_function_signature(func)?;
+                self.output.push_str(";\n");
+            }
         }
         self.output.push('\n');
 
@@ -411,6 +435,14 @@ impl CBackend {
         self.generate_function_signature(func)?;
         self.output.push_str(" {\n");
         self.indent += 1;
+
+        // For main(), initialize I/O and command-line args before anything else
+        if func.name.as_ref() == "main" {
+            self.write_indent();
+            self.output.push_str("__quanta_init_io();\n");
+            self.write_indent();
+            self.output.push_str("quanta_args_init(argc, argv);\n");
+        }
 
         // Generate local declarations
         for local in &func.locals {
@@ -423,11 +455,9 @@ impl CBackend {
                 let name = self.local_name(local.id, &func.locals);
                 // Arrays need special C declaration syntax: `type name[size]`
                 // Function pointers need: `ret (*name)(params)`
-                if let MirType::Array(ref elem, len) = local.ty {
-                    write!(self.output, "{} {}[{}];\n",
-                        self.type_to_c(elem),
-                        name,
-                        len
+                if matches!(local.ty, MirType::Array(_, _)) {
+                    write!(self.output, "{};\n",
+                        self.fmt_array_decl(&local.ty, &name)
                     ).unwrap();
                 } else if let MirType::FnPtr(ref sig) = local.ty {
                     let ret = self.type_to_c(&sig.ret);
@@ -506,6 +536,12 @@ impl CBackend {
         };
         write!(self.output, "{} {}(", ret_type, func_name).unwrap();
 
+        // For main(), always emit (int argc, char** argv) signature
+        if func.name.as_ref() == "main" {
+            self.output.push_str("int argc, char** argv)");
+            return Ok(());
+        }
+
         // Parameters
         let params: Vec<_> = func.locals.iter()
             .filter(|l| l.is_param)
@@ -526,11 +562,9 @@ impl CBackend {
                     .unwrap_or_else(|| format!("arg{}", i));
                 // Arrays need special C parameter syntax: `type name[size]`
                 // Function pointers need: `ret (*name)(params)`
-                if let MirType::Array(ref elem, len) = param.ty {
-                    write!(self.output, "{} {}[{}]",
-                        self.type_to_c(elem),
-                        name,
-                        len
+                if matches!(param.ty, MirType::Array(_, _)) {
+                    write!(self.output, "{}",
+                        self.fmt_array_decl(&param.ty, &name)
                     ).unwrap();
                 } else if let MirType::FnPtr(ref sig) = param.ty {
                     let ret = self.type_to_c(&sig.ret);
@@ -775,12 +809,23 @@ impl CBackend {
                     .collect();
 
                 if let Some(dest_local) = dest {
-                    let dest_name = self.local_name(*dest_local, locals);
-                    write!(self.output, "{} = {}({});\n",
-                        dest_name,
-                        func_str,
-                        args_str.join(", ")
-                    ).unwrap();
+                    // Skip assignment for void-returning functions
+                    let dest_is_void = locals.get(dest_local.0 as usize)
+                        .map(|l| matches!(l.ty, MirType::Void))
+                        .unwrap_or(false);
+                    if dest_is_void {
+                        write!(self.output, "{}({});\n",
+                            func_str,
+                            args_str.join(", ")
+                        ).unwrap();
+                    } else {
+                        let dest_name = self.local_name(*dest_local, locals);
+                        write!(self.output, "{} = {}({});\n",
+                            dest_name,
+                            func_str,
+                            args_str.join(", ")
+                        ).unwrap();
+                    }
                 } else {
                     write!(self.output, "{}({});\n",
                         func_str,
@@ -794,6 +839,10 @@ impl CBackend {
                 }
             }
             MirTerminator::Return(value) => {
+                // Flush stdout before returning to ensure all output is visible,
+                // especially when running as a child process on Windows.
+                self.write_indent();
+                self.output.push_str("fflush(stdout);\n");
                 self.write_indent();
                 if let Some(val) = value {
                     let val_str = self.value_to_c(val, locals);
@@ -891,7 +940,41 @@ impl CBackend {
             MirType::Sampler => "void*".to_string(),       // Opaque GPU handle
             MirType::SampledImage(_) => "void*".to_string(), // Opaque GPU handle
             MirType::TraitObject(name) => format!("dyn_{}", name), // vtable struct
+            MirType::Vec(_) => "QuantaVecHandle".to_string(),
+            MirType::Map(_, _) => "QuantaStrF64MapHandle".to_string(),
+            MirType::Tuple(ref elems) => {
+                if elems.is_empty() {
+                    "void".to_string()
+                } else {
+                    MirType::tuple_type_name(elems).to_string()
+                }
+            }
         }
+    }
+
+    /// Recursively extract the base (non-array) element type and all dimension
+    /// sizes from a (possibly nested) `MirType::Array`.
+    ///
+    /// For `Array(Array(f64, 3), 3)` this returns `(f64, [3, 3])`.
+    /// The dimensions are in *outer-to-inner* order so they can be appended
+    /// directly after the variable name: `double name[3][3]`.
+    fn array_base_and_dims<'a>(&self, ty: &'a MirType) -> (&'a MirType, Vec<u64>) {
+        let mut current = ty;
+        let mut dims = Vec::new();
+        while let MirType::Array(ref elem, len) = *current {
+            dims.push(len);
+            current = elem;
+        }
+        (current, dims)
+    }
+
+    /// Format an array declaration: `base_type name[d1][d2]...`.
+    /// Returns the string assuming the caller will append `;\n` or similar.
+    fn fmt_array_decl(&self, ty: &MirType, name: &str) -> String {
+        let (base, dims) = self.array_base_and_dims(ty);
+        let base_c = self.type_to_c(base);
+        let dim_str: String = dims.iter().map(|d| format!("[{}]", d)).collect();
+        format!("{} {}{}", base_c, name, dim_str)
     }
 
     fn value_to_c(&self, value: &MirValue, locals: &[MirLocal]) -> String {
@@ -951,6 +1034,12 @@ impl CBackend {
                 format!("(({}){{}})", self.type_to_c(ty))
             }
             MirConst::Undef(_) => "/* undef */ 0".to_string(),
+            MirConst::Struct(name, fields) => {
+                let field_strs: Vec<String> = fields.iter()
+                    .map(|f| self.const_to_c(f))
+                    .collect();
+                format!("({}){{ {} }}", name, field_strs.join(", "))
+            }
         }
     }
 
@@ -991,7 +1080,32 @@ impl CBackend {
                     .collect();
                 match kind {
                     AggregateKind::Array(_) => format!("{{ {} }}", vals.join(", ")),
-                    AggregateKind::Tuple => format!("{{ {} }}", vals.join(", ")),
+                    AggregateKind::Tuple => {
+                        // Determine element types to build the typedef name.
+                        let elem_tys: Vec<MirType> = operands.iter().map(|op| {
+                            match op {
+                                MirValue::Local(id) => {
+                                    locals.get(id.0 as usize)
+                                        .map(|l| l.ty.clone())
+                                        .unwrap_or(MirType::i32())
+                                }
+                                MirValue::Const(c) => match c {
+                                    MirConst::Bool(_) => MirType::Bool,
+                                    MirConst::Int(_, ty) => ty.clone(),
+                                    MirConst::Uint(_, ty) => ty.clone(),
+                                    MirConst::Float(_, ty) => ty.clone(),
+                                    _ => MirType::i32(),
+                                },
+                                _ => MirType::i32(),
+                            }
+                        }).collect();
+                        if elem_tys.is_empty() {
+                            format!("{{ {} }}", vals.join(", "))
+                        } else {
+                            let name = MirType::tuple_type_name(&elem_tys);
+                            format!("({}){{ {} }}", name, vals.join(", "))
+                        }
+                    }
                     AggregateKind::Struct(name) => {
                         if name.starts_with("dyn_") && vals.len() == 2 {
                             // Fat pointer: { data = (void*)&obj, vtable = &vtable_instance }
@@ -1160,8 +1274,13 @@ impl CBackend {
         }
         // Standard C math / stdlib functions used by the builtin system
         matches!(name,
-            "sqrt" | "sin" | "cos" | "tan" | "pow" | "fabs" |
-            "floor" | "ceil" | "round" | "abs" |
+            "sqrt" | "cbrt" | "sin" | "cos" | "tan" | "pow" | "fabs" |
+            "asin" | "acos" | "atan" | "atan2" |
+            "sinh" | "cosh" | "tanh" |
+            "exp" | "exp2" | "log" | "log2" | "log10" |
+            "floor" | "ceil" | "round" | "trunc" |
+            "fmax" | "fmin" | "fmod" | "hypot" | "copysign" |
+            "abs" |
             "printf" | "fprintf" | "sprintf" |
             "setjmp" | "longjmp" |
             "malloc" | "realloc" | "free" |
@@ -1692,5 +1811,713 @@ fn area(s: Shape) -> f64 {
 
         // Verify tag comparison
         assert!(code.contains(".tag"), "Missing tag access in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_ref_self_method() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+impl Point {
+    fn new(x: f64, y: f64) -> Self {
+        Point { x: x, y: y }
+    }
+
+    fn magnitude(&self) -> f64 {
+        sqrt(self.x * self.x + self.y * self.y)
+    }
+
+    fn scale(&mut self, factor: f64) {
+        self.x = self.x * factor;
+        self.y = self.y * factor;
+    }
+}
+
+fn main() {
+    let mut p = Point::new(3.0, 4.0);
+    let mag = p.magnitude();
+    p.scale(2.0);
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate");
+        let code = output.as_string().unwrap();
+
+        // &self method should take a pointer parameter
+        assert!(code.contains("Point*"), "Expected 'Point*' in:\n{}", code);
+        // field access through pointer should use ->
+        assert!(code.contains("->x") || code.contains("-> x"),
+            "Expected '->x' (pointer field access) in:\n{}", code);
+        // Method call should pass &p
+        assert!(code.contains("&p") || code.contains("& p"),
+            "Expected '&p' (address-of) in method call in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_ref_self_distance() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+impl Point {
+    fn distance(&self, other: &Point) -> f64 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        sqrt(dx * dx + dy * dy)
+    }
+}
+
+fn main() {
+    let p = Point { x: 3.0, y: 4.0 };
+    let q = Point { x: 0.0, y: 0.0 };
+    let dist = p.distance(&q);
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate");
+        let code = output.as_string().unwrap();
+
+        // &self method takes pointer
+        assert!(code.contains("Point*"), "Expected 'Point*' param in:\n{}", code);
+        // Field access through pointer should use ->
+        assert!(code.contains("->x"), "Expected '->x' in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_mut_self_method() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+impl Point {
+    fn scale(&mut self, factor: f64) {
+        self.x = self.x * factor;
+        self.y = self.y * factor;
+    }
+}
+
+fn main() {
+    let mut p = Point { x: 3.0, y: 4.0 };
+    p.scale(2.0);
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate");
+        let code = output.as_string().unwrap();
+
+        // &mut self should generate pointer parameter
+        assert!(code.contains("Point*"), "Expected 'Point*' param in:\n{}", code);
+        // Field assignment through pointer: self->x = ...
+        assert!(code.contains("->x =") || code.contains("->x="),
+            "Expected '->x =' (pointer field assign) in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_primitive_float_methods() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let x: f64 = -3.7;
+    let y: f64 = 2.0;
+
+    let a = x.abs();
+    let f = x.floor();
+    let c = x.ceil();
+    let s = (4.0).sqrt();
+    let p = y.powi(3);
+    let mx = x.max(y);
+    let mn = x.min(y);
+    let pi = 3.14159265358979323846;
+    let deg = pi.to_degrees();
+    let rad = (180.0).to_radians();
+    let sv = (0.0).sin();
+    let cv = (0.0).cos();
+    let ev = (1.0).exp();
+    let lv = (1.0).ln();
+    let fv = (3.7).fract();
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // Verify primitive method calls are lowered to correct C functions
+        assert!(code.contains("fabs("), "Expected fabs() for .abs() in:\n{}", code);
+        assert!(code.contains("floor("), "Expected floor() for .floor() in:\n{}", code);
+        assert!(code.contains("ceil("), "Expected ceil() for .ceil() in:\n{}", code);
+        assert!(code.contains("sqrt("), "Expected sqrt() for .sqrt() in:\n{}", code);
+        assert!(code.contains("pow("), "Expected pow() for .powi() in:\n{}", code);
+        assert!(code.contains("fmax("), "Expected fmax() for .max() in:\n{}", code);
+        assert!(code.contains("fmin("), "Expected fmin() for .min() in:\n{}", code);
+        assert!(code.contains("sin("), "Expected sin() for .sin() in:\n{}", code);
+        assert!(code.contains("cos("), "Expected cos() for .cos() in:\n{}", code);
+        assert!(code.contains("exp("), "Expected exp() for .exp() in:\n{}", code);
+        assert!(code.contains("log("), "Expected log() for .ln() in:\n{}", code);
+
+        // to_degrees and to_radians lower to multiplication by constants
+        // They should NOT produce a function call to "to_degrees" or "to_radians"
+        assert!(!code.contains("to_degrees("), "to_degrees should be inlined, not a call in:\n{}", code);
+        assert!(!code.contains("to_radians("), "to_radians should be inlined, not a call in:\n{}", code);
+
+        // fract should use floor() and subtraction
+        // Verify floor appears (used by both .floor() and .fract())
+        let floor_count = code.matches("floor(").count();
+        assert!(floor_count >= 2, "Expected at least 2 floor() calls (for .floor() and .fract()) in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_inline_module_basic() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+pub mod math {
+    pub fn add(a: i32, b: i32) -> i32 {
+        a + b
+    }
+}
+
+fn main() {
+    let result = math::add(3, 4);
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // The function inside `mod math` should be emitted as `math_add`
+        assert!(code.contains("math_add"), "Expected math_add function in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_inline_module_with_const() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+pub mod config {
+    pub const MAX_SIZE: i32 = 100;
+}
+
+fn main() {
+    let x = config::MAX_SIZE;
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // The const inside `mod config` should be emitted as `config_MAX_SIZE`
+        assert!(code.contains("config_MAX_SIZE"), "Expected config_MAX_SIZE global in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_inline_module_with_use_super() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn helper() -> i32 {
+    42
+}
+
+pub mod inner {
+    use super::*;
+
+    pub fn call_helper() -> i32 {
+        helper()
+    }
+}
+
+fn main() {
+    let x = inner::call_helper();
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // inner::call_helper should generate inner_call_helper
+        assert!(code.contains("inner_call_helper"), "Expected inner_call_helper function in:\n{}", code);
+        // The body should call helper() (the parent-scope function)
+        assert!(code.contains("helper("), "Expected call to helper() in inner_call_helper body:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_nested_inline_modules() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+pub mod outer {
+    pub mod inner {
+        pub fn deep_fn() -> i32 {
+            99
+        }
+    }
+}
+
+fn main() {
+    let x = outer::inner::deep_fn();
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // Nested modules should produce outer_inner_deep_fn
+        assert!(code.contains("outer_inner_deep_fn"), "Expected outer_inner_deep_fn function in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_struct_const() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+struct Color {
+    r: f64,
+    g: f64,
+    b: f64,
+}
+
+const WHITE: Color = Color { r: 1.0, g: 1.0, b: 1.0 };
+const BLACK: Color = Color { r: 0.0, g: 0.0, b: 0.0 };
+
+fn main() {
+    let w = WHITE;
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // Verify struct constant globals are emitted with initializers
+        assert!(code.contains("const Color WHITE = (Color)"),
+            "Expected const Color WHITE global in:\n{}", code);
+        assert!(code.contains("const Color BLACK = (Color)"),
+            "Expected const Color BLACK global in:\n{}", code);
+
+        // Verify field values are present in the initializer
+        assert!(code.contains("1") && code.contains("0"),
+            "Expected field values in struct const initializer:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_vec_macro_literal() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let v = vec![1, 2, 3];
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // vec![1, 2, 3] should expand to vec_new + 3x vec_push
+        assert!(code.contains("quanta_hvec_new_i32"),
+            "Expected quanta_hvec_new_i32 call in:\n{}", code);
+        assert!(code.contains("quanta_hvec_push_i32"),
+            "Expected quanta_hvec_push_i32 calls in:\n{}", code);
+        let push_count = code.matches("quanta_hvec_push_i32").count();
+        assert!(push_count >= 3,
+            "Expected at least 3 push calls, got {} in:\n{}", push_count, code);
+    }
+
+    #[test]
+    fn test_e2e_vec_macro_repeat() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let zeros = vec![0.0; 5];
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // vec![0.0; 5] should use f64 variant and have a loop
+        assert!(code.contains("quanta_hvec_new_f64"),
+            "Expected quanta_hvec_new_f64 call in:\n{}", code);
+        assert!(code.contains("quanta_hvec_push_f64"),
+            "Expected quanta_hvec_push_f64 call in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_vec_type_annotation() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let v: Vec<f64> = vec![1.0, 2.0, 3.0];
+    let len = vec_len(v);
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // Vec<f64> type annotation should produce QuantaVecHandle
+        assert!(code.contains("QuantaVecHandle"),
+            "Expected QuantaVecHandle type in:\n{}", code);
+        assert!(code.contains("quanta_hvec_new_f64"),
+            "Expected quanta_hvec_new_f64 in:\n{}", code);
+    }
+
+    // =========================================================================
+    // Iterator chain lowering tests
+    // =========================================================================
+
+    #[test]
+    fn test_e2e_iter_map_collect() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let v = vec![1.0, 2.0, 3.0];
+    let doubled = v.iter().map(|x: f64| x * 2.0).collect();
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // Iterator chain should lower to a loop with vec_new + get + push
+        assert!(code.contains("quanta_hvec_new_f64"),
+            "Expected quanta_hvec_new_f64 for collect result in:\n{}", code);
+        assert!(code.contains("quanta_hvec_get_f64"),
+            "Expected quanta_hvec_get_f64 for element access in:\n{}", code);
+        assert!(code.contains("quanta_hvec_push_f64"),
+            "Expected quanta_hvec_push_f64 for collect push in:\n{}", code);
+        assert!(code.contains("quanta_hvec_len"),
+            "Expected quanta_hvec_len for loop bound in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_iter_fold() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let v = vec![1.0, 2.0, 3.0];
+    let sum = v.iter().fold(0.0, |acc: f64, x: f64| acc + x);
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // fold should lower to a loop with accumulator but NO vec_new/push
+        assert!(code.contains("quanta_hvec_get_f64"),
+            "Expected quanta_hvec_get_f64 for element access in:\n{}", code);
+        assert!(code.contains("quanta_hvec_len"),
+            "Expected quanta_hvec_len for loop bound in:\n{}", code);
+        // fold shouldn't create a new output vec (only the source vec![...] + runtime definition)
+        let new_count = code.matches("quanta_hvec_new_f64").count();
+        // 1 for the runtime header definition + 1 for source vec = 2 total
+        assert!(new_count == 2,
+            "Expected exactly 2 quanta_hvec_new_f64 (runtime def + source), got {} in:\n{}", new_count, code);
+        // Also verify no push calls (fold accumulates, doesn't push)
+        // Count only calls in main(), not the runtime definition
+        let push_count = code.matches("quanta_hvec_push_f64(").count();
+        // 3 pushes for vec![1.0, 2.0, 3.0] + 1 runtime def = 4
+        assert!(push_count <= 4,
+            "Fold should not add extra push calls, got {} in:\n{}", push_count, code);
+    }
+
+    #[test]
+    fn test_e2e_iter_map_fold_chain() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let v = vec![1.0, 2.0, 3.0];
+    let sum_sq = v.iter().map(|x: f64| x * x).fold(0.0, |acc: f64, x: f64| acc + x);
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // map + fold chain: should have get + len but only 1 new (for source)
+        assert!(code.contains("quanta_hvec_get_f64"),
+            "Expected quanta_hvec_get_f64 in:\n{}", code);
+        assert!(code.contains("quanta_hvec_len"),
+            "Expected quanta_hvec_len in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_iter_enumerate_map_collect() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let v = vec![10.0, 20.0, 30.0];
+    let indices = v.iter().enumerate().map(|i: i64, x: f64| i).collect();
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // enumerate + map + collect: should have the loop infrastructure
+        assert!(code.contains("quanta_hvec_len"),
+            "Expected quanta_hvec_len for loop bound in:\n{}", code);
+        assert!(code.contains("quanta_hvec_get_f64"),
+            "Expected quanta_hvec_get_f64 in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_inclusive_range_for_loop() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let mut sum = 0;
+    for i in 0..=5 {
+        sum = sum + i;
+    }
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // Inclusive range: exit condition uses > (not >=)
+        assert!(code.contains("> 5)"), "Expected `> 5)` for inclusive range exit in:\n{}", code);
+        // Should have an increment by 1
+        assert!(code.contains("+ 1)"), "Expected increment by 1 in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_range_step_by() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let mut count = 0;
+    for i in (0..10).step_by(2) {
+        count = count + 1;
+    }
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // Exclusive range: exit condition uses >=
+        assert!(code.contains(">= 10)"), "Expected `>= 10)` for exclusive range exit in:\n{}", code);
+        // step_by(2): increment by 2 instead of 1
+        assert!(code.contains("+ 2)"), "Expected increment by 2 for step_by(2) in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_inclusive_range_step_by() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let mut vals = vec![];
+    for i in (0..=10).step_by(3) {
+        vec_push(vals, i);
+    }
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // Inclusive range: exit condition uses >
+        assert!(code.contains("> 10)"), "Expected `> 10)` for inclusive range exit in:\n{}", code);
+        // step_by(3): increment by 3
+        assert!(code.contains("+ 3)"), "Expected increment by 3 for step_by(3) in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_main_argc_argv() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let n = args_count();
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        // main gets argc/argv signature
+        assert!(code.contains("main(int argc, char** argv)"), "Missing argc/argv signature in:\n{}", code);
+        // args init is called
+        assert!(code.contains("quanta_args_init(argc, argv)"), "Missing args init in:\n{}", code);
+        // args_count builtin is called
+        assert!(code.contains("quanta_args_count"), "Missing args_count call in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_string_parse_methods() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let s = "Hello, World!";
+    let idx = s.index_of("World");
+    let sub = s.substring(0, 5);
+    let r = s.replace("World", "QuantaLang");
+    let n = "42".parse_int();
+    let f = "3.14".parse_float();
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        assert!(code.contains("quanta_string_index_of"), "Missing index_of call in:\n{}", code);
+        assert!(code.contains("quanta_string_substring"), "Missing substring call in:\n{}", code);
+        assert!(code.contains("quanta_string_replace"), "Missing replace call in:\n{}", code);
+        assert!(code.contains("quanta_string_parse_int"), "Missing parse_int call in:\n{}", code);
+        assert!(code.contains("quanta_string_parse_float"), "Missing parse_float call in:\n{}", code);
+    }
+
+    #[test]
+    fn test_e2e_stdin_builtins() {
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+        use crate::codegen::{CodeGenerator, Target};
+
+        let source = r#"
+fn main() {
+    let piped = stdin_is_pipe();
+    if piped {
+        let input = read_all();
+    }
+}
+"#;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let code = output.as_string().unwrap();
+
+        assert!(code.contains("quanta_stdin_is_pipe"), "Missing stdin_is_pipe call in:\n{}", code);
+        assert!(code.contains("quanta_read_all"), "Missing read_all call in:\n{}", code);
     }
 }

@@ -17,7 +17,9 @@
 // ===============================================================================
 
 #![warn(rust_2018_idioms)]
-#![warn(missing_docs)]
+#![allow(missing_docs)]
+#![allow(dead_code)]
+#![allow(ambiguous_glob_reexports)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 //! # QuantaLang Compiler

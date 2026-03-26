@@ -1004,6 +1004,8 @@ pub enum Keyword {
     Pub,
     /// `mod`
     Mod,
+    /// `module` (QuantaLang ecosystem module declaration)
+    Module,
     /// `use`
     Use,
     /// `as`
@@ -1167,6 +1169,7 @@ impl Keyword {
             Keyword::Mut => "mut",
             Keyword::Pub => "pub",
             Keyword::Mod => "mod",
+            Keyword::Module => "module",
             Keyword::Use => "use",
             Keyword::As => "as",
             Keyword::Crate => "crate",
@@ -1235,6 +1238,7 @@ impl Keyword {
             "mut" => Some(Keyword::Mut),
             "pub" => Some(Keyword::Pub),
             "mod" => Some(Keyword::Mod),
+            "module" => Some(Keyword::Module),
             "use" => Some(Keyword::Use),
             "as" => Some(Keyword::As),
             "crate" => Some(Keyword::Crate),

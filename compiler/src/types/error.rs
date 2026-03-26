@@ -407,7 +407,7 @@ impl TypeError {
                     effect_name, func_name, effect_name, effect_name
                 ))
             }
-            TypeError::UndeclaredEffect { func_name, effect_name, declared_effects } => {
+            TypeError::UndeclaredEffect { func_name: _, effect_name, declared_effects } => {
                 let declared = declared_effects.join(", ");
                 Some(format!(
                     "add `{}` to the effect annotations: ~ {}, {}",

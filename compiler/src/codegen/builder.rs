@@ -344,6 +344,11 @@ impl MirModuleBuilder {
         self.module
     }
 
+    /// Find a global variable by name.
+    pub fn find_global(&self, name: &str) -> Option<&MirGlobal> {
+        self.module.find_global(name)
+    }
+
     /// Get mutable access to the underlying MirModule.
     pub fn module_mut(&mut self) -> &mut MirModule {
         &mut self.module

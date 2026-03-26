@@ -6,8 +6,7 @@
 
 //! Main formatter implementation for QuantaLang source code.
 
-use super::config::{FormatConfig, BraceStyle, TrailingComma, ImportStyle};
-use super::pretty::{Doc, PrettyPrinter};
+use super::config::{FormatConfig, BraceStyle, TrailingComma};
 
 // =============================================================================
 // FORMATTER
@@ -484,7 +483,7 @@ impl Formatter {
     }
 
     /// Format trait-like or impl-like block.
-    fn format_impl_like(&self, lines: &[&str], start: usize, kind: &str) -> Result<(String, usize), FormatError> {
+    fn format_impl_like(&self, lines: &[&str], start: usize, _kind: &str) -> Result<(String, usize), FormatError> {
         let mut output = String::new();
         let line = lines[start].trim();
 

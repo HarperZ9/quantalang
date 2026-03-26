@@ -49,7 +49,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use super::{Ty, TyVarId, DefId};
+use super::{Ty, DefId};
 
 /// A unique identifier for effect variables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -264,7 +264,7 @@ impl EffectRow {
 
     /// Merge two rows.
     pub fn merge(&self, other: &EffectRow) -> EffectRow {
-        let mut effects: HashSet<_> = self.effects.union(&other.effects).cloned().collect();
+        let effects: HashSet<_> = self.effects.union(&other.effects).cloned().collect();
         let tail = match (self.tail, other.tail) {
             (Some(v1), Some(v2)) if v1 == v2 => Some(v1),
             (Some(v), None) | (None, Some(v)) => Some(v),

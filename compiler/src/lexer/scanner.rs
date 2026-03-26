@@ -10,13 +10,13 @@
 //! into a stream of tokens.
 
 use super::cursor::{
-    is_binary_digit, is_digit, is_hex_digit, is_id_continue, is_id_start, is_octal_digit,
+    is_digit, is_hex_digit, is_id_continue, is_id_start,
     is_whitespace, Cursor, EOF_CHAR,
 };
 use super::error::{LexerError, LexerErrorKind, LexerErrors, LexerResult};
-use super::span::{BytePos, SourceFile, SourceId, Span};
+use super::span::{BytePos, SourceFile, Span};
 use super::token::{
-    is_dsl_name, is_integer_only_suffix, is_valid_float_suffix, is_valid_int_suffix,
+    is_dsl_name,
     validate_numeric_suffix, Delimiter, DocComment, DocCommentKind, DocComments,
     IntBase, InterpolatedPart, Keyword, LiteralKind, NumericSuffixKind,
     NumericSuffixValidation, Token, TokenKind,
@@ -175,7 +175,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// Extract a DocComment from a comment token.
-    fn extract_doc_comment(&self, token: &Token, is_inner: bool) -> Option<DocComment> {
+    fn extract_doc_comment(&self, token: &Token, _is_inner: bool) -> Option<DocComment> {
         let source = self.source.source();
         let start = token.span.start.to_usize();
         let end = token.span.end.to_usize();
@@ -896,7 +896,7 @@ impl<'a> Lexer<'a> {
                         self.current_span(),
                     ));
                 }
-                c => {
+                _c => {
                     return Err(LexerError::new(
                         LexerErrorKind::NonAsciiInByteLiteral,
                         self.current_span(),
@@ -1488,7 +1488,7 @@ impl<'a> Lexer<'a> {
     // IDENTIFIER SCANNING
     // =========================================================================
 
-    fn scan_identifier(&mut self, first: char) -> LexerResult<Token> {
+    fn scan_identifier(&mut self, _first: char) -> LexerResult<Token> {
         self.cursor.eat_while(is_id_continue);
 
         let text = self.cursor.slice_from(self.token_start);

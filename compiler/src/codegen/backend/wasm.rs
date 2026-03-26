@@ -20,7 +20,6 @@
 
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::sync::Arc;
 
 use super::{Backend, Target, CodegenError, CodegenResult};
 use crate::codegen::ir::*;
@@ -318,6 +317,9 @@ impl WasmBackend {
             // Opaque GPU types — represent as i32 pointer handles in WASM
             MirType::Texture2D(_) | MirType::Sampler | MirType::SampledImage(_) => "i32",
             MirType::TraitObject(_) => "i32", // wasm pointer
+            MirType::Vec(_) => "i32", // QuantaVecHandle is a pointer in wasm32
+            MirType::Tuple(_) => "i32", // Tuples are memory pointers in wasm32
+            MirType::Map(_, _) => "i32", // QuantaMapHandle is a pointer in wasm32
         }
     }
 
@@ -346,6 +348,9 @@ impl WasmBackend {
             // Opaque GPU types — pointer-sized handles in wasm32
             MirType::Texture2D(_) | MirType::Sampler | MirType::SampledImage(_) => 4,
             MirType::TraitObject(_) => 8, // two i32 pointers: data ptr + vtable ptr
+            MirType::Vec(_) => 4, // wasm32 pointer
+            MirType::Tuple(elems) => elems.iter().map(|e| self.type_size(e)).sum(),
+            MirType::Map(_, _) => 4, // wasm32 pointer
         }
     }
 
@@ -918,7 +923,7 @@ impl WasmBackend {
                 let from_ty = self.infer_value_type(value, func)?;
                 self.gen_cast(*kind, &from_ty, ty)?;
             }
-            MirRValue::Aggregate { kind, operands } => {
+            MirRValue::Aggregate { kind: _, operands } => {
                 // Allocate space on heap and store values
                 let size = operands.len() as u32 * 4; // Simplified
                 self.emit_line(&format!("global.get $__heap_base"));
@@ -1044,7 +1049,7 @@ impl WasmBackend {
     }
 
     /// Generate a value (push onto stack).
-    fn gen_value(&mut self, value: &MirValue, func: &MirFunction) -> CodegenResult<()> {
+    fn gen_value(&mut self, value: &MirValue, _func: &MirFunction) -> CodegenResult<()> {
         match value {
             MirValue::Local(id) => {
                 let name = self.local_names.get(id)
@@ -1106,13 +1111,17 @@ impl WasmBackend {
             MirConst::Undef(_) => {
                 self.emit_line("i32.const 0 ;; undef");
             }
+            MirConst::Struct(_, _) => {
+                // Struct constants not yet supported in WASM backend
+                self.emit_line("i32.const 0 ;; struct const stub");
+            }
         }
 
         Ok(())
     }
 
     /// Generate a place address.
-    fn gen_place_addr(&mut self, place: &MirPlace, func: &MirFunction) -> CodegenResult<()> {
+    fn gen_place_addr(&mut self, place: &MirPlace, _func: &MirFunction) -> CodegenResult<()> {
         // Start with the local's address
         let name = self.local_names.get(&place.local)
             .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", place.local)))?
@@ -1502,6 +1511,7 @@ impl WasmBackend {
                     MirConst::Unit => Ok(MirType::Void),
                     MirConst::Zeroed(ty) => Ok(ty.clone()),
                     MirConst::Undef(ty) => Ok(ty.clone()),
+                    MirConst::Struct(name, _) => Ok(MirType::Struct(name.clone())),
                 }
             }
             MirValue::Global(_) => Ok(MirType::i32()),

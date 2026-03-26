@@ -8,12 +8,11 @@
 //!
 //! This module implements the expansion of macro invocations to AST nodes.
 
-use std::sync::Arc;
 
-use crate::lexer::{Token, TokenKind, Span, Delimiter};
+use crate::lexer::{Token, TokenKind, Span};
 
 use super::{
-    MacroDef, MacroRule, MacroExpansion, ExpansionElement, RepetitionKind,
+    MacroExpansion, ExpansionElement, RepetitionKind,
     TokenTree, MacroContext, MacroError, MacroResult,
     Bindings, Binding, BindingValue, match_macro_pattern, tokens_to_tree,
 };

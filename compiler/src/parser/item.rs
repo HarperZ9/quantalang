@@ -40,7 +40,21 @@ impl<'a> Parser<'a> {
         start: crate::lexer::Span,
     ) -> ParseResult<Item> {
         // Handle modifiers
-        let is_default = self.eat_keyword(Keyword::Default);
+        // Only consume `default` if followed by fn/impl/type (not when used as identifier)
+        let _is_default = if self.check_keyword(Keyword::Default) {
+            let next = &self.peek().kind;
+            let is_modifier = matches!(next,
+                TokenKind::Keyword(Keyword::Fn)
+                | TokenKind::Keyword(Keyword::Unsafe)
+                | TokenKind::Keyword(Keyword::Async)
+                | TokenKind::Keyword(Keyword::Const)
+                | TokenKind::Keyword(Keyword::Impl)
+                | TokenKind::Keyword(Keyword::Type)
+            );
+            if is_modifier { self.eat_keyword(Keyword::Default) } else { false }
+        } else {
+            false
+        };
         let is_unsafe = self.eat_keyword(Keyword::Unsafe);
         let is_async = self.eat_keyword(Keyword::Async);
         let is_const = self.eat_keyword(Keyword::Const);
@@ -177,6 +191,20 @@ impl<'a> Parser<'a> {
             // =================================================================
             TokenKind::Keyword(Keyword::Mod) => {
                 let mod_def = self.parse_mod(is_unsafe)?;
+                let span = start.merge(&self.tokens[self.pos.saturating_sub(1)].span);
+                Ok(Item::new(
+                    ItemKind::Mod(Box::new(mod_def)),
+                    vis,
+                    attrs,
+                    span,
+                ))
+            }
+
+            // =================================================================
+            // MODULE DECLARATION (QuantaLang ecosystem: `module std::math`)
+            // =================================================================
+            TokenKind::Keyword(Keyword::Module) => {
+                let mod_def = self.parse_module_decl(is_unsafe)?;
                 let span = start.merge(&self.tokens[self.pos.saturating_sub(1)].span);
                 Ok(Item::new(
                     ItemKind::Mod(Box::new(mod_def)),
@@ -508,7 +536,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Check for mut self
+        // Check for mut self or mut self: Type
         if self.check_keyword(Keyword::Mut) && self.peek().kind == TokenKind::Keyword(Keyword::Self_) {
             self.advance(); // consume mut
             let self_span = self.current_span();
@@ -524,30 +552,35 @@ impl<'a> Parser<'a> {
                 self_span,
             );
 
-            // Type is Self
-            let self_type_path = Path {
-                segments: vec![PathSegment {
-                    ident: Ident::new("Self", self_span),
-                    generics: vec![],
-                }],
-                span: self_span,
-            };
-            let ty = Type {
-                kind: TypeKind::Path(self_type_path),
-                span: self_span,
-                id: NodeId::DUMMY,
+            // Check for explicit type: `mut self: Self`, `mut self: &mut Self`
+            let ty = if self.eat(&TokenKind::Colon) {
+                self.parse_type()?
+            } else {
+                let self_type_path = Path {
+                    segments: vec![PathSegment {
+                        ident: Ident::new("Self", self_span),
+                        generics: vec![],
+                    }],
+                    span: self_span,
+                };
+                Type {
+                    kind: TypeKind::Path(self_type_path),
+                    span: self_span,
+                    id: NodeId::DUMMY,
+                }
             };
 
+            let end_span = self.tokens[self.pos.saturating_sub(1)].span;
             return Ok(Some(Param {
                 attrs: attrs.to_vec(),
                 pattern,
                 ty: Box::new(ty),
                 default: None,
-                span: start.merge(&self_span),
+                span: start.merge(&end_span),
             }));
         }
 
-        // Check for plain self
+        // Check for plain self or self: ExplicitType
         if self.check_keyword(Keyword::Self_) {
             let self_span = self.current_span();
             self.advance(); // consume self
@@ -562,26 +595,33 @@ impl<'a> Parser<'a> {
                 self_span,
             );
 
-            // Type is Self
-            let self_type_path = Path {
-                segments: vec![PathSegment {
-                    ident: Ident::new("Self", self_span),
-                    generics: vec![],
-                }],
-                span: self_span,
-            };
-            let ty = Type {
-                kind: TypeKind::Path(self_type_path),
-                span: self_span,
-                id: NodeId::DUMMY,
+            // Check for explicit type annotation: `self: &Self`, `self: Self`, etc.
+            let ty = if self.eat(&TokenKind::Colon) {
+                // Explicit self type — parse the type
+                self.parse_type()?
+            } else {
+                // Implicit self type — default to Self
+                let self_type_path = Path {
+                    segments: vec![PathSegment {
+                        ident: Ident::new("Self", self_span),
+                        generics: vec![],
+                    }],
+                    span: self_span,
+                };
+                Type {
+                    kind: TypeKind::Path(self_type_path),
+                    span: self_span,
+                    id: NodeId::DUMMY,
+                }
             };
 
+            let end_span = self.tokens[self.pos.saturating_sub(1)].span;
             return Ok(Some(Param {
                 attrs: attrs.to_vec(),
                 pattern,
                 ty: Box::new(ty),
                 default: None,
-                span: self_span,
+                span: start.merge(&end_span),
             }));
         }
 
@@ -900,8 +940,21 @@ impl<'a> Parser<'a> {
         let vis = self.parse_visibility()?;
         let start = self.current_span();
 
-        let is_default = self.eat_keyword(Keyword::Default);
-        let is_const = self.eat_keyword(Keyword::Const);
+        let is_default = if self.check_keyword(Keyword::Default) {
+            let next = &self.peek().kind;
+            if matches!(next, TokenKind::Keyword(Keyword::Fn) | TokenKind::Keyword(Keyword::Type)) {
+                self.eat_keyword(Keyword::Default)
+            } else { false }
+        } else { false };
+
+        // Only consume const as modifier if followed by fn (const fn)
+        let is_const = if self.check_keyword(Keyword::Const) {
+            let next = &self.peek().kind;
+            if matches!(next, TokenKind::Keyword(Keyword::Fn)) {
+                self.eat_keyword(Keyword::Const)
+            } else { false }
+        } else { false };
+
         let is_async = self.eat_keyword(Keyword::Async);
         let is_unsafe = self.eat_keyword(Keyword::Unsafe);
 
@@ -1084,6 +1137,49 @@ impl<'a> Parser<'a> {
         Ok(ModDef { name, content, is_unsafe })
     }
 
+    /// Parse a `module` declaration (QuantaLang ecosystem convention).
+    ///
+    /// Syntax: `module name` or `module path::to::name`
+    ///
+    /// This is a file-level module declaration used by .quanta ecosystem files.
+    /// It declares the module path for the current file. Unlike `mod`, it does
+    /// not have a body or require a semicolon — the rest of the file IS the body.
+    fn parse_module_decl(&mut self, is_unsafe: bool) -> ParseResult<ModDef> {
+        self.expect_keyword(Keyword::Module)?;
+
+        // Parse the module name (may be a path like `std::math`)
+        let name = self.expect_ident()?;
+
+        // Consume any `::segment` path components (e.g., `std::math::trig`)
+        while self.eat(&TokenKind::ColonColon) {
+            let _segment = self.expect_ident()?;
+        }
+
+        // Check for braced body: `module name { ... items ... }`
+        let content = if self.check(&TokenKind::OpenDelim(Delimiter::Brace)) {
+            let brace_start = self.expect(&TokenKind::OpenDelim(Delimiter::Brace))?.span;
+            let attrs = self.parse_inner_attrs()?;
+            let mut items = Vec::new();
+            while !self.check(&TokenKind::CloseDelim(Delimiter::Brace)) && !self.is_eof() {
+                match self.parse_item() {
+                    Ok(item) => items.push(item),
+                    Err(e) => {
+                        self.errors.push(e);
+                        self.recover_to_item();
+                    }
+                }
+            }
+            let brace_end = self.expect(&TokenKind::CloseDelim(Delimiter::Brace))?.span;
+            Some(ModContent { attrs, items, span: brace_start.merge(&brace_end) })
+        } else {
+            // Optional semicolon (ecosystem files often omit it)
+            self.eat(&TokenKind::Semi);
+            None
+        };
+
+        Ok(ModDef { name, content, is_unsafe })
+    }
+
     // =========================================================================
     // USE
     // =========================================================================
@@ -1094,7 +1190,8 @@ impl<'a> Parser<'a> {
 
         let tree = self.parse_use_tree()?;
 
-        self.expect(&TokenKind::Semi)?;
+        // Semicolon is optional (ecosystem files often omit it)
+        self.eat(&TokenKind::Semi);
 
         Ok(UseDef { tree })
     }

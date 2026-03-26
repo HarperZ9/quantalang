@@ -9,7 +9,7 @@
 //! Patterns are used in match expressions, let bindings, and function parameters.
 
 use crate::lexer::Span;
-use super::{Attribute, Expr, Ident, Literal, Mutability, NodeId, Path, Type};
+use super::{Attribute, Expr, Ident, Literal, Mutability, NodeId, Path};
 
 /// A pattern node.
 #[derive(Debug, Clone, PartialEq)]

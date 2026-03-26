@@ -867,7 +867,7 @@ impl DwarfGenerator {
             }
 
             // Write DIE tree
-            let start = data.len();
+            let _start = data.len();
             self.write_die(&mut data, root, 1);
             data.push(0); // End of children
 
@@ -1243,7 +1243,7 @@ impl DwarfGenerator {
         let cie_offset = 0u32;
 
         // Frame Description Entries (FDEs)
-        for (name, start, length) in funcs {
+        for (_name, start, length) in funcs {
             let fde_length_pos = data.len();
             data.extend_from_slice(&0u32.to_le_bytes()); // Length placeholder
             data.extend_from_slice(&cie_offset.to_le_bytes()); // CIE pointer
@@ -1365,7 +1365,7 @@ pub fn encode_uleb128(mut value: u64) -> Vec<u8> {
 /// Encode a signed LEB128 value.
 pub fn encode_sleb128(mut value: i64) -> Vec<u8> {
     let mut result = Vec::new();
-    let negative = value < 0;
+    let _negative = value < 0;
     loop {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;

@@ -50,7 +50,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use super::{Ty, TyKind, TyVarId, IntTy};
+use super::{Ty, TyKind, IntTy};
 
 /// A unique identifier for const variables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

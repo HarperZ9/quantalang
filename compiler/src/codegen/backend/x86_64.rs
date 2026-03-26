@@ -28,11 +28,11 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use super::{Backend, Target, CodegenError, CodegenResult};
-use super::x86_64_enc::{X86_64Encoder, Reg64, Reg8, RegXmm, Mem, Scale, Cond};
+use super::{Backend, Target, CodegenResult};
+use super::x86_64_enc::{X86_64Encoder, Reg64, Reg8, Mem, Cond};
 use crate::codegen::ir::*;
 use crate::codegen::{GeneratedCode, OutputFormat};
-use crate::codegen::debug::{DwarfGenerator, LineEntry, AddressRange};
+use crate::codegen::debug::DwarfGenerator;
 
 /// Output mode for the x86-64 backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,6 +561,9 @@ impl X86_64Backend {
             // Opaque GPU types — treat as pointer-sized handles
             MirType::Texture2D(_) | MirType::Sampler | MirType::SampledImage(_) => 8,
             MirType::TraitObject(_) => 16, // fat pointer: data ptr + vtable ptr
+            MirType::Vec(_) => 8, // QuantaVecHandle is a pointer
+            MirType::Tuple(elems) => elems.iter().map(|e| self.type_size(e)).sum(),
+            MirType::Map(_, _) => 8, // QuantaMapHandle is a pointer
         }
     }
 
@@ -795,7 +798,7 @@ impl X86_64Backend {
                     self.store_reg_to_local(Reg64::RAX, dest)?;
                 }
             }
-            MirRValue::Cast { value, ty, .. } => {
+            MirRValue::Cast { value, ty: _, .. } => {
                 self.load_value_to_reg(value, Reg64::RAX, func)?;
                 // Most casts are no-ops at machine code level
                 // Handle sign/zero extension as needed
@@ -811,7 +814,7 @@ impl X86_64Backend {
     }
 
     /// Load a value into a register.
-    fn load_value_to_reg(&mut self, value: &MirValue, reg: Reg64, func: &MirFunction) -> CodegenResult<()> {
+    fn load_value_to_reg(&mut self, value: &MirValue, reg: Reg64, _func: &MirFunction) -> CodegenResult<()> {
         match value {
             MirValue::Local(id) => {
                 let offset = self.local_offsets.get(id).copied().unwrap_or(8);
@@ -862,13 +865,13 @@ impl X86_64Backend {
                     }
                 }
             }
-            MirValue::Global(name) => {
+            MirValue::Global(_name) => {
                 // RIP-relative addressing for globals
                 let mem = Mem::rip_relative(0);
                 self.enc().lea(reg, &mem);
                 // Note: actual relocation would be needed here
             }
-            MirValue::Function(name) => {
+            MirValue::Function(_name) => {
                 // Load function address
                 let mem = Mem::rip_relative(0);
                 self.enc().lea(reg, &mem);

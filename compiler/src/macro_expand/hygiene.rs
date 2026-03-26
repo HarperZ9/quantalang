@@ -161,7 +161,7 @@ impl HygieneContext {
     }
 
     /// Apply a syntax context to a span.
-    pub fn apply_context(&self, span: Span, ctx: SyntaxContext) -> Span {
+    pub fn apply_context(&self, span: Span, _ctx: SyntaxContext) -> Span {
         // For now, just return the span unchanged
         // In a full implementation, we would attach the context to the span
         span

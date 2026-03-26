@@ -8,14 +8,12 @@
 //!
 //! This module provides built-in macros like `println!`, `vec!`, `format!`, etc.
 
-use std::sync::Arc;
 
-use crate::lexer::{Token, TokenKind, Span, Delimiter, Keyword, LiteralKind};
+use crate::lexer::{TokenKind, Span, Delimiter, Keyword, LiteralKind};
 
 use super::{
     MacroContext, MacroDef, MacroRule, MacroPattern, PatternElement,
     MacroExpansion, ExpansionElement, MetaVarKind, RepetitionKind, MacroId,
-    TokenTree, MacroResult, MacroError,
 };
 
 // =============================================================================

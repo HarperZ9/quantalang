@@ -419,7 +419,7 @@ impl CompletionProvider {
     }
 
     /// Get local completions from the document.
-    fn local_completions(&self, doc: &Document, position: Position) -> Vec<CompletionItem> {
+    fn local_completions(&self, doc: &Document, _position: Position) -> Vec<CompletionItem> {
         let mut items = Vec::new();
         let content = &doc.content;
 

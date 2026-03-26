@@ -111,7 +111,7 @@ impl Unifier {
             (TyKind::Error, _) | (_, TyKind::Error) => Ok(()),
 
             // Never type can unify with any type (subtype of everything)
-            (TyKind::Never, _) => Ok(()),
+            (TyKind::Never, _) | (_, TyKind::Never) => Ok(()),
 
             // Primitive types must be equal
             (TyKind::Int(i1), TyKind::Int(i2)) if i1 == i2 => Ok(()),
@@ -121,6 +121,9 @@ impl Unifier {
             // so test programs that index arrays with i32 variables compile.
             (TyKind::Int(_), TyKind::Int(_)) => Ok(()),
             (TyKind::Float(f1), TyKind::Float(f2)) if f1 == f2 => Ok(()),
+            // Allow implicit float width coercion (f32 <-> f64) for ecosystem
+            // compatibility. Shader code frequently mixes f32 and f64.
+            (TyKind::Float(_), TyKind::Float(_)) => Ok(()),
             (TyKind::Bool, TyKind::Bool) => Ok(()),
             (TyKind::Char, TyKind::Char) => Ok(()),
             (TyKind::Str, TyKind::Str) => Ok(()),
@@ -132,6 +135,19 @@ impl Unifier {
                 if inner.kind == TyKind::Str =>
             {
                 Ok(())
+            }
+
+            // Reference coercion: `&T` unifies with `T` (auto-deref).
+            // Only for concrete types (ADT, primitives), not for Never/Error.
+            (TyKind::Ref(_, _, inner), other)
+                if !matches!(other, TyKind::Never | TyKind::Error | TyKind::Var(_)) =>
+            {
+                self.unify_impl(inner, t2)
+            }
+            (other, TyKind::Ref(_, _, inner))
+                if !matches!(other, TyKind::Never | TyKind::Error | TyKind::Var(_)) =>
+            {
+                self.unify_impl(t1, inner)
             }
 
             // Tuples: must have same length and unify element-wise

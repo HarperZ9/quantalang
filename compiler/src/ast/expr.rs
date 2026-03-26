@@ -53,8 +53,10 @@ impl Expr {
             self.kind,
             ExprKind::Ident(_)
                 | ExprKind::Field { .. }
+                | ExprKind::TupleField { .. }
                 | ExprKind::Index { .. }
                 | ExprKind::Deref(_)
+                | ExprKind::Path(_)
         )
     }
 
@@ -199,6 +201,14 @@ pub enum ExprKind {
     /// If expression: `if cond { ... } else { ... }`
     If {
         condition: Box<Expr>,
+        then_branch: Box<Block>,
+        else_branch: Option<Box<Expr>>,
+    },
+
+    /// If let expression: `if let Pat = expr { ... } else { ... }`
+    IfLet {
+        pattern: Box<Pattern>,
+        expr: Box<Expr>,
         then_branch: Box<Block>,
         else_branch: Option<Box<Expr>>,
     },

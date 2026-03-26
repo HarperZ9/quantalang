@@ -95,6 +95,11 @@ impl MirModule {
         self.globals.push(global);
     }
 
+    /// Find a global variable by name.
+    pub fn find_global(&self, name: &str) -> Option<&MirGlobal> {
+        self.globals.iter().find(|g| g.name.as_ref() == name)
+    }
+
     /// Add a type definition.
     pub fn add_type(&mut self, ty: MirTypeDef) {
         self.types.push(ty);
@@ -847,6 +852,12 @@ pub enum MirType {
     /// Trait object: fat pointer (data_ptr: *void, vtable_ptr: *VTable).
     /// The Arc<str> is the trait name.
     TraitObject(Arc<str>),
+    /// Dynamic array Vec<T>: heap-allocated handle wrapping QuantaVec.
+    Vec(Box<MirType>),
+    /// HashMap<K, V>: heap-allocated handle wrapping QuantaHashMap.
+    Map(Box<MirType>, Box<MirType>),
+    /// Tuple type: (T0, T1, ...).
+    Tuple(Vec<MirType>),
 }
 
 impl MirType {
@@ -904,6 +915,35 @@ impl MirType {
     /// Create a combined sampled image type.
     pub fn sampled_image(elem: MirType) -> Self { MirType::SampledImage(Box::new(elem)) }
 
+    /// Create a tuple type.
+    pub fn tuple(elems: Vec<MirType>) -> Self { MirType::Tuple(elems) }
+
+    /// Generate the canonical C typedef name for a tuple type.
+    pub fn tuple_type_name(elems: &[MirType]) -> Arc<str> {
+        let parts: Vec<&str> = elems.iter().map(|t| match t {
+            MirType::Void => "void",
+            MirType::Bool => "bool",
+            MirType::Int(IntSize::I8, true) => "i8",
+            MirType::Int(IntSize::I16, true) => "i16",
+            MirType::Int(IntSize::I32, true) => "i32",
+            MirType::Int(IntSize::I64, true) => "i64",
+            MirType::Int(IntSize::I128, true) => "i128",
+            MirType::Int(IntSize::ISize, true) => "isize",
+            MirType::Int(IntSize::I8, false) => "u8",
+            MirType::Int(IntSize::I16, false) => "u16",
+            MirType::Int(IntSize::I32, false) => "u32",
+            MirType::Int(IntSize::I64, false) => "u64",
+            MirType::Int(IntSize::I128, false) => "u128",
+            MirType::Int(IntSize::ISize, false) => "usize",
+            MirType::Float(FloatSize::F32) => "f32",
+            MirType::Float(FloatSize::F64) => "f64",
+            MirType::Ptr(_) => "ptr",
+            MirType::Struct(name) => name.as_ref(),
+            _ => "unknown",
+        }).collect();
+        Arc::from(format!("Tuple_{}", parts.join("_")))
+    }
+
     /// Check if this is a signed integer.
     pub fn is_signed(&self) -> bool {
         matches!(self, MirType::Int(_, true))
@@ -946,6 +986,15 @@ impl MirType {
                 None // Opaque GPU types — no CPU bit size
             }
             MirType::TraitObject(_) => Some(ptr_size * 2), // Fat pointer: data + vtable
+            MirType::Vec(_) => Some(ptr_size), // QuantaVecHandle is a pointer
+            MirType::Map(_, _) => Some(ptr_size), // QuantaMapHandle is a pointer
+            MirType::Tuple(elems) => {
+                let mut total = 0u32;
+                for e in elems {
+                    total += e.bit_size(ptr_size)?;
+                }
+                Some(total)
+            }
         }
     }
 }
@@ -988,6 +1037,16 @@ impl fmt::Display for MirType {
             MirType::Sampler => write!(f, "sampler"),
             MirType::SampledImage(elem) => write!(f, "sampled_image<{}>", elem),
             MirType::TraitObject(name) => write!(f, "dyn {}", name),
+            MirType::Vec(elem) => write!(f, "Vec<{}>", elem),
+            MirType::Map(key, val) => write!(f, "HashMap<{}, {}>", key, val),
+            MirType::Tuple(elems) => {
+                write!(f, "(")?;
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", e)?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -1055,6 +1114,8 @@ pub enum MirConst {
     Zeroed(MirType),
     /// Undefined value.
     Undef(MirType),
+    /// Struct constant: (struct_name, field_values).
+    Struct(Arc<str>, Vec<MirConst>),
 }
 
 impl fmt::Display for MirConst {
@@ -1070,6 +1131,14 @@ impl fmt::Display for MirConst {
             MirConst::Unit => write!(f, "()"),
             MirConst::Zeroed(ty) => write!(f, "zeroed:{}", ty),
             MirConst::Undef(ty) => write!(f, "undef:{}", ty),
+            MirConst::Struct(name, fields) => {
+                write!(f, "{}{{", name)?;
+                for (i, fv) in fields.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", fv)?;
+                }
+                write!(f, "}}")
+            }
         }
     }
 }
@@ -1417,6 +1486,17 @@ mod tests {
         assert_eq!(format!("{}", MirConst::Uint(100, MirType::u64())), "100u64");
         assert_eq!(format!("{}", MirConst::Str(0)), "str#0");
         assert_eq!(format!("{}", MirConst::Unit), "()");
+        assert_eq!(
+            format!("{}", MirConst::Struct(
+                Arc::from("Color"),
+                vec![
+                    MirConst::Float(1.0, MirType::f64()),
+                    MirConst::Float(0.5, MirType::f64()),
+                    MirConst::Float(0.0, MirType::f64()),
+                ],
+            )),
+            "Color{1f64, 0.5f64, 0f64}",
+        );
     }
 
     // =========================================================================

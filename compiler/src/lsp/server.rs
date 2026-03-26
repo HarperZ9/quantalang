@@ -337,7 +337,7 @@ impl LanguageServer {
     /// Handle rename request.
     pub fn rename(&self, params: RenameParams) -> Option<WorkspaceEdit> {
         let doc = self.documents.get(&params.text_document_position.text_document.uri)?;
-        let (word, range) = doc.word_at(params.text_document_position.position)?;
+        let (word, _range) = doc.word_at(params.text_document_position.position)?;
 
         // Find all occurrences in the document
         let mut edit = WorkspaceEdit::new();
@@ -1006,7 +1006,7 @@ fn extract_id(content: &str) -> Option<String> {
 
 /// Build initialize result JSON.
 fn build_initialize_result(result: &InitializeResult) -> String {
-    let caps = &result.capabilities;
+    let _caps = &result.capabilities;
 
     let mut builder = JsonObjectBuilder::new()
         .field(

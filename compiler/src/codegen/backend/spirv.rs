@@ -1373,10 +1373,6 @@ impl SpirvBackend {
                 operands.extend(param_ids);
                 self.emit_global(SpvOp::OpTypeFunction, &operands);
             }
-            MirType::Never => {
-                // Never type maps to void in SPIR-V
-                self.emit_global(SpvOp::OpTypeVoid, &[id]);
-            }
             MirType::Vector(elem, lanes) => {
                 let elem_id = self.get_type_id(elem);
                 self.emit_global(SpvOp::OpTypeVector, &[id, elem_id, *lanes]);
@@ -1412,6 +1408,40 @@ impl SpirvBackend {
                 ]);
                 self.emit_global(SpvOp::OpTypeStruct, &[id, ptr_ty_data, ptr_ty_vtable]);
                 self.emit_name(id, &format!("dyn_{}", name));
+            }
+            MirType::Vec(_) => {
+                // Vec<T> is an opaque pointer handle in SPIR-V
+                let u32_ty = self.get_type_id(&MirType::Int(IntSize::I32, false));
+                let ptr_ty = self.alloc_id();
+                self.emit_global(SpvOp::OpTypePointer, &[
+                    ptr_ty,
+                    SpvStorageClass::Function as u32,
+                    u32_ty,
+                ]);
+                self.emit_global(SpvOp::OpTypeStruct, &[id, ptr_ty]);
+                self.emit_name(id, "QuantaVecHandle");
+            }
+            MirType::Map(_, _) => {
+                // HashMap<K,V> is an opaque pointer handle in SPIR-V
+                let u32_ty = self.get_type_id(&MirType::Int(IntSize::I32, false));
+                let ptr_ty = self.alloc_id();
+                self.emit_global(SpvOp::OpTypePointer, &[
+                    ptr_ty,
+                    SpvStorageClass::Function as u32,
+                    u32_ty,
+                ]);
+                self.emit_global(SpvOp::OpTypeStruct, &[id, ptr_ty]);
+                self.emit_name(id, "QuantaMapHandle");
+            }
+            MirType::Tuple(elems) => {
+                // Tuples map to SPIR-V structs.
+                let mut operands = vec![id];
+                for e in elems {
+                    operands.push(self.get_type_id(e));
+                }
+                self.emit_global(SpvOp::OpTypeStruct, &operands);
+                let name = MirType::tuple_type_name(elems);
+                self.emit_name(id, &name);
             }
         }
 
@@ -1568,7 +1598,7 @@ impl SpirvBackend {
             return id;
         }
 
-        let ty_id = self.get_type_id(ty);
+        let _ty_id = self.get_type_id(ty);
         let ptr_ty_id = self.get_ptr_type_id(ty, SpvStorageClass::Input);
         let var_id = self.alloc_id();
 
@@ -1985,10 +2015,10 @@ impl SpirvBackend {
                 let ids: Vec<u32> = (0..*count).map(|_| val_id).collect();
                 Ok(self.emit_composite_construct(arr_ty_id, &ids))
             }
-            MirRValue::NullaryOp(op, ty) => {
+            MirRValue::NullaryOp(_op, ty) => {
                 // Operations without operands — typically sizeof or alignof
-                let ty_id = self.get_type_id(ty);
-                let result_id = self.alloc_id();
+                let _ty_id = self.get_type_id(ty);
+                let _result_id = self.alloc_id();
                 // Return zero constant of the appropriate type
                 Ok(self.get_const_id(&MirConst::Int(0, ty.clone())))
             }
@@ -2319,7 +2349,7 @@ impl SpirvBackend {
             }
             MirTerminator::Assert { cond, expected, target, .. } => {
                 // Simplified assert - just branch if condition passes
-                let cond_id = self.gen_value(cond, func)?;
+                let _cond_id = self.gen_value(cond, func)?;
                 let target_id = *self.block_ids.get(target).unwrap();
 
                 if *expected {
@@ -3263,7 +3293,7 @@ impl SpirvBackend {
     /// For fragment shaders:
     ///   - Each function parameter becomes an Input variable with Location decoration
     ///   - The return type becomes an Output variable with Location decoration
-    fn setup_shader_io(&mut self, func: &MirFunction, func_id: u32, exec_model: SpvExecutionModel) {
+    fn setup_shader_io(&mut self, func: &MirFunction, _func_id: u32, exec_model: SpvExecutionModel) {
         if !matches!(exec_model, SpvExecutionModel::Vertex | SpvExecutionModel::Fragment) {
             return;
         }
@@ -3479,8 +3509,8 @@ impl SpirvBackend {
                 ptr: Self::coerce_value(ptr),
                 pointee_ty: Self::coerce_type(pointee_ty),
             },
-            MirRValue::Ref { is_mut, place } => rv.clone(),
-            MirRValue::AddressOf { is_mut, place } => rv.clone(),
+            MirRValue::Ref { is_mut: _, place: _ } => rv.clone(),
+            MirRValue::AddressOf { is_mut: _, place: _ } => rv.clone(),
             MirRValue::TextureSample { texture, sampler, coords } => MirRValue::TextureSample {
                 texture: Self::coerce_value(texture),
                 sampler: Self::coerce_value(sampler),

@@ -48,6 +48,11 @@ pub struct TypeContext {
     /// Populated by check_inherent_impl so that lookup_method can resolve
     /// method calls on user-defined types without a trait.
     inherent_methods: HashMap<(Arc<str>, Arc<str>), TraitMethod>,
+
+    /// Type parameter trait bounds: param_name → [trait_name, ...].
+    /// Populated when entering a generic function so that lookup_method can
+    /// resolve trait methods on type parameters through their bounds.
+    param_trait_bounds: HashMap<Arc<str>, Vec<Arc<str>>>,
 }
 
 /// A scope containing variable bindings.
@@ -276,6 +281,7 @@ impl TypeContext {
             next_def_id: 0,
             current_self_ty: None,
             inherent_methods: HashMap::new(),
+            param_trait_bounds: HashMap::new(),
         };
         ctx.init_builtins();
         ctx
@@ -283,7 +289,37 @@ impl TypeContext {
 
     /// Initialize built-in types.
     fn init_builtins(&mut self) {
-        // Built-in types are handled specially in type resolution
+        // Trait stubs are registered lazily during check_module to avoid
+        // shifting DefIds for user types. See register_builtin_traits().
+    }
+
+    /// Register common trait stubs so ecosystem code can use `impl Default for X` etc.
+    /// Called during check_module AFTER user types are collected.
+    pub fn register_builtin_traits(&mut self) {
+        let common_traits = [
+            "Default", "Display", "Debug", "Clone", "Copy",
+            "PartialEq", "Eq", "PartialOrd", "Ord", "Hash",
+            "Send", "Sync", "Sized", "Drop",
+            "Iterator", "IntoIterator", "FromIterator",
+            "From", "Into", "TryFrom", "TryInto",
+            "AsRef", "AsMut", "Deref", "DerefMut",
+            "Add", "Sub", "Mul", "Div", "Rem", "Neg",
+            "Serialize", "Deserialize",
+        ];
+        for name in &common_traits {
+            // Only register if not already defined by user code
+            if self.lookup_trait_by_name(name).is_none() {
+                let def_id = self.fresh_def_id();
+                self.register_trait(TraitDef {
+                    def_id,
+                    name: Arc::from(*name),
+                    generics: Vec::new(),
+                    supertraits: Vec::new(),
+                    methods: Vec::new(),
+                    assoc_types: Vec::new(),
+                });
+            }
+        }
     }
 
     /// Generate a fresh definition ID.
@@ -448,7 +484,7 @@ impl TypeContext {
     }
 
     /// Find implementations of a trait for a type.
-    pub fn find_impls(&self, trait_id: DefId, self_ty: &Ty) -> Vec<&TraitImpl> {
+    pub fn find_impls(&self, trait_id: DefId, _self_ty: &Ty) -> Vec<&TraitImpl> {
         self.impls
             .iter()
             .filter(|impl_| impl_.trait_id == trait_id)
@@ -499,6 +535,50 @@ impl TypeContext {
     /// Look up an inherent method on a type by name.
     pub fn lookup_inherent_method(&self, type_name: &str, method_name: &str) -> Option<&TraitMethod> {
         self.inherent_methods.get(&(Arc::from(type_name), Arc::from(method_name)))
+    }
+
+    /// Find the type name that has an inherent method with the given name.
+    /// Used as a fallback when DefId-based type lookup fails.
+    pub fn lookup_type_by_name_containing_method(&self, method_name: &str) -> Option<String> {
+        let method_arc = Arc::from(method_name);
+        for (type_name, mname) in self.inherent_methods.keys() {
+            if mname == &method_arc {
+                return Some(type_name.to_string());
+            }
+        }
+        None
+    }
+
+    // =========================================================================
+    // TYPE PARAMETER TRAIT BOUNDS
+    // =========================================================================
+
+    /// Register trait bounds for a type parameter (e.g., `T: Clone + Debug`).
+    pub fn register_param_bounds(&mut self, param_name: Arc<str>, trait_names: Vec<Arc<str>>) {
+        self.param_trait_bounds.insert(param_name, trait_names);
+    }
+
+    /// Clear all type parameter trait bounds (call when leaving a generic scope).
+    pub fn clear_param_bounds(&mut self) {
+        self.param_trait_bounds.clear();
+    }
+
+    /// Look up a method on a type parameter by searching its trait bounds.
+    ///
+    /// For `T: Ord + Display`, this searches the `Ord` and `Display` trait
+    /// definitions for the named method and returns the first match.
+    pub fn lookup_param_method(&self, param_name: &str, method_name: &str) -> Option<&TraitMethod> {
+        let bounds = self.param_trait_bounds.get(param_name)?;
+        for trait_name in bounds {
+            // Find the trait definition by name
+            if let Some(trait_def) = self.lookup_trait_by_name(trait_name) {
+                // Search the trait's methods
+                if let Some(method) = trait_def.methods.iter().find(|m| m.name.as_ref() == method_name) {
+                    return Some(method);
+                }
+            }
+        }
+        None
     }
 
     // =========================================================================

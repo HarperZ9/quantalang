@@ -60,6 +60,8 @@ impl<'a> Parser<'a> {
         let mut lhs = self.parse_prefix_expr()?;
 
         loop {
+            // Type cast handled outside the loop (see above)
+
             // Try postfix operators first (highest precedence)
             if let Some(postfix_bp) = self.postfix_binding_power() {
                 if postfix_bp >= min_bp {
@@ -115,19 +117,94 @@ impl<'a> Parser<'a> {
 
             TokenKind::Keyword(Keyword::SelfType) => {
                 self.advance();
-                let path = Path::from_ident(Ident::new("Self", start));
+                let mut segments = vec![PathSegment {
+                    ident: Ident::new("Self", start),
+                    generics: vec![],
+                }];
+
+                // Continue parsing path segments: Self::method, Self::Type
+                while self.check(&TokenKind::ColonColon) {
+                    self.advance(); // consume ::
+                    if self.check_ident() || self.is_contextual_keyword() {
+                        let ident = self.expect_ident()?;
+                        let generics = if self.check(&TokenKind::ColonColon) && self.peek().kind == TokenKind::Lt {
+                            self.advance(); // ::
+                            self.parse_generic_args()?
+                        } else if self.check(&TokenKind::Lt) {
+                            // Turbofish or generic args
+                            self.parse_generic_args()?
+                        } else {
+                            vec![]
+                        };
+                        segments.push(PathSegment { ident, generics });
+                    } else {
+                        break;
+                    }
+                }
+
+                let path = Path::new(segments, start.merge(&self.tokens[self.pos.saturating_sub(1)].span));
+
+                // Check for struct literal: Self { ... } or Self::Variant { ... }
+                if !self.restrictions.no_struct_literal
+                    && self.check(&TokenKind::OpenDelim(Delimiter::Brace))
+                {
+                    return self.parse_struct_expr(path);
+                }
+
+                // Check for function call: Self::new(...)
+                if self.check(&TokenKind::OpenDelim(Delimiter::Paren)) {
+                    let (args, _) = self.parse_paren_comma_seq(|p| p.parse_expr())?;
+                    let span = start.merge(&self.tokens[self.pos.saturating_sub(1)].span);
+                    return Ok(Expr::new(ExprKind::Call {
+                        func: Box::new(Expr::new(ExprKind::Path(path), start)),
+                        args,
+                    }, span));
+                }
+
+                // Check for macro: Self!(...) — unlikely but handle it
+                if self.check(&TokenKind::Not) {
+                    self.advance();
+                    return self.parse_macro_expr(path, start);
+                }
+
                 Ok(Expr::new(ExprKind::Path(path), start))
             }
 
-            TokenKind::Keyword(Keyword::Crate) => {
+            TokenKind::Keyword(Keyword::Crate) | TokenKind::Keyword(Keyword::Super) => {
                 self.advance();
-                let path = Path::from_ident(Ident::new("crate", start));
-                Ok(Expr::new(ExprKind::Path(path), start))
-            }
+                let keyword_name = if matches!(self.tokens[self.pos - 1].kind, TokenKind::Keyword(Keyword::Crate)) {
+                    "crate"
+                } else {
+                    "super"
+                };
+                let mut segments = vec![PathSegment {
+                    ident: Ident::new(keyword_name, start),
+                    generics: vec![],
+                }];
 
-            TokenKind::Keyword(Keyword::Super) => {
-                self.advance();
-                let path = Path::from_ident(Ident::new("super", start));
+                // Continue: crate::module::func() or super::func()
+                while self.check(&TokenKind::ColonColon) {
+                    self.advance();
+                    if self.check_ident() || self.is_contextual_keyword() {
+                        let ident = self.expect_ident()?;
+                        segments.push(PathSegment { ident, generics: vec![] });
+                    } else {
+                        break;
+                    }
+                }
+
+                let path = Path::new(segments, start.merge(&self.tokens[self.pos.saturating_sub(1)].span));
+
+                // Check for function call
+                if self.check(&TokenKind::OpenDelim(Delimiter::Paren)) {
+                    let (args, _) = self.parse_paren_comma_seq(|p| p.parse_expr())?;
+                    let span = start.merge(&self.tokens[self.pos.saturating_sub(1)].span);
+                    return Ok(Expr::new(ExprKind::Call {
+                        func: Box::new(Expr::new(ExprKind::Path(path), start)),
+                        args,
+                    }, span));
+                }
+
                 Ok(Expr::new(ExprKind::Path(path), start))
             }
 
@@ -451,8 +528,10 @@ impl<'a> Parser<'a> {
 
                 let field = self.expect_ident()?;
 
-                // Check for method call
-                if self.check(&TokenKind::OpenDelim(Delimiter::Paren)) {
+                // Check for method call — either `method(...)` or `method::<T>(...)`
+                let is_turbofish = self.check(&TokenKind::ColonColon)
+                    && self.peek().kind == TokenKind::Lt;
+                if self.check(&TokenKind::OpenDelim(Delimiter::Paren)) || is_turbofish {
                     // Method call with optional turbofish
                     let generics = if self.check(&TokenKind::ColonColon) {
                         self.advance();
@@ -1103,9 +1182,14 @@ impl<'a> Parser<'a> {
         Ok(Expr::new(ExprKind::Array(elements), span))
     }
 
-    /// Parse if expression.
+    /// Parse if expression (including `if let`).
     fn parse_if_expr(&mut self) -> ParseResult<Expr> {
         let start = self.expect_keyword(Keyword::If)?;
+
+        // Check for `if let Pattern = expr { ... }`
+        if self.check_keyword(Keyword::Let) {
+            return self.parse_if_let_expr(start);
+        }
 
         // Don't allow struct literals in condition (ambiguous with block)
         let old_restrictions = self.restrictions;
@@ -1138,6 +1222,50 @@ impl<'a> Parser<'a> {
         Ok(Expr::new(
             ExprKind::If {
                 condition: Box::new(condition),
+                then_branch: Box::new(then_branch),
+                else_branch,
+            },
+            span,
+        ))
+    }
+
+    /// Parse `if let Pattern = expr { ... } else { ... }`
+    fn parse_if_let_expr(&mut self, start: crate::lexer::Span) -> ParseResult<Expr> {
+        self.expect_keyword(Keyword::Let)?;
+        let pattern = self.parse_pattern()?;
+        self.expect(&TokenKind::Eq)?;
+
+        let old_restrictions = self.restrictions;
+        self.restrictions.no_struct_literal = true;
+        let expr = self.parse_expr()?;
+        self.restrictions = old_restrictions;
+
+        let then_branch = self.parse_block()?;
+
+        let else_branch = if self.eat_keyword(Keyword::Else) {
+            if self.check_keyword(Keyword::If) {
+                Some(Box::new(self.parse_if_expr()?))
+            } else {
+                let block = self.parse_block()?;
+                Some(Box::new(Expr::new(
+                    ExprKind::Block(Box::new(block.clone())),
+                    block.span,
+                )))
+            }
+        } else {
+            None
+        };
+
+        let span = if let Some(ref e) = else_branch {
+            start.merge(&e.span)
+        } else {
+            start.merge(&then_branch.span)
+        };
+
+        Ok(Expr::new(
+            ExprKind::IfLet {
+                pattern: Box::new(pattern),
+                expr: Box::new(expr),
                 then_branch: Box::new(then_branch),
                 else_branch,
             },
@@ -1183,10 +1311,20 @@ impl<'a> Parser<'a> {
                 span: arm_span,
             });
 
-            // Comma is optional before closing brace
+            // Comma is optional after block expression bodies (Rust convention)
             if !self.eat(&TokenKind::Comma) {
                 if !self.check(&TokenKind::CloseDelim(Delimiter::Brace)) {
-                    return Err(self.error_expected("`,` or `}`"));
+                    // Check if this looks like the start of another arm — if so, allow missing comma
+                    let looks_like_next_arm = self.check_ident()
+                        || self.check(&TokenKind::Underscore)
+                        || self.check(&TokenKind::Pound)
+                        || self.check(&TokenKind::At)
+                        || self.check_keyword(Keyword::Self_)
+                        || self.check_keyword(Keyword::SelfType)
+                        || self.check(&TokenKind::Or);
+                    if !looks_like_next_arm {
+                        return Err(self.error_expected("`,` or `}`"));
+                    }
                 }
             }
         }
@@ -1371,7 +1509,10 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         while !self.check(&TokenKind::Or) && !self.is_eof() {
             let param_start = self.current_span();
-            let pattern = self.parse_pattern()?;
+            // Use parse_pattern_primary (not parse_pattern) to avoid
+            // consuming `|` as an or-pattern — in closures, `|` is the
+            // parameter list delimiter, not a pattern combinator.
+            let pattern = self.parse_pattern_primary()?;
             let ty = if self.eat(&TokenKind::Colon) {
                 Some(Box::new(self.parse_type()?))
             } else {
@@ -1525,10 +1666,20 @@ impl<'a> Parser<'a> {
                 span: clause_span,
             });
 
-            // Comma is optional before closing brace
+            // Comma is optional after block expression bodies (Rust convention)
             if !self.eat(&TokenKind::Comma) {
                 if !self.check(&TokenKind::CloseDelim(Delimiter::Brace)) {
-                    return Err(self.error_expected("`,` or `}`"));
+                    // Check if this looks like the start of another arm — if so, allow missing comma
+                    let looks_like_next_arm = self.check_ident()
+                        || self.check(&TokenKind::Underscore)
+                        || self.check(&TokenKind::Pound)
+                        || self.check(&TokenKind::At)
+                        || self.check_keyword(Keyword::Self_)
+                        || self.check_keyword(Keyword::SelfType)
+                        || self.check(&TokenKind::Or);
+                    if !looks_like_next_arm {
+                        return Err(self.error_expected("`,` or `}`"));
+                    }
                 }
             }
         }

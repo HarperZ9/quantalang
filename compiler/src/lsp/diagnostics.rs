@@ -128,7 +128,7 @@ impl DiagnosticsProvider {
     }
 
     /// Check for bracket matching.
-    fn check_brackets(&self, content: &str, doc: &Document, diagnostics: &mut Vec<Diagnostic>) {
+    fn check_brackets(&self, content: &str, _doc: &Document, diagnostics: &mut Vec<Diagnostic>) {
         let mut stack: Vec<(char, Position)> = Vec::new();
 
         for (line_num, line) in content.lines().enumerate() {
@@ -234,7 +234,7 @@ impl DiagnosticsProvider {
     }
 
     /// Check for common coding issues.
-    fn check_common_issues(&self, content: &str, doc: &Document, diagnostics: &mut Vec<Diagnostic>) {
+    fn check_common_issues(&self, content: &str, _doc: &Document, diagnostics: &mut Vec<Diagnostic>) {
         for (line_num, line) in content.lines().enumerate() {
             let line_num = line_num as u32;
             let trimmed = line.trim();
@@ -359,7 +359,7 @@ impl DiagnosticsProvider {
     }
 
     /// Check for unused variables.
-    fn check_unused_variables(&self, content: &str, doc: &Document, diagnostics: &mut Vec<Diagnostic>) {
+    fn check_unused_variables(&self, content: &str, _doc: &Document, diagnostics: &mut Vec<Diagnostic>) {
         // Simple unused variable detection
         // In real implementation, this would use proper scope analysis
 

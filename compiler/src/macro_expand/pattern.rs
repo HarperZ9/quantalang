@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::lexer::{Token, TokenKind, Delimiter, Keyword};
+use crate::lexer::{TokenKind, Delimiter, Keyword};
 
 use super::{
     MacroPattern, PatternElement, MetaVarKind, RepetitionKind,
@@ -503,7 +503,7 @@ pub fn match_macro_pattern(pattern: &MacroPattern, input: &[TokenTree]) -> Macro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::{SourceFile, Lexer};
+    use crate::lexer::{SourceFile, Lexer, Token};
     use crate::macro_expand::tokens_to_tree;
 
     fn lex(source: &str) -> Vec<Token> {

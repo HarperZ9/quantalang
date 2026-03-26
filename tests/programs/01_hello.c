@@ -15,6 +15,12 @@
 // Embedded in generated C output - do not edit
 // ============================================================================
 
+// --- I/O initialization ---
+static void __quanta_init_io(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+}
+
 // --- String type ---
 
 typedef struct {
@@ -95,7 +101,216 @@ static void quanta_vec_free(QuantaVec* v) {
     v->cap = 0;
 }
 
+// --- Typed Vec helpers (wrapping QuantaVec for specific element types) ---
+
+static QuantaVec quanta_vec_new_i32(void) { return quanta_vec_new(sizeof(int32_t)); }
+static QuantaVec quanta_vec_new_i64(void) { return quanta_vec_new(sizeof(int64_t)); }
+static QuantaVec quanta_vec_new_f64(void) { return quanta_vec_new(sizeof(double)); }
+
+// Note: These wrappers use a global QuantaVec pointer trick — the first
+// argument is a QuantaVec passed by value, but since QuantaLang passes
+// struct locals, the C compiler will place them on the stack where we
+// can take their address. We use a thin wrapper to bridge the gap.
+static QuantaVec* __quanta_vec_ref = NULL;
+static void quanta_vec_push_i32(QuantaVec v, int32_t val) {
+    // Find the original local via the stored pointer (set by codegen)
+    // Fallback: push into a copy — but mutations won't be visible.
+    // The real solution: codegen passes &v. For now we use a global registry.
+    (void)v; (void)val;
+}
+// Simpler approach: heap-allocated vecs via a handle pattern
+typedef struct { QuantaVec* inner; } QuantaVecHandle;
+
+static QuantaVecHandle quanta_hvec_new_i32(void) {
+    QuantaVecHandle h;
+    h.inner = (QuantaVec*)malloc(sizeof(QuantaVec));
+    *h.inner = quanta_vec_new(sizeof(int32_t));
+    return h;
+}
+static void quanta_hvec_push_i32(QuantaVecHandle h, int32_t val) { quanta_vec_push(h.inner, &val); }
+static int32_t quanta_hvec_get_i32(QuantaVecHandle h, size_t index) { return *(int32_t*)quanta_vec_get(h.inner, index); }
+static size_t quanta_hvec_len(QuantaVecHandle h) { return h.inner->len; }
+static int32_t quanta_hvec_pop_i32(QuantaVecHandle h) {
+    if (h.inner->len == 0) return 0;
+    h.inner->len--;
+    return *(int32_t*)((char*)h.inner->ptr + h.inner->len * h.inner->elem_size);
+}
+static void quanta_hvec_free(QuantaVecHandle h) { quanta_vec_free(h.inner); free(h.inner); }
+
+// f64 handle variants
+static QuantaVecHandle quanta_hvec_new_f64(void) {
+    QuantaVecHandle h;
+    h.inner = (QuantaVec*)malloc(sizeof(QuantaVec));
+    *h.inner = quanta_vec_new(sizeof(double));
+    return h;
+}
+static void quanta_hvec_push_f64(QuantaVecHandle h, double val) { quanta_vec_push(h.inner, &val); }
+static double quanta_hvec_get_f64(QuantaVecHandle h, size_t index) { return *(double*)quanta_vec_get(h.inner, index); }
+static double quanta_hvec_pop_f64(QuantaVecHandle h) {
+    if (h.inner->len == 0) return 0.0;
+    h.inner->len--;
+    return *(double*)((char*)h.inner->ptr + h.inner->len * h.inner->elem_size);
+}
+// i64 handle variants
+static QuantaVecHandle quanta_hvec_new_i64(void) {
+    QuantaVecHandle h;
+    h.inner = (QuantaVec*)malloc(sizeof(QuantaVec));
+    *h.inner = quanta_vec_new(sizeof(int64_t));
+    return h;
+}
+static void quanta_hvec_push_i64(QuantaVecHandle h, int64_t val) { quanta_vec_push(h.inner, &val); }
+static int64_t quanta_hvec_get_i64(QuantaVecHandle h, size_t index) { return *(int64_t*)quanta_vec_get(h.inner, index); }
+static int64_t quanta_hvec_pop_i64(QuantaVecHandle h) {
+    if (h.inner->len == 0) return 0;
+    h.inner->len--;
+    return *(int64_t*)((char*)h.inner->ptr + h.inner->len * h.inner->elem_size);
+}
+
+// --- Format string helpers (returns QuantaString) ---
+
+static QuantaString quanta_format_i32(const char* fmt, int32_t v) {
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), fmt, v);
+    char* heap = (char*)malloc(n + 1);
+    memcpy(heap, buf, n + 1);
+    QuantaString qs; qs.ptr = heap; qs.len = n; qs.cap = n + 1;
+    return qs;
+}
+
+static QuantaString quanta_format_f64(const char* fmt, double v) {
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), fmt, v);
+    char* heap = (char*)malloc(n + 1);
+    memcpy(heap, buf, n + 1);
+    QuantaString qs; qs.ptr = heap; qs.len = n; qs.cap = n + 1;
+    return qs;
+}
+
+static QuantaString quanta_format_str(const char* fmt, const char* v) {
+    int n = snprintf(NULL, 0, fmt, v);
+    char* heap = (char*)malloc(n + 1);
+    snprintf(heap, n + 1, fmt, v);
+    QuantaString qs; qs.ptr = heap; qs.len = n; qs.cap = n + 1;
+    return qs;
+}
+
+static QuantaString quanta_i32_to_string(int32_t v) { return quanta_format_i32("%d", v); }
+static QuantaString quanta_f64_to_string(double v) { return quanta_format_f64("%g", v); }
+
+// --- Math constants ---
+static const double QUANTA_PI = 3.14159265358979323846;
+static const double QUANTA_E = 2.71828182845904523536;
+static const double QUANTA_TAU = 6.28318530717958647692;
+
+// --- HashMap (i32 -> i32, open addressing with linear probing) ---
+
+typedef struct {
+    int32_t* keys;
+    int32_t* values;
+    uint8_t* occupied;
+    size_t cap;
+    size_t len;
+} QuantaHashMap;
+
+typedef struct { QuantaHashMap* inner; } QuantaMapHandle;
+
+static QuantaMapHandle quanta_map_new(void) {
+    QuantaMapHandle h;
+    h.inner = (QuantaHashMap*)malloc(sizeof(QuantaHashMap));
+    h.inner->cap = 16;
+    h.inner->len = 0;
+    h.inner->keys = (int32_t*)calloc(16, sizeof(int32_t));
+    h.inner->values = (int32_t*)calloc(16, sizeof(int32_t));
+    h.inner->occupied = (uint8_t*)calloc(16, sizeof(uint8_t));
+    return h;
+}
+
+static void quanta_map_grow(QuantaHashMap* m) {
+    size_t old_cap = m->cap;
+    int32_t* old_keys = m->keys;
+    int32_t* old_values = m->values;
+    uint8_t* old_occ = m->occupied;
+    m->cap *= 2;
+    m->len = 0;
+    m->keys = (int32_t*)calloc(m->cap, sizeof(int32_t));
+    m->values = (int32_t*)calloc(m->cap, sizeof(int32_t));
+    m->occupied = (uint8_t*)calloc(m->cap, sizeof(uint8_t));
+    for (size_t i = 0; i < old_cap; i++) {
+        if (old_occ[i]) {
+            uint32_t h = (uint32_t)old_keys[i] * 2654435761u;
+            size_t idx = h % m->cap;
+            while (m->occupied[idx]) idx = (idx + 1) % m->cap;
+            m->keys[idx] = old_keys[i];
+            m->values[idx] = old_values[i];
+            m->occupied[idx] = 1;
+            m->len++;
+        }
+    }
+    free(old_keys); free(old_values); free(old_occ);
+}
+
+static void quanta_map_insert(QuantaMapHandle h, int32_t key, int32_t value) {
+    QuantaHashMap* m = h.inner;
+    if (m->len * 4 >= m->cap * 3) quanta_map_grow(m);
+    uint32_t hash = (uint32_t)key * 2654435761u;
+    size_t idx = hash % m->cap;
+    while (m->occupied[idx]) {
+        if (m->keys[idx] == key) { m->values[idx] = value; return; }
+        idx = (idx + 1) % m->cap;
+    }
+    m->keys[idx] = key;
+    m->values[idx] = value;
+    m->occupied[idx] = 1;
+    m->len++;
+}
+
+static int32_t quanta_map_get(QuantaMapHandle h, int32_t key, int32_t fallback) {
+    QuantaHashMap* m = h.inner;
+    uint32_t hash = (uint32_t)key * 2654435761u;
+    size_t idx = hash % m->cap;
+    size_t start = idx;
+    while (m->occupied[idx]) {
+        if (m->keys[idx] == key) return m->values[idx];
+        idx = (idx + 1) % m->cap;
+        if (idx == start) break;
+    }
+    return fallback;
+}
+
+static bool quanta_map_contains(QuantaMapHandle h, int32_t key) {
+    QuantaHashMap* m = h.inner;
+    uint32_t hash = (uint32_t)key * 2654435761u;
+    size_t idx = hash % m->cap;
+    size_t start = idx;
+    while (m->occupied[idx]) {
+        if (m->keys[idx] == key) return true;
+        idx = (idx + 1) % m->cap;
+        if (idx == start) break;
+    }
+    return false;
+}
+
+static size_t quanta_map_len(QuantaMapHandle h) { return h.inner->len; }
+
+static bool quanta_map_remove(QuantaMapHandle h, int32_t key) {
+    QuantaHashMap* m = h.inner;
+    uint32_t hash = (uint32_t)key * 2654435761u;
+    size_t idx = hash % m->cap;
+    size_t start = idx;
+    while (m->occupied[idx]) {
+        if (m->keys[idx] == key) {
+            m->occupied[idx] = 0;
+            m->len--;
+            return true;
+        }
+        idx = (idx + 1) % m->cap;
+        if (idx == start) break;
+    }
+    return false;
+}
+
 // --- Print formatting helpers ---
+// Use snprintf + __quanta_write for reliable output under MinTTY/git-bash.
 
 static void quanta_print_i32(int32_t v) { printf("%d", v); }
 static void quanta_print_i64(int64_t v) { printf("%lld", (long long)v); }
@@ -247,6 +462,7 @@ static double quanta_smoothstep(double edge0, double edge1, double x) {
 static double quanta_mix(double a, double b, double t) { return a + (b - a) * t; }
 static double quanta_fract(double x) { return x - floor(x); }
 static double quanta_step(double edge, double x) { return x < edge ? 0.0 : 1.0; }
+static double quanta_saturate(double x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); }
 
 // --- Effect handler runtime (setjmp/longjmp based) ---
 
@@ -411,6 +627,17 @@ static void quanta_gfx_shutdown(void) {
     __quanta_gfx_ctx.initialized = 0;
 }
 
+// --- stdout initialization ---
+// Disable output buffering so printf output is visible immediately,
+// especially when running as a child process (e.g., quantac run).
+#ifdef _MSC_VER
+#pragma section(".CRT$XCU", read)
+static void __quanta_init_stdio(void) { setvbuf(stdout, NULL, _IONBF, 0); }
+__declspec(allocate(".CRT$XCU")) static void (*__quanta_init_ptr)(void) = __quanta_init_stdio;
+#else
+__attribute__((constructor)) static void __quanta_init_stdio(void) { setvbuf(stdout, NULL, _IONBF, 0); }
+#endif
+
 // ============================================================================
 // End QuantaLang Runtime
 // ============================================================================
@@ -423,6 +650,7 @@ static const char* __str0 = "Hello, World!\n";
 int32_t main(void);
 
 int32_t main(void) {
+    __quanta_init_io();
     int32_t _ret;
     int8_t* _1;
 
@@ -430,6 +658,7 @@ int32_t main(void) {
     printf(_1);
     goto bb1;
 bb1:
+    fflush(stdout);
     return 0;
 }
 

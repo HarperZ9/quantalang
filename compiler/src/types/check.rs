@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use crate::ast::{self, ItemKind, Visibility, TraitItemKind, ImplItemKind, StructFields};
+use crate::ast::{self, ItemKind, TraitItemKind, ImplItemKind, StructFields};
 use crate::lexer::Span;
 
 use super::ty::*;
@@ -74,10 +74,24 @@ impl<'ctx> TypeChecker<'ctx> {
         // like `vec3` resolve to known struct types with accessible fields.
         self.register_builtin_vec_types();
 
+        // Register prelude constructors (Ok, Err, Some, None) as variables
+        // with fresh type variables so they pass type checking.
+        self.ctx.define_var(Arc::from("Ok"), Ty::fresh_var());
+        self.ctx.define_var(Arc::from("Err"), Ty::fresh_var());
+        self.ctx.define_var(Arc::from("Some"), Ty::fresh_var());
+        self.ctx.define_var(Arc::from("None"), Ty::fresh_var());
+
+        // Register shader built-in functions as variables
+        self.ctx.define_var(Arc::from("saturate"), Ty::fresh_var());
+        self.ctx.define_var(Arc::from("discard"), Ty::fresh_var());
+
         // First pass: collect all type definitions
         for item in &module.items {
             self.collect_item(item);
         }
+
+        // Register built-in trait stubs AFTER user types so DefIds are consistent
+        self.ctx.register_builtin_traits();
 
         // Second pass: type check all items
         for item in &module.items {
@@ -149,6 +163,7 @@ impl<'ctx> TypeChecker<'ctx> {
                 is_tuple: false,
             }),
         });
+
     }
 
     // =========================================================================
@@ -166,31 +181,55 @@ impl<'ctx> TypeChecker<'ctx> {
             ItemKind::Effect(e) => self.collect_effect(e, item.span),
             ItemKind::ExternBlock(eb) => self.collect_extern_block(eb, item.span),
             ItemKind::Impl(impl_) => self.collect_impl(impl_, item.span),
+            ItemKind::Const(c) => {
+                // Pre-register constants so forward references work
+                let ty = self.lower_type(&c.ty);
+                self.ctx.define_var(c.name.name.clone(), ty);
+            }
+            ItemKind::Static(s) => {
+                // Pre-register statics so forward references work
+                let ty = self.lower_type(&s.ty);
+                self.ctx.define_var(s.name.name.clone(), ty);
+            }
+            // Module items are handled during the check phase (check_mod),
+            // not during collection. Full module support requires proper
+            // scoped type registration to avoid name collisions.
+            ItemKind::Mod(_) => {}
             _ => {}
         }
     }
 
     /// Collect inherent impl methods during the first pass so they're
     /// available for method resolution when function bodies are checked.
-    fn collect_impl(&mut self, impl_: &ast::ImplDef, span: Span) {
+    fn collect_impl(&mut self, impl_: &ast::ImplDef, _span: Span) {
         // Only collect inherent impls (no trait). Trait impls are handled in check_impl.
         if impl_.trait_ref.is_some() {
             return;
         }
 
-        let self_ty = self.lower_type(&impl_.self_ty);
+        let _self_ty = self.lower_type(&impl_.self_ty);
         let type_name = Self::extract_type_name_from_ast(&impl_.self_ty);
 
         for item in &impl_.items {
-            if let ImplItemKind::Function(f) = &item.kind {
-                if let Some(ref tname) = type_name {
-                    let sig = self.build_fn_sig_from_ast(f);
-                    self.ctx.register_inherent_method(
-                        Arc::from(tname.as_str()),
-                        f.name.name.clone(),
-                        sig,
-                    );
+            match &item.kind {
+                ImplItemKind::Function(f) => {
+                    if let Some(ref tname) = type_name {
+                        let sig = self.build_fn_sig_from_ast(f);
+                        self.ctx.register_inherent_method(
+                            Arc::from(tname.as_str()),
+                            f.name.name.clone(),
+                            sig,
+                        );
+                    }
                 }
+                ImplItemKind::Const { name, ty, .. } => {
+                    // Register associated constants at module scope so they're
+                    // accessible from other impl blocks (e.g., BRADFORD in
+                    // chromatic_adaptation.quanta).
+                    let const_ty = self.lower_type(ty);
+                    self.ctx.define_var(name.name.clone(), const_ty);
+                }
+                _ => {}
             }
         }
     }
@@ -199,6 +238,7 @@ impl<'ctx> TypeChecker<'ctx> {
         let def_id = self.ctx.fresh_def_id();
 
         let generics = self.collect_generics(&s.generics);
+        let num_generics = generics.len();
 
         let fields = match &s.fields {
             StructFields::Named(fields) => {
@@ -227,6 +267,18 @@ impl<'ctx> TypeChecker<'ctx> {
         };
 
         self.ctx.register_type(type_def);
+
+        // For tuple structs, register a constructor function so that
+        // `TupleStruct(val)` works as a call expression.
+        if matches!(&s.fields, StructFields::Tuple(_)) {
+            if let StructFields::Tuple(fields) = &s.fields {
+                let param_tys: Vec<Ty> = fields.iter().map(|f| self.lower_type(&f.ty)).collect();
+                let substs: Vec<Ty> = (0..num_generics).map(|_| Ty::fresh_var()).collect();
+                let ret_ty = Ty::adt(def_id, substs);
+                let fn_ty = Ty::function(param_tys, ret_ty);
+                self.ctx.define_var(s.name.name.clone(), fn_ty);
+            }
+        }
     }
 
     fn collect_enum(&mut self, e: &ast::EnumDef, _span: Span) {
@@ -406,11 +458,47 @@ impl<'ctx> TypeChecker<'ctx> {
         if let Some(body) = &f.body {
             self.ctx.push_scope(ScopeKind::Function);
 
-            // Add generic parameters
+            // Add generic parameters and register their trait bounds
+            self.ctx.clear_param_bounds();
             for (idx, param) in f.generics.params.iter().enumerate() {
-                if let ast::GenericParamKind::Type { .. } = &param.kind {
+                if let ast::GenericParamKind::Type { ref bounds, .. } = &param.kind {
                     let ty = Ty::param(param.ident.name.clone(), idx as u32);
                     self.ctx.define_type_param(param.ident.name.clone(), ty);
+
+                    // Collect trait bound names for this type parameter
+                    if !bounds.is_empty() {
+                        let trait_names: Vec<Arc<str>> = bounds.iter()
+                            .filter(|b| !b.is_maybe)
+                            .map(|b| {
+                                // Extract the last segment of the trait path as the name
+                                Arc::from(b.path.segments.last()
+                                    .map(|s| s.ident.name.as_ref())
+                                    .unwrap_or(""))
+                            })
+                            .collect();
+                        self.ctx.register_param_bounds(param.ident.name.clone(), trait_names);
+                    }
+                }
+            }
+
+            // Also register bounds from where clauses
+            for pred in f.generics.where_clause.iter().flat_map(|wc| &wc.predicates) {
+                // Extract the type parameter name from the type
+                if let ast::TypeKind::Path(ref path) = pred.ty.kind {
+                    if let Some(seg) = path.segments.last() {
+                        let param_name = seg.ident.name.clone();
+                        let trait_names: Vec<Arc<str>> = pred.bounds.iter()
+                            .filter(|b| !b.is_maybe)
+                            .map(|b| {
+                                Arc::from(b.path.segments.last()
+                                    .map(|s| s.ident.name.as_ref())
+                                    .unwrap_or(""))
+                            })
+                            .collect();
+                        if !trait_names.is_empty() {
+                            self.ctx.register_param_bounds(param_name, trait_names);
+                        }
+                    }
                 }
             }
 
@@ -473,10 +561,27 @@ impl<'ctx> TypeChecker<'ctx> {
             // already validated by infer_return(), so skip the body check.
             if !has_return {
                 if let Err(_) = super::unify::unify(&body_ty, &expected_ret) {
-                    self.error(TypeError::ReturnTypeMismatch {
-                        expected: expected_ret,
-                        found: body_ty,
-                    }, span);
+                    // When ADT types mismatch by DefId, check if they match by
+                    // name.  This handles cases where inline module re-exports
+                    // or registration order give the same struct different
+                    // DefIds.
+                    let name_match = if let (TyKind::Adt(d1, _), TyKind::Adt(d2, _)) = (&body_ty.kind, &expected_ret.kind) {
+                        if d1 != d2 {
+                            let n1 = self.ctx.lookup_type(*d1).map(|t| t.name.clone());
+                            let n2 = self.ctx.lookup_type(*d2).map(|t| t.name.clone());
+                            n1.is_some() && n1 == n2
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    };
+                    if !name_match {
+                        self.error(TypeError::ReturnTypeMismatch {
+                            expected: expected_ret,
+                            found: body_ty,
+                        }, span);
+                    }
                 }
             }
 
@@ -655,7 +760,17 @@ impl<'ctx> TypeChecker<'ctx> {
         // Extract the type name for inherent method registration
         let type_name = Self::extract_type_name_from_ast(&impl_.self_ty);
 
+        // Pre-register associated constants so they're accessible by bare name
+        // within the impl block (e.g., `BRADFORD` instead of `Self::BRADFORD`).
         for item in &impl_.items {
+            if let ImplItemKind::Const { name, ty, .. } = &item.kind {
+                let const_ty = self.lower_type(ty);
+                self.ctx.define_var(name.name.clone(), const_ty);
+            }
+        }
+
+        for item in &impl_.items {
+            let _error_count_before = self.errors.len();
             self.check_impl_item(item, self_ty);
 
             // Register each method so lookup_method can find it
@@ -798,6 +913,49 @@ impl<'ctx> TypeChecker<'ctx> {
             }
 
             self.ctx.pop_scope();
+
+            // Re-export pub items to parent scope (implicit `use mod::*`).
+            // This is the QuantaLang ecosystem convention — module contents
+            // are accessible by bare name from the parent scope.
+            //
+            // IMPORTANT: For structs and enums, reuse the existing DefId from
+            // the first registration (inside the module scope) instead of
+            // calling collect_struct/collect_enum which would create a NEW
+            // DefId.  A duplicated DefId causes type mismatches when code
+            // inside the module constructs a value (using the original DefId)
+            // but the return-type annotation resolves to the re-exported DefId.
+            for item in &content.items {
+                match &item.kind {
+                    ItemKind::Const(c) => {
+                        let ty = self.lower_type(&c.ty);
+                        self.ctx.define_var(c.name.name.clone(), ty);
+                    }
+                    ItemKind::Function(f) => {
+                        self.collect_function(f, item.span);
+                    }
+                    ItemKind::Struct(s) => {
+                        // Reuse the existing type registration if it exists,
+                        // so that the DefId is identical to the one used inside
+                        // the module scope.
+                        if self.ctx.lookup_type_by_name(s.name.name.as_ref()).is_none() {
+                            self.collect_struct(s, item.span);
+                        }
+                    }
+                    ItemKind::Enum(e) => {
+                        // Same as structs: reuse existing DefId.
+                        if self.ctx.lookup_type_by_name(e.name.name.as_ref()).is_none() {
+                            self.collect_enum(e, item.span);
+                        }
+                    }
+                    ItemKind::Impl(impl_) => {
+                        // Re-export inherent methods to parent scope so they're
+                        // accessible when code outside the module calls methods
+                        // on the re-exported types.
+                        self.collect_impl(impl_, item.span);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 

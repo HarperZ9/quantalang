@@ -179,7 +179,7 @@ impl CodeActionProvider {
     /// Remove unused import quick fix.
     fn remove_import_fix(&self, doc: &Document, diagnostic: &Diagnostic) -> CodeAction {
         let line = diagnostic.range.start.line;
-        let line_text = doc.line(line).unwrap_or("");
+        let _line_text = doc.line(line).unwrap_or("");
         let start = Position::new(line, 0);
         // Include the newline
         let end = Position::new(line + 1, 0);

@@ -9,7 +9,7 @@
 //! Types describe the shape of values in QuantaLang.
 
 use crate::lexer::Span;
-use super::{Expr, GenericArg, Ident, Lifetime, Mutability, NodeId, Path, TypeBound};
+use super::{Expr, Ident, Lifetime, Mutability, NodeId, Path, TypeBound};
 
 /// A type node.
 #[derive(Debug, Clone, PartialEq)]

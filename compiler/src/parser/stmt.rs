@@ -126,7 +126,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse an expression statement.
-    fn parse_expr_stmt(&mut self, attrs: Vec<Attribute>) -> ParseResult<Stmt> {
+    fn parse_expr_stmt(&mut self, _attrs: Vec<Attribute>) -> ParseResult<Stmt> {
         let expr = self.parse_expr()?;
         let start = expr.span;
 

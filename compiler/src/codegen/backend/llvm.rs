@@ -1620,8 +1620,8 @@ impl LlvmBackend {
             }
             MirType::Struct(name) => Ok(format!("%{}", name)),
             MirType::FnPtr(sig) => {
-                let ret = self.llvm_type(&sig.ret)?;
-                let params: Vec<String> = sig.params
+                let _ret = self.llvm_type(&sig.ret)?;
+                let _params: Vec<String> = sig.params
                     .iter()
                     .map(|p| self.llvm_type(p))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1635,6 +1635,18 @@ impl LlvmBackend {
             // Opaque GPU types — represent as opaque pointers in LLVM
             MirType::Texture2D(_) | MirType::Sampler | MirType::SampledImage(_) => Ok("ptr".into()),
             MirType::TraitObject(_) => Ok("{ ptr, ptr }".to_string()), // data ptr + vtable ptr
+            MirType::Vec(_) => Ok("ptr".to_string()), // QuantaVecHandle is a pointer
+            MirType::Map(_, _) => Ok("ptr".to_string()), // QuantaMapHandle is a pointer
+            MirType::Tuple(elems) => {
+                if elems.is_empty() {
+                    Ok("void".into())
+                } else {
+                    let parts: Vec<String> = elems.iter()
+                        .map(|e| self.llvm_type(e))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(format!("{{ {} }}", parts.join(", ")))
+                }
+            }
         }
     }
 
@@ -1667,6 +1679,9 @@ impl LlvmBackend {
             // Opaque GPU types — pointer-sized
             MirType::Texture2D(_) | MirType::Sampler | MirType::SampledImage(_) => 8,
             MirType::TraitObject(_) => 16, // fat pointer: data ptr + vtable ptr
+            MirType::Vec(_) => 8, // QuantaVecHandle is a pointer
+            MirType::Map(_, _) => 8, // QuantaMapHandle is a pointer
+            MirType::Tuple(elems) => elems.iter().map(|e| self.type_size(e)).sum(),
         }
     }
 
@@ -1700,6 +1715,11 @@ impl LlvmBackend {
             // Opaque GPU types — pointer-aligned
             MirType::Texture2D(_) | MirType::Sampler | MirType::SampledImage(_) => 8,
             MirType::TraitObject(_) => 8, // pointer-aligned
+            MirType::Vec(_) => 8, // pointer-aligned
+            MirType::Map(_, _) => 8, // pointer-aligned
+            MirType::Tuple(elems) => {
+                elems.iter().map(|e| self.type_align(e)).max().unwrap_or(1)
+            }
         }
     }
 
@@ -1746,6 +1766,12 @@ impl LlvmBackend {
             MirConst::Unit => Ok("void".into()),
             MirConst::Zeroed(_) => Ok("zeroinitializer".into()),
             MirConst::Undef(_) => Ok("undef".into()),
+            MirConst::Struct(_, fields) => {
+                let parts: Result<Vec<String>, _> = fields.iter()
+                    .map(|f| self.llvm_const(f))
+                    .collect();
+                Ok(format!("{{ {} }}", parts?.join(", ")))
+            }
         }
     }
 
@@ -1895,6 +1921,7 @@ impl LlvmBackend {
                     MirConst::Unit => Ok(MirType::Void),
                     MirConst::Zeroed(ty) => Ok(ty.clone()),
                     MirConst::Undef(ty) => Ok(ty.clone()),
+                    MirConst::Struct(name, _) => Ok(MirType::Struct(name.clone())),
                 }
             }
             MirValue::Global(_) => Ok(MirType::Ptr(Box::new(MirType::Void))),

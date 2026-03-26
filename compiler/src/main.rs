@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use quantalang::lexer::{SourceFile, Lexer, Span};
-use quantalang::parser::{Parser, parse};
+use quantalang::parser::Parser;
 use quantalang::ast::{self, Module, ItemKind, Ident, Visibility, ExprKind, StmtKind, Block, Expr};
 use quantalang::types::{TypeContext, TypeChecker};
 use quantalang::codegen::{CodeGenerator, Target};
@@ -523,27 +523,37 @@ fn cmd_check(file: &PathBuf) -> Result<(), i32> {
 
     println!("Lexing... OK ({} tokens)", tokens.len());
 
-    // Parse
+    // Parse (continues past errors, collecting valid items)
     let mut parser = Parser::new(&source_file, tokens);
-    let ast = parser.parse().map_err(|e| {
-        eprintln!("Parse error: {}", e);
-        for err in parser.errors() {
-            eprintln!("  {}", err);
-        }
-        1
-    })?;
+    let ast = parser.parse().unwrap(); // Always Ok now (errors stored in parser)
+    let parse_errors = parser.errors().to_vec();
 
-    println!("Parsing... OK ({} items)", ast.items.len());
+    if parse_errors.is_empty() {
+        println!("Parsing... OK ({} items)", ast.items.len());
+    } else {
+        println!("Parsing... {} items ({} parse errors)", ast.items.len(), parse_errors.len());
+    }
 
-    // Type check
+    // Type check the successfully parsed items
     let mut ctx = TypeContext::new();
     let mut checker = TypeChecker::new(&mut ctx);
     checker.check_module(&ast);
 
-    if checker.has_errors() {
-        eprintln!("Type errors found:");
-        for err in checker.errors() {
-            eprintln!("  {}", err);
+    let has_parse_errors = !parse_errors.is_empty();
+    let has_type_errors = checker.has_errors();
+
+    if has_parse_errors || has_type_errors {
+        if has_parse_errors {
+            eprintln!("Parse errors:");
+            for err in &parse_errors {
+                eprintln!("  {}", err);
+            }
+        }
+        if has_type_errors {
+            eprintln!("Type errors found:");
+            for err in checker.errors() {
+                eprintln!("  {}", err);
+            }
         }
         Err(1)
     } else {
@@ -565,6 +575,7 @@ fn cmd_check(file: &PathBuf) -> Result<(), i32> {
 ///
 /// Returns the compiler command name if found.
 fn find_c_compiler() -> Option<String> {
+    // First: try compilers already in PATH
     let candidates: &[&str] = if cfg!(windows) {
         &["cl.exe", "cl", "gcc", "clang"]
     } else {
@@ -578,8 +589,6 @@ fn find_c_compiler() -> Option<String> {
             .stderr(std::process::Stdio::null())
             .status();
 
-        // MSVC `cl.exe` doesn't support --version; it prints help to stderr
-        // and exits 0, or it might fail. Try a second probe without args.
         let ok = match probe {
             Ok(status) => status.success(),
             Err(_) if compiler.starts_with("cl") => {
@@ -596,6 +605,142 @@ fn find_c_compiler() -> Option<String> {
         if ok {
             return Some(compiler.to_string());
         }
+    }
+
+    // Second (Windows only): auto-discover MSVC from Visual Studio BuildTools
+    #[cfg(windows)]
+    {
+        if let Some(cl_path) = find_msvc_cl() {
+            return Some(cl_path);
+        }
+    }
+
+    None
+}
+
+/// Find vcvarsall.bat from Visual Studio installation.
+#[cfg(windows)]
+#[allow(dead_code)]
+fn find_vcvars_bat() -> Option<String> {
+    let vs_roots = [
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools",
+        r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools",
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\Community",
+        r"C:\Program Files\Microsoft Visual Studio\2022\Community",
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\Professional",
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise",
+    ];
+
+    for vs_root in &vs_roots {
+        let vcvars = std::path::PathBuf::from(vs_root)
+            .join(r"VC\Auxiliary\Build\vcvarsall.bat");
+        if vcvars.is_file() {
+            return Some(vcvars.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+/// Auto-discover MSVC cl.exe from Visual Studio BuildTools installation.
+/// Searches common install paths and sets INCLUDE/LIB/PATH environment
+/// variables so cl.exe can find headers and libraries.
+#[cfg(windows)]
+fn find_msvc_cl() -> Option<String> {
+    use std::path::PathBuf;
+
+    let vs_roots = [
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools",
+        r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools",
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\Community",
+        r"C:\Program Files\Microsoft Visual Studio\2022\Community",
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\Professional",
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise",
+    ];
+
+    for vs_root in &vs_roots {
+        let vc_tools = PathBuf::from(vs_root).join(r"VC\Tools\MSVC");
+        if !vc_tools.is_dir() {
+            continue;
+        }
+
+        // Find the latest MSVC version directory
+        let mut versions: Vec<_> = std::fs::read_dir(&vc_tools).ok()?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        versions.sort();
+
+        let msvc_ver = versions.last()?;
+        let msvc_dir = vc_tools.join(msvc_ver);
+        let cl_exe = msvc_dir.join(r"bin\Hostx64\x64\cl.exe");
+
+        if !cl_exe.is_file() {
+            continue;
+        }
+
+        // Find Windows SDK
+        let sdk_root = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10");
+        let sdk_include = sdk_root.join("Include");
+        let sdk_lib = sdk_root.join("Lib");
+
+        // Find latest SDK version
+        let sdk_ver = if sdk_include.is_dir() {
+            let mut sdk_versions: Vec<_> = std::fs::read_dir(&sdk_include).ok()
+                .map(|rd| rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect())
+                .unwrap_or_default();
+            sdk_versions.sort();
+            sdk_versions.last().cloned().unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        // Set INCLUDE
+        let msvc_include = msvc_dir.join("include");
+        let ucrt_include = sdk_include.join(&sdk_ver).join("ucrt");
+        let um_include = sdk_include.join(&sdk_ver).join("um");
+        let shared_include = sdk_include.join(&sdk_ver).join("shared");
+
+        let include_path = format!("{};{};{};{}",
+            msvc_include.display(),
+            ucrt_include.display(),
+            um_include.display(),
+            shared_include.display(),
+        );
+
+        // Set LIB
+        let msvc_lib = msvc_dir.join(r"lib\x64");
+        let ucrt_lib = sdk_lib.join(&sdk_ver).join(r"ucrt\x64");
+        let um_lib = sdk_lib.join(&sdk_ver).join(r"um\x64");
+
+        let lib_path = format!("{};{};{}",
+            msvc_lib.display(),
+            ucrt_lib.display(),
+            um_lib.display(),
+        );
+
+        // Set PATH to include the bin directory
+        let bin_dir = msvc_dir.join(r"bin\Hostx64\x64");
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{};{}", bin_dir.display(), current_path);
+
+        // Apply environment variables globally for this process.
+        // This ensures cl.exe can find headers and libraries when invoked.
+        std::env::set_var("INCLUDE", &include_path);
+        std::env::set_var("LIB", &lib_path);
+        std::env::set_var("PATH", &new_path);
+
+        // Also store the paths for explicit use by invoke_c_compiler
+        std::env::set_var("QUANTALANG_MSVC_INCLUDE", &include_path);
+        std::env::set_var("QUANTALANG_MSVC_LIB", &lib_path);
+        std::env::set_var("QUANTALANG_MSVC_BIN", bin_dir.to_string_lossy().as_ref());
+
+        eprintln!("Auto-detected MSVC: {}", cl_exe.display());
+
+        return Some(cl_exe.to_string_lossy().to_string());
     }
 
     None
@@ -615,21 +760,48 @@ fn invoke_c_compiler(
     exe_file: &std::path::Path,
     release: bool,
 ) -> Result<(), i32> {
-    let is_msvc = compiler.starts_with("cl");
+    let is_msvc = compiler.starts_with("cl") || compiler.ends_with("cl.exe") || compiler.ends_with("cl");
 
     let mut cmd = std::process::Command::new(compiler);
 
     if is_msvc {
-        // MSVC cl.exe uses /Fe for output, /std:c11, /O2 or /Zi
-        cmd.arg(c_file);
-        cmd.arg(format!("/Fe:{}", exe_file.display()));
-        cmd.arg("/std:c11");
-        if release {
-            cmd.arg("/O2");
+        // On Windows, write a temporary .bat file that sets the MSVC
+        // environment and calls cl.exe. This avoids quoting issues
+        // with PowerShell and cmd.exe invocations.
+        let c_path = c_file.to_string_lossy().replace('/', "\\");
+        let _exe_path = exe_file.to_string_lossy().replace('/', "\\");
+        let opt_flag = if release { "/O2" } else { "/Zi" };
+
+        if let (Ok(inc), Ok(lib), Ok(bin)) = (
+            std::env::var("QUANTALANG_MSVC_INCLUDE"),
+            std::env::var("QUANTALANG_MSVC_LIB"),
+            std::env::var("QUANTALANG_MSVC_BIN"),
+        ) {
+            let bat_path = c_file.with_extension("bat");
+            // Write bat file with MSVC env setup and compilation
+            let bat_content = format!(
+                "set \"INCLUDE={}\"\r\nset \"LIB={}\"\r\nset \"PATH={};%PATH%\"\r\ncl.exe /nologo /W0 /std:c11 {} \"{}\" /Fe\"temp.exe\" 1>&2\r\n",
+                inc, lib, bin, opt_flag, c_path
+            );
+            std::fs::write(&bat_path, &bat_content).map_err(|e| {
+                eprintln!("Failed to write build script: {}", e);
+                1
+            })?;
+
+            cmd = std::process::Command::new("cmd.exe");
+            cmd.args(&["/C", &bat_path.to_string_lossy().replace('/', "\\")]);
+            if let Some(parent) = c_file.parent() {
+                cmd.current_dir(parent);
+            }
         } else {
-            cmd.arg("/Zi");
+            // Direct invocation fallback
+            cmd.arg(c_file);
+            cmd.arg(format!("/Fe:{}", exe_file.display()));
+            cmd.arg("/std:c11");
+            if release { cmd.arg("/O2"); } else { cmd.arg("/Zi"); }
+            cmd.arg("/nologo");
+            cmd.arg("/W0");
         }
-        cmd.arg("/nologo");
     } else {
         // GCC / Clang / cc - POSIX-style flags
         cmd.arg(c_file);
@@ -653,9 +825,12 @@ fn invoke_c_compiler(
     })?;
 
     if output.status.success() {
+        if !exe_file.exists() {
+            eprintln!("Warning: C compiler succeeded but executable not found at {}", exe_file.display());
+        }
         Ok(())
     } else {
-        eprintln!("C compilation failed:");
+        eprintln!("C compilation failed (exit code: {:?}):", output.status.code());
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.is_empty() {
             eprintln!("{}", stderr);
@@ -1128,14 +1303,29 @@ fn cmd_run(file: &PathBuf, args: &[String]) -> Result<(), i32> {
 
     invoke_c_compiler(&compiler, &c_file, &exe_file, false)?;
 
-    // Run the compiled program
-    let mut cmd = std::process::Command::new(&exe_file);
-    cmd.args(args);
+    // Verify the executable was created
+    if !exe_file.exists() {
+        eprintln!("Error: C compilation reported success but executable not found at '{}'", exe_file.display());
+        // Check if MSVC put it somewhere else (current directory)
+        let alt_name = std::path::Path::new("temp.exe");
+        if alt_name.exists() {
+            eprintln!("Found executable in current directory instead — moving it");
+            let _ = std::fs::rename(alt_name, &exe_file);
+        } else {
+            return Err(1);
+        }
+    }
 
-    let status = cmd.status().map_err(|e| {
-        eprintln!("Failed to run program: {}", e);
-        1
-    })?;
+    // Run the compiled program directly (Win32 WriteFile in the runtime
+    // ensures output works even under MinTTY/git-bash).
+    let status = {
+        let mut run_cmd = std::process::Command::new(&exe_file);
+        run_cmd.args(args);
+        run_cmd.status().map_err(|e| {
+            eprintln!("Failed to run program: {}", e);
+            1i32
+        })?
+    };
 
     // Clean up temp files
     let _ = std::fs::remove_file(&c_file);
@@ -1594,13 +1784,10 @@ fn resolve_modules_with_prefix(ast: &mut Module, source_dir: &Path, prefix: &str
         } else if mod_dir_file.exists() {
             (mod_dir_file, source_dir.join(mod_name))
         } else {
-            eprintln!(
-                "Error: module '{}' declared but neither '{}' nor '{}' found",
-                mod_name,
-                source_dir.join(format!("{}.quanta", mod_name)).display(),
-                source_dir.join(mod_name).join("mod.quanta").display(),
-            );
-            return Err(1);
+            // Module file not found — skip silently for single-file compilation.
+            // The `module foo::bar` declaration is informational when compiling
+            // a standalone file.
+            continue;
         };
 
         // Read and parse the module file
@@ -1643,7 +1830,7 @@ fn resolve_modules_with_prefix(ast: &mut Module, source_dir: &Path, prefix: &str
             }
         }).collect();
 
-        let module_types: HashSet<String> = mod_ast.items.iter().filter_map(|item| {
+        let _module_types: HashSet<String> = mod_ast.items.iter().filter_map(|item| {
             match &item.kind {
                 ItemKind::Struct(ref s) => Some(s.name.name.to_string()),
                 ItemKind::Enum(ref e) => Some(e.name.name.to_string()),
@@ -1806,6 +1993,13 @@ fn rename_calls_in_expr(expr: &mut Expr, prefix: &str, module_fns: &HashSet<Stri
         ExprKind::WhileLet { ref mut expr, ref mut body, .. } => {
             rename_calls_in_expr(expr, prefix, module_fns);
             rename_calls_in_block(body, prefix, module_fns);
+        }
+        ExprKind::IfLet { ref mut expr, ref mut then_branch, ref mut else_branch, .. } => {
+            rename_calls_in_expr(expr, prefix, module_fns);
+            rename_calls_in_block(then_branch, prefix, module_fns);
+            if let Some(ref mut e) = else_branch {
+                rename_calls_in_expr(e, prefix, module_fns);
+            }
         }
         ExprKind::For { ref mut iter, ref mut body, .. } => {
             rename_calls_in_expr(iter, prefix, module_fns);

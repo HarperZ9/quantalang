@@ -84,7 +84,7 @@ impl SymbolProvider {
     }
 
     /// Parse a function definition.
-    fn parse_function(&self, lines: &[&str], start: usize, doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_function(&self, lines: &[&str], start: usize, _doc: &Document) -> Option<(DocumentSymbol, usize)> {
         let line = lines[start];
         let trimmed = line.trim();
 
@@ -135,7 +135,7 @@ impl SymbolProvider {
     }
 
     /// Parse a struct definition.
-    fn parse_struct(&self, lines: &[&str], start: usize, doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_struct(&self, lines: &[&str], start: usize, _doc: &Document) -> Option<(DocumentSymbol, usize)> {
         let line = lines[start];
         let trimmed = line.trim();
 
@@ -216,7 +216,7 @@ impl SymbolProvider {
     }
 
     /// Parse an enum definition.
-    fn parse_enum(&self, lines: &[&str], start: usize, doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_enum(&self, lines: &[&str], start: usize, _doc: &Document) -> Option<(DocumentSymbol, usize)> {
         let line = lines[start];
         let trimmed = line.trim();
 
@@ -407,7 +407,7 @@ impl SymbolProvider {
     }
 
     /// Parse a const definition.
-    fn parse_const(&self, lines: &[&str], start: usize, doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_const(&self, lines: &[&str], start: usize, _doc: &Document) -> Option<(DocumentSymbol, usize)> {
         let line = lines[start];
         let trimmed = line.trim();
 
@@ -437,7 +437,7 @@ impl SymbolProvider {
     }
 
     /// Parse a type alias.
-    fn parse_type_alias(&self, lines: &[&str], start: usize, doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_type_alias(&self, lines: &[&str], start: usize, _doc: &Document) -> Option<(DocumentSymbol, usize)> {
         let line = lines[start];
         let trimmed = line.trim();
 

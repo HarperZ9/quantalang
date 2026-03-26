@@ -13,10 +13,8 @@
 //!
 //! Shares structured control flow reconstruction with the HLSL backend.
 
-use std::fmt::Write;
-use std::sync::Arc;
 
-use super::{CodegenError, CodegenResult};
+use super::CodegenResult;
 use crate::codegen::ir::*;
 
 /// GLSL backend for code generation.

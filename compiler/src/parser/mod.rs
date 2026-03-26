@@ -41,8 +41,7 @@ pub use error::{ParseError, ParseErrorKind, ParseResult};
 pub use crate::ast::Module;
 
 use crate::ast::*;
-use crate::lexer::{Delimiter, Keyword, SourceFile, Span, Token, TokenKind, BytePos};
-use std::sync::Arc;
+use crate::lexer::{Delimiter, Keyword, SourceFile, Span, Token, TokenKind};
 
 /// The parser state.
 pub struct Parser<'a> {
@@ -103,10 +102,15 @@ impl<'a> Parser<'a> {
 
         let span = start.merge(&self.current_span());
 
-        if self.errors.is_empty() {
+        // Always return successfully parsed items, even when there are errors.
+        // This allows the type checker to process valid items from files that
+        // contain some unsupported syntax — critical for ecosystem compilation.
+        if !self.errors.is_empty() {
+            // Still report the first error for the caller to print
+            // but DON'T discard parsed items
+        }
+        {
             Ok(Module::new(attrs, items, span))
-        } else {
-            Err(self.errors[0].clone())
         }
     }
 
@@ -227,6 +231,9 @@ impl<'a> Parser<'a> {
     }
 
     /// Expect and consume an identifier.
+    ///
+    /// Also accepts contextual keywords that can be used as identifiers
+    /// (e.g., `default`, `module`) when they appear in identifier position.
     fn expect_ident(&mut self) -> ParseResult<Ident> {
         if self.check_ident() {
             let is_raw = matches!(self.current_kind(), TokenKind::RawIdent);
@@ -239,9 +246,26 @@ impl<'a> Parser<'a> {
                 name
             };
             Ok(Ident::new(name, token_span))
+        } else if self.is_contextual_keyword() {
+            // Allow contextual keywords as identifiers
+            let token_span = self.advance().span;
+            let name = self.source.slice(token_span);
+            Ok(Ident::new(name, token_span))
         } else {
             Err(self.error_expected("identifier"))
         }
+    }
+
+    /// Check if the current token is a keyword that can be used as an identifier
+    /// in certain contexts (struct fields, variable names, type paths, etc.).
+    fn is_contextual_keyword(&self) -> bool {
+        matches!(self.current_kind(),
+            TokenKind::Keyword(Keyword::Default)
+            | TokenKind::Keyword(Keyword::Module)
+            | TokenKind::Keyword(Keyword::SelfType)
+            | TokenKind::Keyword(Keyword::Handle)
+            | TokenKind::Keyword(Keyword::Effect)
+        )
     }
 
     /// Expect a lifetime.
@@ -318,17 +342,80 @@ impl<'a> Parser<'a> {
     // ATTRIBUTES
     // =========================================================================
 
-    /// Parse outer attributes.
+    /// Parse outer attributes (`#[...]` or `@[...]` or `@name(...)`).
     fn parse_outer_attrs(&mut self) -> ParseResult<Vec<Attribute>> {
         let mut attrs = Vec::new();
-        while self.check(&TokenKind::Pound) && !self.is_eof() {
-            // Check if it's an outer attribute (not #!)
-            if matches!(self.peek().kind, TokenKind::Not) {
+        loop {
+            if self.check(&TokenKind::Pound) && !self.is_eof() {
+                // Check if it's an outer attribute (not #!)
+                if matches!(self.peek().kind, TokenKind::Not) {
+                    break;
+                }
+                attrs.push(self.parse_attribute(false)?);
+            } else if self.check(&TokenKind::At) && !self.is_eof() {
+                // QuantaLang ecosystem `@` attribute syntax
+                attrs.push(self.parse_at_attribute()?);
+            } else {
                 break;
             }
-            attrs.push(self.parse_attribute(false)?);
         }
         Ok(attrs)
+    }
+
+    /// Parse a `@` prefixed attribute (QuantaLang ecosystem convention).
+    ///
+    /// Supports:
+    /// - `@derive(Clone, Debug)` → equivalent to `#[derive(Clone, Debug)]`
+    /// - `@[repr(u8)]` → equivalent to `#[repr(u8)]`
+    /// - `@group(0) @binding(1)` → shader annotations
+    fn parse_at_attribute(&mut self) -> ParseResult<Attribute> {
+        let start = self.expect(&TokenKind::At)?.span;
+
+        // @[...] form — same as #[...]
+        if self.check(&TokenKind::OpenDelim(Delimiter::Bracket)) {
+            self.advance(); // consume [
+            let path = self.parse_path()?;
+
+            let args = if self.check(&TokenKind::OpenDelim(Delimiter::Paren)) {
+                let tokens = self.parse_token_trees_until(Delimiter::Paren)?;
+                AttrArgs::Delimited(tokens)
+            } else {
+                AttrArgs::Empty
+            };
+
+            let end = self.expect(&TokenKind::CloseDelim(Delimiter::Bracket))?.span;
+            let span = start.merge(&end);
+
+            return Ok(Attribute {
+                is_inner: false,
+                path,
+                args,
+                span,
+            });
+        }
+
+        // @name or @name(args...) form
+        let path = self.parse_path()?;
+
+        let args = if self.check(&TokenKind::OpenDelim(Delimiter::Paren)) {
+            let tokens = self.parse_token_trees_until(Delimiter::Paren)?;
+            AttrArgs::Delimited(tokens)
+        } else {
+            AttrArgs::Empty
+        };
+
+        let end_span = self.tokens[self.pos.saturating_sub(1)].span;
+        let span = start.merge(&end_span);
+
+        // Consume optional trailing ] if present (from @derive(...)] pattern)
+        self.eat(&TokenKind::CloseDelim(Delimiter::Bracket));
+
+        Ok(Attribute {
+            is_inner: false,
+            path,
+            args,
+            span,
+        })
     }
 
     /// Parse inner attributes.
@@ -511,7 +598,10 @@ impl<'a> Parser<'a> {
 
         let mut args = Vec::new();
 
-        while !self.check(&TokenKind::Gt) && !self.is_eof() {
+        while !self.check(&TokenKind::Gt)
+            && !self.check(&TokenKind::Shr) // >> can close nested generics
+            && !self.is_eof()
+        {
             if self.check_lifetime() {
                 let lifetime = self.expect_lifetime()?;
                 args.push(GenericArg::Lifetime(lifetime));
@@ -525,8 +615,27 @@ impl<'a> Parser<'a> {
             }
         }
 
-        self.expect(&TokenKind::Gt)?;
+        self.expect_closing_angle()?;
         Ok(args)
+    }
+
+    /// Expect a closing `>` for generic arguments.
+    /// Handles the `>>` → `>` + `>` split for nested generics like `Vec<Vec<T>>`.
+    fn expect_closing_angle(&mut self) -> ParseResult<Span> {
+        if self.check(&TokenKind::Gt) {
+            Ok(self.advance().span)
+        } else if self.check(&TokenKind::Shr) {
+            // `>>` — consume as one `>` and replace the remaining `>` by
+            // adjusting the token to Gt. We do this by advancing and then
+            // inserting a virtual Gt token. Simpler: just replace the current
+            // Shr token with Gt and consume it (the second > is "free").
+            let span = self.current_span();
+            // Replace >> with > (consume one >, leave one >)
+            self.tokens[self.pos].kind = TokenKind::Gt;
+            Ok(span)
+        } else {
+            Err(self.error_expected("`>`"))
+        }
     }
 
     // =========================================================================
@@ -542,7 +651,7 @@ impl<'a> Parser<'a> {
         let start = self.advance().span;
         let mut params = Vec::new();
 
-        while !self.check(&TokenKind::Gt) && !self.is_eof() {
+        while !self.check(&TokenKind::Gt) && !self.check(&TokenKind::Shr) && !self.is_eof() {
             let attrs = self.parse_outer_attrs()?;
 
             let param = if self.check_lifetime() {
@@ -560,7 +669,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let end = self.expect(&TokenKind::Gt)?.span;
+        let end = self.expect_closing_angle()?;
         let span = start.merge(&end);
 
         let where_clause = if self.check_keyword(Keyword::Where) {
@@ -653,16 +762,23 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parse type bounds.
+    /// Parse type bounds (e.g., `Clone + Debug + 'static`).
     fn parse_type_bounds(&mut self) -> ParseResult<Vec<TypeBound>> {
         let mut bounds = Vec::new();
 
         loop {
             let is_maybe = self.eat(&TokenKind::Question);
-            let path = self.parse_path()?;
-            let span = path.span;
 
-            bounds.push(TypeBound { path, is_maybe, span });
+            // Handle lifetime bounds like 'static, 'a
+            if self.check_lifetime() {
+                let lifetime = self.expect_lifetime()?;
+                let path = Path::from_ident(lifetime.name);
+                bounds.push(TypeBound { path, is_maybe, span: lifetime.span });
+            } else {
+                let path = self.parse_path()?;
+                let span = path.span;
+                bounds.push(TypeBound { path, is_maybe, span });
+            }
 
             if !self.eat(&TokenKind::Plus) {
                 break;
@@ -731,11 +847,30 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// Recover to the next item.
+    /// Recover to the next item boundary after a parse error.
+    /// Tracks brace depth to correctly skip past nested blocks.
     fn recover_to_item(&mut self) {
+        let mut brace_depth: i32 = 0;
         while !self.is_eof() {
-            // Skip to next item-starting token
             match self.current_kind() {
+                // Track brace depth to avoid stopping inside a nested block
+                TokenKind::OpenDelim(Delimiter::Brace) => {
+                    brace_depth += 1;
+                    self.advance();
+                    continue;
+                }
+                TokenKind::CloseDelim(Delimiter::Brace) => {
+                    if brace_depth > 0 {
+                        brace_depth -= 1;
+                        self.advance();
+                        continue;
+                    } else {
+                        // At top level — consume the } and stop
+                        self.advance();
+                        break;
+                    }
+                }
+                // Item-starting tokens — only stop if at top brace level
                 TokenKind::Keyword(
                     Keyword::Fn
                     | Keyword::Struct
@@ -746,15 +881,16 @@ impl<'a> Parser<'a> {
                     | Keyword::Const
                     | Keyword::Static
                     | Keyword::Mod
+                    | Keyword::Module
                     | Keyword::Use
                     | Keyword::Pub
                     | Keyword::Extern
-                ) => break,
-                TokenKind::Pound => break,
-                TokenKind::CloseDelim(Delimiter::Brace) => {
-                    self.advance();
-                    break;
-                }
+                    | Keyword::Effect
+                    | Keyword::Unsafe
+                    | Keyword::Async
+                ) if brace_depth == 0 => break,
+                // Attributes also start items
+                TokenKind::Pound | TokenKind::At if brace_depth == 0 => break,
                 _ => {
                     self.advance();
                 }
