@@ -1371,99 +1371,58 @@ static int64_t quanta_time_unix(void) {
 // ============================================================================
 
 // Type definitions
-typedef struct Dog {
-    int32_t age;
-} Dog;
-
-typedef struct Cat {
-    int32_t lives;
-} Cat;
-
-// Vtable types for dynamic dispatch
-typedef struct Describable_vtable {
-    int32_t (*describe)(void*);
-} Describable_vtable;
-
-typedef struct dyn_Describable {
-    void* data;
-    Describable_vtable* vtable;
-} dyn_Describable;
+typedef struct Point {
+    int64_t x;
+    int64_t y;
+} Point;
 
 // String table
-static const char* __str0 = "Dog age: %d\n";
-static const char* __str1 = "Cat lives: %d\n";
-static const char* __str2 = "Trait dispatch test complete\n";
+static const char* __str0 = "x=%lld\n";
+static const char* __str1 = "y=%lld\n";
+static const char* __str2 = "sum=%lld\n";
 
 // Forward declarations
-static int32_t Dog_describe(Dog self);
-static int32_t Cat_describe(Cat self);
 int32_t main(int argc, char** argv);
-
-static int32_t __vtable_wrap_Dog_Describable_describe(void* __self) { return Dog_describe((*(Dog*)__self)); }
-static int32_t __vtable_wrap_Cat_Describable_describe(void* __self) { return Cat_describe((*(Cat*)__self)); }
-
-static Describable_vtable Dog_Describable_vtable_instance = {
-    .describe = (int32_t (*)(void*))__vtable_wrap_Dog_Describable_describe,
-};
-
-static Describable_vtable Cat_Describable_vtable_instance = {
-    .describe = (int32_t (*)(void*))__vtable_wrap_Cat_Describable_describe,
-};
-
-static int32_t Dog_describe(Dog self) {
-    int32_t _ret;
-    int32_t _2;
-
-    _2 = self.age;
-    fflush(stdout);
-    return _2;
-}
-
-static int32_t Cat_describe(Cat self) {
-    int32_t _ret;
-    int32_t _2;
-
-    _2 = self.lives;
-    fflush(stdout);
-    return _2;
-}
 
 int32_t main(int argc, char** argv) {
     __quanta_init_io();
     quanta_args_init(argc, argv);
     int32_t _ret;
-    Dog _1;
-    Dog dog;
-    Cat _3;
-    Cat cat;
-    int32_t _5;
+    Point _1;
+    Point p;
+    int64_t _3;
+    int8_t* _4;
+    int64_t _5;
     int8_t* _6;
-    int32_t _7;
-    int8_t* _8;
-    int8_t* _9;
+    int64_t _7;
+    int64_t _8;
+    int64_t _9;
+    int64_t _10;
+    int8_t* _11;
 
-    _1 = (Dog){ 5 };
-    dog = _1;
-    _3 = (Cat){ 9 };
-    cat = _3;
-    _5 = Dog_describe(dog);
+    _1 = (Point){ 1, 2 };
+    p = _1;
+    p.x = 10;
+    p.y = 20;
+    _3 = p.x;
+    _4 = __str0;
+    printf(_4, _3);
     goto bb1;
 bb1:
-    _6 = __str0;
+    _5 = p.y;
+    _6 = __str1;
     printf(_6, _5);
     goto bb2;
 bb2:
-    _7 = Cat_describe(cat);
+    _7 = p.x;
+    _8 = p.y;
+    _9 = (_7 + _8);
+    p.x = _9;
+    _10 = p.x;
+    _11 = __str2;
+    printf(_11, _10);
     goto bb3;
 bb3:
-    _8 = __str1;
-    printf(_8, _7);
-    goto bb4;
-bb4:
-    _9 = __str2;
-    printf(_9);
-    goto bb5;
-bb5:
     fflush(stdout);
     return 0;
 }

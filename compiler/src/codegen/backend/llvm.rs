@@ -770,6 +770,10 @@ impl LlvmBackend {
                 let ptr_name = self.get_local_name(*ptr)?;
                 writeln!(&mut self.output, "  ; field_deref_store {}->{}  = <value>", ptr_name, field_name).unwrap();
             }
+            MirStmtKind::FieldAssign { base, field_name, .. } => {
+                let base_name = self.get_local_name(*base)?;
+                writeln!(&mut self.output, "  ; field_store {}.{} = <value>", base_name, field_name).unwrap();
+            }
             MirStmtKind::StorageLive(local) => {
                 let name = self.get_local_name(*local)?;
                 writeln!(&mut self.output, "  ; storage_live {}", name).unwrap();

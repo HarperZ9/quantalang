@@ -236,6 +236,11 @@ impl X86_64Backend {
                 self.output.push_str(&format!("    mov rbx, [rbp-{}]\n", offset));
                 self.output.push_str("    mov qword [rbx], rax\n");
             }
+            MirStmtKind::FieldAssign { base, field_name, .. } => {
+                let offset = self.local_stack_offset(*base, func);
+                self.output.push_str(&format!("    ; field store .{} on local at rbp-{}\n", field_name, offset));
+                self.output.push_str("    mov qword [rbx], rax\n");
+            }
             MirStmtKind::StorageLive(_) | MirStmtKind::StorageDead(_) => {
                 // No-op
             }
@@ -737,8 +742,8 @@ impl X86_64Backend {
             MirStmtKind::Assign { dest, value } => {
                 self.generate_assign_machine_code(*dest, value, func)?;
             }
-            MirStmtKind::DerefAssign { .. } | MirStmtKind::FieldDerefAssign { .. } => {
-                // Pointer store in machine code: emit nop placeholder
+            MirStmtKind::DerefAssign { .. } | MirStmtKind::FieldDerefAssign { .. } | MirStmtKind::FieldAssign { .. } => {
+                // Pointer/field store in machine code: emit nop placeholder
                 // Full implementation requires register allocator
                 self.enc().nop();
             }

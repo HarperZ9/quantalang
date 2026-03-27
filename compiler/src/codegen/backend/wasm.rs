@@ -852,6 +852,15 @@ impl WasmBackend {
                 self.emit_line(&format!("local.get {}", ptr_name));
                 self.emit_line("i64.store");
             }
+            MirStmtKind::FieldAssign { base, field_name: _, value } => {
+                // Local struct field store: compute value then store to base's memory
+                let base_name = self.local_names.get(base)
+                    .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", base)))?
+                    .clone();
+                self.gen_rvalue(value, func)?;
+                self.emit_line(&format!("local.get {}", base_name));
+                self.emit_line("i64.store");
+            }
             MirStmtKind::StorageLive(_local) => {
                 // No-op in WASM
             }

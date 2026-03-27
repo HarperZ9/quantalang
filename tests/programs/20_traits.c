@@ -1371,99 +1371,152 @@ static int64_t quanta_time_unix(void) {
 // ============================================================================
 
 // Type definitions
-typedef struct Dog {
-    int32_t age;
-} Dog;
+typedef struct Circle {
+    double radius;
+} Circle;
 
-typedef struct Cat {
-    int32_t lives;
-} Cat;
+typedef struct Rectangle {
+    double width;
+    double height;
+} Rectangle;
 
 // Vtable types for dynamic dispatch
-typedef struct Describable_vtable {
-    int32_t (*describe)(void*);
-} Describable_vtable;
+typedef struct Shape_vtable {
+    double (*area)(void*);
+    QuantaString (*name)(void*);
+} Shape_vtable;
 
-typedef struct dyn_Describable {
+typedef struct dyn_Shape {
     void* data;
-    Describable_vtable* vtable;
-} dyn_Describable;
+    Shape_vtable* vtable;
+} dyn_Shape;
 
 // String table
-static const char* __str0 = "Dog age: %d\n";
-static const char* __str1 = "Cat lives: %d\n";
-static const char* __str2 = "Trait dispatch test complete\n";
+static const char* __str0 = "Circle";
+static const char* __str1 = "Rectangle";
+static const char* __str2 = "%s area: %g\n";
 
 // Forward declarations
-static int32_t Dog_describe(Dog self);
-static int32_t Cat_describe(Cat self);
+static double Circle_area(Circle self);
+static QuantaString Circle_name(Circle self);
+static double Rectangle_area(Rectangle self);
+static QuantaString Rectangle_name(Rectangle self);
+static void print_shape_area(QuantaString shape_name, double area);
 int32_t main(int argc, char** argv);
 
-static int32_t __vtable_wrap_Dog_Describable_describe(void* __self) { return Dog_describe((*(Dog*)__self)); }
-static int32_t __vtable_wrap_Cat_Describable_describe(void* __self) { return Cat_describe((*(Cat*)__self)); }
+static double __vtable_wrap_Circle_Shape_area(void* __self) { return Circle_area((*(Circle*)__self)); }
+static QuantaString __vtable_wrap_Circle_Shape_name(void* __self) { return Circle_name((*(Circle*)__self)); }
+static double __vtable_wrap_Rectangle_Shape_area(void* __self) { return Rectangle_area((*(Rectangle*)__self)); }
+static QuantaString __vtable_wrap_Rectangle_Shape_name(void* __self) { return Rectangle_name((*(Rectangle*)__self)); }
 
-static Describable_vtable Dog_Describable_vtable_instance = {
-    .describe = (int32_t (*)(void*))__vtable_wrap_Dog_Describable_describe,
+static Shape_vtable Circle_Shape_vtable_instance = {
+    .area = (double (*)(void*))__vtable_wrap_Circle_Shape_area,
+    .name = (QuantaString (*)(void*))__vtable_wrap_Circle_Shape_name,
 };
 
-static Describable_vtable Cat_Describable_vtable_instance = {
-    .describe = (int32_t (*)(void*))__vtable_wrap_Cat_Describable_describe,
+static Shape_vtable Rectangle_Shape_vtable_instance = {
+    .area = (double (*)(void*))__vtable_wrap_Rectangle_Shape_area,
+    .name = (QuantaString (*)(void*))__vtable_wrap_Rectangle_Shape_name,
 };
 
-static int32_t Dog_describe(Dog self) {
-    int32_t _ret;
-    int32_t _2;
+static double Circle_area(Circle self) {
+    double _ret;
+    double _2;
+    double _3;
+    double _4;
+    double _5;
 
-    _2 = self.age;
+    _2 = self.radius;
+    _3 = (3.14159 * _2);
+    _4 = self.radius;
+    _5 = (_3 * _4);
+    fflush(stdout);
+    return _5;
+}
+
+static QuantaString Circle_name(Circle self) {
+    QuantaString _ret;
+    QuantaString _2;
+
+    _2 = quanta_string_new(__str0);
+    goto bb1;
+bb1:
     fflush(stdout);
     return _2;
 }
 
-static int32_t Cat_describe(Cat self) {
-    int32_t _ret;
-    int32_t _2;
+static double Rectangle_area(Rectangle self) {
+    double _ret;
+    double _2;
+    double _3;
+    double _4;
 
-    _2 = self.lives;
+    _2 = self.width;
+    _3 = self.height;
+    _4 = (_2 * _3);
+    fflush(stdout);
+    return _4;
+}
+
+static QuantaString Rectangle_name(Rectangle self) {
+    QuantaString _ret;
+    QuantaString _2;
+
+    _2 = quanta_string_new(__str1);
+    goto bb1;
+bb1:
     fflush(stdout);
     return _2;
+}
+
+static void print_shape_area(QuantaString shape_name, double area) {
+    int8_t* _2;
+    int8_t* _3;
+
+    _2 = shape_name.ptr;
+    _3 = __str2;
+    printf(_3, _2, area);
+    goto bb1;
+bb1:
+    fflush(stdout);
+    return;
 }
 
 int32_t main(int argc, char** argv) {
     __quanta_init_io();
     quanta_args_init(argc, argv);
     int32_t _ret;
-    Dog _1;
-    Dog dog;
-    Cat _3;
-    Cat cat;
-    int32_t _5;
-    int8_t* _6;
-    int32_t _7;
-    int8_t* _8;
-    int8_t* _9;
+    Circle _1;
+    Circle c;
+    Rectangle _3;
+    Rectangle r;
+    QuantaString _5;
+    double _6;
+    QuantaString _7;
+    double _8;
 
-    _1 = (Dog){ 5 };
-    dog = _1;
-    _3 = (Cat){ 9 };
-    cat = _3;
-    _5 = Dog_describe(dog);
+    _1 = (Circle){ 5 };
+    c = _1;
+    _3 = (Rectangle){ 4, 6 };
+    r = _3;
+    _5 = Circle_name(c);
     goto bb1;
 bb1:
-    _6 = __str0;
-    printf(_6, _5);
+    _6 = Circle_area(c);
     goto bb2;
 bb2:
-    _7 = Cat_describe(cat);
+    print_shape_area(_5, _6);
     goto bb3;
 bb3:
-    _8 = __str1;
-    printf(_8, _7);
+    _7 = Rectangle_name(r);
     goto bb4;
 bb4:
-    _9 = __str2;
-    printf(_9);
+    _8 = Rectangle_area(r);
     goto bb5;
 bb5:
+    print_shape_area(_7, _8);
+    goto bb6;
+bb6:
     fflush(stdout);
     return 0;
 }

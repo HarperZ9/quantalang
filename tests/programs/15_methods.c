@@ -1371,99 +1371,75 @@ static int64_t quanta_time_unix(void) {
 // ============================================================================
 
 // Type definitions
-typedef struct Dog {
-    int32_t age;
-} Dog;
-
-typedef struct Cat {
-    int32_t lives;
-} Cat;
-
-// Vtable types for dynamic dispatch
-typedef struct Describable_vtable {
-    int32_t (*describe)(void*);
-} Describable_vtable;
-
-typedef struct dyn_Describable {
-    void* data;
-    Describable_vtable* vtable;
-} dyn_Describable;
+typedef struct Rectangle {
+    double width;
+    double height;
+} Rectangle;
 
 // String table
-static const char* __str0 = "Dog age: %d\n";
-static const char* __str1 = "Cat lives: %d\n";
-static const char* __str2 = "Trait dispatch test complete\n";
+static const char* __str0 = "Area: %g\n";
+static const char* __str1 = "Perimeter: %g\n";
 
 // Forward declarations
-static int32_t Dog_describe(Dog self);
-static int32_t Cat_describe(Cat self);
+static double Rectangle_area(Rectangle self);
+static double Rectangle_perimeter(Rectangle self);
 int32_t main(int argc, char** argv);
 
-static int32_t __vtable_wrap_Dog_Describable_describe(void* __self) { return Dog_describe((*(Dog*)__self)); }
-static int32_t __vtable_wrap_Cat_Describable_describe(void* __self) { return Cat_describe((*(Cat*)__self)); }
+static double Rectangle_area(Rectangle self) {
+    double _ret;
+    double _2;
+    double _3;
+    double _4;
 
-static Describable_vtable Dog_Describable_vtable_instance = {
-    .describe = (int32_t (*)(void*))__vtable_wrap_Dog_Describable_describe,
-};
-
-static Describable_vtable Cat_Describable_vtable_instance = {
-    .describe = (int32_t (*)(void*))__vtable_wrap_Cat_Describable_describe,
-};
-
-static int32_t Dog_describe(Dog self) {
-    int32_t _ret;
-    int32_t _2;
-
-    _2 = self.age;
+    _2 = self.width;
+    _3 = self.height;
+    _4 = (_2 * _3);
     fflush(stdout);
-    return _2;
+    return _4;
 }
 
-static int32_t Cat_describe(Cat self) {
-    int32_t _ret;
-    int32_t _2;
+static double Rectangle_perimeter(Rectangle self) {
+    double _ret;
+    double _2;
+    double _3;
+    double _4;
+    double _5;
 
-    _2 = self.lives;
+    _2 = self.width;
+    _3 = self.height;
+    _4 = (_2 + _3);
+    _5 = (2 * _4);
     fflush(stdout);
-    return _2;
+    return _5;
 }
 
 int32_t main(int argc, char** argv) {
     __quanta_init_io();
     quanta_args_init(argc, argv);
     int32_t _ret;
-    Dog _1;
-    Dog dog;
-    Cat _3;
-    Cat cat;
-    int32_t _5;
+    Rectangle _1;
+    Rectangle rect;
+    double _3;
+    int8_t* _4;
+    double _5;
     int8_t* _6;
-    int32_t _7;
-    int8_t* _8;
-    int8_t* _9;
 
-    _1 = (Dog){ 5 };
-    dog = _1;
-    _3 = (Cat){ 9 };
-    cat = _3;
-    _5 = Dog_describe(dog);
+    _1 = (Rectangle){ 5, 3 };
+    rect = _1;
+    _3 = Rectangle_area(rect);
     goto bb1;
 bb1:
-    _6 = __str0;
-    printf(_6, _5);
+    _4 = __str0;
+    printf(_4, _3);
     goto bb2;
 bb2:
-    _7 = Cat_describe(cat);
+    _5 = Rectangle_perimeter(rect);
     goto bb3;
 bb3:
-    _8 = __str1;
-    printf(_8, _7);
+    _6 = __str1;
+    printf(_6, _5);
     goto bb4;
 bb4:
-    _9 = __str2;
-    printf(_9);
-    goto bb5;
-bb5:
     fflush(stdout);
     return 0;
 }

@@ -511,6 +511,13 @@ pub enum MirStmtKind {
         value: MirRValue,
     },
 
+    /// Store to a field on a local struct: `local.field = value`
+    FieldAssign {
+        base: LocalId,
+        field_name: Arc<str>,
+        value: MirRValue,
+    },
+
     /// Storage live (local becomes valid).
     StorageLive(LocalId),
 

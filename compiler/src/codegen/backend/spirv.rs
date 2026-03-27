@@ -1852,6 +1852,13 @@ impl SpirvBackend {
                 // Simplified: store directly to the base pointer (struct field offset not computed)
                 self.emit(SpvOp::OpStore, &[ptr_id, val_id]);
             }
+            MirStmtKind::FieldAssign { base, field_name: _, value } => {
+                // Local struct field store
+                let val_id = self.gen_rvalue(value, func)?;
+                let base_id = *self.local_ids.get(base)
+                    .ok_or_else(|| CodegenError::Internal(format!("Unknown local for field assign: {:?}", base)))?;
+                self.emit(SpvOp::OpStore, &[base_id, val_id]);
+            }
             MirStmtKind::StorageLive(_) | MirStmtKind::StorageDead(_) | MirStmtKind::Nop => {
                 // No-op in SPIR-V
             }

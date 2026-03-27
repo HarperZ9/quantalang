@@ -1371,99 +1371,67 @@ static int64_t quanta_time_unix(void) {
 // ============================================================================
 
 // Type definitions
-typedef struct Dog {
-    int32_t age;
-} Dog;
-
-typedef struct Cat {
-    int32_t lives;
-} Cat;
-
-// Vtable types for dynamic dispatch
-typedef struct Describable_vtable {
-    int32_t (*describe)(void*);
-} Describable_vtable;
-
-typedef struct dyn_Describable {
-    void* data;
-    Describable_vtable* vtable;
-} dyn_Describable;
+typedef struct Point {
+    int32_t x;
+    int32_t y;
+} Point;
 
 // String table
-static const char* __str0 = "Dog age: %d\n";
-static const char* __str1 = "Cat lives: %d\n";
-static const char* __str2 = "Trait dispatch test complete\n";
+static const char* __str0 = "Sum: (%d, %d)\n";
 
 // Forward declarations
-static int32_t Dog_describe(Dog self);
-static int32_t Cat_describe(Cat self);
+static Point add_points(Point a, Point b);
 int32_t main(int argc, char** argv);
 
-static int32_t __vtable_wrap_Dog_Describable_describe(void* __self) { return Dog_describe((*(Dog*)__self)); }
-static int32_t __vtable_wrap_Cat_Describable_describe(void* __self) { return Cat_describe((*(Cat*)__self)); }
+static Point add_points(Point a, Point b) {
+    Point _ret;
+    int32_t _3;
+    int32_t _4;
+    int32_t _5;
+    int32_t _6;
+    int32_t _7;
+    int32_t _8;
+    Point _9;
 
-static Describable_vtable Dog_Describable_vtable_instance = {
-    .describe = (int32_t (*)(void*))__vtable_wrap_Dog_Describable_describe,
-};
-
-static Describable_vtable Cat_Describable_vtable_instance = {
-    .describe = (int32_t (*)(void*))__vtable_wrap_Cat_Describable_describe,
-};
-
-static int32_t Dog_describe(Dog self) {
-    int32_t _ret;
-    int32_t _2;
-
-    _2 = self.age;
+    _3 = a.x;
+    _4 = b.x;
+    _5 = (_3 + _4);
+    _6 = a.y;
+    _7 = b.y;
+    _8 = (_6 + _7);
+    _9 = (Point){ _5, _8 };
     fflush(stdout);
-    return _2;
-}
-
-static int32_t Cat_describe(Cat self) {
-    int32_t _ret;
-    int32_t _2;
-
-    _2 = self.lives;
-    fflush(stdout);
-    return _2;
+    return _9;
 }
 
 int32_t main(int argc, char** argv) {
     __quanta_init_io();
     quanta_args_init(argc, argv);
     int32_t _ret;
-    Dog _1;
-    Dog dog;
-    Cat _3;
-    Cat cat;
-    int32_t _5;
-    int8_t* _6;
+    Point _1;
+    Point p1;
+    Point _3;
+    Point p2;
+    Point _5;
+    Point sum;
     int32_t _7;
-    int8_t* _8;
+    int32_t _8;
     int8_t* _9;
 
-    _1 = (Dog){ 5 };
-    dog = _1;
-    _3 = (Cat){ 9 };
-    cat = _3;
-    _5 = Dog_describe(dog);
+    _1 = (Point){ 3, 4 };
+    p1 = _1;
+    _3 = (Point){ 10, 20 };
+    p2 = _3;
+    _5 = add_points(p1, p2);
     goto bb1;
 bb1:
-    _6 = __str0;
-    printf(_6, _5);
+    sum = _5;
+    _7 = sum.x;
+    _8 = sum.y;
+    _9 = __str0;
+    printf(_9, _7, _8);
     goto bb2;
 bb2:
-    _7 = Cat_describe(cat);
-    goto bb3;
-bb3:
-    _8 = __str1;
-    printf(_8, _7);
-    goto bb4;
-bb4:
-    _9 = __str2;
-    printf(_9);
-    goto bb5;
-bb5:
     fflush(stdout);
     return 0;
 }

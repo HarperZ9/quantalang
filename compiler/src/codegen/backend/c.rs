@@ -665,6 +665,12 @@ impl CBackend {
                 let rvalue = self.rvalue_to_c(value, locals)?;
                 write!(self.output, "{}->{} = {};\n", ptr_name, field_name, rvalue).unwrap();
             }
+            MirStmtKind::FieldAssign { base, field_name, value } => {
+                let base_name = self.local_name(*base, locals);
+                self.write_indent();
+                let rvalue = self.rvalue_to_c(value, locals)?;
+                write!(self.output, "{}.{} = {};\n", base_name, field_name, rvalue).unwrap();
+            }
             MirStmtKind::StorageLive(_) | MirStmtKind::StorageDead(_) => {
                 // No-op in C
             }

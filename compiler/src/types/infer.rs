@@ -641,12 +641,11 @@ impl<'ctx> TypeInfer<'ctx> {
             AstLiteral::Char(_) => Ty::char(),
             AstLiteral::Byte(_) => Ty::int(IntTy::U8),
             AstLiteral::Str { .. } => {
-                // String literals have type &'static str
-                Ty::reference(
-                    Some(Lifetime::static_lifetime()),
-                    Mutability::Immutable,
-                    Ty::str(),
-                )
+                // String literals have type str (owned).
+                // At the C level all strings are QuantaString, so using the
+                // owned str type lets method calls like char_at, substring,
+                // contains, etc. pass type-checking without a workaround.
+                Ty::str()
             }
             AstLiteral::ByteStr { value, .. } => {
                 // Byte string literals have type &'static [u8; N]
@@ -1600,9 +1599,11 @@ impl<'ctx> TypeInfer<'ctx> {
             "trim" | "trim_start" | "trim_end"
             | "trim_matches" | "trim_start_matches" | "trim_end_matches"
             | "to_uppercase" | "to_lowercase" | "to_ascii_uppercase" | "to_ascii_lowercase"
-            | "replace" | "replacen" => {
+            | "replace" | "replacen"
+            | "char_at" | "substring" => {
                 return Ty::str();
             }
+            "index_of" => return Ty::int(IntTy::I64),
             "repeat" => return Ty::str(),
             "parse" => return Ty::fresh_var(),
             "rfind" if matches!(&receiver_ty.kind, TyKind::Str | TyKind::Ref(_, _, _)) => {

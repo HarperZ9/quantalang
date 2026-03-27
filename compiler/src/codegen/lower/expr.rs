@@ -872,26 +872,31 @@ impl<'ctx> MirLowerer<'ctx> {
             return Ok(values::unit());
         }
 
-        // Handle field assignment through a pointer: `self.field = value` where self is &mut T
+        // Handle field assignment: `obj.field = value`
         if let ExprKind::Field { expr: obj, field } = &target.kind {
             let obj_val = self.lower_expr(obj)?;
             let obj_ty = self.type_of_value(&obj_val);
 
+            let obj_local = match &obj_val {
+                MirValue::Local(id) => *id,
+                _ => {
+                    let builder = self.current_fn.as_mut().unwrap();
+                    let temp = builder.create_local(obj_ty.clone());
+                    builder.assign(temp, MirRValue::Use(obj_val));
+                    temp
+                }
+            };
+
             if obj_ty.is_pointer() {
-                // This is a pointer-to-struct field assignment: emit ptr->field = value
-                let obj_local = match &obj_val {
-                    MirValue::Local(id) => *id,
-                    _ => {
-                        let builder = self.current_fn.as_mut().unwrap();
-                        let temp = builder.create_local(obj_ty);
-                        builder.assign(temp, MirRValue::Use(obj_val));
-                        temp
-                    }
-                };
+                // Pointer-to-struct field assignment: emit ptr->field = value
                 let builder = self.current_fn.as_mut().unwrap();
                 builder.push_field_deref_assign(obj_local, field.name.clone(), MirRValue::Use(val));
-                return Ok(values::unit());
+            } else {
+                // Local struct field assignment: emit base.field = value
+                let builder = self.current_fn.as_mut().unwrap();
+                builder.push_field_assign(obj_local, field.name.clone(), MirRValue::Use(val));
             }
+            return Ok(values::unit());
         }
 
         // Get the target local

@@ -226,6 +226,11 @@ impl MirBuilder {
         self.push_stmt(MirStmtKind::FieldDerefAssign { ptr, field_name, value });
     }
 
+    /// Store to a field on a local struct: `local.field = value`
+    pub fn push_field_assign(&mut self, base: LocalId, field_name: Arc<str>, value: MirRValue) {
+        self.push_stmt(MirStmtKind::FieldAssign { base, field_name, value });
+    }
+
     /// Create an aggregate (tuple, struct, array).
     pub fn aggregate(&mut self, dest: LocalId, kind: AggregateKind, operands: Vec<MirValue>) {
         self.assign(dest, MirRValue::Aggregate { kind, operands });
