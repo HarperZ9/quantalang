@@ -74,6 +74,7 @@ impl CBackend {
         self.output.push_str("#include <stdlib.h>\n");
         self.output.push_str("#include <string.h>\n");
         self.output.push_str("#include <math.h>\n");
+        self.output.push_str("#include <time.h>\n");
         self.output.push('\n');
 
         // Embedded runtime library

@@ -1375,6 +1375,8 @@ impl<'ctx> MirLowerer<'ctx> {
                 "tcp_close"   => return MirType::Void,
                 // Environment variable builtins
                 "getenv" => return MirType::Struct(Arc::from("QuantaString")),
+                // Clock / time builtins
+                "clock_ms" | "time_unix" => return MirType::i64(),
                 // Format builtins
                 "to_string_i32" | "to_string_f64" => return MirType::Struct(Arc::from("QuantaString")),
                 // HashMap builtins (legacy i32->i32)

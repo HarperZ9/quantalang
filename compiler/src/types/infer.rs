@@ -699,6 +699,8 @@ impl<'ctx> TypeInfer<'ctx> {
                 "tcp_connect" | "tcp_send" | "tcp_recv" | "tcp_close" |
                 // Environment variable builtins
                 "getenv" |
+                // Clock / time builtins
+                "clock_ms" | "time_unix" |
                 // Vec builtins
                 "vec_new" | "vec_push" | "vec_get" | "vec_len" | "vec_pop" |
                 // Format builtins

@@ -1356,6 +1356,25 @@ static QuantaString quanta_getenv(const char* name) {
     return quanta_string_from_cstr(val);
 }
 
+// --- Clock / time builtins ---
+
+static int64_t quanta_clock_ms(void) {
+    #ifdef _WIN32
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (int64_t)(count.QuadPart * 1000 / freq.QuadPart);
+    #else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    #endif
+}
+
+static int64_t quanta_time_unix(void) {
+    return (int64_t)time(NULL);
+}
+
 // ============================================================================
 // End QuantaLang Runtime
 // ============================================================================
@@ -1407,6 +1426,8 @@ pub const MATH_BUILTINS: &[&str] = &[
     "tcp_connect", "tcp_send", "tcp_recv", "tcp_close",
     // Environment variable builtins
     "getenv",
+    // Clock / time builtins
+    "clock_ms", "time_unix",
 ];
 
 /// Maps a QuantaLang math built-in name to its C equivalent expression.
@@ -1532,6 +1553,9 @@ pub fn math_builtin_to_c(name: &str) -> Option<&'static str> {
         "tcp_close"   => Some("quanta_tcp_close"),
         // Environment variable builtins
         "getenv" => Some("quanta_getenv"),
+        // Clock / time builtins
+        "clock_ms"  => Some("quanta_clock_ms"),
+        "time_unix" => Some("quanta_time_unix"),
         _ => None,
     }
 }
@@ -1621,7 +1645,7 @@ mod tests {
 
     #[test]
     fn test_math_builtins_list() {
-        assert_eq!(MATH_BUILTINS.len(), 94);
+        assert_eq!(MATH_BUILTINS.len(), 96);
         assert!(MATH_BUILTINS.contains(&"abs"));
         assert!(MATH_BUILTINS.contains(&"min"));
         assert!(MATH_BUILTINS.contains(&"max"));
@@ -1839,6 +1863,19 @@ mod tests {
         assert!(header.contains("quanta_hvec_new_str"));
         assert!(header.contains("quanta_hvec_push_str"));
         assert!(header.contains("quanta_hvec_get_str"));
+    }
+
+    #[test]
+    fn test_clock_builtin_lookup() {
+        assert_eq!(math_builtin_to_c("clock_ms"), Some("quanta_clock_ms"));
+        assert_eq!(math_builtin_to_c("time_unix"), Some("quanta_time_unix"));
+    }
+
+    #[test]
+    fn test_runtime_header_contains_clock() {
+        let header = runtime_header();
+        assert!(header.contains("quanta_clock_ms"));
+        assert!(header.contains("quanta_time_unix"));
     }
 
     #[test]
