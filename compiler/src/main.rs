@@ -237,6 +237,10 @@ fn cmd_lex(file: &PathBuf, verbose: bool) -> Result<(), i32> {
         1
     })?;
 
+    // Expand `include!("path")` directives
+    let lex_base = file.parent().unwrap_or(Path::new("."));
+    let source = preprocess_includes(&source, lex_base)?;
+
     let source_file = SourceFile::new(file.to_string_lossy(), source);
     let mut lexer = Lexer::new(&source_file);
 
@@ -271,6 +275,10 @@ fn cmd_parse(file: &PathBuf, json: bool) -> Result<(), i32> {
         eprintln!("Error reading file '{}': {}", file.display(), e);
         1
     })?;
+
+    // Expand `include!("path")` directives
+    let parse_base = file.parent().unwrap_or(Path::new("."));
+    let source = preprocess_includes(&source, parse_base)?;
 
     let source_file = SourceFile::new(file.to_string_lossy(), source);
 
@@ -410,6 +418,108 @@ fn print_item_summary(item: &quantalang::ast::Item, indent: usize) {
 }
 
 // =============================================================================
+// INCLUDE PREPROCESSING (textual `include!("path")` expansion)
+// =============================================================================
+
+/// Maximum recursion depth for nested includes to prevent infinite loops.
+const MAX_INCLUDE_DEPTH: usize = 10;
+
+/// Preprocess `include!("path")` directives in source code.
+///
+/// This is a textual inclusion mechanism (like C's `#include`): the referenced
+/// file's contents replace the `include!()` line.  Paths are resolved relative
+/// to `base_dir` (typically the directory containing the current source file).
+///
+/// Features:
+/// - Nested includes up to `MAX_INCLUDE_DEPTH` levels
+/// - Double-inclusion guard: each canonical path is included at most once
+/// - Graceful error reporting on missing files or depth overflow
+fn preprocess_includes(source: &str, base_dir: &Path) -> Result<String, i32> {
+    let mut included: HashSet<PathBuf> = HashSet::new();
+    preprocess_includes_inner(source, base_dir, 0, &mut included)
+}
+
+fn preprocess_includes_inner(
+    source: &str,
+    base_dir: &Path,
+    depth: usize,
+    included: &mut HashSet<PathBuf>,
+) -> Result<String, i32> {
+    if depth > MAX_INCLUDE_DEPTH {
+        eprintln!(
+            "Error: include depth exceeds {} — possible circular inclusion",
+            MAX_INCLUDE_DEPTH
+        );
+        return Err(1);
+    }
+
+    let mut result = String::with_capacity(source.len());
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+
+        // Match: include!("some/path.quanta");
+        if let Some(path_str) = trimmed
+            .strip_prefix("include!(\"")
+            .and_then(|s| s.strip_suffix("\");"))
+        {
+            let full_path = base_dir.join(path_str);
+            let canonical = full_path.canonicalize().unwrap_or_else(|_| full_path.clone());
+
+            // Double-inclusion guard
+            if included.contains(&canonical) {
+                // Already included — skip silently
+                result.push_str("// [include already loaded: ");
+                result.push_str(path_str);
+                result.push_str("]\n");
+                continue;
+            }
+
+            if full_path.exists() {
+                let contents = std::fs::read_to_string(&full_path).map_err(|e| {
+                    eprintln!(
+                        "Error reading include '{}': {}",
+                        full_path.display(),
+                        e
+                    );
+                    1
+                })?;
+
+                included.insert(canonical);
+
+                // Recursively expand includes in the included file
+                let inc_dir = full_path.parent().unwrap_or(base_dir);
+                let expanded =
+                    preprocess_includes_inner(&contents, inc_dir, depth + 1, included)?;
+
+                result.push_str("// === include: ");
+                result.push_str(path_str);
+                result.push_str(" ===\n");
+                result.push_str(&expanded);
+                if !expanded.ends_with('\n') {
+                    result.push('\n');
+                }
+                result.push_str("// === end include: ");
+                result.push_str(path_str);
+                result.push_str(" ===\n");
+            } else {
+                eprintln!(
+                    "Error: include file not found: '{}' (resolved to '{}')",
+                    path_str,
+                    full_path.display()
+                );
+                return Err(1);
+            }
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+
+    Ok(result)
+}
+
+// =============================================================================
 // IMPORT RESOLUTION (simple `// import <pkg>` and `use <pkg>;` directives)
 // =============================================================================
 
@@ -511,6 +621,10 @@ fn cmd_check(file: &PathBuf) -> Result<(), i32> {
 
     // Resolve `// import <pkg>` and `use <pkg>;` directives
     let source = resolve_imports(&source, file)?;
+
+    // Expand `include!("path")` directives
+    let chk_base = file.parent().unwrap_or(Path::new("."));
+    let source = preprocess_includes(&source, chk_base)?;
 
     let source_file = SourceFile::new(file.to_string_lossy(), source);
 
@@ -911,6 +1025,10 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
     // Resolve `// import <pkg>` and `use <pkg>;` directives
     let source = resolve_imports(&source, &main_path)?;
 
+    // Expand `include!("path")` directives
+    let inc_base = main_path.parent().unwrap_or(Path::new("."));
+    let source = preprocess_includes(&source, inc_base)?;
+
     let source_file = SourceFile::new(main_path.to_string_lossy(), source);
 
     // Tokenize
@@ -1226,6 +1344,13 @@ fn cmd_run(file: &PathBuf, args: &[String]) -> Result<(), i32> {
         eprintln!("Error reading file '{}': {}", file.display(), e);
         1
     })?;
+
+    // Resolve `// import <pkg>` and `use <pkg>;` directives
+    let source = resolve_imports(&source, file)?;
+
+    // Expand `include!("path")` directives
+    let run_base = file.parent().unwrap_or(Path::new("."));
+    let source = preprocess_includes(&source, run_base)?;
 
     let source_file = SourceFile::new(file.to_string_lossy(), source);
 
@@ -2128,6 +2253,10 @@ fn cmd_compile(
 
     // Resolve `// import <pkg>` and `use <pkg>;` directives
     let source = resolve_imports(&source, input)?;
+
+    // Expand `include!("path")` directives
+    let base_dir = input.parent().unwrap_or(Path::new("."));
+    let source = preprocess_includes(&source, base_dir)?;
 
     let source_file = SourceFile::new(input.to_string_lossy(), source);
 
