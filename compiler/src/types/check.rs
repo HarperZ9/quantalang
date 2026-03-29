@@ -27,6 +27,8 @@ pub struct TypeChecker<'ctx> {
     errors: Vec<TypeErrorWithSpan>,
     /// Effect context for tracking registered effects.
     effect_ctx: super::effects::EffectContext,
+    /// Source directory for resolving external module files.
+    source_dir: Option<std::path::PathBuf>,
 }
 
 impl<'ctx> TypeChecker<'ctx> {
@@ -36,7 +38,13 @@ impl<'ctx> TypeChecker<'ctx> {
             ctx,
             errors: Vec::new(),
             effect_ctx: super::effects::EffectContext::new(),
+            source_dir: None,
         }
+    }
+
+    /// Set the source directory for resolving `mod foo;` declarations.
+    pub fn set_source_dir(&mut self, dir: std::path::PathBuf) {
+        self.source_dir = Some(dir);
     }
 
     /// Get a reference to the effect context.
@@ -199,11 +207,41 @@ impl<'ctx> TypeChecker<'ctx> {
                 self.ctx.define_var(s.name.name.clone(), ty);
             }
             ItemKind::Use(use_def) => self.resolve_use(&use_def.tree),
-            // Module items are handled during the check phase (check_mod),
-            // not during collection. Full module support requires proper
-            // scoped type registration to avoid name collisions.
-            ItemKind::Mod(_) => {}
+            ItemKind::Mod(m) => self.collect_mod(m),
             _ => {}
+        }
+    }
+
+    /// Collect module items during the first pass.
+    /// For inline modules, collect their items recursively.
+    /// For external modules (`mod foo;`), load and parse the file.
+    fn collect_mod(&mut self, m: &ast::ModDef) {
+        if let Some(content) = &m.content {
+            // Inline module: collect items directly
+            for item in &content.items {
+                self.collect_item(item);
+            }
+        } else if let Some(ref dir) = self.source_dir.clone() {
+            // External module: load from disk
+            let mod_name = m.name.name.as_ref();
+            let mod_path = dir.join(format!("{}.quanta", mod_name));
+            if mod_path.exists() {
+                if let Ok(source_text) = std::fs::read_to_string(&mod_path) {
+                    let source = crate::lexer::SourceFile::new(
+                        mod_path.to_string_lossy().as_ref(),
+                        source_text,
+                    );
+                    let mut lexer = crate::lexer::Lexer::new(&source);
+                    if let Ok(tokens) = lexer.tokenize() {
+                        let mut parser = crate::parser::Parser::new(&source, tokens);
+                        if let Ok(module_ast) = parser.parse() {
+                            for item in &module_ast.items {
+                                self.collect_item(item);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -945,6 +983,57 @@ impl<'ctx> TypeChecker<'ctx> {
     }
 
     fn check_mod(&mut self, m: &ast::ModDef) {
+        // External module: `mod foo;` loads foo.quanta from disk
+        if m.content.is_none() {
+            if let Some(ref dir) = self.source_dir {
+                let mod_name = m.name.name.as_ref();
+                let mod_path = dir.join(format!("{}.quanta", mod_name));
+                if mod_path.exists() {
+                    if let Ok(source_text) = std::fs::read_to_string(&mod_path) {
+                        let source = crate::lexer::SourceFile::new(
+                            mod_path.to_string_lossy().as_ref(),
+                            source_text,
+                        );
+                        let mut lexer = crate::lexer::Lexer::new(&source);
+                        if let Ok(tokens) = lexer.tokenize() {
+                            let mut parser = crate::parser::Parser::new(&source, tokens);
+                            if let Ok(module_ast) = parser.parse() {
+                                // Process the external module's items as if they were inline
+                                self.ctx.push_scope(ScopeKind::Module);
+                                for item in &module_ast.items {
+                                    self.collect_item(item);
+                                }
+                                for item in &module_ast.items {
+                                    self.check_item(item);
+                                }
+                                let module_name = m.name.name.clone();
+                                let bindings = self.ctx.current_scope_bindings();
+                                self.ctx.register_module_bindings(module_name.clone(), bindings);
+                                // Re-export to parent scope
+                                for item in &module_ast.items {
+                                    match &item.kind {
+                                        ItemKind::Function(f) => self.collect_function(f, item.span),
+                                        ItemKind::Struct(s) => {
+                                            if self.ctx.lookup_type_by_name(s.name.name.as_ref()).is_none() {
+                                                self.collect_struct(s, item.span);
+                                            }
+                                        }
+                                        ItemKind::Enum(e) => {
+                                            if self.ctx.lookup_type_by_name(e.name.name.as_ref()).is_none() {
+                                                self.collect_enum(e, item.span);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                self.ctx.pop_scope();
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
         if let Some(content) = &m.content {
             self.ctx.push_scope(ScopeKind::Module);
 

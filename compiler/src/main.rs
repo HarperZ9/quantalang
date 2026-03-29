@@ -651,6 +651,7 @@ fn cmd_check(file: &PathBuf) -> Result<(), i32> {
     // Type check the successfully parsed items
     let mut ctx = TypeContext::new();
     let mut checker = TypeChecker::new(&mut ctx);
+    checker.set_source_dir(chk_base.to_path_buf());
     checker.check_module(&ast);
 
     let has_parse_errors = !parse_errors.is_empty();
@@ -1059,6 +1060,7 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
     // Type check
     let mut ctx = TypeContext::new();
     let mut checker = TypeChecker::new(&mut ctx);
+    checker.set_source_dir(source_dir.to_path_buf());
     checker.check_module(&ast);
 
     if checker.has_errors() {
@@ -1378,6 +1380,7 @@ fn cmd_run(file: &PathBuf, args: &[String]) -> Result<(), i32> {
     // Type check
     let mut ctx = TypeContext::new();
     let mut checker = TypeChecker::new(&mut ctx);
+    checker.set_source_dir(source_dir.to_path_buf());
     checker.check_module(&ast);
 
     if checker.has_errors() {
@@ -2284,6 +2287,7 @@ fn cmd_compile(
     // Type check
     let mut ctx = TypeContext::new();
     let mut checker = TypeChecker::new(&mut ctx);
+    checker.set_source_dir(source_dir.to_path_buf());
     checker.check_module(&ast);
 
     if checker.has_errors() {
