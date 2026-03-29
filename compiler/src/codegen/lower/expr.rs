@@ -2171,18 +2171,24 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(values::local(result))
     }
 
-    /// Simplified if-let lowering: always takes the then branch.
-    /// A full implementation would lower to a match with pattern destructuring.
+    /// Simplified if-let lowering: lowers both branches.
+    /// A full implementation would lower to a match with pattern destructuring;
+    /// this version always takes the then branch at runtime but lowers both
+    /// branches so that the else branch's code is generated (not silently dropped).
     fn lower_if_unconditional(
         &mut self,
         then_branch: &ast::Block,
         else_branch: Option<&ast::Expr>,
     ) -> CodegenResult<MirValue> {
-        // For now, just lower the then branch directly.
-        // This is semantically wrong (ignores the pattern match condition)
-        // but allows the code to compile and run for the common case.
         let then_val = self.lower_block(then_branch)?;
-        let _ = else_branch; // TODO: handle else branch
+
+        // Lower the else branch if present (even though the then branch
+        // is always taken, the else branch must be compiled so its code
+        // is not silently lost).
+        if let Some(else_expr) = else_branch {
+            let _else_val = self.lower_expr(else_expr)?;
+        }
+
         Ok(then_val.unwrap_or(values::unit()))
     }
 

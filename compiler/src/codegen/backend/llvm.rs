@@ -2014,7 +2014,7 @@ impl LlvmBackend {
                         }
                         // For variant fields, search all variants
                         for variant in variants {
-                            for (i, (name_opt, _ty)) in variant.fields.iter().enumerate() {
+                            for (_i, (name_opt, _ty)) in variant.fields.iter().enumerate() {
                                 if let Some(n) = name_opt {
                                     if n.as_ref() == field_name {
                                         // Offset past discriminant: field index i + 1
