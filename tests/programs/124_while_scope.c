@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 
 // ============================================================================
@@ -767,6 +768,42 @@ static bool quanta_file_exists(const char* path) {
     return false;
 }
 
+// --- Binary file I/O ---
+
+static bool quanta_write_bytes(const char* path, const char* data, int64_t len) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    fwrite(data, 1, (size_t)len, f);
+    fclose(f);
+    return true;
+}
+
+static QuantaString quanta_read_bytes(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return quanta_string_new("");
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* buf = (char*)malloc(sz + 1);
+    fread(buf, 1, sz, f);
+    buf[sz] = 0;
+    fclose(f);
+    QuantaString s;
+    s.ptr = buf;
+    s.len = (int64_t)sz;
+    s.cap = (int64_t)sz + 1;
+    return s;
+}
+
+static bool quanta_append_file(const char* path, const char* data) {
+    FILE* f = fopen(path, "ab");
+    if (!f) return false;
+    size_t len = strlen(data);
+    fwrite(data, 1, len, f);
+    fclose(f);
+    return true;
+}
+
 // --- Process / Environment ---
 
 static int32_t quanta_exit(int32_t code) {
@@ -1300,6 +1337,33 @@ static QuantaString quanta_tcp_recv(int64_t sock) {
 // Close socket
 static void quanta_tcp_close(int64_t sock) {
     closesocket((int)sock);
+}
+
+// --- Environment variable access ---
+
+static QuantaString quanta_getenv(const char* name) {
+    const char* val = getenv(name);
+    if (val == NULL) return quanta_string_from_cstr("");
+    return quanta_string_from_cstr(val);
+}
+
+// --- Clock / time builtins ---
+
+static int64_t quanta_clock_ms(void) {
+    #ifdef _WIN32
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (int64_t)(count.QuadPart * 1000 / freq.QuadPart);
+    #else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    #endif
+}
+
+static int64_t quanta_time_unix(void) {
+    return (int64_t)time(NULL);
 }
 
 // ============================================================================

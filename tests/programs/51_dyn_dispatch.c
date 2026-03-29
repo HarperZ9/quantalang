@@ -1401,15 +1401,15 @@ static double Metal_shade(Metal self);
 static double render_material(dyn_Material mat);
 int32_t main(int argc, char** argv);
 
-static double __vtable_wrap_Metal_Material_shade(void* __self) { return Metal_shade((*(Metal*)__self)); }
 static double __vtable_wrap_Plastic_Material_shade(void* __self) { return Plastic_shade((*(Plastic*)__self)); }
-
-static Material_vtable Metal_Material_vtable_instance = {
-    .shade = (double (*)(void*))__vtable_wrap_Metal_Material_shade,
-};
+static double __vtable_wrap_Metal_Material_shade(void* __self) { return Metal_shade((*(Metal*)__self)); }
 
 static Material_vtable Plastic_Material_vtable_instance = {
     .shade = (double (*)(void*))__vtable_wrap_Plastic_Material_shade,
+};
+
+static Material_vtable Metal_Material_vtable_instance = {
+    .shade = (double (*)(void*))__vtable_wrap_Metal_Material_shade,
 };
 
 static double Plastic_shade(Plastic self) {

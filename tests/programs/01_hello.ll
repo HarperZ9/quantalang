@@ -2,12 +2,18 @@
 ; Module: main
 
 source_filename = "main"
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
+target datalayout = "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-pc-windows-msvc"
 
 %quanta_vec2 = type { double, double }
 %quanta_vec3 = type { double, double, double }
 %quanta_vec4 = type { double, double, double, double }
+
+
+; Runtime types
+%QuantaString = type { ptr, i64, i64 }
+%QuantaVec = type { ptr, i64, i64, i64 }
+%QuantaHandler = type { [64 x i8], i32, ptr, ptr }
 
 @.str.0 = private unnamed_addr constant [15 x i8] c"Hello, World!\0A\00", align 1
 

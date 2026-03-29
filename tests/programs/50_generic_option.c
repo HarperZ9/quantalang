@@ -1399,15 +1399,15 @@ static int32_t Dog_describe(Dog self);
 static int32_t Cat_describe(Cat self);
 int32_t main(int argc, char** argv);
 
-static int32_t __vtable_wrap_Dog_Describable_describe(void* __self) { return Dog_describe((*(Dog*)__self)); }
 static int32_t __vtable_wrap_Cat_Describable_describe(void* __self) { return Cat_describe((*(Cat*)__self)); }
-
-static Describable_vtable Dog_Describable_vtable_instance = {
-    .describe = (int32_t (*)(void*))__vtable_wrap_Dog_Describable_describe,
-};
+static int32_t __vtable_wrap_Dog_Describable_describe(void* __self) { return Dog_describe((*(Dog*)__self)); }
 
 static Describable_vtable Cat_Describable_vtable_instance = {
     .describe = (int32_t (*)(void*))__vtable_wrap_Cat_Describable_describe,
+};
+
+static Describable_vtable Dog_Describable_vtable_instance = {
+    .describe = (int32_t (*)(void*))__vtable_wrap_Dog_Describable_describe,
 };
 
 static int32_t Dog_describe(Dog self) {

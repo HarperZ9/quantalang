@@ -1,4 +1,4 @@
-# QuantaLang™ Compliance Framework
+# QuantaLang Compliance Framework
 ## Safety-Critical Systems & Industry Standards
 
 **Version:** 1.0.0  
