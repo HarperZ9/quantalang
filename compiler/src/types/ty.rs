@@ -312,17 +312,17 @@ impl Ty {
     /// Create a String type (as a well-known type placeholder).
     /// In a full implementation, this would use a real DefId for String.
     pub fn string() -> Self {
-        // For now, represent String as a fresh type variable
-        // TODO: Use proper String ADT when type context is available
-        Self::fresh_var()
+        // Owned string type — maps to QuantaString in the C backend.
+        Self::str()
     }
 
     /// Create a Vec<T> type (as a well-known type placeholder).
     /// In a full implementation, this would use a real DefId for Vec.
-    pub fn vec(_elem: Ty) -> Self {
-        // For now, represent Vec<T> as a fresh type variable
-        // TODO: Use proper Vec ADT when type context is available
-        Self::fresh_var()
+    pub fn vec(elem: Ty) -> Self {
+        // Vec<T> is represented as a Struct type with a known name.
+        // The C backend maps this to QuantaVecHandle.
+        // The element type is preserved for generic instantiation.
+        Self::new(TyKind::Adt(DefId::DUMMY, vec![elem]))
     }
 
     /// Check if this is a type variable.

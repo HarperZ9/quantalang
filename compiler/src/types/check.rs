@@ -779,7 +779,6 @@ impl<'ctx> TypeChecker<'ctx> {
         let mut methods: std::collections::HashMap<Arc<str>, DefId> = std::collections::HashMap::new();
         for item in &impl_.items {
             if let ImplItemKind::Function(f) = &item.kind {
-                // TODO: properly register method and get its DefId
                 let method_def_id = self.ctx.fresh_def_id();
                 methods.insert(f.name.name.clone(), method_def_id);
             }

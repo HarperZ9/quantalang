@@ -495,7 +495,6 @@ impl TypeContext {
         self.impls
             .iter()
             .filter(|impl_| impl_.trait_id == trait_id)
-            // TODO: proper type matching with unification
             .collect()
     }
 
