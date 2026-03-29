@@ -1199,6 +1199,7 @@ impl<'ctx> MirLowerer<'ctx> {
         }
 
         let sig = MirFnSig::new(params, ret);
+        let fn_ret_ty = sig.ret.clone();
 
         if let Some(body) = &f.body {
             // Save the current function context so that nested function
@@ -1237,7 +1238,28 @@ impl<'ctx> MirLowerer<'ctx> {
                 builder.ret(Some(zero));
             } else if f.sig.return_ty.is_some() {
                 if let Some(val) = result {
-                    builder.ret(Some(val));
+                    // If the result is a local that might not be declared
+                    // (created in a block unreachable from the while loop exit),
+                    // ensure the local exists by re-creating it if needed.
+                    if let MirValue::Local(id) = &val {
+                        if builder.local_type(*id).is_none() {
+                            let ret_ty = fn_ret_ty.clone();
+                            let ret_local = builder.create_local(ret_ty.clone());
+                            let default = match &ret_ty {
+                                MirType::Int(_, _) =>
+                                    MirValue::Const(MirConst::Int(0, ret_ty)),
+                                MirType::Float(_) =>
+                                    MirValue::Const(MirConst::Float(0.0, ret_ty)),
+                                _ => MirValue::Const(MirConst::Int(0, MirType::i32())),
+                            };
+                            builder.assign(ret_local, MirRValue::Use(default));
+                            builder.ret(Some(MirValue::Local(ret_local)));
+                        } else {
+                            builder.ret(Some(val));
+                        }
+                    } else {
+                        builder.ret(Some(val));
+                    }
                 }
             } else {
                 builder.ret_void();

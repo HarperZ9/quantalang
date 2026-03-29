@@ -776,6 +776,21 @@ impl<'ctx> MirLowerer<'ctx> {
         // Lower inner expression FIRST before borrowing builder
         let inner_val = self.lower_expr(inner)?;
 
+        // Constant folding: -literal → negative constant (no local needed).
+        // This prevents creating unreachable locals for fallback return values
+        // like `fn find(...) -> i32 { while ... { return x; } -1 }`.
+        if matches!(op, AstUnaryOp::Neg) {
+            match &inner_val {
+                MirValue::Const(MirConst::Int(v, ty)) => {
+                    return Ok(MirValue::Const(MirConst::Int(-v, ty.clone())));
+                }
+                MirValue::Const(MirConst::Float(v, ty)) => {
+                    return Ok(MirValue::Const(MirConst::Float(-v, ty.clone())));
+                }
+                _ => {}
+            }
+        }
+
         // Vector negation: -vec -> quanta_vecN_neg(vec)
         if matches!(op, AstUnaryOp::Neg) {
             let inner_ty = self.type_of_value(&inner_val);
