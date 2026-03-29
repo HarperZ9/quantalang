@@ -378,8 +378,7 @@ impl Formatter {
         // Normalize spacing around colon
         let normalized = field
             .replace(" :", ":")
-            .replace(":  ", ": ")
-            .replace(": ", ": ");
+            .replace(":  ", ": ");
 
         // Handle trailing comma
         let trimmed = normalized.trim_end_matches(',').trim();
@@ -574,7 +573,7 @@ impl Formatter {
         let normalized = line
             .replace(" :", ":")
             .replace(":  ", ": ")
-            .replace(" =", " =")
+            .replace("  =", " =")
             .replace("=  ", "= ");
 
         let mut output = normalized.trim().to_string();
@@ -588,7 +587,7 @@ impl Formatter {
     /// Format a type alias.
     fn format_type_alias(&self, line: &str) -> Result<String, FormatError> {
         let normalized = line
-            .replace(" =", " =")
+            .replace("  =", " =")
             .replace("=  ", "= ");
 
         let mut output = normalized.trim().to_string();
