@@ -59,6 +59,16 @@ impl<'a> Parser<'a> {
         // Parse prefix (atoms and unary operators)
         let mut lhs = self.parse_prefix_expr()?;
 
+        // Control flow expressions (while, for, loop, if-without-value) are
+        // statement-level constructs that cannot be the left operand of a
+        // binary expression. Stop parsing infix/postfix after them.
+        // This prevents `while ... { } -1` from being parsed as
+        // `(while_result) - 1` (binary subtraction) instead of two separate
+        // expressions (while statement, then -1 as implicit return).
+        if Self::is_statement_expr(&lhs) {
+            return Ok(lhs);
+        }
+
         loop {
             // Type cast handled outside the loop (see above)
 
@@ -84,6 +94,16 @@ impl<'a> Parser<'a> {
         }
 
         Ok(lhs)
+    }
+
+    /// Check if an expression is a statement-level control flow construct
+    /// that should not participate in binary/postfix operations.
+    fn is_statement_expr(expr: &Expr) -> bool {
+        matches!(&expr.kind,
+            ExprKind::While { .. } |
+            ExprKind::Loop { .. } |
+            ExprKind::For { .. }
+        )
     }
 
     /// Parse a prefix expression (atoms and unary operators).
