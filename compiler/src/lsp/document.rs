@@ -395,9 +395,6 @@ impl Rope {
     }
 
     /// Convert to string.
-    pub fn to_string(&self) -> String {
-        self.slice(0, self.len())
-    }
 }
 
 impl RopeNode {
@@ -454,7 +451,7 @@ impl From<&str> for Rope {
 
 impl std::fmt::Display for Rope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+        write!(f, "{}", self.slice(0, self.len()))
     }
 }
 
