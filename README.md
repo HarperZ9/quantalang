@@ -2,7 +2,7 @@
 
 **The Effects Language** — a compiled language for graphics, shaders, and systems programming.
 
-QuantaLang compiles `.quanta` source files to **C** (production-ready), **HLSL** and **GLSL** (shader output), with experimental backends for SPIR-V, LLVM IR, WebAssembly, x86-64, and ARM64.
+QuantaLang compiles `.quanta` source files to **C** (primary target), **HLSL** and **GLSL** (shader output), with experimental backends for SPIR-V, LLVM IR, WebAssembly, x86-64, and ARM64.
 
 ## Installation
 
@@ -97,13 +97,11 @@ Use `--target` to select a code generation backend:
 
 ## Status
 
-**132/132 test programs compile. 108 have verified runtime output.** Full pipeline: `.quanta` → C99 → MSVC → native x86-64 executable. See [TEST_RESULTS.md](TEST_RESULTS.md) for outputs.
+**132/132 test programs compile.** Full pipeline: `.quanta` → C99 → MSVC → native x86-64 executable. See [TEST_RESULTS.md](TEST_RESULTS.md) for outputs.
 
-Programs cover: functions, recursion, structs, enums, closures, generics, traits, dynamic dispatch, algebraic effects, pattern matching, iterators, hashmaps, file I/O, vector math, color science, and self-hosted compiler components.
+Programs cover: functions, recursion, structs, enums, closures, generics, traits, dynamic dispatch, algebraic effects, pattern matching, iterators, hashmaps, vector math, color science, and self-hosted compiler components.
 
-Additionally, **56 coreutils-compatible CLI tools** (wc, grep, sort, sed, awk, find, diff, jq, db, calc, and 46 more) have been compiled from QuantaLang to native Windows binaries. `qwc` produces output identical to GNU `wc` on all tested inputs.
-
-The C backend is the primary production target. HLSL/GLSL produce clean shader output. SPIR-V passes `spirv-val`. LLVM, WASM, x86-64, and ARM64 backends are experimental.
+The C backend is the primary target. HLSL/GLSL produce clean shader output. SPIR-V, LLVM, WASM, x86-64, and ARM64 backends are experimental.
 
 ## Design
 
@@ -115,13 +113,14 @@ See [DESIGN.md](DESIGN.md) for full architectural documentation including:
 
 ## Code Quality
 
-- **CI**: clippy (`-D warnings`) + rustfmt + `cargo test` on Linux and Windows
+- **CI**: clippy (correctness) + rustfmt + `cargo test` on Linux and Windows
 - **Error handling**: Parser uses `expect()` with messages, lexer has 30+ error variants for recovery, pkg layer uses full `Result<T, E>` propagation
 - **Codegen unwraps**: Intentional assertions on validated AST (documented policy in `codegen/mod.rs`)
-- **Tests**: 588 unit tests + 119 end-to-end tests + snapshot tests via `insta`
-  - Type inference: 40 tests (unification properties, bidirectional flow, effect inference)
-  - Parser: 42 tests (operator precedence, associativity, all expression/item/pattern forms)
-  - Codegen: 335 tests across 8 backends
+- **Tests**: 599 passing, 0 failing, 3 ignored (SPIR-V validator dependency)
+  - Type inference: 54 tests (unification, bidirectional flow, effect inference, const generics)
+  - Lexer: 51 tests (token types, spans, Unicode, edge cases, error recovery)
+  - Parser: 85 tests (all expression/item/pattern forms, malformed programs)
+  - Codegen: 195 tests across 8 backends (C backend has 24 end-to-end output verification tests)
 
 ## License
 
