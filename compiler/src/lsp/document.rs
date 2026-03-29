@@ -393,8 +393,6 @@ impl Rope {
         }
         self.root = Self::build_tree(&new_content);
     }
-
-    /// Convert to string.
 }
 
 impl RopeNode {
