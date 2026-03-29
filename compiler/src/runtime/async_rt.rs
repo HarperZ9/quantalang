@@ -227,11 +227,13 @@ impl Task {
 
     /// Add a child task.
     pub fn add_child(&self, child_id: TaskId) {
+        // Mutex poisoning only occurs on thread panic
         self.children.lock().unwrap().push(child_id);
     }
 
     /// Notify waiters that task completed.
     pub fn notify_waiters(&self) {
+        // Mutex poisoning only occurs on thread panic
         let waiters = std::mem::take(&mut *self.waiters.lock().unwrap());
         for waker in waiters {
             waker.wake();
@@ -277,6 +279,7 @@ impl WorkStealingDeque {
 
     /// Push a task to the back (owner operation).
     pub fn push(&self, task: Arc<Task>) {
+        // Mutex poisoning only occurs on thread panic
         let mut queue = self.queue.lock().unwrap();
         queue.push_back(task);
         self.len.fetch_add(1, Ordering::Release);
@@ -284,6 +287,7 @@ impl WorkStealingDeque {
 
     /// Pop a task from the back (owner operation).
     pub fn pop(&self) -> Option<Arc<Task>> {
+        // Mutex poisoning only occurs on thread panic
         let mut queue = self.queue.lock().unwrap();
         if let Some(task) = queue.pop_back() {
             self.len.fetch_sub(1, Ordering::Release);
@@ -295,6 +299,7 @@ impl WorkStealingDeque {
 
     /// Steal a task from the front (stealer operation).
     pub fn steal(&self) -> Option<Arc<Task>> {
+        // Mutex poisoning only occurs on thread panic
         let mut queue = self.queue.lock().unwrap();
         if let Some(task) = queue.pop_front() {
             self.len.fetch_sub(1, Ordering::Release);
@@ -306,6 +311,7 @@ impl WorkStealingDeque {
 
     /// Steal half the tasks (batch stealing).
     pub fn steal_batch(&self, max: usize) -> Vec<Arc<Task>> {
+        // Mutex poisoning only occurs on thread panic
         let mut queue = self.queue.lock().unwrap();
         let steal_count = std::cmp::min(queue.len() / 2, max);
         let mut stolen = Vec::with_capacity(steal_count);
@@ -418,6 +424,7 @@ impl ExecutorInner {
     /// Wake a task by ID, moving it to ready state and scheduling it.
     pub fn wake_task(&self, task_id: TaskId) {
         let task = {
+            // Mutex poisoning only occurs on thread panic
             let tasks = self.tasks.lock().unwrap();
             if let Some(task) = tasks.get(&task_id) {
                 let state = task.get_state();
@@ -434,6 +441,7 @@ impl ExecutorInner {
 
         // Add to global queue outside the lock
         if let Some(task) = task {
+            // Mutex poisoning only occurs on thread panic
             self.global_queue.lock().unwrap().push_back(task);
             // Wake a parked worker
             self.park_condvar.notify_one();
@@ -447,6 +455,7 @@ impl ExecutorInner {
 
     /// Get task by ID.
     pub fn get_task(&self, task_id: TaskId) -> Option<Arc<Task>> {
+        // Mutex poisoning only occurs on thread panic
         self.tasks.lock().unwrap().get(&task_id).cloned()
     }
 
@@ -533,9 +542,10 @@ impl Executor {
         let task = Arc::new(Task::new(task_id, priority));
 
         // Register task
+        // Mutex poisoning only occurs on thread panic
         self.inner.tasks.lock().unwrap().insert(task_id, task.clone());
 
-        // Add to global queue
+        // Add to global queue — Mutex poisoning only occurs on thread panic
         self.inner.global_queue.lock().unwrap().push_back(task);
 
         // Wake a worker if parked
@@ -562,6 +572,7 @@ impl Executor {
         if let Some(task) = self.inner.get_task(task_id) {
             task.set_state(TaskState::Cancelled);
             // Cancel children recursively
+            // Mutex poisoning only occurs on thread panic
             let children = task.children.lock().unwrap().clone();
             for child_id in children {
                 self.cancel(child_id);
@@ -585,6 +596,7 @@ impl Executor {
     pub fn block_on(&self, task_id: TaskId) {
         while !self.is_complete(task_id) {
             // Run one task from global queue
+            // Mutex poisoning only occurs on thread panic
             if let Some(task) = self.inner.global_queue.lock().unwrap().pop_front() {
                 self.run_task(&task);
             } else {
@@ -634,6 +646,7 @@ impl Executor {
         ExecutorStats {
             total_tasks_executed: total_executed,
             total_tasks_stolen: total_stolen,
+            // Mutex poisoning only occurs on thread panic
             global_queue_len: self.inner.global_queue.lock().unwrap().len(),
             worker_queue_lengths: queue_lengths,
             active_workers: self.inner.active_workers.load(Ordering::Relaxed),
@@ -708,6 +721,7 @@ impl TimerWheel {
             cancelled: AtomicBool::new(false),
         });
 
+        // Mutex poisoning only occurs on thread panic
         let mut entries = self.entries.lock().unwrap();
         // Insert sorted by deadline
         let pos = entries
@@ -731,6 +745,7 @@ impl TimerWheel {
     /// Process expired timers, waking their tasks.
     pub fn process(&self) -> Option<Duration> {
         let now = Instant::now();
+        // Mutex poisoning only occurs on thread panic
         let mut entries = self.entries.lock().unwrap();
 
         // Wake all expired, non-cancelled timers
@@ -785,6 +800,7 @@ impl<T> Channel<T> {
             return Err(ChannelError::Closed(value));
         }
 
+        // Mutex poisoning only occurs on thread panic
         let mut buffer = self.buffer.lock().unwrap();
         if buffer.len() >= self.capacity {
             Err(ChannelError::Full(value))
@@ -800,6 +816,7 @@ impl<T> Channel<T> {
 
     /// Try to receive a value.
     pub fn try_recv(&self) -> Result<T, ChannelError<()>> {
+        // Mutex poisoning only occurs on thread panic
         let mut buffer = self.buffer.lock().unwrap();
         if let Some(value) = buffer.pop_front() {
             // Wake one sender
@@ -816,11 +833,13 @@ impl<T> Channel<T> {
 
     /// Register to wait for send.
     pub fn register_send_wait(&self, waker: Waker) {
+        // Mutex poisoning only occurs on thread panic
         self.send_waiters.lock().unwrap().push(waker);
     }
 
     /// Register to wait for receive.
     pub fn register_recv_wait(&self, waker: Waker) {
+        // Mutex poisoning only occurs on thread panic
         self.recv_waiters.lock().unwrap().push(waker);
     }
 
@@ -828,6 +847,7 @@ impl<T> Channel<T> {
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         // Wake all waiters
+        // Mutex poisoning only occurs on thread panic
         for waker in self.send_waiters.lock().unwrap().drain(..) {
             waker.wake();
         }
@@ -843,6 +863,7 @@ impl<T> Channel<T> {
 
     /// Get current length.
     pub fn len(&self) -> usize {
+        // Mutex poisoning only occurs on thread panic
         self.buffer.lock().unwrap().len()
     }
 
@@ -905,6 +926,7 @@ impl Semaphore {
 
     /// Register to wait for a permit.
     pub fn register_wait(&self, waker: Waker) {
+        // Mutex poisoning only occurs on thread panic
         self.waiters.lock().unwrap().push(waker);
     }
 
@@ -914,6 +936,7 @@ impl Semaphore {
         debug_assert!(prev < self.max_permits, "released more than acquired");
 
         // Wake one waiter
+        // Mutex poisoning only occurs on thread panic
         if let Some(waker) = self.waiters.lock().unwrap().pop() {
             waker.wake();
         }
@@ -954,6 +977,7 @@ impl<T> Oneshot<T> {
             return Err(value);
         }
 
+        // Mutex poisoning only occurs on thread panic
         *self.value.lock().unwrap() = Some(value);
         self.completed.store(true, Ordering::Release);
 
@@ -967,6 +991,7 @@ impl<T> Oneshot<T> {
     /// Try to receive the value.
     pub fn try_recv(&self) -> Option<T> {
         if self.completed.load(Ordering::Acquire) {
+            // Mutex poisoning only occurs on thread panic
             self.value.lock().unwrap().take()
         } else {
             None
@@ -975,6 +1000,7 @@ impl<T> Oneshot<T> {
 
     /// Register to wait for the value.
     pub fn register_wait(&self, waker: Waker) {
+        // Mutex poisoning only occurs on thread panic
         *self.waiter.lock().unwrap() = Some(waker);
     }
 
@@ -1022,6 +1048,7 @@ impl JoinHandle {
     /// Register to be woken when task completes.
     pub fn register_wait(&self, waker: Waker) {
         if let Some(task) = self.executor.get_task(self.task_id) {
+            // Mutex poisoning only occurs on thread panic
             task.waiters.lock().unwrap().push(waker);
         }
     }

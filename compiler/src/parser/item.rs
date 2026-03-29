@@ -1521,3 +1521,167 @@ impl<'a> Parser<'a> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::{Lexer, SourceFile as LexerSourceFile};
+
+    fn parse_item_str(s: &str) -> ParseResult<Item> {
+        let source = LexerSourceFile::new("test.quanta", s.to_string());
+        let mut lexer = Lexer::new(&source);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(&source, tokens);
+        parser.parse_item()
+    }
+
+    #[test]
+    fn fn_no_params() {
+        let item = parse_item_str("fn foo() -> i32 { 42 }").unwrap();
+        match &item.kind {
+            ItemKind::Function(f) => {
+                assert_eq!(f.name.as_str(), "foo");
+                assert!(f.sig.params.is_empty());
+                assert!(f.sig.return_ty.is_some());
+                assert!(f.body.is_some());
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fn_with_params() {
+        let item = parse_item_str("fn add(a: i32, b: i32) -> i32 { a + b }").unwrap();
+        match &item.kind {
+            ItemKind::Function(f) => {
+                assert_eq!(f.name.as_str(), "add");
+                assert_eq!(f.sig.params.len(), 2);
+                assert!(f.sig.return_ty.is_some());
+                assert!(f.body.is_some());
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn struct_with_fields() {
+        let item = parse_item_str("struct Point { x: f64, y: f64 }").unwrap();
+        match &item.kind {
+            ItemKind::Struct(s) => {
+                assert_eq!(s.name.as_str(), "Point");
+                match &s.fields {
+                    StructFields::Named(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        assert_eq!(fields[0].name.as_str(), "x");
+                        assert_eq!(fields[1].name.as_str(), "y");
+                    }
+                    other => panic!("expected Named fields, got {:?}", other),
+                }
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enum_with_variants() {
+        let item = parse_item_str("enum Option<T> { Some(T), None }").unwrap();
+        match &item.kind {
+            ItemKind::Enum(e) => {
+                assert_eq!(e.name.as_str(), "Option");
+                assert!(!e.generics.params.is_empty());
+                assert_eq!(e.variants.len(), 2);
+                assert_eq!(e.variants[0].name.as_str(), "Some");
+                assert_eq!(e.variants[1].name.as_str(), "None");
+            }
+            other => panic!("expected Enum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn trait_definition() {
+        let item = parse_item_str("trait Display { fn fmt(&self) -> str; }").unwrap();
+        match &item.kind {
+            ItemKind::Trait(t) => {
+                assert_eq!(t.name.as_str(), "Display");
+                assert_eq!(t.items.len(), 1);
+                match &t.items[0].kind {
+                    TraitItemKind::Function(f) => {
+                        assert_eq!(f.name.as_str(), "fmt");
+                        assert!(f.body.is_none(), "trait method should be bodyless");
+                    }
+                    other => panic!("expected trait Function item, got {:?}", other),
+                }
+            }
+            other => panic!("expected Trait, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn impl_block() {
+        let item = parse_item_str(
+            "impl Point { fn new(x: f64, y: f64) -> Point { Point { x: x, y: y } } }"
+        ).unwrap();
+        match &item.kind {
+            ItemKind::Impl(imp) => {
+                assert!(imp.trait_ref.is_none(), "inherent impl has no trait ref");
+                assert!(!imp.items.is_empty());
+                match &imp.items[0].kind {
+                    ImplItemKind::Function(f) => {
+                        assert_eq!(f.name.as_str(), "new");
+                        assert_eq!(f.sig.params.len(), 2);
+                    }
+                    other => panic!("expected impl Function item, got {:?}", other),
+                }
+            }
+            other => panic!("expected Impl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn generic_function() {
+        let item = parse_item_str("fn identity<T>(x: T) -> T { x }").unwrap();
+        match &item.kind {
+            ItemKind::Function(f) => {
+                assert_eq!(f.name.as_str(), "identity");
+                assert_eq!(f.generics.params.len(), 1);
+                assert_eq!(f.sig.params.len(), 1);
+                assert!(f.sig.return_ty.is_some());
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pub_function() {
+        let item = parse_item_str("pub fn greet() {}").unwrap();
+        assert!(matches!(&item.vis, Visibility::Public(_)));
+        assert!(matches!(&item.kind, ItemKind::Function(_)));
+    }
+
+    #[test]
+    fn unit_struct() {
+        let item = parse_item_str("struct Unit;").unwrap();
+        match &item.kind {
+            ItemKind::Struct(s) => {
+                assert_eq!(s.name.as_str(), "Unit");
+                assert!(matches!(&s.fields, StructFields::Unit));
+            }
+            other => panic!("expected Struct(Unit), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tuple_struct() {
+        let item = parse_item_str("struct Pair(i32, i32);").unwrap();
+        match &item.kind {
+            ItemKind::Struct(s) => {
+                assert_eq!(s.name.as_str(), "Pair");
+                match &s.fields {
+                    StructFields::Tuple(fields) => assert_eq!(fields.len(), 2),
+                    other => panic!("expected Tuple fields, got {:?}", other),
+                }
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+}

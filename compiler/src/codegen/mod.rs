@@ -17,13 +17,23 @@
 //! AST -> MIR (Mid-level IR) -> Backend-specific output
 //! ```
 //!
+//! ## Unwrap Policy
+//!
+//! Code generation operates on ASTs that have already been parsed, resolved,
+//! and type-checked. `.unwrap()` calls in codegen are assertions that the
+//! type checker's guarantees hold — an unwrap failure here indicates a
+//! compiler bug in an earlier phase, not malformed user input.
+//!
+//! This is consistent with how `rustc`, `cranelift`, and other production
+//! compilers handle post-validation code generation.
+//!
 //! ## Supported Backends
 //!
-//! - **C**: Transpiles to C99 for maximum portability
-//! - **x86-64**: Native machine code for x86-64 processors
-//! - **ARM64**: Native machine code for ARM64/AArch64 processors
-//! - **WASM**: WebAssembly for web and edge deployment
-//! - **SPIR-V**: GPU shaders and compute kernels
+//! - **C**: Transpiles to C99 for maximum portability (production)
+//! - **x86-64**: Native machine code for x86-64 processors (experimental)
+//! - **ARM64**: Native machine code for ARM64/AArch64 processors (experimental)
+//! - **WASM**: WebAssembly for web and edge deployment (experimental)
+//! - **SPIR-V**: GPU shaders and compute kernels (experimental)
 //!
 //! ## Example
 //!

@@ -85,6 +85,13 @@ impl<'ctx> TypeChecker<'ctx> {
         self.ctx.define_var(Arc::from("saturate"), Ty::fresh_var());
         self.ctx.define_var(Arc::from("discard"), Ty::fresh_var());
 
+        // Register runtime built-in functions
+        self.ctx.define_var(Arc::from("assert"), Ty::function(
+            vec![Ty::bool()], Ty::unit(),
+        ));
+        self.ctx.define_var(Arc::from("assert_eq"), Ty::fresh_var());
+        self.ctx.define_var(Arc::from("println"), Ty::fresh_var());
+
         // First pass: collect all type definitions
         for item in &module.items {
             self.collect_item(item);
@@ -191,6 +198,7 @@ impl<'ctx> TypeChecker<'ctx> {
                 let ty = self.lower_type(&s.ty);
                 self.ctx.define_var(s.name.name.clone(), ty);
             }
+            ItemKind::Use(use_def) => self.resolve_use(&use_def.tree),
             // Module items are handled during the check phase (check_mod),
             // not during collection. Full module support requires proper
             // scoped type registration to avoid name collisions.
@@ -898,6 +906,44 @@ impl<'ctx> TypeChecker<'ctx> {
         self.ctx.define_var(s.name.name.clone(), ty);
     }
 
+    /// Resolve a `use` statement, importing bindings from a module into the
+    /// current scope.
+    fn resolve_use(&mut self, tree: &ast::UseTree) {
+        match &tree.kind {
+            ast::UseTreeKind::Simple { path, rename } => {
+                // use foo::bar; or use foo::bar as baz;
+                if path.segments.len() >= 2 {
+                    let module = path.segments[0].ident.name.as_ref();
+                    let item = &path.segments[path.segments.len() - 1].ident.name;
+                    let local_name = rename.as_ref()
+                        .map(|r| r.name.clone())
+                        .unwrap_or_else(|| item.clone());
+
+                    if let Some(ty) = self.ctx.lookup_module_binding(module, item.as_ref()) {
+                        self.ctx.define_var(local_name, ty);
+                    }
+                }
+            }
+            ast::UseTreeKind::Glob(path) => {
+                // use foo::*;
+                if let Some(ident) = path.last_ident() {
+                    let module = ident.name.as_ref();
+                    if let Some(bindings) = self.ctx.clone_module_bindings(module) {
+                        for (name, scheme) in bindings {
+                            self.ctx.define_var(name, scheme.instantiate());
+                        }
+                    }
+                }
+            }
+            ast::UseTreeKind::Nested { path: _, trees } => {
+                // use foo::{bar, baz};
+                for sub_tree in trees {
+                    self.resolve_use(sub_tree);
+                }
+            }
+        }
+    }
+
     fn check_mod(&mut self, m: &ast::ModDef) {
         if let Some(content) = &m.content {
             self.ctx.push_scope(ScopeKind::Module);
@@ -911,6 +957,12 @@ impl<'ctx> TypeChecker<'ctx> {
             for item in &content.items {
                 self.check_item(item);
             }
+
+            // Save module bindings for use-statement resolution before
+            // popping the scope (so we capture the module's definitions).
+            let module_name = m.name.name.clone();
+            let bindings = self.ctx.current_scope_bindings();
+            self.ctx.register_module_bindings(module_name, bindings);
 
             self.ctx.pop_scope();
 

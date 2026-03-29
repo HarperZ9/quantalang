@@ -236,6 +236,12 @@ pub enum TypeError {
     #[error("non-exhaustive patterns")]
     NonExhaustivePatterns,
 
+    /// Non-exhaustive match (missing specific enum variants).
+    #[error("non-exhaustive match: missing variants {}", missing_variants.join(", "))]
+    NonExhaustiveMatch {
+        missing_variants: Vec<String>,
+    },
+
     // =========================================================================
     // CONTROL FLOW ERRORS
     // =========================================================================
@@ -424,6 +430,12 @@ impl TypeError {
                 Some(format!(
                     "add a handler clause for `{}`:\n  {}.{}(params) => |resume| {{\n      // handle the {} operation\n      resume(())\n  }},",
                     operation, effect_name, operation, operation
+                ))
+            }
+            TypeError::NonExhaustiveMatch { missing_variants } => {
+                Some(format!(
+                    "add arms for the missing variants: {}, or add a wildcard `_` arm",
+                    missing_variants.join(", ")
                 ))
             }
             _ => None,

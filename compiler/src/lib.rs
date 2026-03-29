@@ -11,7 +11,7 @@
 // - First-class effects system
 // - Embedded DSLs (SQL, Regex, Math, Finance, Graphics)
 // - Universal compilation (x86-64, ARM64, WASM, SPIR-V, C, JS)
-// - AI-native constructs (@ai decorator, neural types)
+// - @ai decorator, neural types (@ai decorator, neural types)
 // - Self-evolution through Axiom integration
 //
 // ===============================================================================

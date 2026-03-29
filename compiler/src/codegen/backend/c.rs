@@ -8,6 +8,10 @@
 //!
 //! Transpiles MIR to C99-compliant code for maximum portability.
 
+// NOTE: `.unwrap()` calls in this backend are intentional assertions on
+// type-checked AST invariants. Failures indicate compiler bugs in earlier
+// phases, not user input errors. See codegen/mod.rs for the full unwrap policy.
+
 use std::fmt::Write;
 use std::sync::Arc;
 

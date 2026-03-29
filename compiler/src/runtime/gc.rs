@@ -364,6 +364,7 @@ impl CycleCollector {
         hdr.set_buffered(true);
         hdr.set_color(GcColor::Purple);
 
+        // Mutex poisoning only occurs on thread panic
         let mut candidates = self.candidates.lock().unwrap();
         candidates.push(header);
 
@@ -390,6 +391,7 @@ impl CycleCollector {
 
     /// Mark candidates as potential roots.
     fn mark_roots(&self) {
+        // Mutex poisoning only occurs on thread panic
         let mut candidates = self.candidates.lock().unwrap();
         let mut roots = self.roots.lock().unwrap();
 
@@ -434,6 +436,7 @@ impl CycleCollector {
 
     /// Scan roots to find garbage.
     fn scan_roots(&self) {
+        // Mutex poisoning only occurs on thread panic
         let roots = self.roots.lock().unwrap();
 
         for &header in roots.iter() {
@@ -488,6 +491,7 @@ impl CycleCollector {
 
     /// Collect white (garbage) nodes.
     fn collect_white(&self) {
+        // Mutex poisoning only occurs on thread panic
         let mut roots = self.roots.lock().unwrap();
 
         for &header in roots.iter() {
@@ -577,6 +581,7 @@ impl Arena {
             return self.alloc(size, align);
         }
 
+        // Safe: chunks is never empty — constructor and alloc both guarantee at least one chunk
         let ptr = self.chunks.last_mut().unwrap().as_mut_ptr();
         let result = unsafe { ptr.add(aligned_pos) };
         self.pos = aligned_pos + size;
@@ -652,6 +657,7 @@ impl<T> MemoryPool<T> {
     pub fn alloc(&self) -> NonNull<T> {
         // Try to get from free list
         {
+            // Mutex poisoning only occurs on thread panic
             let mut free_list = self.free_list.lock().unwrap();
             if let Some(ptr) = free_list.pop() {
                 self.allocated.fetch_add(1, Ordering::Relaxed);
@@ -672,6 +678,7 @@ impl<T> MemoryPool<T> {
 
     /// Return to the pool.
     pub fn free(&self, ptr: NonNull<T>) {
+        // Mutex poisoning only occurs on thread panic
         let mut free_list = self.free_list.lock().unwrap();
 
         // Only keep up to capacity in free list
@@ -696,6 +703,7 @@ impl<T> MemoryPool<T> {
 
 impl<T> Drop for MemoryPool<T> {
     fn drop(&mut self) {
+        // Mutex poisoning only occurs on thread panic
         let free_list = self.free_list.lock().unwrap();
         let layout = Layout::new::<T>();
 

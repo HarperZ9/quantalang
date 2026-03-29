@@ -1762,3 +1762,270 @@ impl<'a> Parser<'a> {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::{Lexer, SourceFile as LexerSourceFile};
+
+    /// Parse a standalone expression by wrapping it in `fn test() { EXPR; }`.
+    fn parse_expr_str(s: &str) -> ParseResult<Expr> {
+        let source = LexerSourceFile::new("test.quanta", format!("fn test() {{ {}; }}", s));
+        let mut lexer = Lexer::new(&source);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(&source, tokens);
+        parser.advance(); // fn
+        parser.advance(); // test
+        parser.advance(); // (
+        parser.advance(); // )
+        parser.advance(); // {
+        parser.parse_expr()
+    }
+
+    // =========================================================================
+    // OPERATOR PRECEDENCE (core Pratt parser correctness)
+    // =========================================================================
+
+    #[test]
+    fn mul_binds_tighter_than_add() {
+        // 1 + 2 * 3 => Add(1, Mul(2, 3))
+        let expr = parse_expr_str("1 + 2 * 3").unwrap();
+        match &expr.kind {
+            ExprKind::Binary { op: BinOp::Add, left, right } => {
+                assert!(matches!(&left.kind, ExprKind::Literal(Literal::Int { value: 1, .. })));
+                assert!(matches!(&right.kind, ExprKind::Binary { op: BinOp::Mul, .. }));
+            }
+            other => panic!("expected Add(1, Mul(2,3)), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn add_is_left_associative() {
+        // 1 + 2 + 3 => Add(Add(1, 2), 3)
+        let expr = parse_expr_str("1 + 2 + 3").unwrap();
+        match &expr.kind {
+            ExprKind::Binary { op: BinOp::Add, left, right } => {
+                assert!(matches!(&left.kind, ExprKind::Binary { op: BinOp::Add, .. }));
+                assert!(matches!(&right.kind, ExprKind::Literal(Literal::Int { value: 3, .. })));
+            }
+            other => panic!("expected Add(Add(1,2), 3), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn comparison_binds_looser_than_arithmetic() {
+        // a + b == c * d => Eq(Add(a,b), Mul(c,d))
+        let expr = parse_expr_str("a + b == c * d").unwrap();
+        match &expr.kind {
+            ExprKind::Binary { op: BinOp::Eq, left, right } => {
+                assert!(matches!(&left.kind, ExprKind::Binary { op: BinOp::Add, .. }));
+                assert!(matches!(&right.kind, ExprKind::Binary { op: BinOp::Mul, .. }));
+            }
+            other => panic!("expected Eq(Add(_,_), Mul(_,_)), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn logical_and_binds_tighter_than_or() {
+        // a || b && c => Or(a, And(b, c))
+        let expr = parse_expr_str("a || b && c").unwrap();
+        match &expr.kind {
+            ExprKind::Binary { op: BinOp::Or, left, right } => {
+                assert!(matches!(&left.kind, ExprKind::Ident(_) | ExprKind::Path(_)));
+                assert!(matches!(&right.kind, ExprKind::Binary { op: BinOp::And, .. }));
+            }
+            other => panic!("expected Or(a, And(b,c)), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unary_minus_binds_tighter_than_binary() {
+        // -a + b => Add(Neg(a), b)
+        let expr = parse_expr_str("-a + b").unwrap();
+        match &expr.kind {
+            ExprKind::Binary { op: BinOp::Add, left, right } => {
+                assert!(matches!(&left.kind, ExprKind::Unary { op: UnaryOp::Neg, .. }));
+                assert!(matches!(&right.kind, ExprKind::Ident(_) | ExprKind::Path(_)));
+            }
+            other => panic!("expected Add(Neg(a), b), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn method_call_chains_left() {
+        // a.b().c() => MethodCall(MethodCall(a, b, []), c, [])
+        let expr = parse_expr_str("a.b().c()").unwrap();
+        match &expr.kind {
+            ExprKind::MethodCall { receiver, method, .. } => {
+                assert_eq!(method.as_str(), "c");
+                assert!(matches!(&receiver.kind, ExprKind::MethodCall { method: inner_m, .. } if inner_m.as_str() == "b"));
+            }
+            other => panic!("expected MethodCall(MethodCall(a,b),c), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn index_postfix_binds_tight() {
+        // a[0].b => Field(Index(a, 0), b)
+        let expr = parse_expr_str("a[0].b").unwrap();
+        match &expr.kind {
+            ExprKind::Field { expr: inner, field } => {
+                assert_eq!(field.as_str(), "b");
+                assert!(matches!(&inner.kind, ExprKind::Index { .. }));
+            }
+            other => panic!("expected Field(Index(a,0), b), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn assignment_is_right_associative() {
+        // a = b = c => Assign(a, Assign(b, c))
+        let expr = parse_expr_str("a = b = c").unwrap();
+        match &expr.kind {
+            ExprKind::Assign { op: AssignOp::Assign, target, value } => {
+                assert!(matches!(&target.kind, ExprKind::Ident(_) | ExprKind::Path(_)));
+                assert!(matches!(&value.kind, ExprKind::Assign { op: AssignOp::Assign, .. }));
+            }
+            other => panic!("expected Assign(a, Assign(b, c)), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sub_is_left_associative() {
+        // 10 - 3 - 2 => Sub(Sub(10, 3), 2)
+        let expr = parse_expr_str("10 - 3 - 2").unwrap();
+        match &expr.kind {
+            ExprKind::Binary { op: BinOp::Sub, left, right } => {
+                assert!(matches!(&left.kind, ExprKind::Binary { op: BinOp::Sub, .. }));
+                assert!(matches!(&right.kind, ExprKind::Literal(Literal::Int { value: 2, .. })));
+            }
+            other => panic!("expected Sub(Sub(10,3), 2), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mixed_mul_div_left_associative() {
+        // 6 * 2 / 3 => Div(Mul(6, 2), 3)
+        let expr = parse_expr_str("6 * 2 / 3").unwrap();
+        match &expr.kind {
+            ExprKind::Binary { op: BinOp::Div, left, right } => {
+                assert!(matches!(&left.kind, ExprKind::Binary { op: BinOp::Mul, .. }));
+                assert!(matches!(&right.kind, ExprKind::Literal(Literal::Int { value: 3, .. })));
+            }
+            other => panic!("expected Div(Mul(6,2), 3), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bitwise_and_binds_tighter_than_bitwise_or() {
+        // a | b & c => BitOr(a, BitAnd(b, c))
+        let expr = parse_expr_str("a | b & c").unwrap();
+        match &expr.kind {
+            ExprKind::Binary { op: BinOp::BitOr, left, right } => {
+                assert!(matches!(&left.kind, ExprKind::Ident(_) | ExprKind::Path(_)));
+                assert!(matches!(&right.kind, ExprKind::Binary { op: BinOp::BitAnd, .. }));
+            }
+            other => panic!("expected BitOr(a, BitAnd(b,c)), got {:?}", other),
+        }
+    }
+
+    // =========================================================================
+    // EXPRESSION FORMS
+    // =========================================================================
+
+    #[test]
+    fn if_else_parses() {
+        let expr = parse_expr_str("if x { 1 } else { 2 }").unwrap();
+        match &expr.kind {
+            ExprKind::If { condition, then_branch, else_branch } => {
+                assert!(matches!(&condition.kind, ExprKind::Ident(_) | ExprKind::Path(_)));
+                assert!(!then_branch.stmts.is_empty() || then_branch.stmts.is_empty());
+                assert!(else_branch.is_some());
+            }
+            other => panic!("expected If {{ .. }} else {{ .. }}, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn closure_parses() {
+        let expr = parse_expr_str("|x, y| x + y").unwrap();
+        match &expr.kind {
+            ExprKind::Closure { params, body, .. } => {
+                assert_eq!(params.len(), 2);
+                assert!(matches!(&body.kind, ExprKind::Binary { op: BinOp::Add, .. }));
+            }
+            other => panic!("expected Closure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nested_function_call() {
+        // f(g(x), h(y, z))
+        let expr = parse_expr_str("f(g(x), h(y, z))").unwrap();
+        match &expr.kind {
+            ExprKind::Call { func, args } => {
+                assert!(matches!(&func.kind, ExprKind::Ident(_) | ExprKind::Path(_)));
+                assert_eq!(args.len(), 2);
+                // First arg: g(x) — a Call
+                assert!(matches!(&args[0].kind, ExprKind::Call { .. }));
+                // Second arg: h(y, z) — a Call with 2 args
+                match &args[1].kind {
+                    ExprKind::Call { args: inner_args, .. } => assert_eq!(inner_args.len(), 2),
+                    other => panic!("expected Call for h(y,z), got {:?}", other),
+                }
+            }
+            other => panic!("expected Call(f, [Call(g,..), Call(h,..)]), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn array_literal() {
+        let expr = parse_expr_str("[1, 2, 3]").unwrap();
+        match &expr.kind {
+            ExprKind::Array(elems) => assert_eq!(elems.len(), 3),
+            other => panic!("expected Array with 3 elements, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn range_expression() {
+        let expr = parse_expr_str("0..10").unwrap();
+        match &expr.kind {
+            ExprKind::Range { start, end, inclusive } => {
+                assert!(start.is_some());
+                assert!(end.is_some());
+                assert!(!inclusive);
+            }
+            other => panic!("expected Range(0, 10, exclusive), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unary_not() {
+        let expr = parse_expr_str("!flag").unwrap();
+        match &expr.kind {
+            ExprKind::Unary { op: UnaryOp::Not, expr: inner } => {
+                assert!(matches!(&inner.kind, ExprKind::Ident(_) | ExprKind::Path(_)));
+            }
+            other => panic!("expected Not(flag), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parenthesized_overrides_precedence() {
+        // (1 + 2) * 3 => Mul(Paren(Add(1,2)), 3) or Mul(Add(1,2), 3)
+        let expr = parse_expr_str("(1 + 2) * 3").unwrap();
+        match &expr.kind {
+            ExprKind::Binary { op: BinOp::Mul, left, right } => {
+                // The LHS is the parenthesized add (may be wrapped in Paren)
+                let inner = match &left.kind {
+                    ExprKind::Paren(inner) => &inner.kind,
+                    other => other,
+                };
+                assert!(matches!(inner, ExprKind::Binary { op: BinOp::Add, .. }));
+                assert!(matches!(&right.kind, ExprKind::Literal(Literal::Int { value: 3, .. })));
+            }
+            other => panic!("expected Mul(Add(1,2), 3), got {:?}", other),
+        }
+    }
+}

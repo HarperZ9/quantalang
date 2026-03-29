@@ -502,45 +502,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_version_parse() {
-        let v: Version = "1.2.3".parse().unwrap();
+    fn test_version_parse() -> Result<(), VersionError> {
+        let v: Version = "1.2.3".parse()?;
         assert_eq!(v.major, 1);
         assert_eq!(v.minor, 2);
         assert_eq!(v.patch, 3);
+        Ok(())
     }
 
     #[test]
-    fn test_version_prerelease() {
-        let v: Version = "1.0.0-alpha.1".parse().unwrap();
+    fn test_version_prerelease() -> Result<(), VersionError> {
+        let v: Version = "1.0.0-alpha.1".parse()?;
         assert_eq!(v.pre.len(), 2);
         assert_eq!(v.pre[0], PreRelease::Alphanumeric("alpha".to_string()));
         assert_eq!(v.pre[1], PreRelease::Numeric(1));
+        Ok(())
     }
 
     #[test]
-    fn test_version_ordering() {
-        let v1: Version = "1.0.0".parse().unwrap();
-        let v2: Version = "2.0.0".parse().unwrap();
-        let v3: Version = "1.0.0-alpha".parse().unwrap();
+    fn test_version_ordering() -> Result<(), VersionError> {
+        let v1: Version = "1.0.0".parse()?;
+        let v2: Version = "2.0.0".parse()?;
+        let v3: Version = "1.0.0-alpha".parse()?;
 
         assert!(v1 < v2);
         assert!(v3 < v1); // Pre-release < release
+        Ok(())
     }
 
     #[test]
-    fn test_caret_matches() {
-        let req = VersionReq::caret("1.2.3".parse().unwrap());
-        assert!(req.matches(&"1.2.3".parse().unwrap()));
-        assert!(req.matches(&"1.5.0".parse().unwrap()));
-        assert!(!req.matches(&"2.0.0".parse().unwrap()));
-        assert!(!req.matches(&"1.2.2".parse().unwrap()));
+    fn test_caret_matches() -> Result<(), VersionError> {
+        let req = VersionReq::caret("1.2.3".parse()?);
+        assert!(req.matches(&"1.2.3".parse()?));
+        assert!(req.matches(&"1.5.0".parse()?));
+        assert!(!req.matches(&"2.0.0".parse()?));
+        assert!(!req.matches(&"1.2.2".parse()?));
+        Ok(())
     }
 
     #[test]
-    fn test_tilde_matches() {
-        let req = VersionReq::tilde("1.2.3".parse().unwrap());
-        assert!(req.matches(&"1.2.3".parse().unwrap()));
-        assert!(req.matches(&"1.2.5".parse().unwrap()));
-        assert!(!req.matches(&"1.3.0".parse().unwrap()));
+    fn test_tilde_matches() -> Result<(), VersionError> {
+        let req = VersionReq::tilde("1.2.3".parse()?);
+        assert!(req.matches(&"1.2.3".parse()?));
+        assert!(req.matches(&"1.2.5".parse()?));
+        assert!(!req.matches(&"1.3.0".parse()?));
+        Ok(())
     }
 }

@@ -629,3 +629,146 @@ impl<'a> Parser<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::{Lexer, SourceFile as LexerSourceFile};
+
+    /// Parse a pattern by wrapping it in `fn test() { let PATTERN = x; }`.
+    fn parse_pattern_str(s: &str) -> ParseResult<Pattern> {
+        let source = LexerSourceFile::new(
+            "test.quanta",
+            format!("fn test() {{ let {} = x; }}", s),
+        );
+        let mut lexer = Lexer::new(&source);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(&source, tokens);
+        // Skip: fn(0) test(1) ((2) )(3) {(4) let(5) → now at pattern
+        for _ in 0..6 {
+            parser.advance();
+        }
+        parser.parse_pattern()
+    }
+
+    #[test]
+    fn wildcard_pattern() {
+        // The lexer produces Ident for `_` (not TokenKind::Underscore),
+        // so the pattern parser treats it as an identifier binding.
+        let pat = parse_pattern_str("_").unwrap();
+        match &pat.kind {
+            PatternKind::Ident { name, .. } => assert_eq!(name.as_str(), "_"),
+            PatternKind::Wildcard => {} // accepted if lexer changes
+            other => panic!("expected Ident(_) or Wildcard, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn binding_pattern() {
+        let pat = parse_pattern_str("x").unwrap();
+        match &pat.kind {
+            PatternKind::Ident { name, mutability, .. } => {
+                assert_eq!(name.as_str(), "x");
+                assert_eq!(*mutability, Mutability::Immutable);
+            }
+            other => panic!("expected Ident pattern, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tuple_destructure() {
+        let pat = parse_pattern_str("(a, b, c)").unwrap();
+        match &pat.kind {
+            PatternKind::Tuple(patterns) => {
+                assert_eq!(patterns.len(), 3);
+                assert!(matches!(&patterns[0].kind, PatternKind::Ident { name, .. } if name.as_str() == "a"));
+                assert!(matches!(&patterns[1].kind, PatternKind::Ident { name, .. } if name.as_str() == "b"));
+                assert!(matches!(&patterns[2].kind, PatternKind::Ident { name, .. } if name.as_str() == "c"));
+            }
+            other => panic!("expected Tuple pattern, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn struct_destructure() {
+        let pat = parse_pattern_str("Point { x, y }").unwrap();
+        match &pat.kind {
+            PatternKind::Struct { path, fields, rest } => {
+                assert_eq!(path.segments.last().unwrap().ident.as_str(), "Point");
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name.as_str(), "x");
+                assert!(fields[0].is_shorthand);
+                assert_eq!(fields[1].name.as_str(), "y");
+                assert!(rest.is_none());
+            }
+            other => panic!("expected Struct pattern, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enum_pattern() {
+        let pat = parse_pattern_str("Some(value)").unwrap();
+        match &pat.kind {
+            PatternKind::TupleStruct { path, patterns } => {
+                assert_eq!(path.segments.last().unwrap().ident.as_str(), "Some");
+                assert_eq!(patterns.len(), 1);
+                assert!(matches!(&patterns[0].kind, PatternKind::Ident { name, .. } if name.as_str() == "value"));
+            }
+            other => panic!("expected TupleStruct pattern, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nested_pattern() {
+        let pat = parse_pattern_str("Some((a, b))").unwrap();
+        match &pat.kind {
+            PatternKind::TupleStruct { path, patterns } => {
+                assert_eq!(path.segments.last().unwrap().ident.as_str(), "Some");
+                assert_eq!(patterns.len(), 1);
+                assert!(matches!(&patterns[0].kind, PatternKind::Tuple(_)));
+            }
+            other => panic!("expected TupleStruct(Some, [Tuple]), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn literal_pattern() {
+        let pat = parse_pattern_str("42").unwrap();
+        match &pat.kind {
+            PatternKind::Literal(Literal::Int { value: 42, .. }) => {}
+            other => panic!("expected Literal(42), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn or_pattern() {
+        let pat = parse_pattern_str("A | B").unwrap();
+        match &pat.kind {
+            PatternKind::Or(alternatives) => {
+                assert_eq!(alternatives.len(), 2);
+            }
+            other => panic!("expected Or pattern, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mut_binding() {
+        let pat = parse_pattern_str("mut x").unwrap();
+        match &pat.kind {
+            PatternKind::Ident { name, mutability, .. } => {
+                assert_eq!(name.as_str(), "x");
+                assert_eq!(*mutability, Mutability::Mutable);
+            }
+            other => panic!("expected mut Ident, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn slice_pattern() {
+        let pat = parse_pattern_str("[a, b, c]").unwrap();
+        match &pat.kind {
+            PatternKind::Slice(patterns) => assert_eq!(patterns.len(), 3),
+            other => panic!("expected Slice pattern, got {:?}", other),
+        }
+    }
+}

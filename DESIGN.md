@@ -394,6 +394,62 @@ The MIR uses SSA form with explicit basic blocks rather than directly walking th
 2. **Backend simplicity**: each backend only needs to emit straight-line code per block plus terminators, rather than handling recursive AST patterns
 3. **Future optimization**: SSA is the standard form for dataflow analysis, enabling future passes like GVN, LICM, and register allocation for the native backends
 
+## Type System Design Rationale
+
+### Why bidirectional inference instead of Algorithm W?
+
+Algorithm W (Damas-Milner) infers types purely bottom-up: it synthesizes the type of every expression, then unifies at usage sites. This works for Haskell-style languages where every expression has exactly one principal type.
+
+QuantaLang has features that break the Algorithm W assumption:
+- **Integer literal overloading**: `42` could be `i8`, `i32`, `i64`, `u32`, etc. Algorithm W would either default to one type or require explicit annotation on every literal.
+- **Struct literal disambiguation**: `Point { x: 1, y: 2 }` needs to know the target type to resolve which `Point` is being constructed when there are multiple types with the same name across modules.
+- **Method call resolution**: `x.foo()` requires knowing the type of `x` to look up `foo` in the correct impl. With traits, there may be multiple `foo` methods, and only the expected return type can disambiguate.
+
+Bidirectional inference solves this by combining synthesis (bottom-up) with checking (top-down). When a `let x: i32 = 42;` is encountered, the `i32` annotation flows *down* into the literal, constraining it directly. When calling `f(42)` where `f` expects `u64`, the expected parameter type flows down to resolve the literal.
+
+The cost is implementation complexity — `infer_expr` (synthesis) and `check_expr` (checking) are separate code paths that must stay in sync. In practice, `check_expr` delegates to `infer_expr` for most node types and only intervenes where top-down information is useful (literals, closures, struct literals).
+
+### Why Pratt parsing for expressions?
+
+Recursive descent handles statements and items well, but expression parsing with 15 precedence levels would require 15 mutually recursive functions (`parse_or_expr` calling `parse_and_expr` calling `parse_compare_expr` calling...). Adding a new precedence level means inserting a function in the middle of the chain and updating all callers.
+
+Pratt parsing collapses this into a single loop driven by a binding power table. Adding a new operator means adding one entry to `infix_binding_power()`. The code is shorter (the entire expression parser is one function with helpers) and the precedence relationships are explicit in the `bp` module rather than implicit in the call graph.
+
+The tradeoff: Pratt parsing is harder to read for someone unfamiliar with the technique. The `parse_expr_with_bp(min_bp)` function is a tight loop that's not obviously correct on first read. The 42 precedence tests exist partly to compensate for this — they prove the binding powers are correct even though the code is dense.
+
+### Why setjmp/longjmp for algebraic effects?
+
+Algebraic effects need non-local control flow: `perform` jumps from the effect site to the enclosing `handle` block, and `resume` continues execution after the `perform`. There are three implementation strategies:
+
+1. **CPS transform**: Rewrite every effectful function into continuation-passing style. Correct but doubles code size and makes generated C unreadable.
+2. **Stack switching**: Use fibers or coroutines. Correct and efficient but requires platform-specific assembly (ucontext on Linux, fibers on Windows) and defeats C compiler optimizations.
+3. **setjmp/longjmp**: Use the C runtime's non-local goto. Works on every platform, no assembly needed, zero overhead when no effect is performed.
+
+We chose setjmp/longjmp because it matches the C backend's portability goal. The handler saves state with `setjmp`, the body runs normally, and `perform` calls `longjmp` to jump back to the handler with an operation ID. The handler dispatches on the ID and can `resume` by calling the continuation function directly.
+
+The limitation: `longjmp` destroys stack frames between the handler and the perform site, so `resume` can only be called once (one-shot continuations). Multi-shot continuations (calling `resume` multiple times for the same `perform`) would require stack copying, which setjmp doesn't support. In practice, one-shot is sufficient for error handling, async simulation, and resource management — the primary use cases.
+
+### Why color space annotations in the type system?
+
+Color science has a class of bugs that type systems normally can't catch: passing a linear-light RGB value to a function expecting sRGB, or mixing Display P3 and Rec.709 primaries. These are all `(f32, f32, f32)` at the type level but semantically incompatible.
+
+QuantaLang's type annotations attach metadata strings (like `ColorSpace:Linear` or `ColorSpace:sRGB`) to types. The unifier checks annotation compatibility: if both operands of a binary operation carry annotations in the same category, they must match. This catches `linear_rgb + srgb_rgb` at compile time.
+
+The design is intentionally minimal — annotations are strings, not a full dependent type system. They're checked structurally (category:value matching) rather than requiring a dedicated solver. This keeps the type checker simple while catching the most common class of color space bugs.
+
+The limitation: annotations are per-type, not per-value. If a function takes `Vec3` and you want one `Vec3` to be linear and another to be sRGB, you need different type aliases. This is a pragmatic compromise — full dependent types would be more expressive but dramatically more complex.
+
+### Known Limitations
+
+1. **Generics are monomorphized eagerly**: every generic instantiation generates a separate function. No polymorphic compilation. This means compile times scale with the number of instantiations, not the number of generic definitions.
+2. **No lifetime analysis**: The `Lifetime` type exists structurally (`TyKind::Ref(Option<Lifetime>, Mutability, Box<Ty>)`) and the parser handles lifetime annotations, but references are unchecked — the C backend emits raw pointers and the type checker strips lifetimes during lowering. Use-after-free is possible and undetected. A borrow checker is the most important missing feature and requires: (a) region inference assigning lifetime variables to every reference, (b) outlives constraint generation from assignments and returns, (c) NLL-style constraint solving, and (d) MIR-level validation of the borrow graph. This is an estimated 3,000-5,000 line addition and the highest-priority item for the next major version.
+3. **Module system is partial**: Inline `mod foo { ... }` blocks work with proper scoping, and `use` statements resolve through a module registry. However, external file modules (`mod foo;` loading from `foo.quanta`) and the `include!()` preprocessor are not yet unified into a single module resolver. Separate compilation and incremental builds are not supported.
+4. **Effect system is one-shot only**: `resume` can be called at most once per `perform` due to the setjmp/longjmp implementation. This is a deliberate trade-off for C backend portability — CPS transform would enable multi-shot but doubles code size and makes generated C unreadable.
+
+### Resolved (Previously Listed as Limitations)
+
+- **Pattern exhaustiveness** (resolved in v1.0.2): The compiler now performs exhaustiveness checking on match expressions over enum types. Missing variants produce a type error naming the uncovered variants. Wildcard and binding patterns are recognized as catch-all arms. The check resolves the enum from pattern paths when the scrutinee type is an unresolved inference variable.
+
 ## Source File Index
 
 ### Core Pipeline

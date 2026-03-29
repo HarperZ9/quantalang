@@ -53,6 +53,10 @@ pub struct TypeContext {
     /// Populated when entering a generic function so that lookup_method can
     /// resolve trait methods on type parameters through their bounds.
     param_trait_bounds: HashMap<Arc<str>, Vec<Arc<str>>>,
+
+    /// Module registry: module_name -> (variable bindings, type definitions).
+    /// Populated by check_mod so that `use` statements can import names.
+    module_bindings: HashMap<Arc<str>, HashMap<Arc<str>, TypeScheme>>,
 }
 
 /// A scope containing variable bindings.
@@ -282,6 +286,7 @@ impl TypeContext {
             current_self_ty: None,
             inherent_methods: HashMap::new(),
             param_trait_bounds: HashMap::new(),
+            module_bindings: HashMap::new(),
         };
         ctx.init_builtins();
         ctx
@@ -579,6 +584,34 @@ impl TypeContext {
             }
         }
         None
+    }
+
+    // =========================================================================
+    // MODULE BINDINGS
+    // =========================================================================
+
+    /// Register a module's exported bindings for use-statement resolution.
+    pub fn register_module_bindings(&mut self, name: Arc<str>, bindings: HashMap<Arc<str>, TypeScheme>) {
+        self.module_bindings.insert(name, bindings);
+    }
+
+    /// Look up a binding in a named module.
+    pub fn lookup_module_binding(&self, module: &str, name: &str) -> Option<Ty> {
+        self.module_bindings.get(module)?
+            .get(name)
+            .map(|scheme| scheme.instantiate())
+    }
+
+    /// Return a clone of the current scope's variable bindings.
+    pub fn current_scope_bindings(&self) -> HashMap<Arc<str>, TypeScheme> {
+        self.scopes.last()
+            .map(|s| s.bindings.clone())
+            .unwrap_or_default()
+    }
+
+    /// Return a clone of a named module's bindings (for glob imports).
+    pub fn clone_module_bindings(&self, module: &str) -> Option<HashMap<Arc<str>, TypeScheme>> {
+        self.module_bindings.get(module).cloned()
     }
 
     // =========================================================================

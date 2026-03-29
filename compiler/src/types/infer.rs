@@ -77,6 +77,65 @@ pub struct TypeInfer<'ctx> {
     has_return: bool,
 }
 
+/// Extract variant names covered by a single pattern.
+///
+/// Returns `"*"` for wildcard / catch-all patterns (bare ident, `_`).
+/// Returns the variant name for path-like patterns (`Some(x)`, `None`).
+/// Extract the enum name from a variant pattern.
+/// `Color::Red` → `"Color"`, `Shape::Circle(r)` → `"Shape"`.
+fn extract_enum_name_from_pattern(pattern: &ast::Pattern) -> Option<String> {
+    match &pattern.kind {
+        ast::PatternKind::TupleStruct { path, .. }
+        | ast::PatternKind::Path(path)
+        | ast::PatternKind::Struct { path, .. } => {
+            if path.segments.len() >= 2 {
+                Some(path.segments[path.segments.len() - 2].ident.name.to_string())
+            } else {
+                None
+            }
+        }
+        ast::PatternKind::Or(patterns) => {
+            patterns.iter().find_map(extract_enum_name_from_pattern)
+        }
+        _ => None,
+    }
+}
+
+fn extract_covered_variants(pattern: &ast::Pattern) -> Vec<String> {
+    match &pattern.kind {
+        ast::PatternKind::TupleStruct { path, .. } => {
+            if let Some(ident) = path.last_ident() {
+                vec![ident.name.to_string()]
+            } else {
+                vec![]
+            }
+        }
+        ast::PatternKind::Path(path) => {
+            if let Some(ident) = path.last_ident() {
+                vec![ident.name.to_string()]
+            } else {
+                vec![]
+            }
+        }
+        ast::PatternKind::Struct { path, .. } => {
+            if let Some(ident) = path.last_ident() {
+                vec![ident.name.to_string()]
+            } else {
+                vec![]
+            }
+        }
+        ast::PatternKind::Ident { .. } => {
+            // A bare identifier without a subpattern is a catch-all binding.
+            vec!["*".to_string()]
+        }
+        ast::PatternKind::Wildcard => vec!["*".to_string()],
+        ast::PatternKind::Or(patterns) => {
+            patterns.iter().flat_map(extract_covered_variants).collect()
+        }
+        _ => vec![],
+    }
+}
+
 impl<'ctx> TypeInfer<'ctx> {
     /// Create a new type inference engine.
     pub fn new(ctx: &'ctx mut TypeContext) -> Self {
@@ -702,6 +761,8 @@ impl<'ctx> TypeInfer<'ctx> {
                 "clock_ms" | "time_unix" |
                 // Vec builtins
                 "vec_new" | "vec_push" | "vec_get" | "vec_len" | "vec_pop" |
+                "vec_new_f64" | "vec_push_f64" | "vec_get_f64" | "vec_pop_f64" |
+                "vec_new_i64" | "vec_push_i64" | "vec_get_i64" | "vec_pop_i64" |
                 // Format builtins
                 "to_string_i32" | "to_string_f64" |
                 // HashMap builtins
@@ -1442,6 +1503,8 @@ impl<'ctx> TypeInfer<'ctx> {
             "clone" | "copy" => return receiver_ty.clone(),
             "to_string" | "to_owned" => return Ty::str(),
             "as_str" | "as_ref" => return Ty::str(),
+            "parse_int" => return Ty::int(IntTy::I64),
+            "parse_float" => return Ty::float(FloatTy::F64),
 
             // Collection mutators — return unit
             "push" | "push_str" | "push_back" | "push_front"
@@ -1740,7 +1803,79 @@ impl<'ctx> TypeInfer<'ctx> {
             result_ty = self.apply(&result_ty);
         }
 
+        // Exhaustiveness checking: determine the enum type from either
+        // the resolved scrutinee or the arm patterns, then verify all
+        // variants are covered.
+        let enum_info = self.resolve_enum_from_match(arms, &scrutinee_ty);
+        if let Some(all_variants) = enum_info {
+                    let mut covered: Vec<String> = Vec::new();
+                    let mut has_wildcard = false;
+
+                    for arm in arms {
+                        let variants = extract_covered_variants(&arm.pattern);
+                        for v in &variants {
+                            if v == "*" {
+                                has_wildcard = true;
+                            } else {
+                                covered.push(v.clone());
+                            }
+                        }
+                    }
+
+                    if !has_wildcard {
+                        let missing: Vec<String> = all_variants
+                            .iter()
+                            .filter(|v| !covered.contains(v))
+                            .cloned()
+                            .collect();
+
+                        if !missing.is_empty() {
+                            self.error(
+                                TypeError::NonExhaustiveMatch {
+                                    missing_variants: missing,
+                                },
+                                span,
+                            );
+                        }
+                    }
+        }
+
         result_ty
+    }
+
+    /// Resolve the enum type from match arm patterns.
+    /// When the scrutinee is an unresolved type variable, we extract the enum
+    /// name from the first variant pattern (e.g., `Color::Red` tells us the
+    /// enum is `Color`) and look it up in the type context.
+    fn resolve_enum_from_match(
+        &self,
+        arms: &[ast::MatchArm],
+        scrutinee_ty: &Ty,
+    ) -> Option<Vec<String>> {
+        // First try: resolved scrutinee type
+        let resolved = self.apply(scrutinee_ty);
+        if let TyKind::Adt(def_id, _) = &resolved.kind {
+            if let Some(type_def) = self.ctx.lookup_type(*def_id) {
+                if let TypeDefKind::Enum(enum_def) = &type_def.kind {
+                    return Some(enum_def.variants.iter()
+                        .map(|v| v.name.to_string()).collect());
+                }
+            }
+        }
+
+        // Second try: extract enum name from the pattern paths
+        for arm in arms {
+            if let Some(enum_name) = extract_enum_name_from_pattern(&arm.pattern) {
+                if let Some(type_def) = self.ctx.lookup_type_by_name(&enum_name) {
+                    if let TypeDefKind::Enum(enum_def) = &type_def.kind {
+                        return Some(enum_def.variants.iter()
+                            .map(|v| v.name.to_string()).collect());
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn infer_loop(&mut self, body: &ast::Block) -> Ty {
@@ -2441,5 +2576,756 @@ impl<'ctx> TypeInfer<'ctx> {
             "f64" => Some(Ty::float(FloatTy::F64)),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{self, ExprKind, Literal as AstLiteral, NodeId};
+    use crate::lexer::Span;
+    use super::super::unify::{self, Unifier};
+    use super::super::effects::{Effect, EffectRow};
+
+    // =====================================================================
+    // Test helpers
+    // =====================================================================
+
+    fn dummy_span() -> Span {
+        Span::dummy()
+    }
+
+    fn make_expr(kind: ExprKind) -> ast::Expr {
+        ast::Expr {
+            kind,
+            span: dummy_span(),
+            id: NodeId::DUMMY,
+            attrs: Vec::new(),
+        }
+    }
+
+    fn int_lit(value: u128, suffix: Option<ast::IntSuffix>) -> AstLiteral {
+        AstLiteral::Int {
+            value,
+            suffix,
+            base: crate::lexer::IntBase::Decimal,
+        }
+    }
+
+    fn float_lit(value: f64, suffix: Option<ast::FloatSuffix>) -> AstLiteral {
+        AstLiteral::Float { value, suffix }
+    }
+
+    // =====================================================================
+    // 1. Literal inference
+    // =====================================================================
+
+    #[test]
+    fn unsuffixed_int_gets_infer_int() {
+        // Unsuffixed integer literals must produce InferKind::Int so that
+        // later unification can default them to i32 or coerce to context.
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+        let ty = infer.infer_literal(&int_lit(42, None));
+
+        match &ty.kind {
+            TyKind::Infer(it) => assert_eq!(it.kind, InferKind::Int),
+            other => panic!("expected Infer(Int), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn suffixed_int_i32() {
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+        let ty = infer.infer_literal(&int_lit(42, Some(ast::IntSuffix::I32)));
+        assert_eq!(ty, Ty::int(IntTy::I32));
+    }
+
+    #[test]
+    fn suffixed_int_u64() {
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+        let ty = infer.infer_literal(&int_lit(0, Some(ast::IntSuffix::U64)));
+        assert_eq!(ty, Ty::int(IntTy::U64));
+    }
+
+    #[test]
+    fn unsuffixed_float_gets_infer_float() {
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+        let ty = infer.infer_literal(&float_lit(3.14, None));
+
+        match &ty.kind {
+            TyKind::Infer(it) => assert_eq!(it.kind, InferKind::Float),
+            other => panic!("expected Infer(Float), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn suffixed_float_f32() {
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+        let ty = infer.infer_literal(&float_lit(1.0, Some(ast::FloatSuffix::F32)));
+        assert_eq!(ty, Ty::float(FloatTy::F32));
+    }
+
+    #[test]
+    fn bool_literal() {
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+        assert_eq!(infer.infer_literal(&AstLiteral::Bool(true)), Ty::bool());
+        assert_eq!(infer.infer_literal(&AstLiteral::Bool(false)), Ty::bool());
+    }
+
+    #[test]
+    fn char_literal() {
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+        assert_eq!(infer.infer_literal(&AstLiteral::Char('x')), Ty::char());
+    }
+
+    #[test]
+    fn str_literal_is_owned_str() {
+        // QuantaLang strings are owned; string literals get `str` not `&str`.
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+        let ty = infer.infer_literal(&AstLiteral::Str {
+            value: "hello".into(),
+            is_raw: false,
+        });
+        assert_eq!(ty, Ty::str());
+    }
+
+    #[test]
+    fn byte_literal_is_u8() {
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+        assert_eq!(infer.infer_literal(&AstLiteral::Byte(b'A')), Ty::int(IntTy::U8));
+    }
+
+    #[test]
+    fn byte_string_is_ref_u8_array() {
+        // b"hello" should be &'static [u8; 5]
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+        let ty = infer.infer_literal(&AstLiteral::ByteStr {
+            value: b"hello".to_vec(),
+            is_raw: false,
+        });
+        let expected = Ty::reference(
+            Some(Lifetime::static_lifetime()),
+            Mutability::Immutable,
+            Ty::array(Ty::int(IntTy::U8), 5),
+        );
+        assert_eq!(ty, expected);
+    }
+
+    // =====================================================================
+    // 2. Unification properties
+    // =====================================================================
+
+    #[test]
+    fn unify_reflexivity_primitives() {
+        // Reflexivity: unify(T, T) must succeed for any concrete T.
+        // This is the identity law of the unification relation.
+        for ty in &[
+            Ty::int(IntTy::I32),
+            Ty::bool(),
+            Ty::char(),
+            Ty::str(),
+            Ty::float(FloatTy::F64),
+            Ty::unit(),
+            Ty::never(),
+        ] {
+            let subst = unify::unify(ty, ty).unwrap();
+            assert!(subst.is_empty(), "reflexive unify of {} produced bindings", ty);
+        }
+    }
+
+    #[test]
+    fn unify_reflexivity_compound() {
+        // Reflexivity for compound types: tuples, arrays, functions.
+        let tuple = Ty::tuple(vec![Ty::int(IntTy::I32), Ty::bool()]);
+        assert!(unify::unify(&tuple, &tuple).unwrap().is_empty());
+
+        let arr = Ty::array(Ty::int(IntTy::I32), 3);
+        assert!(unify::unify(&arr, &arr).unwrap().is_empty());
+
+        let func = Ty::function(vec![Ty::int(IntTy::I32)], Ty::bool());
+        assert!(unify::unify(&func, &func).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unify_symmetry() {
+        // Symmetry: if unify(A, B) binds ?a -> T, then unify(B, A) must
+        // produce the same resolved type. Order must not matter.
+        let v = TyVarId::fresh();
+        let var = Ty::var(v);
+        let concrete = Ty::int(IntTy::I64);
+
+        let s1 = unify::unify(&var, &concrete).unwrap();
+        assert_eq!(s1.get(v), Some(&concrete));
+
+        let v2 = TyVarId::fresh();
+        let var2 = Ty::var(v2);
+        let s2 = unify::unify(&concrete, &var2).unwrap();
+        assert_eq!(s2.get(v2), Some(&concrete));
+    }
+
+    #[test]
+    fn unify_symmetry_two_vars() {
+        // When unifying two vars, direction should not matter for resolution.
+        let a = TyVarId::fresh();
+        let b = TyVarId::fresh();
+
+        let mut u = Unifier::new();
+        u.unify(&Ty::var(a), &Ty::var(b)).unwrap();
+        u.unify(&Ty::var(b), &Ty::int(IntTy::I32)).unwrap();
+
+        // Both must resolve to i32 regardless of which was unified first.
+        assert_eq!(u.apply(&Ty::var(a)), Ty::int(IntTy::I32));
+        assert_eq!(u.apply(&Ty::var(b)), Ty::int(IntTy::I32));
+    }
+
+    #[test]
+    fn occurs_check_prevents_infinite_type() {
+        // Occurs check: unifying ?a with a type that contains ?a must fail.
+        // Without this, the substitution {?a -> (?a, bool)} would loop forever.
+        let v = TyVarId::fresh();
+        let var = Ty::var(v);
+        let cyclic = Ty::tuple(vec![var.clone(), Ty::bool()]);
+
+        let result = unify::unify(&var, &cyclic);
+        assert!(result.is_err(), "occurs check should reject ?a ~ (?a, bool)");
+    }
+
+    #[test]
+    fn occurs_check_nested() {
+        // Nested occurs check: ?a ~ fn(?a) -> bool
+        let v = TyVarId::fresh();
+        let var = Ty::var(v);
+        let func = Ty::function(vec![var.clone()], Ty::bool());
+
+        assert!(unify::unify(&var, &func).is_err());
+    }
+
+    #[test]
+    fn occurs_check_through_array() {
+        let v = TyVarId::fresh();
+        let var = Ty::var(v);
+        let arr = Ty::array(var.clone(), 1);
+
+        assert!(unify::unify(&var, &arr).is_err());
+    }
+
+    #[test]
+    fn never_is_bottom_type() {
+        // Never (!) is the bottom type: it unifies with everything.
+        // This is essential for soundness of diverging expressions.
+        let never = Ty::never();
+        for ty in &[
+            Ty::int(IntTy::I32),
+            Ty::bool(),
+            Ty::str(),
+            Ty::tuple(vec![Ty::int(IntTy::I32)]),
+            Ty::function(vec![], Ty::unit()),
+        ] {
+            assert!(unify::unify(&never, ty).is_ok(), "! should unify with {}", ty);
+            assert!(unify::unify(ty, &never).is_ok(), "{} should unify with !", ty);
+        }
+    }
+
+    #[test]
+    fn error_type_absorbs() {
+        // Error type unifies with anything for error recovery.
+        let err = Ty::error();
+        assert!(unify::unify(&err, &Ty::int(IntTy::I32)).is_ok());
+        assert!(unify::unify(&Ty::bool(), &err).is_ok());
+    }
+
+    #[test]
+    fn infer_var_unifies_like_regular_var() {
+        // InferKind::Int variables bind to concrete types through unification,
+        // just like plain Var — they just carry fallback info.
+        let infer_ty = Ty::new(TyKind::Infer(InferTy {
+            var: TyVarId::fresh(),
+            kind: InferKind::Int,
+        }));
+        let concrete = Ty::int(IntTy::I32);
+        assert!(unify::unify(&infer_ty, &concrete).is_ok());
+    }
+
+    // =====================================================================
+    // 3. Bidirectional flow
+    // =====================================================================
+
+    #[test]
+    fn check_expr_constrains_literal() {
+        // Checking mode: check_expr(expr, expected) should unify the
+        // inferred type with the expected type. A bare integer literal
+        // checked against i64 should resolve without error.
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+
+        let expr = make_expr(ExprKind::Literal(int_lit(42, None)));
+        let result = infer.check_expr(&expr, &Ty::int(IntTy::I64));
+
+        // Result should be compatible with i64 (InferKind::Int unifies with any int)
+        assert!(infer.errors().is_empty(), "check_expr should not produce errors");
+        // The resolved type might still be Infer(Int) or i64 depending on
+        // whether the unifier collapsed it, but no error is the key property.
+        let _ = result;
+    }
+
+    #[test]
+    fn check_expr_rejects_type_mismatch() {
+        // Checking mode must reject impossible coercions: bool vs i32.
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+
+        let expr = make_expr(ExprKind::Literal(AstLiteral::Bool(true)));
+        let _ = infer.check_expr(&expr, &Ty::int(IntTy::I32));
+
+        assert!(!infer.errors().is_empty(), "bool checked against i32 should error");
+    }
+
+    #[test]
+    fn if_else_branches_unify() {
+        // if-else is a classic bidirectional case: both branches must
+        // have the same type. We test this by building an if-else where
+        // both branches are bool literals — the result should be bool.
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+
+        let cond = make_expr(ExprKind::Literal(AstLiteral::Bool(true)));
+        let then_expr = make_expr(ExprKind::Literal(AstLiteral::Bool(true)));
+        let else_expr = make_expr(ExprKind::Literal(AstLiteral::Bool(false)));
+
+        let then_block = ast::Block {
+            stmts: vec![ast::Stmt::new(
+                ast::StmtKind::Expr(Box::new(then_expr)),
+                dummy_span(),
+            )],
+            span: dummy_span(),
+            id: NodeId::DUMMY,
+        };
+
+        let result = infer.infer_if(&cond, &then_block, Some(&else_expr), dummy_span());
+        assert!(infer.errors().is_empty());
+        assert_eq!(result, Ty::bool());
+    }
+
+    #[test]
+    fn if_without_else_is_unit() {
+        // if without else must return unit, since the else path implicitly
+        // yields (). The then-branch is also unified with unit.
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+
+        let cond = make_expr(ExprKind::Literal(AstLiteral::Bool(true)));
+        let then_expr = make_expr(ExprKind::Literal(AstLiteral::Bool(true)));
+        let then_block = ast::Block {
+            stmts: vec![ast::Stmt::new(
+                ast::StmtKind::Semi(Box::new(then_expr)),
+                dummy_span(),
+            )],
+            span: dummy_span(),
+            id: NodeId::DUMMY,
+        };
+
+        let result = infer.infer_if(&cond, &then_block, None, dummy_span());
+        assert_eq!(result, Ty::unit());
+    }
+
+    #[test]
+    fn if_else_mismatched_branches_errors() {
+        // If then-branch is bool and else-branch is i32, unification should
+        // fail and produce a type error.
+        let mut ctx = TypeContext::new();
+        let mut infer = TypeInfer::new(&mut ctx);
+
+        let cond = make_expr(ExprKind::Literal(AstLiteral::Bool(true)));
+        let then_expr = make_expr(ExprKind::Literal(AstLiteral::Bool(true)));
+        let else_expr = make_expr(ExprKind::Literal(int_lit(1, Some(ast::IntSuffix::I32))));
+
+        let then_block = ast::Block {
+            stmts: vec![ast::Stmt::new(
+                ast::StmtKind::Expr(Box::new(then_expr)),
+                dummy_span(),
+            )],
+            span: dummy_span(),
+            id: NodeId::DUMMY,
+        };
+
+        let _ = infer.infer_if(&cond, &then_block, Some(&else_expr), dummy_span());
+        assert!(!infer.errors().is_empty(), "mismatched if-else branches must error");
+    }
+
+    // =====================================================================
+    // 4. Function call inference
+    // =====================================================================
+
+    #[test]
+    fn call_infers_return_type_from_signature() {
+        // Given a function fn(i32) -> bool in scope, calling it with an
+        // i32 argument should produce bool.
+        let mut ctx = TypeContext::new();
+        ctx.define_var("is_positive", Ty::function(
+            vec![Ty::int(IntTy::I32)],
+            Ty::bool(),
+        ));
+
+        let mut infer = TypeInfer::new(&mut ctx);
+
+        let func = make_expr(ExprKind::Ident(ast::Ident::dummy("is_positive")));
+        let arg = make_expr(ExprKind::Literal(int_lit(5, Some(ast::IntSuffix::I32))));
+        let result = infer.infer_call(&func, &[arg], dummy_span());
+
+        assert!(infer.errors().is_empty());
+        assert_eq!(result, Ty::bool());
+    }
+
+    #[test]
+    fn call_generic_instantiation_from_args() {
+        // A generic identity function fn(?T) -> ?T should have its type
+        // parameter instantiated from the argument type.
+        let v = TyVarId::fresh();
+        let scheme = TypeScheme::poly(
+            vec![v],
+            Ty::function(vec![Ty::var(v)], Ty::var(v)),
+        );
+
+        let mut ctx = TypeContext::new();
+        ctx.define_var_scheme("identity", scheme);
+
+        let mut infer = TypeInfer::new(&mut ctx);
+
+        let func = make_expr(ExprKind::Ident(ast::Ident::dummy("identity")));
+        let arg = make_expr(ExprKind::Literal(AstLiteral::Bool(true)));
+        let result = infer.infer_call(&func, &[arg], dummy_span());
+
+        assert!(infer.errors().is_empty());
+        // The return type should resolve to bool after instantiation + unification
+        let resolved = infer.apply(&result);
+        assert_eq!(resolved, Ty::bool());
+    }
+
+    #[test]
+    fn call_arity_mismatch() {
+        let mut ctx = TypeContext::new();
+        ctx.define_var("f", Ty::function(vec![Ty::int(IntTy::I32)], Ty::bool()));
+
+        let mut infer = TypeInfer::new(&mut ctx);
+
+        let func = make_expr(ExprKind::Ident(ast::Ident::dummy("f")));
+        // Pass two args to a one-param function
+        let arg1 = make_expr(ExprKind::Literal(int_lit(1, Some(ast::IntSuffix::I32))));
+        let arg2 = make_expr(ExprKind::Literal(int_lit(2, Some(ast::IntSuffix::I32))));
+        let _ = infer.infer_call(&func, &[arg1, arg2], dummy_span());
+
+        assert!(!infer.errors().is_empty(), "wrong arity should error");
+    }
+
+    #[test]
+    fn call_infers_var_function_from_usage() {
+        // When the callee is an unresolved type variable, inference should
+        // construct a function type from the call-site arguments and unify.
+        let a = TyVarId::fresh();
+        let mut ctx = TypeContext::new();
+        ctx.define_var("mystery", Ty::var(a));
+
+        let mut infer = TypeInfer::new(&mut ctx);
+
+        let func = make_expr(ExprKind::Ident(ast::Ident::dummy("mystery")));
+        let arg = make_expr(ExprKind::Literal(AstLiteral::Bool(true)));
+        let ret = infer.infer_call(&func, &[arg], dummy_span());
+
+        assert!(infer.errors().is_empty());
+        // The variable should now be bound to fn(bool) -> ?ret
+        let resolved = infer.apply(&Ty::var(a));
+        match &resolved.kind {
+            TyKind::Fn(fn_ty) => {
+                assert_eq!(fn_ty.params.len(), 1);
+                assert_eq!(fn_ty.params[0], Ty::bool());
+            }
+            _ => panic!("expected function type, got {}", resolved),
+        }
+        let _ = ret;
+    }
+
+    #[test]
+    fn call_propagates_callee_effects() {
+        // When calling a function with effects, those effects should be
+        // accumulated into the caller's effect row.
+        let io_row = EffectRow::closed(vec![Effect::io()]);
+        let fn_ty = Ty::function_with_effects(
+            vec![Ty::str()],
+            Ty::unit(),
+            io_row,
+        );
+
+        let mut ctx = TypeContext::new();
+        ctx.define_var("print", fn_ty);
+
+        let mut infer = TypeInfer::new(&mut ctx);
+        assert!(infer.current_effect_row().is_empty());
+
+        let func = make_expr(ExprKind::Ident(ast::Ident::dummy("print")));
+        let arg = make_expr(ExprKind::Literal(AstLiteral::Str {
+            value: "hi".into(),
+            is_raw: false,
+        }));
+        let _ = infer.infer_call(&func, &[arg], dummy_span());
+
+        assert!(infer.current_effect_row().has_io());
+    }
+
+    // =====================================================================
+    // 5. Effect inference
+    // =====================================================================
+
+    #[test]
+    fn pure_function_has_empty_effects() {
+        // A pure function (no `with` clause) should have an empty effect row.
+        let fn_ty = Ty::function(vec![Ty::int(IntTy::I32)], Ty::int(IntTy::I32));
+        match &fn_ty.kind {
+            TyKind::Fn(f) => assert!(f.effects.is_empty()),
+            _ => panic!("expected Fn"),
+        }
+    }
+
+    #[test]
+    fn io_function_has_io_effect() {
+        let io_row = EffectRow::closed(vec![Effect::io()]);
+        let fn_ty = Ty::function_with_effects(
+            vec![Ty::str()],
+            Ty::unit(),
+            io_row.clone(),
+        );
+        match &fn_ty.kind {
+            TyKind::Fn(f) => {
+                assert!(f.effects.has_io());
+                assert!(!f.effects.is_empty());
+            }
+            _ => panic!("expected Fn"),
+        }
+    }
+
+    #[test]
+    fn effect_accumulation_across_calls() {
+        // Calling two functions with different effects should accumulate
+        // both effects in the caller's row.
+        let io_row = EffectRow::closed(vec![Effect::io()]);
+        let err_row = EffectRow::closed(vec![Effect::error(Ty::str())]);
+
+        let mut ctx = TypeContext::new();
+        ctx.define_var("read", Ty::function_with_effects(
+            vec![], Ty::str(), io_row,
+        ));
+        ctx.define_var("parse", Ty::function_with_effects(
+            vec![Ty::str()], Ty::int(IntTy::I32), err_row,
+        ));
+
+        let mut infer = TypeInfer::new(&mut ctx);
+
+        let read_fn = make_expr(ExprKind::Ident(ast::Ident::dummy("read")));
+        let _ = infer.infer_call(&read_fn, &[], dummy_span());
+
+        let parse_fn = make_expr(ExprKind::Ident(ast::Ident::dummy("parse")));
+        let arg = make_expr(ExprKind::Literal(AstLiteral::Str {
+            value: "42".into(),
+            is_raw: false,
+        }));
+        let _ = infer.infer_call(&parse_fn, &[arg], dummy_span());
+
+        let effects = infer.current_effect_row();
+        assert!(effects.has_io(), "should have IO from read()");
+        assert!(effects.has_error(), "should have Error from parse()");
+    }
+
+    #[test]
+    fn effect_row_merge_is_union() {
+        // Merging two effect rows should produce the set union.
+        let row1 = EffectRow::closed(vec![Effect::io()]);
+        let row2 = EffectRow::closed(vec![Effect::error(Ty::str())]);
+        let merged = row1.merge(&row2);
+
+        assert!(merged.has_io());
+        assert!(merged.has_error());
+    }
+
+    #[test]
+    fn empty_effect_row_is_pure() {
+        let row = EffectRow::empty();
+        assert!(row.is_empty());
+        assert!(!row.has_io());
+        assert!(row.is_closed());
+    }
+
+    // =====================================================================
+    // Additional properties
+    // =====================================================================
+
+    #[test]
+    fn transitive_unification_chain() {
+        // If ?a ~ ?b and ?b ~ ?c and ?c ~ i32, then ?a must resolve to i32.
+        let a = TyVarId::fresh();
+        let b = TyVarId::fresh();
+        let c = TyVarId::fresh();
+
+        let mut u = Unifier::new();
+        u.unify(&Ty::var(a), &Ty::var(b)).unwrap();
+        u.unify(&Ty::var(b), &Ty::var(c)).unwrap();
+        u.unify(&Ty::var(c), &Ty::int(IntTy::I32)).unwrap();
+
+        assert_eq!(u.apply(&Ty::var(a)), Ty::int(IntTy::I32));
+        assert_eq!(u.apply(&Ty::var(b)), Ty::int(IntTy::I32));
+        assert_eq!(u.apply(&Ty::var(c)), Ty::int(IntTy::I32));
+    }
+
+    #[test]
+    fn unify_tuple_element_wise() {
+        // Unifying (i32, ?a) with (i32, bool) must bind ?a -> bool.
+        let a = TyVarId::fresh();
+        let t1 = Ty::tuple(vec![Ty::int(IntTy::I32), Ty::var(a)]);
+        let t2 = Ty::tuple(vec![Ty::int(IntTy::I32), Ty::bool()]);
+
+        let subst = unify::unify(&t1, &t2).unwrap();
+        assert_eq!(subst.get(a), Some(&Ty::bool()));
+    }
+
+    #[test]
+    fn unify_function_binds_return() {
+        // Unifying fn(?a) -> ?b with fn(i32) -> bool should bind both.
+        let a = TyVarId::fresh();
+        let b = TyVarId::fresh();
+
+        let t1 = Ty::function(vec![Ty::var(a)], Ty::var(b));
+        let t2 = Ty::function(vec![Ty::int(IntTy::I32)], Ty::bool());
+
+        let subst = unify::unify(&t1, &t2).unwrap();
+        assert_eq!(subst.get(a), Some(&Ty::int(IntTy::I32)));
+        assert_eq!(subst.get(b), Some(&Ty::bool()));
+    }
+
+    #[test]
+    fn unify_array_requires_same_length() {
+        let a1 = Ty::array(Ty::int(IntTy::I32), 3);
+        let a2 = Ty::array(Ty::int(IntTy::I32), 5);
+        assert!(unify::unify(&a1, &a2).is_err(), "[i32; 3] != [i32; 5]");
+
+        // Same length should succeed
+        let a3 = Ty::array(Ty::int(IntTy::I32), 3);
+        assert!(unify::unify(&a1, &a3).is_ok());
+    }
+
+    #[test]
+    fn type_scheme_instantiation_is_fresh() {
+        // Two instantiations of the same scheme must produce independent
+        // type variables so they can unify to different concrete types.
+        let v = TyVarId::fresh();
+        let scheme = TypeScheme::poly(
+            vec![v],
+            Ty::function(vec![Ty::var(v)], Ty::var(v)),
+        );
+
+        let inst1 = scheme.instantiate();
+        let inst2 = scheme.instantiate();
+
+        assert_ne!(inst1, inst2, "each instantiation should use fresh vars");
+
+        // But both should have the same *shape*: fn(?a) -> ?a
+        match (&inst1.kind, &inst2.kind) {
+            (TyKind::Fn(f1), TyKind::Fn(f2)) => {
+                assert_eq!(f1.params.len(), 1);
+                assert_eq!(f2.params.len(), 1);
+                // Param and return should be the same var within each instance
+                assert_eq!(f1.params[0], *f1.ret);
+                assert_eq!(f2.params[0], *f2.ret);
+                // But different between instances
+                assert_ne!(f1.params[0], f2.params[0]);
+            }
+            _ => panic!("expected function types"),
+        }
+    }
+
+    // =====================================================================
+    // Exhaustiveness checking helpers
+    // =====================================================================
+
+    #[test]
+    fn extract_wildcard_covers_all() {
+        let pat = ast::Pattern::wildcard(dummy_span());
+        let covered = extract_covered_variants(&pat);
+        assert_eq!(covered, vec!["*"]);
+    }
+
+    #[test]
+    fn extract_ident_covers_all() {
+        let pat = ast::Pattern::ident(
+            ast::Ident::dummy("x"),
+            ast::Mutability::Immutable,
+        );
+        let covered = extract_covered_variants(&pat);
+        assert_eq!(covered, vec!["*"]);
+    }
+
+    #[test]
+    fn extract_path_variant() {
+        let path = ast::Path::from_ident(ast::Ident::dummy("None"));
+        let pat = ast::Pattern::new(
+            ast::PatternKind::Path(path),
+            dummy_span(),
+        );
+        let covered = extract_covered_variants(&pat);
+        assert_eq!(covered, vec!["None"]);
+    }
+
+    #[test]
+    fn extract_tuple_struct_variant() {
+        let path = ast::Path::from_ident(ast::Ident::dummy("Some"));
+        let pat = ast::Pattern::new(
+            ast::PatternKind::TupleStruct {
+                path,
+                patterns: vec![ast::Pattern::wildcard(dummy_span())],
+            },
+            dummy_span(),
+        );
+        let covered = extract_covered_variants(&pat);
+        assert_eq!(covered, vec!["Some"]);
+    }
+
+    #[test]
+    fn extract_or_pattern_collects_all() {
+        let p1 = ast::Pattern::new(
+            ast::PatternKind::Path(ast::Path::from_ident(ast::Ident::dummy("A"))),
+            dummy_span(),
+        );
+        let p2 = ast::Pattern::new(
+            ast::PatternKind::Path(ast::Path::from_ident(ast::Ident::dummy("B"))),
+            dummy_span(),
+        );
+        let pat = ast::Pattern::new(
+            ast::PatternKind::Or(vec![p1, p2]),
+            dummy_span(),
+        );
+        let covered = extract_covered_variants(&pat);
+        assert_eq!(covered, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn extract_struct_pattern_variant() {
+        let path = ast::Path::from_ident(ast::Ident::dummy("Point"));
+        let pat = ast::Pattern::new(
+            ast::PatternKind::Struct {
+                path,
+                fields: vec![],
+                rest: None,
+            },
+            dummy_span(),
+        );
+        let covered = extract_covered_variants(&pat);
+        assert_eq!(covered, vec!["Point"]);
     }
 }

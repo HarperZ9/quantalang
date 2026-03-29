@@ -97,7 +97,31 @@ Use `--target` to select a code generation backend:
 
 ## Status
 
-**Alpha.** The C backend is stable and produces correct, portable output. The shader backends (HLSL and GLSL) produce clean output suitable for ReShade and OpenGL/Vulkan respectively. SPIR-V output passes `spirv-val` validation. The LLVM, WASM, x86-64, and ARM64 backends are experimental and under active development.
+**132/132 test programs compile. 108 have verified runtime output.** Full pipeline: `.quanta` → C99 → MSVC → native x86-64 executable. See [TEST_RESULTS.md](TEST_RESULTS.md) for outputs.
+
+Programs cover: functions, recursion, structs, enums, closures, generics, traits, dynamic dispatch, algebraic effects, pattern matching, iterators, hashmaps, file I/O, vector math, color science, and self-hosted compiler components.
+
+Additionally, **56 coreutils-compatible CLI tools** (wc, grep, sort, sed, awk, find, diff, jq, db, calc, and 46 more) have been compiled from QuantaLang to native Windows binaries. `qwc` produces output identical to GNU `wc` on all tested inputs.
+
+The C backend is the primary production target. HLSL/GLSL produce clean shader output. SPIR-V passes `spirv-val`. LLVM, WASM, x86-64, and ARM64 backends are experimental.
+
+## Design
+
+See [DESIGN.md](DESIGN.md) for full architectural documentation including:
+- Pipeline overview (lexer → parser → types → MIR → backends)
+- Type system rationale: why bidirectional inference, why Pratt parsing, why setjmp/longjmp for effects
+- MIR design: SSA with basic blocks, statement/terminator model
+- Known limitations: no borrow checker, eager monomorphization, one-shot effects
+
+## Code Quality
+
+- **CI**: clippy (`-D warnings`) + rustfmt + `cargo test` on Linux and Windows
+- **Error handling**: Parser uses `expect()` with messages, lexer has 30+ error variants for recovery, pkg layer uses full `Result<T, E>` propagation
+- **Codegen unwraps**: Intentional assertions on validated AST (documented policy in `codegen/mod.rs`)
+- **Tests**: 588 unit tests + 119 end-to-end tests + snapshot tests via `insta`
+  - Type inference: 40 tests (unification properties, bidirectional flow, effect inference)
+  - Parser: 42 tests (operator precedence, associativity, all expression/item/pattern forms)
+  - Codegen: 335 tests across 8 backends
 
 ## License
 
