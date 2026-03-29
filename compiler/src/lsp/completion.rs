@@ -72,7 +72,8 @@ impl CompletionProvider {
         // Check for member access (. or ::)
         if let Some(dot_pos) = prefix.rfind('.') {
             let before_dot = &prefix[..dot_pos];
-            let word_start = before_dot.rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            let word_start = before_dot
+                .rfind(|c: char| !c.is_alphanumeric() && c != '_')
                 .map(|i| i + 1)
                 .unwrap_or(0);
             return CompletionContext::MemberAccess(before_dot[word_start..].to_string());
@@ -81,7 +82,8 @@ impl CompletionProvider {
         if prefix.contains("::") {
             if let Some(colon_pos) = prefix.rfind("::") {
                 let before_colon = &prefix[..colon_pos];
-                let word_start = before_colon.rfind(|c: char| !c.is_alphanumeric() && c != '_')
+                let word_start = before_colon
+                    .rfind(|c: char| !c.is_alphanumeric() && c != '_')
                     .map(|i| i + 1)
                     .unwrap_or(0);
                 return CompletionContext::MemberAccess(before_colon[word_start..].to_string());
@@ -152,8 +154,7 @@ impl CompletionProvider {
                 .with_detail("If statement")
                 .with_insert_text("if ${1:condition} {\n\t$0\n}")
                 .with_insert_text_format(InsertTextFormat::Snippet),
-            CompletionItem::keyword("else")
-                .with_detail("Else clause"),
+            CompletionItem::keyword("else").with_detail("Else clause"),
             CompletionItem::keyword("match")
                 .with_detail("Match expression")
                 .with_insert_text("match ${1:value} {\n\t${2:pattern} => ${0:expr},\n}")
@@ -170,38 +171,22 @@ impl CompletionProvider {
                 .with_detail("Infinite loop")
                 .with_insert_text("loop {\n\t$0\n}")
                 .with_insert_text_format(InsertTextFormat::Snippet),
-            CompletionItem::keyword("return")
-                .with_detail("Return statement"),
-            CompletionItem::keyword("break")
-                .with_detail("Break statement"),
-            CompletionItem::keyword("continue")
-                .with_detail("Continue statement"),
-            CompletionItem::keyword("pub")
-                .with_detail("Public visibility"),
-            CompletionItem::keyword("mod")
-                .with_detail("Module declaration"),
-            CompletionItem::keyword("use")
-                .with_detail("Use declaration"),
-            CompletionItem::keyword("async")
-                .with_detail("Async function"),
-            CompletionItem::keyword("await")
-                .with_detail("Await expression"),
-            CompletionItem::keyword("unsafe")
-                .with_detail("Unsafe block"),
-            CompletionItem::keyword("where")
-                .with_detail("Where clause"),
-            CompletionItem::keyword("type")
-                .with_detail("Type alias"),
-            CompletionItem::keyword("self")
-                .with_detail("Self reference"),
-            CompletionItem::keyword("Self")
-                .with_detail("Self type"),
-            CompletionItem::keyword("super")
-                .with_detail("Parent module"),
-            CompletionItem::keyword("true")
-                .with_detail("Boolean true"),
-            CompletionItem::keyword("false")
-                .with_detail("Boolean false"),
+            CompletionItem::keyword("return").with_detail("Return statement"),
+            CompletionItem::keyword("break").with_detail("Break statement"),
+            CompletionItem::keyword("continue").with_detail("Continue statement"),
+            CompletionItem::keyword("pub").with_detail("Public visibility"),
+            CompletionItem::keyword("mod").with_detail("Module declaration"),
+            CompletionItem::keyword("use").with_detail("Use declaration"),
+            CompletionItem::keyword("async").with_detail("Async function"),
+            CompletionItem::keyword("await").with_detail("Await expression"),
+            CompletionItem::keyword("unsafe").with_detail("Unsafe block"),
+            CompletionItem::keyword("where").with_detail("Where clause"),
+            CompletionItem::keyword("type").with_detail("Type alias"),
+            CompletionItem::keyword("self").with_detail("Self reference"),
+            CompletionItem::keyword("Self").with_detail("Self type"),
+            CompletionItem::keyword("super").with_detail("Parent module"),
+            CompletionItem::keyword("true").with_detail("Boolean true"),
+            CompletionItem::keyword("false").with_detail("Boolean false"),
         ]
     }
 
@@ -228,28 +213,36 @@ impl CompletionProvider {
             CompletionItem::type_item("str").with_detail("String slice"),
             // Common types
             CompletionItem::type_item("String").with_detail("Owned string"),
-            CompletionItem::type_item("Vec").with_detail("Dynamic array")
+            CompletionItem::type_item("Vec")
+                .with_detail("Dynamic array")
                 .with_insert_text("Vec<${1:T}>")
                 .with_insert_text_format(InsertTextFormat::Snippet),
-            CompletionItem::type_item("Option").with_detail("Optional value")
+            CompletionItem::type_item("Option")
+                .with_detail("Optional value")
                 .with_insert_text("Option<${1:T}>")
                 .with_insert_text_format(InsertTextFormat::Snippet),
-            CompletionItem::type_item("Result").with_detail("Result type")
+            CompletionItem::type_item("Result")
+                .with_detail("Result type")
                 .with_insert_text("Result<${1:T}, ${2:E}>")
                 .with_insert_text_format(InsertTextFormat::Snippet),
-            CompletionItem::type_item("Box").with_detail("Heap allocation")
+            CompletionItem::type_item("Box")
+                .with_detail("Heap allocation")
                 .with_insert_text("Box<${1:T}>")
                 .with_insert_text_format(InsertTextFormat::Snippet),
-            CompletionItem::type_item("Arc").with_detail("Atomic reference counting")
+            CompletionItem::type_item("Arc")
+                .with_detail("Atomic reference counting")
                 .with_insert_text("Arc<${1:T}>")
                 .with_insert_text_format(InsertTextFormat::Snippet),
-            CompletionItem::type_item("Rc").with_detail("Reference counting")
+            CompletionItem::type_item("Rc")
+                .with_detail("Reference counting")
                 .with_insert_text("Rc<${1:T}>")
                 .with_insert_text_format(InsertTextFormat::Snippet),
-            CompletionItem::type_item("HashMap").with_detail("Hash map")
+            CompletionItem::type_item("HashMap")
+                .with_detail("Hash map")
                 .with_insert_text("HashMap<${1:K}, ${2:V}>")
                 .with_insert_text_format(InsertTextFormat::Snippet),
-            CompletionItem::type_item("HashSet").with_detail("Hash set")
+            CompletionItem::type_item("HashSet")
+                .with_detail("Hash set")
                 .with_insert_text("HashSet<${1:T}>")
                 .with_insert_text_format(InsertTextFormat::Snippet),
         ]
@@ -297,7 +290,8 @@ impl CompletionProvider {
                 CompletionItem::method("unwrap_or").with_detail("fn(T) -> T"),
                 CompletionItem::method("unwrap_or_else").with_detail("fn(FnOnce() -> T) -> T"),
                 CompletionItem::method("map").with_detail("fn(FnOnce(T) -> U) -> Option<U>"),
-                CompletionItem::method("and_then").with_detail("fn(FnOnce(T) -> Option<U>) -> Option<U>"),
+                CompletionItem::method("and_then")
+                    .with_detail("fn(FnOnce(T) -> Option<U>) -> Option<U>"),
                 CompletionItem::method("ok_or").with_detail("fn(E) -> Result<T, E>"),
                 CompletionItem::method("expect").with_detail("fn(&str) -> T"),
             ],
@@ -311,7 +305,8 @@ impl CompletionProvider {
                 CompletionItem::method("unwrap_or").with_detail("fn(T) -> T"),
                 CompletionItem::method("map").with_detail("fn(FnOnce(T) -> U) -> Result<U, E>"),
                 CompletionItem::method("map_err").with_detail("fn(FnOnce(E) -> F) -> Result<T, F>"),
-                CompletionItem::method("and_then").with_detail("fn(FnOnce(T) -> Result<U, E>) -> Result<U, E>"),
+                CompletionItem::method("and_then")
+                    .with_detail("fn(FnOnce(T) -> Result<U, E>) -> Result<U, E>"),
                 CompletionItem::method("expect").with_detail("fn(&str) -> T"),
             ],
             _ => vec![
@@ -393,28 +388,23 @@ impl CompletionProvider {
     /// Get snippet completions.
     fn snippet_completions(&self) -> Vec<CompletionItem> {
         vec![
-            CompletionItem::snippet("main", "fn main() {\n\t$0\n}")
-                .with_detail("Main function"),
+            CompletionItem::snippet("main", "fn main() {\n\t$0\n}").with_detail("Main function"),
             CompletionItem::snippet("test", "#[test]\nfn ${1:test_name}() {\n\t$0\n}")
                 .with_detail("Test function"),
             CompletionItem::snippet("println", "println!(\"${1:}\");$0")
                 .with_detail("Print line macro"),
-            CompletionItem::snippet("print", "print!(\"${1:}\");$0")
-                .with_detail("Print macro"),
+            CompletionItem::snippet("print", "print!(\"${1:}\");$0").with_detail("Print macro"),
             CompletionItem::snippet("format", "format!(\"${1:}\"${2:, args})$0")
                 .with_detail("Format string"),
-            CompletionItem::snippet("vec", "vec![${1:items}]$0")
-                .with_detail("Vector literal"),
-            CompletionItem::snippet("todo", "todo!(\"${1:}\")$0")
-                .with_detail("Todo macro"),
+            CompletionItem::snippet("vec", "vec![${1:items}]$0").with_detail("Vector literal"),
+            CompletionItem::snippet("todo", "todo!(\"${1:}\")$0").with_detail("Todo macro"),
             CompletionItem::snippet("unimplemented", "unimplemented!(\"${1:}\")$0")
                 .with_detail("Unimplemented macro"),
             CompletionItem::snippet("assert", "assert!(${1:condition});$0")
                 .with_detail("Assert macro"),
             CompletionItem::snippet("assert_eq", "assert_eq!(${1:left}, ${2:right});$0")
                 .with_detail("Assert equality"),
-            CompletionItem::snippet("dbg", "dbg!(${1:&value})$0")
-                .with_detail("Debug print"),
+            CompletionItem::snippet("dbg", "dbg!(${1:&value})$0").with_detail("Debug print"),
         ]
     }
 
@@ -438,8 +428,7 @@ impl CompletionProvider {
             // Match let bindings
             if let Some(var_name) = extract_let_binding(line) {
                 items.push(
-                    CompletionItem::variable(&var_name)
-                        .with_sort_text(format!("1_{}", var_name)),
+                    CompletionItem::variable(&var_name).with_sort_text(format!("1_{}", var_name)),
                 );
             }
 
@@ -499,10 +488,12 @@ fn extract_fn_name(line: &str) -> Option<FnMatch> {
 fn extract_let_binding(line: &str) -> Option<String> {
     let trimmed = line.trim();
     // Try "let mut " first since "let " is a prefix of "let mut "
-    let rest = trimmed.strip_prefix("let mut ")
+    let rest = trimmed
+        .strip_prefix("let mut ")
         .or_else(|| trimmed.strip_prefix("let "))?;
 
-    let end = rest.find(|c: char| c == ':' || c == '=' || c == ' ')
+    let end = rest
+        .find(|c: char| c == ':' || c == '=' || c == ' ')
         .unwrap_or(rest.len());
     let name = rest[..end].trim().to_string();
 
@@ -516,10 +507,12 @@ fn extract_let_binding(line: &str) -> Option<String> {
 /// Extract struct name.
 fn extract_struct_name(line: &str) -> Option<String> {
     let trimmed = line.trim();
-    let rest = trimmed.strip_prefix("struct ")
+    let rest = trimmed
+        .strip_prefix("struct ")
         .or_else(|| trimmed.strip_prefix("pub struct "))?;
 
-    let end = rest.find(|c: char| c == '<' || c == '{' || c == '(' || c == ' ')
+    let end = rest
+        .find(|c: char| c == '<' || c == '{' || c == '(' || c == ' ')
         .unwrap_or(rest.len());
     let name = rest[..end].trim().to_string();
 
@@ -534,9 +527,7 @@ fn extract_struct_name(line: &str) -> Option<String> {
 fn is_valid_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
-        Some(c) if c.is_alphabetic() || c == '_' => {
-            chars.all(|c| c.is_alphanumeric() || c == '_')
-        }
+        Some(c) if c.is_alphabetic() || c == '_' => chars.all(|c| c.is_alphanumeric() || c == '_'),
         _ => false,
     }
 }
@@ -556,12 +547,18 @@ mod tests {
     #[test]
     fn test_extract_let_binding() {
         assert_eq!(extract_let_binding("let x = 5;"), Some("x".to_string()));
-        assert_eq!(extract_let_binding("let mut y: i32 = 10;"), Some("y".to_string()));
+        assert_eq!(
+            extract_let_binding("let mut y: i32 = 10;"),
+            Some("y".to_string())
+        );
     }
 
     #[test]
     fn test_extract_struct_name() {
         assert_eq!(extract_struct_name("struct Foo {"), Some("Foo".to_string()));
-        assert_eq!(extract_struct_name("pub struct Bar<T> {"), Some("Bar".to_string()));
+        assert_eq!(
+            extract_struct_name("pub struct Bar<T> {"),
+            Some("Bar".to_string())
+        );
     }
 }

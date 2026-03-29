@@ -543,7 +543,11 @@ impl Executor {
 
         // Register task
         // Mutex poisoning only occurs on thread panic
-        self.inner.tasks.lock().unwrap().insert(task_id, task.clone());
+        self.inner
+            .tasks
+            .lock()
+            .unwrap()
+            .insert(task_id, task.clone());
 
         // Add to global queue — Mutex poisoning only occurs on thread panic
         self.inner.global_queue.lock().unwrap().push_back(task);
@@ -588,7 +592,12 @@ impl Executor {
     pub fn is_complete(&self, task_id: TaskId) -> bool {
         self.inner
             .get_task(task_id)
-            .map(|t| matches!(t.get_state(), TaskState::Completed | TaskState::Cancelled | TaskState::Panicked))
+            .map(|t| {
+                matches!(
+                    t.get_state(),
+                    TaskState::Completed | TaskState::Cancelled | TaskState::Panicked
+                )
+            })
             .unwrap_or(true)
     }
 
@@ -1041,7 +1050,12 @@ impl JoinHandle {
     pub fn is_finished(&self) -> bool {
         self.executor
             .get_task(self.task_id)
-            .map(|t| matches!(t.get_state(), TaskState::Completed | TaskState::Cancelled | TaskState::Panicked))
+            .map(|t| {
+                matches!(
+                    t.get_state(),
+                    TaskState::Completed | TaskState::Cancelled | TaskState::Panicked
+                )
+            })
             .unwrap_or(true)
     }
 
@@ -1115,7 +1129,7 @@ impl AsyncState {
 /// Generate async state machine struct layout.
 pub fn async_state_machine_layout(
     name: &str,
-    state_fields: &[(String, String)],  // (name, type)
+    state_fields: &[(String, String)], // (name, type)
 ) -> String {
     let mut layout = format!("struct {}State {{\n", name);
     layout.push_str("    __state: u32,\n");

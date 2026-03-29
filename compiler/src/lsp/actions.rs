@@ -46,7 +46,11 @@ impl CodeActionProvider {
     }
 
     /// Generate quick fixes for a diagnostic.
-    fn quick_fixes_for_diagnostic(&self, doc: &Document, diagnostic: &Diagnostic) -> Vec<CodeAction> {
+    fn quick_fixes_for_diagnostic(
+        &self,
+        doc: &Document,
+        diagnostic: &Diagnostic,
+    ) -> Vec<CodeAction> {
         let mut actions = Vec::new();
         let message = &diagnostic.message;
 
@@ -112,10 +116,7 @@ impl CodeActionProvider {
         let end = Position::new(diagnostic.range.start.line, line.len() as u32);
 
         let mut edit = WorkspaceEdit::new();
-        edit.add_edit(
-            doc.uri.clone(),
-            TextEdit::delete(Range::new(start, end)),
-        );
+        edit.add_edit(doc.uri.clone(), TextEdit::delete(Range::new(start, end)));
 
         CodeAction::quick_fix("Remove unused variable").with_edit(edit)
     }
@@ -167,10 +168,7 @@ impl CodeActionProvider {
                 doc.uri.clone(),
                 TextEdit::insert(Position::new(0, 0), import_line),
             );
-            actions.push(
-                CodeAction::quick_fix(format!("Import {}", suggestion))
-                    .with_edit(edit),
-            );
+            actions.push(CodeAction::quick_fix(format!("Import {}", suggestion)).with_edit(edit));
         }
 
         actions
@@ -235,14 +233,18 @@ impl CodeActionProvider {
 
         // Insert let statement before the line
         let line_start = Position::new(range.start.line, 0);
-        let indent = doc.line(range.start.line)
+        let indent = doc
+            .line(range.start.line)
             .map(|l| l.len() - l.trim_start().len())
             .unwrap_or(0);
         let indented_let = format!("{}{}", " ".repeat(indent), let_stmt);
         edit.add_edit(doc.uri.clone(), TextEdit::insert(line_start, indented_let));
 
         // Replace selection with variable name
-        edit.add_edit(doc.uri.clone(), TextEdit::replace(range, var_name.to_string()));
+        edit.add_edit(
+            doc.uri.clone(),
+            TextEdit::replace(range, var_name.to_string()),
+        );
 
         CodeAction::new("Extract to variable")
             .with_kind(CodeActionKind::refactor_extract())
@@ -264,11 +266,17 @@ impl CodeActionProvider {
 
         // Insert function at end of file
         let last_line = doc.line_count().saturating_sub(1) as u32;
-        let end_pos = Position::new(last_line, doc.line(last_line).map(|l| l.len() as u32).unwrap_or(0));
+        let end_pos = Position::new(
+            last_line,
+            doc.line(last_line).map(|l| l.len() as u32).unwrap_or(0),
+        );
         edit.add_edit(doc.uri.clone(), TextEdit::insert(end_pos, fn_def));
 
         // Replace selection with function call
-        edit.add_edit(doc.uri.clone(), TextEdit::replace(range, "extracted()".to_string()));
+        edit.add_edit(
+            doc.uri.clone(),
+            TextEdit::replace(range, "extracted()".to_string()),
+        );
 
         CodeAction::new("Extract to function")
             .with_kind(CodeActionKind::refactor_extract())
@@ -289,10 +297,7 @@ impl CodeActionProvider {
         }
 
         // Add missing derive
-        actions.push(
-            CodeAction::new("Add #[derive(Debug)]")
-                .with_kind(CodeActionKind::source()),
-        );
+        actions.push(CodeAction::new("Add #[derive(Debug)]").with_kind(CodeActionKind::source()));
 
         actions
     }
@@ -331,7 +336,9 @@ impl CodeActionProvider {
             let a_priority = import_priority(a_trimmed);
             let b_priority = import_priority(b_trimmed);
 
-            a_priority.cmp(&b_priority).then_with(|| a_trimmed.cmp(b_trimmed))
+            a_priority
+                .cmp(&b_priority)
+                .then_with(|| a_trimmed.cmp(b_trimmed))
         });
 
         let first = first_import_line?;
@@ -370,7 +377,8 @@ impl Default for CodeActionProvider {
 fn import_priority(import: &str) -> u8 {
     if import.contains("std::") {
         0 // std first
-    } else if import.contains("crate::") || import.contains("self::") || import.contains("super::") {
+    } else if import.contains("crate::") || import.contains("self::") || import.contains("super::")
+    {
         2 // local last
     } else {
         1 // external crates middle

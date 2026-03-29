@@ -32,13 +32,13 @@
 
 mod error;
 mod expr;
-mod stmt;
 mod item;
-mod ty;
 mod pattern;
+mod stmt;
+mod ty;
 
-pub use error::{ParseError, ParseErrorKind, ParseResult};
 pub use crate::ast::Module;
+pub use error::{ParseError, ParseErrorKind, ParseResult};
 
 use crate::ast::*;
 use crate::lexer::{Delimiter, Keyword, SourceFile, Span, Token, TokenKind};
@@ -130,9 +130,9 @@ impl<'a> Parser<'a> {
 
     /// Get the current token.
     fn current(&self) -> &Token {
-        self.tokens.get(self.pos).unwrap_or_else(|| {
-            self.tokens.last().expect("tokens should not be empty")
-        })
+        self.tokens
+            .get(self.pos)
+            .unwrap_or_else(|| self.tokens.last().expect("tokens should not be empty"))
     }
 
     /// Get the current token kind.
@@ -147,16 +147,16 @@ impl<'a> Parser<'a> {
 
     /// Peek at the next token.
     fn peek(&self) -> &Token {
-        self.tokens.get(self.pos + 1).unwrap_or_else(|| {
-            self.tokens.last().expect("tokens should not be empty")
-        })
+        self.tokens
+            .get(self.pos + 1)
+            .unwrap_or_else(|| self.tokens.last().expect("tokens should not be empty"))
     }
 
     /// Peek at the nth next token.
     fn peek_n(&self, n: usize) -> &Token {
-        self.tokens.get(self.pos + n).unwrap_or_else(|| {
-            self.tokens.last().expect("tokens should not be empty")
-        })
+        self.tokens
+            .get(self.pos + n)
+            .unwrap_or_else(|| self.tokens.last().expect("tokens should not be empty"))
     }
 
     /// Check if at end of file.
@@ -240,11 +240,7 @@ impl<'a> Parser<'a> {
             let token_span = self.advance().span;
             let name = self.source.slice(token_span);
             // Strip r# prefix for raw identifiers
-            let name = if is_raw {
-                &name[2..]
-            } else {
-                name
-            };
+            let name = if is_raw { &name[2..] } else { name };
             Ok(Ident::new(name, token_span))
         } else if self.is_contextual_keyword() {
             // Allow contextual keywords as identifiers
@@ -259,12 +255,13 @@ impl<'a> Parser<'a> {
     /// Check if the current token is a keyword that can be used as an identifier
     /// in certain contexts (struct fields, variable names, type paths, etc.).
     fn is_contextual_keyword(&self) -> bool {
-        matches!(self.current_kind(),
+        matches!(
+            self.current_kind(),
             TokenKind::Keyword(Keyword::Default)
-            | TokenKind::Keyword(Keyword::Module)
-            | TokenKind::Keyword(Keyword::SelfType)
-            | TokenKind::Keyword(Keyword::Handle)
-            | TokenKind::Keyword(Keyword::Effect)
+                | TokenKind::Keyword(Keyword::Module)
+                | TokenKind::Keyword(Keyword::SelfType)
+                | TokenKind::Keyword(Keyword::Handle)
+                | TokenKind::Keyword(Keyword::Effect)
         )
     }
 
@@ -319,7 +316,12 @@ impl<'a> Parser<'a> {
     where
         F: FnMut(&mut Self) -> ParseResult<T>,
     {
-        self.parse_delimited(Delimiter::Paren, Delimiter::Paren, &TokenKind::Comma, parse_elem)
+        self.parse_delimited(
+            Delimiter::Paren,
+            Delimiter::Paren,
+            &TokenKind::Comma,
+            parse_elem,
+        )
     }
 
     /// Parse a comma-separated list in brackets.
@@ -327,7 +329,12 @@ impl<'a> Parser<'a> {
     where
         F: FnMut(&mut Self) -> ParseResult<T>,
     {
-        self.parse_delimited(Delimiter::Bracket, Delimiter::Bracket, &TokenKind::Comma, parse_elem)
+        self.parse_delimited(
+            Delimiter::Bracket,
+            Delimiter::Bracket,
+            &TokenKind::Comma,
+            parse_elem,
+        )
     }
 
     /// Parse a comma-separated list in braces.
@@ -335,7 +342,12 @@ impl<'a> Parser<'a> {
     where
         F: FnMut(&mut Self) -> ParseResult<T>,
     {
-        self.parse_delimited(Delimiter::Brace, Delimiter::Brace, &TokenKind::Comma, parse_elem)
+        self.parse_delimited(
+            Delimiter::Brace,
+            Delimiter::Brace,
+            &TokenKind::Comma,
+            parse_elem,
+        )
     }
 
     // =========================================================================
@@ -383,7 +395,9 @@ impl<'a> Parser<'a> {
                 AttrArgs::Empty
             };
 
-            let end = self.expect(&TokenKind::CloseDelim(Delimiter::Bracket))?.span;
+            let end = self
+                .expect(&TokenKind::CloseDelim(Delimiter::Bracket))?
+                .span;
             let span = start.merge(&end);
 
             return Ok(Attribute {
@@ -452,7 +466,9 @@ impl<'a> Parser<'a> {
             AttrArgs::Empty
         };
 
-        let end = self.expect(&TokenKind::CloseDelim(Delimiter::Bracket))?.span;
+        let end = self
+            .expect(&TokenKind::CloseDelim(Delimiter::Bracket))?
+            .span;
         let span = start.merge(&end);
 
         Ok(Attribute {
@@ -773,11 +789,19 @@ impl<'a> Parser<'a> {
             if self.check_lifetime() {
                 let lifetime = self.expect_lifetime()?;
                 let path = Path::from_ident(lifetime.name);
-                bounds.push(TypeBound { path, is_maybe, span: lifetime.span });
+                bounds.push(TypeBound {
+                    path,
+                    is_maybe,
+                    span: lifetime.span,
+                });
             } else {
                 let path = self.parse_path()?;
                 let span = path.span;
-                bounds.push(TypeBound { path, is_maybe, span });
+                bounds.push(TypeBound {
+                    path,
+                    is_maybe,
+                    span,
+                });
             }
 
             if !self.eat(&TokenKind::Plus) {
@@ -887,7 +911,7 @@ impl<'a> Parser<'a> {
                     | Keyword::Extern
                     | Keyword::Effect
                     | Keyword::Unsafe
-                    | Keyword::Async
+                    | Keyword::Async,
                 ) if brace_depth == 0 => break,
                 // Attributes also start items
                 TokenKind::Pound | TokenKind::At if brace_depth == 0 => break,
@@ -907,7 +931,17 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 TokenKind::CloseDelim(Delimiter::Brace) => break,
-                TokenKind::Keyword(Keyword::Let | Keyword::If | Keyword::While | Keyword::For | Keyword::Loop | Keyword::Match | Keyword::Return | Keyword::Break | Keyword::Continue) => break,
+                TokenKind::Keyword(
+                    Keyword::Let
+                    | Keyword::If
+                    | Keyword::While
+                    | Keyword::For
+                    | Keyword::Loop
+                    | Keyword::Match
+                    | Keyword::Return
+                    | Keyword::Break
+                    | Keyword::Continue,
+                ) => break,
                 _ => {
                     self.advance();
                 }
@@ -926,11 +960,8 @@ pub fn parse(source: &SourceFile, tokens: Vec<Token>) -> ParseResult<Module> {
 pub fn parse_source(name: &str, source: &str) -> ParseResult<Module> {
     let source_file = SourceFile::new(name, source);
     let mut lexer = crate::lexer::Lexer::new(&source_file);
-    let tokens = lexer.tokenize().map_err(|e| {
-        ParseError::new(
-            ParseErrorKind::LexerError(e.to_string()),
-            e.span,
-        )
-    })?;
+    let tokens = lexer
+        .tokenize()
+        .map_err(|e| ParseError::new(ParseErrorKind::LexerError(e.to_string()), e.span))?;
     parse(&source_file, tokens)
 }

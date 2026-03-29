@@ -14,8 +14,8 @@
 //! - `SourceId`: A unique identifier for a source file
 
 use std::fmt;
-use std::sync::Arc;
 use std::ops::{Add, Range};
+use std::sync::Arc;
 
 /// Unique identifier for a source file in a compilation session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -86,7 +86,11 @@ impl Position {
     /// Create a new position.
     #[inline]
     pub const fn new(line: u32, column: u32, offset: BytePos) -> Self {
-        Self { line, column, offset }
+        Self {
+            line,
+            column,
+            offset,
+        }
     }
 
     /// Create the start position (line 1, column 1, offset 0).
@@ -121,7 +125,11 @@ impl Span {
     /// Create a new span.
     #[inline]
     pub const fn new(start: BytePos, end: BytePos, source_id: SourceId) -> Self {
-        Self { start, end, source_id }
+        Self {
+            start,
+            end,
+            source_id,
+        }
     }
 
     /// Create a span from byte offsets.
@@ -216,9 +224,7 @@ impl Span {
     /// Check if this span overlaps with another.
     #[inline]
     pub fn overlaps(&self, other: &Span) -> bool {
-        self.source_id == other.source_id
-            && self.start < other.end
-            && other.start < self.end
+        self.source_id == other.source_id && self.start < other.end && other.start < self.end
     }
 }
 
@@ -302,7 +308,8 @@ impl SourceFile {
         // Count Unicode scalar values for column
         let column = self.source[line_start.to_usize()..pos.to_usize()]
             .chars()
-            .count() as u32 + 1;
+            .count() as u32
+            + 1;
 
         Position {
             line: line_index as u32 + 1,
@@ -327,7 +334,8 @@ impl SourceFile {
     /// Get the source text for a line (0-indexed).
     pub fn line_source(&self, line: usize) -> Option<&str> {
         let start = self.line_starts.get(line)?.to_usize();
-        let end = self.line_starts
+        let end = self
+            .line_starts
             .get(line + 1)
             .map(|p| p.to_usize())
             .unwrap_or(self.source.len());
@@ -339,7 +347,10 @@ impl SourceFile {
 
     /// Get start and end positions for a span.
     pub fn span_to_positions(&self, span: Span) -> (Position, Position) {
-        (self.lookup_position(span.start), self.lookup_position(span.end))
+        (
+            self.lookup_position(span.start),
+            self.lookup_position(span.end),
+        )
     }
 
     /// Compute line start positions from source.

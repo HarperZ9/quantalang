@@ -8,15 +8,13 @@
 //!
 //! This module implements the expansion of macro invocations to AST nodes.
 
+use crate::lexer::{Span, Token, TokenKind};
 
-use crate::lexer::{Token, TokenKind, Span};
-
-use super::{
-    MacroExpansion, ExpansionElement, RepetitionKind,
-    TokenTree, MacroContext, MacroError, MacroResult,
-    Bindings, Binding, BindingValue, match_macro_pattern, tokens_to_tree,
-};
 use super::hygiene::{HygieneContext, SyntaxContext};
+use super::{
+    match_macro_pattern, tokens_to_tree, Binding, BindingValue, Bindings, ExpansionElement,
+    MacroContext, MacroError, MacroExpansion, MacroResult, RepetitionKind, TokenTree,
+};
 
 // =============================================================================
 // MACRO EXPANDER
@@ -60,13 +58,18 @@ impl<'ctx> MacroExpander<'ctx> {
     ) -> MacroResult<Vec<TokenTree>> {
         // Check recursion limit
         if self.depth >= self.max_depth {
-            return Err(MacroError::RecursionLimit { limit: self.max_depth });
+            return Err(MacroError::RecursionLimit {
+                limit: self.max_depth,
+            });
         }
 
         // Look up the macro
-        let macro_def = self.ctx.lookup_macro(name).ok_or_else(|| {
-            MacroError::MacroNotFound { name: name.to_string() }
-        })?;
+        let macro_def = self
+            .ctx
+            .lookup_macro(name)
+            .ok_or_else(|| MacroError::MacroNotFound {
+                name: name.to_string(),
+            })?;
 
         // Convert input to token trees
         let input_trees = tokens_to_tree(input);
@@ -87,7 +90,9 @@ impl<'ctx> MacroExpander<'ctx> {
         }
 
         // No rule matched
-        Err(MacroError::NoMatchingRule { name: name.to_string() })
+        Err(MacroError::NoMatchingRule {
+            name: name.to_string(),
+        })
     }
 
     /// Expand a macro template.
@@ -123,13 +128,23 @@ impl<'ctx> MacroExpander<'ctx> {
                 };
                 Ok(vec![TokenTree::Token(token)])
             }
-            ExpansionElement::MetaVar(name) => {
-                self.expand_metavar(name, bindings)
-            }
-            ExpansionElement::Repetition { elements, separator, repetition } => {
-                self.expand_repetition(elements, separator.as_ref(), *repetition, bindings, syntax_ctx)
-            }
-            ExpansionElement::Delimited { delimiter, elements, span } => {
+            ExpansionElement::MetaVar(name) => self.expand_metavar(name, bindings),
+            ExpansionElement::Repetition {
+                elements,
+                separator,
+                repetition,
+            } => self.expand_repetition(
+                elements,
+                separator.as_ref(),
+                *repetition,
+                bindings,
+                syntax_ctx,
+            ),
+            ExpansionElement::Delimited {
+                delimiter,
+                elements,
+                span,
+            } => {
                 let inner = self.expand_elements(elements, bindings, syntax_ctx)?;
                 Ok(vec![TokenTree::Delimited {
                     delimiter: *delimiter,
@@ -157,17 +172,17 @@ impl<'ctx> MacroExpander<'ctx> {
 
     /// Expand a metavariable reference.
     fn expand_metavar(&mut self, name: &str, bindings: &Bindings) -> MacroResult<Vec<TokenTree>> {
-        let binding = bindings.get(name).ok_or_else(|| {
-            MacroError::MetaVarNotFound { name: name.to_string() }
-        })?;
+        let binding = bindings
+            .get(name)
+            .ok_or_else(|| MacroError::MetaVarNotFound {
+                name: name.to_string(),
+            })?;
 
         match binding {
-            Binding::Single(value) => {
-                match value {
-                    BindingValue::TokenTree(tt) => Ok(vec![tt.clone()]),
-                    BindingValue::TokenTrees(tts) => Ok(tts.clone()),
-                }
-            }
+            Binding::Single(value) => match value {
+                BindingValue::TokenTree(tt) => Ok(vec![tt.clone()]),
+                BindingValue::TokenTrees(tts) => Ok(tts.clone()),
+            },
             Binding::Repeated(_) => {
                 // This shouldn't happen outside of a repetition context
                 Err(MacroError::RepetitionMismatch {
@@ -214,7 +229,11 @@ impl<'ctx> MacroExpander<'ctx> {
     }
 
     /// Find the repetition count from a set of bindings.
-    fn find_repetition_count(&self, elements: &[ExpansionElement], bindings: &Bindings) -> MacroResult<usize> {
+    fn find_repetition_count(
+        &self,
+        elements: &[ExpansionElement],
+        bindings: &Bindings,
+    ) -> MacroResult<usize> {
         for element in elements {
             if let Some(count) = self.element_repetition_count(element, bindings) {
                 return Ok(count);
@@ -225,7 +244,11 @@ impl<'ctx> MacroExpander<'ctx> {
     }
 
     /// Get the repetition count for an element.
-    fn element_repetition_count(&self, element: &ExpansionElement, bindings: &Bindings) -> Option<usize> {
+    fn element_repetition_count(
+        &self,
+        element: &ExpansionElement,
+        bindings: &Bindings,
+    ) -> Option<usize> {
         match element {
             ExpansionElement::MetaVar(name) => {
                 if let Some(binding) = bindings.get(name) {
@@ -294,7 +317,7 @@ pub fn expand_macro(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::{SourceFile, Lexer};
+    use crate::lexer::{Lexer, SourceFile};
 
     fn lex(source: &str) -> Vec<Token> {
         let file = SourceFile::anonymous(source);
@@ -307,7 +330,9 @@ mod tests {
         // Create a simple macro that just returns its input
         let mut ctx = MacroContext::new();
 
-        use super::super::{MacroDef, MacroRule, MacroPattern, PatternElement, MetaVarKind, MacroId};
+        use super::super::{
+            MacroDef, MacroId, MacroPattern, MacroRule, MetaVarKind, PatternElement,
+        };
 
         let rule = MacroRule {
             pattern: MacroPattern {

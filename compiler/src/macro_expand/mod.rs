@@ -30,20 +30,20 @@
 //! let expanded = expander.expand_expr(&macro_invocation)?;
 //! ```
 
-mod pattern;
+mod builtins;
 mod expand;
 mod hygiene;
-mod builtins;
+mod pattern;
 
-pub use pattern::*;
+pub use builtins::*;
 pub use expand::*;
 pub use hygiene::*;
-pub use builtins::*;
+pub use pattern::*;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::lexer::{Token, TokenKind, Span, Delimiter};
+use crate::lexer::{Delimiter, Span, Token, TokenKind};
 use thiserror::Error;
 
 // =============================================================================
@@ -73,9 +73,11 @@ impl TokenTree {
     pub fn span(&self) -> Span {
         match self {
             TokenTree::Token(t) => t.span,
-            TokenTree::Delimited { open_span, close_span, .. } => {
-                open_span.merge(close_span)
-            }
+            TokenTree::Delimited {
+                open_span,
+                close_span,
+                ..
+            } => open_span.merge(close_span),
         }
     }
 
@@ -100,7 +102,9 @@ impl TokenTree {
     /// Get the inner tokens if this is a delimited group.
     pub fn as_delimited(&self) -> Option<(&Delimiter, &[TokenTree])> {
         match self {
-            TokenTree::Delimited { delimiter, tokens, .. } => Some((delimiter, tokens)),
+            TokenTree::Delimited {
+                delimiter, tokens, ..
+            } => Some((delimiter, tokens)),
             _ => None,
         }
     }
@@ -239,10 +243,7 @@ pub enum PatternElement {
     /// A literal token to match.
     Token(TokenKind),
     /// A metavariable: `$name:kind`.
-    MetaVar {
-        name: Arc<str>,
-        kind: MetaVarKind,
-    },
+    MetaVar { name: Arc<str>, kind: MetaVarKind },
     /// A repetition: `$(...)*` or `$(...)+` or `$(...)?`.
     Repetition {
         elements: Vec<PatternElement>,
@@ -395,7 +396,9 @@ impl MacroContext {
             }
         }
         // Check global
-        self.macro_names.get(name).and_then(|id| self.macros.get(id))
+        self.macro_names
+            .get(name)
+            .and_then(|id| self.macros.get(id))
     }
 
     /// Push a new scope.

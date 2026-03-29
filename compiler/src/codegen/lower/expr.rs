@@ -9,11 +9,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ast::{self, ExprKind, StmtKind, Literal, BinOp as AstBinOp, UnaryOp as AstUnaryOp};
+use crate::ast::{self, BinOp as AstBinOp, ExprKind, Literal, StmtKind, UnaryOp as AstUnaryOp};
 
-use crate::codegen::ir::*;
-use crate::codegen::builder::values;
 use crate::codegen::backend::{CodegenError, CodegenResult};
+use crate::codegen::builder::values;
+use crate::codegen::ir::*;
 use crate::codegen::runtime;
 
 use super::MirLowerer;
@@ -58,7 +58,9 @@ impl<'ctx> MirLowerer<'ctx> {
             }
             StmtKind::Empty => Ok(None),
             StmtKind::Macro { path, tokens, .. } => {
-                let macro_name = path.segments.last()
+                let macro_name = path
+                    .segments
+                    .last()
                     .map(|s| s.ident.name.as_ref())
                     .unwrap_or("");
 
@@ -106,7 +108,8 @@ impl<'ctx> MirLowerer<'ctx> {
                                 let builder = self.current_fn.as_mut().ok_or_else(|| {
                                     CodegenError::Internal("No current function".to_string())
                                 })?;
-                                let local_id = builder.create_named_local(name.name.clone(), elem_ty);
+                                let local_id =
+                                    builder.create_named_local(name.name.clone(), elem_ty);
                                 builder.assign(local_id, MirRValue::Use(val));
                                 self.var_map.insert(name.name.clone(), local_id);
                             }
@@ -131,13 +134,17 @@ impl<'ctx> MirLowerer<'ctx> {
                         let builder = self.current_fn.as_mut().ok_or_else(|| {
                             CodegenError::Internal("No current function".to_string())
                         })?;
-                        let local_id = builder.create_named_local(name.name.clone(), elem_ty.clone());
+                        let local_id =
+                            builder.create_named_local(name.name.clone(), elem_ty.clone());
                         let field_name: Arc<str> = Arc::from(format!("_{}", i));
-                        builder.assign(local_id, MirRValue::FieldAccess {
-                            base: init_v.clone(),
-                            field_name,
-                            field_ty: elem_ty,
-                        });
+                        builder.assign(
+                            local_id,
+                            MirRValue::FieldAccess {
+                                base: init_v.clone(),
+                                field_name,
+                                field_ty: elem_ty,
+                            },
+                        );
                         self.var_map.insert(name.name.clone(), local_id);
                     }
                 }
@@ -147,8 +154,7 @@ impl<'ctx> MirLowerer<'ctx> {
         }
 
         // Compute type from annotation if present
-        let explicit_ty = local.ty.as_ref()
-            .map(|t| self.lower_type_from_ast(t));
+        let explicit_ty = local.ty.as_ref().map(|t| self.lower_type_from_ast(t));
 
         // Compute init value if present
         let init_val = if let Some(init) = &local.init {
@@ -169,7 +175,8 @@ impl<'ctx> MirLowerer<'ctx> {
         // Coerce float constants to match the declared type.
         // When `let a: f32 = 1.0;`, the literal produces f64 but we need f32.
         let init_val = init_val.map(|val| {
-            if let (Some(ref exp_ty), MirValue::Const(MirConst::Float(v, _))) = (&explicit_ty, &val) {
+            if let (Some(ref exp_ty), MirValue::Const(MirConst::Float(v, _))) = (&explicit_ty, &val)
+            {
                 if matches!(exp_ty, MirType::Float(FloatSize::F32)) {
                     return MirValue::Const(MirConst::Float(*v, MirType::f32()));
                 }
@@ -178,9 +185,10 @@ impl<'ctx> MirLowerer<'ctx> {
         });
 
         // Now borrow current_fn and use it
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         // Create local for the binding
         if let ast::PatternKind::Ident { name, .. } = &local.pattern.kind {
@@ -217,50 +225,57 @@ impl<'ctx> MirLowerer<'ctx> {
             ExprKind::Ident(ident) => self.lower_ident(ident),
             ExprKind::Path(path) => self.lower_path(path),
 
-            ExprKind::Binary { op, left, right } => {
-                self.lower_binary(*op, left, right)
-            }
-            ExprKind::Unary { op, expr: inner } => {
-                self.lower_unary(*op, inner)
-            }
-            ExprKind::Assign { op, target, value } => {
-                self.lower_assign(*op, target, value)
-            }
+            ExprKind::Binary { op, left, right } => self.lower_binary(*op, left, right),
+            ExprKind::Unary { op, expr: inner } => self.lower_unary(*op, inner),
+            ExprKind::Assign { op, target, value } => self.lower_assign(*op, target, value),
 
-            ExprKind::Call { func, args } => {
-                self.lower_call(func, args)
-            }
-            ExprKind::MethodCall { receiver, method, args, .. } => {
-                self.lower_method_call(receiver, method, args)
-            }
+            ExprKind::Call { func, args } => self.lower_call(func, args),
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+                ..
+            } => self.lower_method_call(receiver, method, args),
 
-            ExprKind::If { condition, then_branch, else_branch } => {
-                self.lower_if(condition, then_branch, else_branch.as_deref())
-            }
-            ExprKind::IfLet { expr: scrutinee, then_branch, else_branch, .. } => {
+            ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => self.lower_if(condition, then_branch, else_branch.as_deref()),
+            ExprKind::IfLet {
+                expr: scrutinee,
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 // Desugar if let as: evaluate scrutinee, take then branch
                 // (simplified — full pattern matching would require match lowering)
                 let _ = self.lower_expr(scrutinee)?;
                 self.lower_if_unconditional(then_branch, else_branch.as_deref())
             }
-            ExprKind::Match { scrutinee, arms } => {
-                self.lower_match(scrutinee, arms)
-            }
+            ExprKind::Match { scrutinee, arms } => self.lower_match(scrutinee, arms),
 
-            ExprKind::Loop { body, label } => {
-                self.lower_loop(body, label.as_ref())
-            }
-            ExprKind::While { condition, body, label } => {
-                self.lower_while(condition, body, label.as_ref())
-            }
-            ExprKind::WhileLet { expr: scrutinee, body, .. } => {
+            ExprKind::Loop { body, label } => self.lower_loop(body, label.as_ref()),
+            ExprKind::While {
+                condition,
+                body,
+                label,
+            } => self.lower_while(condition, body, label.as_ref()),
+            ExprKind::WhileLet {
+                expr: scrutinee,
+                body,
+                ..
+            } => {
                 // Simplified: lower scrutinee, then loop body
                 let _ = self.lower_expr(scrutinee)?;
                 self.lower_loop(body, None)
             }
-            ExprKind::For { pattern, iter, body, label } => {
-                self.lower_for(pattern, iter, body, label.as_ref())
-            }
+            ExprKind::For {
+                pattern,
+                iter,
+                body,
+                label,
+            } => self.lower_for(pattern, iter, body, label.as_ref()),
 
             ExprKind::Block(block) => {
                 // Explicit blocks create a new scope -- save and restore
@@ -271,62 +286,56 @@ impl<'ctx> MirLowerer<'ctx> {
                 Ok(result.unwrap_or(values::unit()))
             }
 
-            ExprKind::Return(value) => {
-                self.lower_return(value.as_deref())
-            }
-            ExprKind::Break { value, label } => {
-                self.lower_break(value.as_deref(), label.as_ref())
-            }
-            ExprKind::Continue { label } => {
-                self.lower_continue(label.as_ref())
-            }
+            ExprKind::Return(value) => self.lower_return(value.as_deref()),
+            ExprKind::Break { value, label } => self.lower_break(value.as_deref(), label.as_ref()),
+            ExprKind::Continue { label } => self.lower_continue(label.as_ref()),
 
             ExprKind::Tuple(elems) => self.lower_tuple(elems),
             ExprKind::Array(elems) => self.lower_array(elems),
-            ExprKind::Index { expr: arr, index } => {
-                self.lower_index(arr, index)
-            }
-            ExprKind::Field { expr: obj, field } => {
-                self.lower_field(obj, field)
-            }
-            ExprKind::TupleField { expr: inner, index, .. } => {
-                self.lower_tuple_field(inner, *index)
-            }
+            ExprKind::Index { expr: arr, index } => self.lower_index(arr, index),
+            ExprKind::Field { expr: obj, field } => self.lower_field(obj, field),
+            ExprKind::TupleField {
+                expr: inner, index, ..
+            } => self.lower_tuple_field(inner, *index),
 
-            ExprKind::Ref { mutability, expr: inner } => {
-                self.lower_ref(*mutability, inner)
-            }
-            ExprKind::Deref(inner) => {
-                self.lower_deref(inner)
-            }
+            ExprKind::Ref {
+                mutability,
+                expr: inner,
+            } => self.lower_ref(*mutability, inner),
+            ExprKind::Deref(inner) => self.lower_deref(inner),
 
-            ExprKind::Cast { expr: inner, ty } => {
-                self.lower_cast(inner, ty)
-            }
+            ExprKind::Cast { expr: inner, ty } => self.lower_cast(inner, ty),
 
             ExprKind::Paren(inner) => self.lower_expr(inner),
 
-            ExprKind::Closure { params, return_type, body, .. } => {
-                self.lower_closure(params, return_type.as_deref(), body)
-            }
+            ExprKind::Closure {
+                params,
+                return_type,
+                body,
+                ..
+            } => self.lower_closure(params, return_type.as_deref(), body),
 
             ExprKind::Struct { path, fields, rest } => {
                 self.lower_struct_expr(path, fields, rest.as_deref())
             }
 
-            ExprKind::Handle { effect, handlers, body } => {
-                self.lower_handle(effect, handlers, body)
-            }
-            ExprKind::Resume(value) => {
-                self.lower_resume(value.as_deref())
-            }
-            ExprKind::Perform { effect, operation, args } => {
-                self.lower_perform(effect, operation, args)
-            }
+            ExprKind::Handle {
+                effect,
+                handlers,
+                body,
+            } => self.lower_handle(effect, handlers, body),
+            ExprKind::Resume(value) => self.lower_resume(value.as_deref()),
+            ExprKind::Perform {
+                effect,
+                operation,
+                args,
+            } => self.lower_perform(effect, operation, args),
 
             ExprKind::Macro { path, tokens, .. } => {
                 // Expand macro expressions (println!, print!, etc.)
-                let macro_name = path.segments.last()
+                let macro_name = path
+                    .segments
+                    .last()
                     .map(|s| s.ident.name.as_ref())
                     .unwrap_or("");
 
@@ -350,13 +359,9 @@ impl<'ctx> MirLowerer<'ctx> {
                     "format" => {
                         // format! returns a string - for now return a string constant
                         let s = self.extract_string_from_tokens(tokens);
-                        Ok(MirValue::Const(MirConst::Str(
-                            self.module.intern_string(s),
-                        )))
+                        Ok(MirValue::Const(MirConst::Str(self.module.intern_string(s))))
                     }
-                    "vec" => {
-                        self.lower_vec_macro(tokens)
-                    }
+                    "vec" => self.lower_vec_macro(tokens),
                     _ => {
                         // Unknown macro expression - return unit
                         Ok(values::unit())
@@ -364,9 +369,7 @@ impl<'ctx> MirLowerer<'ctx> {
                 }
             }
 
-            ExprKind::Try(inner) => {
-                self.lower_try(inner)
-            }
+            ExprKind::Try(inner) => self.lower_try(inner),
 
             _ => {
                 // Unsupported expression - return unit
@@ -378,20 +381,23 @@ impl<'ctx> MirLowerer<'ctx> {
     fn lower_literal(&mut self, lit: &Literal) -> CodegenResult<MirValue> {
         match lit {
             Literal::Int { value, suffix, .. } => {
-                let (ty, signed) = suffix.as_ref().map(|s| match s {
-                    ast::IntSuffix::I8 => (MirType::i8(), true),
-                    ast::IntSuffix::I16 => (MirType::i16(), true),
-                    ast::IntSuffix::I32 => (MirType::i32(), true),
-                    ast::IntSuffix::I64 => (MirType::i64(), true),
-                    ast::IntSuffix::I128 => (MirType::Int(IntSize::I128, true), true),
-                    ast::IntSuffix::Isize => (MirType::isize(), true),
-                    ast::IntSuffix::U8 => (MirType::u8(), false),
-                    ast::IntSuffix::U16 => (MirType::u16(), false),
-                    ast::IntSuffix::U32 => (MirType::u32(), false),
-                    ast::IntSuffix::U64 => (MirType::u64(), false),
-                    ast::IntSuffix::U128 => (MirType::Int(IntSize::I128, false), false),
-                    ast::IntSuffix::Usize => (MirType::usize(), false),
-                }).unwrap_or((MirType::i32(), true));
+                let (ty, signed) = suffix
+                    .as_ref()
+                    .map(|s| match s {
+                        ast::IntSuffix::I8 => (MirType::i8(), true),
+                        ast::IntSuffix::I16 => (MirType::i16(), true),
+                        ast::IntSuffix::I32 => (MirType::i32(), true),
+                        ast::IntSuffix::I64 => (MirType::i64(), true),
+                        ast::IntSuffix::I128 => (MirType::Int(IntSize::I128, true), true),
+                        ast::IntSuffix::Isize => (MirType::isize(), true),
+                        ast::IntSuffix::U8 => (MirType::u8(), false),
+                        ast::IntSuffix::U16 => (MirType::u16(), false),
+                        ast::IntSuffix::U32 => (MirType::u32(), false),
+                        ast::IntSuffix::U64 => (MirType::u64(), false),
+                        ast::IntSuffix::U128 => (MirType::Int(IntSize::I128, false), false),
+                        ast::IntSuffix::Usize => (MirType::usize(), false),
+                    })
+                    .unwrap_or((MirType::i32(), true));
 
                 if signed {
                     Ok(MirValue::Const(MirConst::Int(*value as i128, ty)))
@@ -400,16 +406,17 @@ impl<'ctx> MirLowerer<'ctx> {
                 }
             }
             Literal::Float { value, suffix } => {
-                let ty = suffix.as_ref().map(|s| match s {
-                    ast::FloatSuffix::F16 | ast::FloatSuffix::F32 => MirType::f32(),
-                    ast::FloatSuffix::F64 => MirType::f64(),
-                }).unwrap_or(MirType::f64());
+                let ty = suffix
+                    .as_ref()
+                    .map(|s| match s {
+                        ast::FloatSuffix::F16 | ast::FloatSuffix::F32 => MirType::f32(),
+                        ast::FloatSuffix::F64 => MirType::f64(),
+                    })
+                    .unwrap_or(MirType::f64());
                 Ok(MirValue::Const(MirConst::Float(*value, ty)))
             }
             Literal::Bool(b) => Ok(values::bool(*b)),
-            Literal::Char(c) => {
-                Ok(MirValue::Const(MirConst::Uint(*c as u128, MirType::u32())))
-            }
+            Literal::Char(c) => Ok(MirValue::Const(MirConst::Uint(*c as u128, MirType::u32()))),
             Literal::Str { value, .. } => {
                 let idx = self.module.intern_string(value.clone());
                 // Wrap string literal in quanta_string_new() to produce a QuantaString
@@ -424,12 +431,8 @@ impl<'ctx> MirLowerer<'ctx> {
                 builder.switch_to_block(cont);
                 Ok(values::local(result))
             }
-            Literal::ByteStr { value, .. } => {
-                Ok(MirValue::Const(MirConst::ByteStr(value.clone())))
-            }
-            Literal::Byte(b) => {
-                Ok(MirValue::Const(MirConst::Uint(*b as u128, MirType::u8())))
-            }
+            Literal::ByteStr { value, .. } => Ok(MirValue::Const(MirConst::ByteStr(value.clone()))),
+            Literal::Byte(b) => Ok(MirValue::Const(MirConst::Uint(*b as u128, MirType::u8()))),
         }
     }
 
@@ -439,9 +442,18 @@ impl<'ctx> MirLowerer<'ctx> {
         } else {
             // Check for math constants
             match ident.name.as_ref() {
-                "PI" => Ok(MirValue::Const(MirConst::Float(std::f64::consts::PI, MirType::f64()))),
-                "E" => Ok(MirValue::Const(MirConst::Float(std::f64::consts::E, MirType::f64()))),
-                "TAU" => Ok(MirValue::Const(MirConst::Float(std::f64::consts::TAU, MirType::f64()))),
+                "PI" => Ok(MirValue::Const(MirConst::Float(
+                    std::f64::consts::PI,
+                    MirType::f64(),
+                ))),
+                "E" => Ok(MirValue::Const(MirConst::Float(
+                    std::f64::consts::E,
+                    MirType::f64(),
+                ))),
+                "TAU" => Ok(MirValue::Const(MirConst::Float(
+                    std::f64::consts::TAU,
+                    MirType::f64(),
+                ))),
                 // Might be a global or function — inside inline modules,
                 // try the module-prefixed name first so local definitions
                 // shadow parent-scope functions (use super::*).
@@ -476,18 +488,24 @@ impl<'ctx> MirLowerer<'ctx> {
 
             if self.is_enum_type(&resolved_name) {
                 // Unit variant construction (no payload)
-                let disc = self.lookup_enum_variant(&resolved_name, variant_name)
+                let disc = self
+                    .lookup_enum_variant(&resolved_name, variant_name)
                     .map(|(d, _)| d)
                     .unwrap_or(0);
 
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
                 let result = builder.create_local(MirType::Struct(resolved_name.clone()));
                 builder.aggregate(
                     result,
-                    AggregateKind::Variant(resolved_name.clone(), disc as u32, variant_name.clone()),
+                    AggregateKind::Variant(
+                        resolved_name.clone(),
+                        disc as u32,
+                        variant_name.clone(),
+                    ),
                     Vec::new(),
                 );
 
@@ -498,14 +516,21 @@ impl<'ctx> MirLowerer<'ctx> {
         // Complex path - treat as module-qualified reference.
         // Join segments with `_` so that `mod::func` resolves to the
         // mangled name `mod_func` produced by the module loader.
-        let name = path.segments.iter()
+        let name = path
+            .segments
+            .iter()
             .map(|s| s.ident.name.as_ref())
             .collect::<Vec<_>>()
             .join("_");
         Ok(values::global(name))
     }
 
-    fn lower_binary(&mut self, op: AstBinOp, left: &ast::Expr, right: &ast::Expr) -> CodegenResult<MirValue> {
+    fn lower_binary(
+        &mut self,
+        op: AstBinOp,
+        left: &ast::Expr,
+        right: &ast::Expr,
+    ) -> CodegenResult<MirValue> {
         // Handle special cases that don't need the builder first
         match op {
             AstBinOp::And | AstBinOp::Or => {
@@ -540,7 +565,9 @@ impl<'ctx> MirLowerer<'ctx> {
             let coerce_to_f32 = |v: MirValue| -> MirValue {
                 if let MirValue::Const(MirConst::Float(fv, _)) = &v {
                     MirValue::Const(MirConst::Float(*fv, MirType::f32()))
-                } else { v }
+                } else {
+                    v
+                }
             };
             if is_f32(&lt) && !is_f32(&rt) {
                 (left_val, coerce_to_f32(right_val))
@@ -553,13 +580,15 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // Check if operands are strings (QuantaString) for special operator handling
         let left_ty = self.type_of_value(&left_val);
-        let is_string_op = matches!(&left_ty, MirType::Struct(name) if name.as_ref() == "QuantaString");
+        let is_string_op =
+            matches!(&left_ty, MirType::Struct(name) if name.as_ref() == "QuantaString");
 
         // String concatenation: `+` on QuantaString -> quanta_string_concat()
         if is_string_op && op == AstBinOp::Add {
-            let builder = self.current_fn.as_mut().ok_or_else(|| {
-                CodegenError::Internal("No current function".to_string())
-            })?;
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
             let result = builder.create_local(MirType::Struct(Arc::from("QuantaString")));
             let cont = builder.create_block();
             let func = MirValue::Function(Arc::from("quanta_string_concat"));
@@ -570,9 +599,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // String comparison: `==` on QuantaString -> quanta_string_eq()
         if is_string_op && op == AstBinOp::Eq {
-            let builder = self.current_fn.as_mut().ok_or_else(|| {
-                CodegenError::Internal("No current function".to_string())
-            })?;
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
             let result = builder.create_local(MirType::Bool);
             let cont = builder.create_block();
             let func = MirValue::Function(Arc::from("quanta_string_eq"));
@@ -583,9 +613,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // String inequality: `!=` on QuantaString -> !quanta_string_eq()
         if is_string_op && op == AstBinOp::Ne {
-            let builder = self.current_fn.as_mut().ok_or_else(|| {
-                CodegenError::Internal("No current function".to_string())
-            })?;
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
             let eq_result = builder.create_local(MirType::Bool);
             let cont = builder.create_block();
             let func = MirValue::Function(Arc::from("quanta_string_eq"));
@@ -608,9 +639,10 @@ impl<'ctx> MirLowerer<'ctx> {
                 };
                 if let Some(suffix) = op_suffix {
                     let c_func = format!("quanta_vec{}_{}", n, suffix);
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(left_ty.clone());
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from(c_func.as_str()));
@@ -630,16 +662,20 @@ impl<'ctx> MirLowerer<'ctx> {
                         if rname.as_ref() == "quanta_mat4" {
                             ("quanta_mat4_mul", MirType::Struct(Arc::from("quanta_mat4")))
                         } else if rname.as_ref() == "quanta_vec4" {
-                            ("quanta_mat4_mul_vec4", MirType::Struct(Arc::from("quanta_vec4")))
+                            (
+                                "quanta_mat4_mul_vec4",
+                                MirType::Struct(Arc::from("quanta_vec4")),
+                            )
                         } else {
                             ("quanta_mat4_mul", left_ty.clone())
                         }
                     } else {
                         ("quanta_mat4_mul", left_ty.clone())
                     };
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(ret_ty);
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from(c_func));
@@ -660,23 +696,26 @@ impl<'ctx> MirLowerer<'ctx> {
                 AstBinOp::Mul => Some("mul"),
                 AstBinOp::Div => Some("div"),
                 AstBinOp::Rem => Some("rem"),
-                AstBinOp::Eq  => Some("eq"),
-                AstBinOp::Ne  => Some("ne"),
-                AstBinOp::Lt  => Some("lt"),
-                AstBinOp::Gt  => Some("gt"),
-                AstBinOp::Le  => Some("le"),
-                AstBinOp::Ge  => Some("ge"),
+                AstBinOp::Eq => Some("eq"),
+                AstBinOp::Ne => Some("ne"),
+                AstBinOp::Lt => Some("lt"),
+                AstBinOp::Gt => Some("gt"),
+                AstBinOp::Le => Some("le"),
+                AstBinOp::Ge => Some("ge"),
                 _ => None,
             };
             if let Some(method) = method_name {
                 let key = (type_name.clone(), Arc::from(method));
                 if let Some(mangled_fn) = self.impl_methods.get(&key).cloned() {
-                    let ret_ty = self.module.find_function(mangled_fn.as_ref())
+                    let ret_ty = self
+                        .module
+                        .find_function(mangled_fn.as_ref())
                         .map(|f| f.sig.ret.clone())
                         .unwrap_or(left_ty.clone());
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(ret_ty);
                     let cont = builder.create_block();
                     let func = MirValue::Function(mangled_fn);
@@ -711,23 +750,30 @@ impl<'ctx> MirLowerer<'ctx> {
         // Compute result type before borrowing the builder mutably
         let result_ty = self.binary_result_type(mir_op, &left_val);
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         let result = builder.create_local(result_ty);
         builder.binary_op(result, mir_op, left_val, right_val);
         Ok(values::local(result))
     }
 
-    fn lower_logical_op(&mut self, op: AstBinOp, left: &ast::Expr, right: &ast::Expr) -> CodegenResult<MirValue> {
+    fn lower_logical_op(
+        &mut self,
+        op: AstBinOp,
+        left: &ast::Expr,
+        right: &ast::Expr,
+    ) -> CodegenResult<MirValue> {
         // Lower left expression FIRST before borrowing builder
         let left_val = self.lower_expr(left)?;
 
         // Now set up blocks and result
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         let result = builder.create_local(MirType::Bool);
         let eval_right = builder.create_block();
@@ -797,9 +843,10 @@ impl<'ctx> MirLowerer<'ctx> {
             if let MirType::Struct(ref name) = inner_ty {
                 if let Some(n) = Self::vec_component_count(name) {
                     let c_func = format!("quanta_vec{}_neg", n);
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(inner_ty.clone());
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from(c_func.as_str()));
@@ -819,14 +866,18 @@ impl<'ctx> MirLowerer<'ctx> {
                     MirType::Ptr(inner) => *inner,
                     _ => MirType::i32(),
                 };
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                 let result = builder.create_local(pointee_ty.clone());
-                builder.assign(result, MirRValue::Deref {
-                    ptr: inner_val,
-                    pointee_ty,
-                });
+                builder.assign(
+                    result,
+                    MirRValue::Deref {
+                        ptr: inner_val,
+                        pointee_ty,
+                    },
+                );
                 return Ok(values::local(result));
             }
             AstUnaryOp::Ref | AstUnaryOp::RefMut => {
@@ -844,9 +895,10 @@ impl<'ctx> MirLowerer<'ctx> {
                     }
                 };
                 let is_mut = matches!(op, AstUnaryOp::RefMut);
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                 let result = builder.create_local(MirType::Ptr(Box::new(inner_ty)));
                 builder.make_ref(result, is_mut, MirPlace::local(local));
                 return Ok(values::local(result));
@@ -856,16 +908,22 @@ impl<'ctx> MirLowerer<'ctx> {
         // Compute result type before borrowing the builder mutably
         let result_ty = self.type_of_value(&inner_val);
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         let result = builder.create_local(result_ty);
         builder.unary_op(result, mir_op, inner_val);
         Ok(values::local(result))
     }
 
-    fn lower_assign(&mut self, op: ast::AssignOp, target: &ast::Expr, value: &ast::Expr) -> CodegenResult<MirValue> {
+    fn lower_assign(
+        &mut self,
+        op: ast::AssignOp,
+        target: &ast::Expr,
+        value: &ast::Expr,
+    ) -> CodegenResult<MirValue> {
         let val = self.lower_expr(value)?;
 
         // Handle dereference assignment: `*ptr = value`
@@ -916,9 +974,7 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // Get the target local
         let target_local = match &target.kind {
-            ExprKind::Ident(ident) => {
-                self.var_map.get(&ident.name).copied()
-            }
+            ExprKind::Ident(ident) => self.var_map.get(&ident.name).copied(),
             _ => None,
         };
 
@@ -969,11 +1025,14 @@ impl<'ctx> MirLowerer<'ctx> {
                     let result_ty = MirType::Struct(Arc::from("quanta_vec4"));
                     let builder = self.current_fn.as_mut().unwrap();
                     let dest = builder.create_local(result_ty);
-                    builder.assign(dest, MirRValue::TextureSample {
-                        texture: tex,
-                        sampler: samp,
-                        coords: coords,
-                    });
+                    builder.assign(
+                        dest,
+                        MirRValue::TextureSample {
+                            texture: tex,
+                            sampler: samp,
+                            coords: coords,
+                        },
+                    );
                     return Ok(MirValue::Local(dest));
                 }
                 _ => {}
@@ -1032,7 +1091,8 @@ impl<'ctx> MirLowerer<'ctx> {
         // Try to resolve the function's return type from declared signatures
         let ret_ty = self.resolve_call_return_type(func);
 
-        let mut arg_vals: Vec<_> = args.iter()
+        let mut arg_vals: Vec<_> = args
+            .iter()
             .map(|a| self.lower_expr(a))
             .collect::<CodegenResult<_>>()?;
 
@@ -1046,18 +1106,24 @@ impl<'ctx> MirLowerer<'ctx> {
                     let param_types: Vec<MirType> = target_fn.sig.params.clone();
                     for (i, arg_val) in arg_vals.iter_mut().enumerate() {
                         if i < param_types.len() {
-                            if matches!(&param_types[i], MirType::Ptr(inner) if matches!(inner.as_ref(), MirType::Int(IntSize::I8, true))) {
+                            if matches!(&param_types[i], MirType::Ptr(inner) if matches!(inner.as_ref(), MirType::Int(IntSize::I8, true)))
+                            {
                                 let arg_ty = self.type_of_value(arg_val);
                                 if let MirType::Struct(ref name) = arg_ty {
                                     if name.as_ref() == "QuantaString" {
                                         if let MirValue::Local(local_id) = arg_val {
                                             let builder = self.current_fn.as_mut().unwrap();
-                                            let ptr_local = builder.create_local(MirType::Ptr(Box::new(MirType::i8())));
-                                            builder.assign(ptr_local, MirRValue::FieldAccess {
-                                                base: MirValue::Local(*local_id),
-                                                field_name: Arc::from("ptr"),
-                                                field_ty: MirType::Ptr(Box::new(MirType::i8())),
-                                            });
+                                            let ptr_local = builder.create_local(MirType::Ptr(
+                                                Box::new(MirType::i8()),
+                                            ));
+                                            builder.assign(
+                                                ptr_local,
+                                                MirRValue::FieldAccess {
+                                                    base: MirValue::Local(*local_id),
+                                                    field_name: Arc::from("ptr"),
+                                                    field_ty: MirType::Ptr(Box::new(MirType::i8())),
+                                                },
+                                            );
                                             *arg_val = values::local(ptr_local);
                                         }
                                     }
@@ -1073,14 +1139,26 @@ impl<'ctx> MirLowerer<'ctx> {
         // Runtime builtins like read_file, write_file, file_exists expect
         // const char* but the lowerer passes QuantaString values.
         if let Some(fn_name) = self.extract_call_name(func) {
-            let needs_str_coerce = matches!(fn_name,
-                "read_file" | "write_file" | "file_exists" |
-                "read_bytes" | "write_bytes" | "append_file" |
-                "quanta_vk_load_shader_file" | "quanta_vk_run_compute" |
-                "map_insert" | "map_get" | "map_contains" | "map_remove" |
-                "list_dir" | "is_dir" | "file_size" |
-                "tcp_connect" | "tcp_send" |
-                "getenv"
+            let needs_str_coerce = matches!(
+                fn_name,
+                "read_file"
+                    | "write_file"
+                    | "file_exists"
+                    | "read_bytes"
+                    | "write_bytes"
+                    | "append_file"
+                    | "quanta_vk_load_shader_file"
+                    | "quanta_vk_run_compute"
+                    | "map_insert"
+                    | "map_get"
+                    | "map_contains"
+                    | "map_remove"
+                    | "list_dir"
+                    | "is_dir"
+                    | "file_size"
+                    | "tcp_connect"
+                    | "tcp_send"
+                    | "getenv"
             );
             if needs_str_coerce {
                 for arg_val in arg_vals.iter_mut() {
@@ -1089,12 +1167,16 @@ impl<'ctx> MirLowerer<'ctx> {
                         if name.as_ref() == "QuantaString" {
                             if let MirValue::Local(local_id) = arg_val {
                                 let builder = self.current_fn.as_mut().unwrap();
-                                let ptr_local = builder.create_local(MirType::Ptr(Box::new(MirType::i8())));
-                                builder.assign(ptr_local, MirRValue::FieldAccess {
-                                    base: MirValue::Local(*local_id),
-                                    field_name: Arc::from("ptr"),
-                                    field_ty: MirType::Ptr(Box::new(MirType::i8())),
-                                });
+                                let ptr_local =
+                                    builder.create_local(MirType::Ptr(Box::new(MirType::i8())));
+                                builder.assign(
+                                    ptr_local,
+                                    MirRValue::FieldAccess {
+                                        base: MirValue::Local(*local_id),
+                                        field_name: Arc::from("ptr"),
+                                        field_ty: MirType::Ptr(Box::new(MirType::i8())),
+                                    },
+                                );
                                 *arg_val = values::local(ptr_local);
                             }
                         }
@@ -1118,9 +1200,10 @@ impl<'ctx> MirLowerer<'ctx> {
             }
         }
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
         let cont = builder.create_block();
 
         // If the function returns void, don't create a result local or
@@ -1157,21 +1240,29 @@ impl<'ctx> MirLowerer<'ctx> {
 
     /// Lower a vector constructor call: `vec2(x,y)`, `vec3(x,y,z)`, `vec4(x,y,z,w)`.
     /// Generates a struct aggregate for the corresponding `quanta_vecN` type.
-    fn lower_vec_constructor(&mut self, components: u32, args: &[ast::Expr]) -> CodegenResult<MirValue> {
+    fn lower_vec_constructor(
+        &mut self,
+        components: u32,
+        args: &[ast::Expr],
+    ) -> CodegenResult<MirValue> {
         let struct_name = format!("quanta_vec{}", components);
         let mut operands = Vec::new();
         for arg in args {
             operands.push(self.lower_expr(arg)?);
         }
         let ty = MirType::Struct(Arc::from(struct_name.as_str()));
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
         let result = builder.create_local(ty.clone());
-        builder.assign(result, MirRValue::Aggregate {
-            kind: AggregateKind::Struct(Arc::from(struct_name.as_str())),
-            operands,
-        });
+        builder.assign(
+            result,
+            MirRValue::Aggregate {
+                kind: AggregateKind::Struct(Arc::from(struct_name.as_str())),
+                operands,
+            },
+        );
         Ok(MirValue::Local(result))
     }
 
@@ -1188,7 +1279,11 @@ impl<'ctx> MirLowerer<'ctx> {
     /// Dispatch vector math builtins (dot, normalize, length, lerp, cross,
     /// reflect) to the correct size-specific C function based on the first
     /// argument's type.
-    fn try_dispatch_vector_builtin(&mut self, name: &str, args: &[ast::Expr]) -> Option<CodegenResult<MirValue>> {
+    fn try_dispatch_vector_builtin(
+        &mut self,
+        name: &str,
+        args: &[ast::Expr],
+    ) -> Option<CodegenResult<MirValue>> {
         // Only handle known vector builtins
         match name {
             "dot" | "normalize" | "length" | "lerp" | "cross" | "reflect" => {}
@@ -1219,11 +1314,15 @@ impl<'ctx> MirLowerer<'ctx> {
             "normalize" => (format!("quanta_normalize{}", n), first_ty.clone()),
             "length" => (format!("quanta_length{}", n), MirType::f64()),
             "cross" => {
-                if n != 3 { return None; }
+                if n != 3 {
+                    return None;
+                }
                 ("quanta_cross".to_string(), first_ty.clone())
             }
             "reflect" => {
-                if n != 3 { return None; }
+                if n != 3 {
+                    return None;
+                }
                 ("quanta_reflect3".to_string(), first_ty.clone())
             }
             "lerp" => (format!("quanta_lerp{}", n), first_ty.clone()),
@@ -1241,7 +1340,11 @@ impl<'ctx> MirLowerer<'ctx> {
 
         let builder = match self.current_fn.as_mut() {
             Some(b) => b,
-            None => return Some(Err(CodegenError::Internal("No current function".to_string()))),
+            None => {
+                return Some(Err(CodegenError::Internal(
+                    "No current function".to_string(),
+                )))
+            }
         };
         let result = builder.create_local(ret_ty);
         let cont = builder.create_block();
@@ -1254,12 +1357,28 @@ impl<'ctx> MirLowerer<'ctx> {
     /// Dispatch mat4 builtins (mat4_identity, mat4_translate, mat4_scale,
     /// mat4_perspective) to the correct C runtime function with the proper
     /// return type.
-    fn try_dispatch_mat4_builtin(&mut self, name: &str, args: &[ast::Expr]) -> Option<CodegenResult<MirValue>> {
+    fn try_dispatch_mat4_builtin(
+        &mut self,
+        name: &str,
+        args: &[ast::Expr],
+    ) -> Option<CodegenResult<MirValue>> {
         let (c_func, ret_ty) = match name {
-            "mat4_identity" => ("quanta_mat4_identity", MirType::Struct(Arc::from("quanta_mat4"))),
-            "mat4_translate" => ("quanta_mat4_translate", MirType::Struct(Arc::from("quanta_mat4"))),
-            "mat4_scale" => ("quanta_mat4_scale", MirType::Struct(Arc::from("quanta_mat4"))),
-            "mat4_perspective" => ("quanta_mat4_perspective", MirType::Struct(Arc::from("quanta_mat4"))),
+            "mat4_identity" => (
+                "quanta_mat4_identity",
+                MirType::Struct(Arc::from("quanta_mat4")),
+            ),
+            "mat4_translate" => (
+                "quanta_mat4_translate",
+                MirType::Struct(Arc::from("quanta_mat4")),
+            ),
+            "mat4_scale" => (
+                "quanta_mat4_scale",
+                MirType::Struct(Arc::from("quanta_mat4")),
+            ),
+            "mat4_perspective" => (
+                "quanta_mat4_perspective",
+                MirType::Struct(Arc::from("quanta_mat4")),
+            ),
             _ => return None,
         };
 
@@ -1274,7 +1393,11 @@ impl<'ctx> MirLowerer<'ctx> {
 
         let builder = match self.current_fn.as_mut() {
             Some(b) => b,
-            None => return Some(Err(CodegenError::Internal("No current function".to_string()))),
+            None => {
+                return Some(Err(CodegenError::Internal(
+                    "No current function".to_string(),
+                )))
+            }
         };
         let result = builder.create_local(ret_ty);
         let cont = builder.create_block();
@@ -1298,14 +1421,16 @@ impl<'ctx> MirLowerer<'ctx> {
                 // For module-qualified paths like `math::add`, join with `_`
                 // to match the mangled name `math_add`.
                 if path.segments.len() > 1 {
-                    Some(path.segments.iter()
-                        .map(|s| s.ident.name.as_ref())
-                        .collect::<Vec<_>>()
-                        .join("_"))
+                    Some(
+                        path.segments
+                            .iter()
+                            .map(|s| s.ident.name.as_ref())
+                            .collect::<Vec<_>>()
+                            .join("_"),
+                    )
                 } else {
-                    path.last_ident().map(|i| {
-                        self.resolve_fn_name(&i.name).to_string()
-                    })
+                    path.last_ident()
+                        .map(|i| self.resolve_fn_name(&i.name).to_string())
                 }
             }
             _ => None,
@@ -1327,11 +1452,27 @@ impl<'ctx> MirLowerer<'ctx> {
         }
         // Check if it's a math/graphics builtin — these return f64
         if let Some(ref fn_name) = name {
-            let is_f64_builtin = matches!(fn_name.as_str(),
-                "sqrt" | "sin" | "cos" | "tan" | "pow" | "abs" |
-                "floor" | "ceil" | "round" | "min" | "max" |
-                "clamp" | "smoothstep" | "mix" | "fract" | "step" |
-                "dot" | "length" | "lerp"
+            let is_f64_builtin = matches!(
+                fn_name.as_str(),
+                "sqrt"
+                    | "sin"
+                    | "cos"
+                    | "tan"
+                    | "pow"
+                    | "abs"
+                    | "floor"
+                    | "ceil"
+                    | "round"
+                    | "min"
+                    | "max"
+                    | "clamp"
+                    | "smoothstep"
+                    | "mix"
+                    | "fract"
+                    | "step"
+                    | "dot"
+                    | "length"
+                    | "lerp"
             );
             if is_f64_builtin {
                 return MirType::f64();
@@ -1341,7 +1482,9 @@ impl<'ctx> MirLowerer<'ctx> {
                 "vec2" => return MirType::Struct(Arc::from("quanta_vec2")),
                 "vec3" => return MirType::Struct(Arc::from("quanta_vec3")),
                 "vec4" => return MirType::Struct(Arc::from("quanta_vec4")),
-                "normalize" | "cross" | "reflect" => return MirType::Struct(Arc::from("quanta_vec3")),
+                "normalize" | "cross" | "reflect" => {
+                    return MirType::Struct(Arc::from("quanta_vec3"))
+                }
                 // Texture sampling — returns vec4 (tex2d_depth returns f64 for single channel)
                 "tex2d" | "texture_sample" => return MirType::Struct(Arc::from("quanta_vec4")),
                 "tex2d_depth" => return MirType::f64(),
@@ -1381,24 +1524,30 @@ impl<'ctx> MirLowerer<'ctx> {
                 // Process builtins
                 "process_exit" => return MirType::Void,
                 // Directory traversal builtins
-                "list_dir" => return MirType::Vec(Box::new(MirType::Struct(Arc::from("QuantaString")))),
+                "list_dir" => {
+                    return MirType::Vec(Box::new(MirType::Struct(Arc::from("QuantaString"))))
+                }
                 "is_dir" => return MirType::Bool,
                 "file_size" => return MirType::i64(),
                 // String vec builtins
-                "vec_new_str" => return MirType::Vec(Box::new(MirType::Struct(Arc::from("QuantaString")))),
+                "vec_new_str" => {
+                    return MirType::Vec(Box::new(MirType::Struct(Arc::from("QuantaString"))))
+                }
                 "vec_get_str" => return MirType::Struct(Arc::from("QuantaString")),
                 "vec_push_str" => return MirType::Void,
                 // TCP socket builtins
                 "tcp_connect" => return MirType::i64(),
-                "tcp_send"    => return MirType::i64(),
-                "tcp_recv"    => return MirType::Struct(Arc::from("QuantaString")),
-                "tcp_close"   => return MirType::Void,
+                "tcp_send" => return MirType::i64(),
+                "tcp_recv" => return MirType::Struct(Arc::from("QuantaString")),
+                "tcp_close" => return MirType::Void,
                 // Environment variable builtins
                 "getenv" => return MirType::Struct(Arc::from("QuantaString")),
                 // Clock / time builtins
                 "clock_ms" | "time_unix" => return MirType::i64(),
                 // Format builtins
-                "to_string_i32" | "to_string_f64" => return MirType::Struct(Arc::from("QuantaString")),
+                "to_string_i32" | "to_string_f64" => {
+                    return MirType::Struct(Arc::from("QuantaString"))
+                }
                 // HashMap builtins (legacy i32->i32)
                 "map_new_i32" => return MirType::Struct(Arc::from("QuantaMapHandle")),
                 "map_get_i32" => return MirType::i32(),
@@ -1406,19 +1555,20 @@ impl<'ctx> MirLowerer<'ctx> {
                 "map_contains_i32" | "map_remove_i32" => return MirType::Bool,
                 "map_insert_i32" => return MirType::Void,
                 // HashMap builtins (str->f64, default)
-                "map_new" => return MirType::Map(
-                    Box::new(MirType::Struct(Arc::from("QuantaString"))),
-                    Box::new(MirType::f64()),
-                ),
+                "map_new" => {
+                    return MirType::Map(
+                        Box::new(MirType::Struct(Arc::from("QuantaString"))),
+                        Box::new(MirType::f64()),
+                    )
+                }
                 "map_get" => return MirType::f64(),
                 "map_len" => return MirType::i64(),
                 "map_contains" | "map_remove" => return MirType::Bool,
                 "map_insert" => return MirType::Void,
                 // HashMap builtins (i64->f64)
-                "map_new_i64" => return MirType::Map(
-                    Box::new(MirType::i64()),
-                    Box::new(MirType::f64()),
-                ),
+                "map_new_i64" => {
+                    return MirType::Map(Box::new(MirType::i64()), Box::new(MirType::f64()))
+                }
                 "map_get_i64" => return MirType::f64(),
                 "map_len_i64" => return MirType::i64(),
                 "map_contains_i64" | "map_remove_i64" => return MirType::Bool,
@@ -1438,7 +1588,9 @@ impl<'ctx> MirLowerer<'ctx> {
                 let enum_name = &path.segments[0].ident.name;
                 let variant_name = &path.segments[1].ident.name;
                 // Check both concrete enums AND generic enum templates
-                if self.is_enum_type(enum_name) || self.generic_enums.contains_key(enum_name.as_ref()) {
+                if self.is_enum_type(enum_name)
+                    || self.generic_enums.contains_key(enum_name.as_ref())
+                {
                     return Some((enum_name.clone(), variant_name.clone()));
                 }
             }
@@ -1455,7 +1607,8 @@ impl<'ctx> MirLowerer<'ctx> {
         args: &[ast::Expr],
     ) -> CodegenResult<MirValue> {
         // Lower all argument values first
-        let arg_vals: Vec<_> = args.iter()
+        let arg_vals: Vec<_> = args
+            .iter()
             .map(|a| self.lower_expr(a))
             .collect::<CodegenResult<_>>()?;
 
@@ -1469,13 +1622,15 @@ impl<'ctx> MirLowerer<'ctx> {
         };
 
         // Look up the variant to get its discriminant
-        let disc = self.lookup_enum_variant(&actual_enum_name, variant_name)
+        let disc = self
+            .lookup_enum_variant(&actual_enum_name, variant_name)
             .map(|(d, _)| d)
             .unwrap_or(0);
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         let result = builder.create_local(MirType::Struct(actual_enum_name.clone()));
         builder.aggregate(
@@ -1503,7 +1658,10 @@ impl<'ctx> MirLowerer<'ctx> {
         };
 
         // Get type parameter names
-        let type_param_names: Vec<Arc<str>> = enum_def.generics.params.iter()
+        let type_param_names: Vec<Arc<str>> = enum_def
+            .generics
+            .params
+            .iter()
             .filter_map(|p| match &p.kind {
                 ast::GenericParamKind::Type { .. } => Some(p.ident.name.clone()),
                 _ => None,
@@ -1511,10 +1669,18 @@ impl<'ctx> MirLowerer<'ctx> {
             .collect();
 
         // Find the variant definition
-        if let Some(variant) = enum_def.variants.iter().find(|v| v.name.name.as_ref() == variant_name) {
+        if let Some(variant) = enum_def
+            .variants
+            .iter()
+            .find(|v| v.name.name.as_ref() == variant_name)
+        {
             let fields = match &variant.fields {
-                ast::StructFields::Tuple(fields) => fields.iter().map(|f| &f.ty).collect::<Vec<_>>(),
-                ast::StructFields::Named(fields) => fields.iter().map(|f| &f.ty).collect::<Vec<_>>(),
+                ast::StructFields::Tuple(fields) => {
+                    fields.iter().map(|f| &f.ty).collect::<Vec<_>>()
+                }
+                ast::StructFields::Named(fields) => {
+                    fields.iter().map(|f| &f.ty).collect::<Vec<_>>()
+                }
                 ast::StructFields::Unit => Vec::new(),
             };
 
@@ -1577,9 +1743,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
                 // --- No-arg methods returning usize ---
                 if method_name == "len" {
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::usize());
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from("quanta_string_len"));
@@ -1590,9 +1757,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
                 // --- No-arg methods returning bool ---
                 if method_name == "is_empty" {
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::Bool);
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from("quanta_string_is_empty"));
@@ -1605,13 +1773,14 @@ impl<'ctx> MirLowerer<'ctx> {
                 let no_arg_str_fn: Option<&str> = match method_name {
                     "to_uppercase" => Some("quanta_string_to_upper"),
                     "to_lowercase" => Some("quanta_string_to_lower"),
-                    "trim"         => Some("quanta_string_trim"),
+                    "trim" => Some("quanta_string_trim"),
                     _ => None,
                 };
                 if let Some(c_fn) = no_arg_str_fn {
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::Struct(Arc::from("QuantaString")));
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from(c_fn));
@@ -1623,8 +1792,8 @@ impl<'ctx> MirLowerer<'ctx> {
                 // --- Single-arg methods returning bool (arg is QuantaString) ---
                 let one_arg_bool_fn: Option<&str> = match method_name {
                     "starts_with" => Some("quanta_string_starts_with"),
-                    "ends_with"   => Some("quanta_string_ends_with"),
-                    "contains"    => Some("quanta_string_contains"),
+                    "ends_with" => Some("quanta_string_ends_with"),
+                    "contains" => Some("quanta_string_contains"),
                     _ => None,
                 };
                 if let Some(c_fn) = one_arg_bool_fn {
@@ -1632,9 +1801,10 @@ impl<'ctx> MirLowerer<'ctx> {
                     for arg in args {
                         arg_vals.push(self.lower_expr(arg)?);
                     }
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::Bool);
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from(c_fn));
@@ -1649,9 +1819,10 @@ impl<'ctx> MirLowerer<'ctx> {
                     for arg in args {
                         arg_vals.push(self.lower_expr(arg)?);
                     }
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::Struct(Arc::from("QuantaVec")));
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from("quanta_string_split"));
@@ -1662,9 +1833,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
                 // --- split_whitespace() → QuantaVec of QuantaString ---
                 if method_name == "split_whitespace" {
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::Struct(Arc::from("QuantaVec")));
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from("quanta_string_split_ws"));
@@ -1675,9 +1847,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
                 // --- lines() → QuantaVec of QuantaString ---
                 if method_name == "lines" {
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::Struct(Arc::from("QuantaVec")));
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from("quanta_string_lines"));
@@ -1688,9 +1861,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
                 // --- parse_int() → i64 ---
                 if method_name == "parse_int" {
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::i64());
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from("quanta_string_parse_int"));
@@ -1701,9 +1875,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
                 // --- parse_float() → f64 ---
                 if method_name == "parse_float" {
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::f64());
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from("quanta_string_parse_float"));
@@ -1715,9 +1890,10 @@ impl<'ctx> MirLowerer<'ctx> {
                 // --- char_at(index) → QuantaString ---
                 if method_name == "char_at" && args.len() == 1 {
                     let idx_val = self.lower_expr(&args[0])?;
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::Struct(Arc::from("QuantaString")));
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from("quanta_string_char_at"));
@@ -1730,13 +1906,19 @@ impl<'ctx> MirLowerer<'ctx> {
                 if method_name == "substring" && args.len() == 2 {
                     let start_val = self.lower_expr(&args[0])?;
                     let len_val = self.lower_expr(&args[1])?;
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::Struct(Arc::from("QuantaString")));
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from("quanta_string_substring"));
-                    builder.call(func, vec![receiver_val, start_val, len_val], Some(result), cont);
+                    builder.call(
+                        func,
+                        vec![receiver_val, start_val, len_val],
+                        Some(result),
+                        cont,
+                    );
                     builder.switch_to_block(cont);
                     return Ok(values::local(result));
                 }
@@ -1747,9 +1929,10 @@ impl<'ctx> MirLowerer<'ctx> {
                     for arg in args {
                         arg_vals.push(self.lower_expr(arg)?);
                     }
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::Struct(Arc::from("QuantaString")));
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from("quanta_string_replace"));
@@ -1761,9 +1944,10 @@ impl<'ctx> MirLowerer<'ctx> {
                 // --- repeat(count) → QuantaString ---
                 if method_name == "repeat" && args.len() == 1 {
                     let count_val = self.lower_expr(&args[0])?;
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::Struct(Arc::from("QuantaString")));
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from("quanta_string_repeat"));
@@ -1775,9 +1959,10 @@ impl<'ctx> MirLowerer<'ctx> {
                 // --- index_of(substr) → i64 ---
                 if method_name == "index_of" && args.len() == 1 {
                     let substr_val = self.lower_expr(&args[0])?;
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::i64());
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from("quanta_string_index_of"));
@@ -1789,9 +1974,10 @@ impl<'ctx> MirLowerer<'ctx> {
                 // --- compare(other) → i64 ---
                 if method_name == "compare" && args.len() == 1 {
                     let other_val = self.lower_expr(&args[0])?;
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(MirType::i64());
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from("quanta_string_compare"));
@@ -1806,7 +1992,9 @@ impl<'ctx> MirLowerer<'ctx> {
         if let MirType::TraitObject(ref trait_name) = receiver_ty {
             if let Some(trait_methods) = self.trait_methods.get(trait_name).cloned() {
                 // Find the method index in the vtable
-                if let Some((method_idx, (_, method_sig))) = trait_methods.iter().enumerate()
+                if let Some((method_idx, (_, method_sig))) = trait_methods
+                    .iter()
+                    .enumerate()
                     .find(|(_, (name, _))| name.as_ref() == method.name.as_ref())
                 {
                     // Lower all arguments
@@ -1816,26 +2004,33 @@ impl<'ctx> MirLowerer<'ctx> {
                     }
 
                     let ret_ty = method_sig.ret.clone();
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
                     // Extract data pointer from fat pointer: receiver.data
                     let data_ptr = builder.create_local(MirType::Ptr(Box::new(MirType::Void)));
-                    builder.assign(data_ptr, MirRValue::FieldAccess {
-                        base: receiver_val.clone(),
-                        field_name: Arc::from("data"),
-                        field_ty: MirType::Ptr(Box::new(MirType::Void)),
-                    });
+                    builder.assign(
+                        data_ptr,
+                        MirRValue::FieldAccess {
+                            base: receiver_val.clone(),
+                            field_name: Arc::from("data"),
+                            field_ty: MirType::Ptr(Box::new(MirType::Void)),
+                        },
+                    );
 
                     // Extract vtable pointer: receiver.vtable
                     let vtable_ptr_ty = MirType::Ptr(Box::new(MirType::Void));
                     let vtable_ptr = builder.create_local(vtable_ptr_ty.clone());
-                    builder.assign(vtable_ptr, MirRValue::FieldAccess {
-                        base: receiver_val,
-                        field_name: Arc::from("vtable"),
-                        field_ty: vtable_ptr_ty,
-                    });
+                    builder.assign(
+                        vtable_ptr,
+                        MirRValue::FieldAccess {
+                            base: receiver_val,
+                            field_name: Arc::from("vtable"),
+                            field_ty: vtable_ptr_ty,
+                        },
+                    );
 
                     // The C backend will generate: receiver.vtable->method(receiver.data, args...)
                     // We store the method index and trait name for the C backend
@@ -1844,14 +2039,20 @@ impl<'ctx> MirLowerer<'ctx> {
 
                     // Create a function value that encodes the vtable dispatch
                     let dispatch_name = Arc::from(format!(
-                        "__vtable_dispatch_{}_{}_{}", trait_name, method.name, method_idx
+                        "__vtable_dispatch_{}_{}_{}",
+                        trait_name, method.name, method_idx
                     ));
 
                     // Prepend data pointer as first argument (self)
                     let mut all_args = vec![values::local(data_ptr)];
                     all_args.extend(arg_vals);
 
-                    builder.call(MirValue::Global(dispatch_name), all_args, Some(result), cont);
+                    builder.call(
+                        MirValue::Global(dispatch_name),
+                        all_args,
+                        Some(result),
+                        cont,
+                    );
                     builder.switch_to_block(cont);
                     return Ok(values::local(result));
                 }
@@ -1866,50 +2067,51 @@ impl<'ctx> MirLowerer<'ctx> {
             let method_name = method.name.as_ref();
             // Map method name → C function name (single-arg, receiver is the argument)
             let simple_c_fn: Option<&str> = match method_name {
-                "abs"    => Some("fabs"),
-                "sqrt"   => Some("sqrt"),
-                "cbrt"   => Some("cbrt"),
-                "ceil"   => Some("ceil"),
-                "floor"  => Some("floor"),
-                "round"  => Some("round"),
-                "trunc"  => Some("trunc"),
+                "abs" => Some("fabs"),
+                "sqrt" => Some("sqrt"),
+                "cbrt" => Some("cbrt"),
+                "ceil" => Some("ceil"),
+                "floor" => Some("floor"),
+                "round" => Some("round"),
+                "trunc" => Some("trunc"),
                 "signum" => None, // not a simple C call
-                "recip"  => None, // not a simple C call
-                "sin"    => Some("sin"),
-                "cos"    => Some("cos"),
-                "tan"    => Some("tan"),
-                "asin"   => Some("asin"),
-                "acos"   => Some("acos"),
-                "atan"   => Some("atan"),
-                "sinh"   => Some("sinh"),
-                "cosh"   => Some("cosh"),
-                "tanh"   => Some("tanh"),
-                "exp"    => Some("exp"),
-                "exp2"   => Some("exp2"),
-                "ln"     => Some("log"),
-                "log2"   => Some("log2"),
-                "log10"  => Some("log10"),
+                "recip" => None,  // not a simple C call
+                "sin" => Some("sin"),
+                "cos" => Some("cos"),
+                "tan" => Some("tan"),
+                "asin" => Some("asin"),
+                "acos" => Some("acos"),
+                "atan" => Some("atan"),
+                "sinh" => Some("sinh"),
+                "cosh" => Some("cosh"),
+                "tanh" => Some("tanh"),
+                "exp" => Some("exp"),
+                "exp2" => Some("exp2"),
+                "ln" => Some("log"),
+                "log2" => Some("log2"),
+                "log10" => Some("log10"),
                 _ => None,
             };
 
             // Two-arg float methods: val.method(other) → c_fn(val, other)
             let two_arg_c_fn: Option<&str> = match method_name {
-                "powi"     => Some("pow"),
-                "powf"     => Some("pow"),
-                "log"      => Some("log"), // Rust log(base) — but C log is ln; handle specially
-                "atan2"    => Some("atan2"),
-                "hypot"    => Some("hypot"),
+                "powi" => Some("pow"),
+                "powf" => Some("pow"),
+                "log" => Some("log"), // Rust log(base) — but C log is ln; handle specially
+                "atan2" => Some("atan2"),
+                "hypot" => Some("hypot"),
                 "copysign" => Some("copysign"),
-                "max"      => Some("fmax"),
-                "min"      => Some("fmin"),
+                "max" => Some("fmax"),
+                "min" => Some("fmin"),
                 _ => None,
             };
 
             // Handle simple single-arg methods: val.method() → c_fn(val)
             if let Some(c_fn) = simple_c_fn {
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                 let result = builder.create_local(receiver_ty.clone());
                 let cont = builder.create_block();
                 let func = MirValue::Function(Arc::from(c_fn));
@@ -1924,9 +2126,10 @@ impl<'ctx> MirLowerer<'ctx> {
                 for arg in args {
                     arg_vals.push(self.lower_expr(arg)?);
                 }
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                 let result = builder.create_local(receiver_ty.clone());
                 let cont = builder.create_block();
                 let func = MirValue::Function(Arc::from(c_fn));
@@ -1938,43 +2141,66 @@ impl<'ctx> MirLowerer<'ctx> {
             // to_degrees: val * (180.0 / PI)
             if method_name == "to_degrees" {
                 let factor = 180.0_f64 / std::f64::consts::PI;
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                 let factor_local = builder.create_local(receiver_ty.clone());
                 builder.assign_const(factor_local, MirConst::Float(factor, receiver_ty.clone()));
                 let result = builder.create_local(receiver_ty.clone());
-                builder.binary_op(result, BinOp::Mul, receiver_val, values::local(factor_local));
+                builder.binary_op(
+                    result,
+                    BinOp::Mul,
+                    receiver_val,
+                    values::local(factor_local),
+                );
                 return Ok(values::local(result));
             }
 
             // to_radians: val * (PI / 180.0)
             if method_name == "to_radians" {
                 let factor = std::f64::consts::PI / 180.0_f64;
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                 let factor_local = builder.create_local(receiver_ty.clone());
                 builder.assign_const(factor_local, MirConst::Float(factor, receiver_ty.clone()));
                 let result = builder.create_local(receiver_ty.clone());
-                builder.binary_op(result, BinOp::Mul, receiver_val, values::local(factor_local));
+                builder.binary_op(
+                    result,
+                    BinOp::Mul,
+                    receiver_val,
+                    values::local(factor_local),
+                );
                 return Ok(values::local(result));
             }
 
             // fract: val - floor(val)
             if method_name == "fract" {
                 // First compute floor(val)
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                 let floor_result = builder.create_local(receiver_ty.clone());
                 let cont1 = builder.create_block();
                 let floor_fn = MirValue::Function(Arc::from("floor"));
-                builder.call(floor_fn, vec![receiver_val.clone()], Some(floor_result), cont1);
+                builder.call(
+                    floor_fn,
+                    vec![receiver_val.clone()],
+                    Some(floor_result),
+                    cont1,
+                );
                 builder.switch_to_block(cont1);
                 // Then compute val - floor(val)
                 let result = builder.create_local(receiver_ty.clone());
-                builder.binary_op(result, BinOp::Sub, receiver_val, values::local(floor_result));
+                builder.binary_op(
+                    result,
+                    BinOp::Sub,
+                    receiver_val,
+                    values::local(floor_result),
+                );
                 return Ok(values::local(result));
             }
 
@@ -1982,20 +2208,31 @@ impl<'ctx> MirLowerer<'ctx> {
             if method_name == "clamp" && args.len() == 2 {
                 let min_val = self.lower_expr(&args[0])?;
                 let max_val = self.lower_expr(&args[1])?;
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                 // fmin(val, max)
                 let clamped_high = builder.create_local(receiver_ty.clone());
                 let cont1 = builder.create_block();
                 let fmin_fn = MirValue::Function(Arc::from("fmin"));
-                builder.call(fmin_fn, vec![receiver_val, max_val], Some(clamped_high), cont1);
+                builder.call(
+                    fmin_fn,
+                    vec![receiver_val, max_val],
+                    Some(clamped_high),
+                    cont1,
+                );
                 builder.switch_to_block(cont1);
                 // fmax(result, min)
                 let result = builder.create_local(receiver_ty.clone());
                 let cont2 = builder.create_block();
                 let fmax_fn = MirValue::Function(Arc::from("fmax"));
-                builder.call(fmax_fn, vec![values::local(clamped_high), min_val], Some(result), cont2);
+                builder.call(
+                    fmax_fn,
+                    vec![values::local(clamped_high), min_val],
+                    Some(result),
+                    cont2,
+                );
                 builder.switch_to_block(cont2);
                 return Ok(values::local(result));
             }
@@ -2004,9 +2241,10 @@ impl<'ctx> MirLowerer<'ctx> {
             if method_name == "mul_add" && args.len() == 2 {
                 let a_val = self.lower_expr(&args[0])?;
                 let b_val = self.lower_expr(&args[1])?;
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                 let mul_result = builder.create_local(receiver_ty.clone());
                 builder.binary_op(mul_result, BinOp::Mul, receiver_val, a_val);
                 let result = builder.create_local(receiver_ty.clone());
@@ -2021,12 +2259,15 @@ impl<'ctx> MirLowerer<'ctx> {
         // Try to resolve the method via impl_methods registry.
         // Auto-deref: if receiver is &T (pointer to struct), look up on T.
         let resolved_fn_name = match &receiver_ty {
-            MirType::Struct(ref type_name) => {
-                self.impl_methods.get(&(type_name.clone(), method.name.clone())).cloned()
-            }
+            MirType::Struct(ref type_name) => self
+                .impl_methods
+                .get(&(type_name.clone(), method.name.clone()))
+                .cloned(),
             MirType::Ptr(inner) => {
                 if let MirType::Struct(ref type_name) = **inner {
-                    self.impl_methods.get(&(type_name.clone(), method.name.clone())).cloned()
+                    self.impl_methods
+                        .get(&(type_name.clone(), method.name.clone()))
+                        .cloned()
                 } else {
                     None
                 }
@@ -2037,7 +2278,9 @@ impl<'ctx> MirLowerer<'ctx> {
         if let Some(mangled_name) = resolved_fn_name {
             // Check if the method's first parameter (self) is a pointer type,
             // meaning it was declared as &self or &mut self.
-            let self_is_ref = self.module.find_function(&mangled_name)
+            let self_is_ref = self
+                .module
+                .find_function(&mangled_name)
                 .and_then(|f| f.sig.params.first())
                 .map(|p| p.is_pointer())
                 .unwrap_or(false);
@@ -2072,13 +2315,16 @@ impl<'ctx> MirLowerer<'ctx> {
             }
 
             // Resolve return type from already-lowered function
-            let ret_ty = self.module.find_function(&mangled_name)
+            let ret_ty = self
+                .module
+                .find_function(&mangled_name)
                 .map(|f| f.sig.ret.clone())
                 .unwrap_or(MirType::i32());
 
-            let builder = self.current_fn.as_mut().ok_or_else(|| {
-                CodegenError::Internal("No current function".to_string())
-            })?;
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
             let result = builder.create_local(ret_ty);
             let cont = builder.create_block();
             let func = MirValue::Function(mangled_name);
@@ -2093,9 +2339,10 @@ impl<'ctx> MirLowerer<'ctx> {
             arg_vals.push(self.lower_expr(arg)?);
         }
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
         let result = builder.create_local(MirType::i32());
         let cont = builder.create_block();
         let func = MirValue::Function(method.name.clone());
@@ -2115,9 +2362,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // Set up blocks (allocate result local later once we know the type)
         let (then_block, else_block, merge_block) = {
-            let builder = self.current_fn.as_mut().ok_or_else(|| {
-                CodegenError::Internal("No current function".to_string())
-            })?;
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
             let then_block = builder.create_block();
             let else_block = builder.create_block();
@@ -2137,7 +2385,8 @@ impl<'ctx> MirLowerer<'ctx> {
         self.var_map = saved_vars.clone();
 
         // Determine the if-expression's result type from the then-branch value
-        let result_ty = then_val.as_ref()
+        let result_ty = then_val
+            .as_ref()
             .map(|v| self.type_of_value(v))
             .unwrap_or(MirType::Void);
 
@@ -2192,7 +2441,11 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(then_val.unwrap_or(values::unit()))
     }
 
-    fn lower_match(&mut self, scrutinee: &ast::Expr, arms: &[ast::MatchArm]) -> CodegenResult<MirValue> {
+    fn lower_match(
+        &mut self,
+        scrutinee: &ast::Expr,
+        arms: &[ast::MatchArm],
+    ) -> CodegenResult<MirValue> {
         // Evaluate the scrutinee once and store in a temporary.
         let scrutinee_val = self.lower_expr(scrutinee)?;
         let scrutinee_ty = self.type_of_value(&scrutinee_val);
@@ -2204,9 +2457,10 @@ impl<'ctx> MirLowerer<'ctx> {
             false
         };
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         let scrutinee_local = builder.create_local(scrutinee_ty.clone());
         builder.assign(scrutinee_local, MirRValue::Use(scrutinee_val));
@@ -2252,11 +2506,16 @@ impl<'ctx> MirLowerer<'ctx> {
         // produce a non-enum value, we use the enclosing function's return
         // type as a best-effort guess.  For simpler matches use the scrutinee type.
         let result_ty = if is_enum_match {
-            let builder = self.current_fn.as_ref().ok_or_else(|| {
-                CodegenError::Internal("No current function".to_string())
-            })?;
+            let builder = self
+                .current_fn
+                .as_ref()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
             let ret = builder.return_type().clone();
-            if ret == MirType::Void { MirType::i32() } else { ret }
+            if ret == MirType::Void {
+                MirType::i32()
+            } else {
+                ret
+            }
         } else {
             scrutinee_ty.clone()
         };
@@ -2307,16 +2566,9 @@ impl<'ctx> MirLowerer<'ctx> {
                     // exists only because there is a guard clause.
                     values::bool(true)
                 } else if is_enum_match {
-                    self.lower_enum_pattern_test(
-                        &arm.pattern,
-                        scrutinee_local,
-                        &scrutinee_ty,
-                    )?
+                    self.lower_enum_pattern_test(&arm.pattern, scrutinee_local, &scrutinee_ty)?
                 } else {
-                    self.lower_pattern_test(
-                        &arm.pattern,
-                        values::local(scrutinee_local),
-                    )?
+                    self.lower_pattern_test(&arm.pattern, values::local(scrutinee_local))?
                 };
 
                 // If there is a guard, jump to the guard block on pattern
@@ -2404,26 +2656,33 @@ impl<'ctx> MirLowerer<'ctx> {
         match &pattern.kind {
             ast::PatternKind::TupleStruct { path, .. } => {
                 // Extract variant name from path (e.g., Shape::Circle -> "Circle")
-                let variant_name = path.segments.last()
+                let variant_name = path
+                    .segments
+                    .last()
                     .map(|s| s.ident.name.clone())
                     .unwrap_or(Arc::from(""));
 
                 // Look up the discriminant for this variant
-                let disc = self.lookup_enum_variant(&enum_name, &variant_name)
+                let disc = self
+                    .lookup_enum_variant(&enum_name, &variant_name)
                     .map(|(d, _)| d)
                     .unwrap_or(0);
 
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
                 // Read the tag: scrutinee.tag
                 let tag_local = builder.create_local(MirType::i32());
-                builder.assign(tag_local, MirRValue::FieldAccess {
-                    base: values::local(scrutinee_local),
-                    field_name: Arc::from("tag"),
-                    field_ty: MirType::i32(),
-                });
+                builder.assign(
+                    tag_local,
+                    MirRValue::FieldAccess {
+                        base: values::local(scrutinee_local),
+                        field_name: Arc::from("tag"),
+                        field_ty: MirType::i32(),
+                    },
+                );
 
                 // Compare: tag == expected_discriminant
                 let cmp = builder.create_local(MirType::Bool);
@@ -2439,24 +2698,31 @@ impl<'ctx> MirLowerer<'ctx> {
 
             ast::PatternKind::Path(path) => {
                 // Unit variant (no payload): Shape::Unit
-                let variant_name = path.segments.last()
+                let variant_name = path
+                    .segments
+                    .last()
                     .map(|s| s.ident.name.clone())
                     .unwrap_or(Arc::from(""));
 
-                let disc = self.lookup_enum_variant(&enum_name, &variant_name)
+                let disc = self
+                    .lookup_enum_variant(&enum_name, &variant_name)
                     .map(|(d, _)| d)
                     .unwrap_or(0);
 
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
                 let tag_local = builder.create_local(MirType::i32());
-                builder.assign(tag_local, MirRValue::FieldAccess {
-                    base: values::local(scrutinee_local),
-                    field_name: Arc::from("tag"),
-                    field_ty: MirType::i32(),
-                });
+                builder.assign(
+                    tag_local,
+                    MirRValue::FieldAccess {
+                        base: values::local(scrutinee_local),
+                        field_name: Arc::from("tag"),
+                        field_ty: MirType::i32(),
+                    },
+                );
 
                 let cmp = builder.create_local(MirType::Bool);
                 builder.binary_op(
@@ -2493,12 +2759,15 @@ impl<'ctx> MirLowerer<'ctx> {
 
         match &pattern.kind {
             ast::PatternKind::TupleStruct { path, patterns } => {
-                let variant_name = path.segments.last()
+                let variant_name = path
+                    .segments
+                    .last()
                     .map(|s| s.ident.name.clone())
                     .unwrap_or(Arc::from(""));
 
                 // Look up variant fields to get their types
-                let variant_fields = self.lookup_enum_variant(&enum_name, &variant_name)
+                let variant_fields = self
+                    .lookup_enum_variant(&enum_name, &variant_name)
                     .map(|(_, fields)| fields)
                     .unwrap_or_default();
 
@@ -2508,7 +2777,8 @@ impl<'ctx> MirLowerer<'ctx> {
                         if name.name.as_ref() == "_" {
                             continue;
                         }
-                        let field_ty = variant_fields.get(idx)
+                        let field_ty = variant_fields
+                            .get(idx)
                             .map(|(_, ty)| ty.clone())
                             .unwrap_or(MirType::f64());
 
@@ -2517,12 +2787,15 @@ impl<'ctx> MirLowerer<'ctx> {
                         })?;
 
                         let local = builder.create_named_local(name.name.clone(), field_ty.clone());
-                        builder.assign(local, MirRValue::VariantField {
-                            base: values::local(scrutinee_local),
-                            variant_name: variant_name.clone(),
-                            field_index: idx as u32,
-                            field_ty,
-                        });
+                        builder.assign(
+                            local,
+                            MirRValue::VariantField {
+                                base: values::local(scrutinee_local),
+                                variant_name: variant_name.clone(),
+                                field_index: idx as u32,
+                                field_ty,
+                            },
+                        );
                         self.var_map.insert(name.name.clone(), local);
                     }
                     // Wildcard patterns in enum variant bindings are ignored.
@@ -2531,9 +2804,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
             ast::PatternKind::Ident { name, .. } => {
                 // Bind the entire scrutinee to the variable
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                 let local = builder.create_local(scrutinee_ty.clone());
                 builder.assign(local, MirRValue::Use(values::local(scrutinee_local)));
                 self.var_map.insert(name.name.clone(), local);
@@ -2562,9 +2836,10 @@ impl<'ctx> MirLowerer<'ctx> {
             // Literal patterns: emit scrutinee == literal.
             ast::PatternKind::Literal(lit) => {
                 let lit_val = self.lower_literal(lit)?;
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                 let cmp = builder.create_local(MirType::Bool);
                 builder.binary_op(cmp, BinOp::Eq, scrutinee_val, lit_val);
                 Ok(values::local(cmp))
@@ -2588,9 +2863,10 @@ impl<'ctx> MirLowerer<'ctx> {
             // as equality for now (this is a simplification).
             ast::PatternKind::Path(path) => {
                 let path_val = self.lower_path(path)?;
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                 let cmp = builder.create_local(MirType::Bool);
                 builder.binary_op(cmp, BinOp::Eq, scrutinee_val, path_val);
                 Ok(values::local(cmp))
@@ -2600,7 +2876,11 @@ impl<'ctx> MirLowerer<'ctx> {
             // avoid panicking.  A real implementation would need full pattern
             // compilation here.
             // Range pattern: lo..=hi → scrutinee >= lo && scrutinee <= hi
-            ast::PatternKind::Range { start, end, inclusive } => {
+            ast::PatternKind::Range {
+                start,
+                end,
+                inclusive,
+            } => {
                 let lo_val = if let Some(lo_expr) = start {
                     self.lower_expr(lo_expr)?
                 } else {
@@ -2612,9 +2892,10 @@ impl<'ctx> MirLowerer<'ctx> {
                     values::i32(i32::MAX)
                 };
 
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
                 let ge = builder.create_local(MirType::Bool);
                 builder.binary_op(ge, BinOp::Ge, scrutinee_val.clone(), lo_val);
@@ -2633,10 +2914,15 @@ impl<'ctx> MirLowerer<'ctx> {
         }
     }
 
-    fn lower_loop(&mut self, body: &ast::Block, _label: Option<&ast::Ident>) -> CodegenResult<MirValue> {
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+    fn lower_loop(
+        &mut self,
+        body: &ast::Block,
+        _label: Option<&ast::Ident>,
+    ) -> CodegenResult<MirValue> {
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         let loop_block = builder.create_block();
         let exit_block = builder.create_block();
@@ -2662,10 +2948,16 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(values::unit())
     }
 
-    fn lower_while(&mut self, condition: &ast::Expr, body: &ast::Block, _label: Option<&ast::Ident>) -> CodegenResult<MirValue> {
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+    fn lower_while(
+        &mut self,
+        condition: &ast::Expr,
+        body: &ast::Block,
+        _label: Option<&ast::Ident>,
+    ) -> CodegenResult<MirValue> {
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         let cond_block = builder.create_block();
         let body_block = builder.create_block();
@@ -2696,20 +2988,51 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(values::unit())
     }
 
-    fn lower_for(&mut self, pattern: &ast::Pattern, iter: &ast::Expr, body: &ast::Block, _label: Option<&ast::Ident>) -> CodegenResult<MirValue> {
+    fn lower_for(
+        &mut self,
+        pattern: &ast::Pattern,
+        iter: &ast::Expr,
+        body: &ast::Block,
+        _label: Option<&ast::Ident>,
+    ) -> CodegenResult<MirValue> {
         // Detect `.step_by(n)` on a range: `(start..end).step_by(n)` or `(start..=end).step_by(n)`
-        if let ExprKind::MethodCall { receiver, method, args, .. } = &iter.kind {
+        if let ExprKind::MethodCall {
+            receiver,
+            method,
+            args,
+            ..
+        } = &iter.kind
+        {
             if method.name.as_ref() == "step_by" && args.len() == 1 {
                 if let Some((start, end, inclusive)) = Self::extract_range_parts(receiver) {
-                    return self.lower_for_range(pattern, start, end, inclusive, body, Some(&args[0]));
+                    return self.lower_for_range(
+                        pattern,
+                        start,
+                        end,
+                        inclusive,
+                        body,
+                        Some(&args[0]),
+                    );
                 }
             }
         }
 
         // Detect range-based for loops: `for i in start..end` or `for i in start..=end`
         // and lower them into an explicit counted loop.
-        if let ExprKind::Range { start, end, inclusive } = &iter.kind {
-            return self.lower_for_range(pattern, start.as_deref(), end.as_deref(), *inclusive, body, None);
+        if let ExprKind::Range {
+            start,
+            end,
+            inclusive,
+        } = &iter.kind
+        {
+            return self.lower_for_range(
+                pattern,
+                start.as_deref(),
+                end.as_deref(),
+                *inclusive,
+                body,
+                None,
+            );
         }
 
         // Also detect binary Range/RangeInclusive operators produced by the
@@ -2745,14 +3068,18 @@ impl<'ctx> MirLowerer<'ctx> {
                 // Requires the type to have a `next` method registered in impl_methods
                 // that returns an enum with variant 0 = Some(T) and variant 1 = None.
                 if let MirType::Struct(ref type_name) = iter_ty {
-                    if self.impl_methods.contains_key(&(type_name.clone(), Arc::from("next"))) {
+                    if self
+                        .impl_methods
+                        .contains_key(&(type_name.clone(), Arc::from("next")))
+                    {
                         return self.lower_for_iterator(pattern, iter_val, &iter_ty, body);
                     }
                 }
                 // No iterator protocol — emit a no-op loop
-                let builder = self.current_fn.as_mut().ok_or_else(|| {
-                    CodegenError::Internal("No current function".to_string())
-                })?;
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                 let exit_block = builder.create_block();
                 builder.goto(exit_block);
                 builder.switch_to_block(exit_block);
@@ -2760,9 +3087,10 @@ impl<'ctx> MirLowerer<'ctx> {
             }
         };
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         // Store the array in a local
         let arr_local = builder.create_local(iter_ty.clone());
@@ -2770,7 +3098,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // Create index counter: let mut __idx = 0;
         let idx_local = builder.create_local(MirType::i64());
-        builder.assign(idx_local, MirRValue::Use(MirValue::Const(MirConst::Int(0, MirType::i64()))));
+        builder.assign(
+            idx_local,
+            MirRValue::Use(MirValue::Const(MirConst::Int(0, MirType::i64()))),
+        );
 
         let cond_block = builder.create_block();
         let body_block = builder.create_block();
@@ -2792,11 +3123,14 @@ impl<'ctx> MirLowerer<'ctx> {
         builder.switch_to_block(body_block);
 
         let elem_local = builder.create_local(elem_ty.clone());
-        builder.assign(elem_local, MirRValue::IndexAccess {
-            base: values::local(arr_local),
-            index: values::local(idx_local),
-            elem_ty: elem_ty.clone(),
-        });
+        builder.assign(
+            elem_local,
+            MirRValue::IndexAccess {
+                base: values::local(arr_local),
+                index: values::local(idx_local),
+                elem_ty: elem_ty.clone(),
+            },
+        );
 
         // Bind pattern variable and save var_map so loop-body `let`
         // bindings do not leak into the enclosing scope.
@@ -2830,11 +3164,15 @@ impl<'ctx> MirLowerer<'ctx> {
 
     /// Extract range parts from an expression, unwrapping Paren and Binary wrappers.
     /// Returns `(start, end, inclusive)` if the expression is a range.
-    fn extract_range_parts(expr: &ast::Expr) -> Option<(Option<&ast::Expr>, Option<&ast::Expr>, bool)> {
+    fn extract_range_parts(
+        expr: &ast::Expr,
+    ) -> Option<(Option<&ast::Expr>, Option<&ast::Expr>, bool)> {
         match &expr.kind {
-            ExprKind::Range { start, end, inclusive } => {
-                Some((start.as_deref(), end.as_deref(), *inclusive))
-            }
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => Some((start.as_deref(), end.as_deref(), *inclusive)),
             ExprKind::Binary { op, left, right } if *op == AstBinOp::Range => {
                 Some((Some(left.as_ref()), Some(right.as_ref()), false))
             }
@@ -2882,9 +3220,10 @@ impl<'ctx> MirLowerer<'ctx> {
             None
         };
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         // Create the loop counter local and initialize it.
         let counter = builder.create_local(iter_ty.clone());
@@ -2975,13 +3314,18 @@ impl<'ctx> MirLowerer<'ctx> {
         };
 
         // Resolve the `next` method
-        let next_fn_name = match self.impl_methods.get(&(type_name.clone(), Arc::from("next"))) {
+        let next_fn_name = match self
+            .impl_methods
+            .get(&(type_name.clone(), Arc::from("next")))
+        {
             Some(name) => name.clone(),
             None => return Ok(values::unit()),
         };
 
         // Get return type of next() — should be an enum (Option-like)
-        let next_ret_ty = self.module.find_function(next_fn_name.as_ref())
+        let next_ret_ty = self
+            .module
+            .find_function(next_fn_name.as_ref())
             .map(|f| f.sig.ret.clone())
             .unwrap_or(MirType::i32());
 
@@ -2989,7 +3333,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let payload_ty = if let MirType::Struct(ref enum_name) = next_ret_ty {
             if let Some(type_def) = self.module.find_type(enum_name) {
                 if let TypeDefKind::Enum { variants, .. } = &type_def.kind {
-                    variants.iter()
+                    variants
+                        .iter()
                         .find(|v| v.discriminant == 0)
                         .and_then(|v| v.fields.first())
                         .map(|(_, ty)| ty.clone())
@@ -3004,9 +3349,10 @@ impl<'ctx> MirLowerer<'ctx> {
             MirType::i32()
         };
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         // Store the iterator in a mutable local
         let iter_local = builder.create_local(iter_ty.clone());
@@ -3025,16 +3371,24 @@ impl<'ctx> MirLowerer<'ctx> {
         let next_result = builder.create_local(next_ret_ty.clone());
         let cont_after_next = builder.create_block();
         let func = MirValue::Function(next_fn_name);
-        builder.call(func, vec![values::local(iter_local)], Some(next_result), cont_after_next);
+        builder.call(
+            func,
+            vec![values::local(iter_local)],
+            Some(next_result),
+            cont_after_next,
+        );
         builder.switch_to_block(cont_after_next);
 
         // Check tag: if tag == 1 (None), goto exit
         let tag_local = builder.create_local(MirType::i32());
-        builder.assign(tag_local, MirRValue::FieldAccess {
-            base: values::local(next_result),
-            field_name: Arc::from("tag"),
-            field_ty: MirType::i32(),
-        });
+        builder.assign(
+            tag_local,
+            MirRValue::FieldAccess {
+                base: values::local(next_result),
+                field_name: Arc::from("tag"),
+                field_ty: MirType::i32(),
+            },
+        );
         let is_none = builder.create_local(MirType::Bool);
         builder.binary_op(
             is_none,
@@ -3051,7 +3405,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let some_variant_name = if let MirType::Struct(ref enum_name) = next_ret_ty {
             if let Some(type_def) = self.module.find_type(enum_name) {
                 if let TypeDefKind::Enum { variants, .. } = &type_def.kind {
-                    variants.iter()
+                    variants
+                        .iter()
                         .find(|v| v.discriminant == 0)
                         .map(|v| v.name.clone())
                         .unwrap_or(Arc::from("Some"))
@@ -3066,12 +3421,15 @@ impl<'ctx> MirLowerer<'ctx> {
         };
 
         let payload = builder.create_local(payload_ty.clone());
-        builder.assign(payload, MirRValue::VariantField {
-            base: values::local(next_result),
-            variant_name: some_variant_name,
-            field_index: 0,
-            field_ty: payload_ty,
-        });
+        builder.assign(
+            payload,
+            MirRValue::VariantField {
+                base: values::local(next_result),
+                variant_name: some_variant_name,
+                field_index: 0,
+                field_ty: payload_ty,
+            },
+        );
 
         // Bind pattern variable and save var_map so loop-body `let`
         // bindings do not leak into the enclosing scope.
@@ -3102,9 +3460,10 @@ impl<'ctx> MirLowerer<'ctx> {
             None
         };
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         if let Some(val) = ret_val {
             builder.ret(Some(val));
@@ -3153,11 +3512,14 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // 3. Read the discriminant tag
         let tag_local = builder.create_local(MirType::i32());
-        builder.assign(tag_local, MirRValue::FieldAccess {
-            base: values::local(scrutinee_local),
-            field_name: Arc::from("tag"),
-            field_ty: MirType::i32(),
-        });
+        builder.assign(
+            tag_local,
+            MirRValue::FieldAccess {
+                base: values::local(scrutinee_local),
+                field_name: Arc::from("tag"),
+                field_ty: MirType::i32(),
+            },
+        );
 
         // 4. Create basic blocks: ok_block, err_block, continue_block
         let ok_block = builder.create_block();
@@ -3204,12 +3566,15 @@ impl<'ctx> MirLowerer<'ctx> {
 
             // Extract the payload from variant field 0
             let unwrapped = builder.create_local(ok_field_ty.clone());
-            builder.assign(unwrapped, MirRValue::VariantField {
-                base: values::local(scrutinee_local),
-                variant_name: ok_variant_name,
-                field_index: 0,
-                field_ty: ok_field_ty,
-            });
+            builder.assign(
+                unwrapped,
+                MirRValue::VariantField {
+                    base: values::local(scrutinee_local),
+                    variant_name: ok_variant_name,
+                    field_index: 0,
+                    field_ty: ok_field_ty,
+                },
+            );
             builder.goto(cont_block);
 
             // 6. Err/None block -- construct the error variant and return early
@@ -3221,26 +3586,39 @@ impl<'ctx> MirLowerer<'ctx> {
                     let err_result = builder.create_local(MirType::Struct(enum_name.clone()));
                     builder.aggregate(
                         err_result,
-                        AggregateKind::Variant(enum_name, err_v.discriminant as u32, err_v.name.clone()),
+                        AggregateKind::Variant(
+                            enum_name,
+                            err_v.discriminant as u32,
+                            err_v.name.clone(),
+                        ),
                         vec![],
                     );
                     builder.ret(Some(values::local(err_result)));
                 } else {
                     // Err-like variant (has payload): extract payload, reconstruct, return
-                    let err_field_ty = err_v.fields.first()
+                    let err_field_ty = err_v
+                        .fields
+                        .first()
                         .map(|(_, ty)| ty.clone())
                         .unwrap_or(MirType::i32());
                     let err_payload = builder.create_local(err_field_ty.clone());
-                    builder.assign(err_payload, MirRValue::VariantField {
-                        base: values::local(scrutinee_local),
-                        variant_name: err_v.name.clone(),
-                        field_index: 0,
-                        field_ty: err_field_ty,
-                    });
+                    builder.assign(
+                        err_payload,
+                        MirRValue::VariantField {
+                            base: values::local(scrutinee_local),
+                            variant_name: err_v.name.clone(),
+                            field_index: 0,
+                            field_ty: err_field_ty,
+                        },
+                    );
                     let err_result = builder.create_local(MirType::Struct(enum_name.clone()));
                     builder.aggregate(
                         err_result,
-                        AggregateKind::Variant(enum_name, err_v.discriminant as u32, err_v.name.clone()),
+                        AggregateKind::Variant(
+                            enum_name,
+                            err_v.discriminant as u32,
+                            err_v.name.clone(),
+                        ),
                         vec![values::local(err_payload)],
                     );
                     builder.ret(Some(values::local(err_result)));
@@ -3260,7 +3638,11 @@ impl<'ctx> MirLowerer<'ctx> {
         }
     }
 
-    fn lower_break(&mut self, value: Option<&ast::Expr>, _label: Option<&ast::Ident>) -> CodegenResult<MirValue> {
+    fn lower_break(
+        &mut self,
+        value: Option<&ast::Expr>,
+        _label: Option<&ast::Ident>,
+    ) -> CodegenResult<MirValue> {
         // Break value (e.g. `break 42`) is evaluated but currently not
         // assigned to a loop result local because loops do not yet propagate
         // a result variable.  The value is lowered for side-effect correctness.
@@ -3268,9 +3650,10 @@ impl<'ctx> MirLowerer<'ctx> {
             if let Some(expr) = value {
                 let _val = self.lower_expr(expr)?;
             }
-            let builder = self.current_fn.as_mut().ok_or_else(|| {
-                CodegenError::Internal("No current function".to_string())
-            })?;
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
             builder.goto(exit_block);
         }
 
@@ -3282,9 +3665,10 @@ impl<'ctx> MirLowerer<'ctx> {
     }
 
     fn lower_continue(&mut self, _label: Option<&ast::Ident>) -> CodegenResult<MirValue> {
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         if let Some((continue_block, _)) = self.loop_stack.last().copied() {
             builder.goto(continue_block);
@@ -3297,31 +3681,32 @@ impl<'ctx> MirLowerer<'ctx> {
     }
 
     fn lower_tuple(&mut self, elems: &[ast::Expr]) -> CodegenResult<MirValue> {
-        let elem_vals: Vec<_> = elems.iter()
+        let elem_vals: Vec<_> = elems
+            .iter()
             .map(|e| self.lower_expr(e))
             .collect::<CodegenResult<_>>()?;
 
         if elem_vals.is_empty() {
-            let builder = self.current_fn.as_mut().ok_or_else(|| {
-                CodegenError::Internal("No current function".to_string())
-            })?;
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
             let result = builder.create_local(MirType::Void);
             builder.aggregate(result, AggregateKind::Tuple, elem_vals);
             return Ok(values::local(result));
         }
 
         // Build the proper MirType::Tuple from element types.
-        let elem_tys: Vec<MirType> = elem_vals.iter()
-            .map(|v| self.type_of_value(v))
-            .collect();
+        let elem_tys: Vec<MirType> = elem_vals.iter().map(|v| self.type_of_value(v)).collect();
         let tuple_ty = MirType::Tuple(elem_tys.clone());
 
         // Register the tuple type definition (struct typedef) if not already done.
         self.ensure_tuple_type_def(&elem_tys);
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
         let result = builder.create_local(tuple_ty);
         builder.aggregate(result, AggregateKind::Tuple, elem_vals);
 
@@ -3333,31 +3718,42 @@ impl<'ctx> MirLowerer<'ctx> {
         let name = MirType::tuple_type_name(elem_tys);
         if !self.tuple_type_defs.contains(&name) {
             self.tuple_type_defs.insert(name.clone());
-            let fields: Vec<(Option<Arc<str>>, MirType)> = elem_tys.iter().enumerate()
+            let fields: Vec<(Option<Arc<str>>, MirType)> = elem_tys
+                .iter()
+                .enumerate()
                 .map(|(i, ty)| (Some(Arc::from(format!("_{}", i))), ty.clone()))
                 .collect();
             self.module.add_type(MirTypeDef {
                 name,
-                kind: TypeDefKind::Struct { fields, packed: false },
+                kind: TypeDefKind::Struct {
+                    fields,
+                    packed: false,
+                },
             });
         }
     }
 
     fn lower_array(&mut self, elems: &[ast::Expr]) -> CodegenResult<MirValue> {
-        let elem_vals: Vec<_> = elems.iter()
+        let elem_vals: Vec<_> = elems
+            .iter()
             .map(|e| self.lower_expr(e))
             .collect::<CodegenResult<_>>()?;
 
         // Infer element type from the first element; fall back to i32 for
         // empty array literals.
-        let elem_ty = elem_vals.first()
+        let elem_ty = elem_vals
+            .first()
             .map(|v| self.type_of_value(v))
             .unwrap_or(MirType::i32());
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
-        let result = builder.create_local(MirType::Array(Box::new(elem_ty.clone()), elems.len() as u64));
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+        let result = builder.create_local(MirType::Array(
+            Box::new(elem_ty.clone()),
+            elems.len() as u64,
+        ));
         builder.aggregate(result, AggregateKind::Array(elem_ty), elem_vals);
 
         Ok(values::local(result))
@@ -3376,16 +3772,20 @@ impl<'ctx> MirLowerer<'ctx> {
             _ => MirType::i32(),
         };
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         let result = builder.create_local(elem_ty.clone());
-        builder.assign(result, MirRValue::IndexAccess {
-            base: arr_val,
-            index: idx_val,
-            elem_ty,
-        });
+        builder.assign(
+            result,
+            MirRValue::IndexAccess {
+                base: arr_val,
+                index: idx_val,
+                elem_ty,
+            },
+        );
 
         Ok(values::local(result))
     }
@@ -3452,19 +3852,23 @@ impl<'ctx> MirLowerer<'ctx> {
                             CodegenError::Internal("No current function".to_string())
                         })?;
                         let comp_local = builder.create_local(MirType::f64());
-                        builder.assign(comp_local, MirRValue::FieldAccess {
-                            base: obj_val.clone(),
-                            field_name: Arc::from(comp_name),
-                            field_ty: MirType::f64(),
-                        });
+                        builder.assign(
+                            comp_local,
+                            MirRValue::FieldAccess {
+                                base: obj_val.clone(),
+                                field_name: Arc::from(comp_name),
+                                field_ty: MirType::f64(),
+                            },
+                        );
                         component_vals.push(values::local(comp_local));
                     }
 
                     // Build constructor call: quanta_vecN_new(...)
                     let constructor = format!("quanta_vec{}_new", swizzle_len);
-                    let builder = self.current_fn.as_mut().ok_or_else(|| {
-                        CodegenError::Internal("No current function".to_string())
-                    })?;
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
                     let result = builder.create_local(result_ty);
                     let cont = builder.create_block();
                     let func = MirValue::Function(Arc::from(constructor.as_str()));
@@ -3483,16 +3887,20 @@ impl<'ctx> MirLowerer<'ctx> {
             MirType::i32()
         };
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         let result = builder.create_local(field_ty.clone());
-        builder.assign(result, MirRValue::FieldAccess {
-            base: obj_val,
-            field_name,
-            field_ty,
-        });
+        builder.assign(
+            result,
+            MirRValue::FieldAccess {
+                base: obj_val,
+                field_name,
+                field_ty,
+            },
+        );
 
         Ok(values::local(result))
     }
@@ -3508,26 +3916,35 @@ impl<'ctx> MirLowerer<'ctx> {
         };
 
         let field_name: Arc<str> = Arc::from(format!("_{}", index));
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
         let result = builder.create_local(elem_ty.clone());
-        builder.assign(result, MirRValue::FieldAccess {
-            base: base_val,
-            field_name,
-            field_ty: elem_ty,
-        });
+        builder.assign(
+            result,
+            MirRValue::FieldAccess {
+                base: base_val,
+                field_name,
+                field_ty: elem_ty,
+            },
+        );
 
         Ok(values::local(result))
     }
 
-    fn lower_ref(&mut self, mutability: ast::Mutability, inner: &ast::Expr) -> CodegenResult<MirValue> {
+    fn lower_ref(
+        &mut self,
+        mutability: ast::Mutability,
+        inner: &ast::Expr,
+    ) -> CodegenResult<MirValue> {
         let inner_val = self.lower_expr(inner)?;
         let inner_ty = self.type_of_value(&inner_val);
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         // Get the local from inner value
         let local = match &inner_val {
@@ -3555,16 +3972,20 @@ impl<'ctx> MirLowerer<'ctx> {
             _ => MirType::i32(), // Fallback for non-pointer derefs
         };
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         // Emit a Deref rvalue that reads through the pointer.
         let result = builder.create_local(pointee_ty.clone());
-        builder.assign(result, MirRValue::Deref {
-            ptr: inner_val,
-            pointee_ty,
-        });
+        builder.assign(
+            result,
+            MirRValue::Deref {
+                ptr: inner_val,
+                pointee_ty,
+            },
+        );
 
         Ok(values::local(result))
     }
@@ -3590,9 +4011,10 @@ impl<'ctx> MirLowerer<'ctx> {
                 _ => Arc::from("Unknown"),
             };
 
-            let builder = self.current_fn.as_mut().ok_or_else(|| {
-                CodegenError::Internal("No current function".to_string())
-            })?;
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
             // Create the fat pointer struct
             let result = builder.create_local(target_ty.clone());
@@ -3614,18 +4036,20 @@ impl<'ctx> MirLowerer<'ctx> {
             builder.make_ref(data_ptr, false, MirPlace::local(data_local));
 
             // Store vtable reference — the C backend generates &vtable_instance
-            let vtable_name: Arc<str> = Arc::from(format!(
-                "{}_{}_vtable_instance", type_name, trait_name
-            ));
+            let vtable_name: Arc<str> =
+                Arc::from(format!("{}_{}_vtable_instance", type_name, trait_name));
             let vtable_struct_ty = MirType::Struct(Arc::from(format!("{}_vtable", trait_name)));
             let vtable_ptr = builder.create_local(vtable_struct_ty);
             builder.assign(vtable_ptr, MirRValue::Use(MirValue::Global(vtable_name)));
 
             // Construct the fat pointer aggregate
-            builder.assign(result, MirRValue::Aggregate {
-                kind: AggregateKind::Struct(Arc::from(format!("dyn_{}", trait_name))),
-                operands: vec![values::local(data_ptr), values::local(vtable_ptr)],
-            });
+            builder.assign(
+                result,
+                MirRValue::Aggregate {
+                    kind: AggregateKind::Struct(Arc::from(format!("dyn_{}", trait_name))),
+                    operands: vec![values::local(data_ptr), values::local(vtable_ptr)],
+                },
+            );
 
             return Ok(values::local(result));
         }
@@ -3642,14 +4066,14 @@ impl<'ctx> MirLowerer<'ctx> {
             _ => CastKind::Transmute,
         };
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         let result = builder.create_local(target_ty.clone());
         builder.cast(result, cast_kind, inner_val, target_ty);
 
         Ok(values::local(result))
     }
-
 }

@@ -29,14 +29,14 @@
 //! criterion = "0.4"
 //! ```
 
+pub mod lockfile;
 pub mod manifest;
-pub mod version;
 pub mod registry;
 pub mod resolver;
-pub mod lockfile;
+pub mod version;
 
+pub use lockfile::*;
 pub use manifest::*;
-pub use version::*;
 pub use registry::*;
 pub use resolver::*;
-pub use lockfile::*;
+pub use version::*;

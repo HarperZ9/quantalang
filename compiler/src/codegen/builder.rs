@@ -122,7 +122,9 @@ impl MirBuilder {
 
     /// Look up the type of a local variable by its ID.
     pub fn local_type(&self, id: LocalId) -> Option<MirType> {
-        self.func.locals.iter()
+        self.func
+            .locals
+            .iter()
             .find(|l| l.id == id)
             .map(|l| l.ty.clone())
     }
@@ -222,13 +224,26 @@ impl MirBuilder {
     }
 
     /// Store to a field through a pointer: `ptr->field = value`
-    pub fn push_field_deref_assign(&mut self, ptr: LocalId, field_name: Arc<str>, value: MirRValue) {
-        self.push_stmt(MirStmtKind::FieldDerefAssign { ptr, field_name, value });
+    pub fn push_field_deref_assign(
+        &mut self,
+        ptr: LocalId,
+        field_name: Arc<str>,
+        value: MirRValue,
+    ) {
+        self.push_stmt(MirStmtKind::FieldDerefAssign {
+            ptr,
+            field_name,
+            value,
+        });
     }
 
     /// Store to a field on a local struct: `local.field = value`
     pub fn push_field_assign(&mut self, base: LocalId, field_name: Arc<str>, value: MirRValue) {
-        self.push_stmt(MirStmtKind::FieldAssign { base, field_name, value });
+        self.push_stmt(MirStmtKind::FieldAssign {
+            base,
+            field_name,
+            value,
+        });
     }
 
     /// Create an aggregate (tuple, struct, array).
@@ -510,22 +525,14 @@ mod tests {
     #[test]
     fn test_builder_simple_function() {
         // Build: fn add(a: i32, b: i32) -> i32 { a + b }
-        let sig = MirFnSig::new(
-            vec![MirType::i32(), MirType::i32()],
-            MirType::i32(),
-        );
+        let sig = MirFnSig::new(vec![MirType::i32(), MirType::i32()], MirType::i32());
         let mut builder = MirBuilder::new("add", sig);
 
         let a = builder.param_local(0);
         let b = builder.param_local(1);
         let result = builder.create_local(MirType::i32());
 
-        builder.binary_op(
-            result,
-            BinOp::Add,
-            values::local(a),
-            values::local(b),
-        );
+        builder.binary_op(result, BinOp::Add, values::local(a), values::local(b));
         builder.ret(Some(values::local(result)));
 
         let func = builder.build();
@@ -536,10 +543,7 @@ mod tests {
     #[test]
     fn test_builder_with_branch() {
         // Build: fn max(a: i32, b: i32) -> i32 { if a > b { a } else { b } }
-        let sig = MirFnSig::new(
-            vec![MirType::i32(), MirType::i32()],
-            MirType::i32(),
-        );
+        let sig = MirFnSig::new(vec![MirType::i32(), MirType::i32()], MirType::i32());
         let mut builder = MirBuilder::new("max", sig);
 
         let a = builder.param_local(0);
@@ -550,12 +554,7 @@ mod tests {
         let else_block = builder.create_block();
 
         // Entry block: compare a > b
-        builder.binary_op(
-            cond,
-            BinOp::Gt,
-            values::local(a),
-            values::local(b),
-        );
+        builder.binary_op(cond, BinOp::Gt, values::local(a), values::local(b));
         builder.branch(values::local(cond), then_block, else_block);
 
         // Then block: return a
@@ -709,7 +708,10 @@ mod tests {
 
         let func = builder.build();
         let blocks = func.blocks.as_ref().unwrap();
-        assert!(matches!(blocks[0].terminator, Some(MirTerminator::Unreachable)));
+        assert!(matches!(
+            blocks[0].terminator,
+            Some(MirTerminator::Unreachable)
+        ));
     }
 
     #[test]

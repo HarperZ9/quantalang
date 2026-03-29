@@ -6,7 +6,7 @@
 
 //! Main formatter implementation for QuantaLang source code.
 
-use super::config::{FormatConfig, BraceStyle, TrailingComma};
+use super::config::{BraceStyle, FormatConfig, TrailingComma};
 
 // =============================================================================
 // FORMATTER
@@ -95,7 +95,11 @@ impl Formatter {
     }
 
     /// Format a construct starting at line index.
-    fn format_construct(&self, lines: &[&str], start: usize) -> Result<(String, usize), FormatError> {
+    fn format_construct(
+        &self,
+        lines: &[&str],
+        start: usize,
+    ) -> Result<(String, usize), FormatError> {
         let line = lines[start];
         let trimmed = line.trim();
 
@@ -105,8 +109,10 @@ impl Formatter {
         }
 
         // Function definition
-        if trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ")
-            || trimmed.starts_with("async fn ") || trimmed.starts_with("pub async fn ")
+        if trimmed.starts_with("fn ")
+            || trimmed.starts_with("pub fn ")
+            || trimmed.starts_with("async fn ")
+            || trimmed.starts_with("pub async fn ")
         {
             return self.format_function(lines, start);
         }
@@ -132,8 +138,10 @@ impl Formatter {
         }
 
         // Const/static
-        if trimmed.starts_with("const ") || trimmed.starts_with("pub const ")
-            || trimmed.starts_with("static ") || trimmed.starts_with("pub static ")
+        if trimmed.starts_with("const ")
+            || trimmed.starts_with("pub const ")
+            || trimmed.starts_with("static ")
+            || trimmed.starts_with("pub static ")
         {
             return Ok((self.format_const_static(trimmed)?, 1));
         }
@@ -180,7 +188,11 @@ impl Formatter {
     }
 
     /// Format a function.
-    fn format_function(&self, lines: &[&str], start: usize) -> Result<(String, usize), FormatError> {
+    fn format_function(
+        &self,
+        lines: &[&str],
+        start: usize,
+    ) -> Result<(String, usize), FormatError> {
         let mut output = String::new();
         let line = lines[start].trim();
 
@@ -271,8 +283,8 @@ impl Formatter {
         }
 
         let params: Vec<&str> = params.split(',').collect();
-        let total_len: usize = params.iter().map(|p| p.trim().len()).sum::<usize>()
-            + params.len() * 2; // commas and spaces
+        let total_len: usize =
+            params.iter().map(|p| p.trim().len()).sum::<usize>() + params.len() * 2; // commas and spaces
 
         // Check if fits on one line
         if total_len < self.config.max_line_length - 20 {
@@ -290,7 +302,10 @@ impl Formatter {
                 output.push_str(param.trim());
                 if i < params.len() - 1 {
                     output.push(',');
-                } else if matches!(self.config.trailing_comma, TrailingComma::Always | TrailingComma::Multiline) {
+                } else if matches!(
+                    self.config.trailing_comma,
+                    TrailingComma::Always | TrailingComma::Multiline
+                ) {
                     output.push(',');
                 }
                 output.push_str(self.config.newline_str());
@@ -341,7 +356,11 @@ impl Formatter {
     }
 
     /// Format struct fields.
-    fn format_struct_fields(&self, lines: &[&str], start: usize) -> Result<(String, usize), FormatError> {
+    fn format_struct_fields(
+        &self,
+        lines: &[&str],
+        start: usize,
+    ) -> Result<(String, usize), FormatError> {
         let mut output = String::new();
         let mut depth = 0;
         let mut end_line = start;
@@ -376,16 +395,17 @@ impl Formatter {
     /// Format a struct field.
     fn format_field(&self, field: &str) -> Result<String, FormatError> {
         // Normalize spacing around colon
-        let normalized = field
-            .replace(" :", ":")
-            .replace(":  ", ": ");
+        let normalized = field.replace(" :", ":").replace(":  ", ": ");
 
         // Handle trailing comma
         let trimmed = normalized.trim_end_matches(',').trim();
         let mut output = trimmed.to_string();
 
         // Add trailing comma if configured
-        if matches!(self.config.trailing_comma, TrailingComma::Always | TrailingComma::Multiline) {
+        if matches!(
+            self.config.trailing_comma,
+            TrailingComma::Always | TrailingComma::Multiline
+        ) {
             output.push(',');
         }
 
@@ -426,7 +446,11 @@ impl Formatter {
     }
 
     /// Format enum variants.
-    fn format_enum_variants(&self, lines: &[&str], start: usize) -> Result<(String, usize), FormatError> {
+    fn format_enum_variants(
+        &self,
+        lines: &[&str],
+        start: usize,
+    ) -> Result<(String, usize), FormatError> {
         let mut output = String::new();
         let mut depth = 0;
         let mut end_line = start;
@@ -463,7 +487,10 @@ impl Formatter {
         let trimmed = variant.trim_end_matches(',').trim();
         let mut output = trimmed.to_string();
 
-        if matches!(self.config.trailing_comma, TrailingComma::Always | TrailingComma::Multiline) {
+        if matches!(
+            self.config.trailing_comma,
+            TrailingComma::Always | TrailingComma::Multiline
+        ) {
             output.push(',');
         }
 
@@ -482,7 +509,12 @@ impl Formatter {
     }
 
     /// Format trait-like or impl-like block.
-    fn format_impl_like(&self, lines: &[&str], start: usize, _kind: &str) -> Result<(String, usize), FormatError> {
+    fn format_impl_like(
+        &self,
+        lines: &[&str],
+        start: usize,
+        _kind: &str,
+    ) -> Result<(String, usize), FormatError> {
         let mut output = String::new();
         let line = lines[start].trim();
 
@@ -515,7 +547,11 @@ impl Formatter {
     }
 
     /// Format a block body.
-    fn format_block_body(&self, lines: &[&str], start: usize) -> Result<(String, usize), FormatError> {
+    fn format_block_body(
+        &self,
+        lines: &[&str],
+        start: usize,
+    ) -> Result<(String, usize), FormatError> {
         let mut output = String::new();
         let mut depth = 0;
         let mut end_line = start;
@@ -586,9 +622,7 @@ impl Formatter {
 
     /// Format a type alias.
     fn format_type_alias(&self, line: &str) -> Result<String, FormatError> {
-        let normalized = line
-            .replace("  =", " =")
-            .replace("=  ", "= ");
+        let normalized = line.replace("  =", " =").replace("=  ", "= ");
 
         let mut output = normalized.trim().to_string();
         if !output.ends_with(';') {

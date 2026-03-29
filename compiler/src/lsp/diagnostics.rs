@@ -51,7 +51,12 @@ impl DiagnosticsProvider {
             let trimmed = line.trim();
 
             // Check for missing semicolons after statements
-            if self.needs_semicolon(trimmed) && !trimmed.ends_with(';') && !trimmed.ends_with('{') && !trimmed.ends_with('}') && !trimmed.ends_with(',') {
+            if self.needs_semicolon(trimmed)
+                && !trimmed.ends_with(';')
+                && !trimmed.ends_with('{')
+                && !trimmed.ends_with('}')
+                && !trimmed.ends_with(',')
+            {
                 let col = line.len() as u32;
                 diagnostics.push(
                     Diagnostic::error(
@@ -98,14 +103,7 @@ impl DiagnosticsProvider {
     /// Check if a line needs a semicolon.
     fn needs_semicolon(&self, line: &str) -> bool {
         // Lines that typically need semicolons
-        let patterns = [
-            "let ",
-            "return ",
-            "break",
-            "continue",
-            ") =",
-            "= ",
-        ];
+        let patterns = ["let ", "return ", "break", "continue", ") =", "= "];
 
         for pattern in &patterns {
             if line.contains(pattern) {
@@ -173,7 +171,10 @@ impl DiagnosticsProvider {
                             if open != '(' {
                                 diagnostics.push(Diagnostic::error(
                                     Range::point(Position::new(line_num, col)),
-                                    format!("mismatched bracket: expected closing for '{}', found ')'", open),
+                                    format!(
+                                        "mismatched bracket: expected closing for '{}', found ')'",
+                                        open
+                                    ),
                                 ));
                             }
                         } else {
@@ -188,7 +189,10 @@ impl DiagnosticsProvider {
                             if open != '[' {
                                 diagnostics.push(Diagnostic::error(
                                     Range::point(Position::new(line_num, col)),
-                                    format!("mismatched bracket: expected closing for '{}', found ']'", open),
+                                    format!(
+                                        "mismatched bracket: expected closing for '{}', found ']'",
+                                        open
+                                    ),
                                 ));
                             }
                         } else {
@@ -203,7 +207,10 @@ impl DiagnosticsProvider {
                             if open != '{' {
                                 diagnostics.push(Diagnostic::error(
                                     Range::point(Position::new(line_num, col)),
-                                    format!("mismatched bracket: expected closing for '{}', found '}}'", open),
+                                    format!(
+                                        "mismatched bracket: expected closing for '{}', found '}}'",
+                                        open
+                                    ),
                                 ));
                             }
                         } else {
@@ -234,7 +241,12 @@ impl DiagnosticsProvider {
     }
 
     /// Check for common coding issues.
-    fn check_common_issues(&self, content: &str, _doc: &Document, diagnostics: &mut Vec<Diagnostic>) {
+    fn check_common_issues(
+        &self,
+        content: &str,
+        _doc: &Document,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
         for (line_num, line) in content.lines().enumerate() {
             let line_num = line_num as u32;
             let trimmed = line.trim();
@@ -243,15 +255,13 @@ impl DiagnosticsProvider {
             for marker in &["TODO", "FIXME", "HACK", "XXX"] {
                 if let Some(pos) = line.to_uppercase().find(marker) {
                     if line[..pos].contains("//") || line[..pos].contains("/*") {
-                        diagnostics.push(
-                            Diagnostic::hint(
-                                Range::new(
-                                    Position::new(line_num, pos as u32),
-                                    Position::new(line_num, pos as u32 + marker.len() as u32),
-                                ),
-                                format!("{} comment", marker),
-                            )
-                        );
+                        diagnostics.push(Diagnostic::hint(
+                            Range::new(
+                                Position::new(line_num, pos as u32),
+                                Position::new(line_num, pos as u32 + marker.len() as u32),
+                            ),
+                            format!("{} comment", marker),
+                        ));
                     }
                 }
             }
@@ -259,30 +269,27 @@ impl DiagnosticsProvider {
             // Check for deprecated patterns
             if trimmed.contains("unwrap()") {
                 if let Some(pos) = line.find("unwrap()") {
-                    diagnostics.push(
-                        Diagnostic::hint(
-                            Range::new(
-                                Position::new(line_num, pos as u32),
-                                Position::new(line_num, pos as u32 + 8),
-                            ),
-                            "consider using 'expect' or '?' instead of 'unwrap'",
-                        )
-                    );
+                    diagnostics.push(Diagnostic::hint(
+                        Range::new(
+                            Position::new(line_num, pos as u32),
+                            Position::new(line_num, pos as u32 + 8),
+                        ),
+                        "consider using 'expect' or '?' instead of 'unwrap'",
+                    ));
                 }
             }
 
             // Check for panic! in non-test code
-            if trimmed.contains("panic!(") && !self.is_in_test_function(content, line_num as usize) {
+            if trimmed.contains("panic!(") && !self.is_in_test_function(content, line_num as usize)
+            {
                 if let Some(pos) = line.find("panic!(") {
-                    diagnostics.push(
-                        Diagnostic::warning(
-                            Range::new(
-                                Position::new(line_num, pos as u32),
-                                Position::new(line_num, pos as u32 + 7),
-                            ),
-                            "consider using Result instead of panic!",
-                        )
-                    );
+                    diagnostics.push(Diagnostic::warning(
+                        Range::new(
+                            Position::new(line_num, pos as u32),
+                            Position::new(line_num, pos as u32 + 7),
+                        ),
+                        "consider using Result instead of panic!",
+                    ));
                 }
             }
 
@@ -341,15 +348,13 @@ impl DiagnosticsProvider {
                     // Only flag larger numbers
                     if let Ok(n) = clean_num.parse::<i64>() {
                         if n.abs() > 10 {
-                            diagnostics.push(
-                                Diagnostic::hint(
-                                    Range::new(
-                                        Position::new(line_num, start as u32),
-                                        Position::new(line_num, col as u32 + 1),
-                                    ),
-                                    "consider extracting magic number to a named constant",
-                                )
-                            );
+                            diagnostics.push(Diagnostic::hint(
+                                Range::new(
+                                    Position::new(line_num, start as u32),
+                                    Position::new(line_num, col as u32 + 1),
+                                ),
+                                "consider extracting magic number to a named constant",
+                            ));
                         }
                     }
                 }
@@ -359,7 +364,12 @@ impl DiagnosticsProvider {
     }
 
     /// Check for unused variables.
-    fn check_unused_variables(&self, content: &str, _doc: &Document, diagnostics: &mut Vec<Diagnostic>) {
+    fn check_unused_variables(
+        &self,
+        content: &str,
+        _doc: &Document,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
         // Simple unused variable detection
         // In real implementation, this would use proper scope analysis
 
@@ -370,10 +380,12 @@ impl DiagnosticsProvider {
             let trimmed = line.trim();
 
             // Find let bindings
-            if let Some(rest) = trimmed.strip_prefix("let ")
+            if let Some(rest) = trimmed
+                .strip_prefix("let ")
                 .or_else(|| trimmed.strip_prefix("let mut "))
             {
-                let var_end = rest.find(|c: char| c == ':' || c == '=' || c == ' ')
+                let var_end = rest
+                    .find(|c: char| c == ':' || c == '=' || c == ' ')
                     .unwrap_or(rest.len());
                 let var_name = rest[..var_end].trim().to_string();
 
@@ -406,7 +418,10 @@ impl DiagnosticsProvider {
             if !used {
                 diagnostics.push(
                     Diagnostic::warning(
-                        Range::new(pos, Position::new(pos.line, pos.character + var_name.len() as u32)),
+                        Range::new(
+                            pos,
+                            Position::new(pos.line, pos.character + var_name.len() as u32),
+                        ),
                         format!("unused variable: {}", var_name),
                     )
                     .with_tag(DiagnosticTag::Unnecessary)

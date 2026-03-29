@@ -38,26 +38,26 @@
 //! checker.check_module(&module)?;
 //! ```
 
-mod ty;
-mod context;
-mod infer;
-mod unify;
-mod check;
-mod error;
 mod builtins;
-mod traits;
-mod hkt;
-mod effects;
+mod check;
 mod const_generics;
+mod context;
+mod effects;
+mod error;
+mod hkt;
+mod infer;
+mod traits;
+mod ty;
+mod unify;
 
-pub use ty::*;
-pub use context::*;
-pub use infer::*;
-pub use unify::*;
-pub use check::*;
-pub use error::*;
 pub use builtins::*;
-pub use traits::*;
-pub use hkt::*;
-pub use effects::*;
+pub use check::*;
 pub use const_generics::*;
+pub use context::*;
+pub use effects::*;
+pub use error::*;
+pub use hkt::*;
+pub use infer::*;
+pub use traits::*;
+pub use ty::*;
+pub use unify::*;

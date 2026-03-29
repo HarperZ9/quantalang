@@ -8,8 +8,8 @@
 //!
 //! Patterns are used in match expressions, let bindings, and function parameters.
 
-use crate::lexer::Span;
 use super::{Attribute, Expr, Ident, Literal, Mutability, NodeId, Path};
+use crate::lexer::Span;
 
 /// A pattern node.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,8 +54,13 @@ impl Pattern {
     pub fn is_irrefutable(&self) -> bool {
         match &self.kind {
             PatternKind::Wildcard => true,
-            PatternKind::Ident { subpattern: None, .. } => true,
-            PatternKind::Ident { subpattern: Some(p), .. } => p.is_irrefutable(),
+            PatternKind::Ident {
+                subpattern: None, ..
+            } => true,
+            PatternKind::Ident {
+                subpattern: Some(p),
+                ..
+            } => p.is_irrefutable(),
             PatternKind::Tuple(patterns) => patterns.iter().all(|p| p.is_irrefutable()),
             PatternKind::Ref { pattern, .. } => pattern.is_irrefutable(),
             PatternKind::Paren(p) => p.is_irrefutable(),
@@ -79,9 +84,9 @@ impl Pattern {
                 patterns.iter().any(|p| p.binds_variables())
             }
             PatternKind::Or(patterns) => patterns.iter().any(|p| p.binds_variables()),
-            PatternKind::Ref { pattern, .. } | PatternKind::Box(pattern) | PatternKind::Paren(pattern) => {
-                pattern.binds_variables()
-            }
+            PatternKind::Ref { pattern, .. }
+            | PatternKind::Box(pattern)
+            | PatternKind::Paren(pattern) => pattern.binds_variables(),
             PatternKind::Range { .. } => false,
             PatternKind::Macro { .. } | PatternKind::Error => false,
         }
@@ -94,7 +99,6 @@ pub enum PatternKind {
     // =========================================================================
     // BASIC PATTERNS
     // =========================================================================
-
     /// Wildcard pattern: `_`
     Wildcard,
 
@@ -114,14 +118,12 @@ pub enum PatternKind {
     // =========================================================================
     // PATH PATTERNS
     // =========================================================================
-
     /// Path pattern: `None`, `Some`, `Enum::Variant`
     Path(Path),
 
     // =========================================================================
     // COMPOUND PATTERNS
     // =========================================================================
-
     /// Tuple pattern: `(a, b, c)`
     Tuple(Vec<Pattern>),
 
@@ -136,15 +138,11 @@ pub enum PatternKind {
     },
 
     /// Tuple struct pattern: `Some(x)`, `Point(x, y)`
-    TupleStruct {
-        path: Path,
-        patterns: Vec<Pattern>,
-    },
+    TupleStruct { path: Path, patterns: Vec<Pattern> },
 
     // =========================================================================
     // COMPOSITE PATTERNS
     // =========================================================================
-
     /// Or pattern: `A | B | C`
     Or(Vec<Pattern>),
 
@@ -160,7 +158,6 @@ pub enum PatternKind {
     // =========================================================================
     // RANGE PATTERNS
     // =========================================================================
-
     /// Range pattern: `0..10`, `'a'..='z'`, `..10`
     Range {
         start: Option<Box<Expr>>,
@@ -171,7 +168,6 @@ pub enum PatternKind {
     // =========================================================================
     // SPECIAL
     // =========================================================================
-
     /// Parenthesized pattern (for span preservation)
     Paren(Box<Pattern>),
 
@@ -243,11 +239,14 @@ mod tests {
         assert!(Pattern::ident(ident, Mutability::Immutable).is_irrefutable());
 
         // Literal is refutable
-        let lit = Pattern::new(PatternKind::Literal(Literal::Int {
-            value: 42,
-            suffix: None,
-            base: crate::lexer::IntBase::Decimal,
-        }), span);
+        let lit = Pattern::new(
+            PatternKind::Literal(Literal::Int {
+                value: 42,
+                suffix: None,
+                base: crate::lexer::IntBase::Decimal,
+            }),
+            span,
+        );
         assert!(!lit.is_irrefutable());
     }
 }

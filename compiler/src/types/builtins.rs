@@ -11,8 +11,8 @@
 
 use std::sync::Arc;
 
-use super::ty::*;
 use super::context::*;
+use super::ty::*;
 
 /// IDs for built-in traits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -144,16 +144,24 @@ impl Builtins {
 
         // Comparison traits
         self.register_trait(ctx, BuiltinTraitId::PartialEq, "PartialEq", vec![]);
-        self.register_trait(ctx, BuiltinTraitId::Eq, "Eq", vec![
-            BuiltinTraitId::PartialEq,
-        ]);
-        self.register_trait(ctx, BuiltinTraitId::PartialOrd, "PartialOrd", vec![
-            BuiltinTraitId::PartialEq,
-        ]);
-        self.register_trait(ctx, BuiltinTraitId::Ord, "Ord", vec![
+        self.register_trait(
+            ctx,
             BuiltinTraitId::Eq,
+            "Eq",
+            vec![BuiltinTraitId::PartialEq],
+        );
+        self.register_trait(
+            ctx,
             BuiltinTraitId::PartialOrd,
-        ]);
+            "PartialOrd",
+            vec![BuiltinTraitId::PartialEq],
+        );
+        self.register_trait(
+            ctx,
+            BuiltinTraitId::Ord,
+            "Ord",
+            vec![BuiltinTraitId::Eq, BuiltinTraitId::PartialOrd],
+        );
 
         // Hash trait
         self.register_trait(ctx, BuiltinTraitId::Hash, "Hash", vec![]);
@@ -174,24 +182,31 @@ impl Builtins {
 
         // Indexing traits
         self.register_trait(ctx, BuiltinTraitId::Index, "Index", vec![]);
-        self.register_trait(ctx, BuiltinTraitId::IndexMut, "IndexMut", vec![
-            BuiltinTraitId::Index,
-        ]);
+        self.register_trait(
+            ctx,
+            BuiltinTraitId::IndexMut,
+            "IndexMut",
+            vec![BuiltinTraitId::Index],
+        );
 
         // Deref traits
         self.register_trait(ctx, BuiltinTraitId::Deref, "Deref", vec![]);
-        self.register_trait(ctx, BuiltinTraitId::DerefMut, "DerefMut", vec![
-            BuiltinTraitId::Deref,
-        ]);
+        self.register_trait(
+            ctx,
+            BuiltinTraitId::DerefMut,
+            "DerefMut",
+            vec![BuiltinTraitId::Deref],
+        );
 
         // Callable traits
         self.register_trait(ctx, BuiltinTraitId::FnOnce, "FnOnce", vec![]);
-        self.register_trait(ctx, BuiltinTraitId::FnMut, "FnMut", vec![
-            BuiltinTraitId::FnOnce,
-        ]);
-        self.register_trait(ctx, BuiltinTraitId::Fn, "Fn", vec![
+        self.register_trait(
+            ctx,
             BuiltinTraitId::FnMut,
-        ]);
+            "FnMut",
+            vec![BuiltinTraitId::FnOnce],
+        );
+        self.register_trait(ctx, BuiltinTraitId::Fn, "Fn", vec![BuiltinTraitId::FnMut]);
 
         // Async traits
         self.register_trait(ctx, BuiltinTraitId::Future, "Future", vec![]);
@@ -216,7 +231,8 @@ impl Builtins {
         let def_id = ctx.fresh_def_id();
         self.trait_ids.insert(id, def_id);
 
-        let supertrait_bounds: Vec<_> = supertraits.iter()
+        let supertrait_bounds: Vec<_> = supertraits
+            .iter()
             .filter_map(|st| {
                 self.trait_ids.get(st).map(|&trait_id| TraitBound {
                     trait_id,
@@ -299,10 +315,7 @@ impl Builtins {
         }
 
         // Float types
-        let float_types = vec![
-            Ty::float(FloatTy::F32),
-            Ty::float(FloatTy::F64),
-        ];
+        let float_types = vec![Ty::float(FloatTy::F32), Ty::float(FloatTy::F64)];
 
         for ty in &float_types {
             self.register_impl(ctx, BuiltinTraitId::Copy, ty.clone());
@@ -381,9 +394,14 @@ pub fn is_copy(ctx: &TypeContext, builtins: &Builtins, ty: &Ty) -> bool {
         !ctx.find_impls(copy_id, ty).is_empty()
     } else {
         // Fallback: primitives are always Copy
-        matches!(ty.kind,
-            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char |
-            TyKind::Ptr(_, _) | TyKind::Never
+        matches!(
+            ty.kind,
+            TyKind::Int(_)
+                | TyKind::Float(_)
+                | TyKind::Bool
+                | TyKind::Char
+                | TyKind::Ptr(_, _)
+                | TyKind::Never
         )
     }
 }
@@ -417,8 +435,18 @@ pub fn is_sync(ctx: &TypeContext, builtins: &Builtins, ty: &Ty) -> bool {
 pub fn default_value_repr(ty: &Ty) -> Option<String> {
     match &ty.kind {
         TyKind::Int(int_ty) => Some(match int_ty {
-            IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::I128 | IntTy::Isize |
-            IntTy::U8 | IntTy::U16 | IntTy::U32 | IntTy::U64 | IntTy::U128 | IntTy::Usize => "0".to_string(),
+            IntTy::I8
+            | IntTy::I16
+            | IntTy::I32
+            | IntTy::I64
+            | IntTy::I128
+            | IntTy::Isize
+            | IntTy::U8
+            | IntTy::U16
+            | IntTy::U32
+            | IntTy::U64
+            | IntTy::U128
+            | IntTy::Usize => "0".to_string(),
         }),
         TyKind::Float(_) => Some("0.0".to_string()),
         TyKind::Bool => Some("false".to_string()),
@@ -455,8 +483,14 @@ mod tests {
 
     #[test]
     fn test_default_values() {
-        assert_eq!(default_value_repr(&Ty::int(IntTy::I32)), Some("0".to_string()));
+        assert_eq!(
+            default_value_repr(&Ty::int(IntTy::I32)),
+            Some("0".to_string())
+        );
         assert_eq!(default_value_repr(&Ty::bool()), Some("false".to_string()));
-        assert_eq!(default_value_repr(&Ty::float(FloatTy::F64)), Some("0.0".to_string()));
+        assert_eq!(
+            default_value_repr(&Ty::float(FloatTy::F64)),
+            Some("0.0".to_string())
+        );
     }
 }

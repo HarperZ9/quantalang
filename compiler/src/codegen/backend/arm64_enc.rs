@@ -36,13 +36,34 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Reg64 {
-    X0 = 0, X1 = 1, X2 = 2, X3 = 3,
-    X4 = 4, X5 = 5, X6 = 6, X7 = 7,
-    X8 = 8, X9 = 9, X10 = 10, X11 = 11,
-    X12 = 12, X13 = 13, X14 = 14, X15 = 15,
-    X16 = 16, X17 = 17, X18 = 18, X19 = 19,
-    X20 = 20, X21 = 21, X22 = 22, X23 = 23,
-    X24 = 24, X25 = 25, X26 = 26, X27 = 27,
+    X0 = 0,
+    X1 = 1,
+    X2 = 2,
+    X3 = 3,
+    X4 = 4,
+    X5 = 5,
+    X6 = 6,
+    X7 = 7,
+    X8 = 8,
+    X9 = 9,
+    X10 = 10,
+    X11 = 11,
+    X12 = 12,
+    X13 = 13,
+    X14 = 14,
+    X15 = 15,
+    X16 = 16,
+    X17 = 17,
+    X18 = 18,
+    X19 = 19,
+    X20 = 20,
+    X21 = 21,
+    X22 = 22,
+    X23 = 23,
+    X24 = 24,
+    X25 = 25,
+    X26 = 26,
+    X27 = 27,
     X28 = 28,
     /// Frame pointer (X29).
     FP = 29,
@@ -78,14 +99,37 @@ impl Reg64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Reg32 {
-    W0 = 0, W1 = 1, W2 = 2, W3 = 3,
-    W4 = 4, W5 = 5, W6 = 6, W7 = 7,
-    W8 = 8, W9 = 9, W10 = 10, W11 = 11,
-    W12 = 12, W13 = 13, W14 = 14, W15 = 15,
-    W16 = 16, W17 = 17, W18 = 18, W19 = 19,
-    W20 = 20, W21 = 21, W22 = 22, W23 = 23,
-    W24 = 24, W25 = 25, W26 = 26, W27 = 27,
-    W28 = 28, W29 = 29, W30 = 30,
+    W0 = 0,
+    W1 = 1,
+    W2 = 2,
+    W3 = 3,
+    W4 = 4,
+    W5 = 5,
+    W6 = 6,
+    W7 = 7,
+    W8 = 8,
+    W9 = 9,
+    W10 = 10,
+    W11 = 11,
+    W12 = 12,
+    W13 = 13,
+    W14 = 14,
+    W15 = 15,
+    W16 = 16,
+    W17 = 17,
+    W18 = 18,
+    W19 = 19,
+    W20 = 20,
+    W21 = 21,
+    W22 = 22,
+    W23 = 23,
+    W24 = 24,
+    W25 = 25,
+    W26 = 26,
+    W27 = 27,
+    W28 = 28,
+    W29 = 29,
+    W30 = 30,
     /// Zero register (WZR).
     WZR = 31,
 }
@@ -100,14 +144,38 @@ impl Reg32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RegV {
-    V0 = 0, V1 = 1, V2 = 2, V3 = 3,
-    V4 = 4, V5 = 5, V6 = 6, V7 = 7,
-    V8 = 8, V9 = 9, V10 = 10, V11 = 11,
-    V12 = 12, V13 = 13, V14 = 14, V15 = 15,
-    V16 = 16, V17 = 17, V18 = 18, V19 = 19,
-    V20 = 20, V21 = 21, V22 = 22, V23 = 23,
-    V24 = 24, V25 = 25, V26 = 26, V27 = 27,
-    V28 = 28, V29 = 29, V30 = 30, V31 = 31,
+    V0 = 0,
+    V1 = 1,
+    V2 = 2,
+    V3 = 3,
+    V4 = 4,
+    V5 = 5,
+    V6 = 6,
+    V7 = 7,
+    V8 = 8,
+    V9 = 9,
+    V10 = 10,
+    V11 = 11,
+    V12 = 12,
+    V13 = 13,
+    V14 = 14,
+    V15 = 15,
+    V16 = 16,
+    V17 = 17,
+    V18 = 18,
+    V19 = 19,
+    V20 = 20,
+    V21 = 21,
+    V22 = 22,
+    V23 = 23,
+    V24 = 24,
+    V25 = 25,
+    V26 = 26,
+    V27 = 27,
+    V28 = 28,
+    V29 = 29,
+    V30 = 30,
+    V31 = 31,
 }
 
 impl RegV {
@@ -130,14 +198,38 @@ impl RegV {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RegD {
-    D0 = 0, D1 = 1, D2 = 2, D3 = 3,
-    D4 = 4, D5 = 5, D6 = 6, D7 = 7,
-    D8 = 8, D9 = 9, D10 = 10, D11 = 11,
-    D12 = 12, D13 = 13, D14 = 14, D15 = 15,
-    D16 = 16, D17 = 17, D18 = 18, D19 = 19,
-    D20 = 20, D21 = 21, D22 = 22, D23 = 23,
-    D24 = 24, D25 = 25, D26 = 26, D27 = 27,
-    D28 = 28, D29 = 29, D30 = 30, D31 = 31,
+    D0 = 0,
+    D1 = 1,
+    D2 = 2,
+    D3 = 3,
+    D4 = 4,
+    D5 = 5,
+    D6 = 6,
+    D7 = 7,
+    D8 = 8,
+    D9 = 9,
+    D10 = 10,
+    D11 = 11,
+    D12 = 12,
+    D13 = 13,
+    D14 = 14,
+    D15 = 15,
+    D16 = 16,
+    D17 = 17,
+    D18 = 18,
+    D19 = 19,
+    D20 = 20,
+    D21 = 21,
+    D22 = 22,
+    D23 = 23,
+    D24 = 24,
+    D25 = 25,
+    D26 = 26,
+    D27 = 27,
+    D28 = 28,
+    D29 = 29,
+    D30 = 30,
+    D31 = 31,
 }
 
 impl RegD {
@@ -150,14 +242,38 @@ impl RegD {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RegS {
-    S0 = 0, S1 = 1, S2 = 2, S3 = 3,
-    S4 = 4, S5 = 5, S6 = 6, S7 = 7,
-    S8 = 8, S9 = 9, S10 = 10, S11 = 11,
-    S12 = 12, S13 = 13, S14 = 14, S15 = 15,
-    S16 = 16, S17 = 17, S18 = 18, S19 = 19,
-    S20 = 20, S21 = 21, S22 = 22, S23 = 23,
-    S24 = 24, S25 = 25, S26 = 26, S27 = 27,
-    S28 = 28, S29 = 29, S30 = 30, S31 = 31,
+    S0 = 0,
+    S1 = 1,
+    S2 = 2,
+    S3 = 3,
+    S4 = 4,
+    S5 = 5,
+    S6 = 6,
+    S7 = 7,
+    S8 = 8,
+    S9 = 9,
+    S10 = 10,
+    S11 = 11,
+    S12 = 12,
+    S13 = 13,
+    S14 = 14,
+    S15 = 15,
+    S16 = 16,
+    S17 = 17,
+    S18 = 18,
+    S19 = 19,
+    S20 = 20,
+    S21 = 21,
+    S22 = 22,
+    S23 = 23,
+    S24 = 24,
+    S25 = 25,
+    S26 = 26,
+    S27 = 27,
+    S28 = 28,
+    S29 = 29,
+    S30 = 30,
+    S31 = 31,
 }
 
 impl RegS {
@@ -446,55 +562,43 @@ impl Arm64Encoder {
 
     /// ADD Xd, Xn, #imm (64-bit)
     pub fn add_imm(&mut self, dst: Reg64, src: Reg64, imm: u16) {
-        let insn = 0x91000000
-            | ((imm as u32 & 0xFFF) << 10)
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn =
+            0x91000000 | ((imm as u32 & 0xFFF) << 10) | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// ADD Wd, Wn, #imm (32-bit)
     pub fn add_imm32(&mut self, dst: Reg32, src: Reg32, imm: u16) {
-        let insn = 0x11000000
-            | ((imm as u32 & 0xFFF) << 10)
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn =
+            0x11000000 | ((imm as u32 & 0xFFF) << 10) | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// ADDS Xd, Xn, #imm (64-bit, sets flags)
     pub fn adds_imm(&mut self, dst: Reg64, src: Reg64, imm: u16) {
-        let insn = 0xB1000000
-            | ((imm as u32 & 0xFFF) << 10)
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn =
+            0xB1000000 | ((imm as u32 & 0xFFF) << 10) | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// SUB Xd, Xn, #imm (64-bit)
     pub fn sub_imm(&mut self, dst: Reg64, src: Reg64, imm: u16) {
-        let insn = 0xD1000000
-            | ((imm as u32 & 0xFFF) << 10)
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn =
+            0xD1000000 | ((imm as u32 & 0xFFF) << 10) | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// SUB Wd, Wn, #imm (32-bit)
     pub fn sub_imm32(&mut self, dst: Reg32, src: Reg32, imm: u16) {
-        let insn = 0x51000000
-            | ((imm as u32 & 0xFFF) << 10)
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn =
+            0x51000000 | ((imm as u32 & 0xFFF) << 10) | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// SUBS Xd, Xn, #imm (64-bit, sets flags)
     pub fn subs_imm(&mut self, dst: Reg64, src: Reg64, imm: u16) {
-        let insn = 0xF1000000
-            | ((imm as u32 & 0xFFF) << 10)
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn =
+            0xF1000000 | ((imm as u32 & 0xFFF) << 10) | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
@@ -556,40 +660,28 @@ impl Arm64Encoder {
     /// MOVZ Xd, #imm, LSL #shift (64-bit)
     pub fn movz(&mut self, dst: Reg64, imm: u16, shift: u8) {
         let hw = (shift / 16) as u32;
-        let insn = 0xD2800000
-            | (hw << 21)
-            | ((imm as u32) << 5)
-            | dst.encoding();
+        let insn = 0xD2800000 | (hw << 21) | ((imm as u32) << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// MOVZ Wd, #imm, LSL #shift (32-bit)
     pub fn movz32(&mut self, dst: Reg32, imm: u16, shift: u8) {
         let hw = (shift / 16) as u32;
-        let insn = 0x52800000
-            | (hw << 21)
-            | ((imm as u32) << 5)
-            | dst.encoding();
+        let insn = 0x52800000 | (hw << 21) | ((imm as u32) << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// MOVN Xd, #imm, LSL #shift (64-bit, move wide NOT)
     pub fn movn(&mut self, dst: Reg64, imm: u16, shift: u8) {
         let hw = (shift / 16) as u32;
-        let insn = 0x92800000
-            | (hw << 21)
-            | ((imm as u32) << 5)
-            | dst.encoding();
+        let insn = 0x92800000 | (hw << 21) | ((imm as u32) << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// MOVK Xd, #imm, LSL #shift (64-bit, move keep)
     pub fn movk(&mut self, dst: Reg64, imm: u16, shift: u8) {
         let hw = (shift / 16) as u32;
-        let insn = 0xF2800000
-            | (hw << 21)
-            | ((imm as u32) << 5)
-            | dst.encoding();
+        let insn = 0xF2800000 | (hw << 21) | ((imm as u32) << 5) | dst.encoding();
         self.emit(insn);
     }
 
@@ -664,15 +756,19 @@ impl Arm64Encoder {
 
     /// ADD Xd, Xn, Xm (64-bit)
     pub fn add_reg(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0x8B000000
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x8B000000 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// ADD Xd, Xn, Xm, shift #amount (64-bit)
-    pub fn add_reg_shift(&mut self, dst: Reg64, src1: Reg64, src2: Reg64, shift: Shift, amount: u8) {
+    pub fn add_reg_shift(
+        &mut self,
+        dst: Reg64,
+        src1: Reg64,
+        src2: Reg64,
+        shift: Shift,
+        amount: u8,
+    ) {
         let insn = 0x8B000000
             | (shift.encoding() << 22)
             | (src2.encoding() << 16)
@@ -684,24 +780,25 @@ impl Arm64Encoder {
 
     /// ADDS Xd, Xn, Xm (64-bit, sets flags)
     pub fn adds_reg(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0xAB000000
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xAB000000 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// SUB Xd, Xn, Xm (64-bit)
     pub fn sub_reg(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0xCB000000
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xCB000000 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// SUB Xd, Xn, Xm, shift #amount (64-bit)
-    pub fn sub_reg_shift(&mut self, dst: Reg64, src1: Reg64, src2: Reg64, shift: Shift, amount: u8) {
+    pub fn sub_reg_shift(
+        &mut self,
+        dst: Reg64,
+        src1: Reg64,
+        src2: Reg64,
+        shift: Shift,
+        amount: u8,
+    ) {
         let insn = 0xCB000000
             | (shift.encoding() << 22)
             | (src2.encoding() << 16)
@@ -713,10 +810,7 @@ impl Arm64Encoder {
 
     /// SUBS Xd, Xn, Xm (64-bit, sets flags)
     pub fn subs_reg(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0xEB000000
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xEB000000 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
@@ -737,19 +831,13 @@ impl Arm64Encoder {
 
     /// AND Xd, Xn, Xm (64-bit)
     pub fn and_reg(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0x8A000000
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x8A000000 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// ANDS Xd, Xn, Xm (64-bit, sets flags)
     pub fn ands_reg(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0xEA000000
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xEA000000 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
@@ -777,19 +865,13 @@ impl Arm64Encoder {
 
     /// ORR Xd, Xn, Xm (64-bit)
     pub fn orr_reg(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0xAA000000
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xAA000000 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// ORN Xd, Xn, Xm (64-bit, OR NOT)
     pub fn orn_reg(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0xAA200000
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xAA200000 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
@@ -800,28 +882,19 @@ impl Arm64Encoder {
 
     /// EOR Xd, Xn, Xm (64-bit)
     pub fn eor_reg(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0xCA000000
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xCA000000 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// EON Xd, Xn, Xm (64-bit, EOR NOT)
     pub fn eon_reg(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0xCA200000
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xCA200000 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// BIC Xd, Xn, Xm (64-bit, AND NOT)
     pub fn bic_reg(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0x8A200000
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x8A200000 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
@@ -831,10 +904,7 @@ impl Arm64Encoder {
 
     /// LSL Xd, Xn, Xm (64-bit variable shift)
     pub fn lsl_reg(&mut self, dst: Reg64, src: Reg64, amount: Reg64) {
-        let insn = 0x9AC02000
-            | (amount.encoding() << 16)
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9AC02000 | (amount.encoding() << 16) | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
@@ -853,46 +923,33 @@ impl Arm64Encoder {
 
     /// LSR Xd, Xn, Xm (64-bit variable shift)
     pub fn lsr_reg(&mut self, dst: Reg64, src: Reg64, amount: Reg64) {
-        let insn = 0x9AC02400
-            | (amount.encoding() << 16)
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9AC02400 | (amount.encoding() << 16) | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// LSR Xd, Xn, #imm (64-bit immediate shift)
     pub fn lsr_imm(&mut self, dst: Reg64, src: Reg64, shift: u8) {
-        let insn = 0xD340FC00
-            | ((shift as u32 & 0x3F) << 16)
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn =
+            0xD340FC00 | ((shift as u32 & 0x3F) << 16) | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// ASR Xd, Xn, Xm (64-bit variable shift)
     pub fn asr_reg(&mut self, dst: Reg64, src: Reg64, amount: Reg64) {
-        let insn = 0x9AC02800
-            | (amount.encoding() << 16)
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9AC02800 | (amount.encoding() << 16) | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// ASR Xd, Xn, #imm (64-bit immediate shift)
     pub fn asr_imm(&mut self, dst: Reg64, src: Reg64, shift: u8) {
-        let insn = 0x9340FC00
-            | ((shift as u32 & 0x3F) << 16)
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn =
+            0x9340FC00 | ((shift as u32 & 0x3F) << 16) | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// ROR Xd, Xn, Xm (64-bit variable rotate)
     pub fn ror_reg(&mut self, dst: Reg64, src: Reg64, amount: Reg64) {
-        let insn = 0x9AC02C00
-            | (amount.encoding() << 16)
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9AC02C00 | (amount.encoding() << 16) | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
@@ -913,10 +970,7 @@ impl Arm64Encoder {
     /// MUL Xd, Xn, Xm (64-bit)
     pub fn mul(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
         // MUL is alias for MADD Xd, Xn, Xm, XZR
-        let insn = 0x9B007C00
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9B007C00 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
@@ -947,55 +1001,37 @@ impl Arm64Encoder {
 
     /// SMULL Xd, Wn, Wm (signed multiply long)
     pub fn smull(&mut self, dst: Reg64, src1: Reg32, src2: Reg32) {
-        let insn = 0x9B207C00
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9B207C00 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// UMULL Xd, Wn, Wm (unsigned multiply long)
     pub fn umull(&mut self, dst: Reg64, src1: Reg32, src2: Reg32) {
-        let insn = 0x9BA07C00
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9BA07C00 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// SMULH Xd, Xn, Xm (signed multiply high)
     pub fn smulh(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0x9B407C00
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9B407C00 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// UMULH Xd, Xn, Xm (unsigned multiply high)
     pub fn umulh(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0x9BC07C00
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9BC07C00 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// SDIV Xd, Xn, Xm (64-bit signed divide)
     pub fn sdiv(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0x9AC00C00
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9AC00C00 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// UDIV Xd, Xn, Xm (64-bit unsigned divide)
     pub fn udiv(&mut self, dst: Reg64, src1: Reg64, src2: Reg64) {
-        let insn = 0x9AC00800
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9AC00800 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
@@ -1006,87 +1042,60 @@ impl Arm64Encoder {
     /// LDR Xt, [Xn, #imm] (64-bit load, unsigned offset)
     pub fn ldr(&mut self, dst: Reg64, base: Reg64, offset: u16) {
         let imm12 = (offset / 8) as u32;
-        let insn = 0xF9400000
-            | (imm12 << 10)
-            | (base.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xF9400000 | (imm12 << 10) | (base.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// LDR Wt, [Xn, #imm] (32-bit load, unsigned offset)
     pub fn ldr32(&mut self, dst: Reg32, base: Reg64, offset: u16) {
         let imm12 = (offset / 4) as u32;
-        let insn = 0xB9400000
-            | (imm12 << 10)
-            | (base.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xB9400000 | (imm12 << 10) | (base.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// LDRB Wt, [Xn, #imm] (8-bit load, unsigned offset)
     pub fn ldrb(&mut self, dst: Reg32, base: Reg64, offset: u16) {
-        let insn = 0x39400000
-            | ((offset as u32) << 10)
-            | (base.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x39400000 | ((offset as u32) << 10) | (base.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// LDRH Wt, [Xn, #imm] (16-bit load, unsigned offset)
     pub fn ldrh(&mut self, dst: Reg32, base: Reg64, offset: u16) {
         let imm12 = (offset / 2) as u32;
-        let insn = 0x79400000
-            | (imm12 << 10)
-            | (base.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x79400000 | (imm12 << 10) | (base.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// LDRSB Xt, [Xn, #imm] (signed 8-bit load, extend to 64-bit)
     pub fn ldrsb(&mut self, dst: Reg64, base: Reg64, offset: u16) {
-        let insn = 0x39800000
-            | ((offset as u32) << 10)
-            | (base.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x39800000 | ((offset as u32) << 10) | (base.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// LDRSH Xt, [Xn, #imm] (signed 16-bit load, extend to 64-bit)
     pub fn ldrsh(&mut self, dst: Reg64, base: Reg64, offset: u16) {
         let imm12 = (offset / 2) as u32;
-        let insn = 0x79800000
-            | (imm12 << 10)
-            | (base.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x79800000 | (imm12 << 10) | (base.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// LDRSW Xt, [Xn, #imm] (signed 32-bit load, extend to 64-bit)
     pub fn ldrsw(&mut self, dst: Reg64, base: Reg64, offset: u16) {
         let imm12 = (offset / 4) as u32;
-        let insn = 0xB9800000
-            | (imm12 << 10)
-            | (base.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xB9800000 | (imm12 << 10) | (base.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// LDR Xt, [Xn, Xm] (register offset)
     pub fn ldr_reg(&mut self, dst: Reg64, base: Reg64, offset: Reg64) {
-        let insn = 0xF8606800
-            | (offset.encoding() << 16)
-            | (base.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xF8606800 | (offset.encoding() << 16) | (base.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// LDUR Xt, [Xn, #simm] (unscaled offset, -256 to 255)
     pub fn ldur(&mut self, dst: Reg64, base: Reg64, offset: i16) {
         let imm9 = (offset as u32) & 0x1FF;
-        let insn = 0xF8400000
-            | (imm9 << 12)
-            | (base.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xF8400000 | (imm9 << 12) | (base.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
@@ -1126,58 +1135,40 @@ impl Arm64Encoder {
     /// STR Xt, [Xn, #imm] (64-bit store, unsigned offset)
     pub fn str(&mut self, src: Reg64, base: Reg64, offset: u16) {
         let imm12 = (offset / 8) as u32;
-        let insn = 0xF9000000
-            | (imm12 << 10)
-            | (base.encoding() << 5)
-            | src.encoding();
+        let insn = 0xF9000000 | (imm12 << 10) | (base.encoding() << 5) | src.encoding();
         self.emit(insn);
     }
 
     /// STR Wt, [Xn, #imm] (32-bit store, unsigned offset)
     pub fn str32(&mut self, src: Reg32, base: Reg64, offset: u16) {
         let imm12 = (offset / 4) as u32;
-        let insn = 0xB9000000
-            | (imm12 << 10)
-            | (base.encoding() << 5)
-            | src.encoding();
+        let insn = 0xB9000000 | (imm12 << 10) | (base.encoding() << 5) | src.encoding();
         self.emit(insn);
     }
 
     /// STRB Wt, [Xn, #imm] (8-bit store)
     pub fn strb(&mut self, src: Reg32, base: Reg64, offset: u16) {
-        let insn = 0x39000000
-            | ((offset as u32) << 10)
-            | (base.encoding() << 5)
-            | src.encoding();
+        let insn = 0x39000000 | ((offset as u32) << 10) | (base.encoding() << 5) | src.encoding();
         self.emit(insn);
     }
 
     /// STRH Wt, [Xn, #imm] (16-bit store)
     pub fn strh(&mut self, src: Reg32, base: Reg64, offset: u16) {
         let imm12 = (offset / 2) as u32;
-        let insn = 0x79000000
-            | (imm12 << 10)
-            | (base.encoding() << 5)
-            | src.encoding();
+        let insn = 0x79000000 | (imm12 << 10) | (base.encoding() << 5) | src.encoding();
         self.emit(insn);
     }
 
     /// STR Xt, [Xn, Xm] (register offset)
     pub fn str_reg(&mut self, src: Reg64, base: Reg64, offset: Reg64) {
-        let insn = 0xF8206800
-            | (offset.encoding() << 16)
-            | (base.encoding() << 5)
-            | src.encoding();
+        let insn = 0xF8206800 | (offset.encoding() << 16) | (base.encoding() << 5) | src.encoding();
         self.emit(insn);
     }
 
     /// STUR Xt, [Xn, #simm] (unscaled offset)
     pub fn stur(&mut self, src: Reg64, base: Reg64, offset: i16) {
         let imm9 = (offset as u32) & 0x1FF;
-        let insn = 0xF8000000
-            | (imm9 << 12)
-            | (base.encoding() << 5)
-            | src.encoding();
+        let insn = 0xF8000000 | (imm9 << 12) | (base.encoding() << 5) | src.encoding();
         self.emit(insn);
     }
 
@@ -1352,11 +1343,7 @@ impl Arm64Encoder {
         let imm14 = ((offset >> 2) as u32) & 0x3FFF;
         let b5 = ((bit >> 5) & 1) as u32;
         let b40 = (bit & 0x1F) as u32;
-        let insn = 0x36000000
-            | (b5 << 31)
-            | (b40 << 19)
-            | (imm14 << 5)
-            | reg.encoding();
+        let insn = 0x36000000 | (b5 << 31) | (b40 << 19) | (imm14 << 5) | reg.encoding();
         self.emit(insn);
     }
 
@@ -1365,11 +1352,7 @@ impl Arm64Encoder {
         let imm14 = ((offset >> 2) as u32) & 0x3FFF;
         let b5 = ((bit >> 5) & 1) as u32;
         let b40 = (bit & 0x1F) as u32;
-        let insn = 0x37000000
-            | (b5 << 31)
-            | (b40 << 19)
-            | (imm14 << 5)
-            | reg.encoding();
+        let insn = 0x37000000 | (b5 << 31) | (b40 << 19) | (imm14 << 5) | reg.encoding();
         self.emit(insn);
     }
 
@@ -1435,10 +1418,7 @@ impl Arm64Encoder {
     pub fn adr(&mut self, dst: Reg64, offset: i32) {
         let immlo = (offset & 0x3) as u32;
         let immhi = ((offset >> 2) & 0x7FFFF) as u32;
-        let insn = 0x10000000
-            | (immlo << 29)
-            | (immhi << 5)
-            | dst.encoding();
+        let insn = 0x10000000 | (immlo << 29) | (immhi << 5) | dst.encoding();
         self.emit(insn);
     }
 
@@ -1446,10 +1426,7 @@ impl Arm64Encoder {
     pub fn adrp(&mut self, dst: Reg64, offset: i32) {
         let immlo = ((offset >> 12) & 0x3) as u32;
         let immhi = ((offset >> 14) & 0x7FFFF) as u32;
-        let insn = 0x90000000
-            | (immlo << 29)
-            | (immhi << 5)
-            | dst.encoding();
+        let insn = 0x90000000 | (immlo << 29) | (immhi << 5) | dst.encoding();
         self.emit(insn);
     }
 
@@ -1459,225 +1436,161 @@ impl Arm64Encoder {
 
     /// FMOV Dd, Dn (copy double)
     pub fn fmov_d(&mut self, dst: RegD, src: RegD) {
-        let insn = 0x1E604000
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E604000 | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FMOV Sd, Sn (copy single)
     pub fn fmov_s(&mut self, dst: RegS, src: RegS) {
-        let insn = 0x1E204000
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E204000 | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FMOV Xd, Dn (FP to general register)
     pub fn fmov_to_gpr(&mut self, dst: Reg64, src: RegD) {
-        let insn = 0x9E660000
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9E660000 | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FMOV Dd, Xn (general register to FP)
     pub fn fmov_from_gpr(&mut self, dst: RegD, src: Reg64) {
-        let insn = 0x9E670000
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9E670000 | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FADD Dd, Dn, Dm (double add)
     pub fn fadd_d(&mut self, dst: RegD, src1: RegD, src2: RegD) {
-        let insn = 0x1E602800
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E602800 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FADD Sd, Sn, Sm (single add)
     pub fn fadd_s(&mut self, dst: RegS, src1: RegS, src2: RegS) {
-        let insn = 0x1E202800
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E202800 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FSUB Dd, Dn, Dm (double subtract)
     pub fn fsub_d(&mut self, dst: RegD, src1: RegD, src2: RegD) {
-        let insn = 0x1E603800
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E603800 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FSUB Sd, Sn, Sm (single subtract)
     pub fn fsub_s(&mut self, dst: RegS, src1: RegS, src2: RegS) {
-        let insn = 0x1E203800
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E203800 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FMUL Dd, Dn, Dm (double multiply)
     pub fn fmul_d(&mut self, dst: RegD, src1: RegD, src2: RegD) {
-        let insn = 0x1E600800
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E600800 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FMUL Sd, Sn, Sm (single multiply)
     pub fn fmul_s(&mut self, dst: RegS, src1: RegS, src2: RegS) {
-        let insn = 0x1E200800
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E200800 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FDIV Dd, Dn, Dm (double divide)
     pub fn fdiv_d(&mut self, dst: RegD, src1: RegD, src2: RegD) {
-        let insn = 0x1E601800
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E601800 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FDIV Sd, Sn, Sm (single divide)
     pub fn fdiv_s(&mut self, dst: RegS, src1: RegS, src2: RegS) {
-        let insn = 0x1E201800
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E201800 | (src2.encoding() << 16) | (src1.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FNEG Dd, Dn (double negate)
     pub fn fneg_d(&mut self, dst: RegD, src: RegD) {
-        let insn = 0x1E614000
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E614000 | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FABS Dd, Dn (double absolute)
     pub fn fabs_d(&mut self, dst: RegD, src: RegD) {
-        let insn = 0x1E60C000
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E60C000 | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FSQRT Dd, Dn (double square root)
     pub fn fsqrt_d(&mut self, dst: RegD, src: RegD) {
-        let insn = 0x1E61C000
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E61C000 | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FCMP Dn, Dm (double compare)
     pub fn fcmp_d(&mut self, src1: RegD, src2: RegD) {
-        let insn = 0x1E602000
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5);
+        let insn = 0x1E602000 | (src2.encoding() << 16) | (src1.encoding() << 5);
         self.emit(insn);
     }
 
     /// FCMP Sn, Sm (single compare)
     pub fn fcmp_s(&mut self, src1: RegS, src2: RegS) {
-        let insn = 0x1E202000
-            | (src2.encoding() << 16)
-            | (src1.encoding() << 5);
+        let insn = 0x1E202000 | (src2.encoding() << 16) | (src1.encoding() << 5);
         self.emit(insn);
     }
 
     /// FCVTZS Xd, Dn (double to signed int, round toward zero)
     pub fn fcvtzs_d(&mut self, dst: Reg64, src: RegD) {
-        let insn = 0x9E780000
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9E780000 | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// SCVTF Dd, Xn (signed int to double)
     pub fn scvtf_d(&mut self, dst: RegD, src: Reg64) {
-        let insn = 0x9E620000
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9E620000 | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// UCVTF Dd, Xn (unsigned int to double)
     pub fn ucvtf_d(&mut self, dst: RegD, src: Reg64) {
-        let insn = 0x9E630000
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x9E630000 | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FCVT Dd, Sn (single to double)
     pub fn fcvt_s_to_d(&mut self, dst: RegD, src: RegS) {
-        let insn = 0x1E22C000
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E22C000 | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// FCVT Sd, Dn (double to single)
     pub fn fcvt_d_to_s(&mut self, dst: RegS, src: RegD) {
-        let insn = 0x1E624000
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn = 0x1E624000 | (src.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// LDR Dt, [Xn, #imm] (load double)
     pub fn ldr_d(&mut self, dst: RegD, base: Reg64, offset: u16) {
         let imm12 = (offset / 8) as u32;
-        let insn = 0xFD400000
-            | (imm12 << 10)
-            | (base.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xFD400000 | (imm12 << 10) | (base.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// LDR St, [Xn, #imm] (load single)
     pub fn ldr_s(&mut self, dst: RegS, base: Reg64, offset: u16) {
         let imm12 = (offset / 4) as u32;
-        let insn = 0xBD400000
-            | (imm12 << 10)
-            | (base.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xBD400000 | (imm12 << 10) | (base.encoding() << 5) | dst.encoding();
         self.emit(insn);
     }
 
     /// STR Dt, [Xn, #imm] (store double)
     pub fn str_d(&mut self, src: RegD, base: Reg64, offset: u16) {
         let imm12 = (offset / 8) as u32;
-        let insn = 0xFD000000
-            | (imm12 << 10)
-            | (base.encoding() << 5)
-            | src.encoding();
+        let insn = 0xFD000000 | (imm12 << 10) | (base.encoding() << 5) | src.encoding();
         self.emit(insn);
     }
 
     /// STR St, [Xn, #imm] (store single)
     pub fn str_s(&mut self, src: RegS, base: Reg64, offset: u16) {
         let imm12 = (offset / 4) as u32;
-        let insn = 0xBD000000
-            | (imm12 << 10)
-            | (base.encoding() << 5)
-            | src.encoding();
+        let insn = 0xBD000000 | (imm12 << 10) | (base.encoding() << 5) | src.encoding();
         self.emit(insn);
     }
 

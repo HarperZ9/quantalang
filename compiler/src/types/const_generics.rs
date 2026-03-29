@@ -50,7 +50,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use super::{Ty, TyKind, IntTy};
+use super::{IntTy, Ty, TyKind};
 
 /// A unique identifier for const variables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -147,9 +147,7 @@ impl ConstValue {
                     Ty::array(Ty::fresh_var(), 0)
                 }
             }
-            ConstValue::Tuple(elems) => {
-                Ty::tuple(elems.iter().map(|e| e.ty()).collect())
-            }
+            ConstValue::Tuple(elems) => Ty::tuple(elems.iter().map(|e| e.ty()).collect()),
             ConstValue::Named(_) => Ty::fresh_var(), // Type inferred
             ConstValue::Error => Ty::error(),
         }
@@ -315,17 +313,15 @@ impl ConstExpr {
         match self {
             ConstExpr::Literal(v) => Ok(v.clone()),
 
-            ConstExpr::Param(param) => {
-                ctx.get_param(&param.name)
-                    .cloned()
-                    .ok_or_else(|| ConstEvalError::UnboundParam(param.name.to_string()))
-            }
+            ConstExpr::Param(param) => ctx
+                .get_param(&param.name)
+                .cloned()
+                .ok_or_else(|| ConstEvalError::UnboundParam(param.name.to_string())),
 
-            ConstExpr::Var(var) => {
-                ctx.get_var(*var)
-                    .cloned()
-                    .ok_or(ConstEvalError::UnresolvedVar(*var))
-            }
+            ConstExpr::Var(var) => ctx
+                .get_var(*var)
+                .cloned()
+                .ok_or(ConstEvalError::UnresolvedVar(*var)),
 
             ConstExpr::Binary { op, left, right } => {
                 let lval = left.evaluate(ctx)?;
@@ -338,7 +334,11 @@ impl ConstExpr {
                 op.evaluate(&val)
             }
 
-            ConstExpr::If { condition, then_branch, else_branch } => {
+            ConstExpr::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
                 let cond = condition.evaluate(ctx)?;
                 match cond {
                     ConstValue::Bool(true) => then_branch.evaluate(ctx),
@@ -351,9 +351,7 @@ impl ConstExpr {
             }
 
             ConstExpr::Call { func, args } => {
-                let arg_vals: Result<Vec<_>, _> = args.iter()
-                    .map(|a| a.evaluate(ctx))
-                    .collect();
+                let arg_vals: Result<Vec<_>, _> = args.iter().map(|a| a.evaluate(ctx)).collect();
                 ctx.call_function(func, &arg_vals?)
             }
 
@@ -394,11 +392,14 @@ impl ConstExpr {
                 let align = match &ty.kind {
                     TyKind::Bool | TyKind::Int(IntTy::I8) | TyKind::Int(IntTy::U8) => 1,
                     TyKind::Int(IntTy::I16) | TyKind::Int(IntTy::U16) => 2,
-                    TyKind::Int(IntTy::I32) | TyKind::Int(IntTy::U32) |
-                    TyKind::Float(super::FloatTy::F32) => 4,
-                    TyKind::Int(IntTy::I64) | TyKind::Int(IntTy::U64) |
-                    TyKind::Float(super::FloatTy::F64) |
-                    TyKind::Ptr(_, _) | TyKind::Ref(_, _, _) => 8,
+                    TyKind::Int(IntTy::I32)
+                    | TyKind::Int(IntTy::U32)
+                    | TyKind::Float(super::FloatTy::F32) => 4,
+                    TyKind::Int(IntTy::I64)
+                    | TyKind::Int(IntTy::U64)
+                    | TyKind::Float(super::FloatTy::F64)
+                    | TyKind::Ptr(_, _)
+                    | TyKind::Ref(_, _, _) => 8,
                     TyKind::Int(IntTy::I128) | TyKind::Int(IntTy::U128) => 16,
                     _ => return Err(ConstEvalError::CannotCompute("alignof".to_string())),
                 };
@@ -421,9 +422,11 @@ impl ConstExpr {
             ConstExpr::Literal(_) | ConstExpr::Param(_) => false,
             ConstExpr::Binary { left, right, .. } => left.has_vars() || right.has_vars(),
             ConstExpr::Unary { operand, .. } => operand.has_vars(),
-            ConstExpr::If { condition, then_branch, else_branch } => {
-                condition.has_vars() || then_branch.has_vars() || else_branch.has_vars()
-            }
+            ConstExpr::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => condition.has_vars() || then_branch.has_vars() || else_branch.has_vars(),
             ConstExpr::Call { args, .. } => args.iter().any(|a| a.has_vars()),
             ConstExpr::ArrayLen(e) => e.has_vars(),
             ConstExpr::SizeOf(_) | ConstExpr::AlignOf(_) => false,
@@ -441,32 +444,28 @@ impl ConstExpr {
                     self.clone()
                 }
             }
-            ConstExpr::Binary { op, left, right } => {
-                ConstExpr::Binary {
-                    op: *op,
-                    left: Box::new(left.substitute(subst)),
-                    right: Box::new(right.substitute(subst)),
-                }
-            }
-            ConstExpr::Unary { op, operand } => {
-                ConstExpr::Unary {
-                    op: *op,
-                    operand: Box::new(operand.substitute(subst)),
-                }
-            }
-            ConstExpr::If { condition, then_branch, else_branch } => {
-                ConstExpr::If {
-                    condition: Box::new(condition.substitute(subst)),
-                    then_branch: Box::new(then_branch.substitute(subst)),
-                    else_branch: Box::new(else_branch.substitute(subst)),
-                }
-            }
-            ConstExpr::Call { func, args } => {
-                ConstExpr::Call {
-                    func: func.clone(),
-                    args: args.iter().map(|a| a.substitute(subst)).collect(),
-                }
-            }
+            ConstExpr::Binary { op, left, right } => ConstExpr::Binary {
+                op: *op,
+                left: Box::new(left.substitute(subst)),
+                right: Box::new(right.substitute(subst)),
+            },
+            ConstExpr::Unary { op, operand } => ConstExpr::Unary {
+                op: *op,
+                operand: Box::new(operand.substitute(subst)),
+            },
+            ConstExpr::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => ConstExpr::If {
+                condition: Box::new(condition.substitute(subst)),
+                then_branch: Box::new(then_branch.substitute(subst)),
+                else_branch: Box::new(else_branch.substitute(subst)),
+            },
+            ConstExpr::Call { func, args } => ConstExpr::Call {
+                func: func.clone(),
+                args: args.iter().map(|a| a.substitute(subst)).collect(),
+            },
             ConstExpr::ArrayLen(e) => ConstExpr::ArrayLen(Box::new(e.substitute(subst))),
             _ => self.clone(),
         }
@@ -481,8 +480,16 @@ impl fmt::Display for ConstExpr {
             ConstExpr::Var(v) => write!(f, "{}", v),
             ConstExpr::Binary { op, left, right } => write!(f, "({} {} {})", left, op, right),
             ConstExpr::Unary { op, operand } => write!(f, "{}{}", op, operand),
-            ConstExpr::If { condition, then_branch, else_branch } => {
-                write!(f, "if {} {{ {} }} else {{ {} }}", condition, then_branch, else_branch)
+            ConstExpr::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                write!(
+                    f,
+                    "if {} {{ {} }} else {{ {} }}",
+                    condition, then_branch, else_branch
+                )
             }
             ConstExpr::Call { func, args } => {
                 write!(f, "{}(", func)?;
@@ -506,18 +513,36 @@ impl fmt::Display for ConstExpr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConstBinOp {
     // Arithmetic
-    Add, Sub, Mul, Div, Rem,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
     // Bitwise
-    BitAnd, BitOr, BitXor, Shl, Shr,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
     // Comparison
-    Eq, Ne, Lt, Le, Gt, Ge,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
     // Logical
-    And, Or,
+    And,
+    Or,
 }
 
 impl ConstBinOp {
     /// Evaluate this operation on two values.
-    pub fn evaluate(&self, left: &ConstValue, right: &ConstValue) -> Result<ConstValue, ConstEvalError> {
+    pub fn evaluate(
+        &self,
+        left: &ConstValue,
+        right: &ConstValue,
+    ) -> Result<ConstValue, ConstEvalError> {
         match (left, right) {
             (ConstValue::Int(l, ty), ConstValue::Int(r, _)) => {
                 let result = match self {
@@ -579,17 +604,16 @@ impl ConstBinOp {
                     .ok_or(ConstEvalError::Overflow)
             }
 
-            (ConstValue::Bool(l), ConstValue::Bool(r)) => {
-                match self {
-                    ConstBinOp::And => Ok(ConstValue::bool(*l && *r)),
-                    ConstBinOp::Or => Ok(ConstValue::bool(*l || *r)),
-                    ConstBinOp::Eq => Ok(ConstValue::bool(l == r)),
-                    ConstBinOp::Ne => Ok(ConstValue::bool(l != r)),
-                    _ => Err(ConstEvalError::InvalidOperation(format!(
-                        "cannot apply {} to booleans", self
-                    ))),
-                }
-            }
+            (ConstValue::Bool(l), ConstValue::Bool(r)) => match self {
+                ConstBinOp::And => Ok(ConstValue::bool(*l && *r)),
+                ConstBinOp::Or => Ok(ConstValue::bool(*l || *r)),
+                ConstBinOp::Eq => Ok(ConstValue::bool(l == r)),
+                ConstBinOp::Ne => Ok(ConstValue::bool(l != r)),
+                _ => Err(ConstEvalError::InvalidOperation(format!(
+                    "cannot apply {} to booleans",
+                    self
+                ))),
+            },
 
             _ => Err(ConstEvalError::TypeMismatch {
                 expected: format!("{}", left.ty()),
@@ -636,16 +660,17 @@ impl ConstUnaryOp {
     /// Evaluate this operation on a value.
     pub fn evaluate(&self, operand: &ConstValue) -> Result<ConstValue, ConstEvalError> {
         match (self, operand) {
-            (ConstUnaryOp::Neg, ConstValue::Int(v, ty)) => {
-                v.checked_neg()
-                    .map(|r| ConstValue::Int(r, *ty))
-                    .ok_or(ConstEvalError::Overflow)
-            }
+            (ConstUnaryOp::Neg, ConstValue::Int(v, ty)) => v
+                .checked_neg()
+                .map(|r| ConstValue::Int(r, *ty))
+                .ok_or(ConstEvalError::Overflow),
             (ConstUnaryOp::Not, ConstValue::Bool(v)) => Ok(ConstValue::bool(!v)),
             (ConstUnaryOp::BitNot, ConstValue::Int(v, ty)) => Ok(ConstValue::Int(!v, *ty)),
             (ConstUnaryOp::BitNot, ConstValue::Uint(v, ty)) => Ok(ConstValue::Uint(!v, *ty)),
             _ => Err(ConstEvalError::InvalidOperation(format!(
-                "cannot apply {} to {}", self, operand.ty()
+                "cannot apply {} to {}",
+                self,
+                operand.ty()
             ))),
         }
     }
@@ -746,63 +771,57 @@ impl ConstEvalContext {
         // min
         self.functions.insert(
             Arc::from("min"),
-            ConstFn::new(2, |args| {
-                match (&args[0], &args[1]) {
-                    (ConstValue::Int(a, ty), ConstValue::Int(b, _)) => {
-                        Ok(ConstValue::Int((*a).min(*b), *ty))
-                    }
-                    (ConstValue::Uint(a, ty), ConstValue::Uint(b, _)) => {
-                        Ok(ConstValue::Uint((*a).min(*b), *ty))
-                    }
-                    _ => Err(ConstEvalError::TypeMismatch {
-                        expected: "numeric".to_string(),
-                        found: format!("{}", args[0].ty()),
-                    }),
+            ConstFn::new(2, |args| match (&args[0], &args[1]) {
+                (ConstValue::Int(a, ty), ConstValue::Int(b, _)) => {
+                    Ok(ConstValue::Int((*a).min(*b), *ty))
                 }
+                (ConstValue::Uint(a, ty), ConstValue::Uint(b, _)) => {
+                    Ok(ConstValue::Uint((*a).min(*b), *ty))
+                }
+                _ => Err(ConstEvalError::TypeMismatch {
+                    expected: "numeric".to_string(),
+                    found: format!("{}", args[0].ty()),
+                }),
             }),
         );
 
         // max
         self.functions.insert(
             Arc::from("max"),
-            ConstFn::new(2, |args| {
-                match (&args[0], &args[1]) {
-                    (ConstValue::Int(a, ty), ConstValue::Int(b, _)) => {
-                        Ok(ConstValue::Int((*a).max(*b), *ty))
-                    }
-                    (ConstValue::Uint(a, ty), ConstValue::Uint(b, _)) => {
-                        Ok(ConstValue::Uint((*a).max(*b), *ty))
-                    }
-                    _ => Err(ConstEvalError::TypeMismatch {
-                        expected: "numeric".to_string(),
-                        found: format!("{}", args[0].ty()),
-                    }),
+            ConstFn::new(2, |args| match (&args[0], &args[1]) {
+                (ConstValue::Int(a, ty), ConstValue::Int(b, _)) => {
+                    Ok(ConstValue::Int((*a).max(*b), *ty))
                 }
+                (ConstValue::Uint(a, ty), ConstValue::Uint(b, _)) => {
+                    Ok(ConstValue::Uint((*a).max(*b), *ty))
+                }
+                _ => Err(ConstEvalError::TypeMismatch {
+                    expected: "numeric".to_string(),
+                    found: format!("{}", args[0].ty()),
+                }),
             }),
         );
 
         // pow
         self.functions.insert(
             Arc::from("pow"),
-            ConstFn::new(2, |args| {
-                match (&args[0], &args[1]) {
-                    (ConstValue::Int(base, ty), ConstValue::Uint(exp, _)) => {
-                        let exp = *exp as u32;
-                        base.checked_pow(exp)
-                            .map(|r| ConstValue::Int(r, *ty))
-                            .ok_or(ConstEvalError::Overflow)
-                    }
-                    (ConstValue::Uint(base, ty), ConstValue::Uint(exp, _)) => {
-                        let exp = *exp as u32;
-                        base.checked_pow(exp)
-                            .map(|r| ConstValue::Uint(r, *ty))
-                            .ok_or(ConstEvalError::Overflow)
-                    }
-                    _ => Err(ConstEvalError::TypeMismatch {
-                        expected: "numeric".to_string(),
-                        found: format!("{}", args[0].ty()),
-                    }),
+            ConstFn::new(2, |args| match (&args[0], &args[1]) {
+                (ConstValue::Int(base, ty), ConstValue::Uint(exp, _)) => {
+                    let exp = *exp as u32;
+                    base.checked_pow(exp)
+                        .map(|r| ConstValue::Int(r, *ty))
+                        .ok_or(ConstEvalError::Overflow)
                 }
+                (ConstValue::Uint(base, ty), ConstValue::Uint(exp, _)) => {
+                    let exp = *exp as u32;
+                    base.checked_pow(exp)
+                        .map(|r| ConstValue::Uint(r, *ty))
+                        .ok_or(ConstEvalError::Overflow)
+                }
+                _ => Err(ConstEvalError::TypeMismatch {
+                    expected: "numeric".to_string(),
+                    found: format!("{}", args[0].ty()),
+                }),
             }),
         );
     }
@@ -828,8 +847,14 @@ impl ConstEvalContext {
     }
 
     /// Call a const function.
-    pub fn call_function(&self, name: &str, args: &[ConstValue]) -> Result<ConstValue, ConstEvalError> {
-        let func = self.functions.get(name)
+    pub fn call_function(
+        &self,
+        name: &str,
+        args: &[ConstValue],
+    ) -> Result<ConstValue, ConstEvalError> {
+        let func = self
+            .functions
+            .get(name)
             .ok_or_else(|| ConstEvalError::UnknownFunction(name.to_string()))?;
 
         if args.len() != func.arity {
@@ -925,7 +950,11 @@ impl fmt::Display for ConstEvalError {
                 write!(f, "unknown const function: {}", name)
             }
             ConstEvalError::ArityMismatch { expected, found } => {
-                write!(f, "arity mismatch: expected {} arguments, found {}", expected, found)
+                write!(
+                    f,
+                    "arity mismatch: expected {} arguments, found {}",
+                    expected, found
+                )
             }
             ConstEvalError::EvalError(msg) => write!(f, "evaluation error: {}", msg),
         }

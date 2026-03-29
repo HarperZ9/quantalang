@@ -17,18 +17,18 @@
 //! - Pattern nodes mirror expression structure where applicable
 
 mod expr;
-mod stmt;
 mod item;
-mod ty;
-mod pattern;
 mod operators;
+mod pattern;
+mod stmt;
+mod ty;
 
 pub use expr::*;
-pub use stmt::*;
 pub use item::*;
-pub use ty::*;
-pub use pattern::*;
 pub use operators::*;
+pub use pattern::*;
+pub use stmt::*;
+pub use ty::*;
 
 pub use crate::lexer::Span;
 use std::sync::Arc;
@@ -216,10 +216,7 @@ pub enum Visibility {
     /// Public to the parent module.
     Super(Span),
     /// Public to a specific path.
-    Restricted {
-        path: Path,
-        span: Span,
-    },
+    Restricted { path: Path, span: Span },
 }
 
 impl Visibility {
@@ -374,9 +371,7 @@ pub enum GenericParamKind {
         default: Option<Box<Type>>,
     },
     /// A lifetime parameter: `'a` or `'a: 'b`.
-    Lifetime {
-        bounds: Vec<Lifetime>,
-    },
+    Lifetime { bounds: Vec<Lifetime> },
     /// A const parameter: `const N: usize`.
     Const {
         ty: Box<Type>,

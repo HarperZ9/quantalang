@@ -8,11 +8,11 @@
 //!
 //! Items are top-level declarations: functions, structs, enums, traits, etc.
 
-use crate::lexer::Span;
 use super::{
-    Attribute, Block, Expr, Generics, Ident, Mutability, NodeId, Path, Pattern, Type,
-    TypeBound, Visibility,
+    Attribute, Block, Expr, Generics, Ident, Mutability, NodeId, Path, Pattern, Type, TypeBound,
+    Visibility,
 };
+use crate::lexer::Span;
 
 /// An item node.
 #[derive(Debug, Clone, PartialEq)]
@@ -438,17 +438,11 @@ pub struct UseTree {
 #[derive(Debug, Clone, PartialEq)]
 pub enum UseTreeKind {
     /// Simple path: `use std::io;`
-    Simple {
-        path: Path,
-        rename: Option<Ident>,
-    },
+    Simple { path: Path, rename: Option<Ident> },
     /// Glob: `use std::io::*;`
     Glob(Path),
     /// Nested: `use std::{io, fs};`
-    Nested {
-        path: Path,
-        trees: Vec<UseTree>,
-    },
+    Nested { path: Path, trees: Vec<UseTree> },
 }
 
 /// Extern crate.
@@ -498,10 +492,7 @@ pub enum ForeignItemKind {
         ty: Box<Type>,
     },
     /// Foreign type.
-    Type {
-        name: Ident,
-        bounds: Vec<TypeBound>,
-    },
+    Type { name: Ident, bounds: Vec<TypeBound> },
     /// Macro invocation.
     Macro {
         path: Path,

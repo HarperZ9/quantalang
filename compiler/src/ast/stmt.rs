@@ -8,8 +8,8 @@
 //!
 //! Statements are the building blocks of imperative code.
 
-use crate::lexer::Span;
 use super::{Attribute, Expr, Item, NodeId, Pattern, Type};
+use crate::lexer::Span;
 
 /// A statement node.
 #[derive(Debug, Clone, PartialEq)]

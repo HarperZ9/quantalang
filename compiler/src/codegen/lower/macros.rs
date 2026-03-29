@@ -12,11 +12,11 @@ use std::sync::Arc;
 
 use crate::ast::{self, ExprKind, StmtKind};
 
-use crate::codegen::ir::*;
-use crate::codegen::builder::{MirBuilder, values};
 use crate::codegen::backend::{CodegenError, CodegenResult};
+use crate::codegen::builder::{values, MirBuilder};
+use crate::codegen::ir::*;
 
-use super::{MirLowerer, IterChain, IterStep, IterTerminal};
+use super::{IterChain, IterStep, IterTerminal, MirLowerer};
 
 impl<'ctx> MirLowerer<'ctx> {
     // =========================================================================
@@ -49,9 +49,7 @@ impl<'ctx> MirLowerer<'ctx> {
     ) {
         match &expr.kind {
             ExprKind::Ident(ident) => {
-                if !param_names.contains(&ident.name)
-                    && !seen.contains(&ident.name)
-                {
+                if !param_names.contains(&ident.name) && !seen.contains(&ident.name) {
                     if let Some(&local_id) = env_vars.get(&ident.name) {
                         seen.insert(ident.name.clone());
                         found.push((ident.name.clone(), local_id));
@@ -84,11 +82,29 @@ impl<'ctx> MirLowerer<'ctx> {
                     Self::collect_free_vars_inner(a, param_names, env_vars, found, seen, source);
                 }
             }
-            ExprKind::If { condition, then_branch, else_branch } => {
-                Self::collect_free_vars_inner(condition, param_names, env_vars, found, seen, source);
+            ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                Self::collect_free_vars_inner(
+                    condition,
+                    param_names,
+                    env_vars,
+                    found,
+                    seen,
+                    source,
+                );
                 for stmt in &then_branch.stmts {
                     if let StmtKind::Expr(e) | StmtKind::Semi(e) = &stmt.kind {
-                        Self::collect_free_vars_inner(e, param_names, env_vars, found, seen, source);
+                        Self::collect_free_vars_inner(
+                            e,
+                            param_names,
+                            env_vars,
+                            found,
+                            seen,
+                            source,
+                        );
                     }
                 }
                 if let Some(e) = else_branch {
@@ -98,7 +114,14 @@ impl<'ctx> MirLowerer<'ctx> {
             ExprKind::Block(block) | ExprKind::Unsafe(block) => {
                 for stmt in &block.stmts {
                     if let StmtKind::Expr(e) | StmtKind::Semi(e) = &stmt.kind {
-                        Self::collect_free_vars_inner(e, param_names, env_vars, found, seen, source);
+                        Self::collect_free_vars_inner(
+                            e,
+                            param_names,
+                            env_vars,
+                            found,
+                            seen,
+                            source,
+                        );
                     }
                 }
             }
@@ -119,18 +142,46 @@ impl<'ctx> MirLowerer<'ctx> {
                 Self::collect_free_vars_inner(value, param_names, env_vars, found, seen, source);
             }
             ExprKind::Match { scrutinee, arms } => {
-                Self::collect_free_vars_inner(scrutinee, param_names, env_vars, found, seen, source);
+                Self::collect_free_vars_inner(
+                    scrutinee,
+                    param_names,
+                    env_vars,
+                    found,
+                    seen,
+                    source,
+                );
                 for arm in arms {
-                    Self::collect_free_vars_inner(&arm.body, param_names, env_vars, found, seen, source);
+                    Self::collect_free_vars_inner(
+                        &arm.body,
+                        param_names,
+                        env_vars,
+                        found,
+                        seen,
+                        source,
+                    );
                     if let Some(guard) = &arm.guard {
-                        Self::collect_free_vars_inner(guard, param_names, env_vars, found, seen, source);
+                        Self::collect_free_vars_inner(
+                            guard,
+                            param_names,
+                            env_vars,
+                            found,
+                            seen,
+                            source,
+                        );
                     }
                 }
             }
             ExprKind::Macro { tokens, .. } => {
                 // Scan token trees for identifiers
                 for tt in tokens {
-                    Self::collect_free_vars_in_token_tree(tt, param_names, env_vars, found, seen, source);
+                    Self::collect_free_vars_in_token_tree(
+                        tt,
+                        param_names,
+                        env_vars,
+                        found,
+                        seen,
+                        source,
+                    );
                 }
             }
             _ => {}
@@ -168,7 +219,14 @@ impl<'ctx> MirLowerer<'ctx> {
             }
             ast::TokenTree::Delimited { tokens, .. } => {
                 for inner in tokens {
-                    Self::collect_free_vars_in_token_tree(inner, param_names, env_vars, found, seen, source);
+                    Self::collect_free_vars_in_token_tree(
+                        inner,
+                        param_names,
+                        env_vars,
+                        found,
+                        seen,
+                        source,
+                    );
                 }
             }
         }
@@ -196,7 +254,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let closure_name: Arc<str> = Arc::from(format!("__closure_{}", closure_id));
 
         // ---- Detect captured variables (lambda lifting) ----
-        let param_names: HashSet<Arc<str>> = params.iter()
+        let param_names: HashSet<Arc<str>> = params
+            .iter()
             .filter_map(|p| {
                 if let ast::PatternKind::Ident { name, .. } = &p.pattern.kind {
                     Some(name.name.clone())
@@ -206,29 +265,31 @@ impl<'ctx> MirLowerer<'ctx> {
             })
             .collect();
 
-        let captures = Self::collect_free_vars(
-            body,
-            &param_names,
-            &self.var_map,
-            self.source.as_deref(),
-        );
+        let captures =
+            Self::collect_free_vars(body, &param_names, &self.var_map, self.source.as_deref());
 
         // ---- Build the MIR signature ----
         // Declared params first, then captured-variable params appended.
-        let mut mir_params: Vec<MirType> = params.iter().map(|p| {
-            p.ty.as_ref()
-                .map(|t| self.lower_type_from_ast(t))
-                .unwrap_or(MirType::i32())
-        }).collect();
+        let mut mir_params: Vec<MirType> = params
+            .iter()
+            .map(|p| {
+                p.ty.as_ref()
+                    .map(|t| self.lower_type_from_ast(t))
+                    .unwrap_or(MirType::i32())
+            })
+            .collect();
 
         // Resolve captured variable types from the enclosing builder.
-        let capture_types: Vec<MirType> = captures.iter().map(|(_name, local_id)| {
-            if let Some(ref builder) = self.current_fn {
-                builder.local_type(*local_id).unwrap_or(MirType::i32())
-            } else {
-                MirType::i32()
-            }
-        }).collect();
+        let capture_types: Vec<MirType> = captures
+            .iter()
+            .map(|(_name, local_id)| {
+                if let Some(ref builder) = self.current_fn {
+                    builder.local_type(*local_id).unwrap_or(MirType::i32())
+                } else {
+                    MirType::i32()
+                }
+            })
+            .collect();
 
         mir_params.extend(capture_types.iter().cloned());
 
@@ -240,7 +301,8 @@ impl<'ctx> MirLowerer<'ctx> {
         // The fn-ptr type must use the *full* parameter list (visible +
         // captured) so that the C declaration matches the call sites, which
         // append captured values as extra arguments.
-        let fn_ptr_ty = MirType::FnPtr(Box::new(MirFnSig::new(mir_params.clone(), mir_ret.clone())));
+        let fn_ptr_ty =
+            MirType::FnPtr(Box::new(MirFnSig::new(mir_params.clone(), mir_ret.clone())));
 
         // Save current function state
         let saved_fn = self.current_fn.take();
@@ -291,11 +353,15 @@ impl<'ctx> MirLowerer<'ctx> {
             self.closure_captures.insert(closure_name.clone(), captures);
         }
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function for closure".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function for closure".to_string()))?;
         let result = builder.create_local(fn_ptr_ty);
-        builder.assign(result, MirRValue::Use(MirValue::Function(closure_name.clone())));
+        builder.assign(
+            result,
+            MirRValue::Use(MirValue::Function(closure_name.clone())),
+        );
 
         // Track that this local holds the given closure so we can find
         // its captures later when calling through this local.
@@ -311,7 +377,8 @@ impl<'ctx> MirLowerer<'ctx> {
         _rest: Option<&ast::Expr>,
     ) -> CodegenResult<MirValue> {
         // Lower all field values FIRST before borrowing the builder.
-        let field_vals: Vec<_> = fields.iter()
+        let field_vals: Vec<_> = fields
+            .iter()
             .map(|f| {
                 if let Some(val) = &f.value {
                     self.lower_expr(val)
@@ -322,7 +389,8 @@ impl<'ctx> MirLowerer<'ctx> {
             })
             .collect::<CodegenResult<_>>()?;
 
-        let mut raw_name = path.last_ident()
+        let mut raw_name = path
+            .last_ident()
             .map(|i| i.name.clone())
             .unwrap_or(Arc::from(""));
 
@@ -349,21 +417,25 @@ impl<'ctx> MirLowerer<'ctx> {
             if !generic_args.is_empty() {
                 let empty_subst = HashMap::new();
                 let subst = self.resolve_generic_args_with_subst(
-                    raw_name.as_ref(), generic_args, &empty_subst,
+                    raw_name.as_ref(),
+                    generic_args,
+                    &empty_subst,
                 );
                 self.monomorphize_struct(raw_name.as_ref(), &subst)?
             } else {
                 // Infer generic params from field values
-                let subst = self.infer_struct_generics_from_fields(raw_name.as_ref(), &field_vals, fields);
+                let subst =
+                    self.infer_struct_generics_from_fields(raw_name.as_ref(), &field_vals, fields);
                 self.monomorphize_struct(raw_name.as_ref(), &subst)?
             }
         } else {
             raw_name
         };
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
         let result = builder.create_local(MirType::Struct(struct_name.clone()));
         builder.aggregate(result, AggregateKind::Struct(struct_name), field_vals);
 
@@ -386,7 +458,10 @@ impl<'ctx> MirLowerer<'ctx> {
         };
 
         // Get type parameter names
-        let type_param_names: Vec<Arc<str>> = struct_def.generics.params.iter()
+        let type_param_names: Vec<Arc<str>> = struct_def
+            .generics
+            .params
+            .iter()
             .filter_map(|p| match &p.kind {
                 ast::GenericParamKind::Type { .. } => Some(p.ident.name.clone()),
                 _ => None,
@@ -452,10 +527,10 @@ impl<'ctx> MirLowerer<'ctx> {
     /// range starting at 100 so they never collide with the built-in set.
     fn effect_id(effect_name: &str) -> i32 {
         match effect_name {
-            "IO"     => 1,
-            "Error"  => 2,
-            "Async"  => 3,
-            "State"  => 4,
+            "IO" => 1,
+            "Error" => 2,
+            "Async" => 3,
+            "State" => 4,
             "NonDet" => 5,
             _ => {
                 // Hash the name for user-defined effects
@@ -511,16 +586,19 @@ impl<'ctx> MirLowerer<'ctx> {
         body: &ast::Block,
     ) -> CodegenResult<MirValue> {
         // Resolve the effect name and its integer ID.
-        let effect_name = effect.segments.iter()
+        let effect_name = effect
+            .segments
+            .iter()
             .map(|s| s.ident.name.as_ref())
             .collect::<Vec<_>>()
             .join("::");
         let eid = Self::effect_id(&effect_name);
 
         // --- Allocate locals ---------------------------------------------------
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         // The handler struct is opaque at the MIR level; the C backend will emit
         // a `QuantaHandler` declaration for it.  We represent it as an i8 array
@@ -537,15 +615,19 @@ impl<'ctx> MirLowerer<'ctx> {
         let handle_result = builder.create_local(MirType::i32());
 
         // --- Create blocks ------------------------------------------------------
-        let push_block  = builder.create_labeled_block("effect_push");
-        let body_block  = builder.create_labeled_block("effect_body");
+        let push_block = builder.create_labeled_block("effect_push");
+        let body_block = builder.create_labeled_block("effect_body");
         let merge_block = builder.create_labeled_block("effect_merge");
 
         // Create a block for each handler clause.
-        let handler_blocks: Vec<BlockId> = handlers.iter().enumerate().map(|(i, _)| {
-            let builder = self.current_fn.as_mut().unwrap();
-            builder.create_labeled_block(format!("effect_handler_{}", i))
-        }).collect();
+        let handler_blocks: Vec<BlockId> = handlers
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let builder = self.current_fn.as_mut().unwrap();
+                builder.create_labeled_block(format!("effect_handler_{}", i))
+            })
+            .collect();
 
         // --- Emit: push handler -------------------------------------------------
         {
@@ -556,16 +638,24 @@ impl<'ctx> MirLowerer<'ctx> {
             // quanta_push_handler(&handler, effect_id)
             let push_fn = MirValue::Function(Arc::from("quanta_push_handler"));
             // Take address of the handler struct so the C call gets a pointer.
-            let handler_ptr_local = builder.create_local(
-                MirType::Ptr(Box::new(MirType::Struct(Arc::from("QuantaHandler")))),
+            let handler_ptr_local = builder.create_local(MirType::Ptr(Box::new(MirType::Struct(
+                Arc::from("QuantaHandler"),
+            ))));
+            builder.assign(
+                handler_ptr_local,
+                MirRValue::AddressOf {
+                    is_mut: true,
+                    place: MirPlace::local(handler_local),
+                },
             );
-            builder.assign(handler_ptr_local, MirRValue::AddressOf {
-                is_mut: true,
-                place: MirPlace::local(handler_local),
-            });
             let eid_val = MirValue::Const(MirConst::Int(eid as i128, MirType::i32()));
             let cont = builder.create_block();
-            builder.call(push_fn, vec![MirValue::Local(handler_ptr_local), eid_val], None, cont);
+            builder.call(
+                push_fn,
+                vec![MirValue::Local(handler_ptr_local), eid_val],
+                None,
+                cont,
+            );
             builder.switch_to_block(cont);
 
             // setjmp(handler.env) — pass the handler local directly;
@@ -573,7 +663,12 @@ impl<'ctx> MirLowerer<'ctx> {
             // with a QuantaHandler-typed argument.
             let setjmp_fn = MirValue::Function(Arc::from("setjmp"));
             let cont2 = builder.create_block();
-            builder.call(setjmp_fn, vec![MirValue::Local(handler_local)], Some(setjmp_result), cont2);
+            builder.call(
+                setjmp_fn,
+                vec![MirValue::Local(handler_local)],
+                Some(setjmp_result),
+                cont2,
+            );
             builder.switch_to_block(cont2);
 
             // Branch: if setjmp_result == 0 -> body, else dispatch
@@ -598,9 +693,11 @@ impl<'ctx> MirLowerer<'ctx> {
                 builder.branch(MirValue::Local(is_normal), body_block, dispatch_block);
 
                 builder.switch_to_block(dispatch_block);
-                let targets: Vec<(MirConst, BlockId)> = handler_blocks.iter().enumerate().map(|(i, &blk)| {
-                    (MirConst::Int((i as i128) + 1, MirType::i32()), blk)
-                }).collect();
+                let targets: Vec<(MirConst, BlockId)> = handler_blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &blk)| (MirConst::Int((i as i128) + 1, MirType::i32()), blk))
+                    .collect();
                 builder.switch(MirValue::Local(setjmp_result), targets, merge_block);
             }
         }
@@ -644,7 +741,9 @@ impl<'ctx> MirLowerer<'ctx> {
                     // otherwise look up the effect operation's parameter types
                     // from the collected effect definitions.
                     let op_name = handler.operation.name.as_ref();
-                    let ty = param.ty.as_ref()
+                    let ty = param
+                        .ty
+                        .as_ref()
                         .map(|t| self.lower_type_from_ast(t))
                         .unwrap_or_else(|| {
                             self.lookup_effect_param_type(&effect_name, op_name, param_idx)
@@ -762,9 +861,10 @@ impl<'ctx> MirLowerer<'ctx> {
         // Compute the argument type before borrowing current_fn mutably.
         let arg_ty = self.type_of_value(&arg_val);
 
-        let builder = self.current_fn.as_mut().ok_or_else(|| {
-            CodegenError::Internal("No current function".to_string())
-        })?;
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
         // Allocate a result slot on the stack.  Use an unnamed local to
         // avoid duplicate C declarations when perform is called multiple
@@ -777,25 +877,36 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // Take address of arg and result for the void* parameters.
         let arg_ptr = builder.create_local(MirType::Ptr(Box::new(arg_ty)));
-        builder.assign(arg_ptr, MirRValue::AddressOf {
-            is_mut: false,
-            place: MirPlace::local(arg_local),
-        });
+        builder.assign(
+            arg_ptr,
+            MirRValue::AddressOf {
+                is_mut: false,
+                place: MirPlace::local(arg_local),
+            },
+        );
         let result_ptr = builder.create_local(MirType::Ptr(Box::new(MirType::i32())));
-        builder.assign(result_ptr, MirRValue::AddressOf {
-            is_mut: true,
-            place: MirPlace::local(result_local),
-        });
+        builder.assign(
+            result_ptr,
+            MirRValue::AddressOf {
+                is_mut: true,
+                place: MirPlace::local(result_local),
+            },
+        );
 
         // quanta_perform(effect_id, op_id, &arg, &result)
         let perform_fn = MirValue::Function(Arc::from("quanta_perform"));
         let eid_val = MirValue::Const(MirConst::Int(eid as i128, MirType::i32()));
-        let op_val  = MirValue::Const(MirConst::Int(op_id as i128, MirType::i32()));
+        let op_val = MirValue::Const(MirConst::Int(op_id as i128, MirType::i32()));
 
         let cont = builder.create_block();
         builder.call(
             perform_fn,
-            vec![eid_val, op_val, MirValue::Local(arg_ptr), MirValue::Local(result_ptr)],
+            vec![
+                eid_val,
+                op_val,
+                MirValue::Local(arg_ptr),
+                MirValue::Local(result_ptr),
+            ],
             None,
             cont,
         );
@@ -829,9 +940,10 @@ impl<'ctx> MirLowerer<'ctx> {
             // vec![] with no args -- create empty i32 vec
             let new_fn = MirValue::Function(Arc::from("quanta_hvec_new_i32"));
             let vec_ty = MirType::Vec(Box::new(MirType::i32()));
-            let builder = self.current_fn.as_mut().ok_or_else(|| {
-                CodegenError::Internal("No current function".to_string())
-            })?;
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
             let vec_local = builder.create_local(vec_ty);
             let cont = builder.create_block();
             builder.call(new_fn, vec![], Some(vec_local), cont);
@@ -856,9 +968,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
             // Create the vec
             let new_fn = MirValue::Function(Arc::from(new_fn_name));
-            let builder = self.current_fn.as_mut().ok_or_else(|| {
-                CodegenError::Internal("No current function".to_string())
-            })?;
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
             let vec_local = builder.create_local(vec_ty);
             let cont = builder.create_block();
             builder.call(new_fn, vec![], Some(vec_local), cont);
@@ -873,7 +986,10 @@ impl<'ctx> MirLowerer<'ctx> {
             let i_local = {
                 let builder = self.current_fn.as_mut().unwrap();
                 let i = builder.create_local(MirType::i64());
-                builder.assign(i, MirRValue::Use(MirValue::Const(MirConst::Int(0, MirType::i64()))));
+                builder.assign(
+                    i,
+                    MirRValue::Use(MirValue::Const(MirConst::Int(0, MirType::i64()))),
+                );
                 i
             };
 
@@ -897,11 +1013,14 @@ impl<'ctx> MirLowerer<'ctx> {
             let cond = {
                 let builder = self.current_fn.as_mut().unwrap();
                 let cond = builder.create_local(MirType::Bool);
-                builder.assign(cond, MirRValue::BinaryOp {
-                    op: BinOp::Lt,
-                    left: MirValue::Local(i_local),
-                    right: count_val.clone(),
-                });
+                builder.assign(
+                    cond,
+                    MirRValue::BinaryOp {
+                        op: BinOp::Lt,
+                        left: MirValue::Local(i_local),
+                        right: count_val.clone(),
+                    },
+                );
                 cond
             };
 
@@ -925,11 +1044,14 @@ impl<'ctx> MirLowerer<'ctx> {
             {
                 let builder = self.current_fn.as_mut().unwrap();
                 let incremented = builder.create_local(MirType::i64());
-                builder.assign(incremented, MirRValue::BinaryOp {
-                    op: BinOp::Add,
-                    left: MirValue::Local(i_local),
-                    right: MirValue::Const(MirConst::Int(1, MirType::i64())),
-                });
+                builder.assign(
+                    incremented,
+                    MirRValue::BinaryOp {
+                        op: BinOp::Add,
+                        left: MirValue::Local(i_local),
+                        right: MirValue::Const(MirConst::Int(1, MirType::i64())),
+                    },
+                );
                 builder.assign(i_local, MirRValue::Use(MirValue::Local(incremented)));
                 builder.goto(loop_header);
             }
@@ -951,9 +1073,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
             // Create the vec
             let new_fn = MirValue::Function(Arc::from(new_fn_name));
-            let builder = self.current_fn.as_mut().ok_or_else(|| {
-                CodegenError::Internal("No current function".to_string())
-            })?;
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
             let vec_local = builder.create_local(vec_ty);
             let cont = builder.create_block();
             builder.call(new_fn, vec![], Some(vec_local), cont);
@@ -964,7 +1087,12 @@ impl<'ctx> MirLowerer<'ctx> {
             {
                 let builder = self.current_fn.as_mut().unwrap();
                 let cont2 = builder.create_block();
-                builder.call(push_fn_val, vec![MirValue::Local(vec_local), first_val], None, cont2);
+                builder.call(
+                    push_fn_val,
+                    vec![MirValue::Local(vec_local), first_val],
+                    None,
+                    cont2,
+                );
                 builder.switch_to_block(cont2);
             }
 
@@ -974,7 +1102,12 @@ impl<'ctx> MirLowerer<'ctx> {
                 let push_fn_val = MirValue::Function(Arc::from(push_fn_name));
                 let builder = self.current_fn.as_mut().unwrap();
                 let cont2 = builder.create_block();
-                builder.call(push_fn_val, vec![MirValue::Local(vec_local), val], None, cont2);
+                builder.call(
+                    push_fn_val,
+                    vec![MirValue::Local(vec_local), val],
+                    None,
+                    cont2,
+                );
                 builder.switch_to_block(cont2);
             }
 
@@ -1002,7 +1135,7 @@ impl<'ctx> MirLowerer<'ctx> {
     /// Extract all argument source texts from vec! macro tokens.
     /// Unlike print macros, vec! has no format string to skip.
     fn extract_vec_macro_args(&self, tokens: &[ast::TokenTree]) -> Vec<String> {
-        use crate::lexer::{TokenKind, Delimiter};
+        use crate::lexer::{Delimiter, TokenKind};
 
         let source = match self.source {
             Some(ref s) => s,
@@ -1010,7 +1143,8 @@ impl<'ctx> MirLowerer<'ctx> {
         };
 
         // Flatten delimited groups
-        let flat: Vec<&ast::TokenTree> = tokens.iter()
+        let flat: Vec<&ast::TokenTree> = tokens
+            .iter()
             .flat_map(|t| match t {
                 ast::TokenTree::Delimited { tokens: inner, .. } => inner.iter().collect::<Vec<_>>(),
                 other => vec![other],
@@ -1030,22 +1164,34 @@ impl<'ctx> MirLowerer<'ctx> {
                         paren_depth += 1;
                         let s = tok.span.start.to_usize();
                         let e = tok.span.end.to_usize();
-                        if current_arg_start.is_none() { current_arg_start = Some(s); }
-                        if e > current_arg_end { current_arg_end = e; }
+                        if current_arg_start.is_none() {
+                            current_arg_start = Some(s);
+                        }
+                        if e > current_arg_end {
+                            current_arg_end = e;
+                        }
                     }
                     TokenKind::CloseDelim(Delimiter::Paren)
                     | TokenKind::CloseDelim(Delimiter::Bracket) => {
                         paren_depth -= 1;
                         let s = tok.span.start.to_usize();
                         let e = tok.span.end.to_usize();
-                        if current_arg_start.is_none() { current_arg_start = Some(s); }
-                        if e > current_arg_end { current_arg_end = e; }
+                        if current_arg_start.is_none() {
+                            current_arg_start = Some(s);
+                        }
+                        if e > current_arg_end {
+                            current_arg_end = e;
+                        }
                     }
                     TokenKind::Comma if paren_depth == 0 => {
                         // Top-level comma: flush current argument
                         if let Some(start) = current_arg_start {
                             if current_arg_end > start && current_arg_end <= source.len() {
-                                let text = source.get(start..current_arg_end).unwrap_or("").trim().to_string();
+                                let text = source
+                                    .get(start..current_arg_end)
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string();
                                 if !text.is_empty() {
                                     args.push(text);
                                 }
@@ -1058,7 +1204,11 @@ impl<'ctx> MirLowerer<'ctx> {
                         // Semicolon in vec![val; count] -- treat like comma
                         if let Some(start) = current_arg_start {
                             if current_arg_end > start && current_arg_end <= source.len() {
-                                let text = source.get(start..current_arg_end).unwrap_or("").trim().to_string();
+                                let text = source
+                                    .get(start..current_arg_end)
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string();
                                 if !text.is_empty() {
                                     args.push(text);
                                 }
@@ -1070,8 +1220,12 @@ impl<'ctx> MirLowerer<'ctx> {
                     _ => {
                         let s = tok.span.start.to_usize();
                         let e = tok.span.end.to_usize();
-                        if current_arg_start.is_none() { current_arg_start = Some(s); }
-                        if e > current_arg_end { current_arg_end = e; }
+                        if current_arg_start.is_none() {
+                            current_arg_start = Some(s);
+                        }
+                        if e > current_arg_end {
+                            current_arg_end = e;
+                        }
                     }
                 }
             }
@@ -1080,7 +1234,11 @@ impl<'ctx> MirLowerer<'ctx> {
         // Flush remaining
         if let Some(start) = current_arg_start {
             if current_arg_end > start && current_arg_end <= source.len() {
-                let text = source.get(start..current_arg_end).unwrap_or("").trim().to_string();
+                let text = source
+                    .get(start..current_arg_end)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
                 if !text.is_empty() {
                     args.push(text);
                 }
@@ -1093,9 +1251,10 @@ impl<'ctx> MirLowerer<'ctx> {
     /// Detect whether the token stream contains a semicolon at the top level,
     /// indicating the `vec![val; count]` repeat syntax.
     fn detect_vec_repeat_syntax(&self, tokens: &[ast::TokenTree]) -> bool {
-        use crate::lexer::{TokenKind, Delimiter};
+        use crate::lexer::{Delimiter, TokenKind};
 
-        let flat: Vec<&ast::TokenTree> = tokens.iter()
+        let flat: Vec<&ast::TokenTree> = tokens
+            .iter()
             .flat_map(|t| match t {
                 ast::TokenTree::Delimited { tokens: inner, .. } => inner.iter().collect::<Vec<_>>(),
                 other => vec![other],
@@ -1118,7 +1277,11 @@ impl<'ctx> MirLowerer<'ctx> {
         false
     }
 
-    pub(crate) fn lower_print_macro(&mut self, tokens: &[ast::TokenTree], newline: bool) -> CodegenResult<()> {
+    pub(crate) fn lower_print_macro(
+        &mut self,
+        tokens: &[ast::TokenTree],
+        newline: bool,
+    ) -> CodegenResult<()> {
         // Extract the format string from the macro tokens.
         let format_str = self.extract_string_from_tokens(tokens);
 
@@ -1139,13 +1302,17 @@ impl<'ctx> MirLowerer<'ctx> {
                     if let MirType::Struct(ref name) = ty {
                         if name.as_ref() == "QuantaString" {
                             let builder = self.current_fn.as_mut().unwrap();
-                            let ptr_local = builder.create_local(MirType::Ptr(Box::new(MirType::i8())));
+                            let ptr_local =
+                                builder.create_local(MirType::Ptr(Box::new(MirType::i8())));
                             if let MirValue::Local(local_id) = val {
-                                builder.assign(ptr_local, MirRValue::FieldAccess {
-                                    base: MirValue::Local(local_id),
-                                    field_name: Arc::from("ptr"),
-                                    field_ty: MirType::Ptr(Box::new(MirType::i8())),
-                                });
+                                builder.assign(
+                                    ptr_local,
+                                    MirRValue::FieldAccess {
+                                        base: MirValue::Local(local_id),
+                                        field_name: Arc::from("ptr"),
+                                        field_ty: MirType::Ptr(Box::new(MirType::i8())),
+                                    },
+                                );
                             }
                             arg_types.push(Some(MirType::Ptr(Box::new(MirType::i8()))));
                             arg_values.push(MirValue::Local(ptr_local));
@@ -1159,7 +1326,9 @@ impl<'ctx> MirLowerer<'ctx> {
                     // Fallback: try the old identifier-based lookup
                     let arg_name = arg_src.trim();
                     if let Some(&local_id) = self.var_map.get(arg_name) {
-                        let local_ty = self.current_fn.as_ref()
+                        let local_ty = self
+                            .current_fn
+                            .as_ref()
                             .and_then(|b| b.local_type(local_id));
                         arg_types.push(local_ty);
                         arg_values.push(MirValue::Local(local_id));
@@ -1248,16 +1417,19 @@ impl<'ctx> MirLowerer<'ctx> {
         let str_idx = self.module.intern_string(c_fmt);
 
         // Trim arg_values to the number of placeholders we actually found.
-        let arg_values: Vec<MirValue> = arg_values.into_iter()
-            .take(placeholder_count)
-            .collect();
+        let arg_values: Vec<MirValue> = arg_values.into_iter().take(placeholder_count).collect();
 
-        let builder = self.current_fn.as_mut()
+        let builder = self
+            .current_fn
+            .as_mut()
             .ok_or_else(|| CodegenError::Internal("No current function for macro".into()))?;
 
         // Create a local for the format string pointer
         let fmt_local = builder.create_local(MirType::Ptr(Box::new(MirType::i8())));
-        builder.assign(fmt_local, MirRValue::Use(MirValue::Const(MirConst::Str(str_idx))));
+        builder.assign(
+            fmt_local,
+            MirRValue::Use(MirValue::Const(MirConst::Str(str_idx))),
+        );
 
         // Create a continuation block for after the call
         let continue_block = builder.create_block();
@@ -1279,7 +1451,7 @@ impl<'ctx> MirLowerer<'ctx> {
     /// per argument.  Uses token spans to find comma-separated argument
     /// boundaries in the original source.
     fn extract_arg_source_texts(&self, tokens: &[ast::TokenTree]) -> Vec<String> {
-        use crate::lexer::{TokenKind, Delimiter};
+        use crate::lexer::{Delimiter, TokenKind};
 
         let source = match self.source {
             Some(ref s) => s,
@@ -1288,7 +1460,8 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // Flatten delimited groups to get a flat list of tokens (the macro
         // parser emits flat token sequences, not nested Delimited nodes).
-        let flat: Vec<&ast::TokenTree> = tokens.iter()
+        let flat: Vec<&ast::TokenTree> = tokens
+            .iter()
             .flat_map(|t| match t {
                 ast::TokenTree::Delimited { tokens: inner, .. } => inner.iter().collect::<Vec<_>>(),
                 other => vec![other],
@@ -1322,22 +1495,34 @@ impl<'ctx> MirLowerer<'ctx> {
                         // Extend current arg span
                         let s = tok.span.start.to_usize();
                         let e = tok.span.end.to_usize();
-                        if current_arg_start.is_none() { current_arg_start = Some(s); }
-                        if e > current_arg_end { current_arg_end = e; }
+                        if current_arg_start.is_none() {
+                            current_arg_start = Some(s);
+                        }
+                        if e > current_arg_end {
+                            current_arg_end = e;
+                        }
                     }
                     TokenKind::CloseDelim(Delimiter::Paren)
                     | TokenKind::CloseDelim(Delimiter::Bracket) => {
                         paren_depth -= 1;
                         let s = tok.span.start.to_usize();
                         let e = tok.span.end.to_usize();
-                        if current_arg_start.is_none() { current_arg_start = Some(s); }
-                        if e > current_arg_end { current_arg_end = e; }
+                        if current_arg_start.is_none() {
+                            current_arg_start = Some(s);
+                        }
+                        if e > current_arg_end {
+                            current_arg_end = e;
+                        }
                     }
                     TokenKind::Comma if paren_depth == 0 => {
                         // Top-level comma: flush current argument
                         if let Some(start) = current_arg_start {
                             if current_arg_end > start && current_arg_end <= source.len() {
-                                let text = source.get(start..current_arg_end).unwrap_or("").trim().to_string();
+                                let text = source
+                                    .get(start..current_arg_end)
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string();
                                 if !text.is_empty() {
                                     args.push(text);
                                 }
@@ -1350,8 +1535,12 @@ impl<'ctx> MirLowerer<'ctx> {
                         // Extend current argument span
                         let s = tok.span.start.to_usize();
                         let e = tok.span.end.to_usize();
-                        if current_arg_start.is_none() { current_arg_start = Some(s); }
-                        if e > current_arg_end { current_arg_end = e; }
+                        if current_arg_start.is_none() {
+                            current_arg_start = Some(s);
+                        }
+                        if e > current_arg_end {
+                            current_arg_end = e;
+                        }
                     }
                 }
             }
@@ -1360,7 +1549,11 @@ impl<'ctx> MirLowerer<'ctx> {
         // Flush any remaining argument
         if let Some(start) = current_arg_start {
             if current_arg_end > start && current_arg_end <= source.len() {
-                let text = source.get(start..current_arg_end).unwrap_or("").trim().to_string();
+                let text = source
+                    .get(start..current_arg_end)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
                 if !text.is_empty() {
                     args.push(text);
                 }
@@ -1406,9 +1599,7 @@ impl<'ctx> MirLowerer<'ctx> {
             }
             Some(MirType::Bool) => "%s".to_string(), // printed via ternary in C
             Some(MirType::Ptr(_)) => "%s".to_string(), // assume string pointer
-            Some(MirType::Struct(name)) if name.as_ref() == "QuantaString" => {
-                "%s".to_string()
-            }
+            Some(MirType::Struct(name)) if name.as_ref() == "QuantaString" => "%s".to_string(),
             _ => "%d".to_string(), // default for integers (most common)
         }
     }
@@ -1430,14 +1621,17 @@ impl<'ctx> MirLowerer<'ctx> {
             Some(MirType::Ptr(_)) => "str",
             Some(MirType::Struct(name)) => return name.to_string(),
             _ => "i32",
-        }.to_string()
+        }
+        .to_string()
     }
 
     pub(crate) fn lower_panic_macro(&mut self, tokens: &[ast::TokenTree]) -> CodegenResult<()> {
         // Print the panic message first
         self.lower_print_macro(tokens, true)?;
 
-        let builder = self.current_fn.as_mut()
+        let builder = self
+            .current_fn
+            .as_mut()
             .ok_or_else(|| CodegenError::Internal("No current function for macro".into()))?;
 
         // Call abort() after printing
@@ -1465,7 +1659,8 @@ impl<'ctx> MirLowerer<'ctx> {
                                 if start < source.len() && end <= source.len() && start < end {
                                     if let Some(raw) = source.get(start..end) {
                                         // Strip surrounding quotes
-                                        let content = raw.trim_start_matches('"').trim_end_matches('"');
+                                        let content =
+                                            raw.trim_start_matches('"').trim_end_matches('"');
                                         return content.to_string();
                                     }
                                 }
@@ -1494,7 +1689,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let mut current_arg = String::new();
 
         // Flatten delimited groups
-        let flat: Vec<&ast::TokenTree> = tokens.iter()
+        let flat: Vec<&ast::TokenTree> = tokens
+            .iter()
             .flat_map(|t| match t {
                 ast::TokenTree::Delimited { tokens: inner, .. } => inner.iter().collect::<Vec<_>>(),
                 other => vec![other],
@@ -1541,7 +1737,6 @@ impl<'ctx> MirLowerer<'ctx> {
         args
     }
 
-
     // =================================================================
     // Iterator chain lowering: .iter().map(|x| ...).collect() → loop
     // =================================================================
@@ -1558,12 +1753,10 @@ impl<'ctx> MirLowerer<'ctx> {
     ) -> Option<IterChain<'a>> {
         let terminal = match terminal_name {
             "collect" => IterTerminal::Collect,
-            "fold" if terminal_args.len() == 2 => {
-                IterTerminal::Fold {
-                    init: &terminal_args[0],
-                    closure: &terminal_args[1],
-                }
-            }
+            "fold" if terminal_args.len() == 2 => IterTerminal::Fold {
+                init: &terminal_args[0],
+                closure: &terminal_args[1],
+            },
             _ => return None,
         };
 
@@ -1573,7 +1766,12 @@ impl<'ctx> MirLowerer<'ctx> {
 
         loop {
             match &current.kind {
-                ExprKind::MethodCall { receiver, method, args, .. } => {
+                ExprKind::MethodCall {
+                    receiver,
+                    method,
+                    args,
+                    ..
+                } => {
                     let name = method.name.as_ref();
                     match name {
                         "iter" => {
@@ -1644,9 +1842,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // Store source in a local so we can reference it in the loop.
         let source_local = {
-            let builder = self.current_fn.as_mut().ok_or_else(|| {
-                CodegenError::Internal("No current function".to_string())
-            })?;
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
             let loc = builder.create_local(source_ty.clone());
             builder.assign(loc, MirRValue::Use(source_val));
             loc
@@ -1709,9 +1908,10 @@ impl<'ctx> MirLowerer<'ctx> {
         let idx_local = {
             let builder = self.current_fn.as_mut().unwrap();
             let idx = builder.create_local(MirType::i64());
-            builder.assign(idx, MirRValue::Use(
-                MirValue::Const(MirConst::Int(0, MirType::i64())),
-            ));
+            builder.assign(
+                idx,
+                MirRValue::Use(MirValue::Const(MirConst::Int(0, MirType::i64()))),
+            );
             idx
         };
 
@@ -1730,7 +1930,12 @@ impl<'ctx> MirLowerer<'ctx> {
         {
             let builder = self.current_fn.as_mut().unwrap();
             let cmp = builder.create_local(MirType::Bool);
-            builder.binary_op(cmp, BinOp::Lt, values::local(idx_local), values::local(len_local));
+            builder.binary_op(
+                cmp,
+                BinOp::Lt,
+                values::local(idx_local),
+                values::local(len_local),
+            );
             builder.branch(values::local(cmp), body_block, exit_block);
             builder.switch_to_block(body_block);
         }
@@ -1758,7 +1963,11 @@ impl<'ctx> MirLowerer<'ctx> {
                     current_val = self.lower_iter_map_inline(
                         closure,
                         current_val,
-                        if has_enumerate { Some(values::local(idx_local)) } else { None },
+                        if has_enumerate {
+                            Some(values::local(idx_local))
+                        } else {
+                            None
+                        },
                     )?;
                 }
                 IterStep::Enumerate => {
@@ -1787,11 +1996,8 @@ impl<'ctx> MirLowerer<'ctx> {
             }
             IterTerminal::Fold { closure, .. } => {
                 // Inline the fold closure: acc = closure(acc, current_val)
-                let new_acc = self.lower_iter_fold_inline(
-                    closure,
-                    values::local(result_local),
-                    current_val,
-                )?;
+                let new_acc =
+                    self.lower_iter_fold_inline(closure, values::local(result_local), current_val)?;
                 let builder = self.current_fn.as_mut().unwrap();
                 builder.assign(result_local, MirRValue::Use(new_acc));
             }
@@ -1803,7 +2009,9 @@ impl<'ctx> MirLowerer<'ctx> {
             builder.goto(incr_block);
             builder.switch_to_block(incr_block);
             let next_idx = builder.create_local(MirType::i64());
-            builder.binary_op(next_idx, BinOp::Add,
+            builder.binary_op(
+                next_idx,
+                BinOp::Add,
                 values::local(idx_local),
                 MirValue::Const(MirConst::Int(1, MirType::i64())),
             );
@@ -1844,7 +2052,9 @@ impl<'ctx> MirLowerer<'ctx> {
                     saved.push((name.name.clone(), old));
 
                     let idx_val = index_val.unwrap();
-                    let param_ty = params[0].ty.as_ref()
+                    let param_ty = params[0]
+                        .ty
+                        .as_ref()
                         .map(|t| self.lower_type_from_ast(t))
                         .unwrap_or(MirType::i64());
                     let builder = self.current_fn.as_mut().unwrap();
@@ -1856,7 +2066,9 @@ impl<'ctx> MirLowerer<'ctx> {
                     let old = self.var_map.get(&name.name).copied();
                     saved.push((name.name.clone(), old));
 
-                    let param_ty = params[1].ty.as_ref()
+                    let param_ty = params[1]
+                        .ty
+                        .as_ref()
                         .map(|t| self.lower_type_from_ast(t))
                         .unwrap_or(MirType::f64());
                     let builder = self.current_fn.as_mut().unwrap();
@@ -1870,7 +2082,9 @@ impl<'ctx> MirLowerer<'ctx> {
                     let old = self.var_map.get(&name.name).copied();
                     saved.push((name.name.clone(), old));
 
-                    let param_ty = first_param.ty.as_ref()
+                    let param_ty = first_param
+                        .ty
+                        .as_ref()
                         .map(|t| self.lower_type_from_ast(t))
                         .unwrap_or(MirType::f64());
                     let builder = self.current_fn.as_mut().unwrap();
@@ -1915,7 +2129,9 @@ impl<'ctx> MirLowerer<'ctx> {
                     let old = self.var_map.get(&name.name).copied();
                     saved.push((name.name.clone(), old));
 
-                    let param_ty = acc_param.ty.as_ref()
+                    let param_ty = acc_param
+                        .ty
+                        .as_ref()
                         .map(|t| self.lower_type_from_ast(t))
                         .unwrap_or(MirType::f64());
                     let builder = self.current_fn.as_mut().unwrap();
@@ -1931,7 +2147,9 @@ impl<'ctx> MirLowerer<'ctx> {
                     let old = self.var_map.get(&name.name).copied();
                     saved.push((name.name.clone(), old));
 
-                    let param_ty = params[1].ty.as_ref()
+                    let param_ty = params[1]
+                        .ty
+                        .as_ref()
                         .map(|t| self.lower_type_from_ast(t))
                         .unwrap_or(MirType::f64());
                     let builder = self.current_fn.as_mut().unwrap();
@@ -1962,16 +2180,18 @@ impl<'ctx> MirLowerer<'ctx> {
     /// use that.  For closures whose body is a simple identifier matching
     /// a parameter, use that parameter's annotated type.  Otherwise,
     /// propagate the input element type.
-    fn infer_chain_output_type(
-        &self,
-        input_ty: &MirType,
-        steps: &[IterStep<'_>],
-    ) -> MirType {
+    fn infer_chain_output_type(&self, input_ty: &MirType, steps: &[IterStep<'_>]) -> MirType {
         let mut ty = input_ty.clone();
         for step in steps {
             match step {
                 IterStep::Map { closure } => {
-                    if let ExprKind::Closure { return_type, params, body, .. } = &closure.kind {
+                    if let ExprKind::Closure {
+                        return_type,
+                        params,
+                        body,
+                        ..
+                    } = &closure.kind
+                    {
                         if let Some(ret_ty) = return_type {
                             ty = self.lower_type_from_ast(ret_ty);
                         } else {
@@ -1980,7 +2200,9 @@ impl<'ctx> MirLowerer<'ctx> {
                             // that parameter's type annotation.
                             if let ExprKind::Ident(body_ident) = &body.kind {
                                 for param in params {
-                                    if let ast::PatternKind::Ident { name, .. } = &param.pattern.kind {
+                                    if let ast::PatternKind::Ident { name, .. } =
+                                        &param.pattern.kind
+                                    {
                                         if name.name.as_ref() == body_ident.name.as_ref() {
                                             if let Some(pt) = &param.ty {
                                                 ty = self.lower_type_from_ast(pt);
@@ -2020,9 +2242,7 @@ impl<'ctx> MirLowerer<'ctx> {
             MirType::Int(IntSize::I64, _) | MirType::Int(IntSize::ISize, _) => {
                 ("quanta_hvec_get_i64", "quanta_hvec_len")
             }
-            _ => {
-                ("quanta_hvec_get_i32", "quanta_hvec_len")
-            }
+            _ => ("quanta_hvec_get_i32", "quanta_hvec_len"),
         }
     }
 }

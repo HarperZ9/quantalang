@@ -18,9 +18,9 @@
 //! - Macros
 //! - Effects (QuantaLang extension)
 
+use super::{ParseError, ParseErrorKind, ParseResult, Parser};
 use crate::ast::*;
 use crate::lexer::{Delimiter, Keyword, TokenKind};
-use super::{Parser, ParseResult, ParseError, ParseErrorKind};
 
 impl<'a> Parser<'a> {
     /// Parse an item.
@@ -43,15 +43,20 @@ impl<'a> Parser<'a> {
         // Only consume `default` if followed by fn/impl/type (not when used as identifier)
         let _is_default = if self.check_keyword(Keyword::Default) {
             let next = &self.peek().kind;
-            let is_modifier = matches!(next,
+            let is_modifier = matches!(
+                next,
                 TokenKind::Keyword(Keyword::Fn)
-                | TokenKind::Keyword(Keyword::Unsafe)
-                | TokenKind::Keyword(Keyword::Async)
-                | TokenKind::Keyword(Keyword::Const)
-                | TokenKind::Keyword(Keyword::Impl)
-                | TokenKind::Keyword(Keyword::Type)
+                    | TokenKind::Keyword(Keyword::Unsafe)
+                    | TokenKind::Keyword(Keyword::Async)
+                    | TokenKind::Keyword(Keyword::Const)
+                    | TokenKind::Keyword(Keyword::Impl)
+                    | TokenKind::Keyword(Keyword::Type)
             );
-            if is_modifier { self.eat_keyword(Keyword::Default) } else { false }
+            if is_modifier {
+                self.eat_keyword(Keyword::Default)
+            } else {
+                false
+            }
         } else {
             false
         };
@@ -429,8 +434,12 @@ impl<'a> Parser<'a> {
 
     /// Try to parse a self parameter (self, &self, &mut self, mut self).
     /// Returns None if the current position doesn't start a self parameter.
-    fn try_parse_self_param(&mut self, attrs: &[Attribute], start: Span) -> ParseResult<Option<Param>> {
-        use crate::ast::{Pattern, PatternKind, Mutability, Type, TypeKind, Path, PathSegment};
+    fn try_parse_self_param(
+        &mut self,
+        attrs: &[Attribute],
+        start: Span,
+    ) -> ParseResult<Option<Param>> {
+        use crate::ast::{Mutability, Path, PathSegment, Pattern, PatternKind, Type, TypeKind};
 
         // Check for &self or &mut self
         if self.check(&TokenKind::And) {
@@ -537,7 +546,9 @@ impl<'a> Parser<'a> {
         }
 
         // Check for mut self or mut self: Type
-        if self.check_keyword(Keyword::Mut) && self.peek().kind == TokenKind::Keyword(Keyword::Self_) {
+        if self.check_keyword(Keyword::Mut)
+            && self.peek().kind == TokenKind::Keyword(Keyword::Self_)
+        {
             self.advance(); // consume mut
             let self_span = self.current_span();
             self.advance(); // consume self
@@ -654,7 +665,11 @@ impl<'a> Parser<'a> {
             StructFields::Unit
         };
 
-        Ok(StructDef { name, generics, fields })
+        Ok(StructDef {
+            name,
+            generics,
+            fields,
+        })
     }
 
     /// Parse a struct field.
@@ -694,7 +709,12 @@ impl<'a> Parser<'a> {
         let ty = self.parse_type()?;
         let span = start.merge(&ty.span);
 
-        Ok(TupleFieldDef { vis, attrs, ty: Box::new(ty), span })
+        Ok(TupleFieldDef {
+            vis,
+            attrs,
+            ty: Box::new(ty),
+            span,
+        })
     }
 
     // =========================================================================
@@ -710,7 +730,11 @@ impl<'a> Parser<'a> {
 
         let (variants, _) = self.parse_brace_comma_seq(|p| p.parse_enum_variant())?;
 
-        Ok(EnumDef { name, generics, variants })
+        Ok(EnumDef {
+            name,
+            generics,
+            variants,
+        })
     }
 
     /// Parse an enum variant.
@@ -738,7 +762,13 @@ impl<'a> Parser<'a> {
 
         let span = start.merge(&self.tokens[self.pos.saturating_sub(1)].span);
 
-        Ok(EnumVariant { attrs, name, fields, discriminant, span })
+        Ok(EnumVariant {
+            attrs,
+            name,
+            fields,
+            discriminant,
+            span,
+        })
     }
 
     // =========================================================================
@@ -888,10 +918,7 @@ impl<'a> Parser<'a> {
             // This is `impl Trait for Type`
             let trait_path = match &ty.kind {
                 TypeKind::Path(p) => p.clone(),
-                _ => return Err(ParseError::new(
-                    ParseErrorKind::InvalidType,
-                    ty.span,
-                )),
+                _ => return Err(ParseError::new(ParseErrorKind::InvalidType, ty.span)),
             };
             let trait_ref = TraitRef {
                 path: trait_path,
@@ -942,18 +969,29 @@ impl<'a> Parser<'a> {
 
         let is_default = if self.check_keyword(Keyword::Default) {
             let next = &self.peek().kind;
-            if matches!(next, TokenKind::Keyword(Keyword::Fn) | TokenKind::Keyword(Keyword::Type)) {
+            if matches!(
+                next,
+                TokenKind::Keyword(Keyword::Fn) | TokenKind::Keyword(Keyword::Type)
+            ) {
                 self.eat_keyword(Keyword::Default)
-            } else { false }
-        } else { false };
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         // Only consume const as modifier if followed by fn (const fn)
         let is_const = if self.check_keyword(Keyword::Const) {
             let next = &self.peek().kind;
             if matches!(next, TokenKind::Keyword(Keyword::Fn)) {
                 self.eat_keyword(Keyword::Const)
-            } else { false }
-        } else { false };
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         let is_async = self.eat_keyword(Keyword::Async);
         let is_unsafe = self.eat_keyword(Keyword::Unsafe);
@@ -1035,7 +1073,12 @@ impl<'a> Parser<'a> {
 
         self.expect(&TokenKind::Semi)?;
 
-        Ok(TypeAliasDef { name, generics, bounds, ty })
+        Ok(TypeAliasDef {
+            name,
+            generics,
+            bounds,
+            ty,
+        })
     }
 
     // =========================================================================
@@ -1134,7 +1177,11 @@ impl<'a> Parser<'a> {
             None
         };
 
-        Ok(ModDef { name, content, is_unsafe })
+        Ok(ModDef {
+            name,
+            content,
+            is_unsafe,
+        })
     }
 
     /// Parse a `module` declaration (QuantaLang ecosystem convention).
@@ -1170,14 +1217,22 @@ impl<'a> Parser<'a> {
                 }
             }
             let brace_end = self.expect(&TokenKind::CloseDelim(Delimiter::Brace))?.span;
-            Some(ModContent { attrs, items, span: brace_start.merge(&brace_end) })
+            Some(ModContent {
+                attrs,
+                items,
+                span: brace_start.merge(&brace_end),
+            })
         } else {
             // Optional semicolon (ecosystem files often omit it)
             self.eat(&TokenKind::Semi);
             None
         };
 
-        Ok(ModDef { name, content, is_unsafe })
+        Ok(ModDef {
+            name,
+            content,
+            is_unsafe,
+        })
     }
 
     // =========================================================================
@@ -1450,7 +1505,11 @@ impl<'a> Parser<'a> {
 
         let span = start.merge(&self.tokens[self.pos.saturating_sub(1)].span);
 
-        Ok(MacroRule { pattern, body, span })
+        Ok(MacroRule {
+            pattern,
+            body,
+            span,
+        })
     }
 
     /// Parse a macro definition (macro 2.0).
@@ -1486,7 +1545,11 @@ impl<'a> Parser<'a> {
 
         self.expect(&TokenKind::CloseDelim(Delimiter::Brace))?;
 
-        Ok(EffectDef { name, generics, operations })
+        Ok(EffectDef {
+            name,
+            generics,
+            operations,
+        })
     }
 
     /// Parse an effect operation.
@@ -1619,8 +1682,9 @@ mod tests {
     #[test]
     fn impl_block() {
         let item = parse_item_str(
-            "impl Point { fn new(x: f64, y: f64) -> Point { Point { x: x, y: y } } }"
-        ).unwrap();
+            "impl Point { fn new(x: f64, y: f64) -> Point { Point { x: x, y: y } } }",
+        )
+        .unwrap();
         match &item.kind {
             ItemKind::Impl(imp) => {
                 assert!(imp.trait_ref.is_none(), "inherent impl has no trait ref");

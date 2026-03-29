@@ -9,9 +9,9 @@
 //! This module provides comprehensive error types with detailed information
 //! for producing high-quality error messages.
 
+use super::span::Span;
 use std::fmt;
 use thiserror::Error;
-use super::span::Span;
 
 /// Result type for lexer operations.
 pub type LexerResult<T> = Result<T, LexerError>;
@@ -65,7 +65,6 @@ pub enum LexerErrorKind {
     // =========================================================================
     // CHARACTER ERRORS
     // =========================================================================
-
     /// An unexpected character was encountered.
     #[error("unexpected character `{0}`")]
     UnexpectedChar(char),
@@ -77,7 +76,6 @@ pub enum LexerErrorKind {
     // =========================================================================
     // STRING ERRORS
     // =========================================================================
-
     /// A string literal was not terminated.
     #[error("unterminated string literal")]
     UnterminatedString,
@@ -108,7 +106,6 @@ pub enum LexerErrorKind {
     // =========================================================================
     // ESCAPE SEQUENCE ERRORS
     // =========================================================================
-
     /// An unknown escape sequence was found.
     #[error("unknown escape sequence `\\{0}`")]
     UnknownEscape(char),
@@ -148,7 +145,6 @@ pub enum LexerErrorKind {
     // =========================================================================
     // NUMBER ERRORS
     // =========================================================================
-
     /// An invalid numeric literal.
     #[error("invalid numeric literal")]
     InvalidNumber,
@@ -204,7 +200,6 @@ pub enum LexerErrorKind {
     // =========================================================================
     // COMMENT ERRORS
     // =========================================================================
-
     /// A block comment was not terminated.
     #[error("unterminated block comment")]
     UnterminatedBlockComment {
@@ -219,7 +214,6 @@ pub enum LexerErrorKind {
     // =========================================================================
     // IDENTIFIER ERRORS
     // =========================================================================
-
     /// Invalid identifier character.
     #[error("invalid character `{0}` in identifier")]
     InvalidIdentChar(char),
@@ -235,7 +229,6 @@ pub enum LexerErrorKind {
     // =========================================================================
     // LIFETIME ERRORS
     // =========================================================================
-
     /// Lifetime must be followed by identifier.
     #[error("expected lifetime name after `'`")]
     ExpectedLifetime,
@@ -247,7 +240,6 @@ pub enum LexerErrorKind {
     // =========================================================================
     // DSL ERRORS
     // =========================================================================
-
     /// DSL block delimiter mismatch.
     #[error("mismatched DSL block delimiters")]
     MismatchedDslDelimiters,
@@ -259,7 +251,6 @@ pub enum LexerErrorKind {
     // =========================================================================
     // FORMAT STRING ERRORS
     // =========================================================================
-
     /// Format string was not terminated.
     #[error("unterminated format string literal")]
     UnterminatedFormatString,
@@ -283,7 +274,6 @@ pub enum LexerErrorKind {
     // =========================================================================
     // SHEBANG ERRORS
     // =========================================================================
-
     /// Shebang not at start of file.
     #[error("shebang must be at the start of the file")]
     ShebangNotAtStart,
@@ -291,7 +281,6 @@ pub enum LexerErrorKind {
     // =========================================================================
     // ENCODING ERRORS
     // =========================================================================
-
     /// Invalid UTF-8 sequence.
     #[error("invalid UTF-8 sequence")]
     InvalidUtf8,
@@ -307,7 +296,6 @@ pub enum LexerErrorKind {
     // =========================================================================
     // INTERNAL ERRORS
     // =========================================================================
-
     /// Internal lexer error (should not occur).
     #[error("internal lexer error: {0}")]
     Internal(String),
@@ -329,18 +317,16 @@ impl LexerErrorKind {
             LexerErrorKind::MultipleCharsInCharLiteral => {
                 Some("consider using a string literal instead")
             }
-            LexerErrorKind::UnknownEscape(_) => {
-                Some("valid escape sequences: \\n, \\r, \\t, \\\\, \\', \\\", \\0, \\xNN, \\u{NNNN}")
-            }
+            LexerErrorKind::UnknownEscape(_) => Some(
+                "valid escape sequences: \\n, \\r, \\t, \\\\, \\', \\\", \\0, \\xNN, \\u{NNNN}",
+            ),
             LexerErrorKind::UnicodeEscapeMissingBrace => {
                 Some("Unicode escapes use the format \\u{NNNN}")
             }
             LexerErrorKind::EmptyExponent => {
                 Some("add digits after the exponent marker (e.g., `1e10` or `1e-5`)")
             }
-            LexerErrorKind::NoDigitsAfterPrefix(_) => {
-                Some("add digits after the radix prefix")
-            }
+            LexerErrorKind::NoDigitsAfterPrefix(_) => Some("add digits after the radix prefix"),
             LexerErrorKind::LeadingUnderscore => {
                 Some("remove the leading underscore or use an identifier")
             }
@@ -435,20 +421,14 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let err = LexerError::new(
-            LexerErrorKind::UnexpectedChar('$'),
-            Span::dummy(),
-        );
+        let err = LexerError::new(LexerErrorKind::UnexpectedChar('$'), Span::dummy());
         assert!(err.to_string().contains("unexpected character"));
     }
 
     #[test]
     fn test_error_with_help() {
-        let err = LexerError::new(
-            LexerErrorKind::UnterminatedString,
-            Span::dummy(),
-        )
-        .with_help("add a closing quote");
+        let err = LexerError::new(LexerErrorKind::UnterminatedString, Span::dummy())
+            .with_help("add a closing quote");
 
         assert!(err.help.is_some());
         assert!(err.to_string().contains("help"));

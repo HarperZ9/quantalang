@@ -1403,19 +1403,19 @@ static double Rectangle_area(Rectangle self);
 static int32_t Rectangle_name(Rectangle self);
 int32_t main(int argc, char** argv);
 
-static double __vtable_wrap_Circle_Shape_area(void* __self) { return Circle_area((*(Circle*)__self)); }
-static int32_t __vtable_wrap_Circle_Shape_name(void* __self) { return Circle_name((*(Circle*)__self)); }
 static double __vtable_wrap_Rectangle_Shape_area(void* __self) { return Rectangle_area((*(Rectangle*)__self)); }
 static int32_t __vtable_wrap_Rectangle_Shape_name(void* __self) { return Rectangle_name((*(Rectangle*)__self)); }
-
-static Shape_vtable Circle_Shape_vtable_instance = {
-    .area = (double (*)(void*))__vtable_wrap_Circle_Shape_area,
-    .name = (int32_t (*)(void*))__vtable_wrap_Circle_Shape_name,
-};
+static double __vtable_wrap_Circle_Shape_area(void* __self) { return Circle_area((*(Circle*)__self)); }
+static int32_t __vtable_wrap_Circle_Shape_name(void* __self) { return Circle_name((*(Circle*)__self)); }
 
 static Shape_vtable Rectangle_Shape_vtable_instance = {
     .area = (double (*)(void*))__vtable_wrap_Rectangle_Shape_area,
     .name = (int32_t (*)(void*))__vtable_wrap_Rectangle_Shape_name,
+};
+
+static Shape_vtable Circle_Shape_vtable_instance = {
+    .area = (double (*)(void*))__vtable_wrap_Circle_Shape_area,
+    .name = (int32_t (*)(void*))__vtable_wrap_Circle_Shape_name,
 };
 
 static double Circle_area(Circle self) {

@@ -61,19 +61,19 @@ impl CallingConvention {
     /// Get the LLVM calling convention ID.
     pub fn llvm_cc(&self) -> u32 {
         match self {
-            CallingConvention::C => 0,          // ccc
-            CallingConvention::Fastcall => 65,  // x86_fastcallcc
-            CallingConvention::Stdcall => 64,   // x86_stdcallcc
-            CallingConvention::Thiscall => 70,  // x86_thiscallcc
+            CallingConvention::C => 0,           // ccc
+            CallingConvention::Fastcall => 65,   // x86_fastcallcc
+            CallingConvention::Stdcall => 64,    // x86_stdcallcc
+            CallingConvention::Thiscall => 70,   // x86_thiscallcc
             CallingConvention::Vectorcall => 80, // x86_vectorcallcc
-            CallingConvention::Win64 => 79,     // win64cc
-            CallingConvention::SysV64 => 78,    // x86_64_sysvcc
-            CallingConvention::Aapcs => 67,     // aapcscc
-            CallingConvention::AArch64 => 0,    // ccc (default for AArch64)
-            CallingConvention::Wasm => 0,       // ccc
-            CallingConvention::System => 0,     // platform default
-            CallingConvention::Rust => 0,       // no stable ABI
-            CallingConvention::Quanta => 0,     // internal
+            CallingConvention::Win64 => 79,      // win64cc
+            CallingConvention::SysV64 => 78,     // x86_64_sysvcc
+            CallingConvention::Aapcs => 67,      // aapcscc
+            CallingConvention::AArch64 => 0,     // ccc (default for AArch64)
+            CallingConvention::Wasm => 0,        // ccc
+            CallingConvention::System => 0,      // platform default
+            CallingConvention::Rust => 0,        // no stable ABI
+            CallingConvention::Quanta => 0,      // internal
         }
     }
 
@@ -224,10 +224,14 @@ impl CType {
                     Some(4)
                 }
             }
-            CType::LongLong | CType::ULongLong | CType::Int64 | CType::UInt64 | CType::Double => Some(8),
+            CType::LongLong | CType::ULongLong | CType::Int64 | CType::UInt64 | CType::Double => {
+                Some(8)
+            }
             CType::LongDouble => Some(16), // x86 extended precision
             CType::Int128 | CType::UInt128 => Some(16),
-            CType::SizeT | CType::SSizeT | CType::IntPtrT | CType::UIntPtrT | CType::PtrDiffT => Some(ptr_size),
+            CType::SizeT | CType::SSizeT | CType::IntPtrT | CType::UIntPtrT | CType::PtrDiffT => {
+                Some(ptr_size)
+            }
             CType::Ptr(_) | CType::ConstPtr(_) | CType::FnPtr(_) => Some(ptr_size),
             CType::Array(elem, count) => elem.size(ptr_size).map(|s| s * count),
             CType::Struct(_) | CType::Union(_) | CType::Enum(_) | CType::Opaque(_) => None, // Need type info
@@ -242,12 +246,20 @@ impl CType {
             CType::Short | CType::UShort | CType::Int16 | CType::UInt16 => Some(2),
             CType::Int | CType::UInt | CType::Int32 | CType::UInt32 | CType::Float => Some(4),
             CType::Long | CType::ULong => {
-                if ptr_size == 8 { Some(8) } else { Some(4) }
+                if ptr_size == 8 {
+                    Some(8)
+                } else {
+                    Some(4)
+                }
             }
-            CType::LongLong | CType::ULongLong | CType::Int64 | CType::UInt64 | CType::Double => Some(8),
+            CType::LongLong | CType::ULongLong | CType::Int64 | CType::UInt64 | CType::Double => {
+                Some(8)
+            }
             CType::LongDouble => Some(16),
             CType::Int128 | CType::UInt128 => Some(16),
-            CType::SizeT | CType::SSizeT | CType::IntPtrT | CType::UIntPtrT | CType::PtrDiffT => Some(ptr_size),
+            CType::SizeT | CType::SSizeT | CType::IntPtrT | CType::UIntPtrT | CType::PtrDiffT => {
+                Some(ptr_size)
+            }
             CType::Ptr(_) | CType::ConstPtr(_) | CType::FnPtr(_) => Some(ptr_size),
             CType::Array(elem, _) => elem.align(ptr_size),
             CType::Struct(_) | CType::Union(_) | CType::Enum(_) | CType::Opaque(_) => None,
@@ -261,14 +273,34 @@ impl CType {
 
     /// Check if this is an integer type.
     pub fn is_integer(&self) -> bool {
-        matches!(self,
-            CType::Char | CType::UChar | CType::Short | CType::UShort |
-            CType::Int | CType::UInt | CType::Long | CType::ULong |
-            CType::LongLong | CType::ULongLong | CType::Bool |
-            CType::Int8 | CType::UInt8 | CType::Int16 | CType::UInt16 |
-            CType::Int32 | CType::UInt32 | CType::Int64 | CType::UInt64 |
-            CType::Int128 | CType::UInt128 |
-            CType::SizeT | CType::SSizeT | CType::IntPtrT | CType::UIntPtrT | CType::PtrDiffT
+        matches!(
+            self,
+            CType::Char
+                | CType::UChar
+                | CType::Short
+                | CType::UShort
+                | CType::Int
+                | CType::UInt
+                | CType::Long
+                | CType::ULong
+                | CType::LongLong
+                | CType::ULongLong
+                | CType::Bool
+                | CType::Int8
+                | CType::UInt8
+                | CType::Int16
+                | CType::UInt16
+                | CType::Int32
+                | CType::UInt32
+                | CType::Int64
+                | CType::UInt64
+                | CType::Int128
+                | CType::UInt128
+                | CType::SizeT
+                | CType::SSizeT
+                | CType::IntPtrT
+                | CType::UIntPtrT
+                | CType::PtrDiffT
         )
     }
 
@@ -279,11 +311,24 @@ impl CType {
 
     /// Check if this is a signed type.
     pub fn is_signed(&self) -> bool {
-        matches!(self,
-            CType::Char | CType::Short | CType::Int | CType::Long | CType::LongLong |
-            CType::Int8 | CType::Int16 | CType::Int32 | CType::Int64 | CType::Int128 |
-            CType::SSizeT | CType::IntPtrT | CType::PtrDiffT |
-            CType::Float | CType::Double | CType::LongDouble
+        matches!(
+            self,
+            CType::Char
+                | CType::Short
+                | CType::Int
+                | CType::Long
+                | CType::LongLong
+                | CType::Int8
+                | CType::Int16
+                | CType::Int32
+                | CType::Int64
+                | CType::Int128
+                | CType::SSizeT
+                | CType::IntPtrT
+                | CType::PtrDiffT
+                | CType::Float
+                | CType::Double
+                | CType::LongDouble
         )
     }
 
@@ -291,11 +336,17 @@ impl CType {
     pub fn llvm_type(&self, ptr_size: usize) -> String {
         match self {
             CType::Void => "void".to_string(),
-            CType::Char | CType::UChar | CType::Bool | CType::Int8 | CType::UInt8 => "i8".to_string(),
+            CType::Char | CType::UChar | CType::Bool | CType::Int8 | CType::UInt8 => {
+                "i8".to_string()
+            }
             CType::Short | CType::UShort | CType::Int16 | CType::UInt16 => "i16".to_string(),
             CType::Int | CType::UInt | CType::Int32 | CType::UInt32 => "i32".to_string(),
             CType::Long | CType::ULong => {
-                if ptr_size == 8 { "i64".to_string() } else { "i32".to_string() }
+                if ptr_size == 8 {
+                    "i64".to_string()
+                } else {
+                    "i32".to_string()
+                }
             }
             CType::LongLong | CType::ULongLong | CType::Int64 | CType::UInt64 => "i64".to_string(),
             CType::Int128 | CType::UInt128 => "i128".to_string(),
@@ -403,7 +454,12 @@ pub struct CStructDef {
 
 impl CStructDef {
     /// Create a new struct definition and compute layout.
-    pub fn new(name: impl Into<Arc<str>>, fields: Vec<(Arc<str>, CType)>, packed: bool, ptr_size: usize) -> Self {
+    pub fn new(
+        name: impl Into<Arc<str>>,
+        fields: Vec<(Arc<str>, CType)>,
+        packed: bool,
+        ptr_size: usize,
+    ) -> Self {
         let name = name.into();
         let mut computed_fields = Vec::new();
         let mut offset = 0usize;
@@ -455,7 +511,9 @@ impl CStructDef {
 
     /// Generate LLVM IR type definition.
     pub fn llvm_type_def(&self, ptr_size: usize) -> String {
-        let fields: Vec<String> = self.fields.iter()
+        let fields: Vec<String> = self
+            .fields
+            .iter()
             .map(|f| f.ty.llvm_type(ptr_size))
             .collect();
 
@@ -527,17 +585,29 @@ impl ExternFunction {
     /// Generate LLVM declaration.
     pub fn llvm_declaration(&self, ptr_size: usize) -> String {
         let ret_ty = self.signature.return_type.llvm_type(ptr_size);
-        let params: Vec<String> = self.signature.params.iter()
+        let params: Vec<String> = self
+            .signature
+            .params
+            .iter()
             .map(|p| p.llvm_type(ptr_size))
             .collect();
 
-        let variadic = if self.signature.is_variadic { ", ..." } else { "" };
+        let variadic = if self.signature.is_variadic {
+            ", ..."
+        } else {
+            ""
+        };
         let linkage = if self.weak { "extern_weak " } else { "" };
         let cc = self.signature.calling_conv.llvm_str();
 
         format!(
             "declare {} {} {} @{}({}{})",
-            linkage, cc, ret_ty, self.symbol_name(), params.join(", "), variadic
+            linkage,
+            cc,
+            ret_ty,
+            self.symbol_name(),
+            params.join(", "),
+            variadic
         )
     }
 }
@@ -659,230 +729,243 @@ impl FfiContext {
     /// Add standard C library functions.
     pub fn add_libc(&mut self) {
         // Memory functions
-        self.add_function(ExternFunction::new("malloc",
+        self.add_function(ExternFunction::new(
+            "malloc",
+            CFunctionSignature::new(CType::Ptr(Box::new(CType::Void)), vec![CType::SizeT]),
+        ));
+
+        self.add_function(ExternFunction::new(
+            "calloc",
             CFunctionSignature::new(
                 CType::Ptr(Box::new(CType::Void)),
-                vec![CType::SizeT]
-            )
+                vec![CType::SizeT, CType::SizeT],
+            ),
         ));
 
-        self.add_function(ExternFunction::new("calloc",
+        self.add_function(ExternFunction::new(
+            "realloc",
             CFunctionSignature::new(
                 CType::Ptr(Box::new(CType::Void)),
-                vec![CType::SizeT, CType::SizeT]
-            )
+                vec![CType::Ptr(Box::new(CType::Void)), CType::SizeT],
+            ),
         ));
 
-        self.add_function(ExternFunction::new("realloc",
-            CFunctionSignature::new(
-                CType::Ptr(Box::new(CType::Void)),
-                vec![CType::Ptr(Box::new(CType::Void)), CType::SizeT]
-            )
+        self.add_function(ExternFunction::new(
+            "free",
+            CFunctionSignature::new(CType::Void, vec![CType::Ptr(Box::new(CType::Void))]),
         ));
 
-        self.add_function(ExternFunction::new("free",
-            CFunctionSignature::new(
-                CType::Void,
-                vec![CType::Ptr(Box::new(CType::Void))]
-            )
-        ));
-
-        self.add_function(ExternFunction::new("memcpy",
-            CFunctionSignature::new(
-                CType::Ptr(Box::new(CType::Void)),
-                vec![
-                    CType::Ptr(Box::new(CType::Void)),
-                    CType::ConstPtr(Box::new(CType::Void)),
-                    CType::SizeT
-                ]
-            )
-        ));
-
-        self.add_function(ExternFunction::new("memmove",
+        self.add_function(ExternFunction::new(
+            "memcpy",
             CFunctionSignature::new(
                 CType::Ptr(Box::new(CType::Void)),
                 vec![
                     CType::Ptr(Box::new(CType::Void)),
                     CType::ConstPtr(Box::new(CType::Void)),
-                    CType::SizeT
-                ]
-            )
+                    CType::SizeT,
+                ],
+            ),
         ));
 
-        self.add_function(ExternFunction::new("memset",
+        self.add_function(ExternFunction::new(
+            "memmove",
             CFunctionSignature::new(
                 CType::Ptr(Box::new(CType::Void)),
                 vec![
                     CType::Ptr(Box::new(CType::Void)),
-                    CType::Int,
-                    CType::SizeT
-                ]
-            )
+                    CType::ConstPtr(Box::new(CType::Void)),
+                    CType::SizeT,
+                ],
+            ),
         ));
 
-        self.add_function(ExternFunction::new("memcmp",
+        self.add_function(ExternFunction::new(
+            "memset",
+            CFunctionSignature::new(
+                CType::Ptr(Box::new(CType::Void)),
+                vec![CType::Ptr(Box::new(CType::Void)), CType::Int, CType::SizeT],
+            ),
+        ));
+
+        self.add_function(ExternFunction::new(
+            "memcmp",
             CFunctionSignature::new(
                 CType::Int,
                 vec![
                     CType::ConstPtr(Box::new(CType::Void)),
                     CType::ConstPtr(Box::new(CType::Void)),
-                    CType::SizeT
-                ]
-            )
+                    CType::SizeT,
+                ],
+            ),
         ));
 
         // String functions
-        self.add_function(ExternFunction::new("strlen",
-            CFunctionSignature::new(
-                CType::SizeT,
-                vec![CType::ConstPtr(Box::new(CType::Char))]
-            )
+        self.add_function(ExternFunction::new(
+            "strlen",
+            CFunctionSignature::new(CType::SizeT, vec![CType::ConstPtr(Box::new(CType::Char))]),
         ));
 
-        self.add_function(ExternFunction::new("strcpy",
-            CFunctionSignature::new(
-                CType::Ptr(Box::new(CType::Char)),
-                vec![
-                    CType::Ptr(Box::new(CType::Char)),
-                    CType::ConstPtr(Box::new(CType::Char))
-                ]
-            )
-        ));
-
-        self.add_function(ExternFunction::new("strncpy",
+        self.add_function(ExternFunction::new(
+            "strcpy",
             CFunctionSignature::new(
                 CType::Ptr(Box::new(CType::Char)),
                 vec![
                     CType::Ptr(Box::new(CType::Char)),
                     CType::ConstPtr(Box::new(CType::Char)),
-                    CType::SizeT
-                ]
-            )
+                ],
+            ),
         ));
 
-        self.add_function(ExternFunction::new("strcmp",
+        self.add_function(ExternFunction::new(
+            "strncpy",
+            CFunctionSignature::new(
+                CType::Ptr(Box::new(CType::Char)),
+                vec![
+                    CType::Ptr(Box::new(CType::Char)),
+                    CType::ConstPtr(Box::new(CType::Char)),
+                    CType::SizeT,
+                ],
+            ),
+        ));
+
+        self.add_function(ExternFunction::new(
+            "strcmp",
             CFunctionSignature::new(
                 CType::Int,
                 vec![
                     CType::ConstPtr(Box::new(CType::Char)),
-                    CType::ConstPtr(Box::new(CType::Char))
-                ]
-            )
+                    CType::ConstPtr(Box::new(CType::Char)),
+                ],
+            ),
         ));
 
-        self.add_function(ExternFunction::new("strncmp",
+        self.add_function(ExternFunction::new(
+            "strncmp",
             CFunctionSignature::new(
                 CType::Int,
                 vec![
                     CType::ConstPtr(Box::new(CType::Char)),
                     CType::ConstPtr(Box::new(CType::Char)),
-                    CType::SizeT
-                ]
-            )
+                    CType::SizeT,
+                ],
+            ),
         ));
 
         // I/O functions
-        self.add_function(ExternFunction::new("printf",
-            CFunctionSignature::new(
-                CType::Int,
-                vec![CType::ConstPtr(Box::new(CType::Char))]
-            ).variadic()
+        self.add_function(ExternFunction::new(
+            "printf",
+            CFunctionSignature::new(CType::Int, vec![CType::ConstPtr(Box::new(CType::Char))])
+                .variadic(),
         ));
 
-        self.add_function(ExternFunction::new("sprintf",
+        self.add_function(ExternFunction::new(
+            "sprintf",
             CFunctionSignature::new(
                 CType::Int,
                 vec![
                     CType::Ptr(Box::new(CType::Char)),
-                    CType::ConstPtr(Box::new(CType::Char))
-                ]
-            ).variadic()
+                    CType::ConstPtr(Box::new(CType::Char)),
+                ],
+            )
+            .variadic(),
         ));
 
-        self.add_function(ExternFunction::new("snprintf",
+        self.add_function(ExternFunction::new(
+            "snprintf",
             CFunctionSignature::new(
                 CType::Int,
                 vec![
                     CType::Ptr(Box::new(CType::Char)),
                     CType::SizeT,
-                    CType::ConstPtr(Box::new(CType::Char))
-                ]
-            ).variadic()
+                    CType::ConstPtr(Box::new(CType::Char)),
+                ],
+            )
+            .variadic(),
         ));
 
-        self.add_function(ExternFunction::new("puts",
-            CFunctionSignature::new(
-                CType::Int,
-                vec![CType::ConstPtr(Box::new(CType::Char))]
-            )
+        self.add_function(ExternFunction::new(
+            "puts",
+            CFunctionSignature::new(CType::Int, vec![CType::ConstPtr(Box::new(CType::Char))]),
         ));
 
-        self.add_function(ExternFunction::new("putchar",
-            CFunctionSignature::new(
-                CType::Int,
-                vec![CType::Int]
-            )
+        self.add_function(ExternFunction::new(
+            "putchar",
+            CFunctionSignature::new(CType::Int, vec![CType::Int]),
         ));
 
         // Math functions
-        self.add_function(ExternFunction::new("sin",
-            CFunctionSignature::new(CType::Double, vec![CType::Double])
+        self.add_function(ExternFunction::new(
+            "sin",
+            CFunctionSignature::new(CType::Double, vec![CType::Double]),
         ));
 
-        self.add_function(ExternFunction::new("cos",
-            CFunctionSignature::new(CType::Double, vec![CType::Double])
+        self.add_function(ExternFunction::new(
+            "cos",
+            CFunctionSignature::new(CType::Double, vec![CType::Double]),
         ));
 
-        self.add_function(ExternFunction::new("tan",
-            CFunctionSignature::new(CType::Double, vec![CType::Double])
+        self.add_function(ExternFunction::new(
+            "tan",
+            CFunctionSignature::new(CType::Double, vec![CType::Double]),
         ));
 
-        self.add_function(ExternFunction::new("sqrt",
-            CFunctionSignature::new(CType::Double, vec![CType::Double])
+        self.add_function(ExternFunction::new(
+            "sqrt",
+            CFunctionSignature::new(CType::Double, vec![CType::Double]),
         ));
 
-        self.add_function(ExternFunction::new("pow",
-            CFunctionSignature::new(CType::Double, vec![CType::Double, CType::Double])
+        self.add_function(ExternFunction::new(
+            "pow",
+            CFunctionSignature::new(CType::Double, vec![CType::Double, CType::Double]),
         ));
 
-        self.add_function(ExternFunction::new("exp",
-            CFunctionSignature::new(CType::Double, vec![CType::Double])
+        self.add_function(ExternFunction::new(
+            "exp",
+            CFunctionSignature::new(CType::Double, vec![CType::Double]),
         ));
 
-        self.add_function(ExternFunction::new("log",
-            CFunctionSignature::new(CType::Double, vec![CType::Double])
+        self.add_function(ExternFunction::new(
+            "log",
+            CFunctionSignature::new(CType::Double, vec![CType::Double]),
         ));
 
-        self.add_function(ExternFunction::new("log10",
-            CFunctionSignature::new(CType::Double, vec![CType::Double])
+        self.add_function(ExternFunction::new(
+            "log10",
+            CFunctionSignature::new(CType::Double, vec![CType::Double]),
         ));
 
-        self.add_function(ExternFunction::new("fabs",
-            CFunctionSignature::new(CType::Double, vec![CType::Double])
+        self.add_function(ExternFunction::new(
+            "fabs",
+            CFunctionSignature::new(CType::Double, vec![CType::Double]),
         ));
 
-        self.add_function(ExternFunction::new("floor",
-            CFunctionSignature::new(CType::Double, vec![CType::Double])
+        self.add_function(ExternFunction::new(
+            "floor",
+            CFunctionSignature::new(CType::Double, vec![CType::Double]),
         ));
 
-        self.add_function(ExternFunction::new("ceil",
-            CFunctionSignature::new(CType::Double, vec![CType::Double])
+        self.add_function(ExternFunction::new(
+            "ceil",
+            CFunctionSignature::new(CType::Double, vec![CType::Double]),
         ));
 
         // Process functions
-        self.add_function(ExternFunction::new("exit",
-            CFunctionSignature::new(CType::Void, vec![CType::Int])
+        self.add_function(ExternFunction::new(
+            "exit",
+            CFunctionSignature::new(CType::Void, vec![CType::Int]),
         ));
 
-        self.add_function(ExternFunction::new("abort",
-            CFunctionSignature::new(CType::Void, vec![])
+        self.add_function(ExternFunction::new(
+            "abort",
+            CFunctionSignature::new(CType::Void, vec![]),
         ));
 
-        self.add_function(ExternFunction::new("getenv",
+        self.add_function(ExternFunction::new(
+            "getenv",
             CFunctionSignature::new(
                 CType::Ptr(Box::new(CType::Char)),
-                vec![CType::ConstPtr(Box::new(CType::Char))]
-            )
+                vec![CType::ConstPtr(Box::new(CType::Char))],
+            ),
         ));
     }
 }
@@ -978,10 +1061,10 @@ mod tests {
 
         let def = CStructDef::new("TestStruct", fields, false, 8);
 
-        assert_eq!(def.fields[0].offset, 0);  // a at 0
-        assert_eq!(def.fields[1].offset, 8);  // b at 8 (aligned to 8)
+        assert_eq!(def.fields[0].offset, 0); // a at 0
+        assert_eq!(def.fields[1].offset, 8); // b at 8 (aligned to 8)
         assert_eq!(def.fields[2].offset, 16); // c at 16
-        assert_eq!(def.size, 24);             // padded to alignment 8
+        assert_eq!(def.size, 24); // padded to alignment 8
         assert_eq!(def.align, 8);
     }
 
@@ -995,19 +1078,17 @@ mod tests {
 
         let def = CStructDef::new("PackedStruct", fields, true, 8);
 
-        assert_eq!(def.fields[0].offset, 0);  // a at 0
-        assert_eq!(def.fields[1].offset, 4);  // b at 4 (no alignment)
+        assert_eq!(def.fields[0].offset, 0); // a at 0
+        assert_eq!(def.fields[1].offset, 4); // b at 4 (no alignment)
         assert_eq!(def.fields[2].offset, 12); // c at 12
-        assert_eq!(def.size, 13);             // no padding
+        assert_eq!(def.size, 13); // no padding
         assert_eq!(def.align, 1);
     }
 
     #[test]
     fn test_extern_function() {
-        let sig = CFunctionSignature::new(
-            CType::Int,
-            vec![CType::ConstPtr(Box::new(CType::Char))]
-        ).variadic();
+        let sig = CFunctionSignature::new(CType::Int, vec![CType::ConstPtr(Box::new(CType::Char))])
+            .variadic();
 
         let func = ExternFunction::new("printf", sig);
         let decl = func.llvm_declaration(8);

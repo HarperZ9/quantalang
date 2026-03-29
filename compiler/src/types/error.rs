@@ -9,8 +9,8 @@
 use std::fmt;
 use thiserror::Error;
 
-use crate::lexer::Span;
 use super::ty::*;
+use crate::lexer::Span;
 
 /// Result type for type operations.
 pub type TypeResult<T> = Result<T, TypeError>;
@@ -73,20 +73,13 @@ pub enum TypeError {
     // =========================================================================
     // UNIFICATION ERRORS
     // =========================================================================
-
     /// Types do not match.
     #[error("type mismatch: expected `{expected}`, found `{found}`")]
-    TypeMismatch {
-        expected: Ty,
-        found: Ty,
-    },
+    TypeMismatch { expected: Ty, found: Ty },
 
     /// Infinite type (occurs check failure).
     #[error("infinite type: `{var}` occurs in `{ty}`")]
-    InfiniteType {
-        var: TyVarId,
-        ty: Ty,
-    },
+    InfiniteType { var: TyVarId, ty: Ty },
 
     /// Mutability mismatch.
     #[error("mutability mismatch: expected `{expected:?}`, found `{found:?}`")]
@@ -97,17 +90,11 @@ pub enum TypeError {
 
     /// Array length mismatch.
     #[error("array length mismatch: expected `{expected}`, found `{found}`")]
-    ArrayLengthMismatch {
-        expected: usize,
-        found: usize,
-    },
+    ArrayLengthMismatch { expected: usize, found: usize },
 
     /// Arity mismatch (wrong number of arguments).
     #[error("expected {expected} arguments, found {found}")]
-    ArityMismatch {
-        expected: usize,
-        found: usize,
-    },
+    ArityMismatch { expected: usize, found: usize },
 
     /// Unsafety mismatch.
     #[error("unsafety mismatch")]
@@ -130,106 +117,68 @@ pub enum TypeError {
     // =========================================================================
     // LOOKUP ERRORS
     // =========================================================================
-
     /// Undefined variable.
     #[error("undefined variable: `{name}`")]
-    UndefinedVariable {
-        name: String,
-    },
+    UndefinedVariable { name: String },
 
     /// Undefined type.
     #[error("undefined type: `{name}`")]
-    UndefinedType {
-        name: String,
-    },
+    UndefinedType { name: String },
 
     /// Undefined function.
     #[error("undefined function: `{name}`")]
-    UndefinedFunction {
-        name: String,
-    },
+    UndefinedFunction { name: String },
 
     /// Undefined field.
     #[error("type `{ty}` has no field `{field}`")]
-    UndefinedField {
-        ty: Ty,
-        field: String,
-    },
+    UndefinedField { ty: Ty, field: String },
 
     /// Undefined method.
     #[error("type `{ty}` has no method `{method}`")]
-    UndefinedMethod {
-        ty: Ty,
-        method: String,
-    },
+    UndefinedMethod { ty: Ty, method: String },
 
     /// Undefined variant.
     #[error("enum `{enum_name}` has no variant `{variant}`")]
-    UndefinedVariant {
-        enum_name: String,
-        variant: String,
-    },
+    UndefinedVariant { enum_name: String, variant: String },
 
     // =========================================================================
     // EXPRESSION ERRORS
     // =========================================================================
-
     /// Cannot call non-function type.
     #[error("type `{ty}` is not callable")]
-    NotCallable {
-        ty: Ty,
-    },
+    NotCallable { ty: Ty },
 
     /// Cannot index non-array type.
     #[error("type `{ty}` cannot be indexed")]
-    NotIndexable {
-        ty: Ty,
-    },
+    NotIndexable { ty: Ty },
 
     /// Cannot dereference non-pointer type.
     #[error("type `{ty}` cannot be dereferenced")]
-    NotDereferenceable {
-        ty: Ty,
-    },
+    NotDereferenceable { ty: Ty },
 
     /// Cannot borrow variable as mutable while it is already borrowed.
     #[error("cannot borrow `{variable}` as mutable because it is already borrowed")]
-    AlreadyBorrowed {
-        variable: String,
-    },
+    AlreadyBorrowed { variable: String },
 
     /// Cannot borrow variable as mutable more than once at a time.
     #[error("cannot borrow `{variable}` as mutable more than once at a time")]
-    DoubleMutableBorrow {
-        variable: String,
-    },
+    DoubleMutableBorrow { variable: String },
 
     /// Cannot use a moved value.
     #[error("use of moved value: `{variable}`")]
-    UseAfterMove {
-        variable: String,
-    },
+    UseAfterMove { variable: String },
 
     /// Reference to local variable escapes function scope.
     #[error("cannot return reference to local variable `{variable}`")]
-    ReferenceEscapesScope {
-        variable: String,
-    },
+    ReferenceEscapesScope { variable: String },
 
     /// Invalid binary operation.
     #[error("cannot apply binary operator `{op}` to types `{left}` and `{right}`")]
-    InvalidBinaryOp {
-        op: String,
-        left: Ty,
-        right: Ty,
-    },
+    InvalidBinaryOp { op: String, left: Ty, right: Ty },
 
     /// Invalid unary operation.
     #[error("cannot apply unary operator `{op}` to type `{ty}`")]
-    InvalidUnaryOp {
-        op: String,
-        ty: Ty,
-    },
+    InvalidUnaryOp { op: String, ty: Ty },
 
     /// Invalid assignment target.
     #[error("invalid assignment target")]
@@ -237,20 +186,14 @@ pub enum TypeError {
 
     /// Cannot assign to immutable binding.
     #[error("cannot assign to immutable variable `{name}`")]
-    ImmutableAssignment {
-        name: String,
-    },
+    ImmutableAssignment { name: String },
 
     // =========================================================================
     // PATTERN ERRORS
     // =========================================================================
-
     /// Pattern type mismatch.
     #[error("pattern type mismatch: expected `{expected}`, found `{found}`")]
-    PatternMismatch {
-        expected: Ty,
-        found: Ty,
-    },
+    PatternMismatch { expected: Ty, found: Ty },
 
     /// Refutable pattern in irrefutable position.
     #[error("refutable pattern in irrefutable position")]
@@ -262,14 +205,11 @@ pub enum TypeError {
 
     /// Non-exhaustive match (missing specific enum variants).
     #[error("non-exhaustive match: missing variants {}", missing_variants.join(", "))]
-    NonExhaustiveMatch {
-        missing_variants: Vec<String>,
-    },
+    NonExhaustiveMatch { missing_variants: Vec<String> },
 
     // =========================================================================
     // CONTROL FLOW ERRORS
     // =========================================================================
-
     /// Break outside of loop.
     #[error("`break` outside of loop")]
     BreakOutsideLoop,
@@ -284,15 +224,11 @@ pub enum TypeError {
 
     /// Missing return type.
     #[error("function returns `{found}` but expected `{expected}`")]
-    ReturnTypeMismatch {
-        expected: Ty,
-        found: Ty,
-    },
+    ReturnTypeMismatch { expected: Ty, found: Ty },
 
     // =========================================================================
     // TRAIT ERRORS
     // =========================================================================
-
     /// Trait not implemented.
     #[error("the trait bound `{ty}: {trait_id:?}` is not satisfied")]
     TraitNotImplemented {
@@ -302,23 +238,15 @@ pub enum TypeError {
 
     /// Ambiguous trait resolution.
     #[error("multiple implementations of trait `{trait_name}` for type `{ty}`")]
-    AmbiguousImpl {
-        trait_name: String,
-        ty: Ty,
-    },
+    AmbiguousImpl { trait_name: String, ty: Ty },
 
     /// Associated type not found.
     #[error("associated type `{name}` not found in trait `{trait_name}`")]
-    AssocTypeNotFound {
-        name: String,
-        trait_name: String,
-    },
+    AssocTypeNotFound { name: String, trait_name: String },
 
     /// Associated type not defined in impl.
     #[error("associated type `{assoc_name}` not defined")]
-    AssociatedTypeNotDefined {
-        assoc_name: String,
-    },
+    AssociatedTypeNotDefined { assoc_name: String },
 
     /// Internal error.
     #[error("internal error: {0}")]
@@ -327,30 +255,20 @@ pub enum TypeError {
     // =========================================================================
     // GENERICS ERRORS
     // =========================================================================
-
     /// Wrong number of type arguments.
     #[error("expected {expected} type arguments, found {found}")]
-    WrongTypeArgCount {
-        expected: usize,
-        found: usize,
-    },
+    WrongTypeArgCount { expected: usize, found: usize },
 
     /// Bound not satisfied.
     #[error("type `{ty}` does not satisfy bound `{bound}`")]
-    BoundNotSatisfied {
-        ty: Ty,
-        bound: String,
-    },
+    BoundNotSatisfied { ty: Ty, bound: String },
 
     // =========================================================================
     // OTHER ERRORS
     // =========================================================================
-
     /// Duplicate definition.
     #[error("duplicate definition: `{name}`")]
-    DuplicateDefinition {
-        name: String,
-    },
+    DuplicateDefinition { name: String },
 
     /// Type annotation required.
     #[error("type annotations needed")]
@@ -367,12 +285,9 @@ pub enum TypeError {
     // =========================================================================
     // EFFECT ERRORS
     // =========================================================================
-
     /// Unknown effect: the effect has not been declared.
     #[error("unknown effect `{name}`")]
-    UnknownEffect {
-        name: String,
-    },
+    UnknownEffect { name: String },
 
     /// Unhandled effect: a function performs an effect but does not declare it.
     #[error("function `{func_name}` performs effect `{effect_name}` but does not declare it")]

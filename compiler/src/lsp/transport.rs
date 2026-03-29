@@ -166,7 +166,9 @@ impl StdioTransport {
 
     /// Receive an incoming message (blocking).
     pub fn recv(&self) -> TransportResult<RawMessage> {
-        self.incoming_rx.recv().map_err(|_| TransportError::Disconnected)
+        self.incoming_rx
+            .recv()
+            .map_err(|_| TransportError::Disconnected)
     }
 
     /// Try to receive an incoming message (non-blocking).
@@ -180,7 +182,9 @@ impl StdioTransport {
 
     /// Send an outgoing message.
     pub fn send(&self, msg: RawMessage) -> TransportResult<()> {
-        self.outgoing_tx.send(msg).map_err(|_| TransportError::Disconnected)
+        self.outgoing_tx
+            .send(msg)
+            .map_err(|_| TransportError::Disconnected)
     }
 
     /// Shutdown the transport.
@@ -319,7 +323,11 @@ impl JsonBuilder {
     }
 
     pub fn bool(v: bool) -> String {
-        if v { "true".to_string() } else { "false".to_string() }
+        if v {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }
     }
 
     pub fn number<N: std::fmt::Display>(n: N) -> String {

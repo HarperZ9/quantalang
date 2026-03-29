@@ -10,9 +10,9 @@
 //! parsing expressions. Pratt parsing handles operator precedence and
 //! associativity elegantly through binding power.
 
+use super::{ParseError, ParseErrorKind, ParseResult, Parser};
 use crate::ast::*;
-use crate::lexer::{Delimiter, Keyword, TokenKind, IntBase};
-use super::{Parser, ParseResult, ParseError, ParseErrorKind};
+use crate::lexer::{Delimiter, IntBase, Keyword, TokenKind};
 
 /// Binding power for operators.
 mod bp {
@@ -99,10 +99,9 @@ impl<'a> Parser<'a> {
     /// Check if an expression is a statement-level control flow construct
     /// that should not participate in binary/postfix operations.
     fn is_statement_expr(expr: &Expr) -> bool {
-        matches!(&expr.kind,
-            ExprKind::While { .. } |
-            ExprKind::Loop { .. } |
-            ExprKind::For { .. }
+        matches!(
+            &expr.kind,
+            ExprKind::While { .. } | ExprKind::Loop { .. } | ExprKind::For { .. }
         )
     }
 
@@ -114,7 +113,6 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // LITERALS
             // =====================================================================
-
             TokenKind::Literal { kind, suffix } => {
                 self.advance();
                 let literal = self.convert_literal(&kind, suffix.as_deref())?;
@@ -124,10 +122,7 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // IDENTIFIERS AND PATHS
             // =====================================================================
-
-            TokenKind::Ident | TokenKind::RawIdent => {
-                self.parse_path_or_struct_expr()
-            }
+            TokenKind::Ident | TokenKind::RawIdent => self.parse_path_or_struct_expr(),
 
             TokenKind::Keyword(Keyword::Self_) => {
                 self.advance();
@@ -147,7 +142,9 @@ impl<'a> Parser<'a> {
                     self.advance(); // consume ::
                     if self.check_ident() || self.is_contextual_keyword() {
                         let ident = self.expect_ident()?;
-                        let generics = if self.check(&TokenKind::ColonColon) && self.peek().kind == TokenKind::Lt {
+                        let generics = if self.check(&TokenKind::ColonColon)
+                            && self.peek().kind == TokenKind::Lt
+                        {
                             self.advance(); // ::
                             self.parse_generic_args()?
                         } else if self.check(&TokenKind::Lt) {
@@ -162,7 +159,10 @@ impl<'a> Parser<'a> {
                     }
                 }
 
-                let path = Path::new(segments, start.merge(&self.tokens[self.pos.saturating_sub(1)].span));
+                let path = Path::new(
+                    segments,
+                    start.merge(&self.tokens[self.pos.saturating_sub(1)].span),
+                );
 
                 // Check for struct literal: Self { ... } or Self::Variant { ... }
                 if !self.restrictions.no_struct_literal
@@ -175,10 +175,13 @@ impl<'a> Parser<'a> {
                 if self.check(&TokenKind::OpenDelim(Delimiter::Paren)) {
                     let (args, _) = self.parse_paren_comma_seq(|p| p.parse_expr())?;
                     let span = start.merge(&self.tokens[self.pos.saturating_sub(1)].span);
-                    return Ok(Expr::new(ExprKind::Call {
-                        func: Box::new(Expr::new(ExprKind::Path(path), start)),
-                        args,
-                    }, span));
+                    return Ok(Expr::new(
+                        ExprKind::Call {
+                            func: Box::new(Expr::new(ExprKind::Path(path), start)),
+                            args,
+                        },
+                        span,
+                    ));
                 }
 
                 // Check for macro: Self!(...) — unlikely but handle it
@@ -192,7 +195,10 @@ impl<'a> Parser<'a> {
 
             TokenKind::Keyword(Keyword::Crate) | TokenKind::Keyword(Keyword::Super) => {
                 self.advance();
-                let keyword_name = if matches!(self.tokens[self.pos - 1].kind, TokenKind::Keyword(Keyword::Crate)) {
+                let keyword_name = if matches!(
+                    self.tokens[self.pos - 1].kind,
+                    TokenKind::Keyword(Keyword::Crate)
+                ) {
                     "crate"
                 } else {
                     "super"
@@ -207,22 +213,31 @@ impl<'a> Parser<'a> {
                     self.advance();
                     if self.check_ident() || self.is_contextual_keyword() {
                         let ident = self.expect_ident()?;
-                        segments.push(PathSegment { ident, generics: vec![] });
+                        segments.push(PathSegment {
+                            ident,
+                            generics: vec![],
+                        });
                     } else {
                         break;
                     }
                 }
 
-                let path = Path::new(segments, start.merge(&self.tokens[self.pos.saturating_sub(1)].span));
+                let path = Path::new(
+                    segments,
+                    start.merge(&self.tokens[self.pos.saturating_sub(1)].span),
+                );
 
                 // Check for function call
                 if self.check(&TokenKind::OpenDelim(Delimiter::Paren)) {
                     let (args, _) = self.parse_paren_comma_seq(|p| p.parse_expr())?;
                     let span = start.merge(&self.tokens[self.pos.saturating_sub(1)].span);
-                    return Ok(Expr::new(ExprKind::Call {
-                        func: Box::new(Expr::new(ExprKind::Path(path), start)),
-                        args,
-                    }, span));
+                    return Ok(Expr::new(
+                        ExprKind::Call {
+                            func: Box::new(Expr::new(ExprKind::Path(path), start)),
+                            args,
+                        },
+                        span,
+                    ));
                 }
 
                 Ok(Expr::new(ExprKind::Path(path), start))
@@ -231,7 +246,6 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // UNARY OPERATORS
             // =====================================================================
-
             TokenKind::Minus => {
                 self.advance();
                 let expr = self.parse_expr_with_bp(bp::PREFIX)?;
@@ -320,23 +334,16 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // GROUPED / TUPLE / UNIT
             // =====================================================================
-
-            TokenKind::OpenDelim(Delimiter::Paren) => {
-                self.parse_paren_expr()
-            }
+            TokenKind::OpenDelim(Delimiter::Paren) => self.parse_paren_expr(),
 
             // =====================================================================
             // ARRAY
             // =====================================================================
-
-            TokenKind::OpenDelim(Delimiter::Bracket) => {
-                self.parse_array_expr()
-            }
+            TokenKind::OpenDelim(Delimiter::Bracket) => self.parse_array_expr(),
 
             // =====================================================================
             // BLOCK
             // =====================================================================
-
             TokenKind::OpenDelim(Delimiter::Brace) => {
                 let block = self.parse_block()?;
                 let span = block.span;
@@ -346,7 +353,6 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // CONTROL FLOW
             // =====================================================================
-
             TokenKind::Keyword(Keyword::If) => self.parse_if_expr(),
             TokenKind::Keyword(Keyword::Match) => self.parse_match_expr(),
             TokenKind::Keyword(Keyword::Loop) => self.parse_loop_expr(),
@@ -356,7 +362,6 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // EFFECT SYSTEM
             // =====================================================================
-
             TokenKind::Keyword(Keyword::Handle) => self.parse_handle_expr(),
             TokenKind::Keyword(Keyword::Resume) => self.parse_resume_expr(),
             TokenKind::Keyword(Keyword::Perform) => self.parse_perform_expr(),
@@ -364,7 +369,6 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // JUMPS
             // =====================================================================
-
             TokenKind::Keyword(Keyword::Return) => self.parse_return_expr(),
             TokenKind::Keyword(Keyword::Break) => self.parse_break_expr(),
             TokenKind::Keyword(Keyword::Continue) => self.parse_continue_expr(),
@@ -372,7 +376,6 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // CLOSURES
             // =====================================================================
-
             TokenKind::Or => self.parse_closure_expr(false, false),
             TokenKind::OrOr => {
                 // || - closure with no params
@@ -409,7 +412,6 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // UNSAFE
             // =====================================================================
-
             TokenKind::Keyword(Keyword::Unsafe) => {
                 self.advance();
                 let block = self.parse_block()?;
@@ -420,7 +422,6 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // RANGE (prefix form)
             // =====================================================================
-
             TokenKind::DotDot => {
                 self.advance();
                 let end = if self.can_begin_expr() {
@@ -460,7 +461,6 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // MACROS / DSL
             // =====================================================================
-
             TokenKind::DslBlock { ref name } => {
                 let name = name.clone();
                 self.advance();
@@ -479,7 +479,6 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // ERROR
             // =====================================================================
-
             _ => Err(self.error_expected("expression")),
         }
     }
@@ -506,7 +505,9 @@ impl<'a> Parser<'a> {
             TokenKind::OpenDelim(Delimiter::Bracket) => {
                 self.advance();
                 let index = self.parse_expr()?;
-                let end = self.expect(&TokenKind::CloseDelim(Delimiter::Bracket))?.span;
+                let end = self
+                    .expect(&TokenKind::CloseDelim(Delimiter::Bracket))?
+                    .span;
                 let span = start.merge(&end);
                 Ok(Expr::new(
                     ExprKind::Index {
@@ -522,7 +523,11 @@ impl<'a> Parser<'a> {
                 self.advance();
 
                 // Check for tuple field access (expr.0)
-                if let TokenKind::Literal { kind: crate::lexer::LiteralKind::Int { .. }, .. } = self.current_kind() {
+                if let TokenKind::Literal {
+                    kind: crate::lexer::LiteralKind::Int { .. },
+                    ..
+                } = self.current_kind()
+                {
                     let token_span = self.advance().span;
                     let field_str = self.source.slice(token_span);
                     let index: u32 = field_str.parse().map_err(|_| {
@@ -549,8 +554,8 @@ impl<'a> Parser<'a> {
                 let field = self.expect_ident()?;
 
                 // Check for method call — either `method(...)` or `method::<T>(...)`
-                let is_turbofish = self.check(&TokenKind::ColonColon)
-                    && self.peek().kind == TokenKind::Lt;
+                let is_turbofish =
+                    self.check(&TokenKind::ColonColon) && self.peek().kind == TokenKind::Lt;
                 if self.check(&TokenKind::OpenDelim(Delimiter::Paren)) || is_turbofish {
                     // Method call with optional turbofish
                     let generics = if self.check(&TokenKind::ColonColon) {
@@ -638,7 +643,11 @@ impl<'a> Parser<'a> {
         // Check for range operators
         if self.check(&TokenKind::DotDot) {
             self.advance();
-            let end = if self.can_begin_expr() && !matches!(self.current_kind(), TokenKind::CloseDelim(_) | TokenKind::Comma | TokenKind::Semi) {
+            let end = if self.can_begin_expr()
+                && !matches!(
+                    self.current_kind(),
+                    TokenKind::CloseDelim(_) | TokenKind::Comma | TokenKind::Semi
+                ) {
                 Some(Box::new(self.parse_expr_with_bp(right_bp)?))
             } else {
                 None
@@ -703,11 +712,16 @@ impl<'a> Parser<'a> {
         match self.current_kind() {
             // Assignment (right-associative)
             TokenKind::Eq => Some((bp::ASSIGN, bp::ASSIGN)),
-            TokenKind::PlusEq | TokenKind::MinusEq | TokenKind::StarEq
-            | TokenKind::SlashEq | TokenKind::PercentEq | TokenKind::CaretEq
-            | TokenKind::AndEq | TokenKind::OrEq | TokenKind::ShlEq | TokenKind::ShrEq => {
-                Some((bp::ASSIGN, bp::ASSIGN))
-            }
+            TokenKind::PlusEq
+            | TokenKind::MinusEq
+            | TokenKind::StarEq
+            | TokenKind::SlashEq
+            | TokenKind::PercentEq
+            | TokenKind::CaretEq
+            | TokenKind::AndEq
+            | TokenKind::OrEq
+            | TokenKind::ShlEq
+            | TokenKind::ShrEq => Some((bp::ASSIGN, bp::ASSIGN)),
 
             // Range
             TokenKind::DotDot | TokenKind::DotDotEq => Some((bp::RANGE, bp::RANGE + 1)),
@@ -719,8 +733,12 @@ impl<'a> Parser<'a> {
             TokenKind::AndAnd => Some((bp::AND, bp::AND + 1)),
 
             // Comparison (non-associative, but we use left-assoc here)
-            TokenKind::EqEq | TokenKind::Ne | TokenKind::Lt | TokenKind::Le
-            | TokenKind::Gt | TokenKind::Ge => Some((bp::COMPARE, bp::COMPARE + 1)),
+            TokenKind::EqEq
+            | TokenKind::Ne
+            | TokenKind::Lt
+            | TokenKind::Le
+            | TokenKind::Gt
+            | TokenKind::Ge => Some((bp::COMPARE, bp::COMPARE + 1)),
 
             // Bitwise OR
             TokenKind::Or => Some((bp::BIT_OR, bp::BIT_OR + 1)),
@@ -865,7 +883,9 @@ impl<'a> Parser<'a> {
                     IntBase::Binary => text[2..].replace('_', ""),
                 };
                 // Remove suffix
-                let text = suffix.map_or(text.as_str(), |s| &text[..text.len() - s.len()]).to_string();
+                let text = suffix
+                    .map_or(text.as_str(), |s| &text[..text.len() - s.len()])
+                    .to_string();
                 let value = u128::from_str_radix(&text, base.radix()).unwrap_or(0);
                 let int_suffix = suffix.and_then(IntSuffix::from_str);
                 Ok(Literal::Int {
@@ -1016,9 +1036,10 @@ impl<'a> Parser<'a> {
     /// Parse a character literal content.
     fn parse_char_content(&self, s: &str) -> ParseResult<char> {
         let content = self.parse_string_content(s)?;
-        content.chars().next().ok_or_else(|| {
-            ParseError::new(ParseErrorKind::InvalidExpression, self.current_span())
-        })
+        content
+            .chars()
+            .next()
+            .ok_or_else(|| ParseError::new(ParseErrorKind::InvalidExpression, self.current_span()))
     }
 
     /// Parse path or struct expression.
@@ -1094,20 +1115,26 @@ impl<'a> Parser<'a> {
         let end = self.expect(&TokenKind::CloseDelim(Delimiter::Brace))?.span;
         let span = start.merge(&end);
 
-        Ok(Expr::new(
-            ExprKind::Struct { path, fields, rest },
-            span,
-        ))
+        Ok(Expr::new(ExprKind::Struct { path, fields, rest }, span))
     }
 
     /// Parse macro invocation expression.
     fn parse_macro_expr(&mut self, path: Path, start: crate::lexer::Span) -> ParseResult<Expr> {
         let (delimiter, tokens) = if self.check(&TokenKind::OpenDelim(Delimiter::Paren)) {
-            (Delimiter::Paren, self.parse_token_trees_until(Delimiter::Paren)?)
+            (
+                Delimiter::Paren,
+                self.parse_token_trees_until(Delimiter::Paren)?,
+            )
         } else if self.check(&TokenKind::OpenDelim(Delimiter::Bracket)) {
-            (Delimiter::Bracket, self.parse_token_trees_until(Delimiter::Bracket)?)
+            (
+                Delimiter::Bracket,
+                self.parse_token_trees_until(Delimiter::Bracket)?,
+            )
         } else if self.check(&TokenKind::OpenDelim(Delimiter::Brace)) {
-            (Delimiter::Brace, self.parse_token_trees_until(Delimiter::Brace)?)
+            (
+                Delimiter::Brace,
+                self.parse_token_trees_until(Delimiter::Brace)?,
+            )
         } else {
             return Err(self.error_expected("macro delimiter"));
         };
@@ -1174,7 +1201,9 @@ impl<'a> Parser<'a> {
         if self.check(&TokenKind::Semi) {
             self.advance();
             let count = self.parse_expr()?;
-            let end = self.expect(&TokenKind::CloseDelim(Delimiter::Bracket))?.span;
+            let end = self
+                .expect(&TokenKind::CloseDelim(Delimiter::Bracket))?
+                .span;
             let span = start.merge(&end);
             return Ok(Expr::new(
                 ExprKind::ArrayRepeat {
@@ -1197,7 +1226,9 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let end = self.expect(&TokenKind::CloseDelim(Delimiter::Bracket))?.span;
+        let end = self
+            .expect(&TokenKind::CloseDelim(Delimiter::Bracket))?
+            .span;
         let span = start.merge(&end);
         Ok(Expr::new(ExprKind::Array(elements), span))
     }
@@ -1649,7 +1680,11 @@ impl<'a> Parser<'a> {
                     } else {
                         pattern.span
                     };
-                    Ok(ClosureParam { pattern, ty, span: param_span })
+                    Ok(ClosureParam {
+                        pattern,
+                        ty,
+                        span: param_span,
+                    })
                 })?;
                 params
             } else {
@@ -1730,10 +1765,7 @@ impl<'a> Parser<'a> {
             if self.check(&TokenKind::CloseDelim(Delimiter::Paren)) {
                 // resume() => resume with unit
                 let end = self.advance().span;
-                return Ok(Expr::new(
-                    ExprKind::Resume(None),
-                    start.merge(&end),
-                ));
+                return Ok(Expr::new(ExprKind::Resume(None), start.merge(&end)));
             }
             let val = self.parse_expr()?;
             self.expect(&TokenKind::CloseDelim(Delimiter::Paren))?;
@@ -1811,9 +1843,19 @@ mod tests {
         // 1 + 2 * 3 => Add(1, Mul(2, 3))
         let expr = parse_expr_str("1 + 2 * 3").unwrap();
         match &expr.kind {
-            ExprKind::Binary { op: BinOp::Add, left, right } => {
-                assert!(matches!(&left.kind, ExprKind::Literal(Literal::Int { value: 1, .. })));
-                assert!(matches!(&right.kind, ExprKind::Binary { op: BinOp::Mul, .. }));
+            ExprKind::Binary {
+                op: BinOp::Add,
+                left,
+                right,
+            } => {
+                assert!(matches!(
+                    &left.kind,
+                    ExprKind::Literal(Literal::Int { value: 1, .. })
+                ));
+                assert!(matches!(
+                    &right.kind,
+                    ExprKind::Binary { op: BinOp::Mul, .. }
+                ));
             }
             other => panic!("expected Add(1, Mul(2,3)), got {:?}", other),
         }
@@ -1824,9 +1866,19 @@ mod tests {
         // 1 + 2 + 3 => Add(Add(1, 2), 3)
         let expr = parse_expr_str("1 + 2 + 3").unwrap();
         match &expr.kind {
-            ExprKind::Binary { op: BinOp::Add, left, right } => {
-                assert!(matches!(&left.kind, ExprKind::Binary { op: BinOp::Add, .. }));
-                assert!(matches!(&right.kind, ExprKind::Literal(Literal::Int { value: 3, .. })));
+            ExprKind::Binary {
+                op: BinOp::Add,
+                left,
+                right,
+            } => {
+                assert!(matches!(
+                    &left.kind,
+                    ExprKind::Binary { op: BinOp::Add, .. }
+                ));
+                assert!(matches!(
+                    &right.kind,
+                    ExprKind::Literal(Literal::Int { value: 3, .. })
+                ));
             }
             other => panic!("expected Add(Add(1,2), 3), got {:?}", other),
         }
@@ -1837,9 +1889,19 @@ mod tests {
         // a + b == c * d => Eq(Add(a,b), Mul(c,d))
         let expr = parse_expr_str("a + b == c * d").unwrap();
         match &expr.kind {
-            ExprKind::Binary { op: BinOp::Eq, left, right } => {
-                assert!(matches!(&left.kind, ExprKind::Binary { op: BinOp::Add, .. }));
-                assert!(matches!(&right.kind, ExprKind::Binary { op: BinOp::Mul, .. }));
+            ExprKind::Binary {
+                op: BinOp::Eq,
+                left,
+                right,
+            } => {
+                assert!(matches!(
+                    &left.kind,
+                    ExprKind::Binary { op: BinOp::Add, .. }
+                ));
+                assert!(matches!(
+                    &right.kind,
+                    ExprKind::Binary { op: BinOp::Mul, .. }
+                ));
             }
             other => panic!("expected Eq(Add(_,_), Mul(_,_)), got {:?}", other),
         }
@@ -1850,9 +1912,16 @@ mod tests {
         // a || b && c => Or(a, And(b, c))
         let expr = parse_expr_str("a || b && c").unwrap();
         match &expr.kind {
-            ExprKind::Binary { op: BinOp::Or, left, right } => {
+            ExprKind::Binary {
+                op: BinOp::Or,
+                left,
+                right,
+            } => {
                 assert!(matches!(&left.kind, ExprKind::Ident(_) | ExprKind::Path(_)));
-                assert!(matches!(&right.kind, ExprKind::Binary { op: BinOp::And, .. }));
+                assert!(matches!(
+                    &right.kind,
+                    ExprKind::Binary { op: BinOp::And, .. }
+                ));
             }
             other => panic!("expected Or(a, And(b,c)), got {:?}", other),
         }
@@ -1863,9 +1932,22 @@ mod tests {
         // -a + b => Add(Neg(a), b)
         let expr = parse_expr_str("-a + b").unwrap();
         match &expr.kind {
-            ExprKind::Binary { op: BinOp::Add, left, right } => {
-                assert!(matches!(&left.kind, ExprKind::Unary { op: UnaryOp::Neg, .. }));
-                assert!(matches!(&right.kind, ExprKind::Ident(_) | ExprKind::Path(_)));
+            ExprKind::Binary {
+                op: BinOp::Add,
+                left,
+                right,
+            } => {
+                assert!(matches!(
+                    &left.kind,
+                    ExprKind::Unary {
+                        op: UnaryOp::Neg,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    &right.kind,
+                    ExprKind::Ident(_) | ExprKind::Path(_)
+                ));
             }
             other => panic!("expected Add(Neg(a), b), got {:?}", other),
         }
@@ -1876,9 +1958,13 @@ mod tests {
         // a.b().c() => MethodCall(MethodCall(a, b, []), c, [])
         let expr = parse_expr_str("a.b().c()").unwrap();
         match &expr.kind {
-            ExprKind::MethodCall { receiver, method, .. } => {
+            ExprKind::MethodCall {
+                receiver, method, ..
+            } => {
                 assert_eq!(method.as_str(), "c");
-                assert!(matches!(&receiver.kind, ExprKind::MethodCall { method: inner_m, .. } if inner_m.as_str() == "b"));
+                assert!(
+                    matches!(&receiver.kind, ExprKind::MethodCall { method: inner_m, .. } if inner_m.as_str() == "b")
+                );
             }
             other => panic!("expected MethodCall(MethodCall(a,b),c), got {:?}", other),
         }
@@ -1902,9 +1988,22 @@ mod tests {
         // a = b = c => Assign(a, Assign(b, c))
         let expr = parse_expr_str("a = b = c").unwrap();
         match &expr.kind {
-            ExprKind::Assign { op: AssignOp::Assign, target, value } => {
-                assert!(matches!(&target.kind, ExprKind::Ident(_) | ExprKind::Path(_)));
-                assert!(matches!(&value.kind, ExprKind::Assign { op: AssignOp::Assign, .. }));
+            ExprKind::Assign {
+                op: AssignOp::Assign,
+                target,
+                value,
+            } => {
+                assert!(matches!(
+                    &target.kind,
+                    ExprKind::Ident(_) | ExprKind::Path(_)
+                ));
+                assert!(matches!(
+                    &value.kind,
+                    ExprKind::Assign {
+                        op: AssignOp::Assign,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected Assign(a, Assign(b, c)), got {:?}", other),
         }
@@ -1915,9 +2014,19 @@ mod tests {
         // 10 - 3 - 2 => Sub(Sub(10, 3), 2)
         let expr = parse_expr_str("10 - 3 - 2").unwrap();
         match &expr.kind {
-            ExprKind::Binary { op: BinOp::Sub, left, right } => {
-                assert!(matches!(&left.kind, ExprKind::Binary { op: BinOp::Sub, .. }));
-                assert!(matches!(&right.kind, ExprKind::Literal(Literal::Int { value: 2, .. })));
+            ExprKind::Binary {
+                op: BinOp::Sub,
+                left,
+                right,
+            } => {
+                assert!(matches!(
+                    &left.kind,
+                    ExprKind::Binary { op: BinOp::Sub, .. }
+                ));
+                assert!(matches!(
+                    &right.kind,
+                    ExprKind::Literal(Literal::Int { value: 2, .. })
+                ));
             }
             other => panic!("expected Sub(Sub(10,3), 2), got {:?}", other),
         }
@@ -1928,9 +2037,19 @@ mod tests {
         // 6 * 2 / 3 => Div(Mul(6, 2), 3)
         let expr = parse_expr_str("6 * 2 / 3").unwrap();
         match &expr.kind {
-            ExprKind::Binary { op: BinOp::Div, left, right } => {
-                assert!(matches!(&left.kind, ExprKind::Binary { op: BinOp::Mul, .. }));
-                assert!(matches!(&right.kind, ExprKind::Literal(Literal::Int { value: 3, .. })));
+            ExprKind::Binary {
+                op: BinOp::Div,
+                left,
+                right,
+            } => {
+                assert!(matches!(
+                    &left.kind,
+                    ExprKind::Binary { op: BinOp::Mul, .. }
+                ));
+                assert!(matches!(
+                    &right.kind,
+                    ExprKind::Literal(Literal::Int { value: 3, .. })
+                ));
             }
             other => panic!("expected Div(Mul(6,2), 3), got {:?}", other),
         }
@@ -1941,9 +2060,19 @@ mod tests {
         // a | b & c => BitOr(a, BitAnd(b, c))
         let expr = parse_expr_str("a | b & c").unwrap();
         match &expr.kind {
-            ExprKind::Binary { op: BinOp::BitOr, left, right } => {
+            ExprKind::Binary {
+                op: BinOp::BitOr,
+                left,
+                right,
+            } => {
                 assert!(matches!(&left.kind, ExprKind::Ident(_) | ExprKind::Path(_)));
-                assert!(matches!(&right.kind, ExprKind::Binary { op: BinOp::BitAnd, .. }));
+                assert!(matches!(
+                    &right.kind,
+                    ExprKind::Binary {
+                        op: BinOp::BitAnd,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected BitOr(a, BitAnd(b,c)), got {:?}", other),
         }
@@ -1957,8 +2086,15 @@ mod tests {
     fn if_else_parses() {
         let expr = parse_expr_str("if x { 1 } else { 2 }").unwrap();
         match &expr.kind {
-            ExprKind::If { condition, then_branch, else_branch } => {
-                assert!(matches!(&condition.kind, ExprKind::Ident(_) | ExprKind::Path(_)));
+            ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                assert!(matches!(
+                    &condition.kind,
+                    ExprKind::Ident(_) | ExprKind::Path(_)
+                ));
                 assert!(!then_branch.stmts.is_empty() || then_branch.stmts.is_empty());
                 assert!(else_branch.is_some());
             }
@@ -1972,7 +2108,10 @@ mod tests {
         match &expr.kind {
             ExprKind::Closure { params, body, .. } => {
                 assert_eq!(params.len(), 2);
-                assert!(matches!(&body.kind, ExprKind::Binary { op: BinOp::Add, .. }));
+                assert!(matches!(
+                    &body.kind,
+                    ExprKind::Binary { op: BinOp::Add, .. }
+                ));
             }
             other => panic!("expected Closure, got {:?}", other),
         }
@@ -1990,11 +2129,16 @@ mod tests {
                 assert!(matches!(&args[0].kind, ExprKind::Call { .. }));
                 // Second arg: h(y, z) — a Call with 2 args
                 match &args[1].kind {
-                    ExprKind::Call { args: inner_args, .. } => assert_eq!(inner_args.len(), 2),
+                    ExprKind::Call {
+                        args: inner_args, ..
+                    } => assert_eq!(inner_args.len(), 2),
                     other => panic!("expected Call for h(y,z), got {:?}", other),
                 }
             }
-            other => panic!("expected Call(f, [Call(g,..), Call(h,..)]), got {:?}", other),
+            other => panic!(
+                "expected Call(f, [Call(g,..), Call(h,..)]), got {:?}",
+                other
+            ),
         }
     }
 
@@ -2011,7 +2155,11 @@ mod tests {
     fn range_expression() {
         let expr = parse_expr_str("0..10").unwrap();
         match &expr.kind {
-            ExprKind::Range { start, end, inclusive } => {
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => {
                 assert!(start.is_some());
                 assert!(end.is_some());
                 assert!(!inclusive);
@@ -2024,8 +2172,14 @@ mod tests {
     fn unary_not() {
         let expr = parse_expr_str("!flag").unwrap();
         match &expr.kind {
-            ExprKind::Unary { op: UnaryOp::Not, expr: inner } => {
-                assert!(matches!(&inner.kind, ExprKind::Ident(_) | ExprKind::Path(_)));
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                expr: inner,
+            } => {
+                assert!(matches!(
+                    &inner.kind,
+                    ExprKind::Ident(_) | ExprKind::Path(_)
+                ));
             }
             other => panic!("expected Not(flag), got {:?}", other),
         }
@@ -2036,14 +2190,21 @@ mod tests {
         // (1 + 2) * 3 => Mul(Paren(Add(1,2)), 3) or Mul(Add(1,2), 3)
         let expr = parse_expr_str("(1 + 2) * 3").unwrap();
         match &expr.kind {
-            ExprKind::Binary { op: BinOp::Mul, left, right } => {
+            ExprKind::Binary {
+                op: BinOp::Mul,
+                left,
+                right,
+            } => {
                 // The LHS is the parenthesized add (may be wrapped in Paren)
                 let inner = match &left.kind {
                     ExprKind::Paren(inner) => &inner.kind,
                     other => other,
                 };
                 assert!(matches!(inner, ExprKind::Binary { op: BinOp::Add, .. }));
-                assert!(matches!(&right.kind, ExprKind::Literal(Literal::Int { value: 3, .. })));
+                assert!(matches!(
+                    &right.kind,
+                    ExprKind::Literal(Literal::Int { value: 3, .. })
+                ));
             }
             other => panic!("expected Mul(Add(1,2), 3), got {:?}", other),
         }

@@ -262,7 +262,8 @@ impl PrettyPrinter {
                 }
             }
             Doc::Group(d) => {
-                let group_flat = flat || self.fits(d, self.config.max_line_length - self.column, true);
+                let group_flat =
+                    flat || self.fits(d, self.config.max_line_length - self.column, true);
                 self.print_doc(d, group_flat);
             }
             Doc::Nest(n, d) => {
@@ -316,7 +317,11 @@ impl PrettyPrinter {
         }
 
         self.output.push_str(self.config.newline_str());
-        self.output.push_str(&self.config.indent_at(self.indent / self.config.indent_width));
+        self.output.push_str(
+            &self
+                .config
+                .indent_at(self.indent / self.config.indent_width),
+        );
         self.column = self.indent;
     }
 
@@ -440,11 +445,7 @@ mod tests {
     fn test_concat() {
         let config = FormatConfig::default();
         let mut printer = PrettyPrinter::new(config);
-        let doc = Doc::concat(vec![
-            Doc::text("hello"),
-            Doc::text(" "),
-            Doc::text("world"),
-        ]);
+        let doc = Doc::concat(vec![Doc::text("hello"), Doc::text(" "), Doc::text("world")]);
         let result = printer.print(&doc);
         assert_eq!(result.trim(), "hello world");
     }
@@ -470,10 +471,7 @@ mod tests {
         let mut printer = PrettyPrinter::new(config);
         let doc = Doc::concat(vec![
             Doc::text("{"),
-            Doc::nest(
-                4,
-                Doc::concat(vec![Doc::hard_line(), Doc::text("body")]),
-            ),
+            Doc::nest(4, Doc::concat(vec![Doc::hard_line(), Doc::text("body")])),
             Doc::hard_line(),
             Doc::text("}"),
         ]);

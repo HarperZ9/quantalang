@@ -21,7 +21,7 @@
 
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 // =============================================================================
@@ -215,8 +215,7 @@ pub fn rc_alloc(type_info: &'static TypeInfo) -> NonNull<RcHeader> {
     let total_size = data_offset + type_info.size;
     let total_align = header_align.max(type_info.align);
 
-    let layout = Layout::from_size_align(total_size, total_align)
-        .expect("Invalid layout");
+    let layout = Layout::from_size_align(total_size, total_align).expect("Invalid layout");
 
     // Allocate memory
     let ptr = unsafe { alloc(layout) };
@@ -293,8 +292,7 @@ pub fn rc_dec_weak(header: NonNull<RcHeader>) {
         let total_size = data_offset + type_info.size;
         let total_align = header_align.max(type_info.align);
 
-        let layout = Layout::from_size_align(total_size, total_align)
-            .expect("Invalid layout");
+        let layout = Layout::from_size_align(total_size, total_align).expect("Invalid layout");
 
         unsafe {
             dealloc(header.as_ptr() as *mut u8, layout);

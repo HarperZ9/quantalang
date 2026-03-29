@@ -120,7 +120,9 @@ impl BorrowState {
     /// Leave a scope — returns borrows that are dying (created in this scope)
     /// so the caller can check for dangling references.
     pub fn pop_scope(&mut self) -> Vec<BorrowEntry> {
-        let dying: Vec<BorrowEntry> = self.borrows.iter()
+        let dying: Vec<BorrowEntry> = self
+            .borrows
+            .iter()
             .filter(|b| b.scope_depth >= self.scope_depth)
             .cloned()
             .collect();
@@ -130,7 +132,12 @@ impl BorrowState {
     }
 
     /// Record a new borrow of a variable.
-    pub fn add_borrow(&mut self, variable: Arc<str>, binding: Option<Arc<str>>, is_mut: bool) -> LifetimeKind {
+    pub fn add_borrow(
+        &mut self,
+        variable: Arc<str>,
+        binding: Option<Arc<str>>,
+        is_mut: bool,
+    ) -> LifetimeKind {
         let lifetime = LifetimeKind::Var(LifetimeVarId::fresh());
         self.borrows.push(BorrowEntry {
             variable,
@@ -144,7 +151,9 @@ impl BorrowState {
 
     /// Check if a variable has an active mutable borrow.
     pub fn has_mut_borrow(&self, variable: &str) -> bool {
-        self.borrows.iter().any(|b| b.variable.as_ref() == variable && b.is_mut)
+        self.borrows
+            .iter()
+            .any(|b| b.variable.as_ref() == variable && b.is_mut)
     }
 
     /// Check if a variable has any active borrow (shared or mutable).
@@ -154,12 +163,16 @@ impl BorrowState {
 
     /// Get all active borrows of a variable.
     pub fn borrows_of(&self, variable: &str) -> Vec<&BorrowEntry> {
-        self.borrows.iter().filter(|b| b.variable.as_ref() == variable).collect()
+        self.borrows
+            .iter()
+            .filter(|b| b.variable.as_ref() == variable)
+            .collect()
     }
 
     /// Add a constraint: `longer` must outlive `shorter`.
     pub fn add_outlives(&mut self, longer: LifetimeKind, shorter: LifetimeKind) {
-        self.constraints.push(OutlivesConstraint { longer, shorter });
+        self.constraints
+            .push(OutlivesConstraint { longer, shorter });
     }
 
     /// Current scope depth.
@@ -189,7 +202,10 @@ pub struct Ty {
 impl Ty {
     /// Create a new type.
     pub fn new(kind: TyKind) -> Self {
-        Self { kind, annotations: Vec::new() }
+        Self {
+            kind,
+            annotations: Vec::new(),
+        }
     }
 
     /// Create a type with annotations (e.g., `with ColorSpace<Linear>`).
@@ -284,7 +300,11 @@ impl Ty {
     }
 
     /// Create a function type with an effect row.
-    pub fn function_with_effects(params: Vec<Ty>, ret: Ty, effects: super::effects::EffectRow) -> Self {
+    pub fn function_with_effects(
+        params: Vec<Ty>,
+        ret: Ty,
+        effects: super::effects::EffectRow,
+    ) -> Self {
         Self::new(TyKind::Fn(FnTy {
             params,
             ret: Box::new(ret),
@@ -349,16 +369,19 @@ impl Ty {
     pub fn has_vars(&self) -> bool {
         match &self.kind {
             TyKind::Var(_) => true,
-            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char
-            | TyKind::Str | TyKind::Never | TyKind::Error => false,
+            TyKind::Int(_)
+            | TyKind::Float(_)
+            | TyKind::Bool
+            | TyKind::Char
+            | TyKind::Str
+            | TyKind::Never
+            | TyKind::Error => false,
             TyKind::Tuple(elems) => elems.iter().any(|t| t.has_vars()),
             TyKind::Array(elem, _) => elem.has_vars(),
             TyKind::Slice(elem) => elem.has_vars(),
             TyKind::Ref(_, _, ty) => ty.has_vars(),
             TyKind::Ptr(_, ty) => ty.has_vars(),
-            TyKind::Fn(fn_ty) => {
-                fn_ty.params.iter().any(|t| t.has_vars()) || fn_ty.ret.has_vars()
-            }
+            TyKind::Fn(fn_ty) => fn_ty.params.iter().any(|t| t.has_vars()) || fn_ty.ret.has_vars(),
             TyKind::Adt(_, substs) => substs.iter().any(|t| t.has_vars()),
             TyKind::Param(_, _) => false,
             TyKind::Projection { .. } => true, // Projections need resolution
@@ -401,7 +424,9 @@ impl Ty {
                     subst.collect_vars(vars);
                 }
             }
-            TyKind::Projection { self_ty, substs, .. } => {
+            TyKind::Projection {
+                self_ty, substs, ..
+            } => {
                 self_ty.collect_vars(vars);
                 for subst in substs {
                     subst.collect_vars(vars);
@@ -424,41 +449,35 @@ impl Ty {
                     return self.clone();
                 }
             }
-            TyKind::Tuple(elems) => {
-                Ty::tuple(elems.iter().map(|t| t.substitute(subst)).collect())
-            }
-            TyKind::Array(elem, len) => {
-                Ty::array(elem.substitute(subst), *len)
-            }
-            TyKind::Slice(elem) => {
-                Ty::slice(elem.substitute(subst))
-            }
+            TyKind::Tuple(elems) => Ty::tuple(elems.iter().map(|t| t.substitute(subst)).collect()),
+            TyKind::Array(elem, len) => Ty::array(elem.substitute(subst), *len),
+            TyKind::Slice(elem) => Ty::slice(elem.substitute(subst)),
             TyKind::Ref(lifetime, mutability, ty) => {
                 Ty::reference(lifetime.clone(), *mutability, ty.substitute(subst))
             }
-            TyKind::Ptr(mutability, ty) => {
-                Ty::ptr(*mutability, ty.substitute(subst))
-            }
-            TyKind::Fn(fn_ty) => {
-                Ty::new(TyKind::Fn(FnTy {
-                    params: fn_ty.params.iter().map(|t| t.substitute(subst)).collect(),
-                    ret: Box::new(fn_ty.ret.substitute(subst)),
-                    is_unsafe: fn_ty.is_unsafe,
-                    abi: fn_ty.abi.clone(),
-                    effects: fn_ty.effects.clone(),
-                }))
-            }
-            TyKind::Adt(def_id, substs) => {
-                Ty::adt(*def_id, substs.iter().map(|t| t.substitute(subst)).collect())
-            }
-            TyKind::Projection { trait_ref, item, self_ty, substs } => {
-                Ty::new(TyKind::Projection {
-                    trait_ref: trait_ref.clone(),
-                    item: item.clone(),
-                    self_ty: Box::new(self_ty.substitute(subst)),
-                    substs: substs.iter().map(|t| t.substitute(subst)).collect(),
-                })
-            }
+            TyKind::Ptr(mutability, ty) => Ty::ptr(*mutability, ty.substitute(subst)),
+            TyKind::Fn(fn_ty) => Ty::new(TyKind::Fn(FnTy {
+                params: fn_ty.params.iter().map(|t| t.substitute(subst)).collect(),
+                ret: Box::new(fn_ty.ret.substitute(subst)),
+                is_unsafe: fn_ty.is_unsafe,
+                abi: fn_ty.abi.clone(),
+                effects: fn_ty.effects.clone(),
+            })),
+            TyKind::Adt(def_id, substs) => Ty::adt(
+                *def_id,
+                substs.iter().map(|t| t.substitute(subst)).collect(),
+            ),
+            TyKind::Projection {
+                trait_ref,
+                item,
+                self_ty,
+                substs,
+            } => Ty::new(TyKind::Projection {
+                trait_ref: trait_ref.clone(),
+                item: item.clone(),
+                self_ty: Box::new(self_ty.substitute(subst)),
+                substs: substs.iter().map(|t| t.substitute(subst)).collect(),
+            }),
             TyKind::Infer(infer) => {
                 if let Some(ty) = subst.get(infer.var) {
                     ty.substitute(subst)
@@ -562,12 +581,22 @@ impl fmt::Display for Ty {
                 Ok(())
             }
             TyKind::Param(name, _) => write!(f, "{}", name),
-            TyKind::Projection { trait_ref, item, .. } => {
+            TyKind::Projection {
+                trait_ref, item, ..
+            } => {
                 write!(f, "<{} as {}>::{}", trait_ref, trait_ref, item)
             }
             TyKind::Infer(infer) => write!(f, "?{}", infer.var.0),
             TyKind::TraitObject(bounds) => {
-                write!(f, "dyn {}", bounds.iter().map(|b| b.as_ref()).collect::<Vec<_>>().join(" + "))
+                write!(
+                    f,
+                    "dyn {}",
+                    bounds
+                        .iter()
+                        .map(|b| b.as_ref())
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                )
             }
             TyKind::Error => write!(f, "{{error}}"),
         }?;
@@ -597,7 +626,6 @@ pub enum TyKind {
     // =========================================================================
     // TYPE VARIABLES
     // =========================================================================
-
     /// A type variable (for inference).
     Var(TyVarId),
 
@@ -607,7 +635,6 @@ pub enum TyKind {
     // =========================================================================
     // PRIMITIVE TYPES
     // =========================================================================
-
     /// Integer types.
     Int(IntTy),
 
@@ -629,7 +656,6 @@ pub enum TyKind {
     // =========================================================================
     // COMPOUND TYPES
     // =========================================================================
-
     /// Tuple type.
     Tuple(Vec<Ty>),
 
@@ -651,7 +677,6 @@ pub enum TyKind {
     // =========================================================================
     // USER-DEFINED TYPES
     // =========================================================================
-
     /// Algebraic data type (struct, enum, union).
     Adt(DefId, Vec<Ty>),
 
@@ -669,14 +694,12 @@ pub enum TyKind {
     // =========================================================================
     // TRAIT OBJECTS
     // =========================================================================
-
     /// Trait object: `dyn Trait`
     TraitObject(Vec<Arc<str>>),
 
     // =========================================================================
     // SPECIAL
     // =========================================================================
-
     /// Error type (for error recovery).
     Error,
 }
@@ -684,14 +707,27 @@ pub enum TyKind {
 /// Integer types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntTy {
-    I8, I16, I32, I64, I128, Isize,
-    U8, U16, U32, U64, U128, Usize,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    Isize,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    Usize,
 }
 
 impl IntTy {
     /// Check if this is a signed integer type.
     pub fn is_signed(&self) -> bool {
-        matches!(self, IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::I128 | IntTy::Isize)
+        matches!(
+            self,
+            IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::I128 | IntTy::Isize
+        )
     }
 
     /// Get the bit width (None for isize/usize).
@@ -729,7 +765,9 @@ impl fmt::Display for IntTy {
 /// Floating-point types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FloatTy {
-    F16, F32, F64,
+    F16,
+    F32,
+    F64,
 }
 
 impl fmt::Display for FloatTy {
@@ -805,7 +843,10 @@ impl DefId {
     }
 
     /// A dummy DefId for testing.
-    pub const DUMMY: Self = Self { krate: 0, index: u32::MAX };
+    pub const DUMMY: Self = Self {
+        krate: 0,
+        index: u32::MAX,
+    };
 }
 
 impl fmt::Display for DefId {
@@ -903,7 +944,10 @@ pub struct TypeScheme {
 impl TypeScheme {
     /// Create a monomorphic type scheme.
     pub fn mono(ty: Ty) -> Self {
-        Self { vars: Vec::new(), ty }
+        Self {
+            vars: Vec::new(),
+            ty,
+        }
     }
 
     /// Create a polymorphic type scheme.
@@ -942,8 +986,14 @@ mod tests {
         assert_eq!(format!("{}", Ty::bool()), "bool");
         assert_eq!(format!("{}", Ty::unit()), "()");
         assert_eq!(format!("{}", Ty::never()), "!");
-        assert_eq!(format!("{}", Ty::tuple(vec![Ty::int(IntTy::I32), Ty::bool()])), "(i32, bool)");
-        assert_eq!(format!("{}", Ty::array(Ty::int(IntTy::I32), 10)), "[i32; 10]");
+        assert_eq!(
+            format!("{}", Ty::tuple(vec![Ty::int(IntTy::I32), Ty::bool()])),
+            "(i32, bool)"
+        );
+        assert_eq!(
+            format!("{}", Ty::array(Ty::int(IntTy::I32), 10)),
+            "[i32; 10]"
+        );
         assert_eq!(format!("{}", Ty::slice(Ty::int(IntTy::I32))), "[i32]");
     }
 
@@ -962,10 +1012,7 @@ mod tests {
     #[test]
     fn test_type_scheme() {
         let v1 = TyVarId::fresh();
-        let scheme = TypeScheme::poly(
-            vec![v1],
-            Ty::function(vec![Ty::var(v1)], Ty::var(v1)),
-        );
+        let scheme = TypeScheme::poly(vec![v1], Ty::function(vec![Ty::var(v1)], Ty::var(v1)));
 
         let ty1 = scheme.instantiate();
         let ty2 = scheme.instantiate();

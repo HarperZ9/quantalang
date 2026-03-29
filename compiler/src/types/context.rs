@@ -304,14 +304,39 @@ impl TypeContext {
     /// Called during check_module AFTER user types are collected.
     pub fn register_builtin_traits(&mut self) {
         let common_traits = [
-            "Default", "Display", "Debug", "Clone", "Copy",
-            "PartialEq", "Eq", "PartialOrd", "Ord", "Hash",
-            "Send", "Sync", "Sized", "Drop",
-            "Iterator", "IntoIterator", "FromIterator",
-            "From", "Into", "TryFrom", "TryInto",
-            "AsRef", "AsMut", "Deref", "DerefMut",
-            "Add", "Sub", "Mul", "Div", "Rem", "Neg",
-            "Serialize", "Deserialize",
+            "Default",
+            "Display",
+            "Debug",
+            "Clone",
+            "Copy",
+            "PartialEq",
+            "Eq",
+            "PartialOrd",
+            "Ord",
+            "Hash",
+            "Send",
+            "Sync",
+            "Sized",
+            "Drop",
+            "Iterator",
+            "IntoIterator",
+            "FromIterator",
+            "From",
+            "Into",
+            "TryFrom",
+            "TryInto",
+            "AsRef",
+            "AsMut",
+            "Deref",
+            "DerefMut",
+            "Add",
+            "Sub",
+            "Mul",
+            "Div",
+            "Rem",
+            "Neg",
+            "Serialize",
+            "Deserialize",
         ];
         for name in &common_traits {
             // Only register if not already defined by user code
@@ -354,7 +379,10 @@ impl TypeContext {
 
     /// Get the current scope kind.
     pub fn current_scope_kind(&self) -> ScopeKind {
-        self.scopes.last().map(|s| s.kind).unwrap_or(ScopeKind::Module)
+        self.scopes
+            .last()
+            .map(|s| s.kind)
+            .unwrap_or(ScopeKind::Module)
     }
 
     /// Check if we're inside a loop.
@@ -512,7 +540,11 @@ impl TypeContext {
             if matches && impl_.methods.contains_key(method_name) {
                 // Look up the method signature from the trait definition
                 if let Some(trait_def) = self.traits.get(&impl_.trait_id) {
-                    if let Some(method) = trait_def.methods.iter().find(|m| m.name.as_ref() == method_name) {
+                    if let Some(method) = trait_def
+                        .methods
+                        .iter()
+                        .find(|m| m.name.as_ref() == method_name)
+                    {
                         return Some(method);
                     }
                 }
@@ -527,7 +559,12 @@ impl TypeContext {
 
     /// Register an inherent method on a user-defined type.
     /// This is used for `impl Type { fn method(...) }` without a trait.
-    pub fn register_inherent_method(&mut self, type_name: Arc<str>, method_name: Arc<str>, sig: FnSig) {
+    pub fn register_inherent_method(
+        &mut self,
+        type_name: Arc<str>,
+        method_name: Arc<str>,
+        sig: FnSig,
+    ) {
         self.inherent_methods.insert(
             (type_name, method_name.clone()),
             TraitMethod {
@@ -539,8 +576,13 @@ impl TypeContext {
     }
 
     /// Look up an inherent method on a type by name.
-    pub fn lookup_inherent_method(&self, type_name: &str, method_name: &str) -> Option<&TraitMethod> {
-        self.inherent_methods.get(&(Arc::from(type_name), Arc::from(method_name)))
+    pub fn lookup_inherent_method(
+        &self,
+        type_name: &str,
+        method_name: &str,
+    ) -> Option<&TraitMethod> {
+        self.inherent_methods
+            .get(&(Arc::from(type_name), Arc::from(method_name)))
     }
 
     /// Find the type name that has an inherent method with the given name.
@@ -579,7 +621,11 @@ impl TypeContext {
             // Find the trait definition by name
             if let Some(trait_def) = self.lookup_trait_by_name(trait_name) {
                 // Search the trait's methods
-                if let Some(method) = trait_def.methods.iter().find(|m| m.name.as_ref() == method_name) {
+                if let Some(method) = trait_def
+                    .methods
+                    .iter()
+                    .find(|m| m.name.as_ref() == method_name)
+                {
                     return Some(method);
                 }
             }
@@ -592,20 +638,26 @@ impl TypeContext {
     // =========================================================================
 
     /// Register a module's exported bindings for use-statement resolution.
-    pub fn register_module_bindings(&mut self, name: Arc<str>, bindings: HashMap<Arc<str>, TypeScheme>) {
+    pub fn register_module_bindings(
+        &mut self,
+        name: Arc<str>,
+        bindings: HashMap<Arc<str>, TypeScheme>,
+    ) {
         self.module_bindings.insert(name, bindings);
     }
 
     /// Look up a binding in a named module.
     pub fn lookup_module_binding(&self, module: &str, name: &str) -> Option<Ty> {
-        self.module_bindings.get(module)?
+        self.module_bindings
+            .get(module)?
             .get(name)
             .map(|scheme| scheme.instantiate())
     }
 
     /// Return a clone of the current scope's variable bindings.
     pub fn current_scope_bindings(&self) -> HashMap<Arc<str>, TypeScheme> {
-        self.scopes.last()
+        self.scopes
+            .last()
             .map(|s| s.bindings.clone())
             .unwrap_or_default()
     }
@@ -653,10 +705,7 @@ impl TypeContext {
         let free_in_ty = ty.free_vars();
         let free_in_env = self.free_vars_in_env();
 
-        let vars: Vec<_> = free_in_ty
-            .difference(&free_in_env)
-            .cloned()
-            .collect();
+        let vars: Vec<_> = free_in_ty.difference(&free_in_env).cloned().collect();
 
         TypeScheme::poly(vars, ty.clone())
     }

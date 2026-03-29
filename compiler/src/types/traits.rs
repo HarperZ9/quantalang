@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::ty::*;
 use super::error::{TypeError, TypeResult};
+use super::ty::*;
 
 // =============================================================================
 // TRAIT DEFINITIONS
@@ -157,7 +157,10 @@ impl TraitRef {
 
     /// Create a trait reference with no type arguments.
     pub fn simple(trait_id: TraitId) -> Self {
-        Self { trait_id, substs: Vec::new() }
+        Self {
+            trait_id,
+            substs: Vec::new(),
+        }
     }
 }
 
@@ -272,10 +275,7 @@ impl TraitEnv {
         } else {
             // Inherent impl
             if let TyKind::Adt(def_id, _) = &def.self_ty.kind {
-                self.inherent_impls
-                    .entry(*def_id)
-                    .or_default()
-                    .push(id);
+                self.inherent_impls.entry(*def_id).or_default().push(id);
             }
         }
         self.impls.insert(id, def);
@@ -283,7 +283,9 @@ impl TraitEnv {
 
     /// Look up a trait by name.
     pub fn lookup_trait(&self, name: &str) -> Option<&TraitDef> {
-        self.trait_names.get(name).and_then(|id| self.traits.get(id))
+        self.trait_names
+            .get(name)
+            .and_then(|id| self.traits.get(id))
     }
 
     /// Look up a trait by ID.
@@ -382,27 +384,35 @@ impl<'env> TraitResolver<'env> {
             (TyKind::Str, TyKind::Str) => true,
 
             (TyKind::Tuple(e1), TyKind::Tuple(e2)) => {
-                e1.len() == e2.len() && e1.iter().zip(e2.iter()).all(|(a, b)| self.types_unify(a, b))
+                e1.len() == e2.len()
+                    && e1
+                        .iter()
+                        .zip(e2.iter())
+                        .all(|(a, b)| self.types_unify(a, b))
             }
-            (TyKind::Array(e1, l1), TyKind::Array(e2, l2)) => {
-                l1 == l2 && self.types_unify(e1, e2)
-            }
+            (TyKind::Array(e1, l1), TyKind::Array(e2, l2)) => l1 == l2 && self.types_unify(e1, e2),
             (TyKind::Slice(e1), TyKind::Slice(e2)) => self.types_unify(e1, e2),
             (TyKind::Ref(_, m1, t1), TyKind::Ref(_, m2, t2)) => {
                 m1 == m2 && self.types_unify(t1, t2)
             }
-            (TyKind::Ptr(m1, t1), TyKind::Ptr(m2, t2)) => {
-                m1 == m2 && self.types_unify(t1, t2)
-            }
+            (TyKind::Ptr(m1, t1), TyKind::Ptr(m2, t2)) => m1 == m2 && self.types_unify(t1, t2),
             (TyKind::Fn(f1), TyKind::Fn(f2)) => {
                 f1.params.len() == f2.params.len()
                     && f1.is_unsafe == f2.is_unsafe
-                    && f1.params.iter().zip(f2.params.iter()).all(|(a, b)| self.types_unify(a, b))
+                    && f1
+                        .params
+                        .iter()
+                        .zip(f2.params.iter())
+                        .all(|(a, b)| self.types_unify(a, b))
                     && self.types_unify(&f1.ret, &f2.ret)
             }
             (TyKind::Adt(d1, a1), TyKind::Adt(d2, a2)) => {
-                d1 == d2 && a1.len() == a2.len()
-                    && a1.iter().zip(a2.iter()).all(|(a, b)| self.types_unify(a, b))
+                d1 == d2
+                    && a1.len() == a2.len()
+                    && a1
+                        .iter()
+                        .zip(a2.iter())
+                        .all(|(a, b)| self.types_unify(a, b))
             }
             (TyKind::Param(n1, _), TyKind::Param(n2, _)) => n1 == n2,
 
@@ -420,22 +430,26 @@ impl<'env> TraitResolver<'env> {
         trait_id: TraitId,
         assoc_name: &str,
     ) -> TypeResult<Ty> {
-        let impl_id = self.resolve_impl(ty, trait_id).ok_or_else(|| {
-            TypeError::TraitNotImplemented {
-                ty: ty.clone(),
-                trait_id,
-            }
-        })?;
+        let impl_id =
+            self.resolve_impl(ty, trait_id)
+                .ok_or_else(|| TypeError::TraitNotImplemented {
+                    ty: ty.clone(),
+                    trait_id,
+                })?;
 
-        let impl_def = self.env.impls.get(&impl_id).ok_or_else(|| {
-            TypeError::InternalError("impl not found".into())
-        })?;
+        let impl_def = self
+            .env
+            .impls
+            .get(&impl_id)
+            .ok_or_else(|| TypeError::InternalError("impl not found".into()))?;
 
-        impl_def.assoc_types.get(assoc_name).cloned().ok_or_else(|| {
-            TypeError::AssociatedTypeNotDefined {
+        impl_def
+            .assoc_types
+            .get(assoc_name)
+            .cloned()
+            .ok_or_else(|| TypeError::AssociatedTypeNotDefined {
                 assoc_name: assoc_name.to_string(),
-            }
-        })
+            })
     }
 
     /// Resolve a method.
@@ -517,11 +531,14 @@ impl BuiltinTraits {
                 id,
                 name: name.into(),
                 type_params: Vec::new(),
-                assoc_types: assoc_types.into_iter().map(|n| AssocTypeDef {
-                    name: n.into(),
-                    bounds: Vec::new(),
-                    default: None,
-                }).collect(),
+                assoc_types: assoc_types
+                    .into_iter()
+                    .map(|n| AssocTypeDef {
+                        name: n.into(),
+                        bounds: Vec::new(),
+                        default: None,
+                    })
+                    .collect(),
                 assoc_consts: Vec::new(),
                 required_methods: Vec::new(),
                 provided_methods: Vec::new(),

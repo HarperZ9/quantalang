@@ -9,8 +9,8 @@
 //! This module defines all the token types that can be produced by the lexer,
 //! including literals, keywords, operators, and delimiters.
 
-use std::fmt;
 use super::span::Span;
+use std::fmt;
 
 /// A token produced by the lexer.
 #[derive(Debug, Clone, PartialEq)]
@@ -131,11 +131,7 @@ impl Token {
 
             TokenKind::Keyword(kw) => matches!(
                 kw,
-                Keyword::Ref
-                    | Keyword::Mut
-                    | Keyword::True
-                    | Keyword::False
-                    | Keyword::Box
+                Keyword::Ref | Keyword::Mut | Keyword::True | Keyword::False | Keyword::Box
             ),
 
             _ => false,
@@ -155,7 +151,6 @@ pub enum TokenKind {
     // =========================================================================
     // LITERALS
     // =========================================================================
-
     /// A literal value (integer, float, string, char, etc.)
     Literal {
         kind: LiteralKind,
@@ -166,7 +161,6 @@ pub enum TokenKind {
     // =========================================================================
     // IDENTIFIERS
     // =========================================================================
-
     /// An identifier (variable name, function name, etc.)
     Ident,
 
@@ -182,14 +176,12 @@ pub enum TokenKind {
     // =========================================================================
     // KEYWORDS
     // =========================================================================
-
     /// A keyword
     Keyword(Keyword),
 
     // =========================================================================
     // OPERATORS - ARITHMETIC
     // =========================================================================
-
     /// `+`
     Plus,
     /// `-`
@@ -206,7 +198,6 @@ pub enum TokenKind {
     // =========================================================================
     // OPERATORS - BITWISE
     // =========================================================================
-
     /// `&`
     And,
     /// `|`
@@ -221,7 +212,6 @@ pub enum TokenKind {
     // =========================================================================
     // OPERATORS - LOGICAL
     // =========================================================================
-
     /// `&&`
     AndAnd,
     /// `||`
@@ -232,7 +222,6 @@ pub enum TokenKind {
     // =========================================================================
     // OPERATORS - COMPARISON
     // =========================================================================
-
     /// `==`
     EqEq,
     /// `!=`
@@ -249,7 +238,6 @@ pub enum TokenKind {
     // =========================================================================
     // OPERATORS - ASSIGNMENT
     // =========================================================================
-
     /// `=`
     Eq,
     /// `+=`
@@ -276,7 +264,6 @@ pub enum TokenKind {
     // =========================================================================
     // OPERATORS - SPECIAL
     // =========================================================================
-
     /// `->`
     Arrow,
     /// `=>`
@@ -295,7 +282,6 @@ pub enum TokenKind {
     // =========================================================================
     // DELIMITERS
     // =========================================================================
-
     /// Opening delimiter: `(`, `[`, `{`
     OpenDelim(Delimiter),
     /// Closing delimiter: `)`, `]`, `}`
@@ -304,7 +290,6 @@ pub enum TokenKind {
     // =========================================================================
     // PUNCTUATION
     // =========================================================================
-
     /// `.`
     Dot,
     /// `,`
@@ -325,7 +310,6 @@ pub enum TokenKind {
     // =========================================================================
     // SPECIAL TOKENS
     // =========================================================================
-
     /// End of file
     Eof,
 
@@ -660,8 +644,7 @@ impl IntBase {
 
 /// Valid integer type suffixes.
 pub const INTEGER_SUFFIXES: &[&str] = &[
-    "i8", "i16", "i32", "i64", "i128", "isize",
-    "u8", "u16", "u32", "u64", "u128", "usize",
+    "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
 ];
 
 /// Valid floating-point type suffixes.
@@ -669,9 +652,8 @@ pub const FLOAT_SUFFIXES: &[&str] = &["f32", "f64"];
 
 /// All valid numeric suffixes.
 pub const NUMERIC_SUFFIXES: &[&str] = &[
-    "i8", "i16", "i32", "i64", "i128", "isize",
-    "u8", "u16", "u32", "u64", "u128", "usize",
-    "f32", "f64",
+    "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32",
+    "f64",
 ];
 
 /// Numeric suffix kind.
@@ -822,27 +804,43 @@ pub struct DocComment {
 impl DocComment {
     /// Create a new documentation comment.
     pub fn new(kind: DocCommentKind, content: String, span: Span) -> Self {
-        Self { kind, content, span }
+        Self {
+            kind,
+            content,
+            span,
+        }
     }
 
     /// Check if this is an inner doc comment (`//!` or `/*!`).
     pub fn is_inner(&self) -> bool {
-        matches!(self.kind, DocCommentKind::InnerLine | DocCommentKind::InnerBlock)
+        matches!(
+            self.kind,
+            DocCommentKind::InnerLine | DocCommentKind::InnerBlock
+        )
     }
 
     /// Check if this is an outer doc comment (`///` or `/**`).
     pub fn is_outer(&self) -> bool {
-        matches!(self.kind, DocCommentKind::OuterLine | DocCommentKind::OuterBlock)
+        matches!(
+            self.kind,
+            DocCommentKind::OuterLine | DocCommentKind::OuterBlock
+        )
     }
 
     /// Check if this is a line comment.
     pub fn is_line(&self) -> bool {
-        matches!(self.kind, DocCommentKind::OuterLine | DocCommentKind::InnerLine)
+        matches!(
+            self.kind,
+            DocCommentKind::OuterLine | DocCommentKind::InnerLine
+        )
     }
 
     /// Check if this is a block comment.
     pub fn is_block(&self) -> bool {
-        matches!(self.kind, DocCommentKind::OuterBlock | DocCommentKind::InnerBlock)
+        matches!(
+            self.kind,
+            DocCommentKind::OuterBlock | DocCommentKind::InnerBlock
+        )
     }
 }
 
@@ -979,7 +977,6 @@ pub enum Keyword {
     // =========================================================================
     // DECLARATION KEYWORDS
     // =========================================================================
-
     /// `fn`
     Fn,
     /// `struct`
@@ -1022,7 +1019,6 @@ pub enum Keyword {
     // =========================================================================
     // CONTROL FLOW KEYWORDS
     // =========================================================================
-
     /// `if`
     If,
     /// `else`
@@ -1047,7 +1043,6 @@ pub enum Keyword {
     // =========================================================================
     // BOOLEAN KEYWORDS
     // =========================================================================
-
     /// `true`
     True,
     /// `false`
@@ -1056,7 +1051,6 @@ pub enum Keyword {
     // =========================================================================
     // TYPE KEYWORDS
     // =========================================================================
-
     /// `where`
     Where,
     /// `dyn`
@@ -1069,7 +1063,6 @@ pub enum Keyword {
     // =========================================================================
     // MEMORY & SAFETY KEYWORDS
     // =========================================================================
-
     /// `ref`
     Ref,
     /// `move`
@@ -1084,7 +1077,6 @@ pub enum Keyword {
     // =========================================================================
     // ASYNC KEYWORDS
     // =========================================================================
-
     /// `async`
     Async,
     /// `await`
@@ -1093,7 +1085,6 @@ pub enum Keyword {
     // =========================================================================
     // EFFECT SYSTEM KEYWORDS
     // =========================================================================
-
     /// `with`
     With,
     /// `effect`
@@ -1108,7 +1099,6 @@ pub enum Keyword {
     // =========================================================================
     // AI CONSTRUCT KEYWORDS
     // =========================================================================
-
     /// `ai`
     AI,
     /// `neural`
@@ -1119,7 +1109,6 @@ pub enum Keyword {
     // =========================================================================
     // MACRO KEYWORDS
     // =========================================================================
-
     /// `macro`
     Macro,
     /// `macro_rules`
@@ -1128,7 +1117,6 @@ pub enum Keyword {
     // =========================================================================
     // RESERVED KEYWORDS (for future use)
     // =========================================================================
-
     /// `abstract`
     Abstract,
     /// `become`
@@ -1310,7 +1298,10 @@ impl Keyword {
 
     /// Check if this keyword can be used as an identifier with raw syntax (r#keyword).
     pub const fn can_be_raw(&self) -> bool {
-        !matches!(self, Keyword::Crate | Keyword::Self_ | Keyword::SelfType | Keyword::Super)
+        !matches!(
+            self,
+            Keyword::Crate | Keyword::Self_ | Keyword::SelfType | Keyword::Super
+        )
     }
 }
 
@@ -1322,17 +1313,7 @@ impl fmt::Display for Keyword {
 
 /// DSL block names recognized by the lexer.
 pub const DSL_NAMES: &[&str] = &[
-    "sql",
-    "regex",
-    "math",
-    "finance",
-    "glsl",
-    "hlsl",
-    "shell",
-    "json",
-    "xml",
-    "html",
-    "css",
+    "sql", "regex", "math", "finance", "glsl", "hlsl", "shell", "json", "xml", "html", "css",
     "graphql",
 ];
 

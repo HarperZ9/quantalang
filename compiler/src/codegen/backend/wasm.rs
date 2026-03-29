@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use super::{Backend, Target, CodegenError, CodegenResult};
+use super::{Backend, CodegenError, CodegenResult, Target};
 use crate::codegen::ir::*;
 use crate::codegen::{GeneratedCode, OutputFormat};
 
@@ -307,19 +307,19 @@ impl WasmBackend {
                 FloatSize::F32 => "f32",
                 FloatSize::F64 => "f64",
             },
-            MirType::Ptr(_) => "i32", // wasm32 pointers are 32-bit
-            MirType::FnPtr(_) => "i32", // Function pointers are table indices
-            MirType::Array(_, _) => "i32", // Arrays are memory pointers
-            MirType::Slice(_) => "i32", // Slices are fat pointers (ptr + len)
-            MirType::Struct(_) => "i32", // Structs are memory pointers
-            MirType::Never => "i32", // Never returns, but needs a type
+            MirType::Ptr(_) => "i32",        // wasm32 pointers are 32-bit
+            MirType::FnPtr(_) => "i32",      // Function pointers are table indices
+            MirType::Array(_, _) => "i32",   // Arrays are memory pointers
+            MirType::Slice(_) => "i32",      // Slices are fat pointers (ptr + len)
+            MirType::Struct(_) => "i32",     // Structs are memory pointers
+            MirType::Never => "i32",         // Never returns, but needs a type
             MirType::Vector(_, _) => "v128", // WASM SIMD 128-bit vector
             // Opaque GPU types — represent as i32 pointer handles in WASM
             MirType::Texture2D(_) | MirType::Sampler | MirType::SampledImage(_) => "i32",
             MirType::TraitObject(_) => "i32", // wasm pointer
-            MirType::Vec(_) => "i32", // QuantaVecHandle is a pointer in wasm32
-            MirType::Tuple(_) => "i32", // Tuples are memory pointers in wasm32
-            MirType::Map(_, _) => "i32", // QuantaMapHandle is a pointer in wasm32
+            MirType::Vec(_) => "i32",         // QuantaVecHandle is a pointer in wasm32
+            MirType::Tuple(_) => "i32",       // Tuples are memory pointers in wasm32
+            MirType::Map(_, _) => "i32",      // QuantaMapHandle is a pointer in wasm32
         }
     }
 
@@ -341,14 +341,14 @@ impl WasmBackend {
             },
             MirType::Ptr(_) | MirType::FnPtr(_) => 4,
             MirType::Array(elem, count) => self.type_size(elem) * (*count as u32),
-            MirType::Slice(_) => 8, // ptr + len
+            MirType::Slice(_) => 8,  // ptr + len
             MirType::Struct(_) => 4, // Placeholder
             MirType::Never => 0,
             MirType::Vector(elem, lanes) => self.type_size(elem) * lanes,
             // Opaque GPU types — pointer-sized handles in wasm32
             MirType::Texture2D(_) | MirType::Sampler | MirType::SampledImage(_) => 4,
             MirType::TraitObject(_) => 8, // two i32 pointers: data ptr + vtable ptr
-            MirType::Vec(_) => 4, // wasm32 pointer
+            MirType::Vec(_) => 4,         // wasm32 pointer
             MirType::Tuple(elems) => elems.iter().map(|e| self.type_size(e)).sum(),
             MirType::Map(_, _) => 4, // wasm32 pointer
         }
@@ -500,10 +500,7 @@ impl WasmBackend {
                 "(data (i32.const {}) \"{}\\00\")",
                 offset, escaped
             ));
-            self.emit_line(&format!(
-                "(global $__str{} i32 (i32.const {}))",
-                i, offset
-            ));
+            self.emit_line(&format!("(global $__str{} i32 (i32.const {}))", i, offset));
             offset += s.len() as u32 + 1; // +1 for null terminator
         }
         self.output.push('\n');
@@ -571,7 +568,10 @@ impl WasmBackend {
             self.emit_line(";; =======================================================");
             self.emit_line(";; Function Table");
             self.emit_line(";; =======================================================");
-            self.emit_line(&format!("(table (export \"__indirect_function_table\") {} funcref)", func_count));
+            self.emit_line(&format!(
+                "(table (export \"__indirect_function_table\") {} funcref)",
+                func_count
+            ));
 
             // Populate table with function references
             let mut elem_str = String::from("(elem (i32.const 0)");
@@ -707,7 +707,9 @@ impl WasmBackend {
         // If any block has a Switch terminator, declare a scratch local
         // to hold the discriminant value during the case chain.
         let has_switch = func.blocks.as_ref().map_or(false, |blocks| {
-            blocks.iter().any(|b| matches!(&b.terminator, Some(MirTerminator::Switch { .. })))
+            blocks
+                .iter()
+                .any(|b| matches!(&b.terminator, Some(MirTerminator::Switch { .. })))
         });
         if has_switch {
             self.emit_line("(local $__switch_val i32)");
@@ -769,7 +771,11 @@ impl WasmBackend {
         if num_blocks == 1 {
             // Simple case: single block, no control flow wrapping needed.
             let block = &blocks[0];
-            let label = self.block_labels.get(&block.id).cloned().unwrap_or_default();
+            let label = self
+                .block_labels
+                .get(&block.id)
+                .cloned()
+                .unwrap_or_default();
             self.emit_line(&format!(";; Block {}", label));
             for stmt in &block.stmts {
                 self.gen_stmt(stmt, func)?;
@@ -789,7 +795,11 @@ impl WasmBackend {
         // Open nested blocks for bb1 .. bb(N-1).
         // (bb0 is emitted at the innermost level)
         for i in (1..num_blocks).rev() {
-            let label = self.block_labels.get(&BlockId(i as u32)).cloned().unwrap_or_default();
+            let label = self
+                .block_labels
+                .get(&BlockId(i as u32))
+                .cloned()
+                .unwrap_or_default();
             self.emit_line(&format!("(block {}", label));
             self.indent += 1;
         }
@@ -797,7 +807,11 @@ impl WasmBackend {
         // Now emit each basic block's code, closing the nesting after each.
         for (i, block) in blocks.iter().enumerate() {
             let is_last = i == num_blocks - 1;
-            let label = self.block_labels.get(&block.id).cloned().unwrap_or_default();
+            let label = self
+                .block_labels
+                .get(&block.id)
+                .cloned()
+                .unwrap_or_default();
             self.emit_line(&format!(";; Block {}", label));
 
             for stmt in &block.stmts {
@@ -810,7 +824,11 @@ impl WasmBackend {
             // Close the `block` that was opened for this BB (except for the last one).
             if i < num_blocks - 1 {
                 self.indent -= 1;
-                let next_label = self.block_labels.get(&BlockId((i + 1) as u32)).cloned().unwrap_or_default();
+                let next_label = self
+                    .block_labels
+                    .get(&BlockId((i + 1) as u32))
+                    .cloned()
+                    .unwrap_or_default();
                 self.emit_line(&format!(") ;; end {}", next_label));
             }
         }
@@ -830,31 +848,47 @@ impl WasmBackend {
         match &stmt.kind {
             MirStmtKind::Assign { dest, value } => {
                 self.gen_rvalue(value, func)?;
-                let dest_name = self.local_names.get(dest)
+                let dest_name = self
+                    .local_names
+                    .get(dest)
                     .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", dest)))?
                     .clone();
                 self.emit_line(&format!("local.set {}", dest_name));
             }
             MirStmtKind::DerefAssign { ptr, value } => {
                 // WASM linear memory store: load addr, compute value, store
-                let ptr_name = self.local_names.get(ptr)
+                let ptr_name = self
+                    .local_names
+                    .get(ptr)
                     .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", ptr)))?
                     .clone();
                 self.gen_rvalue(value, func)?;
                 self.emit_line(&format!("local.get {}", ptr_name));
                 self.emit_line("i64.store");
             }
-            MirStmtKind::FieldDerefAssign { ptr, field_name: _, value } => {
-                let ptr_name = self.local_names.get(ptr)
+            MirStmtKind::FieldDerefAssign {
+                ptr,
+                field_name: _,
+                value,
+            } => {
+                let ptr_name = self
+                    .local_names
+                    .get(ptr)
                     .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", ptr)))?
                     .clone();
                 self.gen_rvalue(value, func)?;
                 self.emit_line(&format!("local.get {}", ptr_name));
                 self.emit_line("i64.store");
             }
-            MirStmtKind::FieldAssign { base, field_name: _, value } => {
+            MirStmtKind::FieldAssign {
+                base,
+                field_name: _,
+                value,
+            } => {
                 // Local struct field store: compute value then store to base's memory
-                let base_name = self.local_names.get(base)
+                let base_name = self
+                    .local_names
+                    .get(base)
                     .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", base)))?
                     .clone();
                 self.gen_rvalue(value, func)?;
@@ -981,7 +1015,11 @@ impl WasmBackend {
                     }
                 }
             }
-            MirRValue::FieldAccess { base, field_name, field_ty } => {
+            MirRValue::FieldAccess {
+                base,
+                field_name,
+                field_ty,
+            } => {
                 // Struct field access: base is a pointer to the struct in memory.
                 // Load the base pointer, add the field offset, then load the value.
                 // We use a simplified fixed-size field layout (4 bytes per field).
@@ -990,9 +1028,16 @@ impl WasmBackend {
                 // Compute field offset: for now, use a hash-based index as a
                 // rough placeholder.  In a real implementation the struct layout
                 // would be looked up from MirTypeDef.
-                let field_offset = field_name.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32)) % 64;
+                let field_offset = field_name
+                    .bytes()
+                    .fold(0u32, |acc, b| acc.wrapping_add(b as u32))
+                    % 64;
                 let elem_size = self.type_size(field_ty);
-                self.emit_line(&format!("i32.const {} ;; offset of .{}", field_offset * elem_size, field_name));
+                self.emit_line(&format!(
+                    "i32.const {} ;; offset of .{}",
+                    field_offset * elem_size,
+                    field_name
+                ));
                 self.emit_line("i32.add");
                 // Load the field value with the appropriate instruction.
                 let load_instr = match self.emit_type(field_ty) {
@@ -1003,10 +1048,18 @@ impl WasmBackend {
                 };
                 self.emit_line(load_instr);
             }
-            MirRValue::VariantField { base, variant_name, field_index, field_ty } => {
+            MirRValue::VariantField {
+                base,
+                variant_name,
+                field_index,
+                field_ty,
+            } => {
                 // Enum variant field access: skip discriminant (4 bytes), then
                 // index into the payload area.
-                self.emit_line(&format!(";; variant field {}.{}", variant_name, field_index));
+                self.emit_line(&format!(
+                    ";; variant field {}.{}",
+                    variant_name, field_index
+                ));
                 self.gen_value(base, func)?;
                 let elem_size = self.type_size(field_ty);
                 // Offset = 4 (discriminant) + field_index * elem_size
@@ -1021,7 +1074,11 @@ impl WasmBackend {
                 };
                 self.emit_line(load_instr);
             }
-            MirRValue::IndexAccess { base, index, elem_ty } => {
+            MirRValue::IndexAccess {
+                base,
+                index,
+                elem_ty,
+            } => {
                 // Array index access: base_ptr + index * elem_size, then load.
                 self.gen_value(base, func)?;
                 self.gen_value(index, func)?;
@@ -1061,7 +1118,9 @@ impl WasmBackend {
     fn gen_value(&mut self, value: &MirValue, _func: &MirFunction) -> CodegenResult<()> {
         match value {
             MirValue::Local(id) => {
-                let name = self.local_names.get(id)
+                let name = self
+                    .local_names
+                    .get(id)
                     .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", id)))?
                     .clone();
                 self.emit_line(&format!("local.get {}", name));
@@ -1132,7 +1191,9 @@ impl WasmBackend {
     /// Generate a place address.
     fn gen_place_addr(&mut self, place: &MirPlace, _func: &MirFunction) -> CodegenResult<()> {
         // Start with the local's address
-        let name = self.local_names.get(&place.local)
+        let name = self
+            .local_names
+            .get(&place.local)
             .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", place.local)))?
             .clone();
         self.emit_line(&format!("local.get {}", name));
@@ -1148,8 +1209,12 @@ impl WasmBackend {
                     self.emit_line("i32.add");
                 }
                 PlaceProjection::Index(idx_local) => {
-                    let idx_name = self.local_names.get(idx_local)
-                        .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", idx_local)))?
+                    let idx_name = self
+                        .local_names
+                        .get(idx_local)
+                        .ok_or_else(|| {
+                            CodegenError::Internal(format!("Unknown local: {:?}", idx_local))
+                        })?
                         .clone();
                     self.emit_line(&format!("local.get {}", idx_name));
                     self.emit_line("i32.const 4");
@@ -1192,7 +1257,9 @@ impl WasmBackend {
             self.emit_line("br $loop_top ;; back to bb0");
         } else {
             // Forward branch to the target block label.
-            let label = self.block_labels.get(&target)
+            let label = self
+                .block_labels
+                .get(&target)
                 .cloned()
                 .unwrap_or_else(|| format!("$bb{}", target.0));
             self.emit_line(&format!("br {} ;; goto bb{}", label, target.0));
@@ -1200,12 +1267,21 @@ impl WasmBackend {
     }
 
     /// Generate a terminator.
-    fn gen_terminator(&mut self, term: &MirTerminator, func: &MirFunction, _is_last: bool) -> CodegenResult<()> {
+    fn gen_terminator(
+        &mut self,
+        term: &MirTerminator,
+        func: &MirFunction,
+        _is_last: bool,
+    ) -> CodegenResult<()> {
         match term {
             MirTerminator::Goto(target) => {
                 self.emit_br_to(*target);
             }
-            MirTerminator::If { cond, then_block, else_block } => {
+            MirTerminator::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
                 self.gen_value(cond, func)?;
                 self.emit_line("(if");
                 self.indent += 1;
@@ -1222,7 +1298,11 @@ impl WasmBackend {
                 self.indent -= 1;
                 self.emit_line(")");
             }
-            MirTerminator::Switch { value, targets, default } => {
+            MirTerminator::Switch {
+                value,
+                targets,
+                default,
+            } => {
                 // Emit switch as a chain of if-then-br comparisons.
                 // We use a dedicated local ($__switch_val) to avoid re-evaluating
                 // the switch discriminant for each case.
@@ -1253,7 +1333,13 @@ impl WasmBackend {
                 // Default case -- unconditional branch.
                 self.emit_br_to(*default);
             }
-            MirTerminator::Call { func: callee, args, dest, target, .. } => {
+            MirTerminator::Call {
+                func: callee,
+                args,
+                dest,
+                target,
+                ..
+            } => {
                 // Push arguments
                 for arg in args {
                     self.gen_value(arg, func)?;
@@ -1273,8 +1359,12 @@ impl WasmBackend {
 
                 // Store result
                 if let Some(dest_local) = dest {
-                    let dest_name = self.local_names.get(dest_local)
-                        .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", dest_local)))?
+                    let dest_name = self
+                        .local_names
+                        .get(dest_local)
+                        .ok_or_else(|| {
+                            CodegenError::Internal(format!("Unknown local: {:?}", dest_local))
+                        })?
                         .clone();
                     self.emit_line(&format!("local.set {}", dest_name));
                 }
@@ -1299,7 +1389,13 @@ impl WasmBackend {
                 self.emit_line(";; drop (no-op)");
                 self.emit_br_to(*target);
             }
-            MirTerminator::Assert { cond, expected, msg, target, .. } => {
+            MirTerminator::Assert {
+                cond,
+                expected,
+                msg,
+                target,
+                ..
+            } => {
                 self.gen_value(cond, func)?;
                 if !*expected {
                     self.emit_line("i32.eqz");
@@ -1352,22 +1448,28 @@ impl WasmBackend {
                     _ => {} // Same size, no conversion needed
                 }
             }
-            CastKind::FloatToFloat => {
-                match (from_wasm, to_wasm) {
-                    ("f32", "f64") => {
-                        self.emit_line("f64.promote_f32");
-                    }
-                    ("f64", "f32") => {
-                        self.emit_line("f32.demote_f64");
-                    }
-                    _ => {}
+            CastKind::FloatToFloat => match (from_wasm, to_wasm) {
+                ("f32", "f64") => {
+                    self.emit_line("f64.promote_f32");
                 }
-            }
+                ("f64", "f32") => {
+                    self.emit_line("f32.demote_f64");
+                }
+                _ => {}
+            },
             CastKind::IntToFloat => {
                 let convert = if from.is_signed() {
-                    format!("{}.convert_i{}_s", to_wasm, if from_wasm == "i64" { "64" } else { "32" })
+                    format!(
+                        "{}.convert_i{}_s",
+                        to_wasm,
+                        if from_wasm == "i64" { "64" } else { "32" }
+                    )
                 } else {
-                    format!("{}.convert_i{}_u", to_wasm, if from_wasm == "i64" { "64" } else { "32" })
+                    format!(
+                        "{}.convert_i{}_u",
+                        to_wasm,
+                        if from_wasm == "i64" { "64" } else { "32" }
+                    )
                 };
                 self.emit_line(&convert);
             }
@@ -1487,8 +1589,12 @@ impl WasmBackend {
                     format!("{}.ge_u", wasm_ty)
                 }
             }
-            BinOp::AddChecked | BinOp::AddWrapping | BinOp::AddSaturating => format!("{}.add", wasm_ty),
-            BinOp::SubChecked | BinOp::SubWrapping | BinOp::SubSaturating => format!("{}.sub", wasm_ty),
+            BinOp::AddChecked | BinOp::AddWrapping | BinOp::AddSaturating => {
+                format!("{}.add", wasm_ty)
+            }
+            BinOp::SubChecked | BinOp::SubWrapping | BinOp::SubSaturating => {
+                format!("{}.sub", wasm_ty)
+            }
             BinOp::MulChecked | BinOp::MulWrapping => format!("{}.mul", wasm_ty),
             BinOp::Pow => {
                 // WASM doesn't have a native power instruction
@@ -1502,27 +1608,27 @@ impl WasmBackend {
     /// Infer the type of a value.
     fn infer_value_type(&self, value: &MirValue, func: &MirFunction) -> CodegenResult<MirType> {
         match value {
-            MirValue::Local(id) => {
-                func.locals.iter()
-                    .find(|l| l.id == *id)
-                    .map(|l| l.ty.clone())
-                    .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", id)))
-            }
-            MirValue::Const(c) => {
-                match c {
-                    MirConst::Bool(_) => Ok(MirType::Bool),
-                    MirConst::Int(_, ty) => Ok(ty.clone()),
-                    MirConst::Uint(_, ty) => Ok(ty.clone()),
-                    MirConst::Float(_, ty) => Ok(ty.clone()),
-                    MirConst::Str(_) => Ok(MirType::Ptr(Box::new(MirType::Int(IntSize::I8, false)))),
-                    MirConst::ByteStr(_) => Ok(MirType::Ptr(Box::new(MirType::Int(IntSize::I8, false)))),
-                    MirConst::Null(ty) => Ok(ty.clone()),
-                    MirConst::Unit => Ok(MirType::Void),
-                    MirConst::Zeroed(ty) => Ok(ty.clone()),
-                    MirConst::Undef(ty) => Ok(ty.clone()),
-                    MirConst::Struct(name, _) => Ok(MirType::Struct(name.clone())),
+            MirValue::Local(id) => func
+                .locals
+                .iter()
+                .find(|l| l.id == *id)
+                .map(|l| l.ty.clone())
+                .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", id))),
+            MirValue::Const(c) => match c {
+                MirConst::Bool(_) => Ok(MirType::Bool),
+                MirConst::Int(_, ty) => Ok(ty.clone()),
+                MirConst::Uint(_, ty) => Ok(ty.clone()),
+                MirConst::Float(_, ty) => Ok(ty.clone()),
+                MirConst::Str(_) => Ok(MirType::Ptr(Box::new(MirType::Int(IntSize::I8, false)))),
+                MirConst::ByteStr(_) => {
+                    Ok(MirType::Ptr(Box::new(MirType::Int(IntSize::I8, false))))
                 }
-            }
+                MirConst::Null(ty) => Ok(ty.clone()),
+                MirConst::Unit => Ok(MirType::Void),
+                MirConst::Zeroed(ty) => Ok(ty.clone()),
+                MirConst::Undef(ty) => Ok(ty.clone()),
+                MirConst::Struct(name, _) => Ok(MirType::Struct(name.clone())),
+            },
             MirValue::Global(_) => Ok(MirType::i32()),
             MirValue::Function(_) => Ok(MirType::i32()),
         }
@@ -1649,7 +1755,9 @@ impl WasmBackend {
 
         // Memory copy
         if self.bulk_memory {
-            self.emit_line("(func $__quanta_memcpy (param $dest i32) (param $src i32) (param $len i32)");
+            self.emit_line(
+                "(func $__quanta_memcpy (param $dest i32) (param $src i32) (param $len i32)",
+            );
             self.indent += 1;
             self.emit_line("local.get $dest");
             self.emit_line("local.get $src");
@@ -1658,7 +1766,9 @@ impl WasmBackend {
             self.indent -= 1;
             self.emit_line(")");
         } else {
-            self.emit_line("(func $__quanta_memcpy (param $dest i32) (param $src i32) (param $len i32)");
+            self.emit_line(
+                "(func $__quanta_memcpy (param $dest i32) (param $src i32) (param $len i32)",
+            );
             self.indent += 1;
             self.emit_line("(local $i i32)");
             self.emit_line("(block $done");
@@ -1695,7 +1805,9 @@ impl WasmBackend {
 
         // Memory set
         if self.bulk_memory {
-            self.emit_line("(func $__quanta_memset (param $dest i32) (param $val i32) (param $len i32)");
+            self.emit_line(
+                "(func $__quanta_memset (param $dest i32) (param $val i32) (param $len i32)",
+            );
             self.indent += 1;
             self.emit_line("local.get $dest");
             self.emit_line("local.get $val");
@@ -1704,7 +1816,9 @@ impl WasmBackend {
             self.indent -= 1;
             self.emit_line(")");
         } else {
-            self.emit_line("(func $__quanta_memset (param $dest i32) (param $val i32) (param $len i32)");
+            self.emit_line(
+                "(func $__quanta_memset (param $dest i32) (param $val i32) (param $len i32)",
+            );
             self.indent += 1;
             self.emit_line("(local $i i32)");
             self.emit_line("(block $done");
@@ -1990,7 +2104,10 @@ mod tests {
         assert_eq!(backend.emit_type(&MirType::i64()), "i64");
         assert_eq!(backend.emit_type(&MirType::f32()), "f32");
         assert_eq!(backend.emit_type(&MirType::f64()), "f64");
-        assert_eq!(backend.emit_type(&MirType::Ptr(Box::new(MirType::i32()))), "i32");
+        assert_eq!(
+            backend.emit_type(&MirType::Ptr(Box::new(MirType::i32()))),
+            "i32"
+        );
     }
 
     #[test]
@@ -2076,7 +2193,10 @@ mod tests {
         func.is_public = true;
 
         let mut block = MirBlock::new(BlockId::ENTRY);
-        block.set_terminator(MirTerminator::Return(Some(MirValue::Const(MirConst::Int(0, MirType::i32())))));
+        block.set_terminator(MirTerminator::Return(Some(MirValue::Const(MirConst::Int(
+            0,
+            MirType::i32(),
+        )))));
         func.add_block(block);
 
         module.add_function(func);

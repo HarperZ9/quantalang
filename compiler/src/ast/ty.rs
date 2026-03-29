@@ -8,8 +8,8 @@
 //!
 //! Types describe the shape of values in QuantaLang.
 
-use crate::lexer::Span;
 use super::{Expr, Ident, Lifetime, Mutability, NodeId, Path, TypeBound};
+use crate::lexer::Span;
 
 /// A type node.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,14 +69,12 @@ pub enum TypeKind {
     // =========================================================================
     // NAMED TYPES
     // =========================================================================
-
     /// A path type: `std::io::Read`, `Option<T>`
     Path(Path),
 
     // =========================================================================
     // PRIMITIVE TYPES
     // =========================================================================
-
     /// The never type: `!`
     Never,
 
@@ -86,15 +84,11 @@ pub enum TypeKind {
     // =========================================================================
     // COMPOUND TYPES
     // =========================================================================
-
     /// A tuple type: `(A, B, C)`, `()` for unit
     Tuple(Vec<Type>),
 
     /// An array type: `[T; N]`
-    Array {
-        elem: Box<Type>,
-        len: Box<Expr>,
-    },
+    Array { elem: Box<Type>, len: Box<Expr> },
 
     /// A slice type: `[T]`
     Slice(Box<Type>),
@@ -102,7 +96,6 @@ pub enum TypeKind {
     // =========================================================================
     // POINTER TYPES
     // =========================================================================
-
     /// A reference type: `&T`, `&'a T`, `&mut T`
     Ref {
         lifetime: Option<Lifetime>,
@@ -119,7 +112,6 @@ pub enum TypeKind {
     // =========================================================================
     // FUNCTION TYPES
     // =========================================================================
-
     /// A bare function type: `fn(A, B) -> C`
     BareFn {
         is_unsafe: bool,
@@ -140,7 +132,6 @@ pub enum TypeKind {
     // =========================================================================
     // TRAIT OBJECTS
     // =========================================================================
-
     /// A trait object: `dyn Trait`, `dyn Trait + 'a`
     TraitObject {
         bounds: Vec<TypeBound>,
@@ -148,14 +139,11 @@ pub enum TypeKind {
     },
 
     /// An impl trait: `impl Trait`, `impl Trait + 'a`
-    ImplTrait {
-        bounds: Vec<TypeBound>,
-    },
+    ImplTrait { bounds: Vec<TypeBound> },
 
     // =========================================================================
     // SPECIAL
     // =========================================================================
-
     /// Parenthesized type (for span preservation)
     Paren(Box<Type>),
 
@@ -171,27 +159,17 @@ pub enum TypeKind {
     // =========================================================================
     // QUANTALANG EXTENSIONS
     // =========================================================================
-
     /// Effect annotation: `T with Effect`
-    WithEffect {
-        ty: Box<Type>,
-        effects: Vec<Path>,
-    },
+    WithEffect { ty: Box<Type>, effects: Vec<Path> },
 
     /// Neural type: `Neural<Input, Output>`
-    Neural {
-        input: Box<Type>,
-        output: Box<Type>,
-    },
+    Neural { input: Box<Type>, output: Box<Type> },
 
     /// Optional type shorthand: `T?` (sugar for `Option<T>`)
     Optional(Box<Type>),
 
     /// Result type shorthand: `T!E` (sugar for `Result<T, E>`)
-    Result {
-        ok: Box<Type>,
-        err: Box<Type>,
-    },
+    Result { ok: Box<Type>, err: Box<Type> },
 }
 
 /// Parameter in a bare function type.
@@ -231,10 +209,22 @@ impl FnTraitKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PrimitiveType {
     // Integers
-    I8, I16, I32, I64, I128, Isize,
-    U8, U16, U32, U64, U128, Usize,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    Isize,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    Usize,
     // Floats
-    F16, F32, F64,
+    F16,
+    F32,
+    F64,
     // Other
     Bool,
     Char,
@@ -325,6 +315,9 @@ impl PrimitiveType {
 
     /// Check if this is a float type.
     pub fn is_float(&self) -> bool {
-        matches!(self, PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64)
+        matches!(
+            self,
+            PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64
+        )
     }
 }

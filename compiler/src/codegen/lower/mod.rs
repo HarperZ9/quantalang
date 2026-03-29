@@ -14,8 +14,8 @@
 //! - `macros`: Closure, effect, builtin macro, and iterator chain lowering
 
 mod expr;
-mod types;
 mod macros;
+mod types;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -23,9 +23,9 @@ use std::sync::Arc;
 use crate::ast::{self, ItemKind};
 use crate::types::TypeContext;
 
-use super::ir::*;
-use super::builder::{MirBuilder, MirModuleBuilder, values};
 use super::backend::CodegenResult;
+use super::builder::{values, MirBuilder, MirModuleBuilder};
+use super::ir::*;
 
 /// AST to MIR lowerer.
 pub struct MirLowerer<'ctx> {
@@ -104,7 +104,10 @@ pub(crate) enum IterTerminal<'a> {
     /// `.collect()` — gather results into a new Vec.
     Collect,
     /// `.fold(init, |acc, x| body)` — accumulate a single value.
-    Fold { init: &'a ast::Expr, closure: &'a ast::Expr },  // fields accessible via match pattern
+    Fold {
+        init: &'a ast::Expr,
+        closure: &'a ast::Expr,
+    }, // fields accessible via match pattern
 }
 
 /// A fully parsed iterator chain: `source.iter().<steps>.<terminal>`.
@@ -304,20 +307,27 @@ impl<'ctx> MirLowerer<'ctx> {
         // Copy trait_methods to the MirModule for the C backend to access
         let trait_methods_clone = self.trait_methods.clone();
         for (trait_name, methods) in &trait_methods_clone {
-            self.module.module_mut().trait_methods.insert(trait_name.clone(), methods.clone());
+            self.module
+                .module_mut()
+                .trait_methods
+                .insert(trait_name.clone(), methods.clone());
         }
 
         // For each (Trait, Type) impl pair, create a vtable
         let impl_pairs: Vec<_> = self.trait_impls.keys().cloned().collect();
         for (trait_name, type_name) in impl_pairs {
             if let Some(trait_methods) = self.trait_methods.get(&trait_name) {
-                let methods: Vec<_> = trait_methods.iter().map(|(method_name, sig)| {
-                    let mangled = self.impl_methods
-                        .get(&(type_name.clone(), method_name.clone()))
-                        .cloned()
-                        .unwrap_or_else(|| Arc::from(format!("{}_{}", type_name, method_name)));
-                    (method_name.clone(), mangled, sig.clone())
-                }).collect();
+                let methods: Vec<_> = trait_methods
+                    .iter()
+                    .map(|(method_name, sig)| {
+                        let mangled = self
+                            .impl_methods
+                            .get(&(type_name.clone(), method_name.clone()))
+                            .cloned()
+                            .unwrap_or_else(|| Arc::from(format!("{}_{}", type_name, method_name)));
+                        (method_name.clone(), mangled, sig.clone())
+                    })
+                    .collect();
 
                 self.module.module_mut().vtables.push(MirVtable {
                     trait_name: trait_name.clone(),
@@ -334,10 +344,16 @@ impl<'ctx> MirLowerer<'ctx> {
 
         for item in &t.items {
             if let ast::TraitItemKind::Function(fndef) = &item.kind {
-                let params: Vec<MirType> = fndef.sig.params.iter().map(|p| {
-                    self.lower_type_from_ast(&p.ty)
-                }).collect();
-                let ret = fndef.sig.return_ty.as_ref()
+                let params: Vec<MirType> = fndef
+                    .sig
+                    .params
+                    .iter()
+                    .map(|p| self.lower_type_from_ast(&p.ty))
+                    .collect();
+                let ret = fndef
+                    .sig
+                    .return_ty
+                    .as_ref()
                     .map(|t| self.lower_type_from_ast(t))
                     .unwrap_or(MirType::Void);
 
@@ -356,12 +372,18 @@ impl<'ctx> MirLowerer<'ctx> {
 
     fn collect_effect(&mut self, e: &ast::EffectDef) -> CodegenResult<()> {
         let effect_name: Arc<str> = Arc::from(e.name.name.as_ref());
-        let ops: Vec<(Arc<str>, Vec<MirType>)> = e.operations.iter().map(|op| {
-            let param_types: Vec<MirType> = op.params.iter()
-                .map(|p| self.lower_type_from_ast(&p.ty))
-                .collect();
-            (Arc::from(op.name.name.as_ref()), param_types)
-        }).collect();
+        let ops: Vec<(Arc<str>, Vec<MirType>)> = e
+            .operations
+            .iter()
+            .map(|op| {
+                let param_types: Vec<MirType> = op
+                    .params
+                    .iter()
+                    .map(|p| self.lower_type_from_ast(&p.ty))
+                    .collect();
+                (Arc::from(op.name.name.as_ref()), param_types)
+            })
+            .collect();
         self.effect_defs.insert(effect_name, ops);
         Ok(())
     }
@@ -375,11 +397,17 @@ impl<'ctx> MirLowerer<'ctx> {
                 // Build parameter types.  For extern "C" functions, map `&str`
                 // directly to `Ptr(i8)` (i.e. `const char*`) rather than
                 // `Ptr(QuantaString)`.
-                let params: Vec<MirType> = f.sig.params.iter().map(|p| {
-                    self.lower_ffi_type(&p.ty)
-                }).collect();
+                let params: Vec<MirType> = f
+                    .sig
+                    .params
+                    .iter()
+                    .map(|p| self.lower_ffi_type(&p.ty))
+                    .collect();
 
-                let ret = f.sig.return_ty.as_ref()
+                let ret = f
+                    .sig
+                    .return_ty
+                    .as_ref()
                     .map(|t| self.lower_ffi_type(t))
                     .unwrap_or(MirType::Void);
 
@@ -527,9 +555,11 @@ impl<'ctx> MirLowerer<'ctx> {
 
     fn collect_struct(&mut self, s: &ast::StructDef) -> CodegenResult<()> {
         // If the struct has generic type parameters, store for later monomorphization
-        let has_generics = s.generics.params.iter().any(|p| {
-            matches!(p.kind, ast::GenericParamKind::Type { .. })
-        });
+        let has_generics = s
+            .generics
+            .params
+            .iter()
+            .any(|p| matches!(p.kind, ast::GenericParamKind::Type { .. }));
 
         if has_generics {
             self.generic_structs.insert(s.name.name.clone(), s.clone());
@@ -537,18 +567,20 @@ impl<'ctx> MirLowerer<'ctx> {
         }
 
         let fields = match &s.fields {
-            ast::StructFields::Named(fields) => {
-                fields.iter().map(|f| {
+            ast::StructFields::Named(fields) => fields
+                .iter()
+                .map(|f| {
                     let ty = self.lower_type_from_ast(&f.ty);
                     (Some(f.name.name.clone()), ty)
-                }).collect()
-            }
-            ast::StructFields::Tuple(fields) => {
-                fields.iter().map(|f| {
+                })
+                .collect(),
+            ast::StructFields::Tuple(fields) => fields
+                .iter()
+                .map(|f| {
                     let ty = self.lower_type_from_ast(&f.ty);
                     (None, ty)
-                }).collect()
-            }
+                })
+                .collect(),
             ast::StructFields::Unit => Vec::new(),
         };
 
@@ -557,7 +589,12 @@ impl<'ctx> MirLowerer<'ctx> {
     }
 
     /// Process #[derive(...)] attributes on a struct and register auto-generated methods.
-    fn process_derive_attrs(&mut self, attrs: &[ast::Attribute], name: &ast::Ident, _s: &ast::StructDef) {
+    fn process_derive_attrs(
+        &mut self,
+        attrs: &[ast::Attribute],
+        name: &ast::Ident,
+        _s: &ast::StructDef,
+    ) {
         for attr in attrs {
             if let Some(seg) = attr.path.segments.first() {
                 if seg.ident.name.as_ref() == "derive" {
@@ -569,10 +606,8 @@ impl<'ctx> MirLowerer<'ctx> {
                         // The actual body is trivial for value types — just return self.
                         let type_name = name.name.clone();
                         let method_name: Arc<str> = Arc::from(format!("{}_clone", type_name));
-                        self.impl_methods.insert(
-                            (type_name.clone(), Arc::from("clone")),
-                            method_name.clone(),
-                        );
+                        self.impl_methods
+                            .insert((type_name.clone(), Arc::from("clone")), method_name.clone());
                         // The actual function will be generated in lower_item pass
                         // by checking for this registered method.
                     }
@@ -604,48 +639,61 @@ impl<'ctx> MirLowerer<'ctx> {
 
     fn collect_enum(&mut self, e: &ast::EnumDef) -> CodegenResult<()> {
         // If the enum has generic type parameters, store for later monomorphization
-        let has_generics = e.generics.params.iter().any(|p| {
-            matches!(p.kind, ast::GenericParamKind::Type { .. })
-        });
+        let has_generics = e
+            .generics
+            .params
+            .iter()
+            .any(|p| matches!(p.kind, ast::GenericParamKind::Type { .. }));
 
         if has_generics {
             self.generic_enums.insert(e.name.name.clone(), e.clone());
             return Ok(());
         }
 
-        let variants: Vec<_> = e.variants.iter().enumerate().map(|(i, v)| {
-            let fields = match &v.fields {
-                ast::StructFields::Named(fields) => {
-                    fields.iter().map(|f| {
-                        (Some(f.name.name.clone()), self.lower_type_from_ast(&f.ty))
-                    }).collect()
-                }
-                ast::StructFields::Tuple(fields) => {
-                    fields.iter().map(|f| {
-                        (None, self.lower_type_from_ast(&f.ty))
-                    }).collect()
-                }
-                ast::StructFields::Unit => Vec::new(),
-            };
+        let variants: Vec<_> = e
+            .variants
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let fields = match &v.fields {
+                    ast::StructFields::Named(fields) => fields
+                        .iter()
+                        .map(|f| (Some(f.name.name.clone()), self.lower_type_from_ast(&f.ty)))
+                        .collect(),
+                    ast::StructFields::Tuple(fields) => fields
+                        .iter()
+                        .map(|f| (None, self.lower_type_from_ast(&f.ty)))
+                        .collect(),
+                    ast::StructFields::Unit => Vec::new(),
+                };
 
-            MirEnumVariant {
-                name: v.name.name.clone(),
-                discriminant: i as i128,
-                fields,
-            }
-        }).collect();
+                MirEnumVariant {
+                    name: v.name.name.clone(),
+                    discriminant: i as i128,
+                    fields,
+                }
+            })
+            .collect();
 
-        self.module.create_enum(e.name.name.clone(), MirType::i32(), variants);
+        self.module
+            .create_enum(e.name.name.clone(), MirType::i32(), variants);
         Ok(())
     }
 
     /// Monomorphize a generic enum for a specific concrete type (single-param shorthand).
     /// E.g., `Option<T>` + `i32` → `Option_i32` with `Some(i32)` variant.
-    fn monomorphize_enum(&mut self, enum_name: &str, concrete_ty: &MirType) -> CodegenResult<Arc<str>> {
+    fn monomorphize_enum(
+        &mut self,
+        enum_name: &str,
+        concrete_ty: &MirType,
+    ) -> CodegenResult<Arc<str>> {
         // Build single-param substitution map and delegate to multi-param version
         let enum_def = self.generic_enums.get(enum_name).cloned();
         if let Some(ref e) = enum_def {
-            let type_param = e.generics.params.iter()
+            let type_param = e
+                .generics
+                .params
+                .iter()
                 .find_map(|p| match &p.kind {
                     ast::GenericParamKind::Type { .. } => Some(p.ident.name.clone()),
                     _ => None,
@@ -660,7 +708,11 @@ impl<'ctx> MirLowerer<'ctx> {
 
     /// Monomorphize a generic enum with a multi-parameter substitution map.
     /// E.g., `Result<T, E>` + `{T: i32, E: QuantaString}` → `Result_E_QuantaString_T_i32`.
-    fn monomorphize_enum_multi(&mut self, enum_name: &str, subst: &HashMap<Arc<str>, MirType>) -> CodegenResult<Arc<str>> {
+    fn monomorphize_enum_multi(
+        &mut self,
+        enum_name: &str,
+        subst: &HashMap<Arc<str>, MirType>,
+    ) -> CodegenResult<Arc<str>> {
         let mangled_name = Self::mangle_generic_name(enum_name, subst);
 
         if self.monomorphized.contains(&mangled_name) {
@@ -675,31 +727,39 @@ impl<'ctx> MirLowerer<'ctx> {
         };
 
         // Build monomorphized variants using the substitution map
-        let variants: Vec<_> = enum_def.variants.iter().enumerate().map(|(i, v)| {
-            let fields = match &v.fields {
-                ast::StructFields::Named(fields) => {
-                    fields.iter().map(|f| {
-                        let ty = self.substitute_type_from_ast(&f.ty, subst);
-                        (Some(f.name.name.clone()), ty)
-                    }).collect()
-                }
-                ast::StructFields::Tuple(fields) => {
-                    fields.iter().map(|f| {
-                        let ty = self.substitute_type_from_ast(&f.ty, subst);
-                        (None, ty)
-                    }).collect()
-                }
-                ast::StructFields::Unit => Vec::new(),
-            };
+        let variants: Vec<_> = enum_def
+            .variants
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let fields = match &v.fields {
+                    ast::StructFields::Named(fields) => fields
+                        .iter()
+                        .map(|f| {
+                            let ty = self.substitute_type_from_ast(&f.ty, subst);
+                            (Some(f.name.name.clone()), ty)
+                        })
+                        .collect(),
+                    ast::StructFields::Tuple(fields) => fields
+                        .iter()
+                        .map(|f| {
+                            let ty = self.substitute_type_from_ast(&f.ty, subst);
+                            (None, ty)
+                        })
+                        .collect(),
+                    ast::StructFields::Unit => Vec::new(),
+                };
 
-            MirEnumVariant {
-                name: v.name.name.clone(),
-                discriminant: i as i128,
-                fields,
-            }
-        }).collect();
+                MirEnumVariant {
+                    name: v.name.name.clone(),
+                    discriminant: i as i128,
+                    fields,
+                }
+            })
+            .collect();
 
-        self.module.create_enum(mangled_name.clone(), MirType::i32(), variants);
+        self.module
+            .create_enum(mangled_name.clone(), MirType::i32(), variants);
 
         // Also monomorphize any impl blocks for this generic enum
         self.monomorphize_impl_methods(enum_name, &mangled_name, subst)?;
@@ -709,7 +769,11 @@ impl<'ctx> MirLowerer<'ctx> {
 
     /// Monomorphize a generic struct for specific concrete types.
     /// E.g., `Pair<T> { first: T, second: T }` + `{T: i32}` → `Pair_i32`.
-    fn monomorphize_struct(&mut self, struct_name: &str, subst: &HashMap<Arc<str>, MirType>) -> CodegenResult<Arc<str>> {
+    fn monomorphize_struct(
+        &mut self,
+        struct_name: &str,
+        subst: &HashMap<Arc<str>, MirType>,
+    ) -> CodegenResult<Arc<str>> {
         let mangled_name = Self::mangle_generic_name(struct_name, subst);
 
         if self.monomorphized.contains(&mangled_name) {
@@ -724,18 +788,20 @@ impl<'ctx> MirLowerer<'ctx> {
         };
 
         let fields = match &struct_def.fields {
-            ast::StructFields::Named(fields) => {
-                fields.iter().map(|f| {
+            ast::StructFields::Named(fields) => fields
+                .iter()
+                .map(|f| {
                     let ty = self.substitute_type_from_ast(&f.ty, subst);
                     (Some(f.name.name.clone()), ty)
-                }).collect()
-            }
-            ast::StructFields::Tuple(fields) => {
-                fields.iter().map(|f| {
+                })
+                .collect(),
+            ast::StructFields::Tuple(fields) => fields
+                .iter()
+                .map(|f| {
                     let ty = self.substitute_type_from_ast(&f.ty, subst);
                     (None, ty)
-                }).collect()
-            }
+                })
+                .collect(),
             ast::StructFields::Unit => Vec::new(),
         };
 
@@ -749,7 +815,11 @@ impl<'ctx> MirLowerer<'ctx> {
 
     /// Resolve an AST type using a substitution map for generic type parameters.
     /// Falls back to `lower_type_from_ast` for non-generic types.
-    fn substitute_type_from_ast(&self, ty: &ast::Type, subst: &HashMap<Arc<str>, MirType>) -> MirType {
+    fn substitute_type_from_ast(
+        &self,
+        ty: &ast::Type,
+        subst: &HashMap<Arc<str>, MirType>,
+    ) -> MirType {
         match &ty.kind {
             ast::TypeKind::Path(path) => {
                 if path.is_simple() {
@@ -765,10 +835,13 @@ impl<'ctx> MirLowerer<'ctx> {
                     if let Some(generic_args) = path.last_generics() {
                         if !generic_args.is_empty() {
                             let inner_subst = self.resolve_generic_args_with_subst(
-                                ident.name.as_ref(), generic_args, subst,
+                                ident.name.as_ref(),
+                                generic_args,
+                                subst,
                             );
                             if !inner_subst.is_empty() {
-                                let mangled = Self::mangle_generic_name(ident.name.as_ref(), &inner_subst);
+                                let mangled =
+                                    Self::mangle_generic_name(ident.name.as_ref(), &inner_subst);
                                 return MirType::Struct(mangled);
                             }
                         }
@@ -781,7 +854,8 @@ impl<'ctx> MirLowerer<'ctx> {
             }
             ast::TypeKind::Array { elem, len } => {
                 let elem_ty = self.substitute_type_from_ast(elem, subst);
-                let length = self.try_const_eval(len)
+                let length = self
+                    .try_const_eval(len)
                     .and_then(|c| match c {
                         MirConst::Int(v, _) => Some(v as u64),
                         MirConst::Uint(v, _) => Some(v as u64),
@@ -809,14 +883,20 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // Get the type parameter names from the generic definition
         let param_names: Vec<Arc<str>> = if let Some(enum_def) = self.generic_enums.get(type_name) {
-            enum_def.generics.params.iter()
+            enum_def
+                .generics
+                .params
+                .iter()
                 .filter_map(|p| match &p.kind {
                     ast::GenericParamKind::Type { .. } => Some(p.ident.name.clone()),
                     _ => None,
                 })
                 .collect()
         } else if let Some(struct_def) = self.generic_structs.get(type_name) {
-            struct_def.generics.params.iter()
+            struct_def
+                .generics
+                .params
+                .iter()
                 .filter_map(|p| match &p.kind {
                     ast::GenericParamKind::Type { .. } => Some(p.ident.name.clone()),
                     _ => None,
@@ -829,7 +909,10 @@ impl<'ctx> MirLowerer<'ctx> {
         for (i, arg) in generic_args.iter().enumerate() {
             if let ast::GenericArg::Type(arg_ty) = arg {
                 if let Some(param_name) = param_names.get(i) {
-                    result.insert(param_name.clone(), self.substitute_type_from_ast(arg_ty, outer_subst));
+                    result.insert(
+                        param_name.clone(),
+                        self.substitute_type_from_ast(arg_ty, outer_subst),
+                    );
                 }
             }
         }
@@ -867,9 +950,8 @@ impl<'ctx> MirLowerer<'ctx> {
             for impl_item in &impl_def.items {
                 if let ast::ImplItemKind::Function(f) = &impl_item.kind {
                     let method_name = f.name.name.clone();
-                    let mangled_fn_name: Arc<str> = Arc::from(
-                        format!("{}_{}", mangled_type_name, method_name)
-                    );
+                    let mangled_fn_name: Arc<str> =
+                        Arc::from(format!("{}_{}", mangled_type_name, method_name));
 
                     // Register in impl_methods so method calls resolve
                     self.impl_methods.insert(
@@ -920,7 +1002,8 @@ impl<'ctx> MirLowerer<'ctx> {
         // If the function has generic type parameters, store it for later
         // monomorphization instead of lowering it immediately.
         if self.fn_has_type_generics(f) {
-            self.generic_functions.insert(f.name.name.clone(), f.clone());
+            self.generic_functions
+                .insert(f.name.name.clone(), f.clone());
             return Ok(());
         }
 
@@ -928,10 +1011,16 @@ impl<'ctx> MirLowerer<'ctx> {
         // can find the function's return type even before its body is lowered.
         // Skip `main` since its return type is special-cased during lowering.
         if f.name.name.as_ref() != "main" {
-            let params: Vec<MirType> = f.sig.params.iter().map(|p| {
-                self.lower_type_from_ast(&p.ty)
-            }).collect();
-            let ret = f.sig.return_ty.as_ref()
+            let params: Vec<MirType> = f
+                .sig
+                .params
+                .iter()
+                .map(|p| self.lower_type_from_ast(&p.ty))
+                .collect();
+            let ret = f
+                .sig
+                .return_ty
+                .as_ref()
                 .map(|t| self.lower_type_from_ast(t))
                 .unwrap_or(MirType::Void);
             let sig = MirFnSig::new(params, ret);
@@ -947,14 +1036,17 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // Check if this is an impl on a generic type (e.g., impl<T> Option<T> { ... })
         // If so, store for deferred monomorphization.
-        let has_impl_generics = impl_def.generics.params.iter().any(|p| {
-            matches!(p.kind, ast::GenericParamKind::Type { .. })
-        });
+        let has_impl_generics = impl_def
+            .generics
+            .params
+            .iter()
+            .any(|p| matches!(p.kind, ast::GenericParamKind::Type { .. }));
         let is_generic_type = self.generic_enums.contains_key(type_name.as_ref())
             || self.generic_structs.contains_key(type_name.as_ref());
 
         if has_impl_generics || is_generic_type {
-            self.generic_impls.entry(type_name.clone())
+            self.generic_impls
+                .entry(type_name.clone())
                 .or_insert_with(Vec::new)
                 .push(impl_def.clone());
             return Ok(());
@@ -962,7 +1054,10 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // Track trait implementations for vtable generation
         let trait_name = impl_def.trait_ref.as_ref().map(|tr| {
-            tr.path.last_ident().map(|i| i.name.clone()).unwrap_or(Arc::from("Unknown"))
+            tr.path
+                .last_ident()
+                .map(|i| i.name.clone())
+                .unwrap_or(Arc::from("Unknown"))
         });
 
         let mut impl_method_names = Vec::new();
@@ -971,20 +1066,16 @@ impl<'ctx> MirLowerer<'ctx> {
             if let ast::ImplItemKind::Function(f) = &impl_item.kind {
                 let method_name = f.name.name.clone();
                 let mangled: Arc<str> = Arc::from(format!("{}_{}", type_name, method_name));
-                self.impl_methods.insert(
-                    (type_name.clone(), method_name.clone()),
-                    mangled.clone(),
-                );
+                self.impl_methods
+                    .insert((type_name.clone(), method_name.clone()), mangled.clone());
                 impl_method_names.push(mangled);
             }
         }
 
         // Register trait impl for vtable generation
         if let Some(ref tname) = trait_name {
-            self.trait_impls.insert(
-                (tname.clone(), type_name.clone()),
-                impl_method_names,
-            );
+            self.trait_impls
+                .insert((tname.clone(), type_name.clone()), impl_method_names);
         }
 
         Ok(())
@@ -993,11 +1084,10 @@ impl<'ctx> MirLowerer<'ctx> {
     /// Extract a type name from an AST Type node (used for impl block self_ty).
     fn resolve_type_name(&self, ty: &ast::Type) -> Arc<str> {
         match &ty.kind {
-            ast::TypeKind::Path(path) => {
-                path.last_ident()
-                    .map(|i| i.name.clone())
-                    .unwrap_or(Arc::from("Unknown"))
-            }
+            ast::TypeKind::Path(path) => path
+                .last_ident()
+                .map(|i| i.name.clone())
+                .unwrap_or(Arc::from("Unknown")),
             _ => Arc::from("Unknown"),
         }
     }
@@ -1045,7 +1135,11 @@ impl<'ctx> MirLowerer<'ctx> {
     ///
     /// Similar to `collect_inline_mod`, this pushes the module name onto
     /// the prefix stack and rewrites item names before lowering.
-    fn lower_inline_mod(&mut self, m: &ast::ModDef, _attrs: &[ast::Attribute]) -> CodegenResult<()> {
+    fn lower_inline_mod(
+        &mut self,
+        m: &ast::ModDef,
+        _attrs: &[ast::Attribute],
+    ) -> CodegenResult<()> {
         if let Some(ref content) = m.content {
             self.module_prefix.push(m.name.name.clone());
             for item in &content.items {
@@ -1060,7 +1154,9 @@ impl<'ctx> MirLowerer<'ctx> {
     /// Check if any attribute has the given name.
     fn has_attribute(attrs: &[ast::Attribute], name: &str) -> bool {
         attrs.iter().any(|attr| {
-            attr.path.segments.first()
+            attr.path
+                .segments
+                .first()
                 .map_or(false, |seg| seg.ident.name.as_ref() == name)
         })
     }
@@ -1130,14 +1226,20 @@ impl<'ctx> MirLowerer<'ctx> {
                                     // Look for "= N" after the identifier
                                     if let Some(name_str) = name_str {
                                         if i + 2 < tokens.len() {
-                                            if let ast::TokenTree::Token(ref num_tok) = tokens[i + 2] {
-                                                if let crate::lexer::TokenKind::Literal { .. } = &num_tok.kind {
+                                            if let ast::TokenTree::Token(ref num_tok) =
+                                                tokens[i + 2]
+                                            {
+                                                if let crate::lexer::TokenKind::Literal { .. } =
+                                                    &num_tok.kind
+                                                {
                                                     // Extract numeric value from source via span
                                                     if let Some(ref src) = self.source {
                                                         let start = num_tok.span.start.to_usize();
                                                         let end = num_tok.span.end.to_usize();
                                                         if end <= src.len() {
-                                                            if let Ok(n) = src[start..end].parse::<u32>() {
+                                                            if let Ok(n) =
+                                                                src[start..end].parse::<u32>()
+                                                            {
                                                                 match name_str.as_str() {
                                                                     "binding" => binding = n,
                                                                     "set" => set = n,
@@ -1163,7 +1265,12 @@ impl<'ctx> MirLowerer<'ctx> {
     }
 
     /// Lower a function with explicit visibility from the Item node.
-    fn lower_function_with_vis(&mut self, f: &ast::FnDef, attrs: &[ast::Attribute], vis: &ast::Visibility) -> CodegenResult<()> {
+    fn lower_function_with_vis(
+        &mut self,
+        f: &ast::FnDef,
+        attrs: &[ast::Attribute],
+        vis: &ast::Visibility,
+    ) -> CodegenResult<()> {
         self.current_item_vis = Some(vis.is_public());
         let result = self.lower_function(f, attrs);
         self.current_item_vis = None;
@@ -1177,9 +1284,12 @@ impl<'ctx> MirLowerer<'ctx> {
         }
 
         // Build function signature
-        let params: Vec<_> = f.sig.params.iter().map(|p| {
-            self.lower_type_from_ast(&p.ty)
-        }).collect();
+        let params: Vec<_> = f
+            .sig
+            .params
+            .iter()
+            .map(|p| self.lower_type_from_ast(&p.ty))
+            .collect();
 
         let is_main = f.name.name.as_ref() == "main";
         let has_shader_stage = Self::extract_shader_stage(attrs).is_some();
@@ -1188,7 +1298,9 @@ impl<'ctx> MirLowerer<'ctx> {
             // C requires main to return int (but not shader main)
             MirType::i32()
         } else {
-            f.sig.return_ty.as_ref()
+            f.sig
+                .return_ty
+                .as_ref()
                 .map(|t| self.lower_type_from_ast(t))
                 .unwrap_or(MirType::Void)
         };
@@ -1246,10 +1358,8 @@ impl<'ctx> MirLowerer<'ctx> {
                             let ret_ty = fn_ret_ty.clone();
                             let ret_local = builder.create_local(ret_ty.clone());
                             let default = match &ret_ty {
-                                MirType::Int(_, _) =>
-                                    MirValue::Const(MirConst::Int(0, ret_ty)),
-                                MirType::Float(_) =>
-                                    MirValue::Const(MirConst::Float(0.0, ret_ty)),
+                                MirType::Int(_, _) => MirValue::Const(MirConst::Int(0, ret_ty)),
+                                MirType::Float(_) => MirValue::Const(MirConst::Float(0.0, ret_ty)),
                                 _ => MirValue::Const(MirConst::Int(0, MirType::i32())),
                             };
                             builder.assign(ret_local, MirRValue::Use(default));
@@ -1267,7 +1377,7 @@ impl<'ctx> MirLowerer<'ctx> {
 
             let mut func = builder.build();
             if is_main {
-                func.linkage = Linkage::External;  // main must not be static
+                func.linkage = Linkage::External; // main must not be static
             }
             func.is_public = is_main || self.current_item_vis.unwrap_or(true);
 
@@ -1295,9 +1405,11 @@ impl<'ctx> MirLowerer<'ctx> {
         let type_name = self.resolve_type_name(&impl_def.self_ty);
 
         // Skip generic impls — they are lowered when the type is monomorphized
-        let has_impl_generics = impl_def.generics.params.iter().any(|p| {
-            matches!(p.kind, ast::GenericParamKind::Type { .. })
-        });
+        let has_impl_generics = impl_def
+            .generics
+            .params
+            .iter()
+            .any(|p| matches!(p.kind, ast::GenericParamKind::Type { .. }));
         let is_generic_type = self.generic_enums.contains_key(type_name.as_ref())
             || self.generic_structs.contains_key(type_name.as_ref());
 
@@ -1343,7 +1455,10 @@ impl<'ctx> MirLowerer<'ctx> {
             }
         }
 
-        let ret = f.sig.return_ty.as_ref()
+        let ret = f
+            .sig
+            .return_ty
+            .as_ref()
             .map(|t| self.lower_type_from_ast(t))
             .unwrap_or(MirType::Void);
 
@@ -1393,7 +1508,11 @@ impl<'ctx> MirLowerer<'ctx> {
     /// Lower a monomorphized generic impl method. Unlike lower_impl_method,
     /// this uses the function name directly (already mangled) and the self type
     /// is the already-mangled type name.
-    fn lower_generic_impl_method(&mut self, type_name: &Arc<str>, f: &ast::FnDef) -> CodegenResult<()> {
+    fn lower_generic_impl_method(
+        &mut self,
+        type_name: &Arc<str>,
+        f: &ast::FnDef,
+    ) -> CodegenResult<()> {
         // The function name is already the final mangled name (e.g., Option_i32_unwrap_or)
         let fn_name = f.name.name.clone();
 
@@ -1413,7 +1532,10 @@ impl<'ctx> MirLowerer<'ctx> {
             }
         }
 
-        let ret = f.sig.return_ty.as_ref()
+        let ret = f
+            .sig
+            .return_ty
+            .as_ref()
             .map(|t| self.lower_type_from_ast(t))
             .unwrap_or(MirType::Void);
 
@@ -1459,7 +1581,11 @@ impl<'ctx> MirLowerer<'ctx> {
     }
 
     /// Generate methods from #[derive(...)] attributes on a struct.
-    fn generate_derive_methods(&mut self, name: &ast::Ident, _attrs: &[ast::Attribute]) -> CodegenResult<()> {
+    fn generate_derive_methods(
+        &mut self,
+        name: &ast::Ident,
+        _attrs: &[ast::Attribute],
+    ) -> CodegenResult<()> {
         let type_name = name.name.clone();
         let clone_key = (type_name.clone(), Arc::from("clone"));
 
@@ -1562,9 +1688,7 @@ impl<'ctx> MirLowerer<'ctx> {
     /// bitwise ops propagate the operand type.
     fn binary_result_type(&self, op: BinOp, left_val: &MirValue) -> MirType {
         match op {
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                MirType::Bool
-            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => MirType::Bool,
             _ => self.type_of_value(left_val),
         }
     }
@@ -1587,7 +1711,11 @@ impl<'ctx> MirLowerer<'ctx> {
 
     /// Look up an enum variant by enum name and variant name.
     /// Returns (discriminant, variant_fields) if found.
-    fn lookup_enum_variant(&self, enum_name: &str, variant_name: &str) -> Option<(i128, Vec<(Option<Arc<str>>, MirType)>)> {
+    fn lookup_enum_variant(
+        &self,
+        enum_name: &str,
+        variant_name: &str,
+    ) -> Option<(i128, Vec<(Option<Arc<str>>, MirType)>)> {
         if let Some(type_def) = self.module.find_type(enum_name) {
             if let TypeDefKind::Enum { variants, .. } = &type_def.kind {
                 for v in variants {
@@ -1615,11 +1743,11 @@ impl<'ctx> MirLowerer<'ctx> {
         let prefix = format!("{}_", base_name);
         // Search only registered enum types, not all monomorphized names
         // (which also includes functions like Option_i32_unwrap_or)
-        self.monomorphized.iter()
+        self.monomorphized
+            .iter()
             .find(|name| name.starts_with(&prefix) && self.is_enum_type(name))
             .cloned()
     }
-
 }
 
 /// Determine item visibility.  The AST currently does not carry a

@@ -37,22 +37,21 @@
 //! }
 //! ```
 
-mod token;
-mod span;
 mod cursor;
-mod scanner;
 mod error;
+mod scanner;
+mod span;
+mod token;
 
-pub use token::{
-    Token, TokenKind, Keyword, Delimiter, LiteralKind, IntBase, InterpolatedPart,
-    NumericSuffixKind, NumericSuffixValidation, validate_numeric_suffix,
-    is_valid_int_suffix, is_valid_float_suffix, is_integer_only_suffix,
-    INTEGER_SUFFIXES, FLOAT_SUFFIXES, NUMERIC_SUFFIXES,
-    DocComment, DocCommentKind, DocComments,
-};
-pub use span::{Span, Position, SourceFile, SourceId, BytePos};
-pub use scanner::Lexer;
 pub use error::{LexerError, LexerErrorKind, LexerResult};
+pub use scanner::Lexer;
+pub use span::{BytePos, Position, SourceFile, SourceId, Span};
+pub use token::{
+    is_integer_only_suffix, is_valid_float_suffix, is_valid_int_suffix, validate_numeric_suffix,
+    Delimiter, DocComment, DocCommentKind, DocComments, IntBase, InterpolatedPart, Keyword,
+    LiteralKind, NumericSuffixKind, NumericSuffixValidation, Token, TokenKind, FLOAT_SUFFIXES,
+    INTEGER_SUFFIXES, NUMERIC_SUFFIXES,
+};
 
 /// Convenience function to tokenize source code
 pub fn tokenize(source: &str) -> LexerResult<Vec<Token>> {
@@ -76,7 +75,10 @@ pub fn tokenize_with_docs(source: &str) -> LexerResult<(Vec<Token>, DocComments)
 }
 
 /// Convenience function to tokenize source code from a file and extract doc comments
-pub fn tokenize_file_with_docs(filename: &str, source: &str) -> LexerResult<(Vec<Token>, DocComments)> {
+pub fn tokenize_file_with_docs(
+    filename: &str,
+    source: &str,
+) -> LexerResult<(Vec<Token>, DocComments)> {
     let file = SourceFile::new(filename, source);
     let mut lexer = Lexer::new(&file);
     lexer.tokenize_with_docs()

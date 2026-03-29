@@ -233,22 +233,22 @@ pub fn parse_config(content: &str) -> Result<FormatConfig, ConfigError> {
 
         match key {
             "max_line_length" => {
-                config.max_line_length = value.parse().map_err(|_| {
-                    ConfigError::InvalidValue(key.to_string(), value.to_string())
-                })?;
+                config.max_line_length = value
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidValue(key.to_string(), value.to_string()))?;
             }
             "indent_width" => {
-                config.indent_width = value.parse().map_err(|_| {
-                    ConfigError::InvalidValue(key.to_string(), value.to_string())
-                })?;
+                config.indent_width = value
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidValue(key.to_string(), value.to_string()))?;
             }
             "use_tabs" => {
                 config.use_tabs = value == "true";
             }
             "tab_width" => {
-                config.tab_width = value.parse().map_err(|_| {
-                    ConfigError::InvalidValue(key.to_string(), value.to_string())
-                })?;
+                config.tab_width = value
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidValue(key.to_string(), value.to_string()))?;
             }
             "trailing_comma" => {
                 config.trailing_comma = match value {
@@ -312,14 +312,14 @@ pub fn parse_config(content: &str) -> Result<FormatConfig, ConfigError> {
                 config.final_newline = value == "true";
             }
             "blank_lines_before_items" => {
-                config.blank_lines_before_items = value.parse().map_err(|_| {
-                    ConfigError::InvalidValue(key.to_string(), value.to_string())
-                })?;
+                config.blank_lines_before_items = value
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidValue(key.to_string(), value.to_string()))?;
             }
             "max_blank_lines" => {
-                config.max_blank_lines = value.parse().map_err(|_| {
-                    ConfigError::InvalidValue(key.to_string(), value.to_string())
-                })?;
+                config.max_blank_lines = value
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidValue(key.to_string(), value.to_string()))?;
             }
             _ => {
                 // Unknown key - ignore or warn

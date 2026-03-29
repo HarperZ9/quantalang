@@ -9,8 +9,8 @@
 //! This module provides a cursor that iterates over characters in source code
 //! with proper Unicode handling and position tracking.
 
-use std::str::Chars;
 use super::span::{BytePos, SourceId};
+use std::str::Chars;
 
 /// End-of-file character marker.
 pub const EOF_CHAR: char = '\0';
@@ -231,10 +231,7 @@ pub fn is_id_continue(c: char) -> bool {
 /// Check if a character is ASCII whitespace.
 #[inline]
 pub fn is_whitespace(c: char) -> bool {
-    matches!(
-        c,
-        ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C'
-    )
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C')
 }
 
 /// Check if a character is a decimal digit.

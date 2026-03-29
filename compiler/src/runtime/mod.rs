@@ -40,10 +40,10 @@
 //! }
 //! ```
 
+pub mod async_rt;
 pub mod ffi;
 pub mod gc;
-pub mod async_rt;
 
+pub use async_rt::*;
 pub use ffi::*;
 pub use gc::*;
-pub use async_rt::*;

@@ -8,10 +8,10 @@
 //!
 //! Expressions are the core of QuantaLang - everything that produces a value.
 
-use crate::lexer::Span;
 use super::{
-    Attribute, BinOp, UnaryOp, AssignOp, Block, Ident, Mutability, NodeId, Path, Pattern, Type,
+    AssignOp, Attribute, BinOp, Block, Ident, Mutability, NodeId, Path, Pattern, Type, UnaryOp,
 };
+use crate::lexer::Span;
 
 /// An expression node.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,14 +83,12 @@ pub enum ExprKind {
     // =========================================================================
     // LITERALS
     // =========================================================================
-
     /// A literal value.
     Literal(Literal),
 
     // =========================================================================
     // IDENTIFIERS AND PATHS
     // =========================================================================
-
     /// An identifier: `x`, `foo`
     Ident(Ident),
 
@@ -100,7 +98,6 @@ pub enum ExprKind {
     // =========================================================================
     // COMPOUND EXPRESSIONS
     // =========================================================================
-
     /// An array literal: `[1, 2, 3]`
     Array(Vec<Expr>),
 
@@ -123,12 +120,8 @@ pub enum ExprKind {
     // =========================================================================
     // OPERATORS
     // =========================================================================
-
     /// A unary operation: `-x`, `!b`, `*ptr`
-    Unary {
-        op: UnaryOp,
-        expr: Box<Expr>,
-    },
+    Unary { op: UnaryOp, expr: Box<Expr> },
 
     /// A binary operation: `a + b`, `x && y`
     Binary {
@@ -147,12 +140,8 @@ pub enum ExprKind {
     // =========================================================================
     // ACCESS
     // =========================================================================
-
     /// Field access: `point.x`
-    Field {
-        expr: Box<Expr>,
-        field: Ident,
-    },
+    Field { expr: Box<Expr>, field: Ident },
 
     /// Tuple field access: `tuple.0`
     TupleField {
@@ -162,10 +151,7 @@ pub enum ExprKind {
     },
 
     /// Index access: `array[0]`
-    Index {
-        expr: Box<Expr>,
-        index: Box<Expr>,
-    },
+    Index { expr: Box<Expr>, index: Box<Expr> },
 
     /// Dereference: `*ptr`
     Deref(Box<Expr>),
@@ -179,12 +165,8 @@ pub enum ExprKind {
     // =========================================================================
     // CALLS
     // =========================================================================
-
     /// Function call: `foo(1, 2)`
-    Call {
-        func: Box<Expr>,
-        args: Vec<Expr>,
-    },
+    Call { func: Box<Expr>, args: Vec<Expr> },
 
     /// Method call: `x.foo(1, 2)`
     MethodCall {
@@ -197,7 +179,6 @@ pub enum ExprKind {
     // =========================================================================
     // CONTROL FLOW
     // =========================================================================
-
     /// If expression: `if cond { ... } else { ... }`
     If {
         condition: Box<Expr>,
@@ -251,7 +232,6 @@ pub enum ExprKind {
     // =========================================================================
     // JUMPS
     // =========================================================================
-
     /// Return: `return`, `return x`
     Return(Option<Box<Expr>>),
 
@@ -262,14 +242,11 @@ pub enum ExprKind {
     },
 
     /// Continue: `continue`, `continue 'label`
-    Continue {
-        label: Option<Ident>,
-    },
+    Continue { label: Option<Ident> },
 
     // =========================================================================
     // CLOSURES
     // =========================================================================
-
     /// Closure: `|x, y| x + y`, `move |x| x * 2`
     Closure {
         is_move: bool,
@@ -282,7 +259,6 @@ pub enum ExprKind {
     // =========================================================================
     // BLOCKS
     // =========================================================================
-
     /// Block expression: `{ ... }`
     Block(Box<Block>),
 
@@ -290,45 +266,32 @@ pub enum ExprKind {
     Unsafe(Box<Block>),
 
     /// Async block: `async { ... }`, `async move { ... }`
-    Async {
-        is_move: bool,
-        body: Box<Block>,
-    },
+    Async { is_move: bool, body: Box<Block> },
 
     // =========================================================================
     // TYPE OPERATIONS
     // =========================================================================
-
     /// Type cast: `x as i32`
-    Cast {
-        expr: Box<Expr>,
-        ty: Box<Type>,
-    },
+    Cast { expr: Box<Expr>, ty: Box<Type> },
 
     /// Type ascription: `x: i32`
-    TypeAscription {
-        expr: Box<Expr>,
-        ty: Box<Type>,
-    },
+    TypeAscription { expr: Box<Expr>, ty: Box<Type> },
 
     // =========================================================================
     // ERROR HANDLING
     // =========================================================================
-
     /// Try operator: `x?`
     Try(Box<Expr>),
 
     // =========================================================================
     // ASYNC
     // =========================================================================
-
     /// Await: `x.await`
     Await(Box<Expr>),
 
     // =========================================================================
     // RANGES
     // =========================================================================
-
     /// Range: `..`, `a..`, `..b`, `a..b`
     Range {
         start: Option<Box<Expr>>,
@@ -339,7 +302,6 @@ pub enum ExprKind {
     // =========================================================================
     // MACROS
     // =========================================================================
-
     /// Macro invocation: `println!(...)`
     Macro {
         path: Path,
@@ -350,7 +312,6 @@ pub enum ExprKind {
     // =========================================================================
     // QUANTALANG EXTENSIONS
     // =========================================================================
-
     /// AI query: `@ai("prompt")`
     AIQuery {
         prompt: Box<Expr>,
@@ -358,10 +319,7 @@ pub enum ExprKind {
     },
 
     /// AI inference: `expr @infer Type`
-    AIInfer {
-        expr: Box<Expr>,
-        ty: Box<Type>,
-    },
+    AIInfer { expr: Box<Expr>, ty: Box<Type> },
 
     /// Effect handler: `handle effect { ... }`
     Handle {
@@ -386,7 +344,6 @@ pub enum ExprKind {
     // =========================================================================
     // SPECIAL
     // =========================================================================
-
     /// Parenthesized expression (for span tracking)
     Paren(Box<Expr>),
 
@@ -409,15 +366,9 @@ pub enum Literal {
         suffix: Option<FloatSuffix>,
     },
     /// String literal.
-    Str {
-        value: String,
-        is_raw: bool,
-    },
+    Str { value: String, is_raw: bool },
     /// Byte string literal.
-    ByteStr {
-        value: Vec<u8>,
-        is_raw: bool,
-    },
+    ByteStr { value: Vec<u8>, is_raw: bool },
     /// Character literal.
     Char(char),
     /// Byte literal.
@@ -429,8 +380,18 @@ pub enum Literal {
 /// Integer suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntSuffix {
-    I8, I16, I32, I64, I128, Isize,
-    U8, U16, U32, U64, U128, Usize,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    Isize,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    Usize,
 }
 
 impl IntSuffix {
@@ -457,7 +418,9 @@ impl IntSuffix {
 /// Float suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FloatSuffix {
-    F16, F32, F64,
+    F16,
+    F32,
+    F64,
 }
 
 impl FloatSuffix {

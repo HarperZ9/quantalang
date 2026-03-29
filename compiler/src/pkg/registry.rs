@@ -108,7 +108,11 @@ impl std::fmt::Display for RegistryError {
             Self::CacheError(msg) => write!(f, "cache error: {}", msg),
             Self::Io(e) => write!(f, "IO error: {}", e),
             Self::ChecksumMismatch { expected, actual } => {
-                write!(f, "checksum mismatch: expected {}, got {}", expected, actual)
+                write!(
+                    f,
+                    "checksum mismatch: expected {}, got {}",
+                    expected, actual
+                )
             }
             Self::Yanked(name, ver) => write!(f, "package {}@{} has been yanked", name, ver),
         }
@@ -208,7 +212,8 @@ impl Registry {
 
     /// Search for packages
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<PackageMetadata>, RegistryError> {
-        let url = format!("{}/api/v1/search?q={}&limit={}",
+        let url = format!(
+            "{}/api/v1/search?q={}&limit={}",
             self.config.url,
             urlencoding::encode(query),
             limit
@@ -250,7 +255,8 @@ impl Registry {
         let meta = self.get_package(name)?;
 
         // Find all matching non-yanked versions
-        let mut matching: Vec<_> = meta.versions
+        let mut matching: Vec<_> = meta
+            .versions
             .into_iter()
             .filter(|v| !v.yanked && req.matches(&v.version))
             .collect();
@@ -265,7 +271,11 @@ impl Registry {
     }
 
     /// Download a package
-    pub fn download(&self, name: &str, version: &Version) -> Result<DownloadedPackage, RegistryError> {
+    pub fn download(
+        &self,
+        name: &str,
+        version: &Version,
+    ) -> Result<DownloadedPackage, RegistryError> {
         // Check cache first
         if let Some(path) = self.cache.get_package(name, version) {
             let manifest = self.load_manifest(&path)?;
@@ -285,8 +295,10 @@ impl Registry {
         }
 
         // Download tarball
-        let url = format!("{}/api/v1/packages/{}/{}/download",
-            self.config.url, name, version);
+        let url = format!(
+            "{}/api/v1/packages/{}/{}/download",
+            self.config.url, name, version
+        );
         let data = self.http_get_binary(&url)?;
 
         // Verify checksum
@@ -312,7 +324,10 @@ impl Registry {
 
     /// Publish a package
     pub fn publish(&self, tarball: &[u8], manifest: &Manifest) -> Result<(), RegistryError> {
-        let token = self.config.token.as_ref()
+        let token = self
+            .config
+            .token
+            .as_ref()
             .ok_or(RegistryError::AuthRequired)?;
 
         let url = format!("{}/api/v1/packages/new", self.config.url);
@@ -323,14 +338,20 @@ impl Registry {
 
         // Add manifest part
         write!(body, "--{}\r\n", boundary)?;
-        write!(body, "Content-Disposition: form-data; name=\"manifest\"\r\n")?;
+        write!(
+            body,
+            "Content-Disposition: form-data; name=\"manifest\"\r\n"
+        )?;
         write!(body, "Content-Type: application/toml\r\n\r\n")?;
         body.extend_from_slice(manifest.to_toml().as_bytes());
         write!(body, "\r\n")?;
 
         // Add tarball part
         write!(body, "--{}\r\n", boundary)?;
-        write!(body, "Content-Disposition: form-data; name=\"tarball\"; filename=\"package.tar.gz\"\r\n")?;
+        write!(
+            body,
+            "Content-Disposition: form-data; name=\"tarball\"; filename=\"package.tar.gz\"\r\n"
+        )?;
         write!(body, "Content-Type: application/gzip\r\n\r\n")?;
         body.extend_from_slice(tarball);
         write!(body, "\r\n--{}--\r\n", boundary)?;
@@ -342,11 +363,16 @@ impl Registry {
 
     /// Yank a version
     pub fn yank(&self, name: &str, version: &Version) -> Result<(), RegistryError> {
-        let token = self.config.token.as_ref()
+        let token = self
+            .config
+            .token
+            .as_ref()
             .ok_or(RegistryError::AuthRequired)?;
 
-        let url = format!("{}/api/v1/packages/{}/{}/yank",
-            self.config.url, name, version);
+        let url = format!(
+            "{}/api/v1/packages/{}/{}/yank",
+            self.config.url, name, version
+        );
 
         self.http_delete(&url, token)?;
 
@@ -358,11 +384,16 @@ impl Registry {
 
     /// Unyank a version
     pub fn unyank(&self, name: &str, version: &Version) -> Result<(), RegistryError> {
-        let token = self.config.token.as_ref()
+        let token = self
+            .config
+            .token
+            .as_ref()
             .ok_or(RegistryError::AuthRequired)?;
 
-        let url = format!("{}/api/v1/packages/{}/{}/unyank",
-            self.config.url, name, version);
+        let url = format!(
+            "{}/api/v1/packages/{}/{}/unyank",
+            self.config.url, name, version
+        );
 
         self.http_put(&url, &[], token)?;
 
@@ -381,7 +412,10 @@ impl Registry {
 
     /// Add owner to a package
     pub fn add_owner(&self, name: &str, user: &str) -> Result<(), RegistryError> {
-        let token = self.config.token.as_ref()
+        let token = self
+            .config
+            .token
+            .as_ref()
             .ok_or(RegistryError::AuthRequired)?;
 
         let url = format!("{}/api/v1/packages/{}/owners", self.config.url, name);
@@ -394,11 +428,16 @@ impl Registry {
 
     /// Remove owner from a package
     pub fn remove_owner(&self, name: &str, user: &str) -> Result<(), RegistryError> {
-        let token = self.config.token.as_ref()
+        let token = self
+            .config
+            .token
+            .as_ref()
             .ok_or(RegistryError::AuthRequired)?;
 
-        let url = format!("{}/api/v1/packages/{}/owners/{}",
-            self.config.url, name, user);
+        let url = format!(
+            "{}/api/v1/packages/{}/owners/{}",
+            self.config.url, name, user
+        );
 
         self.http_delete(&url, token)?;
 
@@ -412,36 +451,57 @@ impl Registry {
         // Placeholder - would use HTTP client
         let _ = url;
         let _ = self.config.timeout;
-        Err(RegistryError::Network("HTTP client not implemented".to_string()))
+        Err(RegistryError::Network(
+            "HTTP client not implemented".to_string(),
+        ))
     }
 
     fn http_get_binary(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
         let _ = url;
-        Err(RegistryError::Network("HTTP client not implemented".to_string()))
+        Err(RegistryError::Network(
+            "HTTP client not implemented".to_string(),
+        ))
     }
 
-    fn http_post(&self, url: &str, body: &[u8], token: &str, boundary: &str) -> Result<String, RegistryError> {
+    fn http_post(
+        &self,
+        url: &str,
+        body: &[u8],
+        token: &str,
+        boundary: &str,
+    ) -> Result<String, RegistryError> {
         let _ = (url, body, token, boundary);
-        Err(RegistryError::Network("HTTP client not implemented".to_string()))
+        Err(RegistryError::Network(
+            "HTTP client not implemented".to_string(),
+        ))
     }
 
     fn http_put(&self, url: &str, body: &[u8], token: &str) -> Result<String, RegistryError> {
         let _ = (url, body, token);
-        Err(RegistryError::Network("HTTP client not implemented".to_string()))
+        Err(RegistryError::Network(
+            "HTTP client not implemented".to_string(),
+        ))
     }
 
     fn http_delete(&self, url: &str, token: &str) -> Result<(), RegistryError> {
         let _ = (url, token);
-        Err(RegistryError::Network("HTTP client not implemented".to_string()))
+        Err(RegistryError::Network(
+            "HTTP client not implemented".to_string(),
+        ))
     }
 
-    fn parse_search_response(&self, _response: &str) -> Result<Vec<PackageMetadata>, RegistryError> {
+    fn parse_search_response(
+        &self,
+        _response: &str,
+    ) -> Result<Vec<PackageMetadata>, RegistryError> {
         // Placeholder JSON parsing
         Ok(Vec::new())
     }
 
     fn parse_package_response(&self, _response: &str) -> Result<PackageMetadata, RegistryError> {
-        Err(RegistryError::InvalidResponse("JSON parsing not implemented".to_string()))
+        Err(RegistryError::InvalidResponse(
+            "JSON parsing not implemented".to_string(),
+        ))
     }
 
     fn parse_owners_response(&self, _response: &str) -> Result<Vec<Owner>, RegistryError> {
@@ -526,7 +586,12 @@ impl PackageCache {
     }
 
     /// Store package in cache
-    pub fn store_package(&self, name: &str, version: &Version, data: &[u8]) -> Result<PathBuf, RegistryError> {
+    pub fn store_package(
+        &self,
+        name: &str,
+        version: &Version,
+        data: &[u8],
+    ) -> Result<PathBuf, RegistryError> {
         let path = self.package_path(name, version);
 
         if let Some(parent) = path.parent() {
@@ -558,7 +623,10 @@ impl PackageCache {
     }
 
     fn package_path(&self, name: &str, version: &Version) -> PathBuf {
-        self.root.join("packages").join(name).join(version.to_string())
+        self.root
+            .join("packages")
+            .join(name)
+            .join(version.to_string())
     }
 
     fn parse_cached_metadata(&self, _content: &str) -> Option<PackageMetadata> {
@@ -600,8 +668,13 @@ fn sha256_hex(data: &[u8]) -> String {
 
     let mut hasher = DefaultHasher::new();
     data.hash(&mut hasher);
-    format!("{:016x}{:016x}{:016x}{:016x}",
-        hasher.finish(), hasher.finish(), hasher.finish(), hasher.finish())
+    format!(
+        "{:016x}{:016x}{:016x}{:016x}",
+        hasher.finish(),
+        hasher.finish(),
+        hasher.finish(),
+        hasher.finish()
+    )
 }
 
 /// Git source for packages
@@ -650,7 +723,9 @@ impl GitSource {
     pub fn fetch(&self, dest: &Path) -> Result<(), RegistryError> {
         // Placeholder - would use git2 crate
         let _ = dest;
-        Err(RegistryError::Network("Git support not implemented".to_string()))
+        Err(RegistryError::Network(
+            "Git support not implemented".to_string(),
+        ))
     }
 }
 

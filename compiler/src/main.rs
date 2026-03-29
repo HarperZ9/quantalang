@@ -13,11 +13,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use quantalang::lexer::{SourceFile, Lexer, Span};
-use quantalang::parser::Parser;
-use quantalang::ast::{self, Module, ItemKind, Visibility};
-use quantalang::types::{TypeContext, TypeChecker};
+use quantalang::ast::{self, ItemKind, Module, Visibility};
 use quantalang::codegen::{CodeGenerator, Target};
+use quantalang::lexer::{Lexer, SourceFile, Span};
+use quantalang::parser::Parser;
+use quantalang::types::{TypeChecker, TypeContext};
 
 /// QuantaLang Compiler
 #[derive(ClapParser)]
@@ -194,7 +194,13 @@ fn main() -> ExitCode {
         Some(Commands::Lex { file, verbose }) => cmd_lex(&file, verbose),
         Some(Commands::Parse { file, json }) => cmd_parse(&file, json),
         Some(Commands::Check { file }) => cmd_check(&file),
-        Some(Commands::Build { path, release, emit, keep_c, target }) => cmd_build(&path, release, &emit, keep_c, &target),
+        Some(Commands::Build {
+            path,
+            release,
+            emit,
+            keep_c,
+            target,
+        }) => cmd_build(&path, release, &emit, keep_c, &target),
         Some(Commands::Run { file, args }) => cmd_run(&file, &args),
         Some(Commands::Repl) => cmd_repl(),
         Some(Commands::Lsp) => cmd_lsp(),
@@ -207,7 +213,13 @@ fn main() -> ExitCode {
         }
         None => {
             if let Some(input) = cli.input {
-                cmd_compile(&input, cli.output.as_deref(), cli.opt_level, cli.debug, cli.target.as_deref())
+                cmd_compile(
+                    &input,
+                    cli.output.as_deref(),
+                    cli.opt_level,
+                    cli.debug,
+                    cli.target.as_deref(),
+                )
             } else {
                 eprintln!("No input file specified. Use --help for usage information.");
                 Err(1)
@@ -223,7 +235,8 @@ fn main() -> ExitCode {
 
 fn print_version() {
     println!("QuantaLang Compiler (quantac) {}", quantalang::VERSION);
-    println!("Language version: {}.{}.{}",
+    println!(
+        "Language version: {}.{}.{}",
         quantalang::LANGUAGE_VERSION.0,
         quantalang::LANGUAGE_VERSION.1,
         quantalang::LANGUAGE_VERSION.2
@@ -255,8 +268,10 @@ fn cmd_lex(file: &PathBuf, verbose: bool) -> Result<(), i32> {
             let text = source_file.slice(token.span);
             println!(
                 "{:4}:{:<3} - {:4}:{:<3}  {:20} {:?}",
-                start.line, start.column,
-                end.line, end.column,
+                start.line,
+                start.column,
+                end.line,
+                end.column,
                 format!("{}", token.kind),
                 text
             );
@@ -348,7 +363,11 @@ fn format_ast_json(ast: &Module) -> String {
     output.push_str("  \"item_kinds\": [\n");
     for (i, item) in ast.items.iter().enumerate() {
         let comma = if i < ast.items.len() - 1 { "," } else { "" };
-        output.push_str(&format!("    \"{}\"{}\n", item_kind_name(&item.kind), comma));
+        output.push_str(&format!(
+            "    \"{}\"{}\n",
+            item_kind_name(&item.kind),
+            comma
+        ));
     }
     output.push_str("  ]\n");
     output.push_str("}\n");
@@ -373,10 +392,20 @@ fn print_item_summary(item: &quantalang::ast::Item, indent: usize) {
             }
         }
         quantalang::ast::ItemKind::Struct(s) => {
-            println!("{}struct {} ({} fields)", prefix, s.name.name, struct_field_count(&s.fields));
+            println!(
+                "{}struct {} ({} fields)",
+                prefix,
+                s.name.name,
+                struct_field_count(&s.fields)
+            );
         }
         quantalang::ast::ItemKind::Enum(e) => {
-            println!("{}enum {} ({} variants)", prefix, e.name.name, e.variants.len());
+            println!(
+                "{}enum {} ({} variants)",
+                prefix,
+                e.name.name,
+                e.variants.len()
+            );
         }
         quantalang::ast::ItemKind::Trait(t) => {
             println!("{}trait {} ({} items)", prefix, t.name.name, t.items.len());
@@ -403,7 +432,12 @@ fn print_item_summary(item: &quantalang::ast::Item, indent: usize) {
             println!("{}extern crate {}", prefix, e.name.name);
         }
         quantalang::ast::ItemKind::ExternBlock(e) => {
-            println!("{}extern \"{}\" ({} items)", prefix, e.abi.as_deref().unwrap_or("C"), e.items.len());
+            println!(
+                "{}extern \"{}\" ({} items)",
+                prefix,
+                e.abi.as_deref().unwrap_or("C"),
+                e.items.len()
+            );
         }
         quantalang::ast::ItemKind::Macro(m) => {
             println!("{}macro {:?}!", prefix, m.name.as_ref().map(|n| &n.name));
@@ -464,7 +498,9 @@ fn preprocess_includes_inner(
             .and_then(|s| s.strip_suffix("\");"))
         {
             let full_path = base_dir.join(path_str);
-            let canonical = full_path.canonicalize().unwrap_or_else(|_| full_path.clone());
+            let canonical = full_path
+                .canonicalize()
+                .unwrap_or_else(|_| full_path.clone());
 
             // Double-inclusion guard
             if included.contains(&canonical) {
@@ -477,11 +513,7 @@ fn preprocess_includes_inner(
 
             if full_path.exists() {
                 let contents = std::fs::read_to_string(&full_path).map_err(|e| {
-                    eprintln!(
-                        "Error reading include '{}': {}",
-                        full_path.display(),
-                        e
-                    );
+                    eprintln!("Error reading include '{}': {}", full_path.display(), e);
                     1
                 })?;
 
@@ -489,8 +521,7 @@ fn preprocess_includes_inner(
 
                 // Recursively expand includes in the included file
                 let inc_dir = full_path.parent().unwrap_or(base_dir);
-                let expanded =
-                    preprocess_includes_inner(&contents, inc_dir, depth + 1, included)?;
+                let expanded = preprocess_includes_inner(&contents, inc_dir, depth + 1, included)?;
 
                 result.push_str("// === include: ");
                 result.push_str(path_str);
@@ -585,8 +616,12 @@ fn resolve_imports(source: &str, input_file: &Path) -> Result<String, i32> {
                 let lib_path = reg.join(&pkg_dir_name).join("src").join("lib.quanta");
                 if lib_path.exists() {
                     let contents = std::fs::read_to_string(&lib_path).map_err(|e| {
-                        eprintln!("Error reading import '{}' from '{}': {}",
-                                  name, lib_path.display(), e);
+                        eprintln!(
+                            "Error reading import '{}' from '{}': {}",
+                            name,
+                            lib_path.display(),
+                            e
+                        );
                         1
                     })?;
                     // Prepend with a separator comment for clarity.
@@ -596,10 +631,17 @@ fn resolve_imports(source: &str, input_file: &Path) -> Result<String, i32> {
                     ));
                     found_any = true;
                 } else {
-                    eprintln!("Warning: import '{}' not found at '{}'", name, lib_path.display());
+                    eprintln!(
+                        "Warning: import '{}' not found at '{}'",
+                        name,
+                        lib_path.display()
+                    );
                 }
             } else {
-                eprintln!("Warning: import '{}' requested but no registry directory found", name);
+                eprintln!(
+                    "Warning: import '{}' requested but no registry directory found",
+                    name
+                );
             }
         }
     }
@@ -645,7 +687,11 @@ fn cmd_check(file: &PathBuf) -> Result<(), i32> {
     if parse_errors.is_empty() {
         println!("Parsing... OK ({} items)", ast.items.len());
     } else {
-        println!("Parsing... {} items ({} parse errors)", ast.items.len(), parse_errors.len());
+        println!(
+            "Parsing... {} items ({} parse errors)",
+            ast.items.len(),
+            parse_errors.len()
+        );
     }
 
     // Type check the successfully parsed items
@@ -706,14 +752,12 @@ fn find_c_compiler() -> Option<String> {
 
         let ok = match probe {
             Ok(status) => status.success(),
-            Err(_) if compiler.starts_with("cl") => {
-                std::process::Command::new(compiler)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .map(|_| true)
-                    .unwrap_or(false)
-            }
+            Err(_) if compiler.starts_with("cl") => std::process::Command::new(compiler)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|_| true)
+                .unwrap_or(false),
             Err(_) => false,
         };
 
@@ -747,8 +791,7 @@ fn find_vcvars_bat() -> Option<String> {
     ];
 
     for vs_root in &vs_roots {
-        let vcvars = std::path::PathBuf::from(vs_root)
-            .join(r"VC\Auxiliary\Build\vcvarsall.bat");
+        let vcvars = std::path::PathBuf::from(vs_root).join(r"VC\Auxiliary\Build\vcvarsall.bat");
         if vcvars.is_file() {
             return Some(vcvars.to_string_lossy().to_string());
         }
@@ -779,7 +822,8 @@ fn find_msvc_cl() -> Option<String> {
         }
 
         // Find the latest MSVC version directory
-        let mut versions: Vec<_> = std::fs::read_dir(&vc_tools).ok()?
+        let mut versions: Vec<_> = std::fs::read_dir(&vc_tools)
+            .ok()?
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_dir())
             .map(|e| e.file_name().to_string_lossy().to_string())
@@ -801,11 +845,14 @@ fn find_msvc_cl() -> Option<String> {
 
         // Find latest SDK version
         let sdk_ver = if sdk_include.is_dir() {
-            let mut sdk_versions: Vec<_> = std::fs::read_dir(&sdk_include).ok()
-                .map(|rd| rd.filter_map(|e| e.ok())
-                    .filter(|e| e.path().is_dir())
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .collect())
+            let mut sdk_versions: Vec<_> = std::fs::read_dir(&sdk_include)
+                .ok()
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| e.path().is_dir())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect()
+                })
                 .unwrap_or_default();
             sdk_versions.sort();
             sdk_versions.last().cloned().unwrap_or_default()
@@ -819,7 +866,8 @@ fn find_msvc_cl() -> Option<String> {
         let um_include = sdk_include.join(&sdk_ver).join("um");
         let shared_include = sdk_include.join(&sdk_ver).join("shared");
 
-        let include_path = format!("{};{};{};{}",
+        let include_path = format!(
+            "{};{};{};{}",
             msvc_include.display(),
             ucrt_include.display(),
             um_include.display(),
@@ -831,7 +879,8 @@ fn find_msvc_cl() -> Option<String> {
         let ucrt_lib = sdk_lib.join(&sdk_ver).join(r"ucrt\x64");
         let um_lib = sdk_lib.join(&sdk_ver).join(r"um\x64");
 
-        let lib_path = format!("{};{};{}",
+        let lib_path = format!(
+            "{};{};{}",
             msvc_lib.display(),
             ucrt_lib.display(),
             um_lib.display(),
@@ -875,7 +924,8 @@ fn invoke_c_compiler(
     exe_file: &std::path::Path,
     release: bool,
 ) -> Result<(), i32> {
-    let is_msvc = compiler.starts_with("cl") || compiler.ends_with("cl.exe") || compiler.ends_with("cl");
+    let is_msvc =
+        compiler.starts_with("cl") || compiler.ends_with("cl.exe") || compiler.ends_with("cl");
 
     let mut cmd = std::process::Command::new(compiler);
 
@@ -913,7 +963,11 @@ fn invoke_c_compiler(
             cmd.arg(c_file);
             cmd.arg(format!("/Fe:{}", exe_file.display()));
             cmd.arg("/std:c11");
-            if release { cmd.arg("/O2"); } else { cmd.arg("/Zi"); }
+            if release {
+                cmd.arg("/O2");
+            } else {
+                cmd.arg("/Zi");
+            }
             cmd.arg("/nologo");
             cmd.arg("/W0");
         }
@@ -941,11 +995,17 @@ fn invoke_c_compiler(
 
     if output.status.success() {
         if !exe_file.exists() {
-            eprintln!("Warning: C compiler succeeded but executable not found at {}", exe_file.display());
+            eprintln!(
+                "Warning: C compiler succeeded but executable not found at {}",
+                exe_file.display()
+            );
         }
         Ok(())
     } else {
-        eprintln!("C compilation failed (exit code: {:?}):", output.status.code());
+        eprintln!(
+            "C compilation failed (exit code: {:?}):",
+            output.status.code()
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.is_empty() {
             eprintln!("{}", stderr);
@@ -962,7 +1022,13 @@ fn invoke_c_compiler(
 // BUILD COMMAND
 // =============================================================================
 
-fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str: &str) -> Result<(), i32> {
+fn cmd_build(
+    path: &PathBuf,
+    release: bool,
+    emit: &str,
+    keep_c: bool,
+    target_str: &str,
+) -> Result<(), i32> {
     // Look for Quanta.toml or main.quanta in the project directory
     let manifest_path = path.join("Quanta.toml");
     let main_path = if manifest_path.exists() {
@@ -1039,7 +1105,12 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
         1
     })?;
 
-    let total_steps = if emit_c_only || use_llvm || use_native || use_wasm || use_spirv || use_shader { 4 } else { 5 };
+    let total_steps =
+        if emit_c_only || use_llvm || use_native || use_wasm || use_spirv || use_shader {
+            4
+        } else {
+            5
+        };
     println!("[1/{}] Lexing... OK ({} tokens)", total_steps, tokens.len());
 
     // Parse
@@ -1051,7 +1122,11 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
         }
         1
     })?;
-    println!("[2/{}] Parsing... OK ({} items)", total_steps, ast.items.len());
+    println!(
+        "[2/{}] Parsing... OK ({} items)",
+        total_steps,
+        ast.items.len()
+    );
 
     // Resolve `mod foo;` declarations — load and merge external module files
     let source_dir = main_path.parent().unwrap_or(Path::new("."));
@@ -1078,10 +1153,17 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
         eprintln!("Code generation error: {}", e);
         1
     })?;
-    println!("[4/{}] Code generation ({})... OK ({} bytes)", total_steps, target, output.data.len());
+    println!(
+        "[4/{}] Code generation ({})... OK ({} bytes)",
+        total_steps,
+        target,
+        output.data.len()
+    );
 
     // Write output
-    let output_dir = path.join("target").join(if release { "release" } else { "debug" });
+    let output_dir = path
+        .join("target")
+        .join(if release { "release" } else { "debug" });
     std::fs::create_dir_all(&output_dir).map_err(|e| {
         eprintln!("Failed to create output directory: {}", e);
         1
@@ -1100,7 +1182,11 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
         return Ok(());
     } else if use_native {
         // x86-64 / ARM64 target: write assembly file
-        let ext = if target == Target::X86_64 { "x86_64.s" } else { "aarch64.s" };
+        let ext = if target == Target::X86_64 {
+            "x86_64.s"
+        } else {
+            "aarch64.s"
+        };
         let asm_output_file = output_dir.join(format!("main.{}", ext));
         std::fs::write(&asm_output_file, &output.data).map_err(|e| {
             eprintln!("Failed to write assembly output: {}", e);
@@ -1110,7 +1196,11 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
         if !emit_c_only {
             // Try to assemble + link with system tools
             let assembler = if target == Target::X86_64 {
-                if cfg!(windows) { "ml64" } else { "as" }
+                if cfg!(windows) {
+                    "ml64"
+                } else {
+                    "as"
+                }
             } else {
                 "aarch64-linux-gnu-as"
             };
@@ -1135,7 +1225,10 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
                         println!("To link: ml64 /Fe:main.exe {}", asm_output_file.display());
                     } else {
                         println!("To assemble and link:");
-                        println!("  as {} -o main.o && ld main.o -o main -lc", asm_output_file.display());
+                        println!(
+                            "  as {} -o main.o && ld main.o -o main -lc",
+                            asm_output_file.display()
+                        );
                     }
                 } else {
                     println!("To cross-compile:");
@@ -1156,7 +1249,11 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
         return Ok(());
     } else if use_shader {
         // HLSL/GLSL target: write shader source file
-        let (ext, label) = if target == Target::Hlsl { ("hlsl", "HLSL") } else { ("glsl", "GLSL") };
+        let (ext, label) = if target == Target::Hlsl {
+            ("hlsl", "HLSL")
+        } else {
+            ("glsl", "GLSL")
+        };
         let shader_output_file = output_dir.join(format!("main.{}", ext));
         std::fs::write(&shader_output_file, &output.data).map_err(|e| {
             eprintln!("Failed to write {} output: {}", label, e);
@@ -1265,10 +1362,18 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
                 println!();
                 if cfg!(windows) {
                     println!("To compile to executable, install clang and run:");
-                    println!("  clang {} -o {}", ll_output_file.display(), output_dir.join("main.exe").display());
+                    println!(
+                        "  clang {} -o {}",
+                        ll_output_file.display(),
+                        output_dir.join("main.exe").display()
+                    );
                 } else {
                     println!("To compile to executable, install clang and run:");
-                    println!("  clang {} -o {} -lm", ll_output_file.display(), output_dir.join("main").display());
+                    println!(
+                        "  clang {} -o {} -lm",
+                        ll_output_file.display(),
+                        output_dir.join("main").display()
+                    );
                 }
                 return Ok(());
             }
@@ -1318,7 +1423,10 @@ fn cmd_build(path: &PathBuf, release: bool, emit: &str, keep_c: bool, target_str
         1
     })?;
 
-    println!("[5/{}] Compiling C -> executable (using {})...", total_steps, compiler);
+    println!(
+        "[5/{}] Compiling C -> executable (using {})...",
+        total_steps, compiler
+    );
 
     invoke_c_compiler(&compiler, &c_output_file, &exe_output_file, release)?;
 
@@ -1433,7 +1541,10 @@ fn cmd_run(file: &PathBuf, args: &[String]) -> Result<(), i32> {
 
     // Verify the executable was created
     if !exe_file.exists() {
-        eprintln!("Error: C compilation reported success but executable not found at '{}'", exe_file.display());
+        eprintln!(
+            "Error: C compilation reported success but executable not found at '{}'",
+            exe_file.display()
+        );
         // Check if MSVC put it somewhere else (current directory)
         let alt_name = std::path::Path::new("temp.exe");
         if alt_name.exists() {
@@ -1654,7 +1765,10 @@ fn cmd_repl() -> Result<(), i32> {
 // =============================================================================
 
 fn cmd_lsp() -> Result<(), i32> {
-    eprintln!("QuantaLang LSP server v{} starting on stdio...", quantalang::VERSION);
+    eprintln!(
+        "QuantaLang LSP server v{} starting on stdio...",
+        quantalang::VERSION
+    );
 
     match quantalang::lsp::run_server() {
         Ok(()) => {
@@ -1762,7 +1876,9 @@ fn cmd_pkg(cmd: PkgCommands) -> Result<(), i32> {
                 eprintln!("Quanta.toml already exists in {}", path.display());
                 return Err(1);
             }
-            let dir_name = path.canonicalize().ok()
+            let dir_name = path
+                .canonicalize()
+                .ok()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
                 .unwrap_or_else(|| "my-project".to_string());
             let manifest = format!(
@@ -1825,9 +1941,14 @@ fn cmd_pkg(cmd: PkgCommands) -> Result<(), i32> {
                 if in_deps {
                     if let Some((name, _ver)) = trimmed.split_once('=') {
                         let dep_name = name.trim();
-                        if dep_name.is_empty() { continue; }
+                        if dep_name.is_empty() {
+                            continue;
+                        }
                         if let Some(entry) = index.get(dep_name) {
-                            println!("  {} = {} ... found ({})", dep_name, entry.version, entry.description);
+                            println!(
+                                "  {} = {} ... found ({})",
+                                dep_name, entry.version, entry.description
+                            );
                         } else {
                             println!("  {} ... NOT FOUND in local registry", dep_name);
                         }
@@ -1885,16 +2006,24 @@ fn resolve_modules(ast: &mut Module, source_dir: &Path) -> Result<(), i32> {
 
 /// Resolve modules with a prefix for nested module support.
 /// The prefix is prepended to all mangled names (e.g., "utils_" for sub-modules of utils).
-fn resolve_modules_with_prefix(ast: &mut Module, source_dir: &Path, prefix: &str) -> Result<(), i32> {
+fn resolve_modules_with_prefix(
+    ast: &mut Module,
+    source_dir: &Path,
+    prefix: &str,
+) -> Result<(), i32> {
     // Collect module names from `mod foo;` declarations (content == None).
-    let mod_names: Vec<String> = ast.items.iter().filter_map(|item| {
-        if let ItemKind::Mod(ref m) = item.kind {
-            if m.content.is_none() {
-                return Some(m.name.name.to_string());
+    let mod_names: Vec<String> = ast
+        .items
+        .iter()
+        .filter_map(|item| {
+            if let ItemKind::Mod(ref m) = item.kind {
+                if m.content.is_none() {
+                    return Some(m.name.name.to_string());
+                }
             }
-        }
-        None
-    }).collect();
+            None
+        })
+        .collect();
 
     if mod_names.is_empty() {
         return Ok(());
@@ -1920,7 +2049,11 @@ fn resolve_modules_with_prefix(ast: &mut Module, source_dir: &Path, prefix: &str
 
         // Read and parse the module file
         let mod_source = std::fs::read_to_string(&actual_file).map_err(|e| {
-            eprintln!("Error reading module file '{}': {}", actual_file.display(), e);
+            eprintln!(
+                "Error reading module file '{}': {}",
+                actual_file.display(),
+                e
+            );
             1
         })?;
 
@@ -1990,7 +2123,6 @@ fn resolve_modules_with_prefix(ast: &mut Module, source_dir: &Path, prefix: &str
 
 // Dead rename functions removed — modules merge without name mangling.
 
-
 fn cmd_compile(
     input: &PathBuf,
     output: Option<&std::path::Path>,
@@ -2046,18 +2178,27 @@ fn cmd_compile(
             let line = source_file.lookup_line(err.span.start);
             let line_start = source_file.line_start(line).unwrap_or(err.span.start);
             let col = err.span.start.0.saturating_sub(line_start.0) as usize;
-            eprintln!("error[{}:{}:{}]: {}", input.display(), line + 1, col + 1, err.error);
+            eprintln!(
+                "error[{}:{}:{}]: {}",
+                input.display(),
+                line + 1,
+                col + 1,
+                err.error
+            );
 
             // Show the source line with an underline
             if let Some(src_line) = source_file.source().lines().nth(line) {
                 eprintln!("  {} | {}", line + 1, src_line);
                 let padding = format!("{}", line + 1).len();
                 let underline_pos = col;
-                let underline_len = (err.span.end.0.saturating_sub(err.span.start.0) as usize).max(1);
-                eprintln!("  {} | {}{}",
+                let underline_len =
+                    (err.span.end.0.saturating_sub(err.span.start.0) as usize).max(1);
+                eprintln!(
+                    "  {} | {}{}",
                     " ".repeat(padding),
                     " ".repeat(underline_pos),
-                    "^".repeat(underline_len.min(src_line.len().saturating_sub(underline_pos))));
+                    "^".repeat(underline_len.min(src_line.len().saturating_sub(underline_pos)))
+                );
             }
 
             if let Some(help) = &err.help {
@@ -2170,20 +2311,34 @@ fn cmd_compile(
                 Ok(result) => {
                     let stderr = String::from_utf8_lossy(&result.stderr);
                     eprintln!("clang linking failed: {}", stderr.trim());
-                    eprintln!("LLVM IR file is still available at: {}", output_path.display());
+                    eprintln!(
+                        "LLVM IR file is still available at: {}",
+                        output_path.display()
+                    );
                 }
                 Err(e) => {
                     eprintln!("Failed to invoke clang: {}", e);
-                    eprintln!("LLVM IR file is still available at: {}", output_path.display());
+                    eprintln!(
+                        "LLVM IR file is still available at: {}",
+                        output_path.display()
+                    );
                 }
             }
         } else {
             println!();
             println!("LLVM IR generated at {}", output_path.display());
             if cfg!(windows) {
-                println!("To compile: clang {} -o {}", output_path.display(), exe_path.display());
+                println!(
+                    "To compile: clang {} -o {}",
+                    output_path.display(),
+                    exe_path.display()
+                );
             } else {
-                println!("To compile: clang {} -o {} -lm", output_path.display(), exe_path.display());
+                println!(
+                    "To compile: clang {} -o {} -lm",
+                    output_path.display(),
+                    exe_path.display()
+                );
             }
         }
     }
@@ -2192,40 +2347,70 @@ fn cmd_compile(
     if target == Target::X86_64 {
         let obj_path = input.with_extension("o");
         let exe_path = input.with_extension(if cfg!(windows) { "exe" } else { "" });
-        let nasm_ok = std::process::Command::new("nasm").arg("--version")
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-            .status().map(|s| s.success()).unwrap_or(false);
+        let nasm_ok = std::process::Command::new("nasm")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
         if nasm_ok {
             let fmt = if cfg!(windows) { "win64" } else { "elf64" };
-            if let Ok(r) = std::process::Command::new("nasm").args(["-f", fmt])
-                .arg(&output_path).arg("-o").arg(&obj_path).output() {
+            if let Ok(r) = std::process::Command::new("nasm")
+                .args(["-f", fmt])
+                .arg(&output_path)
+                .arg("-o")
+                .arg(&obj_path)
+                .output()
+            {
                 if r.status.success() {
                     println!("Assembled -> {}", obj_path.display());
                     let lr = if cfg!(windows) {
                         std::process::Command::new("link.exe")
                             .args(["/entry:main", "/subsystem:console"])
-                            .arg(&obj_path).arg(&format!("/out:{}", exe_path.display())).output()
+                            .arg(&obj_path)
+                            .arg(&format!("/out:{}", exe_path.display()))
+                            .output()
                     } else {
                         std::process::Command::new("ld")
-                            .arg(&obj_path).arg("-o").arg(&exe_path).arg("-lc").output()
+                            .arg(&obj_path)
+                            .arg("-o")
+                            .arg(&exe_path)
+                            .arg("-lc")
+                            .output()
                     };
-                    if let Ok(r) = lr { if r.status.success() {
-                        println!("Linked -> {}", exe_path.display());
-                    }}
+                    if let Ok(r) = lr {
+                        if r.status.success() {
+                            println!("Linked -> {}", exe_path.display());
+                        }
+                    }
                 }
             }
         } else {
-            println!("\nx86-64 assembly at {}. Install nasm to build native.", output_path.display());
+            println!(
+                "\nx86-64 assembly at {}. Install nasm to build native.",
+                output_path.display()
+            );
         }
     }
 
     // WASM: detect wasmtime/wasmer and show run instructions
     if target == Target::Wasm {
-        let wt = std::process::Command::new("wasmtime").arg("--version")
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-            .status().map(|s| s.success()).unwrap_or(false);
-        if wt { println!("Run: wasmtime {}", output_path.display()); }
-        else { println!("\nWASM at {}. Install wasmtime to run.", output_path.display()); }
+        let wt = std::process::Command::new("wasmtime")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if wt {
+            println!("Run: wasmtime {}", output_path.display());
+        } else {
+            println!(
+                "\nWASM at {}. Install wasmtime to run.",
+                output_path.display()
+            );
+        }
     }
 
     Ok(())
@@ -2237,8 +2422,8 @@ fn cmd_compile(
 ///   quantac watch shaders/ --target=spirv
 ///   quantac watch shader.quanta --target=spirv
 fn cmd_watch(path: &PathBuf, target_str: &str) -> Result<(), i32> {
-    use std::time::{Duration, SystemTime};
     use std::collections::HashMap;
+    use std::time::{Duration, SystemTime};
 
     let target_ext = match target_str {
         "spirv" | "spir-v" | "spv" => "spv",
@@ -2252,18 +2437,21 @@ fn cmd_watch(path: &PathBuf, target_str: &str) -> Result<(), i32> {
 
     // Collect .quanta files to watch
     let files_to_watch: Vec<PathBuf> = if path.is_dir() {
-        std::fs::read_dir(path).map_err(|e| {
-            eprintln!("Failed to read directory '{}': {}", path.display(), e);
-            1
-        })?.filter_map(|entry| {
-            let entry = entry.ok()?;
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("quanta") {
-                Some(p)
-            } else {
-                None
-            }
-        }).collect()
+        std::fs::read_dir(path)
+            .map_err(|e| {
+                eprintln!("Failed to read directory '{}': {}", path.display(), e);
+                1
+            })?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("quanta") {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .collect()
     } else if path.extension().and_then(|e| e.to_str()) == Some("quanta") {
         vec![path.clone()]
     } else {
@@ -2276,7 +2464,11 @@ fn cmd_watch(path: &PathBuf, target_str: &str) -> Result<(), i32> {
         return Err(1);
     }
 
-    println!("Watching {} file(s) for changes (target: {})...", files_to_watch.len(), target_str);
+    println!(
+        "Watching {} file(s) for changes (target: {})...",
+        files_to_watch.len(),
+        target_str
+    );
     for f in &files_to_watch {
         println!("  {}", f.display());
     }
@@ -2321,34 +2513,43 @@ fn cmd_watch(path: &PathBuf, target_str: &str) -> Result<(), i32> {
                     match compile_single_file(f, &output) {
                         Ok(()) => {
                             let elapsed = start.elapsed();
-                            println!("[OK] {} -> {} ({:.1}ms)",
+                            println!(
+                                "[OK] {} -> {} ({:.1}ms)",
                                 f.file_name().unwrap().to_string_lossy(),
                                 output.file_name().unwrap().to_string_lossy(),
-                                elapsed.as_secs_f64() * 1000.0);
+                                elapsed.as_secs_f64() * 1000.0
+                            );
 
                             // Auto-validate SPIR-V if spirv-val is available
                             if target_ext == "spv" {
-                                let spirv_val_paths = [
-                                    "C:\\VulkanSDK\\1.4.341.1\\Bin\\spirv-val.exe",
-                                    "spirv-val",
-                                ];
+                                let spirv_val_paths =
+                                    ["C:\\VulkanSDK\\1.4.341.1\\Bin\\spirv-val.exe", "spirv-val"];
                                 for val_path in &spirv_val_paths {
                                     if let Ok(result) = std::process::Command::new(val_path)
-                                        .arg("--target-env").arg("vulkan1.0")
+                                        .arg("--target-env")
+                                        .arg("vulkan1.0")
                                         .arg(&output)
-                                        .output() {
+                                        .output()
+                                    {
                                         if result.status.success() {
                                             println!("     spirv-val: PASSED (Vulkan 1.0)");
                                         } else {
                                             let stderr = String::from_utf8_lossy(&result.stderr);
-                                            eprintln!("     spirv-val: FAILED\n     {}", stderr.trim());
+                                            eprintln!(
+                                                "     spirv-val: FAILED\n     {}",
+                                                stderr.trim()
+                                            );
                                         }
                                         break;
                                     }
                                 }
                             }
                         }
-                        Err(msg) => eprintln!("[ERR] {}: {}", f.file_name().unwrap().to_string_lossy(), msg),
+                        Err(msg) => eprintln!(
+                            "[ERR] {}: {}",
+                            f.file_name().unwrap().to_string_lossy(),
+                            msg
+                        ),
                     }
                 }
             }
@@ -2358,8 +2559,7 @@ fn cmd_watch(path: &PathBuf, target_str: &str) -> Result<(), i32> {
 
 /// Compile a single .quanta file to the given output path.
 fn compile_single_file(input: &Path, output: &Path) -> Result<(), String> {
-    let source = std::fs::read_to_string(input)
-        .map_err(|e| format!("read error: {}", e))?;
+    let source = std::fs::read_to_string(input).map_err(|e| format!("read error: {}", e))?;
 
     // Resolve `// import <pkg>` and `use <pkg>;` directives
     let source = resolve_imports(&source, input)
@@ -2368,12 +2568,12 @@ fn compile_single_file(input: &Path, output: &Path) -> Result<(), String> {
     let source_file = SourceFile::new(input.to_string_lossy(), source);
 
     let mut lexer = Lexer::new(&source_file);
-    let tokens = lexer.tokenize()
+    let tokens = lexer
+        .tokenize()
         .map_err(|e| format!("lexer error: {}", e))?;
 
     let mut parser = Parser::new(&source_file, tokens);
-    let ast = parser.parse()
-        .map_err(|e| format!("parse error: {}", e))?;
+    let ast = parser.parse().map_err(|e| format!("parse error: {}", e))?;
 
     if !parser.errors().is_empty() {
         return Err(format!("parse errors: {}", parser.errors().len()));
@@ -2395,11 +2595,11 @@ fn compile_single_file(input: &Path, output: &Path) -> Result<(), String> {
     };
 
     let mut codegen = CodeGenerator::with_source(&ctx, target, source_file.source().into());
-    let generated = codegen.generate(&ast)
+    let generated = codegen
+        .generate(&ast)
         .map_err(|e| format!("codegen error: {}", e))?;
 
-    std::fs::write(output, &generated.data)
-        .map_err(|e| format!("write error: {}", e))?;
+    std::fs::write(output, &generated.data).map_err(|e| format!("write error: {}", e))?;
 
     Ok(())
 }

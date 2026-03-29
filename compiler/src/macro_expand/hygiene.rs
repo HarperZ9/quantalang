@@ -72,11 +72,14 @@ impl HygieneContext {
     /// Create a new hygiene context.
     pub fn new() -> Self {
         let mut contexts = HashMap::new();
-        contexts.insert(SyntaxContext::ROOT, ContextInfo {
-            parent: None,
-            expansion_span: Span::dummy(),
-            is_opaque: false,
-        });
+        contexts.insert(
+            SyntaxContext::ROOT,
+            ContextInfo {
+                parent: None,
+                expansion_span: Span::dummy(),
+                is_opaque: false,
+            },
+        );
 
         Self {
             contexts,
@@ -89,11 +92,14 @@ impl HygieneContext {
         let id = SyntaxContext(self.next_id);
         self.next_id += 1;
 
-        self.contexts.insert(id, ContextInfo {
-            parent: Some(SyntaxContext::ROOT),
-            expansion_span: span,
-            is_opaque: true,
-        });
+        self.contexts.insert(
+            id,
+            ContextInfo {
+                parent: Some(SyntaxContext::ROOT),
+                expansion_span: span,
+                is_opaque: true,
+            },
+        );
 
         id
     }
@@ -103,11 +109,14 @@ impl HygieneContext {
         let id = SyntaxContext(self.next_id);
         self.next_id += 1;
 
-        self.contexts.insert(id, ContextInfo {
-            parent: Some(parent),
-            expansion_span: span,
-            is_opaque: true,
-        });
+        self.contexts.insert(
+            id,
+            ContextInfo {
+                parent: Some(parent),
+                expansion_span: span,
+                is_opaque: true,
+            },
+        );
 
         id
     }

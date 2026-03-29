@@ -6,9 +6,9 @@
 
 //! Error types for the parser.
 
+use crate::lexer::Span;
 use std::fmt;
 use thiserror::Error;
-use crate::lexer::Span;
 
 /// Result type for parser operations.
 pub type ParseResult<T> = Result<T, ParseError>;
@@ -74,7 +74,6 @@ pub enum ParseErrorKind {
     // =========================================================================
     // TOKEN ERRORS
     // =========================================================================
-
     /// Unexpected token.
     #[error("unexpected token: {found}")]
     UnexpectedToken { found: String },
@@ -90,7 +89,6 @@ pub enum ParseErrorKind {
     // =========================================================================
     // EXPRESSION ERRORS
     // =========================================================================
-
     /// Invalid expression.
     #[error("invalid expression")]
     InvalidExpression,
@@ -114,7 +112,6 @@ pub enum ParseErrorKind {
     // =========================================================================
     // STATEMENT ERRORS
     // =========================================================================
-
     /// Invalid statement.
     #[error("invalid statement")]
     InvalidStatement,
@@ -126,7 +123,6 @@ pub enum ParseErrorKind {
     // =========================================================================
     // ITEM ERRORS
     // =========================================================================
-
     /// Invalid item.
     #[error("invalid item declaration")]
     InvalidItem,
@@ -142,7 +138,6 @@ pub enum ParseErrorKind {
     // =========================================================================
     // TYPE ERRORS
     // =========================================================================
-
     /// Invalid type.
     #[error("invalid type")]
     InvalidType,
@@ -154,7 +149,6 @@ pub enum ParseErrorKind {
     // =========================================================================
     // PATTERN ERRORS
     // =========================================================================
-
     /// Invalid pattern.
     #[error("invalid pattern")]
     InvalidPattern,
@@ -170,7 +164,6 @@ pub enum ParseErrorKind {
     // =========================================================================
     // GENERIC ERRORS
     // =========================================================================
-
     /// Invalid generic parameter.
     #[error("invalid generic parameter")]
     InvalidGenericParam,
@@ -182,7 +175,6 @@ pub enum ParseErrorKind {
     // =========================================================================
     // ATTRIBUTE ERRORS
     // =========================================================================
-
     /// Invalid attribute.
     #[error("invalid attribute")]
     InvalidAttribute,
@@ -194,7 +186,6 @@ pub enum ParseErrorKind {
     // =========================================================================
     // MACRO ERRORS
     // =========================================================================
-
     /// Invalid macro invocation.
     #[error("invalid macro invocation")]
     InvalidMacroInvocation,
@@ -202,7 +193,6 @@ pub enum ParseErrorKind {
     // =========================================================================
     // LEXER ERRORS
     // =========================================================================
-
     /// Lexer error.
     #[error("lexer error: {0}")]
     LexerError(String),
@@ -210,7 +200,6 @@ pub enum ParseErrorKind {
     // =========================================================================
     // INTERNAL ERRORS
     // =========================================================================
-
     /// Internal parser error.
     #[error("internal parser error: {0}")]
     Internal(String),
@@ -220,12 +209,8 @@ impl ParseErrorKind {
     /// Get a suggested fix for this error.
     pub fn suggestion(&self) -> Option<&'static str> {
         match self {
-            ParseErrorKind::ExpectedSemicolon => {
-                Some("add a `;` at the end of the statement")
-            }
-            ParseErrorKind::UnclosedDelimiter { .. } => {
-                Some("add the missing closing delimiter")
-            }
+            ParseErrorKind::ExpectedSemicolon => Some("add a `;` at the end of the statement"),
+            ParseErrorKind::UnclosedDelimiter { .. } => Some("add the missing closing delimiter"),
             ParseErrorKind::InvalidAssignTarget => {
                 Some("only variables, fields, and dereferences can be assigned to")
             }
@@ -261,11 +246,8 @@ mod tests {
 
     #[test]
     fn test_error_with_help() {
-        let err = ParseError::new(
-            ParseErrorKind::InvalidAssignTarget,
-            Span::dummy(),
-        )
-        .with_help("try using a variable name");
+        let err = ParseError::new(ParseErrorKind::InvalidAssignTarget, Span::dummy())
+            .with_help("try using a variable name");
 
         assert!(err.help.is_some());
     }

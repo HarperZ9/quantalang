@@ -43,13 +43,13 @@
 //! - Concrete: `{IO, Error}`
 //! - Polymorphic: `{IO | E}` (IO plus unknown effects E)
 
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use super::{Ty, DefId};
+use super::{DefId, Ty};
 
 /// A unique identifier for effect variables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -533,16 +533,8 @@ impl EffectContext {
     fn register_builtin_effects(&mut self) {
         // IO effect
         let io = EffectDef::new(DefId::new(0, 0), "IO")
-            .with_operation(EffectOperation::new(
-                "print",
-                vec![Ty::str()],
-                Ty::unit(),
-            ))
-            .with_operation(EffectOperation::new(
-                "read_line",
-                vec![],
-                Ty::str(),
-            ));
+            .with_operation(EffectOperation::new("print", vec![Ty::str()], Ty::unit()))
+            .with_operation(EffectOperation::new("read_line", vec![], Ty::str()));
         self.register_effect(io);
 
         // Error effect
@@ -553,11 +545,7 @@ impl EffectContext {
                 vec![Ty::param("E", 0)],
                 Ty::never(),
             ))
-            .with_operation(EffectOperation::new(
-                "catch",
-                vec![],
-                Ty::param("E", 0),
-            ));
+            .with_operation(EffectOperation::new("catch", vec![], Ty::param("E", 0)));
         self.register_effect(error);
 
         // Async effect
@@ -567,21 +555,13 @@ impl EffectContext {
                 vec![Ty::param("T", 0)],
                 Ty::param("T", 0),
             ))
-            .with_operation(EffectOperation::new(
-                "spawn",
-                vec![],
-                Ty::unit(),
-            ));
+            .with_operation(EffectOperation::new("spawn", vec![], Ty::unit()));
         self.register_effect(async_eff);
 
         // State effect
         let state = EffectDef::new(DefId::new(0, 3), "State")
             .with_type_param("S")
-            .with_operation(EffectOperation::new(
-                "get",
-                vec![],
-                Ty::param("S", 0),
-            ))
+            .with_operation(EffectOperation::new("get", vec![], Ty::param("S", 0)))
             .with_operation(EffectOperation::new(
                 "put",
                 vec![Ty::param("S", 0)],
@@ -601,11 +581,7 @@ impl EffectContext {
                 vec![Ty::param("T", 0), Ty::param("T", 0)],
                 Ty::param("T", 0),
             ))
-            .with_operation(EffectOperation::new(
-                "fail",
-                vec![],
-                Ty::never(),
-            ));
+            .with_operation(EffectOperation::new("fail", vec![], Ty::never()));
         self.register_effect(nondet);
     }
 
@@ -720,7 +696,7 @@ impl EffectContext {
         // If r1 is open, r2 must also be open (or contain all possible effects)
         match (r1.tail, r2.tail) {
             (None, _) => true,
-            (Some(_), None) => false, // r1 is open but r2 is closed
+            (Some(_), None) => false,         // r1 is open but r2 is closed
             (Some(v1), Some(v2)) => v1 == v2, // Same tail variable
         }
     }
@@ -746,7 +722,10 @@ pub enum EffectConstraint {
 #[derive(Debug, Clone)]
 pub enum EffectError {
     /// Effect row mismatch.
-    Mismatch { expected: EffectRow, found: EffectRow },
+    Mismatch {
+        expected: EffectRow,
+        found: EffectRow,
+    },
 
     /// Unhandled effect.
     Unhandled(Effect),
@@ -765,7 +744,11 @@ impl fmt::Display for EffectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EffectError::Mismatch { expected, found } => {
-                write!(f, "effect mismatch: expected {{{}}}, found {{{}}}", expected, found)
+                write!(
+                    f,
+                    "effect mismatch: expected {{{}}}, found {{{}}}",
+                    expected, found
+                )
             }
             EffectError::Unhandled(effect) => {
                 write!(f, "unhandled effect: {}", effect)
@@ -774,7 +757,11 @@ impl fmt::Display for EffectError {
                 write!(f, "unknown effect: {}", name)
             }
             EffectError::UnknownOperation { effect, operation } => {
-                write!(f, "unknown operation '{}' in effect '{}'", operation, effect)
+                write!(
+                    f,
+                    "unknown operation '{}' in effect '{}'",
+                    operation, effect
+                )
             }
             EffectError::InvalidHandler(msg) => {
                 write!(f, "invalid handler: {}", msg)
@@ -859,10 +846,7 @@ mod tests {
 
     #[test]
     fn test_effectful_fn() {
-        let pure_fn = EffectfulFn::pure(
-            vec![Ty::int(super::super::IntTy::I32)],
-            Ty::bool(),
-        );
+        let pure_fn = EffectfulFn::pure(vec![Ty::int(super::super::IntTy::I32)], Ty::bool());
         assert!(pure_fn.is_pure());
 
         let io_fn = EffectfulFn::new(

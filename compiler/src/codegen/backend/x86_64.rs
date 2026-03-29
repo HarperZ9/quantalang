@@ -32,11 +32,11 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use super::{Backend, Target, CodegenResult};
-use super::x86_64_enc::{X86_64Encoder, Reg64, Reg8, Mem, Cond};
+use super::x86_64_enc::{Cond, Mem, Reg64, Reg8, X86_64Encoder};
+use super::{Backend, CodegenResult, Target};
+use crate::codegen::debug::DwarfGenerator;
 use crate::codegen::ir::*;
 use crate::codegen::{GeneratedCode, OutputFormat};
-use crate::codegen::debug::DwarfGenerator;
 
 /// Output mode for the x86-64 backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +105,9 @@ impl X86_64Backend {
 
     /// Get encoder reference (panics if not in machine code mode).
     fn enc(&mut self) -> &mut X86_64Encoder {
-        self.encoder.as_mut().expect("Machine code mode not enabled")
+        self.encoder
+            .as_mut()
+            .expect("Machine code mode not enabled")
     }
 
     fn generate_module(&mut self, module: &MirModule) -> CodegenResult<()> {
@@ -205,7 +207,9 @@ impl X86_64Backend {
 
     fn generate_block(&mut self, block: &MirBlock, func: &MirFunction) -> CodegenResult<()> {
         // Block label
-        let label = block.label.as_ref()
+        let label = block
+            .label
+            .as_ref()
             .map(|l| l.to_string())
             .unwrap_or_else(|| format!(".Lbb{}_{}", func.name, block.id.0));
         write!(self.output, "{}:\n", label).unwrap();
@@ -230,19 +234,34 @@ impl X86_64Backend {
             }
             MirStmtKind::DerefAssign { ptr, .. } => {
                 let offset = self.local_stack_offset(*ptr, func);
-                self.output.push_str(&format!("    ; deref store through local at rbp-{}\n", offset));
-                self.output.push_str(&format!("    mov rbx, [rbp-{}]\n", offset));
+                self.output.push_str(&format!(
+                    "    ; deref store through local at rbp-{}\n",
+                    offset
+                ));
+                self.output
+                    .push_str(&format!("    mov rbx, [rbp-{}]\n", offset));
                 self.output.push_str("    mov qword [rbx], rax\n");
             }
-            MirStmtKind::FieldDerefAssign { ptr, field_name, .. } => {
+            MirStmtKind::FieldDerefAssign {
+                ptr, field_name, ..
+            } => {
                 let offset = self.local_stack_offset(*ptr, func);
-                self.output.push_str(&format!("    ; field deref store .{} through local at rbp-{}\n", field_name, offset));
-                self.output.push_str(&format!("    mov rbx, [rbp-{}]\n", offset));
+                self.output.push_str(&format!(
+                    "    ; field deref store .{} through local at rbp-{}\n",
+                    field_name, offset
+                ));
+                self.output
+                    .push_str(&format!("    mov rbx, [rbp-{}]\n", offset));
                 self.output.push_str("    mov qword [rbx], rax\n");
             }
-            MirStmtKind::FieldAssign { base, field_name, .. } => {
+            MirStmtKind::FieldAssign {
+                base, field_name, ..
+            } => {
                 let offset = self.local_stack_offset(*base, func);
-                self.output.push_str(&format!("    ; field store .{} on local at rbp-{}\n", field_name, offset));
+                self.output.push_str(&format!(
+                    "    ; field store .{} on local at rbp-{}\n",
+                    field_name, offset
+                ));
                 self.output.push_str("    mov qword [rbx], rax\n");
             }
             MirStmtKind::StorageLive(_) | MirStmtKind::StorageDead(_) => {
@@ -255,7 +274,12 @@ impl X86_64Backend {
         Ok(())
     }
 
-    fn generate_assign(&mut self, dest: LocalId, value: &MirRValue, func: &MirFunction) -> CodegenResult<()> {
+    fn generate_assign(
+        &mut self,
+        dest: LocalId,
+        value: &MirRValue,
+        func: &MirFunction,
+    ) -> CodegenResult<()> {
         match value {
             MirRValue::Use(val) => {
                 self.load_value_to_rax(val, func)?;
@@ -290,12 +314,20 @@ impl X86_64Backend {
         Ok(())
     }
 
-    fn generate_terminator(&mut self, term: &MirTerminator, func: &MirFunction) -> CodegenResult<()> {
+    fn generate_terminator(
+        &mut self,
+        term: &MirTerminator,
+        func: &MirFunction,
+    ) -> CodegenResult<()> {
         match term {
             MirTerminator::Goto(target) => {
                 write!(self.output, "    jmp .Lbb{}_{}\n", func.name, target.0).unwrap();
             }
-            MirTerminator::If { cond, then_block, else_block } => {
+            MirTerminator::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
                 self.load_value_to_rax(cond, func)?;
                 self.output.push_str("    test rax, rax\n");
                 write!(self.output, "    jnz .Lbb{}_{}\n", func.name, then_block.0).unwrap();
@@ -310,7 +342,13 @@ impl X86_64Backend {
                 self.output.push_str("    pop rbp\n");
                 self.output.push_str("    ret\n");
             }
-            MirTerminator::Call { func: callee, args, dest, target, .. } => {
+            MirTerminator::Call {
+                func: callee,
+                args,
+                dest,
+                target,
+                ..
+            } => {
                 // Pass arguments in registers (System V ABI)
                 let arg_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
                 for (i, arg) in args.iter().enumerate() {
@@ -335,7 +373,12 @@ impl X86_64Backend {
                 }
                 // Jump to continue block
                 if let Some(target_block) = target {
-                    write!(self.output, "    jmp .Lbb{}_{}\n", func.name, target_block.0).unwrap();
+                    write!(
+                        self.output,
+                        "    jmp .Lbb{}_{}\n",
+                        func.name, target_block.0
+                    )
+                    .unwrap();
                 }
             }
             MirTerminator::Unreachable => {
@@ -357,22 +400,20 @@ impl X86_64Backend {
                 let offset = self.local_stack_offset(*id, func);
                 write!(self.output, "    mov rax, [rbp - {}]\n", offset).unwrap();
             }
-            MirValue::Const(c) => {
-                match c {
-                    MirConst::Int(v, _) => {
-                        write!(self.output, "    mov rax, {}\n", v).unwrap();
-                    }
-                    MirConst::Uint(v, _) => {
-                        write!(self.output, "    mov rax, {}\n", v).unwrap();
-                    }
-                    MirConst::Bool(b) => {
-                        write!(self.output, "    mov rax, {}\n", if *b { 1 } else { 0 }).unwrap();
-                    }
-                    _ => {
-                        self.output.push_str("    xor rax, rax\n");
-                    }
+            MirValue::Const(c) => match c {
+                MirConst::Int(v, _) => {
+                    write!(self.output, "    mov rax, {}\n", v).unwrap();
                 }
-            }
+                MirConst::Uint(v, _) => {
+                    write!(self.output, "    mov rax, {}\n", v).unwrap();
+                }
+                MirConst::Bool(b) => {
+                    write!(self.output, "    mov rax, {}\n", if *b { 1 } else { 0 }).unwrap();
+                }
+                _ => {
+                    self.output.push_str("    xor rax, rax\n");
+                }
+            },
             MirValue::Global(name) => {
                 write!(self.output, "    lea rax, [rip + {}]\n", name).unwrap();
             }
@@ -460,19 +501,19 @@ impl X86_64Backend {
                 let label = self.label_counter;
                 self.label_counter += 1;
                 // r8 = result (starts at 1), rax = base, rcx = exponent
-                self.output.push_str("    mov r8, 1\n");               // result = 1
+                self.output.push_str("    mov r8, 1\n"); // result = 1
                 write!(self.output, ".Lpow_loop_{}:\n", label).unwrap();
-                self.output.push_str("    test rcx, rcx\n");           // while exp != 0
+                self.output.push_str("    test rcx, rcx\n"); // while exp != 0
                 write!(self.output, "    jz .Lpow_done_{}\n", label).unwrap();
-                self.output.push_str("    test rcx, 1\n");             // if exp & 1
+                self.output.push_str("    test rcx, 1\n"); // if exp & 1
                 write!(self.output, "    jz .Lpow_skip_{}\n", label).unwrap();
-                self.output.push_str("    imul r8, rax\n");            // result *= base
+                self.output.push_str("    imul r8, rax\n"); // result *= base
                 write!(self.output, ".Lpow_skip_{}:\n", label).unwrap();
-                self.output.push_str("    imul rax, rax\n");           // base *= base
-                self.output.push_str("    shr rcx, 1\n");              // exp >>= 1
+                self.output.push_str("    imul rax, rax\n"); // base *= base
+                self.output.push_str("    shr rcx, 1\n"); // exp >>= 1
                 write!(self.output, "    jmp .Lpow_loop_{}\n", label).unwrap();
                 write!(self.output, ".Lpow_done_{}:\n", label).unwrap();
-                self.output.push_str("    mov rax, r8\n");             // return result
+                self.output.push_str("    mov rax, r8\n"); // return result
             }
         }
         Ok(())
@@ -500,16 +541,14 @@ impl X86_64Backend {
                     _ => write!(self.output, "    .quad {}\n", v).unwrap(),
                 }
             }
-            MirConst::Float(v, ty) => {
-                match ty {
-                    MirType::Float(FloatSize::F32) => {
-                        write!(self.output, "    .float {}\n", v).unwrap();
-                    }
-                    _ => {
-                        write!(self.output, "    .double {}\n", v).unwrap();
-                    }
+            MirConst::Float(v, ty) => match ty {
+                MirType::Float(FloatSize::F32) => {
+                    write!(self.output, "    .float {}\n", v).unwrap();
                 }
-            }
+                _ => {
+                    write!(self.output, "    .double {}\n", v).unwrap();
+                }
+            },
             MirConst::Bool(b) => {
                 write!(self.output, "    .byte {}\n", if *b { 1 } else { 0 }).unwrap();
             }
@@ -570,7 +609,7 @@ impl X86_64Backend {
             // Opaque GPU types — treat as pointer-sized handles
             MirType::Texture2D(_) | MirType::Sampler | MirType::SampledImage(_) => 8,
             MirType::TraitObject(_) => 16, // fat pointer: data ptr + vtable ptr
-            MirType::Vec(_) => 8, // QuantaVecHandle is a pointer
+            MirType::Vec(_) => 8,          // QuantaVecHandle is a pointer
             MirType::Tuple(elems) => elems.iter().map(|e| self.type_size(e)).sum(),
             MirType::Map(_, _) => 8, // QuantaMapHandle is a pointer
         }
@@ -619,10 +658,7 @@ impl Backend for X86_64Backend {
             X86_64OutputMode::MachineCode => {
                 self.generate_machine_code(mir)?;
                 let code = self.encoder.take().unwrap().finish();
-                Ok(GeneratedCode::new(
-                    OutputFormat::Object,
-                    code,
-                ))
+                Ok(GeneratedCode::new(OutputFormat::Object, code))
             }
         }
     }
@@ -670,7 +706,14 @@ impl X86_64Backend {
         }
 
         // Move parameters from registers to stack
-        let param_regs = [Reg64::RDI, Reg64::RSI, Reg64::RDX, Reg64::RCX, Reg64::R8, Reg64::R9];
+        let param_regs = [
+            Reg64::RDI,
+            Reg64::RSI,
+            Reg64::RDX,
+            Reg64::RCX,
+            Reg64::R8,
+            Reg64::R9,
+        ];
         let mut param_idx = 0;
         for local in &func.locals {
             if local.is_param && param_idx < param_regs.len() {
@@ -700,7 +743,8 @@ impl X86_64Backend {
         }
 
         let end_pos = self.enc().position() as u64;
-        self.func_ranges.push((func.name.to_string(), start_pos, end_pos - start_pos));
+        self.func_ranges
+            .push((func.name.to_string(), start_pos, end_pos - start_pos));
 
         Ok(())
     }
@@ -741,12 +785,18 @@ impl X86_64Backend {
     }
 
     /// Generate machine code for a statement.
-    fn generate_stmt_machine_code(&mut self, stmt: &MirStmt, func: &MirFunction) -> CodegenResult<()> {
+    fn generate_stmt_machine_code(
+        &mut self,
+        stmt: &MirStmt,
+        func: &MirFunction,
+    ) -> CodegenResult<()> {
         match &stmt.kind {
             MirStmtKind::Assign { dest, value } => {
                 self.generate_assign_machine_code(*dest, value, func)?;
             }
-            MirStmtKind::DerefAssign { .. } | MirStmtKind::FieldDerefAssign { .. } | MirStmtKind::FieldAssign { .. } => {
+            MirStmtKind::DerefAssign { .. }
+            | MirStmtKind::FieldDerefAssign { .. }
+            | MirStmtKind::FieldAssign { .. } => {
                 // Pointer/field store in machine code: emit nop placeholder
                 // Full implementation requires register allocator
                 self.enc().nop();
@@ -823,7 +873,12 @@ impl X86_64Backend {
     }
 
     /// Load a value into a register.
-    fn load_value_to_reg(&mut self, value: &MirValue, reg: Reg64, _func: &MirFunction) -> CodegenResult<()> {
+    fn load_value_to_reg(
+        &mut self,
+        value: &MirValue,
+        reg: Reg64,
+        _func: &MirFunction,
+    ) -> CodegenResult<()> {
         match value {
             MirValue::Local(id) => {
                 let offset = self.local_offsets.get(id).copied().unwrap_or(8);
@@ -970,7 +1025,7 @@ impl X86_64Backend {
                 let done_label = self.enc().create_label();
                 let skip_label = self.enc().create_label();
 
-                self.enc().mov_ri(Reg64::R8, 1);           // result = 1
+                self.enc().mov_ri(Reg64::R8, 1); // result = 1
                 self.enc().bind_label(loop_label);
                 self.enc().test_rr(Reg64::RCX, Reg64::RCX);
                 self.enc().jcc_label(Cond::E, done_label); // if exp == 0, done
@@ -979,10 +1034,10 @@ impl X86_64Backend {
                 self.enc().imul_rr(Reg64::R8, Reg64::RAX); // result *= base
                 self.enc().bind_label(skip_label);
                 self.enc().imul_rr(Reg64::RAX, Reg64::RAX); // base *= base
-                self.enc().shr_ri(Reg64::RCX, 1);          // exp >>= 1
+                self.enc().shr_ri(Reg64::RCX, 1); // exp >>= 1
                 self.enc().jmp_label(loop_label);
                 self.enc().bind_label(done_label);
-                self.enc().mov_rr(Reg64::RAX, Reg64::R8);  // return result
+                self.enc().mov_rr(Reg64::RAX, Reg64::R8); // return result
             }
         }
         Ok(())
@@ -1000,7 +1055,11 @@ impl X86_64Backend {
                 let label = block_labels[target];
                 self.enc().jmp_label(label);
             }
-            MirTerminator::If { cond, then_block, else_block } => {
+            MirTerminator::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
                 self.load_value_to_reg(cond, Reg64::RAX, func)?;
                 self.enc().test_rr(Reg64::RAX, Reg64::RAX);
 
@@ -1019,9 +1078,22 @@ impl X86_64Backend {
                 self.enc().pop(Reg64::RBP);
                 self.enc().ret();
             }
-            MirTerminator::Call { func: callee, args, dest, target, .. } => {
+            MirTerminator::Call {
+                func: callee,
+                args,
+                dest,
+                target,
+                ..
+            } => {
                 // Pass arguments
-                let arg_regs = [Reg64::RDI, Reg64::RSI, Reg64::RDX, Reg64::RCX, Reg64::R8, Reg64::R9];
+                let arg_regs = [
+                    Reg64::RDI,
+                    Reg64::RSI,
+                    Reg64::RDX,
+                    Reg64::RCX,
+                    Reg64::R8,
+                    Reg64::R9,
+                ];
                 for (i, arg) in args.iter().enumerate() {
                     if i < arg_regs.len() {
                         self.load_value_to_reg(arg, arg_regs[i], func)?;
@@ -1051,7 +1123,11 @@ impl X86_64Backend {
                     self.enc().jmp_label(label);
                 }
             }
-            MirTerminator::Switch { value, targets, default } => {
+            MirTerminator::Switch {
+                value,
+                targets,
+                default,
+            } => {
                 self.load_value_to_reg(value, Reg64::RAX, func)?;
 
                 // Generate comparisons and jumps for each case
@@ -1081,7 +1157,12 @@ impl X86_64Backend {
                 let label = block_labels[target];
                 self.enc().jmp_label(label);
             }
-            MirTerminator::Assert { cond, expected, target, .. } => {
+            MirTerminator::Assert {
+                cond,
+                expected,
+                target,
+                ..
+            } => {
                 self.load_value_to_reg(cond, Reg64::RAX, func)?;
                 self.enc().test_rr(Reg64::RAX, Reg64::RAX);
                 let label = block_labels[target];
@@ -1105,7 +1186,7 @@ impl X86_64Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codegen::builder::{MirBuilder, MirModuleBuilder, values};
+    use crate::codegen::builder::{values, MirBuilder, MirModuleBuilder};
 
     // =========================================================================
     // X86-64 BACKEND TESTS
@@ -1115,22 +1196,14 @@ mod tests {
     fn test_x86_64_backend_simple() {
         let mut module_builder = MirModuleBuilder::new("test");
 
-        let sig = MirFnSig::new(
-            vec![MirType::i32(), MirType::i32()],
-            MirType::i32(),
-        );
+        let sig = MirFnSig::new(vec![MirType::i32(), MirType::i32()], MirType::i32());
         let mut builder = MirBuilder::new("add", sig);
 
         let a = builder.param_local(0);
         let b = builder.param_local(1);
         let result = builder.create_local(MirType::i32());
 
-        builder.binary_op(
-            result,
-            BinOp::Add,
-            values::local(a),
-            values::local(b),
-        );
+        builder.binary_op(result, BinOp::Add, values::local(a), values::local(b));
         builder.ret(Some(values::local(result)));
 
         module_builder.add_function(builder.build());
@@ -1357,7 +1430,10 @@ mod tests {
         assert_eq!(backend.type_size(&MirType::Int(IntSize::I128, true)), 16);
         assert_eq!(backend.type_size(&MirType::f32()), 4);
         assert_eq!(backend.type_size(&MirType::f64()), 8);
-        assert_eq!(backend.type_size(&MirType::Ptr(Box::new(MirType::i32()))), 8);
+        assert_eq!(
+            backend.type_size(&MirType::Ptr(Box::new(MirType::i32()))),
+            8
+        );
     }
 
     #[test]
@@ -1391,7 +1467,9 @@ mod tests {
         let mut func = MirFunction::new("public_fn", sig);
         func.is_public = true;
         func.add_block(MirBlock::new(BlockId::ENTRY));
-        func.block_mut(BlockId::ENTRY).unwrap().set_terminator(MirTerminator::Return(None));
+        func.block_mut(BlockId::ENTRY)
+            .unwrap()
+            .set_terminator(MirTerminator::Return(None));
         module_builder.add_function(func);
 
         let module = module_builder.build();
@@ -1433,22 +1511,14 @@ mod tests {
     fn test_x86_64_machine_code_add() {
         let mut module_builder = MirModuleBuilder::new("test");
 
-        let sig = MirFnSig::new(
-            vec![MirType::i64(), MirType::i64()],
-            MirType::i64(),
-        );
+        let sig = MirFnSig::new(vec![MirType::i64(), MirType::i64()], MirType::i64());
         let mut builder = MirBuilder::new("add", sig);
 
         let a = builder.param_local(0);
         let b = builder.param_local(1);
         let result = builder.create_local(MirType::i64());
 
-        builder.binary_op(
-            result,
-            BinOp::Add,
-            values::local(a),
-            values::local(b),
-        );
+        builder.binary_op(result, BinOp::Add, values::local(a), values::local(b));
         builder.ret(Some(values::local(result)));
 
         module_builder.add_function(builder.build());
@@ -1491,7 +1561,10 @@ mod tests {
 
         // Should contain JMP (0xE9) or JCC (0x0F 0x8x) instructions
         let contains_jmp = output.data.iter().any(|&b| b == 0xE9);
-        let contains_jcc = output.data.windows(2).any(|w| w[0] == 0x0F && (w[1] & 0xF0) == 0x80);
+        let contains_jcc = output
+            .data
+            .windows(2)
+            .any(|w| w[0] == 0x0F && (w[1] & 0xF0) == 0x80);
         assert!(contains_jmp || contains_jcc);
     }
 
@@ -1530,10 +1603,7 @@ mod tests {
         for (op, name) in ops {
             let mut module_builder = MirModuleBuilder::new("test");
 
-            let sig = MirFnSig::new(
-                vec![MirType::i64(), MirType::i64()],
-                MirType::i64(),
-            );
+            let sig = MirFnSig::new(vec![MirType::i64(), MirType::i64()], MirType::i64());
             let mut builder = MirBuilder::new(name, sig);
 
             let a = builder.param_local(0);
@@ -1558,10 +1628,7 @@ mod tests {
     fn test_x86_64_machine_code_comparison() {
         let mut module_builder = MirModuleBuilder::new("test");
 
-        let sig = MirFnSig::new(
-            vec![MirType::i64(), MirType::i64()],
-            MirType::Bool,
-        );
+        let sig = MirFnSig::new(vec![MirType::i64(), MirType::i64()], MirType::Bool);
         let mut builder = MirBuilder::new("eq", sig);
 
         let a = builder.param_local(0);
@@ -1578,7 +1645,10 @@ mod tests {
         let output = backend.generate(&module).unwrap();
 
         // Should contain SETcc instruction (0x0F 0x9x)
-        let has_setcc = output.data.windows(2).any(|w| w[0] == 0x0F && (w[1] & 0xF0) == 0x90);
+        let has_setcc = output
+            .data
+            .windows(2)
+            .any(|w| w[0] == 0x0F && (w[1] & 0xF0) == 0x90);
         assert!(has_setcc);
     }
 

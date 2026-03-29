@@ -11,13 +11,13 @@
 
 use std::sync::Arc;
 
-use crate::ast::{self, ItemKind, TraitItemKind, ImplItemKind, StructFields};
+use crate::ast::{self, ImplItemKind, ItemKind, StructFields, TraitItemKind};
 use crate::lexer::Span;
 
-use super::ty::*;
 use super::context::*;
-use super::infer::TypeInfer;
 use super::error::*;
+use super::infer::TypeInfer;
+use super::ty::*;
 
 /// The type checker for items and declarations.
 pub struct TypeChecker<'ctx> {
@@ -94,9 +94,10 @@ impl<'ctx> TypeChecker<'ctx> {
         self.ctx.define_var(Arc::from("discard"), Ty::fresh_var());
 
         // Register runtime built-in functions
-        self.ctx.define_var(Arc::from("assert"), Ty::function(
-            vec![Ty::bool()], Ty::unit(),
-        ));
+        self.ctx.define_var(
+            Arc::from("assert"),
+            Ty::function(vec![Ty::bool()], Ty::unit()),
+        );
         self.ctx.define_var(Arc::from("assert_eq"), Ty::fresh_var());
         self.ctx.define_var(Arc::from("println"), Ty::fresh_var());
 
@@ -178,7 +179,6 @@ impl<'ctx> TypeChecker<'ctx> {
                 is_tuple: false,
             }),
         });
-
     }
 
     // =========================================================================
@@ -287,18 +287,21 @@ impl<'ctx> TypeChecker<'ctx> {
         let num_generics = generics.len();
 
         let fields = match &s.fields {
-            StructFields::Named(fields) => {
-                fields.iter().map(|f| {
+            StructFields::Named(fields) => fields
+                .iter()
+                .map(|f| {
                     let ty = self.lower_type(&f.ty);
                     (f.name.name.clone(), ty)
-                }).collect()
-            }
-            StructFields::Tuple(fields) => {
-                fields.iter().enumerate().map(|(i, f)| {
+                })
+                .collect(),
+            StructFields::Tuple(fields) => fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
                     let ty = self.lower_type(&f.ty);
                     (Arc::from(i.to_string()), ty)
-                }).collect()
-            }
+                })
+                .collect(),
             StructFields::Unit => Vec::new(),
         };
 
@@ -332,30 +335,32 @@ impl<'ctx> TypeChecker<'ctx> {
 
         let generics = self.collect_generics(&e.generics);
 
-        let variants = e.variants.iter().map(|v| {
-            let fields = match &v.fields {
-                StructFields::Named(fields) => {
-                    fields.iter().map(|f| {
-                        (Some(f.name.name.clone()), self.lower_type(&f.ty))
-                    }).collect()
-                }
-                StructFields::Tuple(types) => {
-                    types.iter().map(|t| {
-                        (None, self.lower_type(&t.ty))
-                    }).collect()
-                }
-                StructFields::Unit => Vec::new(),
-            };
+        let variants = e
+            .variants
+            .iter()
+            .map(|v| {
+                let fields = match &v.fields {
+                    StructFields::Named(fields) => fields
+                        .iter()
+                        .map(|f| (Some(f.name.name.clone()), self.lower_type(&f.ty)))
+                        .collect(),
+                    StructFields::Tuple(types) => types
+                        .iter()
+                        .map(|t| (None, self.lower_type(&t.ty)))
+                        .collect(),
+                    StructFields::Unit => Vec::new(),
+                };
 
-            EnumVariant {
-                name: v.name.name.clone(),
-                fields,
-                discriminant: v.discriminant.as_ref().and_then(|e| {
-                    // Try to evaluate const expression
-                    self.eval_const_int(e)
-                }),
-            }
-        }).collect();
+                EnumVariant {
+                    name: v.name.name.clone(),
+                    fields,
+                    discriminant: v.discriminant.as_ref().and_then(|e| {
+                        // Try to evaluate const expression
+                        self.eval_const_int(e)
+                    }),
+                }
+            })
+            .collect();
 
         let type_def = TypeDef {
             def_id,
@@ -387,33 +392,52 @@ impl<'ctx> TypeChecker<'ctx> {
         let def_id = self.ctx.fresh_def_id();
         let generics = self.collect_generics(&t.generics);
 
-        let supertraits = t.supertraits.iter().filter_map(|bound| {
-            self.lower_type_bound(bound)
-        }).collect();
+        let supertraits = t
+            .supertraits
+            .iter()
+            .filter_map(|bound| self.lower_type_bound(bound))
+            .collect();
 
-        let assoc_types = t.items.iter().filter_map(|item| {
-            if let TraitItemKind::Type { name, bounds, default, .. } = &item.kind {
-                Some(AssocType {
-                    name: name.name.clone(),
-                    bounds: bounds.iter().filter_map(|b| self.lower_type_bound(b)).collect(),
-                    default: default.as_ref().map(|t| self.lower_type(t)),
-                })
-            } else {
-                None
-            }
-        }).collect();
+        let assoc_types = t
+            .items
+            .iter()
+            .filter_map(|item| {
+                if let TraitItemKind::Type {
+                    name,
+                    bounds,
+                    default,
+                    ..
+                } = &item.kind
+                {
+                    Some(AssocType {
+                        name: name.name.clone(),
+                        bounds: bounds
+                            .iter()
+                            .filter_map(|b| self.lower_type_bound(b))
+                            .collect(),
+                        default: default.as_ref().map(|t| self.lower_type(t)),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        let methods = t.items.iter().filter_map(|item| {
-            if let TraitItemKind::Function(f) = &item.kind {
-                Some(TraitMethod {
-                    name: f.name.name.clone(),
-                    sig: self.lower_fn_sig(&f.generics, &f.sig),
-                    has_default: f.body.is_some(),
-                })
-            } else {
-                None
-            }
-        }).collect();
+        let methods = t
+            .items
+            .iter()
+            .filter_map(|item| {
+                if let TraitItemKind::Function(f) = &item.kind {
+                    Some(TraitMethod {
+                        name: f.name.name.clone(),
+                        sig: self.lower_fn_sig(&f.generics, &f.sig),
+                        has_default: f.body.is_some(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         let trait_def = TraitDef {
             def_id,
@@ -464,19 +488,16 @@ impl<'ctx> TypeChecker<'ctx> {
 
         // Convert each AST operation into a types::effects::EffectOperation
         for op in &effect_def.operations {
-            let param_tys: Vec<Ty> = op.params.iter().map(|p| {
-                self.lower_type(&p.ty)
-            }).collect();
+            let param_tys: Vec<Ty> = op.params.iter().map(|p| self.lower_type(&p.ty)).collect();
 
-            let return_ty = op.return_ty.as_ref()
+            let return_ty = op
+                .return_ty
+                .as_ref()
                 .map(|t| self.lower_type(t))
                 .unwrap_or(Ty::unit());
 
-            let effect_op = super::effects::EffectOperation::new(
-                op.name.name.as_ref(),
-                param_tys,
-                return_ty,
-            );
+            let effect_op =
+                super::effects::EffectOperation::new(op.name.name.as_ref(), param_tys, return_ty);
 
             ty_effect = ty_effect.with_operation(effect_op);
         }
@@ -513,16 +534,22 @@ impl<'ctx> TypeChecker<'ctx> {
 
                     // Collect trait bound names for this type parameter
                     if !bounds.is_empty() {
-                        let trait_names: Vec<Arc<str>> = bounds.iter()
+                        let trait_names: Vec<Arc<str>> = bounds
+                            .iter()
                             .filter(|b| !b.is_maybe)
                             .map(|b| {
                                 // Extract the last segment of the trait path as the name
-                                Arc::from(b.path.segments.last()
-                                    .map(|s| s.ident.name.as_ref())
-                                    .unwrap_or(""))
+                                Arc::from(
+                                    b.path
+                                        .segments
+                                        .last()
+                                        .map(|s| s.ident.name.as_ref())
+                                        .unwrap_or(""),
+                                )
                             })
                             .collect();
-                        self.ctx.register_param_bounds(param.ident.name.clone(), trait_names);
+                        self.ctx
+                            .register_param_bounds(param.ident.name.clone(), trait_names);
                     }
                 }
             }
@@ -533,12 +560,18 @@ impl<'ctx> TypeChecker<'ctx> {
                 if let ast::TypeKind::Path(ref path) = pred.ty.kind {
                     if let Some(seg) = path.segments.last() {
                         let param_name = seg.ident.name.clone();
-                        let trait_names: Vec<Arc<str>> = pred.bounds.iter()
+                        let trait_names: Vec<Arc<str>> = pred
+                            .bounds
+                            .iter()
                             .filter(|b| !b.is_maybe)
                             .map(|b| {
-                                Arc::from(b.path.segments.last()
-                                    .map(|s| s.ident.name.as_ref())
-                                    .unwrap_or(""))
+                                Arc::from(
+                                    b.path
+                                        .segments
+                                        .last()
+                                        .map(|s| s.ident.name.as_ref())
+                                        .unwrap_or(""),
+                                )
                             })
                             .collect();
                         if !trait_names.is_empty() {
@@ -555,7 +588,10 @@ impl<'ctx> TypeChecker<'ctx> {
             }
 
             // Set expected return type FIRST, before creating TypeInfer
-            let expected_ret = f.sig.return_ty.as_ref()
+            let expected_ret = f
+                .sig
+                .return_ty
+                .as_ref()
                 .map(|t| self.lower_type(t))
                 .unwrap_or(Ty::unit());
 
@@ -578,10 +614,7 @@ impl<'ctx> TypeChecker<'ctx> {
             }
 
             // Collect user-defined effects to pass to the inference context
-            let user_effects: Vec<_> = self.effect_ctx.all_effects()
-                .into_iter()
-                .cloned()
-                .collect();
+            let user_effects: Vec<_> = self.effect_ctx.all_effects().into_iter().cloned().collect();
 
             // Check function body - use block to limit TypeInfer borrow scope
             let (body_ty, body_effects, infer_errors, has_return) = {
@@ -611,7 +644,9 @@ impl<'ctx> TypeChecker<'ctx> {
                     // name.  This handles cases where inline module re-exports
                     // or registration order give the same struct different
                     // DefIds.
-                    let name_match = if let (TyKind::Adt(d1, _), TyKind::Adt(d2, _)) = (&body_ty.kind, &expected_ret.kind) {
+                    let name_match = if let (TyKind::Adt(d1, _), TyKind::Adt(d2, _)) =
+                        (&body_ty.kind, &expected_ret.kind)
+                    {
                         if d1 != d2 {
                             let n1 = self.ctx.lookup_type(*d1).map(|t| t.name.clone());
                             let n2 = self.ctx.lookup_type(*d2).map(|t| t.name.clone());
@@ -623,10 +658,13 @@ impl<'ctx> TypeChecker<'ctx> {
                         false
                     };
                     if !name_match {
-                        self.error(TypeError::ReturnTypeMismatch {
-                            expected: expected_ret,
-                            found: body_ty,
-                        }, span);
+                        self.error(
+                            TypeError::ReturnTypeMismatch {
+                                expected: expected_ret,
+                                found: body_ty,
+                            },
+                            span,
+                        );
                     }
                 }
             }
@@ -649,7 +687,9 @@ impl<'ctx> TypeChecker<'ctx> {
                 }
             } else if !expected_effects.is_empty() && !body_effects.is_empty() {
                 // Check that body effects are a subset of declared effects
-                let declared_names: Vec<String> = expected_effects.effects.iter()
+                let declared_names: Vec<String> = expected_effects
+                    .effects
+                    .iter()
                     .map(|e| e.name.to_string())
                     .collect();
                 for body_eff in &body_effects.effects {
@@ -660,10 +700,8 @@ impl<'ctx> TypeChecker<'ctx> {
                             declared_effects: declared_names.clone(),
                         };
                         let mut err_with_span = TypeErrorWithSpan::new(err, span);
-                        err_with_span.help = Some(format!(
-                            "add `{}` to the effect annotations",
-                            body_eff.name
-                        ));
+                        err_with_span.help =
+                            Some(format!("add `{}` to the effect annotations", body_eff.name));
                         self.errors.push(err_with_span);
                     }
                 }
@@ -721,18 +759,29 @@ impl<'ctx> TypeChecker<'ctx> {
         self.ctx.pop_scope();
     }
 
-    fn check_trait_impl(&mut self, impl_: &ast::ImplDef, self_ty: &Ty, trait_ref: &ast::TraitRef, span: Span) {
+    fn check_trait_impl(
+        &mut self,
+        impl_: &ast::ImplDef,
+        self_ty: &Ty,
+        trait_ref: &ast::TraitRef,
+        span: Span,
+    ) {
         // Look up trait
-        let trait_name = trait_ref.path.last_ident()
+        let trait_name = trait_ref
+            .path
+            .last_ident()
             .map(|i| i.name.as_ref())
             .unwrap_or("");
 
         let trait_def = self.ctx.lookup_trait_by_name(trait_name).cloned();
 
         if trait_def.is_none() {
-            self.error(TypeError::UndefinedType {
-                name: trait_name.to_string(),
-            }, span);
+            self.error(
+                TypeError::UndefinedType {
+                    name: trait_name.to_string(),
+                },
+                span,
+            );
             return;
         }
 
@@ -750,10 +799,13 @@ impl<'ctx> TypeChecker<'ctx> {
                 });
 
                 if !found {
-                    self.error(TypeError::UndefinedMethod {
-                        ty: self_ty.clone(),
-                        method: method.name.to_string(),
-                    }, span);
+                    self.error(
+                        TypeError::UndefinedMethod {
+                            ty: self_ty.clone(),
+                            method: method.name.to_string(),
+                        },
+                        span,
+                    );
                 }
             }
         }
@@ -776,7 +828,8 @@ impl<'ctx> TypeChecker<'ctx> {
         }
 
         // Collect method signatures from impl items
-        let mut methods: std::collections::HashMap<Arc<str>, DefId> = std::collections::HashMap::new();
+        let mut methods: std::collections::HashMap<Arc<str>, DefId> =
+            std::collections::HashMap::new();
         for item in &impl_.items {
             if let ImplItemKind::Function(f) = &item.kind {
                 let method_def_id = self.ctx.fresh_def_id();
@@ -785,7 +838,10 @@ impl<'ctx> TypeChecker<'ctx> {
         }
 
         // Collect where clauses from the impl's where clause
-        let where_clauses = impl_.generics.where_clause.as_ref()
+        let where_clauses = impl_
+            .generics
+            .where_clause
+            .as_ref()
             .map(|wc| self.collect_where_predicates(wc))
             .unwrap_or_default();
 
@@ -835,35 +891,44 @@ impl<'ctx> TypeChecker<'ctx> {
     /// Extract a type name string from an AST Type node (for inherent impl registration).
     fn extract_type_name_from_ast(ty: &ast::Type) -> Option<String> {
         match &ty.kind {
-            ast::TypeKind::Path(path) => {
-                path.last_ident().map(|i| i.name.to_string())
-            }
+            ast::TypeKind::Path(path) => path.last_ident().map(|i| i.name.to_string()),
             _ => None,
         }
     }
 
     /// Build a FnSig from an AST function definition for method registration.
     fn build_fn_sig_from_ast(&mut self, f: &ast::FnDef) -> FnSig {
-        let params: Vec<(Arc<str>, Ty)> = f.sig.params.iter().map(|p| {
-            let name = match &p.pattern.kind {
-                ast::PatternKind::Ident { name, .. } => name.name.clone(),
-                _ => Arc::from("_"),
-            };
-            let ty = if name.as_ref() == "self" {
-                // self parameter — use a fresh var since we don't need the exact type
-                Ty::fresh_var()
-            } else {
-                self.lower_type(&p.ty)
-            };
-            (name, ty)
-        }).collect();
+        let params: Vec<(Arc<str>, Ty)> = f
+            .sig
+            .params
+            .iter()
+            .map(|p| {
+                let name = match &p.pattern.kind {
+                    ast::PatternKind::Ident { name, .. } => name.name.clone(),
+                    _ => Arc::from("_"),
+                };
+                let ty = if name.as_ref() == "self" {
+                    // self parameter — use a fresh var since we don't need the exact type
+                    Ty::fresh_var()
+                } else {
+                    self.lower_type(&p.ty)
+                };
+                (name, ty)
+            })
+            .collect();
 
-        let ret = f.sig.return_ty.as_ref()
+        let ret = f
+            .sig
+            .return_ty
+            .as_ref()
             .map(|t| self.lower_type(t))
             .unwrap_or(Ty::unit());
 
         // Extract lifetime parameters from generics
-        let lifetime_params: Vec<Arc<str>> = f.generics.params.iter()
+        let lifetime_params: Vec<Arc<str>> = f
+            .generics
+            .params
+            .iter()
             .filter_map(|p| {
                 if let ast::GenericParamKind::Lifetime { .. } = &p.kind {
                     Some(p.ident.name.clone())
@@ -919,10 +984,13 @@ impl<'ctx> TypeChecker<'ctx> {
             };
 
             if let Err(_) = super::unify::unify(&ty, &init_ty) {
-                self.error(TypeError::TypeMismatch {
-                    expected: ty.clone(),
-                    found: init_ty,
-                }, span);
+                self.error(
+                    TypeError::TypeMismatch {
+                        expected: ty.clone(),
+                        found: init_ty,
+                    },
+                    span,
+                );
             }
 
             self.errors.extend(infer_errors);
@@ -943,10 +1011,13 @@ impl<'ctx> TypeChecker<'ctx> {
             };
 
             if let Err(_) = super::unify::unify(&ty, &init_ty) {
-                self.error(TypeError::TypeMismatch {
-                    expected: ty.clone(),
-                    found: init_ty,
-                }, span);
+                self.error(
+                    TypeError::TypeMismatch {
+                        expected: ty.clone(),
+                        found: init_ty,
+                    },
+                    span,
+                );
             }
 
             self.errors.extend(infer_errors);
@@ -964,7 +1035,8 @@ impl<'ctx> TypeChecker<'ctx> {
                 if path.segments.len() >= 2 {
                     let module = path.segments[0].ident.name.as_ref();
                     let item = &path.segments[path.segments.len() - 1].ident.name;
-                    let local_name = rename.as_ref()
+                    let local_name = rename
+                        .as_ref()
                         .map(|r| r.name.clone())
                         .unwrap_or_else(|| item.clone());
 
@@ -1019,18 +1091,29 @@ impl<'ctx> TypeChecker<'ctx> {
                                 }
                                 let module_name = m.name.name.clone();
                                 let bindings = self.ctx.current_scope_bindings();
-                                self.ctx.register_module_bindings(module_name.clone(), bindings);
+                                self.ctx
+                                    .register_module_bindings(module_name.clone(), bindings);
                                 // Re-export to parent scope
                                 for item in &module_ast.items {
                                     match &item.kind {
-                                        ItemKind::Function(f) => self.collect_function(f, item.span),
+                                        ItemKind::Function(f) => {
+                                            self.collect_function(f, item.span)
+                                        }
                                         ItemKind::Struct(s) => {
-                                            if self.ctx.lookup_type_by_name(s.name.name.as_ref()).is_none() {
+                                            if self
+                                                .ctx
+                                                .lookup_type_by_name(s.name.name.as_ref())
+                                                .is_none()
+                                            {
                                                 self.collect_struct(s, item.span);
                                             }
                                         }
                                         ItemKind::Enum(e) => {
-                                            if self.ctx.lookup_type_by_name(e.name.name.as_ref()).is_none() {
+                                            if self
+                                                .ctx
+                                                .lookup_type_by_name(e.name.name.as_ref())
+                                                .is_none()
+                                            {
                                                 self.collect_enum(e, item.span);
                                             }
                                         }
@@ -1116,56 +1199,75 @@ impl<'ctx> TypeChecker<'ctx> {
     // =========================================================================
 
     fn collect_generics(&mut self, generics: &ast::Generics) -> Vec<GenericParam> {
-        generics.params.iter().enumerate().map(|(idx, p)| {
-            let kind = match &p.kind {
-                ast::GenericParamKind::Type { bounds, .. } => {
-                    GenericParamKind::Type {
-                        bounds: bounds.iter().filter_map(|b| self.lower_type_bound(b)).collect(),
-                    }
-                }
-                ast::GenericParamKind::Lifetime { .. } => {
-                    GenericParamKind::Lifetime
-                }
-                ast::GenericParamKind::Const { ty, .. } => {
-                    GenericParamKind::Const {
+        generics
+            .params
+            .iter()
+            .enumerate()
+            .map(|(idx, p)| {
+                let kind = match &p.kind {
+                    ast::GenericParamKind::Type { bounds, .. } => GenericParamKind::Type {
+                        bounds: bounds
+                            .iter()
+                            .filter_map(|b| self.lower_type_bound(b))
+                            .collect(),
+                    },
+                    ast::GenericParamKind::Lifetime { .. } => GenericParamKind::Lifetime,
+                    ast::GenericParamKind::Const { ty, .. } => GenericParamKind::Const {
                         ty: self.lower_type(ty),
-                    }
-                }
-            };
+                    },
+                };
 
-            GenericParam {
-                name: p.ident.name.clone(),
-                index: idx as u32,
-                kind,
-            }
-        }).collect()
+                GenericParam {
+                    name: p.ident.name.clone(),
+                    index: idx as u32,
+                    kind,
+                }
+            })
+            .collect()
     }
 
     fn lower_fn_sig(&mut self, generics: &ast::Generics, sig: &ast::FnSig) -> FnSig {
         let gen_params = self.collect_generics(generics);
 
-        let params: Vec<_> = sig.params.iter().map(|p| {
-            let name = match &p.pattern.kind {
-                ast::PatternKind::Ident { name, .. } => name.name.clone(),
-                _ => Arc::from("_"),
-            };
-            (name, self.lower_type(&p.ty))
-        }).collect();
+        let params: Vec<_> = sig
+            .params
+            .iter()
+            .map(|p| {
+                let name = match &p.pattern.kind {
+                    ast::PatternKind::Ident { name, .. } => name.name.clone(),
+                    _ => Arc::from("_"),
+                };
+                (name, self.lower_type(&p.ty))
+            })
+            .collect();
 
-        let ret = sig.return_ty.as_ref()
+        let ret = sig
+            .return_ty
+            .as_ref()
             .map(|t| self.lower_type(t))
             .unwrap_or(Ty::unit());
 
-        let where_clauses = generics.where_clause.as_ref().map(|wc| {
-            wc.predicates.iter().map(|p| {
-                WhereClause {
-                    ty: self.lower_type(&p.ty),
-                    bounds: p.bounds.iter().filter_map(|b| self.lower_type_bound(b)).collect(),
-                }
-            }).collect()
-        }).unwrap_or_default();
+        let where_clauses = generics
+            .where_clause
+            .as_ref()
+            .map(|wc| {
+                wc.predicates
+                    .iter()
+                    .map(|p| WhereClause {
+                        ty: self.lower_type(&p.ty),
+                        bounds: p
+                            .bounds
+                            .iter()
+                            .filter_map(|b| self.lower_type_bound(b))
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        let lifetime_params: Vec<Arc<str>> = generics.params.iter()
+        let lifetime_params: Vec<Arc<str>> = generics
+            .params
+            .iter()
             .filter_map(|p| {
                 if let ast::GenericParamKind::Lifetime { .. } = &p.kind {
                     Some(p.ident.name.clone())
@@ -1189,38 +1291,43 @@ impl<'ctx> TypeChecker<'ctx> {
 
     fn lower_type_bound(&mut self, bound: &ast::TypeBound) -> Option<TraitBound> {
         // Look up trait by path
-        let trait_name = bound.path.last_ident()
-            .map(|i| &*i.name)?;
+        let trait_name = bound.path.last_ident().map(|i| &*i.name)?;
 
         let trait_def = self.ctx.lookup_trait_by_name(trait_name)?;
-        let trait_id = trait_def.def_id;  // Extract before the borrow ends
+        let trait_id = trait_def.def_id; // Extract before the borrow ends
 
         // Collect type arguments from the trait bound's path generic args
-        let args = bound.path.segments.last()
+        let args = bound
+            .path
+            .segments
+            .last()
             .map(|seg| {
-                seg.generics.iter().filter_map(|arg| {
-                    match arg {
+                seg.generics
+                    .iter()
+                    .filter_map(|arg| match arg {
                         ast::GenericArg::Type(ty) => Some(self.lower_type(ty)),
                         _ => None,
-                    }
-                }).collect()
+                    })
+                    .collect()
             })
             .unwrap_or_default();
 
-        Some(TraitBound {
-            trait_id,
-            args,
-        })
+        Some(TraitBound { trait_id, args })
     }
 
     fn collect_where_predicates(&mut self, wc: &ast::WhereClause) -> Vec<WhereClause> {
-        wc.predicates.iter().map(|pred| {
-            let ty = self.lower_type(&pred.ty);
-            let bounds = pred.bounds.iter()
-                .filter_map(|b| self.lower_type_bound(b))
-                .collect();
-            WhereClause { ty, bounds }
-        }).collect()
+        wc.predicates
+            .iter()
+            .map(|pred| {
+                let ty = self.lower_type(&pred.ty);
+                let bounds = pred
+                    .bounds
+                    .iter()
+                    .filter_map(|b| self.lower_type_bound(b))
+                    .collect();
+                WhereClause { ty, bounds }
+            })
+            .collect()
     }
 
     fn lower_type(&mut self, ty: &ast::Type) -> Ty {
@@ -1250,9 +1357,10 @@ impl<'ctx> TypeChecker<'ctx> {
         // Basic const evaluation for integer literals and simple expressions
         match &expr.kind {
             ast::ExprKind::Literal(ast::Literal::Int { value, .. }) => Some(*value as i128),
-            ast::ExprKind::Unary { op: ast::UnaryOp::Neg, expr: operand } => {
-                self.eval_const_int(operand).map(|n| -n)
-            }
+            ast::ExprKind::Unary {
+                op: ast::UnaryOp::Neg,
+                expr: operand,
+            } => self.eval_const_int(operand).map(|n| -n),
             ast::ExprKind::Binary { op, left, right } => {
                 let l = self.eval_const_int(left)?;
                 let r = self.eval_const_int(right)?;
@@ -1271,7 +1379,7 @@ impl<'ctx> TypeChecker<'ctx> {
                 }
             }
             ast::ExprKind::Paren(inner) => self.eval_const_int(inner),
-            _ => None
+            _ => None,
         }
     }
 }

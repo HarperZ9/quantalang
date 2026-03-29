@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{Backend, Target, CodegenError, CodegenResult};
+use super::{Backend, CodegenError, CodegenResult, Target};
 use crate::codegen::ir::*;
 use crate::codegen::{GeneratedCode, OutputFormat};
 
@@ -776,10 +776,20 @@ impl SpirvBackend {
     }
 
     /// Emit an OpMemberDecorate instruction into the pending annotations buffer.
-    fn emit_member_decoration(&mut self, struct_id: u32, member: u32, decoration: SpvDecoration, extra: &[u32]) {
+    fn emit_member_decoration(
+        &mut self,
+        struct_id: u32,
+        member: u32,
+        decoration: SpvDecoration,
+        extra: &[u32],
+    ) {
         let mut operands = vec![struct_id, member, decoration as u32];
         operands.extend_from_slice(extra);
-        Self::emit_to(&mut self.pending_annotations, SpvOp::OpMemberDecorate, &operands);
+        Self::emit_to(
+            &mut self.pending_annotations,
+            SpvOp::OpMemberDecorate,
+            &operands,
+        );
     }
 
     /// Emit a string as SPIR-V words (null-terminated, padded to word boundary).
@@ -847,17 +857,32 @@ impl SpirvBackend {
 
     /// Emit atomic load instruction.
     #[allow(dead_code)]
-    fn emit_atomic_load(&mut self, result_type: u32, pointer: u32, scope: SpvScope, semantics: SpvMemorySemantics) -> u32 {
+    fn emit_atomic_load(
+        &mut self,
+        result_type: u32,
+        pointer: u32,
+        scope: SpvScope,
+        semantics: SpvMemorySemantics,
+    ) -> u32 {
         let result = self.alloc_id();
         let scope_id = self.get_const_id(&MirConst::Uint(scope as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics as u128, MirType::u32()));
-        self.emit(SpvOp::OpAtomicLoad, &[result_type, result, pointer, scope_id, sem_id]);
+        self.emit(
+            SpvOp::OpAtomicLoad,
+            &[result_type, result, pointer, scope_id, sem_id],
+        );
         result
     }
 
     /// Emit atomic store instruction.
     #[allow(dead_code)]
-    fn emit_atomic_store(&mut self, pointer: u32, value: u32, scope: SpvScope, semantics: SpvMemorySemantics) {
+    fn emit_atomic_store(
+        &mut self,
+        pointer: u32,
+        value: u32,
+        scope: SpvScope,
+        semantics: SpvMemorySemantics,
+    ) {
         let scope_id = self.get_const_id(&MirConst::Uint(scope as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics as u128, MirType::u32()));
         self.emit(SpvOp::OpAtomicStore, &[pointer, scope_id, sem_id, value]);
@@ -865,112 +890,233 @@ impl SpirvBackend {
 
     /// Emit atomic exchange instruction.
     #[allow(dead_code)]
-    fn emit_atomic_exchange(&mut self, result_type: u32, pointer: u32, value: u32, scope: SpvScope, semantics: SpvMemorySemantics) -> u32 {
+    fn emit_atomic_exchange(
+        &mut self,
+        result_type: u32,
+        pointer: u32,
+        value: u32,
+        scope: SpvScope,
+        semantics: SpvMemorySemantics,
+    ) -> u32 {
         let result = self.alloc_id();
         let scope_id = self.get_const_id(&MirConst::Uint(scope as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics as u128, MirType::u32()));
-        self.emit(SpvOp::OpAtomicExchange, &[result_type, result, pointer, scope_id, sem_id, value]);
+        self.emit(
+            SpvOp::OpAtomicExchange,
+            &[result_type, result, pointer, scope_id, sem_id, value],
+        );
         result
     }
 
     /// Emit atomic compare-exchange instruction.
     #[allow(dead_code)]
-    fn emit_atomic_compare_exchange(&mut self, result_type: u32, pointer: u32, comparator: u32, value: u32, scope: SpvScope, equal_sem: SpvMemorySemantics, unequal_sem: SpvMemorySemantics) -> u32 {
+    fn emit_atomic_compare_exchange(
+        &mut self,
+        result_type: u32,
+        pointer: u32,
+        comparator: u32,
+        value: u32,
+        scope: SpvScope,
+        equal_sem: SpvMemorySemantics,
+        unequal_sem: SpvMemorySemantics,
+    ) -> u32 {
         let result = self.alloc_id();
         let scope_id = self.get_const_id(&MirConst::Uint(scope as u128, MirType::u32()));
         let eq_sem_id = self.get_const_id(&MirConst::Uint(equal_sem as u128, MirType::u32()));
         let neq_sem_id = self.get_const_id(&MirConst::Uint(unequal_sem as u128, MirType::u32()));
-        self.emit(SpvOp::OpAtomicCompareExchange, &[result_type, result, pointer, scope_id, eq_sem_id, neq_sem_id, value, comparator]);
+        self.emit(
+            SpvOp::OpAtomicCompareExchange,
+            &[
+                result_type,
+                result,
+                pointer,
+                scope_id,
+                eq_sem_id,
+                neq_sem_id,
+                value,
+                comparator,
+            ],
+        );
         result
     }
 
     /// Emit atomic add instruction.
     #[allow(dead_code)]
-    fn emit_atomic_add(&mut self, result_type: u32, pointer: u32, value: u32, scope: SpvScope, semantics: SpvMemorySemantics) -> u32 {
+    fn emit_atomic_add(
+        &mut self,
+        result_type: u32,
+        pointer: u32,
+        value: u32,
+        scope: SpvScope,
+        semantics: SpvMemorySemantics,
+    ) -> u32 {
         let result = self.alloc_id();
         let scope_id = self.get_const_id(&MirConst::Uint(scope as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics as u128, MirType::u32()));
-        self.emit(SpvOp::OpAtomicIAdd, &[result_type, result, pointer, scope_id, sem_id, value]);
+        self.emit(
+            SpvOp::OpAtomicIAdd,
+            &[result_type, result, pointer, scope_id, sem_id, value],
+        );
         result
     }
 
     /// Emit atomic subtract instruction.
     #[allow(dead_code)]
-    fn emit_atomic_sub(&mut self, result_type: u32, pointer: u32, value: u32, scope: SpvScope, semantics: SpvMemorySemantics) -> u32 {
+    fn emit_atomic_sub(
+        &mut self,
+        result_type: u32,
+        pointer: u32,
+        value: u32,
+        scope: SpvScope,
+        semantics: SpvMemorySemantics,
+    ) -> u32 {
         let result = self.alloc_id();
         let scope_id = self.get_const_id(&MirConst::Uint(scope as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics as u128, MirType::u32()));
-        self.emit(SpvOp::OpAtomicISub, &[result_type, result, pointer, scope_id, sem_id, value]);
+        self.emit(
+            SpvOp::OpAtomicISub,
+            &[result_type, result, pointer, scope_id, sem_id, value],
+        );
         result
     }
 
     /// Emit atomic min instruction (signed).
     #[allow(dead_code)]
-    fn emit_atomic_smin(&mut self, result_type: u32, pointer: u32, value: u32, scope: SpvScope, semantics: SpvMemorySemantics) -> u32 {
+    fn emit_atomic_smin(
+        &mut self,
+        result_type: u32,
+        pointer: u32,
+        value: u32,
+        scope: SpvScope,
+        semantics: SpvMemorySemantics,
+    ) -> u32 {
         let result = self.alloc_id();
         let scope_id = self.get_const_id(&MirConst::Uint(scope as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics as u128, MirType::u32()));
-        self.emit(SpvOp::OpAtomicSMin, &[result_type, result, pointer, scope_id, sem_id, value]);
+        self.emit(
+            SpvOp::OpAtomicSMin,
+            &[result_type, result, pointer, scope_id, sem_id, value],
+        );
         result
     }
 
     /// Emit atomic min instruction (unsigned).
     #[allow(dead_code)]
-    fn emit_atomic_umin(&mut self, result_type: u32, pointer: u32, value: u32, scope: SpvScope, semantics: SpvMemorySemantics) -> u32 {
+    fn emit_atomic_umin(
+        &mut self,
+        result_type: u32,
+        pointer: u32,
+        value: u32,
+        scope: SpvScope,
+        semantics: SpvMemorySemantics,
+    ) -> u32 {
         let result = self.alloc_id();
         let scope_id = self.get_const_id(&MirConst::Uint(scope as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics as u128, MirType::u32()));
-        self.emit(SpvOp::OpAtomicUMin, &[result_type, result, pointer, scope_id, sem_id, value]);
+        self.emit(
+            SpvOp::OpAtomicUMin,
+            &[result_type, result, pointer, scope_id, sem_id, value],
+        );
         result
     }
 
     /// Emit atomic max instruction (signed).
     #[allow(dead_code)]
-    fn emit_atomic_smax(&mut self, result_type: u32, pointer: u32, value: u32, scope: SpvScope, semantics: SpvMemorySemantics) -> u32 {
+    fn emit_atomic_smax(
+        &mut self,
+        result_type: u32,
+        pointer: u32,
+        value: u32,
+        scope: SpvScope,
+        semantics: SpvMemorySemantics,
+    ) -> u32 {
         let result = self.alloc_id();
         let scope_id = self.get_const_id(&MirConst::Uint(scope as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics as u128, MirType::u32()));
-        self.emit(SpvOp::OpAtomicSMax, &[result_type, result, pointer, scope_id, sem_id, value]);
+        self.emit(
+            SpvOp::OpAtomicSMax,
+            &[result_type, result, pointer, scope_id, sem_id, value],
+        );
         result
     }
 
     /// Emit atomic max instruction (unsigned).
     #[allow(dead_code)]
-    fn emit_atomic_umax(&mut self, result_type: u32, pointer: u32, value: u32, scope: SpvScope, semantics: SpvMemorySemantics) -> u32 {
+    fn emit_atomic_umax(
+        &mut self,
+        result_type: u32,
+        pointer: u32,
+        value: u32,
+        scope: SpvScope,
+        semantics: SpvMemorySemantics,
+    ) -> u32 {
         let result = self.alloc_id();
         let scope_id = self.get_const_id(&MirConst::Uint(scope as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics as u128, MirType::u32()));
-        self.emit(SpvOp::OpAtomicUMax, &[result_type, result, pointer, scope_id, sem_id, value]);
+        self.emit(
+            SpvOp::OpAtomicUMax,
+            &[result_type, result, pointer, scope_id, sem_id, value],
+        );
         result
     }
 
     /// Emit atomic AND instruction.
     #[allow(dead_code)]
-    fn emit_atomic_and(&mut self, result_type: u32, pointer: u32, value: u32, scope: SpvScope, semantics: SpvMemorySemantics) -> u32 {
+    fn emit_atomic_and(
+        &mut self,
+        result_type: u32,
+        pointer: u32,
+        value: u32,
+        scope: SpvScope,
+        semantics: SpvMemorySemantics,
+    ) -> u32 {
         let result = self.alloc_id();
         let scope_id = self.get_const_id(&MirConst::Uint(scope as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics as u128, MirType::u32()));
-        self.emit(SpvOp::OpAtomicAnd, &[result_type, result, pointer, scope_id, sem_id, value]);
+        self.emit(
+            SpvOp::OpAtomicAnd,
+            &[result_type, result, pointer, scope_id, sem_id, value],
+        );
         result
     }
 
     /// Emit atomic OR instruction.
     #[allow(dead_code)]
-    fn emit_atomic_or(&mut self, result_type: u32, pointer: u32, value: u32, scope: SpvScope, semantics: SpvMemorySemantics) -> u32 {
+    fn emit_atomic_or(
+        &mut self,
+        result_type: u32,
+        pointer: u32,
+        value: u32,
+        scope: SpvScope,
+        semantics: SpvMemorySemantics,
+    ) -> u32 {
         let result = self.alloc_id();
         let scope_id = self.get_const_id(&MirConst::Uint(scope as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics as u128, MirType::u32()));
-        self.emit(SpvOp::OpAtomicOr, &[result_type, result, pointer, scope_id, sem_id, value]);
+        self.emit(
+            SpvOp::OpAtomicOr,
+            &[result_type, result, pointer, scope_id, sem_id, value],
+        );
         result
     }
 
     /// Emit atomic XOR instruction.
     #[allow(dead_code)]
-    fn emit_atomic_xor(&mut self, result_type: u32, pointer: u32, value: u32, scope: SpvScope, semantics: SpvMemorySemantics) -> u32 {
+    fn emit_atomic_xor(
+        &mut self,
+        result_type: u32,
+        pointer: u32,
+        value: u32,
+        scope: SpvScope,
+        semantics: SpvMemorySemantics,
+    ) -> u32 {
         let result = self.alloc_id();
         let scope_id = self.get_const_id(&MirConst::Uint(scope as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics as u128, MirType::u32()));
-        self.emit(SpvOp::OpAtomicXor, &[result_type, result, pointer, scope_id, sem_id, value]);
+        self.emit(
+            SpvOp::OpAtomicXor,
+            &[result_type, result, pointer, scope_id, sem_id, value],
+        );
         result
     }
 
@@ -980,11 +1126,20 @@ impl SpirvBackend {
 
     /// Emit control barrier (workgroup synchronization).
     #[allow(dead_code)]
-    fn emit_control_barrier(&mut self, execution_scope: SpvScope, memory_scope: SpvScope, semantics: SpvMemorySemantics) {
-        let exec_scope_id = self.get_const_id(&MirConst::Uint(execution_scope as u128, MirType::u32()));
+    fn emit_control_barrier(
+        &mut self,
+        execution_scope: SpvScope,
+        memory_scope: SpvScope,
+        semantics: SpvMemorySemantics,
+    ) {
+        let exec_scope_id =
+            self.get_const_id(&MirConst::Uint(execution_scope as u128, MirType::u32()));
         let mem_scope_id = self.get_const_id(&MirConst::Uint(memory_scope as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics as u128, MirType::u32()));
-        self.emit(SpvOp::OpControlBarrier, &[exec_scope_id, mem_scope_id, sem_id]);
+        self.emit(
+            SpvOp::OpControlBarrier,
+            &[exec_scope_id, mem_scope_id, sem_id],
+        );
     }
 
     /// Emit memory barrier.
@@ -1001,10 +1156,15 @@ impl SpirvBackend {
     fn emit_workgroup_barrier(&mut self) {
         // AcquireRelease (0x8) | WorkgroupMemory (0x100) = 0x108
         let semantics = 0x108u128;
-        let exec_scope_id = self.get_const_id(&MirConst::Uint(SpvScope::Workgroup as u128, MirType::u32()));
-        let mem_scope_id = self.get_const_id(&MirConst::Uint(SpvScope::Workgroup as u128, MirType::u32()));
+        let exec_scope_id =
+            self.get_const_id(&MirConst::Uint(SpvScope::Workgroup as u128, MirType::u32()));
+        let mem_scope_id =
+            self.get_const_id(&MirConst::Uint(SpvScope::Workgroup as u128, MirType::u32()));
         let sem_id = self.get_const_id(&MirConst::Uint(semantics, MirType::u32()));
-        self.emit(SpvOp::OpControlBarrier, &[exec_scope_id, mem_scope_id, sem_id]);
+        self.emit(
+            SpvOp::OpControlBarrier,
+            &[exec_scope_id, mem_scope_id, sem_id],
+        );
     }
 
     // =========================================================================
@@ -1013,7 +1173,13 @@ impl SpirvBackend {
 
     /// Emit vector shuffle instruction.
     #[allow(dead_code)]
-    fn emit_vector_shuffle(&mut self, result_type: u32, v1: u32, v2: u32, components: &[u32]) -> u32 {
+    fn emit_vector_shuffle(
+        &mut self,
+        result_type: u32,
+        v1: u32,
+        v2: u32,
+        components: &[u32],
+    ) -> u32 {
         let result = self.alloc_id();
         let mut operands = vec![result_type, result, v1, v2];
         operands.extend_from_slice(components);
@@ -1033,7 +1199,13 @@ impl SpirvBackend {
 
     /// Emit composite insert (insert element into vector/struct).
     #[allow(dead_code)]
-    fn emit_composite_insert(&mut self, result_type: u32, object: u32, composite: u32, indices: &[u32]) -> u32 {
+    fn emit_composite_insert(
+        &mut self,
+        result_type: u32,
+        object: u32,
+        composite: u32,
+        indices: &[u32],
+    ) -> u32 {
         let result = self.alloc_id();
         let mut operands = vec![result_type, result, object, composite];
         operands.extend_from_slice(indices);
@@ -1055,7 +1227,10 @@ impl SpirvBackend {
     #[allow(dead_code)]
     fn emit_vector_times_scalar(&mut self, result_type: u32, vector: u32, scalar: u32) -> u32 {
         let result = self.alloc_id();
-        self.emit(SpvOp::OpVectorTimesScalar, &[result_type, result, vector, scalar]);
+        self.emit(
+            SpvOp::OpVectorTimesScalar,
+            &[result_type, result, vector, scalar],
+        );
         result
     }
 
@@ -1230,38 +1405,35 @@ impl SpirvBackend {
     fn glsl_builtin_opcode(name: &str) -> Option<u32> {
         match name {
             // Standard math (1-arg)
-            "sqrt"              => Some(31),  // GLSLstd450Sqrt
-            "sin"               => Some(13),  // GLSLstd450Sin
-            "cos"               => Some(14),  // GLSLstd450Cos
-            "tan"               => Some(15),  // GLSLstd450Tan
-            "fabs" | "abs"      => Some(4),   // GLSLstd450FAbs
-            "floor"             => Some(8),   // GLSLstd450Floor
-            "ceil"              => Some(9),   // GLSLstd450Ceil
-            "round"             => Some(1),   // GLSLstd450Round
-            "exp"               => Some(27),  // GLSLstd450Exp
-            "log"               => Some(28),  // GLSLstd450Log
+            "sqrt" => Some(31),        // GLSLstd450Sqrt
+            "sin" => Some(13),         // GLSLstd450Sin
+            "cos" => Some(14),         // GLSLstd450Cos
+            "tan" => Some(15),         // GLSLstd450Tan
+            "fabs" | "abs" => Some(4), // GLSLstd450FAbs
+            "floor" => Some(8),        // GLSLstd450Floor
+            "ceil" => Some(9),         // GLSLstd450Ceil
+            "round" => Some(1),        // GLSLstd450Round
+            "exp" => Some(27),         // GLSLstd450Exp
+            "log" => Some(28),         // GLSLstd450Log
 
             // Standard math (2-arg)
-            "pow"               => Some(26),  // GLSLstd450Pow
-            "quanta_min_i32" | "fmin" => Some(37),  // GLSLstd450FMin
-            "quanta_max_i32" | "fmax" => Some(40),  // GLSLstd450FMax
+            "pow" => Some(26),                     // GLSLstd450Pow
+            "quanta_min_i32" | "fmin" => Some(37), // GLSLstd450FMin
+            "quanta_max_i32" | "fmax" => Some(40), // GLSLstd450FMax
 
             // Shader math (2-arg or 3-arg)
-            "quanta_clampf"     => Some(43),  // GLSLstd450FClamp
-            "quanta_smoothstep" => Some(49),  // GLSLstd450SmoothStep
-            "quanta_mix"        => Some(46),  // GLSLstd450FMix
-            "quanta_step"       => Some(48),  // GLSLstd450Step
-            "quanta_fract"      => Some(10),  // GLSLstd450Fract
+            "quanta_clampf" => Some(43),     // GLSLstd450FClamp
+            "quanta_smoothstep" => Some(49), // GLSLstd450SmoothStep
+            "quanta_mix" => Some(46),        // GLSLstd450FMix
+            "quanta_step" => Some(48),       // GLSLstd450Step
+            "quanta_fract" => Some(10),      // GLSLstd450Fract
 
             // Vector math
-            "quanta_normalize3" | "quanta_normalize2" | "quanta_normalize4"
-                                => Some(69),  // GLSLstd450Normalize
-            "quanta_length3" | "quanta_length2" | "quanta_length4"
-                                => Some(66),  // GLSLstd450Length
-            "quanta_cross"      => Some(68),  // GLSLstd450Cross
-            "quanta_reflect3"   => Some(71),  // GLSLstd450Reflect
-            "quanta_dot3" | "quanta_dot2" | "quanta_dot4"
-                                => None,      // OpDot is a core op, not GLSL.std.450
+            "quanta_normalize3" | "quanta_normalize2" | "quanta_normalize4" => Some(69), // GLSLstd450Normalize
+            "quanta_length3" | "quanta_length2" | "quanta_length4" => Some(66), // GLSLstd450Length
+            "quanta_cross" => Some(68),                                         // GLSLstd450Cross
+            "quanta_reflect3" => Some(71),                                      // GLSLstd450Reflect
+            "quanta_dot3" | "quanta_dot2" | "quanta_dot4" => None, // OpDot is a core op, not GLSL.std.450
 
             _ => None,
         }
@@ -1307,11 +1479,10 @@ impl SpirvBackend {
             }
             MirType::Ptr(inner) => {
                 let inner_id = self.get_type_id(inner);
-                self.emit_global(SpvOp::OpTypePointer, &[
-                    id,
-                    SpvStorageClass::Function as u32,
-                    inner_id,
-                ]);
+                self.emit_global(
+                    SpvOp::OpTypePointer,
+                    &[id, SpvStorageClass::Function as u32, inner_id],
+                );
             }
             MirType::Array(elem, len) => {
                 let elem_id = self.get_type_id(elem);
@@ -1366,9 +1537,7 @@ impl SpirvBackend {
             }
             MirType::FnPtr(sig) => {
                 let ret_id = self.get_type_id(&sig.ret);
-                let param_ids: Vec<u32> = sig.params.iter()
-                    .map(|p| self.get_type_id(p))
-                    .collect();
+                let param_ids: Vec<u32> = sig.params.iter().map(|p| self.get_type_id(p)).collect();
                 let mut operands = vec![id, ret_id];
                 operands.extend(param_ids);
                 self.emit_global(SpvOp::OpTypeFunction, &operands);
@@ -1395,17 +1564,15 @@ impl SpirvBackend {
                 // Trait object as struct with two pointer members: data ptr + vtable ptr
                 let u32_ty = self.get_type_id(&MirType::Int(IntSize::I32, false));
                 let ptr_ty_data = self.alloc_id();
-                self.emit_global(SpvOp::OpTypePointer, &[
-                    ptr_ty_data,
-                    SpvStorageClass::Function as u32,
-                    u32_ty,
-                ]);
+                self.emit_global(
+                    SpvOp::OpTypePointer,
+                    &[ptr_ty_data, SpvStorageClass::Function as u32, u32_ty],
+                );
                 let ptr_ty_vtable = self.alloc_id();
-                self.emit_global(SpvOp::OpTypePointer, &[
-                    ptr_ty_vtable,
-                    SpvStorageClass::Function as u32,
-                    u32_ty,
-                ]);
+                self.emit_global(
+                    SpvOp::OpTypePointer,
+                    &[ptr_ty_vtable, SpvStorageClass::Function as u32, u32_ty],
+                );
                 self.emit_global(SpvOp::OpTypeStruct, &[id, ptr_ty_data, ptr_ty_vtable]);
                 self.emit_name(id, &format!("dyn_{}", name));
             }
@@ -1413,11 +1580,10 @@ impl SpirvBackend {
                 // Vec<T> is an opaque pointer handle in SPIR-V
                 let u32_ty = self.get_type_id(&MirType::Int(IntSize::I32, false));
                 let ptr_ty = self.alloc_id();
-                self.emit_global(SpvOp::OpTypePointer, &[
-                    ptr_ty,
-                    SpvStorageClass::Function as u32,
-                    u32_ty,
-                ]);
+                self.emit_global(
+                    SpvOp::OpTypePointer,
+                    &[ptr_ty, SpvStorageClass::Function as u32, u32_ty],
+                );
                 self.emit_global(SpvOp::OpTypeStruct, &[id, ptr_ty]);
                 self.emit_name(id, "QuantaVecHandle");
             }
@@ -1425,11 +1591,10 @@ impl SpirvBackend {
                 // HashMap<K,V> is an opaque pointer handle in SPIR-V
                 let u32_ty = self.get_type_id(&MirType::Int(IntSize::I32, false));
                 let ptr_ty = self.alloc_id();
-                self.emit_global(SpvOp::OpTypePointer, &[
-                    ptr_ty,
-                    SpvStorageClass::Function as u32,
-                    u32_ty,
-                ]);
+                self.emit_global(
+                    SpvOp::OpTypePointer,
+                    &[ptr_ty, SpvStorageClass::Function as u32, u32_ty],
+                );
                 self.emit_global(SpvOp::OpTypeStruct, &[id, ptr_ty]);
                 self.emit_name(id, "QuantaMapHandle");
             }
@@ -1586,10 +1751,13 @@ impl SpirvBackend {
 
     /// Emit memory model.
     fn emit_memory_model(&mut self) {
-        self.emit(SpvOp::OpMemoryModel, &[
-            SpvAddressingModel::Logical as u32,
-            SpvMemoryModel::Glsl450 as u32,
-        ]);
+        self.emit(
+            SpvOp::OpMemoryModel,
+            &[
+                SpvAddressingModel::Logical as u32,
+                SpvMemoryModel::Glsl450 as u32,
+            ],
+        );
     }
 
     /// Emit built-in variable.
@@ -1602,7 +1770,10 @@ impl SpirvBackend {
         let ptr_ty_id = self.get_ptr_type_id(ty, SpvStorageClass::Input);
         let var_id = self.alloc_id();
 
-        self.emit_global(SpvOp::OpVariable, &[ptr_ty_id, var_id, SpvStorageClass::Input as u32]);
+        self.emit_global(
+            SpvOp::OpVariable,
+            &[ptr_ty_id, var_id, SpvStorageClass::Input as u32],
+        );
         self.emit_decoration(var_id, SpvDecoration::BuiltIn, &[builtin as u32]);
 
         self.builtin_ids.insert(builtin, var_id);
@@ -1629,11 +1800,17 @@ impl SpirvBackend {
 
         // Create pointer type
         let ptr_id = self.alloc_id();
-        self.emit_global(SpvOp::OpTypePointer, &[ptr_id, SpvStorageClass::StorageBuffer as u32, struct_id]);
+        self.emit_global(
+            SpvOp::OpTypePointer,
+            &[ptr_id, SpvStorageClass::StorageBuffer as u32, struct_id],
+        );
 
         // Create variable
         let var_id = self.alloc_id();
-        self.emit_global(SpvOp::OpVariable, &[ptr_id, var_id, SpvStorageClass::StorageBuffer as u32]);
+        self.emit_global(
+            SpvOp::OpVariable,
+            &[ptr_id, var_id, SpvStorageClass::StorageBuffer as u32],
+        );
 
         // Decorations (buffered to annotations section)
         self.emit_decoration(var_id, SpvDecoration::DescriptorSet, &[set]);
@@ -1678,9 +1855,8 @@ impl SpirvBackend {
         let func_type_key = if is_shader_entry {
             format!("fn_type:void()")
         } else {
-            let param_strs: Vec<String> = func.sig.params.iter()
-                .map(|p| format!("{:?}", p))
-                .collect();
+            let param_strs: Vec<String> =
+                func.sig.params.iter().map(|p| format!("{:?}", p)).collect();
             format!("fn_type:{:?}({})", effective_ret, param_strs.join(","))
         };
 
@@ -1691,7 +1867,10 @@ impl SpirvBackend {
             if is_shader_entry {
                 self.emit_global(SpvOp::OpTypeFunction, &[id, ret_ty_id]);
             } else {
-                let param_ty_ids: Vec<u32> = func.sig.params.iter()
+                let param_ty_ids: Vec<u32> = func
+                    .sig
+                    .params
+                    .iter()
                     .map(|p| self.get_type_id(p))
                     .collect();
                 let mut operands = vec![id, ret_ty_id];
@@ -1729,7 +1908,11 @@ impl SpirvBackend {
                 let param_id = self.alloc_id();
                 self.emit(SpvOp::OpFunctionParameter, &[param_ty_id, param_id]);
 
-                if let Some(local) = func.locals.iter().find(|l| l.is_param && l.id.0 == i as u32) {
+                if let Some(local) = func
+                    .locals
+                    .iter()
+                    .find(|l| l.is_param && l.id.0 == i as u32)
+                {
                     self.local_ids.insert(local.id, param_id);
                     self.value_locals.insert(local.id); // Mark as value, not pointer
                 }
@@ -1782,7 +1965,10 @@ impl SpirvBackend {
                 if !local.is_param {
                     let ptr_ty_id = self.get_ptr_type_id(&local.ty, SpvStorageClass::Function);
                     let var_id = self.alloc_id();
-                    self.emit(SpvOp::OpVariable, &[ptr_ty_id, var_id, SpvStorageClass::Function as u32]);
+                    self.emit(
+                        SpvOp::OpVariable,
+                        &[ptr_ty_id, var_id, SpvStorageClass::Function as u32],
+                    );
                     self.local_ids.insert(local.id, var_id);
                 }
             }
@@ -1795,7 +1981,10 @@ impl SpirvBackend {
                         let ty_id = self.get_type_id(param_ty);
                         let func_ptr_ty = self.get_ptr_type_id(param_ty, SpvStorageClass::Function);
                         let local_var = self.alloc_id();
-                        self.emit(SpvOp::OpVariable, &[func_ptr_ty, local_var, SpvStorageClass::Function as u32]);
+                        self.emit(
+                            SpvOp::OpVariable,
+                            &[func_ptr_ty, local_var, SpvStorageClass::Function as u32],
+                        );
                         shader_param_vars.push((i, local_var, ty_id));
                     }
                 }
@@ -1808,7 +1997,11 @@ impl SpirvBackend {
                 self.emit(SpvOp::OpLoad, &[*ty_id, loaded_id, input_var]);
                 self.emit(SpvOp::OpStore, &[*local_var, loaded_id]);
 
-                if let Some(local) = func.locals.iter().find(|l| l.is_param && l.id.0 == *i as u32) {
+                if let Some(local) = func
+                    .locals
+                    .iter()
+                    .find(|l| l.is_param && l.id.0 == *i as u32)
+                {
                     self.local_ids.insert(local.id, *local_var);
                 }
             }
@@ -1834,29 +2027,42 @@ impl SpirvBackend {
         match &stmt.kind {
             MirStmtKind::Assign { dest, value } => {
                 let val_id = self.gen_rvalue(value, func)?;
-                let ptr_id = *self.local_ids.get(dest)
+                let ptr_id = *self
+                    .local_ids
+                    .get(dest)
                     .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", dest)))?;
                 self.emit(SpvOp::OpStore, &[ptr_id, val_id]);
             }
             MirStmtKind::DerefAssign { ptr, value } => {
                 let val_id = self.gen_rvalue(value, func)?;
-                let ptr_id = *self.local_ids.get(ptr)
-                    .ok_or_else(|| CodegenError::Internal(format!("Unknown local for deref: {:?}", ptr)))?;
+                let ptr_id = *self.local_ids.get(ptr).ok_or_else(|| {
+                    CodegenError::Internal(format!("Unknown local for deref: {:?}", ptr))
+                })?;
                 self.emit(SpvOp::OpStore, &[ptr_id, val_id]);
             }
-            MirStmtKind::FieldDerefAssign { ptr, field_name: _, value } => {
+            MirStmtKind::FieldDerefAssign {
+                ptr,
+                field_name: _,
+                value,
+            } => {
                 // Field access through pointer: use OpAccessChain + OpStore
                 let val_id = self.gen_rvalue(value, func)?;
-                let ptr_id = *self.local_ids.get(ptr)
-                    .ok_or_else(|| CodegenError::Internal(format!("Unknown local for field deref: {:?}", ptr)))?;
+                let ptr_id = *self.local_ids.get(ptr).ok_or_else(|| {
+                    CodegenError::Internal(format!("Unknown local for field deref: {:?}", ptr))
+                })?;
                 // Simplified: store directly to the base pointer (struct field offset not computed)
                 self.emit(SpvOp::OpStore, &[ptr_id, val_id]);
             }
-            MirStmtKind::FieldAssign { base, field_name: _, value } => {
+            MirStmtKind::FieldAssign {
+                base,
+                field_name: _,
+                value,
+            } => {
                 // Local struct field store
                 let val_id = self.gen_rvalue(value, func)?;
-                let base_id = *self.local_ids.get(base)
-                    .ok_or_else(|| CodegenError::Internal(format!("Unknown local for field assign: {:?}", base)))?;
+                let base_id = *self.local_ids.get(base).ok_or_else(|| {
+                    CodegenError::Internal(format!("Unknown local for field assign: {:?}", base))
+                })?;
                 self.emit(SpvOp::OpStore, &[base_id, val_id]);
             }
             MirStmtKind::StorageLive(_) | MirStmtKind::StorageDead(_) | MirStmtKind::Nop => {
@@ -1877,8 +2083,10 @@ impl SpirvBackend {
                 let result_id = self.alloc_id();
 
                 // Comparison ops return bool, not the operand type
-                let is_comparison = matches!(op,
-                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
+                let is_comparison = matches!(
+                    op,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                );
                 let result_ty_id = if is_comparison {
                     self.get_type_id(&MirType::Bool)
                 } else {
@@ -1903,7 +2111,13 @@ impl SpirvBackend {
                     _ => ty.is_float(),
                 };
                 let opcode = match op {
-                    UnaryOp::Neg => if is_float { SpvOp::OpFNegate } else { SpvOp::OpSNegate },
+                    UnaryOp::Neg => {
+                        if is_float {
+                            SpvOp::OpFNegate
+                        } else {
+                            SpvOp::OpSNegate
+                        }
+                    }
                     UnaryOp::Not => SpvOp::OpNot,
                 };
                 self.emit(opcode, &[ty_id, result_id, operand_id]);
@@ -1921,7 +2135,8 @@ impl SpirvBackend {
             }
             MirRValue::Aggregate { kind, operands } => {
                 // Build a composite (struct, array, tuple) from constituents
-                let constituent_ids: Vec<u32> = operands.iter()
+                let constituent_ids: Vec<u32> = operands
+                    .iter()
                     .map(|o| self.gen_value(o, func))
                     .collect::<Result<Vec<_>, _>>()?;
                 let result_type = match kind {
@@ -1938,7 +2153,11 @@ impl SpirvBackend {
                 let ty_id = self.get_type_id(&result_type);
                 Ok(self.emit_composite_construct(ty_id, &constituent_ids))
             }
-            MirRValue::FieldAccess { base, field_name, field_ty } => {
+            MirRValue::FieldAccess {
+                base,
+                field_name,
+                field_ty,
+            } => {
                 // Extract a field from a struct via OpCompositeExtract
                 let base_id = self.gen_value(base, func)?;
                 let base_ty = self.infer_value_type(base, func)?;
@@ -1952,7 +2171,11 @@ impl SpirvBackend {
                 };
                 Ok(self.emit_composite_extract(result_ty_id, base_id, &[field_index]))
             }
-            MirRValue::IndexAccess { base, index, elem_ty } => {
+            MirRValue::IndexAccess {
+                base,
+                index,
+                elem_ty,
+            } => {
                 // Array element access via OpCompositeExtract (constant index)
                 // or OpAccessChain (dynamic index)
                 let base_id = self.gen_value(base, func)?;
@@ -1964,26 +2187,41 @@ impl SpirvBackend {
                 let result_id = self.alloc_id();
                 match &base_ty {
                     MirType::Vector(_, _) => {
-                        self.emit(SpvOp::OpVectorExtractDynamic, &[elem_ty_id, result_id, base_id, index_id]);
+                        self.emit(
+                            SpvOp::OpVectorExtractDynamic,
+                            &[elem_ty_id, result_id, base_id, index_id],
+                        );
                     }
                     _ => {
                         // For arrays: create pointer via OpAccessChain, then load
                         let ptr_ty_id = self.get_type_id(&MirType::Ptr(Box::new(elem_ty.clone())));
                         let chain_id = self.alloc_id();
-                        self.emit(SpvOp::OpAccessChain, &[ptr_ty_id, chain_id, base_id, index_id]);
+                        self.emit(
+                            SpvOp::OpAccessChain,
+                            &[ptr_ty_id, chain_id, base_id, index_id],
+                        );
                         self.emit(SpvOp::OpLoad, &[elem_ty_id, result_id, chain_id]);
                     }
                 }
                 Ok(result_id)
             }
-            MirRValue::VariantField { base, variant_name: _, field_index, field_ty } => {
+            MirRValue::VariantField {
+                base,
+                variant_name: _,
+                field_index,
+                field_ty,
+            } => {
                 // Extract a field from an enum variant — treat as composite extract
                 let base_id = self.gen_value(base, func)?;
                 let field_ty_id = self.get_type_id(field_ty);
                 // Skip tag (index 0), data starts at index 1, then field_index within data
                 Ok(self.emit_composite_extract(field_ty_id, base_id, &[1 + *field_index]))
             }
-            MirRValue::TextureSample { texture, sampler, coords } => {
+            MirRValue::TextureSample {
+                texture,
+                sampler,
+                coords,
+            } => {
                 // OpImageSampleImplicitLod
                 let tex_id = self.gen_value(texture, func)?;
                 let samp_id = self.gen_value(sampler, func)?;
@@ -1992,15 +2230,21 @@ impl SpirvBackend {
                 let result_ty_id = self.get_type_id(&result_ty);
 
                 // Create sampled image from texture + sampler
-                let sampled_img_ty_id = self.get_type_id(&MirType::SampledImage(
-                    Box::new(MirType::Struct(Arc::from("quanta_vec4")))
-                ));
+                let sampled_img_ty_id = self.get_type_id(&MirType::SampledImage(Box::new(
+                    MirType::Struct(Arc::from("quanta_vec4")),
+                )));
                 let combined_id = self.alloc_id();
-                self.emit(SpvOp::OpSampledImage, &[sampled_img_ty_id, combined_id, tex_id, samp_id]);
+                self.emit(
+                    SpvOp::OpSampledImage,
+                    &[sampled_img_ty_id, combined_id, tex_id, samp_id],
+                );
 
                 // Sample
                 let result_id = self.alloc_id();
-                self.emit(SpvOp::OpImageSampleImplicitLod, &[result_ty_id, result_id, combined_id, coords_id]);
+                self.emit(
+                    SpvOp::OpImageSampleImplicitLod,
+                    &[result_ty_id, result_id, combined_id, coords_id],
+                );
                 Ok(result_id)
             }
             MirRValue::Ref { place, .. } | MirRValue::AddressOf { place, .. } => {
@@ -2063,7 +2307,9 @@ impl SpirvBackend {
     fn gen_value(&mut self, value: &MirValue, func: &MirFunction) -> CodegenResult<u32> {
         match value {
             MirValue::Local(id) => {
-                let val_id = *self.local_ids.get(id)
+                let val_id = *self
+                    .local_ids
+                    .get(id)
                     .ok_or_else(|| CodegenError::Internal(format!("Unknown local: {:?}", id)))?;
 
                 // Value locals (function parameters) are direct values — no OpLoad needed.
@@ -2096,7 +2342,8 @@ impl SpirvBackend {
                     // Function not found — might be a mangled or runtime name
                     Err(CodegenError::Internal(format!(
                         "SPIR-V: function '{}' not found in func_ids. Available: {:?}",
-                        name, self.func_ids.keys().collect::<Vec<_>>()
+                        name,
+                        self.func_ids.keys().collect::<Vec<_>>()
                     )))
                 }
             }
@@ -2104,13 +2351,22 @@ impl SpirvBackend {
     }
 
     /// Generate a terminator.
-    fn gen_terminator(&mut self, term: &MirTerminator, func: &MirFunction, block: &MirBlock) -> CodegenResult<()> {
+    fn gen_terminator(
+        &mut self,
+        term: &MirTerminator,
+        func: &MirFunction,
+        block: &MirBlock,
+    ) -> CodegenResult<()> {
         match term {
             MirTerminator::Goto(target) => {
                 let target_id = *self.block_ids.get(target).unwrap();
                 self.emit(SpvOp::OpBranch, &[target_id]);
             }
-            MirTerminator::If { cond, then_block, else_block } => {
+            MirTerminator::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
                 let cond_id = self.gen_value(cond, func)?;
                 let then_id = *self.block_ids.get(then_block).unwrap();
                 let else_id = *self.block_ids.get(else_block).unwrap();
@@ -2132,7 +2388,10 @@ impl SpirvBackend {
                                     }
                                     check = *target;
                                 }
-                                Some(MirTerminator::Call { target: Some(target), .. }) => {
+                                Some(MirTerminator::Call {
+                                    target: Some(target),
+                                    ..
+                                }) => {
                                     // Function call with continuation — follow to target
                                     if *target == block.id {
                                         found_loop = true;
@@ -2140,7 +2399,11 @@ impl SpirvBackend {
                                     }
                                     check = *target;
                                 }
-                                Some(MirTerminator::If { then_block: tb, else_block: eb, .. }) => {
+                                Some(MirTerminator::If {
+                                    then_block: tb,
+                                    else_block: eb,
+                                    ..
+                                }) => {
                                     if *tb == block.id || *eb == block.id {
                                         found_loop = true;
                                         break;
@@ -2172,7 +2435,8 @@ impl SpirvBackend {
                 let merge_id = if let Some(blocks) = &func.blocks {
                     let follow_branch = |start: &BlockId| -> Option<BlockId> {
                         let mut current = *start;
-                        for _ in 0..20 { // limit traversal depth
+                        for _ in 0..20 {
+                            // limit traversal depth
                             if let Some(block) = blocks.iter().find(|b| b.id == current) {
                                 match block.terminator.as_ref() {
                                     Some(MirTerminator::Goto(target)) => return Some(*target),
@@ -2242,7 +2506,11 @@ impl SpirvBackend {
                 self.emit(SpvOp::OpSelectionMerge, &[merge_id, 0]);
                 self.emit(SpvOp::OpBranchConditional, &[cond_id, then_id, else_id]);
             }
-            MirTerminator::Switch { value, targets, default } => {
+            MirTerminator::Switch {
+                value,
+                targets,
+                default,
+            } => {
                 let val_id = self.gen_value(value, func)?;
                 let default_id = *self.block_ids.get(default).unwrap();
 
@@ -2259,8 +2527,15 @@ impl SpirvBackend {
                 }
                 self.emit(SpvOp::OpSwitch, &operands);
             }
-            MirTerminator::Call { func: callee, args, dest, target, .. } => {
-                let arg_ids: Vec<u32> = args.iter()
+            MirTerminator::Call {
+                func: callee,
+                args,
+                dest,
+                target,
+                ..
+            } => {
+                let arg_ids: Vec<u32> = args
+                    .iter()
                     .map(|a| self.gen_value(a, func))
                     .collect::<Result<Vec<_>, _>>()?;
 
@@ -2325,9 +2600,10 @@ impl SpirvBackend {
                                             let output_var = self.io_var_ids[num_inputs + fi];
                                             let field_ty_id = self.get_type_id(field_ty);
                                             let extracted = self.alloc_id();
-                                            self.emit(SpvOp::OpCompositeExtract, &[
-                                                field_ty_id, extracted, val_id, fi as u32
-                                            ]);
+                                            self.emit(
+                                                SpvOp::OpCompositeExtract,
+                                                &[field_ty_id, extracted, val_id, fi as u32],
+                                            );
                                             self.emit(SpvOp::OpStore, &[output_var, extracted]);
                                         }
                                     }
@@ -2354,7 +2630,12 @@ impl SpirvBackend {
                 let target_id = *self.block_ids.get(target).unwrap();
                 self.emit(SpvOp::OpBranch, &[target_id]);
             }
-            MirTerminator::Assert { cond, expected, target, .. } => {
+            MirTerminator::Assert {
+                cond,
+                expected,
+                target,
+                ..
+            } => {
                 // Simplified assert - just branch if condition passes
                 let _cond_id = self.gen_value(cond, func)?;
                 let target_id = *self.block_ids.get(target).unwrap();
@@ -2382,45 +2663,105 @@ impl SpirvBackend {
         let is_signed = ty.is_signed();
 
         match op {
-            BinOp::Add => if is_float { SpvOp::OpFAdd } else { SpvOp::OpIAdd },
-            BinOp::Sub => if is_float { SpvOp::OpFSub } else { SpvOp::OpISub },
-            BinOp::Mul => if is_float { SpvOp::OpFMul } else { SpvOp::OpIMul },
+            BinOp::Add => {
+                if is_float {
+                    SpvOp::OpFAdd
+                } else {
+                    SpvOp::OpIAdd
+                }
+            }
+            BinOp::Sub => {
+                if is_float {
+                    SpvOp::OpFSub
+                } else {
+                    SpvOp::OpISub
+                }
+            }
+            BinOp::Mul => {
+                if is_float {
+                    SpvOp::OpFMul
+                } else {
+                    SpvOp::OpIMul
+                }
+            }
             BinOp::Div => {
-                if is_float { SpvOp::OpFDiv }
-                else if is_signed { SpvOp::OpSDiv }
-                else { SpvOp::OpUDiv }
+                if is_float {
+                    SpvOp::OpFDiv
+                } else if is_signed {
+                    SpvOp::OpSDiv
+                } else {
+                    SpvOp::OpUDiv
+                }
             }
             BinOp::Rem => {
-                if is_float { SpvOp::OpFRem }
-                else if is_signed { SpvOp::OpSRem }
-                else { SpvOp::OpUMod }
+                if is_float {
+                    SpvOp::OpFRem
+                } else if is_signed {
+                    SpvOp::OpSRem
+                } else {
+                    SpvOp::OpUMod
+                }
             }
             BinOp::BitAnd => SpvOp::OpBitwiseAnd,
             BinOp::BitOr => SpvOp::OpBitwiseOr,
             BinOp::BitXor => SpvOp::OpBitwiseXor,
             BinOp::Shl => SpvOp::OpShiftLeftLogical,
-            BinOp::Shr => if is_signed { SpvOp::OpShiftRightArithmetic } else { SpvOp::OpShiftRightLogical },
-            BinOp::Eq => if is_float { SpvOp::OpFOrdEqual } else { SpvOp::OpIEqual },
-            BinOp::Ne => if is_float { SpvOp::OpFOrdNotEqual } else { SpvOp::OpINotEqual },
+            BinOp::Shr => {
+                if is_signed {
+                    SpvOp::OpShiftRightArithmetic
+                } else {
+                    SpvOp::OpShiftRightLogical
+                }
+            }
+            BinOp::Eq => {
+                if is_float {
+                    SpvOp::OpFOrdEqual
+                } else {
+                    SpvOp::OpIEqual
+                }
+            }
+            BinOp::Ne => {
+                if is_float {
+                    SpvOp::OpFOrdNotEqual
+                } else {
+                    SpvOp::OpINotEqual
+                }
+            }
             BinOp::Lt => {
-                if is_float { SpvOp::OpFOrdLessThan }
-                else if is_signed { SpvOp::OpSLessThan }
-                else { SpvOp::OpULessThan }
+                if is_float {
+                    SpvOp::OpFOrdLessThan
+                } else if is_signed {
+                    SpvOp::OpSLessThan
+                } else {
+                    SpvOp::OpULessThan
+                }
             }
             BinOp::Le => {
-                if is_float { SpvOp::OpFOrdLessThanEqual }
-                else if is_signed { SpvOp::OpSLessThanEqual }
-                else { SpvOp::OpULessThanEqual }
+                if is_float {
+                    SpvOp::OpFOrdLessThanEqual
+                } else if is_signed {
+                    SpvOp::OpSLessThanEqual
+                } else {
+                    SpvOp::OpULessThanEqual
+                }
             }
             BinOp::Gt => {
-                if is_float { SpvOp::OpFOrdGreaterThan }
-                else if is_signed { SpvOp::OpSGreaterThan }
-                else { SpvOp::OpUGreaterThan }
+                if is_float {
+                    SpvOp::OpFOrdGreaterThan
+                } else if is_signed {
+                    SpvOp::OpSGreaterThan
+                } else {
+                    SpvOp::OpUGreaterThan
+                }
             }
             BinOp::Ge => {
-                if is_float { SpvOp::OpFOrdGreaterThanEqual }
-                else if is_signed { SpvOp::OpSGreaterThanEqual }
-                else { SpvOp::OpUGreaterThanEqual }
+                if is_float {
+                    SpvOp::OpFOrdGreaterThanEqual
+                } else if is_signed {
+                    SpvOp::OpSGreaterThanEqual
+                } else {
+                    SpvOp::OpUGreaterThanEqual
+                }
             }
             _ => SpvOp::OpIAdd, // Fallback
         }
@@ -2430,24 +2771,39 @@ impl SpirvBackend {
     fn spirv_cast(&self, kind: CastKind, from: &MirType, to: &MirType) -> SpvOp {
         match kind {
             CastKind::IntToInt => {
-                if from.is_signed() { SpvOp::OpSConvert } else { SpvOp::OpUConvert }
+                if from.is_signed() {
+                    SpvOp::OpSConvert
+                } else {
+                    SpvOp::OpUConvert
+                }
             }
             CastKind::FloatToFloat => SpvOp::OpFConvert,
             CastKind::IntToFloat => {
-                if from.is_signed() { SpvOp::OpConvertSToF } else { SpvOp::OpConvertUToF }
+                if from.is_signed() {
+                    SpvOp::OpConvertSToF
+                } else {
+                    SpvOp::OpConvertUToF
+                }
             }
             CastKind::FloatToInt => {
-                if to.is_signed() { SpvOp::OpConvertFToS } else { SpvOp::OpConvertFToU }
+                if to.is_signed() {
+                    SpvOp::OpConvertFToS
+                } else {
+                    SpvOp::OpConvertFToU
+                }
             }
-            CastKind::Transmute | CastKind::PtrToPtr | CastKind::PtrToInt | CastKind::IntToPtr | CastKind::FnToPtr => {
-                SpvOp::OpBitcast
-            }
+            CastKind::Transmute
+            | CastKind::PtrToPtr
+            | CastKind::PtrToInt
+            | CastKind::IntToPtr
+            | CastKind::FnToPtr => SpvOp::OpBitcast,
         }
     }
 
     /// Get the type of a local.
     fn get_local_type(&self, id: LocalId, func: &MirFunction) -> CodegenResult<MirType> {
-        func.locals.iter()
+        func.locals
+            .iter()
             .find(|l| l.id == id)
             .map(|l| l.ty.clone())
             .ok_or_else(|| CodegenError::Internal(format!("Unknown local type: {:?}", id)))
@@ -2457,19 +2813,17 @@ impl SpirvBackend {
     fn infer_value_type(&self, value: &MirValue, func: &MirFunction) -> CodegenResult<MirType> {
         match value {
             MirValue::Local(id) => self.get_local_type(*id, func),
-            MirValue::Const(c) => {
-                match c {
-                    MirConst::Bool(_) => Ok(MirType::Bool),
-                    MirConst::Int(_, ty) => Ok(ty.clone()),
-                    MirConst::Uint(_, ty) => Ok(ty.clone()),
-                    MirConst::Float(_, ty) => Ok(ty.clone()),
-                    MirConst::Null(ty) => Ok(ty.clone()),
-                    MirConst::Unit => Ok(MirType::Void),
-                    MirConst::Zeroed(ty) => Ok(ty.clone()),
-                    MirConst::Undef(ty) => Ok(ty.clone()),
-                    _ => Ok(MirType::i32()),
-                }
-            }
+            MirValue::Const(c) => match c {
+                MirConst::Bool(_) => Ok(MirType::Bool),
+                MirConst::Int(_, ty) => Ok(ty.clone()),
+                MirConst::Uint(_, ty) => Ok(ty.clone()),
+                MirConst::Float(_, ty) => Ok(ty.clone()),
+                MirConst::Null(ty) => Ok(ty.clone()),
+                MirConst::Unit => Ok(MirType::Void),
+                MirConst::Zeroed(ty) => Ok(ty.clone()),
+                MirConst::Undef(ty) => Ok(ty.clone()),
+                _ => Ok(MirType::i32()),
+            },
             MirValue::Global(_) | MirValue::Function(_) => Ok(MirType::i32()),
         }
     }
@@ -2528,17 +2882,17 @@ impl SpirvBackend {
         let preamble_end = self.output.len();
 
         // == Allocate all IDs up front ==
-        let void_ty = self.alloc_id();          // %void
-        let f32_ty = self.alloc_id();           // %float
-        let vec3_ty = self.alloc_id();          // %v3float
-        let vec4_ty = self.alloc_id();          // %v4float
-        let ptr_input_vec3 = self.alloc_id();   // %_ptr_Input_v3float
-        let ptr_output_vec4 = self.alloc_id();  // %_ptr_Output_v4float
-        let func_ty = self.alloc_id();          // %func_void
-        let frag_color_var = self.alloc_id();   // %fragColor
-        let out_color_var = self.alloc_id();    // %outColor
-        let main_fn = self.alloc_id();          // %main
-        let f32_1_0 = self.alloc_id();          // constant 1.0f
+        let void_ty = self.alloc_id(); // %void
+        let f32_ty = self.alloc_id(); // %float
+        let vec3_ty = self.alloc_id(); // %v3float
+        let vec4_ty = self.alloc_id(); // %v4float
+        let ptr_input_vec3 = self.alloc_id(); // %_ptr_Input_v3float
+        let ptr_output_vec4 = self.alloc_id(); // %_ptr_Output_v4float
+        let func_ty = self.alloc_id(); // %func_void
+        let frag_color_var = self.alloc_id(); // %fragColor
+        let out_color_var = self.alloc_id(); // %outColor
+        let main_fn = self.alloc_id(); // %main
+        let f32_1_0 = self.alloc_id(); // constant 1.0f
 
         // == Section 5: Entry point ==
         let mut ep_buf: Vec<u32> = Vec::new();
@@ -2550,33 +2904,41 @@ impl SpirvBackend {
         Self::emit_to(&mut ep_buf, SpvOp::OpEntryPoint, &ep_ops);
 
         // == Section 6: Execution mode ==
-        Self::emit_to(&mut ep_buf, SpvOp::OpExecutionMode, &[
-            main_fn,
-            SpvExecutionMode::OriginUpperLeft as u32,
-        ]);
+        Self::emit_to(
+            &mut ep_buf,
+            SpvOp::OpExecutionMode,
+            &[main_fn, SpvExecutionMode::OriginUpperLeft as u32],
+        );
 
         // == Section 7: Debug names ==
         let mut names_buf: Vec<u32> = Vec::new();
         let n = self.emit_string("main");
-        let mut o = vec![main_fn]; o.extend(n);
+        let mut o = vec![main_fn];
+        o.extend(n);
         Self::emit_to(&mut names_buf, SpvOp::OpName, &o);
         let n = self.emit_string("fragColor");
-        let mut o = vec![frag_color_var]; o.extend(n);
+        let mut o = vec![frag_color_var];
+        o.extend(n);
         Self::emit_to(&mut names_buf, SpvOp::OpName, &o);
         let n = self.emit_string("outColor");
-        let mut o = vec![out_color_var]; o.extend(n);
+        let mut o = vec![out_color_var];
+        o.extend(n);
         Self::emit_to(&mut names_buf, SpvOp::OpName, &o);
 
         // == Section 8: Annotations ==
         let mut annot_buf: Vec<u32> = Vec::new();
         // fragColor: Location 0
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[
-            frag_color_var, SpvDecoration::Location as u32, 0
-        ]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[frag_color_var, SpvDecoration::Location as u32, 0],
+        );
         // outColor: Location 0
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[
-            out_color_var, SpvDecoration::Location as u32, 0
-        ]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[out_color_var, SpvDecoration::Location as u32, 0],
+        );
 
         // == Section 9: Type/constant/global declarations ==
         let mut globals_buf: Vec<u32> = Vec::new();
@@ -2589,48 +2951,90 @@ impl SpirvBackend {
         // %v4float = OpTypeVector %float 4
         Self::emit_to(&mut globals_buf, SpvOp::OpTypeVector, &[vec4_ty, f32_ty, 4]);
         // %_ptr_Input_v3float = OpTypePointer Input %v3float
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[
-            ptr_input_vec3, SpvStorageClass::Input as u32, vec3_ty
-        ]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[ptr_input_vec3, SpvStorageClass::Input as u32, vec3_ty],
+        );
         // %_ptr_Output_v4float = OpTypePointer Output %v4float
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[
-            ptr_output_vec4, SpvStorageClass::Output as u32, vec4_ty
-        ]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[ptr_output_vec4, SpvStorageClass::Output as u32, vec4_ty],
+        );
         // %func_void = OpTypeFunction %void
         Self::emit_to(&mut globals_buf, SpvOp::OpTypeFunction, &[func_ty, void_ty]);
         // %float_1 = OpConstant %float 1.0
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstant, &[f32_ty, f32_1_0, 1.0f32.to_bits()]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstant,
+            &[f32_ty, f32_1_0, 1.0f32.to_bits()],
+        );
         // %fragColor = OpVariable %_ptr_Input_v3float Input
-        Self::emit_to(&mut globals_buf, SpvOp::OpVariable, &[
-            ptr_input_vec3, frag_color_var, SpvStorageClass::Input as u32
-        ]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpVariable,
+            &[
+                ptr_input_vec3,
+                frag_color_var,
+                SpvStorageClass::Input as u32,
+            ],
+        );
         // %outColor = OpVariable %_ptr_Output_v4float Output
-        Self::emit_to(&mut globals_buf, SpvOp::OpVariable, &[
-            ptr_output_vec4, out_color_var, SpvStorageClass::Output as u32
-        ]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpVariable,
+            &[
+                ptr_output_vec4,
+                out_color_var,
+                SpvStorageClass::Output as u32,
+            ],
+        );
 
         // == Sections 10-11: Function body ==
         let mut func_buf: Vec<u32> = Vec::new();
         // %main = OpFunction %void None %func_void
-        Self::emit_to(&mut func_buf, SpvOp::OpFunction, &[void_ty, main_fn, 0, func_ty]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpFunction,
+            &[void_ty, main_fn, 0, func_ty],
+        );
         // %label = OpLabel
         let label = self.alloc_id();
         Self::emit_to(&mut func_buf, SpvOp::OpLabel, &[label]);
         // %loaded_color = OpLoad %v3float %fragColor
         let loaded_color = self.alloc_id();
-        Self::emit_to(&mut func_buf, SpvOp::OpLoad, &[vec3_ty, loaded_color, frag_color_var]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpLoad,
+            &[vec3_ty, loaded_color, frag_color_var],
+        );
         // Extract components from fragColor
         let comp_r = self.alloc_id();
-        Self::emit_to(&mut func_buf, SpvOp::OpCompositeExtract, &[f32_ty, comp_r, loaded_color, 0]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpCompositeExtract,
+            &[f32_ty, comp_r, loaded_color, 0],
+        );
         let comp_g = self.alloc_id();
-        Self::emit_to(&mut func_buf, SpvOp::OpCompositeExtract, &[f32_ty, comp_g, loaded_color, 1]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpCompositeExtract,
+            &[f32_ty, comp_g, loaded_color, 1],
+        );
         let comp_b = self.alloc_id();
-        Self::emit_to(&mut func_buf, SpvOp::OpCompositeExtract, &[f32_ty, comp_b, loaded_color, 2]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpCompositeExtract,
+            &[f32_ty, comp_b, loaded_color, 2],
+        );
         // Construct vec4(r, g, b, 1.0)
         let result_vec4 = self.alloc_id();
-        Self::emit_to(&mut func_buf, SpvOp::OpCompositeConstruct, &[
-            vec4_ty, result_vec4, comp_r, comp_g, comp_b, f32_1_0
-        ]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpCompositeConstruct,
+            &[vec4_ty, result_vec4, comp_r, comp_g, comp_b, f32_1_0],
+        );
         // OpStore %outColor %result_vec4
         Self::emit_to(&mut func_buf, SpvOp::OpStore, &[out_color_var, result_vec4]);
         // OpReturn
@@ -2691,9 +3095,9 @@ impl SpirvBackend {
         let vec2_ty = self.alloc_id();
         let vec3_ty = self.alloc_id();
         let vec4_ty = self.alloc_id();
-        let uint_ty = self.alloc_id();        // for array length constant type
-        let arr3_vec2_ty = self.alloc_id();   // [vec2; 3]
-        let arr3_vec3_ty = self.alloc_id();   // [vec3; 3]
+        let uint_ty = self.alloc_id(); // for array length constant type
+        let arr3_vec2_ty = self.alloc_id(); // [vec2; 3]
+        let arr3_vec3_ty = self.alloc_id(); // [vec3; 3]
         let ptr_func_arr3_vec2 = self.alloc_id();
         let ptr_func_arr3_vec3 = self.alloc_id();
         let ptr_func_vec2 = self.alloc_id();
@@ -2710,12 +3114,12 @@ impl SpirvBackend {
         let main_fn = self.alloc_id();
 
         // == Constants ==
-        let const_0_0 = self.alloc_id();   // 0.0f
-        let const_0_5 = self.alloc_id();   // 0.5f
+        let const_0_0 = self.alloc_id(); // 0.0f
+        let const_0_5 = self.alloc_id(); // 0.5f
         let const_neg_0_5 = self.alloc_id(); // -0.5f
-        let const_1_0 = self.alloc_id();   // 1.0f
-        let const_3_u = self.alloc_id();   // 3u (array length)
-        let const_0_i = self.alloc_id();   // 0i (for access chain)
+        let const_1_0 = self.alloc_id(); // 1.0f
+        let const_3_u = self.alloc_id(); // 3u (array length)
+        let const_0_i = self.alloc_id(); // 0i (for access chain)
 
         // Position data: (0.0, -0.5), (0.5, 0.5), (-0.5, 0.5)
         let pos0 = self.alloc_id(); // vec2(0.0, -0.5)
@@ -2743,32 +3147,50 @@ impl SpirvBackend {
         // == Section 7: Debug names ==
         let mut names_buf: Vec<u32> = Vec::new();
         let n = self.emit_string("main");
-        let mut o = vec![main_fn]; o.extend(n);
+        let mut o = vec![main_fn];
+        o.extend(n);
         Self::emit_to(&mut names_buf, SpvOp::OpName, &o);
         let n = self.emit_string("gl_Position");
-        let mut o = vec![gl_position_var]; o.extend(n);
+        let mut o = vec![gl_position_var];
+        o.extend(n);
         Self::emit_to(&mut names_buf, SpvOp::OpName, &o);
         let n = self.emit_string("fragColor");
-        let mut o = vec![frag_color_var]; o.extend(n);
+        let mut o = vec![frag_color_var];
+        o.extend(n);
         Self::emit_to(&mut names_buf, SpvOp::OpName, &o);
         let n = self.emit_string("gl_VertexIndex");
-        let mut o = vec![vertex_index_var]; o.extend(n);
+        let mut o = vec![vertex_index_var];
+        o.extend(n);
         Self::emit_to(&mut names_buf, SpvOp::OpName, &o);
 
         // == Section 8: Annotations ==
         let mut annot_buf: Vec<u32> = Vec::new();
         // gl_Position: BuiltIn Position
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[
-            gl_position_var, SpvDecoration::BuiltIn as u32, SpvBuiltIn::Position as u32
-        ]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[
+                gl_position_var,
+                SpvDecoration::BuiltIn as u32,
+                SpvBuiltIn::Position as u32,
+            ],
+        );
         // fragColor: Location 0
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[
-            frag_color_var, SpvDecoration::Location as u32, 0
-        ]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[frag_color_var, SpvDecoration::Location as u32, 0],
+        );
         // gl_VertexIndex: BuiltIn VertexIndex
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[
-            vertex_index_var, SpvDecoration::BuiltIn as u32, SpvBuiltIn::VertexIndex as u32
-        ]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[
+                vertex_index_var,
+                SpvDecoration::BuiltIn as u32,
+                SpvBuiltIn::VertexIndex as u32,
+            ],
+        );
 
         // == Section 9: Types, constants, globals ==
         let mut globals_buf: Vec<u32> = Vec::new();
@@ -2782,117 +3204,259 @@ impl SpirvBackend {
         Self::emit_to(&mut globals_buf, SpvOp::OpTypeVector, &[vec4_ty, f32_ty, 4]);
 
         // Array length constant (must come before array type)
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstant, &[uint_ty, const_3_u, 3]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstant,
+            &[uint_ty, const_3_u, 3],
+        );
 
         // Array types
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypeArray, &[arr3_vec2_ty, vec2_ty, const_3_u]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypeArray, &[arr3_vec3_ty, vec3_ty, const_3_u]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypeArray,
+            &[arr3_vec2_ty, vec2_ty, const_3_u],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypeArray,
+            &[arr3_vec3_ty, vec3_ty, const_3_u],
+        );
 
         // Pointer types
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[
-            ptr_func_arr3_vec2, SpvStorageClass::Function as u32, arr3_vec2_ty
-        ]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[
-            ptr_func_arr3_vec3, SpvStorageClass::Function as u32, arr3_vec3_ty
-        ]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[
-            ptr_func_vec2, SpvStorageClass::Function as u32, vec2_ty
-        ]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[
-            ptr_func_vec3, SpvStorageClass::Function as u32, vec3_ty
-        ]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[
-            ptr_output_vec4, SpvStorageClass::Output as u32, vec4_ty
-        ]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[
-            ptr_output_vec3, SpvStorageClass::Output as u32, vec3_ty
-        ]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[
-            ptr_input_i32, SpvStorageClass::Input as u32, i32_ty
-        ]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[
+                ptr_func_arr3_vec2,
+                SpvStorageClass::Function as u32,
+                arr3_vec2_ty,
+            ],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[
+                ptr_func_arr3_vec3,
+                SpvStorageClass::Function as u32,
+                arr3_vec3_ty,
+            ],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[ptr_func_vec2, SpvStorageClass::Function as u32, vec2_ty],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[ptr_func_vec3, SpvStorageClass::Function as u32, vec3_ty],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[ptr_output_vec4, SpvStorageClass::Output as u32, vec4_ty],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[ptr_output_vec3, SpvStorageClass::Output as u32, vec3_ty],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[ptr_input_i32, SpvStorageClass::Input as u32, i32_ty],
+        );
         Self::emit_to(&mut globals_buf, SpvOp::OpTypeFunction, &[func_ty, void_ty]);
 
         // Float constants
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstant, &[f32_ty, const_0_0, 0.0f32.to_bits()]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstant, &[f32_ty, const_0_5, 0.5f32.to_bits()]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstant, &[f32_ty, const_neg_0_5, (-0.5f32).to_bits()]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstant, &[f32_ty, const_1_0, 1.0f32.to_bits()]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstant, &[i32_ty, const_0_i, 0u32]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstant,
+            &[f32_ty, const_0_0, 0.0f32.to_bits()],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstant,
+            &[f32_ty, const_0_5, 0.5f32.to_bits()],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstant,
+            &[f32_ty, const_neg_0_5, (-0.5f32).to_bits()],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstant,
+            &[f32_ty, const_1_0, 1.0f32.to_bits()],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstant,
+            &[i32_ty, const_0_i, 0u32],
+        );
 
         // Composite constants: positions
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstantComposite, &[vec2_ty, pos0, const_0_0, const_neg_0_5]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstantComposite, &[vec2_ty, pos1, const_0_5, const_0_5]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstantComposite, &[vec2_ty, pos2, const_neg_0_5, const_0_5]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstantComposite, &[arr3_vec2_ty, positions_const, pos0, pos1, pos2]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstantComposite,
+            &[vec2_ty, pos0, const_0_0, const_neg_0_5],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstantComposite,
+            &[vec2_ty, pos1, const_0_5, const_0_5],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstantComposite,
+            &[vec2_ty, pos2, const_neg_0_5, const_0_5],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstantComposite,
+            &[arr3_vec2_ty, positions_const, pos0, pos1, pos2],
+        );
 
         // Composite constants: colors
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstantComposite, &[vec3_ty, col0, const_1_0, const_0_0, const_0_0]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstantComposite, &[vec3_ty, col1, const_0_0, const_1_0, const_0_0]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstantComposite, &[vec3_ty, col2, const_0_0, const_0_0, const_1_0]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstantComposite, &[arr3_vec3_ty, colors_const, col0, col1, col2]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstantComposite,
+            &[vec3_ty, col0, const_1_0, const_0_0, const_0_0],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstantComposite,
+            &[vec3_ty, col1, const_0_0, const_1_0, const_0_0],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstantComposite,
+            &[vec3_ty, col2, const_0_0, const_0_0, const_1_0],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstantComposite,
+            &[arr3_vec3_ty, colors_const, col0, col1, col2],
+        );
 
         // Global variables (I/O)
-        Self::emit_to(&mut globals_buf, SpvOp::OpVariable, &[
-            ptr_output_vec4, gl_position_var, SpvStorageClass::Output as u32
-        ]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpVariable, &[
-            ptr_output_vec3, frag_color_var, SpvStorageClass::Output as u32
-        ]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpVariable, &[
-            ptr_input_i32, vertex_index_var, SpvStorageClass::Input as u32
-        ]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpVariable,
+            &[
+                ptr_output_vec4,
+                gl_position_var,
+                SpvStorageClass::Output as u32,
+            ],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpVariable,
+            &[
+                ptr_output_vec3,
+                frag_color_var,
+                SpvStorageClass::Output as u32,
+            ],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpVariable,
+            &[
+                ptr_input_i32,
+                vertex_index_var,
+                SpvStorageClass::Input as u32,
+            ],
+        );
 
         // == Sections 10-11: Function body ==
         let mut func_buf: Vec<u32> = Vec::new();
-        Self::emit_to(&mut func_buf, SpvOp::OpFunction, &[void_ty, main_fn, 0, func_ty]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpFunction,
+            &[void_ty, main_fn, 0, func_ty],
+        );
 
         let label = self.alloc_id();
         Self::emit_to(&mut func_buf, SpvOp::OpLabel, &[label]);
 
         // Allocate function-local arrays
         let positions_var = self.alloc_id();
-        Self::emit_to(&mut func_buf, SpvOp::OpVariable, &[
-            ptr_func_arr3_vec2, positions_var, SpvStorageClass::Function as u32
-        ]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpVariable,
+            &[
+                ptr_func_arr3_vec2,
+                positions_var,
+                SpvStorageClass::Function as u32,
+            ],
+        );
         let colors_var = self.alloc_id();
-        Self::emit_to(&mut func_buf, SpvOp::OpVariable, &[
-            ptr_func_arr3_vec3, colors_var, SpvStorageClass::Function as u32
-        ]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpVariable,
+            &[
+                ptr_func_arr3_vec3,
+                colors_var,
+                SpvStorageClass::Function as u32,
+            ],
+        );
 
         // Store constant arrays into local variables
-        Self::emit_to(&mut func_buf, SpvOp::OpStore, &[positions_var, positions_const]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpStore,
+            &[positions_var, positions_const],
+        );
         Self::emit_to(&mut func_buf, SpvOp::OpStore, &[colors_var, colors_const]);
 
         // Load gl_VertexIndex
         let vtx_idx = self.alloc_id();
-        Self::emit_to(&mut func_buf, SpvOp::OpLoad, &[i32_ty, vtx_idx, vertex_index_var]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpLoad,
+            &[i32_ty, vtx_idx, vertex_index_var],
+        );
 
         // Access positions[gl_VertexIndex]
         let pos_ptr = self.alloc_id();
-        Self::emit_to(&mut func_buf, SpvOp::OpAccessChain, &[
-            ptr_func_vec2, pos_ptr, positions_var, vtx_idx
-        ]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpAccessChain,
+            &[ptr_func_vec2, pos_ptr, positions_var, vtx_idx],
+        );
         let pos_val = self.alloc_id();
         Self::emit_to(&mut func_buf, SpvOp::OpLoad, &[vec2_ty, pos_val, pos_ptr]);
 
         // Extract x, y from position
         let pos_x = self.alloc_id();
-        Self::emit_to(&mut func_buf, SpvOp::OpCompositeExtract, &[f32_ty, pos_x, pos_val, 0]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpCompositeExtract,
+            &[f32_ty, pos_x, pos_val, 0],
+        );
         let pos_y = self.alloc_id();
-        Self::emit_to(&mut func_buf, SpvOp::OpCompositeExtract, &[f32_ty, pos_y, pos_val, 1]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpCompositeExtract,
+            &[f32_ty, pos_y, pos_val, 1],
+        );
 
         // Construct gl_Position = vec4(pos.x, pos.y, 0.0, 1.0)
         let gl_pos = self.alloc_id();
-        Self::emit_to(&mut func_buf, SpvOp::OpCompositeConstruct, &[
-            vec4_ty, gl_pos, pos_x, pos_y, const_0_0, const_1_0
-        ]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpCompositeConstruct,
+            &[vec4_ty, gl_pos, pos_x, pos_y, const_0_0, const_1_0],
+        );
         Self::emit_to(&mut func_buf, SpvOp::OpStore, &[gl_position_var, gl_pos]);
 
         // Access colors[gl_VertexIndex]
         let col_ptr = self.alloc_id();
-        Self::emit_to(&mut func_buf, SpvOp::OpAccessChain, &[
-            ptr_func_vec3, col_ptr, colors_var, vtx_idx
-        ]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpAccessChain,
+            &[ptr_func_vec3, col_ptr, colors_var, vtx_idx],
+        );
         let col_val = self.alloc_id();
         Self::emit_to(&mut func_buf, SpvOp::OpLoad, &[vec3_ty, col_val, col_ptr]);
 
@@ -2932,51 +3496,51 @@ impl SpirvBackend {
         self.reset();
 
         // Allocate all IDs upfront
-        let void_ty       = self.alloc_id(); // 1
-        let float_ty      = self.alloc_id(); // 2
-        let vec3_ty        = self.alloc_id(); // 3
-        let vec4_ty        = self.alloc_id(); // 4
-        let mat4_ty        = self.alloc_id(); // 5
-        let int_ty         = self.alloc_id(); // 6
-        let void_fn_ty     = self.alloc_id(); // 7
-        let main_fn        = self.alloc_id(); // 8
+        let void_ty = self.alloc_id(); // 1
+        let float_ty = self.alloc_id(); // 2
+        let vec3_ty = self.alloc_id(); // 3
+        let vec4_ty = self.alloc_id(); // 4
+        let mat4_ty = self.alloc_id(); // 5
+        let int_ty = self.alloc_id(); // 6
+        let void_fn_ty = self.alloc_id(); // 7
+        let main_fn = self.alloc_id(); // 8
 
         // Input variables
-        let in_pos_ptr_ty   = self.alloc_id(); // 9
+        let in_pos_ptr_ty = self.alloc_id(); // 9
         let in_color_ptr_ty = self.alloc_id(); // 10  (same type as in_pos)
-        let in_pos_var      = self.alloc_id(); // 11
-        let in_color_var    = self.alloc_id(); // 12
+        let in_pos_var = self.alloc_id(); // 11
+        let in_color_var = self.alloc_id(); // 12
 
         // Output variables
-        let out_pos_ptr_ty   = self.alloc_id(); // 13
+        let out_pos_ptr_ty = self.alloc_id(); // 13
         let out_color_ptr_ty = self.alloc_id(); // 14
-        let out_pos_var      = self.alloc_id(); // 15  (gl_Position)
-        let out_color_var    = self.alloc_id(); // 16  (fragColor)
+        let out_pos_var = self.alloc_id(); // 15  (gl_Position)
+        let out_color_var = self.alloc_id(); // 16  (fragColor)
 
         // UBO struct and variable
-        let ubo_struct_ty    = self.alloc_id(); // 17
-        let ubo_ptr_ty       = self.alloc_id(); // 18
-        let ubo_var          = self.alloc_id(); // 19
+        let ubo_struct_ty = self.alloc_id(); // 17
+        let ubo_ptr_ty = self.alloc_id(); // 18
+        let ubo_var = self.alloc_id(); // 19
 
         // Constants
-        let const_0          = self.alloc_id(); // 20
-        let const_1f         = self.alloc_id(); // 21
-        let const_0i         = self.alloc_id(); // 22
+        let const_0 = self.alloc_id(); // 20
+        let const_1f = self.alloc_id(); // 21
+        let const_0i = self.alloc_id(); // 22
 
         // Function-scope temps
-        let label            = self.alloc_id(); // 23
-        let load_pos         = self.alloc_id(); // 24
-        let load_color       = self.alloc_id(); // 25
-        let mat_ptr_ty       = self.alloc_id(); // 26
-        let mvp_ptr          = self.alloc_id(); // 27
-        let load_mvp         = self.alloc_id(); // 28
-        let pos_x            = self.alloc_id(); // 29
-        let pos_y            = self.alloc_id(); // 30
-        let pos_z            = self.alloc_id(); // 31
-        let pos4             = self.alloc_id(); // 32
-        let clip_pos         = self.alloc_id(); // 33
+        let label = self.alloc_id(); // 23
+        let load_pos = self.alloc_id(); // 24
+        let load_color = self.alloc_id(); // 25
+        let mat_ptr_ty = self.alloc_id(); // 26
+        let mvp_ptr = self.alloc_id(); // 27
+        let load_mvp = self.alloc_id(); // 28
+        let pos_x = self.alloc_id(); // 29
+        let pos_y = self.alloc_id(); // 30
+        let pos_z = self.alloc_id(); // 31
+        let pos4 = self.alloc_id(); // 32
+        let clip_pos = self.alloc_id(); // 33
 
-        let glsl_ext         = self.alloc_id(); // 34
+        let glsl_ext = self.alloc_id(); // 34
 
         // Section buffers
         let mut ep_buf: Vec<u32> = Vec::new();
@@ -2993,8 +3557,16 @@ impl SpirvBackend {
         self.output.push(0); // schema
 
         // Capabilities
-        Self::emit_to(&mut self.output, SpvOp::OpCapability, &[SpvCapability::Shader as u32]);
-        Self::emit_to(&mut self.output, SpvOp::OpCapability, &[SpvCapability::Matrix as u32]);
+        Self::emit_to(
+            &mut self.output,
+            SpvOp::OpCapability,
+            &[SpvCapability::Shader as u32],
+        );
+        Self::emit_to(
+            &mut self.output,
+            SpvOp::OpCapability,
+            &[SpvCapability::Matrix as u32],
+        );
 
         // GLSL.std.450 import
         let mut glsl_words = Vec::new();
@@ -3003,9 +3575,14 @@ impl SpirvBackend {
         let mut word = 0u32;
         for (i, &byte) in glsl_str.iter().enumerate() {
             word |= (byte as u32) << ((i % 4) * 8);
-            if i % 4 == 3 { glsl_words.push(word); word = 0; }
+            if i % 4 == 3 {
+                glsl_words.push(word);
+                word = 0;
+            }
         }
-        if glsl_str.len() % 4 != 0 { glsl_words.push(word); }
+        if glsl_str.len() % 4 != 0 {
+            glsl_words.push(word);
+        }
         Self::emit_to(&mut self.output, SpvOp::OpExtInstImport, &glsl_words);
 
         // Memory model
@@ -3019,9 +3596,14 @@ impl SpirvBackend {
         let mut word = 0u32;
         for (i, &byte) in name_str.iter().enumerate() {
             word |= (byte as u32) << ((i % 4) * 8);
-            if i % 4 == 3 { ep_operands.push(word); word = 0; }
+            if i % 4 == 3 {
+                ep_operands.push(word);
+                word = 0;
+            }
         }
-        if name_str.len() % 4 != 0 { ep_operands.push(word); }
+        if name_str.len() % 4 != 0 {
+            ep_operands.push(word);
+        }
         // Interface variables
         ep_operands.extend_from_slice(&[in_pos_var, in_color_var, out_pos_var, out_color_var]);
         Self::emit_to(&mut ep_buf, SpvOp::OpEntryPoint, &ep_operands);
@@ -3037,79 +3619,231 @@ impl SpirvBackend {
 
         // == Annotations ==
         // UBO struct Block decoration
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[ubo_struct_ty, SpvDecoration::Block as u32]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[ubo_struct_ty, SpvDecoration::Block as u32],
+        );
         // UBO member offset (mat4 at offset 0)
-        Self::emit_to(&mut annot_buf, SpvOp::OpMemberDecorate, &[ubo_struct_ty, 0, SpvDecoration::Offset as u32, 0]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpMemberDecorate,
+            &[ubo_struct_ty, 0, SpvDecoration::Offset as u32, 0],
+        );
         // mat4 column major
-        Self::emit_to(&mut annot_buf, SpvOp::OpMemberDecorate, &[ubo_struct_ty, 0, SpvDecoration::ColMajor as u32]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpMemberDecorate,
+            &[ubo_struct_ty, 0, SpvDecoration::ColMajor as u32],
+        );
         // mat4 matrix stride = 16 (4 floats * 4 bytes)
-        Self::emit_to(&mut annot_buf, SpvOp::OpMemberDecorate, &[ubo_struct_ty, 0, SpvDecoration::MatrixStride as u32, 16]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpMemberDecorate,
+            &[ubo_struct_ty, 0, SpvDecoration::MatrixStride as u32, 16],
+        );
 
         // UBO variable binding
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[ubo_var, SpvDecoration::DescriptorSet as u32, 0]);
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[ubo_var, SpvDecoration::Binding as u32, 0]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[ubo_var, SpvDecoration::DescriptorSet as u32, 0],
+        );
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[ubo_var, SpvDecoration::Binding as u32, 0],
+        );
 
         // Input locations
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[in_pos_var, SpvDecoration::Location as u32, 0]);
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[in_color_var, SpvDecoration::Location as u32, 1]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[in_pos_var, SpvDecoration::Location as u32, 0],
+        );
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[in_color_var, SpvDecoration::Location as u32, 1],
+        );
 
         // Output: gl_Position with BuiltIn
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[out_pos_var, SpvDecoration::BuiltIn as u32, SpvBuiltIn::Position as u32]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[
+                out_pos_var,
+                SpvDecoration::BuiltIn as u32,
+                SpvBuiltIn::Position as u32,
+            ],
+        );
         // Output: fragColor at Location 0
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[out_color_var, SpvDecoration::Location as u32, 0]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[out_color_var, SpvDecoration::Location as u32, 0],
+        );
 
         // == Global types and constants ==
         Self::emit_to(&mut globals_buf, SpvOp::OpTypeVoid, &[void_ty]);
         Self::emit_to(&mut globals_buf, SpvOp::OpTypeFloat, &[float_ty, 32]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypeVector, &[vec3_ty, float_ty, 3]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypeVector, &[vec4_ty, float_ty, 4]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypeMatrix, &[mat4_ty, vec4_ty, 4]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypeVector,
+            &[vec3_ty, float_ty, 3],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypeVector,
+            &[vec4_ty, float_ty, 4],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypeMatrix,
+            &[mat4_ty, vec4_ty, 4],
+        );
         Self::emit_to(&mut globals_buf, SpvOp::OpTypeInt, &[int_ty, 32, 1]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypeFunction, &[void_fn_ty, void_ty]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypeFunction,
+            &[void_fn_ty, void_ty],
+        );
 
         // Pointer types
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[in_pos_ptr_ty, SpvStorageClass::Input as u32, vec3_ty]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[in_color_ptr_ty, SpvStorageClass::Input as u32, vec3_ty]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[out_pos_ptr_ty, SpvStorageClass::Output as u32, vec4_ty]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[out_color_ptr_ty, SpvStorageClass::Output as u32, vec3_ty]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[in_pos_ptr_ty, SpvStorageClass::Input as u32, vec3_ty],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[in_color_ptr_ty, SpvStorageClass::Input as u32, vec3_ty],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[out_pos_ptr_ty, SpvStorageClass::Output as u32, vec4_ty],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[out_color_ptr_ty, SpvStorageClass::Output as u32, vec3_ty],
+        );
 
         // UBO struct: { mat4 mvp }
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypeStruct, &[ubo_struct_ty, mat4_ty]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[ubo_ptr_ty, SpvStorageClass::Uniform as u32, ubo_struct_ty]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[mat_ptr_ty, SpvStorageClass::Uniform as u32, mat4_ty]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypeStruct,
+            &[ubo_struct_ty, mat4_ty],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[ubo_ptr_ty, SpvStorageClass::Uniform as u32, ubo_struct_ty],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[mat_ptr_ty, SpvStorageClass::Uniform as u32, mat4_ty],
+        );
 
         // Variables
-        Self::emit_to(&mut globals_buf, SpvOp::OpVariable, &[in_pos_ptr_ty, in_pos_var, SpvStorageClass::Input as u32]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpVariable, &[in_color_ptr_ty, in_color_var, SpvStorageClass::Input as u32]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpVariable, &[out_pos_ptr_ty, out_pos_var, SpvStorageClass::Output as u32]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpVariable, &[out_color_ptr_ty, out_color_var, SpvStorageClass::Output as u32]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpVariable, &[ubo_ptr_ty, ubo_var, SpvStorageClass::Uniform as u32]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpVariable,
+            &[in_pos_ptr_ty, in_pos_var, SpvStorageClass::Input as u32],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpVariable,
+            &[in_color_ptr_ty, in_color_var, SpvStorageClass::Input as u32],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpVariable,
+            &[out_pos_ptr_ty, out_pos_var, SpvStorageClass::Output as u32],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpVariable,
+            &[
+                out_color_ptr_ty,
+                out_color_var,
+                SpvStorageClass::Output as u32,
+            ],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpVariable,
+            &[ubo_ptr_ty, ubo_var, SpvStorageClass::Uniform as u32],
+        );
 
         // Constants
         Self::emit_to(&mut globals_buf, SpvOp::OpConstant, &[float_ty, const_0, 0]); // 0.0f
-        Self::emit_to(&mut globals_buf, SpvOp::OpConstant, &[float_ty, const_1f, 0x3F800000]); // 1.0f
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpConstant,
+            &[float_ty, const_1f, 0x3F800000],
+        ); // 1.0f
         Self::emit_to(&mut globals_buf, SpvOp::OpConstant, &[int_ty, const_0i, 0]); // 0 (int)
 
         // == Function body ==
-        Self::emit_to(&mut func_buf, SpvOp::OpFunction, &[void_ty, main_fn, 0, void_fn_ty]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpFunction,
+            &[void_ty, main_fn, 0, void_fn_ty],
+        );
         Self::emit_to(&mut func_buf, SpvOp::OpLabel, &[label]);
 
         // Load inputs
-        Self::emit_to(&mut func_buf, SpvOp::OpLoad, &[vec3_ty, load_pos, in_pos_var]);
-        Self::emit_to(&mut func_buf, SpvOp::OpLoad, &[vec3_ty, load_color, in_color_var]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpLoad,
+            &[vec3_ty, load_pos, in_pos_var],
+        );
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpLoad,
+            &[vec3_ty, load_color, in_color_var],
+        );
 
         // Access UBO.mvp (member 0)
-        Self::emit_to(&mut func_buf, SpvOp::OpAccessChain, &[mat_ptr_ty, mvp_ptr, ubo_var, const_0i]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpAccessChain,
+            &[mat_ptr_ty, mvp_ptr, ubo_var, const_0i],
+        );
         Self::emit_to(&mut func_buf, SpvOp::OpLoad, &[mat4_ty, load_mvp, mvp_ptr]);
 
         // Construct vec4(position, 1.0)
-        Self::emit_to(&mut func_buf, SpvOp::OpCompositeExtract, &[float_ty, pos_x, load_pos, 0]);
-        Self::emit_to(&mut func_buf, SpvOp::OpCompositeExtract, &[float_ty, pos_y, load_pos, 1]);
-        Self::emit_to(&mut func_buf, SpvOp::OpCompositeExtract, &[float_ty, pos_z, load_pos, 2]);
-        Self::emit_to(&mut func_buf, SpvOp::OpCompositeConstruct, &[vec4_ty, pos4, pos_x, pos_y, pos_z, const_1f]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpCompositeExtract,
+            &[float_ty, pos_x, load_pos, 0],
+        );
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpCompositeExtract,
+            &[float_ty, pos_y, load_pos, 1],
+        );
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpCompositeExtract,
+            &[float_ty, pos_z, load_pos, 2],
+        );
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpCompositeConstruct,
+            &[vec4_ty, pos4, pos_x, pos_y, pos_z, const_1f],
+        );
 
         // gl_Position = mvp * vec4(pos, 1.0)
-        Self::emit_to(&mut func_buf, SpvOp::OpMatrixTimesVector, &[vec4_ty, clip_pos, load_mvp, pos4]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpMatrixTimesVector,
+            &[vec4_ty, clip_pos, load_mvp, pos4],
+        );
 
         // Store outputs
         Self::emit_to(&mut func_buf, SpvOp::OpStore, &[out_pos_var, clip_pos]);
@@ -3147,30 +3881,30 @@ impl SpirvBackend {
         self.reset();
 
         // Allocate all IDs upfront
-        let void_ty        = self.alloc_id(); // 1
-        let float_ty       = self.alloc_id(); // 2
-        let vec2_ty         = self.alloc_id(); // 3
-        let vec4_ty         = self.alloc_id(); // 4
-        let void_fn_ty      = self.alloc_id(); // 5
-        let main_fn         = self.alloc_id(); // 6
+        let void_ty = self.alloc_id(); // 1
+        let float_ty = self.alloc_id(); // 2
+        let vec2_ty = self.alloc_id(); // 3
+        let vec4_ty = self.alloc_id(); // 4
+        let void_fn_ty = self.alloc_id(); // 5
+        let main_fn = self.alloc_id(); // 6
 
         // Image/sampler types
-        let image_ty        = self.alloc_id(); // 7 — OpTypeImage (float, 2D)
-        let sampled_img_ty  = self.alloc_id(); // 8 — OpTypeSampledImage
-        let sampler_ptr_ty  = self.alloc_id(); // 9
+        let image_ty = self.alloc_id(); // 7 — OpTypeImage (float, 2D)
+        let sampled_img_ty = self.alloc_id(); // 8 — OpTypeSampledImage
+        let sampler_ptr_ty = self.alloc_id(); // 9
 
         // Input/output variables
-        let in_uv_ptr_ty    = self.alloc_id(); // 10
+        let in_uv_ptr_ty = self.alloc_id(); // 10
         let out_color_ptr_ty = self.alloc_id(); // 11
-        let in_uv_var       = self.alloc_id(); // 12
-        let out_color_var   = self.alloc_id(); // 13
-        let sampler_var     = self.alloc_id(); // 14
+        let in_uv_var = self.alloc_id(); // 12
+        let out_color_var = self.alloc_id(); // 13
+        let sampler_var = self.alloc_id(); // 14
 
         // Function-scope temps
-        let label           = self.alloc_id(); // 15
-        let load_uv         = self.alloc_id(); // 16
-        let load_sampler    = self.alloc_id(); // 17
-        let sampled_color   = self.alloc_id(); // 18
+        let label = self.alloc_id(); // 15
+        let load_uv = self.alloc_id(); // 16
+        let load_sampler = self.alloc_id(); // 17
+        let sampled_color = self.alloc_id(); // 18
 
         // Section buffers
         let mut ep_buf: Vec<u32> = Vec::new();
@@ -3187,7 +3921,11 @@ impl SpirvBackend {
         self.output.push(0); // schema
 
         // Capabilities
-        Self::emit_to(&mut self.output, SpvOp::OpCapability, &[SpvCapability::Shader as u32]);
+        Self::emit_to(
+            &mut self.output,
+            SpvOp::OpCapability,
+            &[SpvCapability::Shader as u32],
+        );
 
         // GLSL.std.450 import
         let glsl_ext = self.alloc_id();
@@ -3197,9 +3935,14 @@ impl SpirvBackend {
         let mut word = 0u32;
         for (i, &byte) in glsl_str.iter().enumerate() {
             word |= (byte as u32) << ((i % 4) * 8);
-            if i % 4 == 3 { glsl_words.push(word); word = 0; }
+            if i % 4 == 3 {
+                glsl_words.push(word);
+                word = 0;
+            }
         }
-        if glsl_str.len() % 4 != 0 { glsl_words.push(word); }
+        if glsl_str.len() % 4 != 0 {
+            glsl_words.push(word);
+        }
         Self::emit_to(&mut self.output, SpvOp::OpExtInstImport, &glsl_words);
 
         // Memory model
@@ -3213,9 +3956,14 @@ impl SpirvBackend {
         let mut word = 0u32;
         for (i, &byte) in name_str.iter().enumerate() {
             word |= (byte as u32) << ((i % 4) * 8);
-            if i % 4 == 3 { ep_operands.push(word); word = 0; }
+            if i % 4 == 3 {
+                ep_operands.push(word);
+                word = 0;
+            }
         }
-        if name_str.len() % 4 != 0 { ep_operands.push(word); }
+        if name_str.len() % 4 != 0 {
+            ep_operands.push(word);
+        }
         // Only Input/Output vars in the interface list (SPIR-V 1.0-1.3 rule)
         ep_operands.extend_from_slice(&[in_uv_var, out_color_var]);
         Self::emit_to(&mut ep_buf, SpvOp::OpEntryPoint, &ep_operands);
@@ -3231,49 +3979,137 @@ impl SpirvBackend {
 
         // == Annotations ==
         // Sampler binding
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[sampler_var, SpvDecoration::DescriptorSet as u32, 0]);
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[sampler_var, SpvDecoration::Binding as u32, 0]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[sampler_var, SpvDecoration::DescriptorSet as u32, 0],
+        );
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[sampler_var, SpvDecoration::Binding as u32, 0],
+        );
 
         // Input/output locations
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[in_uv_var, SpvDecoration::Location as u32, 0]);
-        Self::emit_to(&mut annot_buf, SpvOp::OpDecorate, &[out_color_var, SpvDecoration::Location as u32, 0]);
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[in_uv_var, SpvDecoration::Location as u32, 0],
+        );
+        Self::emit_to(
+            &mut annot_buf,
+            SpvOp::OpDecorate,
+            &[out_color_var, SpvDecoration::Location as u32, 0],
+        );
 
         // == Global types and constants ==
         Self::emit_to(&mut globals_buf, SpvOp::OpTypeVoid, &[void_ty]);
         Self::emit_to(&mut globals_buf, SpvOp::OpTypeFloat, &[float_ty, 32]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypeVector, &[vec2_ty, float_ty, 2]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypeVector, &[vec4_ty, float_ty, 4]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypeFunction, &[void_fn_ty, void_ty]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypeVector,
+            &[vec2_ty, float_ty, 2],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypeVector,
+            &[vec4_ty, float_ty, 4],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypeFunction,
+            &[void_fn_ty, void_ty],
+        );
 
         // OpTypeImage: result, sampled-type, Dim(1=2D), depth(0), arrayed(0), MS(0), sampled(1), format(0=Unknown)
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypeImage, &[image_ty, float_ty, 1, 0, 0, 0, 1, 0]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypeSampledImage, &[sampled_img_ty, image_ty]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypeImage,
+            &[image_ty, float_ty, 1, 0, 0, 0, 1, 0],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypeSampledImage,
+            &[sampled_img_ty, image_ty],
+        );
 
         // Pointer types
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[in_uv_ptr_ty, SpvStorageClass::Input as u32, vec2_ty]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[out_color_ptr_ty, SpvStorageClass::Output as u32, vec4_ty]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpTypePointer, &[sampler_ptr_ty, SpvStorageClass::UniformConstant as u32, sampled_img_ty]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[in_uv_ptr_ty, SpvStorageClass::Input as u32, vec2_ty],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[out_color_ptr_ty, SpvStorageClass::Output as u32, vec4_ty],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpTypePointer,
+            &[
+                sampler_ptr_ty,
+                SpvStorageClass::UniformConstant as u32,
+                sampled_img_ty,
+            ],
+        );
 
         // Variables
-        Self::emit_to(&mut globals_buf, SpvOp::OpVariable, &[in_uv_ptr_ty, in_uv_var, SpvStorageClass::Input as u32]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpVariable, &[out_color_ptr_ty, out_color_var, SpvStorageClass::Output as u32]);
-        Self::emit_to(&mut globals_buf, SpvOp::OpVariable, &[sampler_ptr_ty, sampler_var, SpvStorageClass::UniformConstant as u32]);
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpVariable,
+            &[in_uv_ptr_ty, in_uv_var, SpvStorageClass::Input as u32],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpVariable,
+            &[
+                out_color_ptr_ty,
+                out_color_var,
+                SpvStorageClass::Output as u32,
+            ],
+        );
+        Self::emit_to(
+            &mut globals_buf,
+            SpvOp::OpVariable,
+            &[
+                sampler_ptr_ty,
+                sampler_var,
+                SpvStorageClass::UniformConstant as u32,
+            ],
+        );
 
         // == Function body ==
-        Self::emit_to(&mut func_buf, SpvOp::OpFunction, &[void_ty, main_fn, 0, void_fn_ty]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpFunction,
+            &[void_ty, main_fn, 0, void_fn_ty],
+        );
         Self::emit_to(&mut func_buf, SpvOp::OpLabel, &[label]);
 
         // Load UV coordinates
         Self::emit_to(&mut func_buf, SpvOp::OpLoad, &[vec2_ty, load_uv, in_uv_var]);
 
         // Load combined image+sampler
-        Self::emit_to(&mut func_buf, SpvOp::OpLoad, &[sampled_img_ty, load_sampler, sampler_var]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpLoad,
+            &[sampled_img_ty, load_sampler, sampler_var],
+        );
 
         // Sample texture: vec4 color = texture(sampler, uv)
-        Self::emit_to(&mut func_buf, SpvOp::OpImageSampleImplicitLod, &[vec4_ty, sampled_color, load_sampler, load_uv]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpImageSampleImplicitLod,
+            &[vec4_ty, sampled_color, load_sampler, load_uv],
+        );
 
         // Store to output
-        Self::emit_to(&mut func_buf, SpvOp::OpStore, &[out_color_var, sampled_color]);
+        Self::emit_to(
+            &mut func_buf,
+            SpvOp::OpStore,
+            &[out_color_var, sampled_color],
+        );
 
         Self::emit_to(&mut func_buf, SpvOp::OpReturn, &[]);
         Self::emit_to(&mut func_buf, SpvOp::OpFunctionEnd, &[]);
@@ -3300,8 +4136,16 @@ impl SpirvBackend {
     /// For fragment shaders:
     ///   - Each function parameter becomes an Input variable with Location decoration
     ///   - The return type becomes an Output variable with Location decoration
-    fn setup_shader_io(&mut self, func: &MirFunction, _func_id: u32, exec_model: SpvExecutionModel) {
-        if !matches!(exec_model, SpvExecutionModel::Vertex | SpvExecutionModel::Fragment) {
+    fn setup_shader_io(
+        &mut self,
+        func: &MirFunction,
+        _func_id: u32,
+        exec_model: SpvExecutionModel,
+    ) {
+        if !matches!(
+            exec_model,
+            SpvExecutionModel::Vertex | SpvExecutionModel::Fragment
+        ) {
             return;
         }
 
@@ -3309,7 +4153,9 @@ impl SpirvBackend {
         self.shader_input_vars.clear();
         let mut location_counter = 0u32;
         for (i, param_ty) in func.sig.params.iter().enumerate() {
-            let param_name = func.locals.iter()
+            let param_name = func
+                .locals
+                .iter()
                 .find(|l| l.is_param && l.id.0 == i as u32)
                 .and_then(|l| l.name.as_ref())
                 .map(|n| n.to_string())
@@ -3317,16 +4163,19 @@ impl SpirvBackend {
 
             // Detect builtin parameters by name convention
             let builtin = match param_name.as_str() {
-                "vertex_id" | "vertex_index" | "gl_VertexIndex" =>
-                    Some(SpvBuiltIn::VertexIndex),
-                "instance_id" | "instance_index" | "gl_InstanceIndex" =>
-                    Some(SpvBuiltIn::InstanceIndex),
+                "vertex_id" | "vertex_index" | "gl_VertexIndex" => Some(SpvBuiltIn::VertexIndex),
+                "instance_id" | "instance_index" | "gl_InstanceIndex" => {
+                    Some(SpvBuiltIn::InstanceIndex)
+                }
                 _ => None,
             };
 
             let ptr_ty_id = self.get_ptr_type_id(param_ty, SpvStorageClass::Input);
             let var_id = self.alloc_id();
-            self.emit_global(SpvOp::OpVariable, &[ptr_ty_id, var_id, SpvStorageClass::Input as u32]);
+            self.emit_global(
+                SpvOp::OpVariable,
+                &[ptr_ty_id, var_id, SpvStorageClass::Input as u32],
+            );
 
             if let Some(bi) = builtin {
                 self.emit_decoration(var_id, SpvDecoration::BuiltIn, &[bi as u32]);
@@ -3359,21 +4208,34 @@ impl SpirvBackend {
                         for (loc, (field_name, field_ty)) in fields.iter().enumerate() {
                             let ptr_ty_id = self.get_ptr_type_id(field_ty, SpvStorageClass::Output);
                             let var_id = self.alloc_id();
-                            self.emit_global(SpvOp::OpVariable, &[ptr_ty_id, var_id, SpvStorageClass::Output as u32]);
+                            self.emit_global(
+                                SpvOp::OpVariable,
+                                &[ptr_ty_id, var_id, SpvStorageClass::Output as u32],
+                            );
 
-                            let is_position = field_name.as_ref()
+                            let is_position = field_name
+                                .as_ref()
                                 .map(|n| n.as_ref() == "position")
                                 .unwrap_or(false);
                             let is_vec4 = matches!(field_ty, MirType::Vector(ref elem, 4) if elem.is_float())
                                 || matches!(field_ty, MirType::Struct(ref n) if n.as_ref() == "quanta_vec4");
 
                             if is_position && is_vec4 {
-                                self.emit_decoration(var_id, SpvDecoration::BuiltIn, &[SpvBuiltIn::Position as u32]);
+                                self.emit_decoration(
+                                    var_id,
+                                    SpvDecoration::BuiltIn,
+                                    &[SpvBuiltIn::Position as u32],
+                                );
                             } else {
-                                self.emit_decoration(var_id, SpvDecoration::Location, &[loc as u32]);
+                                self.emit_decoration(
+                                    var_id,
+                                    SpvDecoration::Location,
+                                    &[loc as u32],
+                                );
                             }
 
-                            let out_name = field_name.as_ref()
+                            let out_name = field_name
+                                .as_ref()
                                 .map(|n| format!("out_{}", n))
                                 .unwrap_or_else(|| format!("out_{}", loc));
                             self.emit_name(var_id, &out_name);
@@ -3383,7 +4245,10 @@ impl SpirvBackend {
                         // Unknown struct, emit as single output
                         let ptr_ty_id = self.get_ptr_type_id(ret_ty, SpvStorageClass::Output);
                         let var_id = self.alloc_id();
-                        self.emit_global(SpvOp::OpVariable, &[ptr_ty_id, var_id, SpvStorageClass::Output as u32]);
+                        self.emit_global(
+                            SpvOp::OpVariable,
+                            &[ptr_ty_id, var_id, SpvStorageClass::Output as u32],
+                        );
                         self.emit_decoration(var_id, SpvDecoration::Location, &[0]);
                         self.io_var_ids.push(var_id);
                     }
@@ -3391,10 +4256,17 @@ impl SpirvBackend {
                     // Non-struct return for vertex shader (MirType::Vector etc)
                     let ptr_ty_id = self.get_ptr_type_id(ret_ty, SpvStorageClass::Output);
                     let var_id = self.alloc_id();
-                    self.emit_global(SpvOp::OpVariable, &[ptr_ty_id, var_id, SpvStorageClass::Output as u32]);
+                    self.emit_global(
+                        SpvOp::OpVariable,
+                        &[ptr_ty_id, var_id, SpvStorageClass::Output as u32],
+                    );
                     let is_vec4 = matches!(ret_ty, MirType::Vector(ref elem, 4) if elem.is_float());
                     if is_vec4 {
-                        self.emit_decoration(var_id, SpvDecoration::BuiltIn, &[SpvBuiltIn::Position as u32]);
+                        self.emit_decoration(
+                            var_id,
+                            SpvDecoration::BuiltIn,
+                            &[SpvBuiltIn::Position as u32],
+                        );
                     } else {
                         self.emit_decoration(var_id, SpvDecoration::Location, &[0]);
                     }
@@ -3405,9 +4277,16 @@ impl SpirvBackend {
                 // quanta_vec types already map to OpTypeVector in get_type_id
                 let ptr_ty_id = self.get_ptr_type_id(ret_ty, SpvStorageClass::Output);
                 let var_id = self.alloc_id();
-                self.emit_global(SpvOp::OpVariable, &[ptr_ty_id, var_id, SpvStorageClass::Output as u32]);
+                self.emit_global(
+                    SpvOp::OpVariable,
+                    &[ptr_ty_id, var_id, SpvStorageClass::Output as u32],
+                );
                 if is_vertex_position {
-                    self.emit_decoration(var_id, SpvDecoration::BuiltIn, &[SpvBuiltIn::Position as u32]);
+                    self.emit_decoration(
+                        var_id,
+                        SpvDecoration::BuiltIn,
+                        &[SpvBuiltIn::Position as u32],
+                    );
                     self.emit_name(var_id, "gl_Position");
                 } else {
                     self.emit_decoration(var_id, SpvDecoration::Location, &[0]);
@@ -3441,7 +4320,9 @@ impl SpirvBackend {
             MirType::Ptr(inner) => MirType::Ptr(Box::new(Self::coerce_type(inner))),
             MirType::Array(elem, len) => MirType::Array(Box::new(Self::coerce_type(elem)), *len),
             MirType::Slice(elem) => MirType::Slice(Box::new(Self::coerce_type(elem))),
-            MirType::Vector(elem, lanes) => MirType::Vector(Box::new(Self::coerce_type(elem)), *lanes),
+            MirType::Vector(elem, lanes) => {
+                MirType::Vector(Box::new(Self::coerce_type(elem)), *lanes)
+            }
             MirType::FnPtr(sig) => {
                 let mut sig = sig.as_ref().clone();
                 sig.ret = Self::coerce_type(&sig.ret);
@@ -3496,18 +4377,31 @@ impl SpirvBackend {
                 value: Self::coerce_value(value),
                 count: *count,
             },
-            MirRValue::FieldAccess { base, field_name, field_ty } => MirRValue::FieldAccess {
+            MirRValue::FieldAccess {
+                base,
+                field_name,
+                field_ty,
+            } => MirRValue::FieldAccess {
                 base: Self::coerce_value(base),
                 field_name: field_name.clone(),
                 field_ty: Self::coerce_type(field_ty),
             },
-            MirRValue::VariantField { base, variant_name, field_index, field_ty } => MirRValue::VariantField {
+            MirRValue::VariantField {
+                base,
+                variant_name,
+                field_index,
+                field_ty,
+            } => MirRValue::VariantField {
                 base: Self::coerce_value(base),
                 variant_name: variant_name.clone(),
                 field_index: *field_index,
                 field_ty: Self::coerce_type(field_ty),
             },
-            MirRValue::IndexAccess { base, index, elem_ty } => MirRValue::IndexAccess {
+            MirRValue::IndexAccess {
+                base,
+                index,
+                elem_ty,
+            } => MirRValue::IndexAccess {
                 base: Self::coerce_value(base),
                 index: Self::coerce_value(index),
                 elem_ty: Self::coerce_type(elem_ty),
@@ -3516,9 +4410,19 @@ impl SpirvBackend {
                 ptr: Self::coerce_value(ptr),
                 pointee_ty: Self::coerce_type(pointee_ty),
             },
-            MirRValue::Ref { is_mut: _, place: _ } => rv.clone(),
-            MirRValue::AddressOf { is_mut: _, place: _ } => rv.clone(),
-            MirRValue::TextureSample { texture, sampler, coords } => MirRValue::TextureSample {
+            MirRValue::Ref {
+                is_mut: _,
+                place: _,
+            } => rv.clone(),
+            MirRValue::AddressOf {
+                is_mut: _,
+                place: _,
+            } => rv.clone(),
+            MirRValue::TextureSample {
+                texture,
+                sampler,
+                coords,
+            } => MirRValue::TextureSample {
                 texture: Self::coerce_value(texture),
                 sampler: Self::coerce_value(sampler),
                 coords: Self::coerce_value(coords),
@@ -3578,7 +4482,11 @@ impl SpirvBackend {
                                 ptr: *ptr,
                                 value: Self::coerce_rvalue(value),
                             },
-                            MirStmtKind::FieldDerefAssign { ptr, field_name, value } => MirStmtKind::FieldDerefAssign {
+                            MirStmtKind::FieldDerefAssign {
+                                ptr,
+                                field_name,
+                                value,
+                            } => MirStmtKind::FieldDerefAssign {
                                 ptr: *ptr,
                                 field_name: field_name.clone(),
                                 value: Self::coerce_rvalue(value),
@@ -3590,20 +4498,39 @@ impl SpirvBackend {
                     // Coerce terminator
                     if let Some(ref term) = block.terminator.clone() {
                         block.terminator = Some(match term {
-                            MirTerminator::Return(Some(v)) => MirTerminator::Return(Some(Self::coerce_value(v))),
-                            MirTerminator::Call { func: fv, args, dest, target, unwind } => MirTerminator::Call {
+                            MirTerminator::Return(Some(v)) => {
+                                MirTerminator::Return(Some(Self::coerce_value(v)))
+                            }
+                            MirTerminator::Call {
+                                func: fv,
+                                args,
+                                dest,
+                                target,
+                                unwind,
+                            } => MirTerminator::Call {
                                 func: Self::coerce_value(fv),
                                 args: args.iter().map(|a| Self::coerce_value(a)).collect(),
                                 dest: *dest,
                                 target: *target,
                                 unwind: *unwind,
                             },
-                            MirTerminator::Switch { value, targets, default } => MirTerminator::Switch {
+                            MirTerminator::Switch {
+                                value,
+                                targets,
+                                default,
+                            } => MirTerminator::Switch {
                                 value: Self::coerce_value(value),
-                                targets: targets.iter().map(|(c, b)| (Self::coerce_const(c), *b)).collect(),
+                                targets: targets
+                                    .iter()
+                                    .map(|(c, b)| (Self::coerce_const(c), *b))
+                                    .collect(),
                                 default: *default,
                             },
-                            MirTerminator::If { cond, then_block, else_block } => MirTerminator::If {
+                            MirTerminator::If {
+                                cond,
+                                then_block,
+                                else_block,
+                            } => MirTerminator::If {
                                 cond: Self::coerce_value(cond),
                                 then_block: *then_block,
                                 else_block: *else_block,
@@ -3642,7 +4569,8 @@ impl Backend for SpirvBackend {
         // Load struct definitions from the MIR module for use during type emission
         for type_def in &mir.types {
             if let TypeDefKind::Struct { fields, .. } = &type_def.kind {
-                self.struct_defs.insert(type_def.name.clone(), fields.clone());
+                self.struct_defs
+                    .insert(type_def.name.clone(), fields.clone());
             }
         }
 
@@ -3671,7 +4599,8 @@ impl Backend for SpirvBackend {
         if has_shaders {
             self.emit_header_version(SPIRV_VERSION_1_0);
             // Remove Float64 capability — GPU shaders use f32 after coercion
-            self.capabilities.retain(|c| !matches!(c, SpvCapability::Float64));
+            self.capabilities
+                .retain(|c| !matches!(c, SpvCapability::Float64));
         } else {
             self.emit_header();
         }
@@ -3706,7 +4635,9 @@ impl Backend for SpirvBackend {
                             if let Some(ref term) = block.terminator {
                                 if let MirTerminator::Call { func: callee, .. } = term {
                                     let callee_name = match callee {
-                                        MirValue::Global(n) | MirValue::Function(n) => Some(n.clone()),
+                                        MirValue::Global(n) | MirValue::Function(n) => {
+                                            Some(n.clone())
+                                        }
                                         _ => None,
                                     };
                                     if let Some(cn) = callee_name {
@@ -3773,19 +4704,24 @@ impl Backend for SpirvBackend {
                 // Execution mode (section 6) -- into entry_point_buf
                 match exec_model {
                     SpvExecutionModel::GLCompute | SpvExecutionModel::Kernel => {
-                        Self::emit_to(&mut entry_point_buf, SpvOp::OpExecutionMode, &[
-                            func_id,
-                            SpvExecutionMode::LocalSize as u32,
-                            self.workgroup_size.0,
-                            self.workgroup_size.1,
-                            self.workgroup_size.2,
-                        ]);
+                        Self::emit_to(
+                            &mut entry_point_buf,
+                            SpvOp::OpExecutionMode,
+                            &[
+                                func_id,
+                                SpvExecutionMode::LocalSize as u32,
+                                self.workgroup_size.0,
+                                self.workgroup_size.1,
+                                self.workgroup_size.2,
+                            ],
+                        );
                     }
                     SpvExecutionModel::Fragment => {
-                        Self::emit_to(&mut entry_point_buf, SpvOp::OpExecutionMode, &[
-                            func_id,
-                            SpvExecutionMode::OriginUpperLeft as u32,
-                        ]);
+                        Self::emit_to(
+                            &mut entry_point_buf,
+                            SpvOp::OpExecutionMode,
+                            &[func_id, SpvExecutionMode::OriginUpperLeft as u32],
+                        );
                     }
                     SpvExecutionModel::Vertex => {
                         // No required execution modes for vertex shaders
@@ -3839,7 +4775,8 @@ impl Backend for SpirvBackend {
         self.output[3] = self.next_id;
 
         // Convert to bytes (little-endian)
-        let bytes: Vec<u8> = self.output
+        let bytes: Vec<u8> = self
+            .output
             .iter()
             .flat_map(|word| word.to_le_bytes())
             .collect();
@@ -3885,9 +4822,7 @@ mod tests {
 
     #[test]
     fn test_spirv_backend_with_capabilities() {
-        let backend = SpirvBackend::new()
-            .with_float64()
-            .with_int64();
+        let backend = SpirvBackend::new().with_float64().with_int64();
         assert!(backend.capabilities.contains(&SpvCapability::Float64));
         assert!(backend.capabilities.contains(&SpvCapability::Int64));
     }
@@ -3927,10 +4862,22 @@ mod tests {
     fn test_spirv_binop() {
         let backend = SpirvBackend::new();
 
-        assert!(matches!(backend.spirv_binop(BinOp::Add, &MirType::i32()), SpvOp::OpIAdd));
-        assert!(matches!(backend.spirv_binop(BinOp::Add, &MirType::f32()), SpvOp::OpFAdd));
-        assert!(matches!(backend.spirv_binop(BinOp::Div, &MirType::i32()), SpvOp::OpSDiv));
-        assert!(matches!(backend.spirv_binop(BinOp::Div, &MirType::u32()), SpvOp::OpUDiv));
+        assert!(matches!(
+            backend.spirv_binop(BinOp::Add, &MirType::i32()),
+            SpvOp::OpIAdd
+        ));
+        assert!(matches!(
+            backend.spirv_binop(BinOp::Add, &MirType::f32()),
+            SpvOp::OpFAdd
+        ));
+        assert!(matches!(
+            backend.spirv_binop(BinOp::Div, &MirType::i32()),
+            SpvOp::OpSDiv
+        ));
+        assert!(matches!(
+            backend.spirv_binop(BinOp::Div, &MirType::u32()),
+            SpvOp::OpUDiv
+        ));
     }
 
     #[test]
@@ -3941,7 +4888,8 @@ mod tests {
 
     /// Helper to extract all SPIR-V words from generated binary.
     fn words_from_bytes(bytes: &[u8]) -> Vec<u32> {
-        bytes.chunks(4)
+        bytes
+            .chunks(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }
@@ -3965,7 +4913,9 @@ mod tests {
             let word = words[i];
             let op = word & 0xFFFF;
             let wc = (word >> 16) as usize;
-            if wc == 0 { break; }
+            if wc == 0 {
+                break;
+            }
             if op == opcode as u32 {
                 results.push(i);
             }
@@ -4010,7 +4960,11 @@ mod tests {
         // Generate
         let mut backend = SpirvBackend::new();
         let result = backend.generate(&module);
-        assert!(result.is_ok(), "Vertex shader generation failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Vertex shader generation failed: {:?}",
+            result.err()
+        );
 
         let code = result.unwrap();
         let bytes = &code.data;
@@ -4022,17 +4976,17 @@ mod tests {
         // 2. Check OpCapability Shader (capability 1)
         let cap_positions = find_instructions(&words, SpvOp::OpCapability);
         assert!(!cap_positions.is_empty(), "No OpCapability found");
-        let has_shader_cap = cap_positions.iter().any(|&pos| {
-            words.get(pos + 1) == Some(&(SpvCapability::Shader as u32))
-        });
+        let has_shader_cap = cap_positions
+            .iter()
+            .any(|&pos| words.get(pos + 1) == Some(&(SpvCapability::Shader as u32)));
         assert!(has_shader_cap, "OpCapability Shader not found");
 
         // 3. Check OpEntryPoint Vertex (execution model 0)
         let ep_positions = find_instructions(&words, SpvOp::OpEntryPoint);
         assert!(!ep_positions.is_empty(), "No OpEntryPoint found");
-        let has_vertex_ep = ep_positions.iter().any(|&pos| {
-            words.get(pos + 1) == Some(&(SpvExecutionModel::Vertex as u32))
-        });
+        let has_vertex_ep = ep_positions
+            .iter()
+            .any(|&pos| words.get(pos + 1) == Some(&(SpvExecutionModel::Vertex as u32)));
         assert!(has_vertex_ep, "OpEntryPoint with Vertex model not found");
 
         // 4. Check OpTypeVector is present
@@ -4043,23 +4997,27 @@ mod tests {
 
         // 5. Check OpDecorate with Location is present
         let dec_positions = find_instructions(&words, SpvOp::OpDecorate);
-        let has_location = dec_positions.iter().any(|&pos| {
-            words.get(pos + 2) == Some(&(SpvDecoration::Location as u32))
-        });
+        let has_location = dec_positions
+            .iter()
+            .any(|&pos| words.get(pos + 2) == Some(&(SpvDecoration::Location as u32)));
         assert!(has_location, "OpDecorate with Location not found");
 
         // 6. Check the function has OpReturn or OpReturnValue
         assert!(
-            contains_opcode(&words, SpvOp::OpReturnValue) || contains_opcode(&words, SpvOp::OpReturn),
+            contains_opcode(&words, SpvOp::OpReturnValue)
+                || contains_opcode(&words, SpvOp::OpReturn),
             "No OpReturn/OpReturnValue found"
         );
 
         // 7. Verify no LocalSize execution mode is emitted (that's for compute only)
         let em_positions = find_instructions(&words, SpvOp::OpExecutionMode);
-        let has_local_size = em_positions.iter().any(|&pos| {
-            words.get(pos + 2) == Some(&(SpvExecutionMode::LocalSize as u32))
-        });
-        assert!(!has_local_size, "Vertex shader should not have LocalSize execution mode");
+        let has_local_size = em_positions
+            .iter()
+            .any(|&pos| words.get(pos + 2) == Some(&(SpvExecutionMode::LocalSize as u32)));
+        assert!(
+            !has_local_size,
+            "Vertex shader should not have LocalSize execution mode"
+        );
     }
 
     #[test]
@@ -4083,24 +5041,31 @@ mod tests {
 
         let mut backend = SpirvBackend::new();
         let result = backend.generate(&module);
-        assert!(result.is_ok(), "Fragment shader generation failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Fragment shader generation failed: {:?}",
+            result.err()
+        );
 
         let code = result.unwrap();
         let words = words_from_bytes(&code.data);
 
         // Check OpEntryPoint Fragment
         let ep_positions = find_instructions(&words, SpvOp::OpEntryPoint);
-        let has_frag_ep = ep_positions.iter().any(|&pos| {
-            words.get(pos + 1) == Some(&(SpvExecutionModel::Fragment as u32))
-        });
+        let has_frag_ep = ep_positions
+            .iter()
+            .any(|&pos| words.get(pos + 1) == Some(&(SpvExecutionModel::Fragment as u32)));
         assert!(has_frag_ep, "OpEntryPoint with Fragment model not found");
 
         // Check OriginUpperLeft execution mode
         let em_positions = find_instructions(&words, SpvOp::OpExecutionMode);
-        let has_origin = em_positions.iter().any(|&pos| {
-            words.get(pos + 2) == Some(&(SpvExecutionMode::OriginUpperLeft as u32))
-        });
-        assert!(has_origin, "Fragment shader must have OriginUpperLeft execution mode");
+        let has_origin = em_positions
+            .iter()
+            .any(|&pos| words.get(pos + 2) == Some(&(SpvExecutionMode::OriginUpperLeft as u32)));
+        assert!(
+            has_origin,
+            "Fragment shader must have OriginUpperLeft execution mode"
+        );
     }
 
     #[test]
@@ -4138,7 +5103,11 @@ mod tests {
 
         let mut backend = SpirvBackend::new();
         let result = backend.generate(&module);
-        assert!(result.is_ok(), "Struct test generation failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Struct test generation failed: {:?}",
+            result.err()
+        );
 
         let code = result.unwrap();
         let words = words_from_bytes(&code.data);
@@ -4153,7 +5122,11 @@ mod tests {
             let wc = (words[pos] >> 16) as usize;
             // word count = 1 (op+wc) + 1 (result id) + N (member types)
             // For our struct with 2 fields: wc should be 4 (1 + 1 + 2)
-            assert!(wc >= 3, "OpTypeStruct has no member types (word count: {})", wc);
+            assert!(
+                wc >= 3,
+                "OpTypeStruct has no member types (word count: {})",
+                wc
+            );
         }
     }
 
@@ -4172,29 +5145,43 @@ mod tests {
 
         // 2. OpCapability Shader
         let cap_positions = find_instructions(&words, SpvOp::OpCapability);
-        let has_shader = cap_positions.iter().any(|&pos| words.get(pos + 1) == Some(&(SpvCapability::Shader as u32)));
+        let has_shader = cap_positions
+            .iter()
+            .any(|&pos| words.get(pos + 1) == Some(&(SpvCapability::Shader as u32)));
         assert!(has_shader, "Missing OpCapability Shader");
 
         // 3. OpEntryPoint Fragment
         let ep_positions = find_instructions(&words, SpvOp::OpEntryPoint);
         assert!(!ep_positions.is_empty(), "No OpEntryPoint found");
-        let has_frag = ep_positions.iter().any(|&pos| words.get(pos + 1) == Some(&(SpvExecutionModel::Fragment as u32)));
+        let has_frag = ep_positions
+            .iter()
+            .any(|&pos| words.get(pos + 1) == Some(&(SpvExecutionModel::Fragment as u32)));
         assert!(has_frag, "OpEntryPoint must use Fragment execution model");
 
         // 4. OpExecutionMode OriginUpperLeft
         let em_positions = find_instructions(&words, SpvOp::OpExecutionMode);
-        let has_origin = em_positions.iter().any(|&pos| words.get(pos + 2) == Some(&(SpvExecutionMode::OriginUpperLeft as u32)));
+        let has_origin = em_positions
+            .iter()
+            .any(|&pos| words.get(pos + 2) == Some(&(SpvExecutionMode::OriginUpperLeft as u32)));
         assert!(has_origin, "Fragment shader must have OriginUpperLeft");
 
         // 5. Has Location decorations
         let dec_positions = find_instructions(&words, SpvOp::OpDecorate);
-        let has_location = dec_positions.iter().any(|&pos| words.get(pos + 2) == Some(&(SpvDecoration::Location as u32)));
+        let has_location = dec_positions
+            .iter()
+            .any(|&pos| words.get(pos + 2) == Some(&(SpvDecoration::Location as u32)));
         assert!(has_location, "Missing Location decoration");
 
         // 6. Has OpLoad, OpCompositeExtract, OpCompositeConstruct, OpStore
         assert!(contains_opcode(&words, SpvOp::OpLoad), "Missing OpLoad");
-        assert!(contains_opcode(&words, SpvOp::OpCompositeExtract), "Missing OpCompositeExtract");
-        assert!(contains_opcode(&words, SpvOp::OpCompositeConstruct), "Missing OpCompositeConstruct");
+        assert!(
+            contains_opcode(&words, SpvOp::OpCompositeExtract),
+            "Missing OpCompositeExtract"
+        );
+        assert!(
+            contains_opcode(&words, SpvOp::OpCompositeConstruct),
+            "Missing OpCompositeConstruct"
+        );
         assert!(contains_opcode(&words, SpvOp::OpStore), "Missing OpStore");
         assert!(contains_opcode(&words, SpvOp::OpReturn), "Missing OpReturn");
     }
@@ -4210,34 +5197,45 @@ mod tests {
 
         // 2. OpEntryPoint Vertex
         let ep_positions = find_instructions(&words, SpvOp::OpEntryPoint);
-        let has_vert = ep_positions.iter().any(|&pos| words.get(pos + 1) == Some(&(SpvExecutionModel::Vertex as u32)));
+        let has_vert = ep_positions
+            .iter()
+            .any(|&pos| words.get(pos + 1) == Some(&(SpvExecutionModel::Vertex as u32)));
         assert!(has_vert, "OpEntryPoint must use Vertex execution model");
 
         // 3. Has BuiltIn Position decoration
         let dec_positions = find_instructions(&words, SpvOp::OpDecorate);
         let has_builtin_pos = dec_positions.iter().any(|&pos| {
             words.get(pos + 2) == Some(&(SpvDecoration::BuiltIn as u32))
-            && words.get(pos + 3) == Some(&(SpvBuiltIn::Position as u32))
+                && words.get(pos + 3) == Some(&(SpvBuiltIn::Position as u32))
         });
         assert!(has_builtin_pos, "Missing BuiltIn Position decoration");
 
         // 4. Has BuiltIn VertexIndex decoration
         let has_vtx_idx = dec_positions.iter().any(|&pos| {
             words.get(pos + 2) == Some(&(SpvDecoration::BuiltIn as u32))
-            && words.get(pos + 3) == Some(&(SpvBuiltIn::VertexIndex as u32))
+                && words.get(pos + 3) == Some(&(SpvBuiltIn::VertexIndex as u32))
         });
         assert!(has_vtx_idx, "Missing BuiltIn VertexIndex decoration");
 
         // 5. Has Location 0 for fragColor output
-        let has_location = dec_positions.iter().any(|&pos| {
-            words.get(pos + 2) == Some(&(SpvDecoration::Location as u32))
-        });
+        let has_location = dec_positions
+            .iter()
+            .any(|&pos| words.get(pos + 2) == Some(&(SpvDecoration::Location as u32)));
         assert!(has_location, "Missing Location decoration for fragColor");
 
         // 6. Has array types and access chain
-        assert!(contains_opcode(&words, SpvOp::OpTypeArray), "Missing OpTypeArray");
-        assert!(contains_opcode(&words, SpvOp::OpAccessChain), "Missing OpAccessChain");
-        assert!(contains_opcode(&words, SpvOp::OpConstantComposite), "Missing OpConstantComposite");
+        assert!(
+            contains_opcode(&words, SpvOp::OpTypeArray),
+            "Missing OpTypeArray"
+        );
+        assert!(
+            contains_opcode(&words, SpvOp::OpAccessChain),
+            "Missing OpAccessChain"
+        );
+        assert!(
+            contains_opcode(&words, SpvOp::OpConstantComposite),
+            "Missing OpConstantComposite"
+        );
     }
 
     /// Write SPIR-V bytes to a temporary file and run spirv-val.
@@ -4301,9 +5299,9 @@ mod tests {
         let mut backend = SpirvBackend::new();
         let frag_bytes = backend.generate_triangle_fragment_shader();
         let frag_path = out_dir.join("quanta_frag.spv");
-        let mut f = std::fs::File::create(&frag_path)
-            .expect("Failed to create quanta_frag.spv");
-        f.write_all(&frag_bytes).expect("Failed to write quanta_frag.spv");
+        let mut f = std::fs::File::create(&frag_path).expect("Failed to create quanta_frag.spv");
+        f.write_all(&frag_bytes)
+            .expect("Failed to write quanta_frag.spv");
 
         // Validate
         validate_spirv_bytes(&frag_bytes, "quanta_frag")
@@ -4313,9 +5311,9 @@ mod tests {
         let mut backend = SpirvBackend::new();
         let vert_bytes = backend.generate_triangle_vertex_shader();
         let vert_path = out_dir.join("quanta_vert.spv");
-        let mut f = std::fs::File::create(&vert_path)
-            .expect("Failed to create quanta_vert.spv");
-        f.write_all(&vert_bytes).expect("Failed to write quanta_vert.spv");
+        let mut f = std::fs::File::create(&vert_path).expect("Failed to create quanta_vert.spv");
+        f.write_all(&vert_bytes)
+            .expect("Failed to write quanta_vert.spv");
 
         // Validate
         validate_spirv_bytes(&vert_bytes, "quanta_vert")
@@ -4324,8 +5322,16 @@ mod tests {
         // Verify files exist and have content
         assert!(frag_path.exists(), "quanta_frag.spv was not written");
         assert!(vert_path.exists(), "quanta_vert.spv was not written");
-        assert!(frag_bytes.len() > 100, "Fragment shader too small: {} bytes", frag_bytes.len());
-        assert!(vert_bytes.len() > 100, "Vertex shader too small: {} bytes", vert_bytes.len());
+        assert!(
+            frag_bytes.len() > 100,
+            "Fragment shader too small: {} bytes",
+            frag_bytes.len()
+        );
+        assert!(
+            vert_bytes.len() > 100,
+            "Vertex shader too small: {} bytes",
+            vert_bytes.len()
+        );
     }
 
     #[test]
@@ -4337,7 +5343,11 @@ mod tests {
         // Verify SPIR-V header
         let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         assert_eq!(magic, SPIRV_MAGIC);
-        assert!(bytes.len() > 200, "Uniform vertex shader too small: {} bytes", bytes.len());
+        assert!(
+            bytes.len() > 200,
+            "Uniform vertex shader too small: {} bytes",
+            bytes.len()
+        );
 
         // Validate with spirv-val
         validate_spirv_bytes(&bytes, "uniform_vert")
@@ -4358,7 +5368,11 @@ mod tests {
         // Verify SPIR-V header
         let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         assert_eq!(magic, SPIRV_MAGIC);
-        assert!(bytes.len() > 150, "Textured fragment shader too small: {} bytes", bytes.len());
+        assert!(
+            bytes.len() > 150,
+            "Textured fragment shader too small: {} bytes",
+            bytes.len()
+        );
 
         // Validate with spirv-val
         validate_spirv_bytes(&bytes, "textured_frag")
@@ -4381,8 +5395,8 @@ mod tests {
         let mut backend = SpirvBackend::new();
         let vert_bytes = backend.generate_uniform_vertex_shader();
         let vert_path = out_dir.join("quanta_uniform_vert.spv");
-        let mut f = std::fs::File::create(&vert_path)
-            .expect("Failed to create quanta_uniform_vert.spv");
+        let mut f =
+            std::fs::File::create(&vert_path).expect("Failed to create quanta_uniform_vert.spv");
         f.write_all(&vert_bytes).expect("Failed to write");
         validate_spirv_bytes(&vert_bytes, "uniform_vert")
             .expect("Uniform vertex shader failed validation");
@@ -4391,8 +5405,8 @@ mod tests {
         let mut backend = SpirvBackend::new();
         let frag_bytes = backend.generate_textured_fragment_shader();
         let frag_path = out_dir.join("quanta_textured_frag.spv");
-        let mut f = std::fs::File::create(&frag_path)
-            .expect("Failed to create quanta_textured_frag.spv");
+        let mut f =
+            std::fs::File::create(&frag_path).expect("Failed to create quanta_textured_frag.spv");
         f.write_all(&frag_bytes).expect("Failed to write");
         validate_spirv_bytes(&frag_bytes, "textured_frag")
             .expect("Textured fragment shader failed validation");

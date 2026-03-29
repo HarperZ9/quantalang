@@ -10,16 +10,14 @@
 //! into a stream of tokens.
 
 use super::cursor::{
-    is_digit, is_hex_digit, is_id_continue, is_id_start,
-    is_whitespace, Cursor, EOF_CHAR,
+    is_digit, is_hex_digit, is_id_continue, is_id_start, is_whitespace, Cursor, EOF_CHAR,
 };
 use super::error::{LexerError, LexerErrorKind, LexerErrors, LexerResult};
 use super::span::{BytePos, SourceFile, Span};
 use super::token::{
-    is_dsl_name,
-    validate_numeric_suffix, Delimiter, DocComment, DocCommentKind, DocComments,
-    IntBase, InterpolatedPart, Keyword, LiteralKind, NumericSuffixKind,
-    NumericSuffixValidation, Token, TokenKind,
+    is_dsl_name, validate_numeric_suffix, Delimiter, DocComment, DocCommentKind, DocComments,
+    IntBase, InterpolatedPart, Keyword, LiteralKind, NumericSuffixKind, NumericSuffixValidation,
+    Token, TokenKind,
 };
 
 /// Configuration options for the lexer.
@@ -140,7 +138,11 @@ impl<'a> Lexer<'a> {
                     let is_eof = token.is_eof();
 
                     // Extract doc comment if this is one
-                    if let TokenKind::Comment { is_doc: true, is_inner } = token.kind {
+                    if let TokenKind::Comment {
+                        is_doc: true,
+                        is_inner,
+                    } = token.kind
+                    {
                         if let Some(doc) = self.extract_doc_comment(&token, is_inner) {
                             doc_comments.push(doc);
                         }
@@ -201,14 +203,20 @@ impl<'a> Lexer<'a> {
                 .strip_prefix("/**")
                 .and_then(|s| s.strip_suffix("*/"))
                 .unwrap_or(text);
-            (DocCommentKind::OuterBlock, self.clean_block_doc_content(content))
+            (
+                DocCommentKind::OuterBlock,
+                self.clean_block_doc_content(content),
+            )
         } else if text.starts_with("/*!") {
             // Block doc comment (inner)
             let content = text
                 .strip_prefix("/*!")
                 .and_then(|s| s.strip_suffix("*/"))
                 .unwrap_or(text);
-            (DocCommentKind::InnerBlock, self.clean_block_doc_content(content))
+            (
+                DocCommentKind::InnerBlock,
+                self.clean_block_doc_content(content),
+            )
         } else {
             return None;
         };
@@ -232,7 +240,13 @@ impl<'a> Lexer<'a> {
                 let indent = line.len() - trimmed.len();
                 // Also account for leading asterisk
                 let effective_start = if trimmed.starts_with('*') {
-                    indent + 1 + if trimmed.len() > 1 && trimmed.chars().nth(1) == Some(' ') { 1 } else { 0 }
+                    indent
+                        + 1
+                        + if trimmed.len() > 1 && trimmed.chars().nth(1) == Some(' ') {
+                            1
+                        } else {
+                            0
+                        }
                 } else {
                     indent
                 };
@@ -256,7 +270,10 @@ impl<'a> Lexer<'a> {
                 } else if trimmed.starts_with('*') {
                     // Remove leading asterisk and optional space
                     let after_star = trimmed.strip_prefix('*').unwrap_or(trimmed);
-                    after_star.strip_prefix(' ').unwrap_or(after_star).to_string()
+                    after_star
+                        .strip_prefix(' ')
+                        .unwrap_or(after_star)
+                        .to_string()
                 } else {
                     // Just remove the common indentation
                     if line.len() >= min_indent {
@@ -368,7 +385,10 @@ impl<'a> Lexer<'a> {
             'r' if self.cursor.first() == '#' || self.cursor.first() == '"' => {
                 return self.scan_raw_string_or_ident();
             }
-            'b' if self.cursor.first() == '"' || self.cursor.first() == '\'' || self.cursor.first() == 'r' => {
+            'b' if self.cursor.first() == '"'
+                || self.cursor.first() == '\''
+                || self.cursor.first() == 'r' =>
+            {
                 return self.scan_byte_string_or_ident();
             }
             'c' if self.cursor.first() == '"' => {
@@ -1447,7 +1467,10 @@ impl<'a> Lexer<'a> {
         let mut is_float = false;
 
         // Check for decimal point
-        if self.cursor.first() == '.' && self.cursor.second() != '.' && !is_id_start(self.cursor.second()) {
+        if self.cursor.first() == '.'
+            && self.cursor.second() != '.'
+            && !is_id_start(self.cursor.second())
+        {
             self.cursor.bump();
             is_float = true;
             self.scan_digits(10);
@@ -1813,7 +1836,10 @@ mod tests {
         assert!(matches!(lex_one("fn"), TokenKind::Keyword(Keyword::Fn)));
         assert!(matches!(lex_one("let"), TokenKind::Keyword(Keyword::Let)));
         assert!(matches!(lex_one("if"), TokenKind::Keyword(Keyword::If)));
-        assert!(matches!(lex_one("match"), TokenKind::Keyword(Keyword::Match)));
+        assert!(matches!(
+            lex_one("match"),
+            TokenKind::Keyword(Keyword::Match)
+        ));
     }
 
     #[test]
@@ -2164,7 +2190,11 @@ mod tests {
         let kind = lex_one("0xFFu8");
         match kind {
             TokenKind::Literal {
-                kind: LiteralKind::Int { base: IntBase::Hexadecimal, .. },
+                kind:
+                    LiteralKind::Int {
+                        base: IntBase::Hexadecimal,
+                        ..
+                    },
                 suffix: Some(s),
             } => assert_eq!(&*s, "u8"),
             _ => panic!("expected hex integer with u8 suffix"),
@@ -2176,7 +2206,11 @@ mod tests {
         let kind = lex_one("0b1010i32");
         match kind {
             TokenKind::Literal {
-                kind: LiteralKind::Int { base: IntBase::Binary, .. },
+                kind:
+                    LiteralKind::Int {
+                        base: IntBase::Binary,
+                        ..
+                    },
                 suffix: Some(s),
             } => assert_eq!(&*s, "i32"),
             _ => panic!("expected binary integer with i32 suffix"),
@@ -2188,7 +2222,11 @@ mod tests {
         let kind = lex_one("0o755u32");
         match kind {
             TokenKind::Literal {
-                kind: LiteralKind::Int { base: IntBase::Octal, .. },
+                kind:
+                    LiteralKind::Int {
+                        base: IntBase::Octal,
+                        ..
+                    },
                 suffix: Some(s),
             } => assert_eq!(&*s, "u32"),
             _ => panic!("expected octal integer with u32 suffix"),
@@ -2272,7 +2310,9 @@ mod tests {
     fn test_doc_comment_preserves_tokens() {
         let (tokens, docs) = lex_with_docs("/// Doc\nfn foo() {}");
         // Tokens should not include doc comments
-        assert!(!tokens.iter().any(|t| matches!(t.kind, TokenKind::Comment { .. })));
+        assert!(!tokens
+            .iter()
+            .any(|t| matches!(t.kind, TokenKind::Comment { .. })));
         // Should have fn, foo, (, ), {, }, EOF
         assert!(tokens.len() >= 7);
         // But we should have extracted the doc

@@ -11,11 +11,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::lexer::{TokenKind, Delimiter, Keyword};
+use crate::lexer::{Delimiter, Keyword, TokenKind};
 
 use super::{
-    MacroPattern, PatternElement, MetaVarKind, RepetitionKind,
-    TokenTree, MacroError, MacroResult,
+    MacroError, MacroPattern, MacroResult, MetaVarKind, PatternElement, RepetitionKind, TokenTree,
 };
 
 // =============================================================================
@@ -132,7 +131,11 @@ impl<'a> PatternMatcher<'a> {
     }
 
     /// Match a single pattern element.
-    fn match_element(&mut self, element: &PatternElement, bindings: &mut Bindings) -> MacroResult<()> {
+    fn match_element(
+        &mut self,
+        element: &PatternElement,
+        bindings: &mut Bindings,
+    ) -> MacroResult<()> {
         match element {
             PatternElement::Token(kind) => {
                 self.expect_token(kind)?;
@@ -141,10 +144,17 @@ impl<'a> PatternMatcher<'a> {
                 let value = self.match_metavar(*kind)?;
                 bindings.insert(name.clone(), Binding::Single(value));
             }
-            PatternElement::Repetition { elements, separator, repetition } => {
+            PatternElement::Repetition {
+                elements,
+                separator,
+                repetition,
+            } => {
                 self.match_repetition(elements, separator.as_ref(), *repetition, bindings)?;
             }
-            PatternElement::Delimited { delimiter, elements } => {
+            PatternElement::Delimited {
+                delimiter,
+                elements,
+            } => {
                 self.match_delimited(*delimiter, elements, bindings)?;
             }
         }
@@ -181,9 +191,15 @@ impl<'a> PatternMatcher<'a> {
                 let tt = self.input[self.pos - 1].clone();
                 Ok(BindingValue::TokenTree(tt))
             }
-            MetaVarKind::Expr | MetaVarKind::Type | MetaVarKind::Path
-            | MetaVarKind::Pat | MetaVarKind::Stmt | MetaVarKind::Block
-            | MetaVarKind::Item | MetaVarKind::Meta | MetaVarKind::Vis => {
+            MetaVarKind::Expr
+            | MetaVarKind::Type
+            | MetaVarKind::Path
+            | MetaVarKind::Pat
+            | MetaVarKind::Stmt
+            | MetaVarKind::Block
+            | MetaVarKind::Item
+            | MetaVarKind::Meta
+            | MetaVarKind::Vis => {
                 // For complex fragments, collect tokens until a delimiter or end
                 let trees = self.collect_fragment(kind)?;
                 Ok(BindingValue::TokenTrees(trees))
@@ -280,7 +296,11 @@ impl<'a> PatternMatcher<'a> {
         }
 
         match &self.input[self.pos] {
-            TokenTree::Delimited { delimiter: d, tokens, .. } if *d == delimiter => {
+            TokenTree::Delimited {
+                delimiter: d,
+                tokens,
+                ..
+            } if *d == delimiter => {
                 self.pos += 1;
 
                 // Match inner elements
@@ -389,27 +409,36 @@ impl<'a> PatternMatcher<'a> {
         match kind {
             MetaVarKind::Expr | MetaVarKind::Stmt => {
                 // Expressions/statements end at ; , => and closing delimiters
-                matches!(token,
-                    TokenKind::Semi | TokenKind::Comma | TokenKind::FatArrow
-                    | TokenKind::CloseDelim(_)
+                matches!(
+                    token,
+                    TokenKind::Semi
+                        | TokenKind::Comma
+                        | TokenKind::FatArrow
+                        | TokenKind::CloseDelim(_)
                 )
             }
             MetaVarKind::Type | MetaVarKind::Path => {
                 // Types/paths end at , ; = > and closing delimiters
-                matches!(token,
-                    TokenKind::Comma | TokenKind::Semi | TokenKind::Eq
-                    | TokenKind::Gt | TokenKind::CloseDelim(_)
+                matches!(
+                    token,
+                    TokenKind::Comma
+                        | TokenKind::Semi
+                        | TokenKind::Eq
+                        | TokenKind::Gt
+                        | TokenKind::CloseDelim(_)
                 )
             }
             MetaVarKind::Pat => {
                 // Patterns end at = | if and closing delimiters
-                matches!(token,
+                matches!(
+                    token,
                     TokenKind::Eq | TokenKind::Or | TokenKind::CloseDelim(_)
                 ) || matches!(token, TokenKind::Keyword(Keyword::If))
             }
             _ => {
                 // Default: end at common delimiters
-                matches!(token,
+                matches!(
+                    token,
                     TokenKind::Semi | TokenKind::Comma | TokenKind::CloseDelim(_)
                 )
             }
@@ -503,7 +532,7 @@ pub fn match_macro_pattern(pattern: &MacroPattern, input: &[TokenTree]) -> Macro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::{SourceFile, Lexer, Token};
+    use crate::lexer::{Lexer, SourceFile, Token};
     use crate::macro_expand::tokens_to_tree;
 
     fn lex(source: &str) -> Vec<Token> {
@@ -521,9 +550,7 @@ mod tests {
         let tokens = lex("foo");
         let trees = tokens_to_tree(&tokens);
 
-        let pattern = make_pattern(vec![
-            PatternElement::Token(TokenKind::Ident),
-        ]);
+        let pattern = make_pattern(vec![PatternElement::Token(TokenKind::Ident)]);
 
         let bindings = match_macro_pattern(&pattern, &trees).unwrap();
         assert!(bindings.bindings.is_empty());
@@ -534,12 +561,10 @@ mod tests {
         let tokens = lex("foo");
         let trees = tokens_to_tree(&tokens);
 
-        let pattern = make_pattern(vec![
-            PatternElement::MetaVar {
-                name: "x".into(),
-                kind: MetaVarKind::Ident,
-            },
-        ]);
+        let pattern = make_pattern(vec![PatternElement::MetaVar {
+            name: "x".into(),
+            kind: MetaVarKind::Ident,
+        }]);
 
         let bindings = match_macro_pattern(&pattern, &trees).unwrap();
         assert!(bindings.get("x").is_some());
@@ -550,12 +575,10 @@ mod tests {
         let tokens = lex("(1 + 2)");
         let trees = tokens_to_tree(&tokens);
 
-        let pattern = make_pattern(vec![
-            PatternElement::MetaVar {
-                name: "e".into(),
-                kind: MetaVarKind::TokenTree,
-            },
-        ]);
+        let pattern = make_pattern(vec![PatternElement::MetaVar {
+            name: "e".into(),
+            kind: MetaVarKind::TokenTree,
+        }]);
 
         let bindings = match_macro_pattern(&pattern, &trees).unwrap();
         assert!(bindings.get("e").is_some());

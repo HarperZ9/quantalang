@@ -37,20 +37,20 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 
-pub mod types;
-pub mod message;
-pub mod transport;
-pub mod server;
-pub mod document;
+pub mod actions;
 pub mod completion;
-pub mod hover;
 pub mod definition;
 pub mod diagnostics;
+pub mod document;
+pub mod hover;
+pub mod message;
+pub mod server;
 pub mod symbols;
-pub mod actions;
+pub mod transport;
+pub mod types;
 
-pub use types::*;
-pub use message::*;
-pub use transport::*;
-pub use server::*;
 pub use document::*;
+pub use message::*;
+pub use server::*;
+pub use transport::*;
+pub use types::*;

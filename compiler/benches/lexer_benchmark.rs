@@ -260,7 +260,8 @@ fn bench_comments(c: &mut Criterion) {
         /* Nested /* comments /* are /* supported */ */ */ */
         /// Doc comment
         fn foo() {}
-    "#.repeat(100);
+    "#
+    .repeat(100);
 
     let source = SourceFile::anonymous(&commented);
     group.throughput(Throughput::Bytes(commented.len() as u64));

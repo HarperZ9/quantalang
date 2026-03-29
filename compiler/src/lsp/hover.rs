@@ -75,10 +75,12 @@ impl HoverProvider {
             }
 
             // Struct definition
-            if let Some(rest) = trimmed.strip_prefix("struct ")
+            if let Some(rest) = trimmed
+                .strip_prefix("struct ")
                 .or_else(|| trimmed.strip_prefix("pub struct "))
             {
-                let struct_name = rest.split(|c: char| !c.is_alphanumeric() && c != '_')
+                let struct_name = rest
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
                     .next()
                     .unwrap_or("");
                 if struct_name == name {
@@ -90,10 +92,12 @@ impl HoverProvider {
             }
 
             // Enum definition
-            if let Some(rest) = trimmed.strip_prefix("enum ")
+            if let Some(rest) = trimmed
+                .strip_prefix("enum ")
                 .or_else(|| trimmed.strip_prefix("pub enum "))
             {
-                let enum_name = rest.split(|c: char| !c.is_alphanumeric() && c != '_')
+                let enum_name = rest
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
                     .next()
                     .unwrap_or("");
                 if enum_name == name {
@@ -105,10 +109,12 @@ impl HoverProvider {
             }
 
             // Trait definition
-            if let Some(rest) = trimmed.strip_prefix("trait ")
+            if let Some(rest) = trimmed
+                .strip_prefix("trait ")
                 .or_else(|| trimmed.strip_prefix("pub trait "))
             {
-                let trait_name = rest.split(|c: char| !c.is_alphanumeric() && c != '_')
+                let trait_name = rest
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
                     .next()
                     .unwrap_or("");
                 if trait_name == name {
@@ -120,17 +126,20 @@ impl HoverProvider {
             }
 
             // Let binding
-            if let Some(rest) = trimmed.strip_prefix("let ")
+            if let Some(rest) = trimmed
+                .strip_prefix("let ")
                 .or_else(|| trimmed.strip_prefix("let mut "))
             {
-                let var_end = rest.find(|c: char| c == ':' || c == '=' || c == ' ')
+                let var_end = rest
+                    .find(|c: char| c == ':' || c == '=' || c == ' ')
                     .unwrap_or(rest.len());
                 let var_name = rest[..var_end].trim();
                 if var_name == name {
                     // Try to extract type annotation
                     if let Some(colon_pos) = rest.find(':') {
                         let type_start = colon_pos + 1;
-                        let type_end = rest[type_start..].find('=')
+                        let type_end = rest[type_start..]
+                            .find('=')
                             .map(|i| type_start + i)
                             .unwrap_or(rest.len());
                         let type_name = rest[type_start..type_end].trim();
@@ -147,7 +156,8 @@ impl HoverProvider {
             }
 
             // Const binding
-            if let Some(rest) = trimmed.strip_prefix("const ")
+            if let Some(rest) = trimmed
+                .strip_prefix("const ")
                 .or_else(|| trimmed.strip_prefix("pub const "))
             {
                 let const_end = rest.find(':').unwrap_or(rest.len());

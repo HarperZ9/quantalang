@@ -134,13 +134,19 @@ impl LanguageServer {
     // =========================================================================
 
     /// Handle didOpen notification.
-    pub fn did_open(&mut self, params: DidOpenTextDocumentParams) -> Option<PublishDiagnosticsParams> {
+    pub fn did_open(
+        &mut self,
+        params: DidOpenTextDocumentParams,
+    ) -> Option<PublishDiagnosticsParams> {
         let doc = self.documents.open(params.text_document);
         Some(self.diagnostics.compute(&doc))
     }
 
     /// Handle didChange notification.
-    pub fn did_change(&mut self, params: DidChangeTextDocumentParams) -> Option<PublishDiagnosticsParams> {
+    pub fn did_change(
+        &mut self,
+        params: DidChangeTextDocumentParams,
+    ) -> Option<PublishDiagnosticsParams> {
         let doc = self.documents.update(
             &params.text_document.uri,
             params.text_document.version,
@@ -150,7 +156,10 @@ impl LanguageServer {
     }
 
     /// Handle didSave notification.
-    pub fn did_save(&mut self, params: DidSaveTextDocumentParams) -> Option<PublishDiagnosticsParams> {
+    pub fn did_save(
+        &mut self,
+        params: DidSaveTextDocumentParams,
+    ) -> Option<PublishDiagnosticsParams> {
         let doc = self.documents.get(&params.text_document.uri)?;
         Some(self.diagnostics.compute(&doc))
     }
@@ -166,8 +175,13 @@ impl LanguageServer {
 
     /// Handle completion request.
     pub fn completion(&self, params: CompletionParams) -> Option<CompletionList> {
-        let doc = self.documents.get(&params.text_document_position.text_document.uri)?;
-        Some(self.completion.provide(&doc, params.text_document_position.position))
+        let doc = self
+            .documents
+            .get(&params.text_document_position.text_document.uri)?;
+        Some(
+            self.completion
+                .provide(&doc, params.text_document_position.position),
+        )
     }
 
     /// Handle hover request.
@@ -271,11 +285,11 @@ impl LanguageServer {
             // Check word boundaries to avoid matching substrings
             let before_ok = abs_pos == 0
                 || !content.as_bytes()[abs_pos - 1].is_ascii_alphanumeric()
-                && content.as_bytes()[abs_pos - 1] != b'_';
+                    && content.as_bytes()[abs_pos - 1] != b'_';
             let after_pos = abs_pos + word.len();
             let after_ok = after_pos >= content.len()
                 || !content.as_bytes()[after_pos].is_ascii_alphanumeric()
-                && content.as_bytes()[after_pos] != b'_';
+                    && content.as_bytes()[after_pos] != b'_';
 
             if before_ok && after_ok {
                 let start = doc.position_at(abs_pos);
@@ -336,7 +350,9 @@ impl LanguageServer {
 
     /// Handle rename request.
     pub fn rename(&self, params: RenameParams) -> Option<WorkspaceEdit> {
-        let doc = self.documents.get(&params.text_document_position.text_document.uri)?;
+        let doc = self
+            .documents
+            .get(&params.text_document_position.text_document.uri)?;
         let (word, _range) = doc.word_at(params.text_document_position.position)?;
 
         // Find all occurrences in the document
@@ -347,9 +363,11 @@ impl LanguageServer {
         while let Some(pos) = content[offset..].find(&word) {
             let abs_pos = offset + pos;
             // Check word boundaries
-            let before_ok = abs_pos == 0 || !content.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
+            let before_ok =
+                abs_pos == 0 || !content.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
             let after_pos = abs_pos + word.len();
-            let after_ok = after_pos >= content.len() || !content.as_bytes()[after_pos].is_ascii_alphanumeric();
+            let after_ok = after_pos >= content.len()
+                || !content.as_bytes()[after_pos].is_ascii_alphanumeric();
 
             if before_ok && after_ok {
                 let start = doc.position_at(abs_pos);
@@ -574,7 +592,13 @@ fn extract_json_string(content: &str, key: &str) -> Option<String> {
     let bytes = rest.as_bytes();
     while end < bytes.len() {
         if bytes[end] == b'"' {
-            return Some(rest[..end].replace("\\\"", "\"").replace("\\\\", "\\").replace("\\n", "\n").replace("\\t", "\t"));
+            return Some(
+                rest[..end]
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\")
+                    .replace("\\n", "\n")
+                    .replace("\\t", "\t"),
+            );
         }
         if bytes[end] == b'\\' {
             end += 1; // skip escaped char
@@ -592,7 +616,9 @@ fn extract_json_number(content: &str, key: &str) -> Option<i64> {
     let rest = rest.trim_start();
     let rest = rest.strip_prefix(':')?;
     let rest = rest.trim_start();
-    let end = rest.find(|c: char| !c.is_ascii_digit() && c != '-').unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }
 
@@ -734,7 +760,8 @@ fn handle_raw_message(server: &mut LanguageServer, content: &str) -> Option<Stri
 
     if content.contains("\"method\":\"textDocument/didOpen\"") {
         let uri = extract_json_string(content, "uri").unwrap_or_default();
-        let language_id = extract_json_string(content, "languageId").unwrap_or_else(|| "quanta".to_string());
+        let language_id =
+            extract_json_string(content, "languageId").unwrap_or_else(|| "quanta".to_string());
         let version = extract_json_number(content, "version").unwrap_or(0) as i32;
         let text = extract_json_string(content, "text").unwrap_or_default();
         let params = DidOpenTextDocumentParams {
@@ -758,10 +785,7 @@ fn handle_raw_message(server: &mut LanguageServer, content: &str) -> Option<Stri
         let text = extract_json_string(content, "text").unwrap_or_default();
         let params = DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier { uri, version },
-            content_changes: vec![TextDocumentContentChangeEvent {
-                range: None,
-                text,
-            }],
+            content_changes: vec![TextDocumentContentChangeEvent { range: None, text }],
         };
         if let Some(diag) = server.did_change(params) {
             return Some(build_diagnostics_notification(&diag));
@@ -829,7 +853,10 @@ fn handle_raw_message(server: &mut LanguageServer, content: &str) -> Option<Stri
             }
             None => JsonBuilder::null(),
         };
-        return Some(build_response(id.unwrap_or_else(|| "1".to_string()), result_json));
+        return Some(build_response(
+            id.unwrap_or_else(|| "1".to_string()),
+            result_json,
+        ));
     }
 
     if content.contains("\"method\":\"textDocument/hover\"") {
@@ -860,7 +887,10 @@ fn handle_raw_message(server: &mut LanguageServer, content: &str) -> Option<Stri
             }
             None => JsonBuilder::null(),
         };
-        return Some(build_response(id.unwrap_or_else(|| "1".to_string()), result_json));
+        return Some(build_response(
+            id.unwrap_or_else(|| "1".to_string()),
+            result_json,
+        ));
     }
 
     if content.contains("\"method\":\"textDocument/definition\"") {
@@ -875,7 +905,10 @@ fn handle_raw_message(server: &mut LanguageServer, content: &str) -> Option<Stri
         for loc in &locations {
             arr = arr.item(build_location_json(loc));
         }
-        return Some(build_response(id.unwrap_or_else(|| "1".to_string()), arr.build()));
+        return Some(build_response(
+            id.unwrap_or_else(|| "1".to_string()),
+            arr.build(),
+        ));
     }
 
     if content.contains("\"method\":\"textDocument/references\"") {
@@ -890,14 +923,20 @@ fn handle_raw_message(server: &mut LanguageServer, content: &str) -> Option<Stri
         for loc in &locations {
             arr = arr.item(build_location_json(loc));
         }
-        return Some(build_response(id.unwrap_or_else(|| "1".to_string()), arr.build()));
+        return Some(build_response(
+            id.unwrap_or_else(|| "1".to_string()),
+            arr.build(),
+        ));
     }
 
     if content.contains("\"method\":\"textDocument/documentSymbol\"") {
         let uri = extract_uri(content).unwrap_or_default();
         let symbols = server.document_symbol(&uri);
         let result = build_symbols_json(&symbols);
-        return Some(build_response(id.unwrap_or_else(|| "1".to_string()), result));
+        return Some(build_response(
+            id.unwrap_or_else(|| "1".to_string()),
+            result,
+        ));
     }
 
     if content.contains("\"method\":\"textDocument/formatting\"") {
@@ -916,7 +955,10 @@ fn handle_raw_message(server: &mut LanguageServer, content: &str) -> Option<Stri
                     .build(),
             );
         }
-        return Some(build_response(id.unwrap_or_else(|| "1".to_string()), arr.build()));
+        return Some(build_response(
+            id.unwrap_or_else(|| "1".to_string()),
+            arr.build(),
+        ));
     }
 
     if content.contains("\"method\":\"textDocument/foldingRange\"") {
@@ -937,7 +979,10 @@ fn handle_raw_message(server: &mut LanguageServer, content: &str) -> Option<Stri
             }
             arr = arr.item(obj.build());
         }
-        return Some(build_response(id.unwrap_or_else(|| "1".to_string()), arr.build()));
+        return Some(build_response(
+            id.unwrap_or_else(|| "1".to_string()),
+            arr.build(),
+        ));
     }
 
     // =========================================================================
@@ -1008,33 +1053,32 @@ fn extract_id(content: &str) -> Option<String> {
 fn build_initialize_result(result: &InitializeResult) -> String {
     let _caps = &result.capabilities;
 
-    let mut builder = JsonObjectBuilder::new()
-        .field(
-            "capabilities",
-            JsonObjectBuilder::new()
-                .field_number("textDocumentSync", 2) // Incremental
-                .field(
-                    "completionProvider",
-                    JsonObjectBuilder::new()
-                        .field(
-                            "triggerCharacters",
-                            JsonArrayBuilder::new()
-                                .item(JsonBuilder::string("."))
-                                .item(JsonBuilder::string(":"))
-                                .build(),
-                        )
-                        .field_bool("resolveProvider", true)
-                        .build(),
-                )
-                .field_bool("hoverProvider", true)
-                .field_bool("definitionProvider", true)
-                .field_bool("referencesProvider", true)
-                .field_bool("documentSymbolProvider", true)
-                .field_bool("documentFormattingProvider", true)
-                .field_bool("renameProvider", true)
-                .field_bool("foldingRangeProvider", true)
-                .build(),
-        );
+    let mut builder = JsonObjectBuilder::new().field(
+        "capabilities",
+        JsonObjectBuilder::new()
+            .field_number("textDocumentSync", 2) // Incremental
+            .field(
+                "completionProvider",
+                JsonObjectBuilder::new()
+                    .field(
+                        "triggerCharacters",
+                        JsonArrayBuilder::new()
+                            .item(JsonBuilder::string("."))
+                            .item(JsonBuilder::string(":"))
+                            .build(),
+                    )
+                    .field_bool("resolveProvider", true)
+                    .build(),
+            )
+            .field_bool("hoverProvider", true)
+            .field_bool("definitionProvider", true)
+            .field_bool("referencesProvider", true)
+            .field_bool("documentSymbolProvider", true)
+            .field_bool("documentFormattingProvider", true)
+            .field_bool("renameProvider", true)
+            .field_bool("foldingRangeProvider", true)
+            .build(),
+    );
 
     if let Some(ref info) = result.server_info {
         builder = builder.field(
@@ -1089,7 +1133,10 @@ mod tests {
 
     #[test]
     fn test_extract_id() {
-        assert_eq!(extract_id(r#"{"id":1,"method":"test"}"#), Some("1".to_string()));
+        assert_eq!(
+            extract_id(r#"{"id":1,"method":"test"}"#),
+            Some("1".to_string())
+        );
         assert_eq!(
             extract_id(r#"{"id":"abc","method":"test"}"#),
             Some("\"abc\"".to_string())

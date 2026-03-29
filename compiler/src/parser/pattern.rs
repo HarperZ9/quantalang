@@ -9,9 +9,9 @@
 //! This module handles parsing of all pattern expressions in QuantaLang,
 //! used in match arms, let bindings, function parameters, etc.
 
+use super::{ParseError, ParseErrorKind, ParseResult, Parser};
 use crate::ast::*;
-use crate::lexer::{Delimiter, Keyword, TokenKind, LiteralKind, IntBase};
-use super::{Parser, ParseResult, ParseError, ParseErrorKind};
+use crate::lexer::{Delimiter, IntBase, Keyword, LiteralKind, TokenKind};
 
 impl<'a> Parser<'a> {
     /// Parse a pattern.
@@ -126,7 +126,10 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            TokenKind::Literal { ref kind, ref suffix } => {
+            TokenKind::Literal {
+                ref kind,
+                ref suffix,
+            } => {
                 let kind = kind.clone();
                 let suffix = suffix.clone();
                 self.advance();
@@ -144,16 +147,12 @@ impl<'a> Parser<'a> {
             // =================================================================
             // TUPLE PATTERN: (pat, pat, ...)
             // =================================================================
-            TokenKind::OpenDelim(Delimiter::Paren) => {
-                self.parse_tuple_pattern()
-            }
+            TokenKind::OpenDelim(Delimiter::Paren) => self.parse_tuple_pattern(),
 
             // =================================================================
             // SLICE PATTERN: [pat, pat, ...]
             // =================================================================
-            TokenKind::OpenDelim(Delimiter::Bracket) => {
-                self.parse_slice_pattern()
-            }
+            TokenKind::OpenDelim(Delimiter::Bracket) => self.parse_slice_pattern(),
 
             // =================================================================
             // MUT IDENTIFIER: mut x
@@ -212,11 +211,13 @@ impl<'a> Parser<'a> {
             // =================================================================
             // PATH / IDENTIFIER / STRUCT / TUPLE STRUCT PATTERNS
             // =================================================================
-            TokenKind::Ident | TokenKind::RawIdent | TokenKind::ColonColon
-            | TokenKind::Keyword(Keyword::Crate | Keyword::Super | Keyword::Self_ | Keyword::SelfType)
-            | TokenKind::Keyword(Keyword::Default | Keyword::Module) => {
-                self.parse_path_pattern()
-            }
+            TokenKind::Ident
+            | TokenKind::RawIdent
+            | TokenKind::ColonColon
+            | TokenKind::Keyword(
+                Keyword::Crate | Keyword::Super | Keyword::Self_ | Keyword::SelfType,
+            )
+            | TokenKind::Keyword(Keyword::Default | Keyword::Module) => self.parse_path_pattern(),
 
             // =================================================================
             // ERROR
@@ -238,7 +239,10 @@ impl<'a> Parser<'a> {
 
         // Try to parse as simple identifier first
         let is_simple_ident = (self.check_ident() || self.is_contextual_keyword())
-            && !matches!(self.peek().kind, TokenKind::ColonColon | TokenKind::OpenDelim(_));
+            && !matches!(
+                self.peek().kind,
+                TokenKind::ColonColon | TokenKind::OpenDelim(_)
+            );
 
         if is_simple_ident && !matches!(self.peek().kind, TokenKind::OpenDelim(_)) {
             let name = self.expect_ident()?;
@@ -273,14 +277,10 @@ impl<'a> Parser<'a> {
         // Check what follows the path
         match self.current_kind() {
             // Struct pattern: Path { field: pat, ... }
-            TokenKind::OpenDelim(Delimiter::Brace) => {
-                self.parse_struct_pattern(path, start)
-            }
+            TokenKind::OpenDelim(Delimiter::Brace) => self.parse_struct_pattern(path, start),
 
             // Tuple struct pattern: Path(pat, ...)
-            TokenKind::OpenDelim(Delimiter::Paren) => {
-                self.parse_tuple_struct_pattern(path, start)
-            }
+            TokenKind::OpenDelim(Delimiter::Paren) => self.parse_tuple_struct_pattern(path, start),
 
             // Range pattern
             TokenKind::DotDot | TokenKind::DotDotEq => {
@@ -313,7 +313,11 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse struct pattern: Path { field: pat, field, .. }
-    fn parse_struct_pattern(&mut self, path: Path, start: crate::lexer::Span) -> ParseResult<Pattern> {
+    fn parse_struct_pattern(
+        &mut self,
+        path: Path,
+        start: crate::lexer::Span,
+    ) -> ParseResult<Pattern> {
         self.expect(&TokenKind::OpenDelim(Delimiter::Brace))?;
 
         let mut fields = Vec::new();
@@ -344,14 +348,17 @@ impl<'a> Parser<'a> {
                 (self.parse_pattern()?, false)
             } else {
                 // Shorthand: just field name
-                (Pattern::new(
-                    PatternKind::Ident {
-                        mutability,
-                        name: name.clone(),
-                        subpattern: None,
-                    },
-                    name.span,
-                ), true)
+                (
+                    Pattern::new(
+                        PatternKind::Ident {
+                            mutability,
+                            name: name.clone(),
+                            subpattern: None,
+                        },
+                        name.span,
+                    ),
+                    true,
+                )
             };
 
             let field_span = field_start.merge(&pattern.span);
@@ -371,15 +378,25 @@ impl<'a> Parser<'a> {
         let end = self.expect(&TokenKind::CloseDelim(Delimiter::Brace))?.span;
         let span = start.merge(&end);
 
-        Ok(Pattern::new(PatternKind::Struct { path, fields, rest }, span))
+        Ok(Pattern::new(
+            PatternKind::Struct { path, fields, rest },
+            span,
+        ))
     }
 
     /// Parse tuple struct pattern: Path(pat, pat, ...)
-    fn parse_tuple_struct_pattern(&mut self, path: Path, start: crate::lexer::Span) -> ParseResult<Pattern> {
+    fn parse_tuple_struct_pattern(
+        &mut self,
+        path: Path,
+        start: crate::lexer::Span,
+    ) -> ParseResult<Pattern> {
         let (patterns, paren_span) = self.parse_paren_comma_seq(|p| p.parse_pattern())?;
         let span = start.merge(&paren_span);
 
-        Ok(Pattern::new(PatternKind::TupleStruct { path, patterns }, span))
+        Ok(Pattern::new(
+            PatternKind::TupleStruct { path, patterns },
+            span,
+        ))
     }
 
     /// Parse tuple pattern: (pat, pat, ...)
@@ -389,7 +406,10 @@ impl<'a> Parser<'a> {
         // Empty tuple: ()
         if self.check(&TokenKind::CloseDelim(Delimiter::Paren)) {
             let end = self.advance().span;
-            return Ok(Pattern::new(PatternKind::Tuple(Vec::new()), start.merge(&end)));
+            return Ok(Pattern::new(
+                PatternKind::Tuple(Vec::new()),
+                start.merge(&end),
+            ));
         }
 
         let mut patterns = Vec::new();
@@ -425,14 +445,20 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let end = self.expect(&TokenKind::CloseDelim(Delimiter::Bracket))?.span;
+        let end = self
+            .expect(&TokenKind::CloseDelim(Delimiter::Bracket))?
+            .span;
         let span = start.merge(&end);
 
         Ok(Pattern::new(PatternKind::Slice(patterns), span))
     }
 
     /// Parse range pattern from literal: 1..10 or 1..=10
-    fn parse_range_pattern(&mut self, start_lit: Literal, start_span: crate::lexer::Span) -> ParseResult<Pattern> {
+    fn parse_range_pattern(
+        &mut self,
+        start_lit: Literal,
+        start_span: crate::lexer::Span,
+    ) -> ParseResult<Pattern> {
         use crate::ast::{Expr, ExprKind, NodeId};
 
         let start_pattern = Pattern::new(PatternKind::Literal(start_lit.clone()), start_span);
@@ -479,7 +505,11 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse range pattern from path.
-    fn parse_range_pattern_from_path(&mut self, path: Path, start_span: crate::lexer::Span) -> ParseResult<Pattern> {
+    fn parse_range_pattern_from_path(
+        &mut self,
+        path: Path,
+        start_span: crate::lexer::Span,
+    ) -> ParseResult<Pattern> {
         use crate::ast::{Expr, ExprKind, NodeId};
 
         let start_pattern = Pattern::new(PatternKind::Path(path.clone()), start_span);
@@ -576,7 +606,9 @@ impl<'a> Parser<'a> {
                     IntBase::Octal => text[2..].replace('_', ""),
                     IntBase::Binary => text[2..].replace('_', ""),
                 };
-                let text = suffix.map_or(text.as_str(), |s| &text[..text.len() - s.len()]).to_string();
+                let text = suffix
+                    .map_or(text.as_str(), |s| &text[..text.len() - s.len()])
+                    .to_string();
                 let value = u128::from_str_radix(&text, base.radix()).unwrap_or(0);
                 // Store as negative value (wrapping)
                 let int_suffix = suffix.and_then(IntSuffix::from_str);
@@ -637,10 +669,7 @@ mod tests {
 
     /// Parse a pattern by wrapping it in `fn test() { let PATTERN = x; }`.
     fn parse_pattern_str(s: &str) -> ParseResult<Pattern> {
-        let source = LexerSourceFile::new(
-            "test.quanta",
-            format!("fn test() {{ let {} = x; }}", s),
-        );
+        let source = LexerSourceFile::new("test.quanta", format!("fn test() {{ let {} = x; }}", s));
         let mut lexer = Lexer::new(&source);
         let tokens = lexer.tokenize().unwrap();
         let mut parser = Parser::new(&source, tokens);
@@ -667,7 +696,9 @@ mod tests {
     fn binding_pattern() {
         let pat = parse_pattern_str("x").unwrap();
         match &pat.kind {
-            PatternKind::Ident { name, mutability, .. } => {
+            PatternKind::Ident {
+                name, mutability, ..
+            } => {
                 assert_eq!(name.as_str(), "x");
                 assert_eq!(*mutability, Mutability::Immutable);
             }
@@ -681,9 +712,15 @@ mod tests {
         match &pat.kind {
             PatternKind::Tuple(patterns) => {
                 assert_eq!(patterns.len(), 3);
-                assert!(matches!(&patterns[0].kind, PatternKind::Ident { name, .. } if name.as_str() == "a"));
-                assert!(matches!(&patterns[1].kind, PatternKind::Ident { name, .. } if name.as_str() == "b"));
-                assert!(matches!(&patterns[2].kind, PatternKind::Ident { name, .. } if name.as_str() == "c"));
+                assert!(
+                    matches!(&patterns[0].kind, PatternKind::Ident { name, .. } if name.as_str() == "a")
+                );
+                assert!(
+                    matches!(&patterns[1].kind, PatternKind::Ident { name, .. } if name.as_str() == "b")
+                );
+                assert!(
+                    matches!(&patterns[2].kind, PatternKind::Ident { name, .. } if name.as_str() == "c")
+                );
             }
             other => panic!("expected Tuple pattern, got {:?}", other),
         }
@@ -712,7 +749,9 @@ mod tests {
             PatternKind::TupleStruct { path, patterns } => {
                 assert_eq!(path.segments.last().unwrap().ident.as_str(), "Some");
                 assert_eq!(patterns.len(), 1);
-                assert!(matches!(&patterns[0].kind, PatternKind::Ident { name, .. } if name.as_str() == "value"));
+                assert!(
+                    matches!(&patterns[0].kind, PatternKind::Ident { name, .. } if name.as_str() == "value")
+                );
             }
             other => panic!("expected TupleStruct pattern, got {:?}", other),
         }
@@ -755,7 +794,9 @@ mod tests {
     fn mut_binding() {
         let pat = parse_pattern_str("mut x").unwrap();
         match &pat.kind {
-            PatternKind::Ident { name, mutability, .. } => {
+            PatternKind::Ident {
+                name, mutability, ..
+            } => {
                 assert_eq!(name.as_str(), "x");
                 assert_eq!(*mutability, Mutability::Mutable);
             }

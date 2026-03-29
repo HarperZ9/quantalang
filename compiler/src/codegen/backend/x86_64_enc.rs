@@ -35,10 +35,22 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Reg64 {
-    RAX = 0, RCX = 1, RDX = 2, RBX = 3,
-    RSP = 4, RBP = 5, RSI = 6, RDI = 7,
-    R8 = 8, R9 = 9, R10 = 10, R11 = 11,
-    R12 = 12, R13 = 13, R14 = 14, R15 = 15,
+    RAX = 0,
+    RCX = 1,
+    RDX = 2,
+    RBX = 3,
+    RSP = 4,
+    RBP = 5,
+    RSI = 6,
+    RDI = 7,
+    R8 = 8,
+    R9 = 9,
+    R10 = 10,
+    R11 = 11,
+    R12 = 12,
+    R13 = 13,
+    R14 = 14,
+    R15 = 15,
 }
 
 impl Reg64 {
@@ -72,10 +84,22 @@ impl Reg64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Reg32 {
-    EAX = 0, ECX = 1, EDX = 2, EBX = 3,
-    ESP = 4, EBP = 5, ESI = 6, EDI = 7,
-    R8D = 8, R9D = 9, R10D = 10, R11D = 11,
-    R12D = 12, R13D = 13, R14D = 14, R15D = 15,
+    EAX = 0,
+    ECX = 1,
+    EDX = 2,
+    EBX = 3,
+    ESP = 4,
+    EBP = 5,
+    ESI = 6,
+    EDI = 7,
+    R8D = 8,
+    R9D = 9,
+    R10D = 10,
+    R11D = 11,
+    R12D = 12,
+    R13D = 13,
+    R14D = 14,
+    R15D = 15,
 }
 
 impl Reg32 {
@@ -92,10 +116,22 @@ impl Reg32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Reg16 {
-    AX = 0, CX = 1, DX = 2, BX = 3,
-    SP = 4, BP = 5, SI = 6, DI = 7,
-    R8W = 8, R9W = 9, R10W = 10, R11W = 11,
-    R12W = 12, R13W = 13, R14W = 14, R15W = 15,
+    AX = 0,
+    CX = 1,
+    DX = 2,
+    BX = 3,
+    SP = 4,
+    BP = 5,
+    SI = 6,
+    DI = 7,
+    R8W = 8,
+    R9W = 9,
+    R10W = 10,
+    R11W = 11,
+    R12W = 12,
+    R13W = 13,
+    R14W = 14,
+    R15W = 15,
 }
 
 impl Reg16 {
@@ -112,11 +148,26 @@ impl Reg16 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Reg8 {
-    AL = 0, CL = 1, DL = 2, BL = 3,
-    AH = 4, CH = 5, DH = 6, BH = 7,
-    R8B = 8, R9B = 9, R10B = 10, R11B = 11,
-    R12B = 12, R13B = 13, R14B = 14, R15B = 15,
-    SPL = 16, BPL = 17, SIL = 18, DIL = 19,
+    AL = 0,
+    CL = 1,
+    DL = 2,
+    BL = 3,
+    AH = 4,
+    CH = 5,
+    DH = 6,
+    BH = 7,
+    R8B = 8,
+    R9B = 9,
+    R10B = 10,
+    R11B = 11,
+    R12B = 12,
+    R13B = 13,
+    R14B = 14,
+    R15B = 15,
+    SPL = 16,
+    BPL = 17,
+    SIL = 18,
+    DIL = 19,
 }
 
 impl Reg8 {
@@ -142,10 +193,22 @@ impl Reg8 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RegXmm {
-    XMM0 = 0, XMM1 = 1, XMM2 = 2, XMM3 = 3,
-    XMM4 = 4, XMM5 = 5, XMM6 = 6, XMM7 = 7,
-    XMM8 = 8, XMM9 = 9, XMM10 = 10, XMM11 = 11,
-    XMM12 = 12, XMM13 = 13, XMM14 = 14, XMM15 = 15,
+    XMM0 = 0,
+    XMM1 = 1,
+    XMM2 = 2,
+    XMM3 = 3,
+    XMM4 = 4,
+    XMM5 = 5,
+    XMM6 = 6,
+    XMM7 = 7,
+    XMM8 = 8,
+    XMM9 = 9,
+    XMM10 = 10,
+    XMM11 = 11,
+    XMM12 = 12,
+    XMM13 = 13,
+    XMM14 = 14,
+    XMM15 = 15,
 }
 
 impl RegXmm {
@@ -239,9 +302,9 @@ impl Mem {
 
     /// Check if this memory operand needs a SIB byte.
     fn needs_sib(&self) -> bool {
-        self.index.is_some() ||
-        self.base.map_or(false, |b| b.requires_sib()) ||
-        (self.base.is_none() && !self.rip_relative)
+        self.index.is_some()
+            || self.base.map_or(false, |b| b.requires_sib())
+            || (self.base.is_none() && !self.rip_relative)
     }
 
     /// Get the Mod field for ModR/M byte.
@@ -365,7 +428,10 @@ impl Rex {
 
     /// Encode to byte.
     pub fn encode(&self) -> u8 {
-        0x40 | ((self.w as u8) << 3) | ((self.r as u8) << 2) | ((self.x as u8) << 1) | (self.b as u8)
+        0x40 | ((self.w as u8) << 3)
+            | ((self.r as u8) << 2)
+            | ((self.x as u8) << 1)
+            | (self.b as u8)
     }
 }
 
@@ -1300,15 +1366,15 @@ impl X86_64Encoder {
     pub fn nop_n(&mut self, n: usize) {
         // Use recommended NOP encodings
         let nops: &[&[u8]] = &[
-            &[],                                          // 0
-            &[0x90],                                      // 1
-            &[0x66, 0x90],                               // 2
-            &[0x0F, 0x1F, 0x00],                         // 3
-            &[0x0F, 0x1F, 0x40, 0x00],                   // 4
-            &[0x0F, 0x1F, 0x44, 0x00, 0x00],             // 5
-            &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],       // 6
-            &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00], // 7
-            &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00], // 8
+            &[],                                                     // 0
+            &[0x90],                                                 // 1
+            &[0x66, 0x90],                                           // 2
+            &[0x0F, 0x1F, 0x00],                                     // 3
+            &[0x0F, 0x1F, 0x40, 0x00],                               // 4
+            &[0x0F, 0x1F, 0x44, 0x00, 0x00],                         // 5
+            &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],                   // 6
+            &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],             // 7
+            &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],       // 8
             &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00], // 9
         ];
 

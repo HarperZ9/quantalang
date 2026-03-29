@@ -8,16 +8,16 @@
 //!
 //! Each backend takes MIR and produces target-specific output.
 
-pub mod c;
-pub mod x86_64;
-pub mod x86_64_enc;
 pub mod arm64;
 pub mod arm64_enc;
-pub mod wasm;
-pub mod spirv;
-pub mod llvm;
-pub mod hlsl;
+pub mod c;
 pub mod glsl;
+pub mod hlsl;
+pub mod llvm;
+pub mod spirv;
+pub mod wasm;
+pub mod x86_64;
+pub mod x86_64_enc;
 
 use std::fmt;
 use thiserror::Error;
@@ -68,7 +68,7 @@ impl Target {
             Target::Arm64 => 64,
             Target::Wasm => 32, // wasm32
             Target::SpirV => 64,
-            Target::LlvmIr => 64, // Default to 64-bit
+            Target::LlvmIr => 64,              // Default to 64-bit
             Target::Hlsl | Target::Glsl => 32, // GPU
         }
     }

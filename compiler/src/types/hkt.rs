@@ -36,7 +36,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use super::{Ty, TyKind, DefId};
+use super::{DefId, Ty, TyKind};
 
 /// A unique identifier for kind variables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -168,9 +168,10 @@ impl Kind {
                     self.clone()
                 }
             }
-            Kind::Arrow(k1, k2) => {
-                Kind::Arrow(Box::new(k1.substitute(subst)), Box::new(k2.substitute(subst)))
-            }
+            Kind::Arrow(k1, k2) => Kind::Arrow(
+                Box::new(k1.substitute(subst)),
+                Box::new(k2.substitute(subst)),
+            ),
             _ => self.clone(),
         }
     }
@@ -283,11 +284,7 @@ pub struct TypeConstructor {
 
 impl TypeConstructor {
     /// Create a new type constructor.
-    pub fn new(
-        def_id: DefId,
-        name: impl Into<Arc<str>>,
-        params: Vec<HKTParam>,
-    ) -> Self {
+    pub fn new(def_id: DefId, name: impl Into<Arc<str>>, params: Vec<HKTParam>) -> Self {
         Self {
             def_id,
             name: name.into(),
@@ -298,9 +295,12 @@ impl TypeConstructor {
 
     /// Get the kind of this type constructor.
     pub fn kind(&self) -> Kind {
-        self.params.iter().rev().fold(self.result_kind.clone(), |acc, param| {
-            Kind::Arrow(Box::new(param.kind.clone()), Box::new(acc))
-        })
+        self.params
+            .iter()
+            .rev()
+            .fold(self.result_kind.clone(), |acc, param| {
+                Kind::Arrow(Box::new(param.kind.clone()), Box::new(acc))
+            })
     }
 
     /// Check if all parameters are of kind *.
@@ -402,29 +402,36 @@ impl KindContext {
     pub fn infer_kind(&mut self, ty: &Ty) -> Result<Kind, KindError> {
         match &ty.kind {
             // Primitive types have kind *
-            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool |
-            TyKind::Char | TyKind::Str | TyKind::Never => Ok(Kind::Type),
+            TyKind::Int(_)
+            | TyKind::Float(_)
+            | TyKind::Bool
+            | TyKind::Char
+            | TyKind::Str
+            | TyKind::Never => Ok(Kind::Type),
 
             // Compound types have kind *
-            TyKind::Tuple(_) | TyKind::Array(_, _) | TyKind::Slice(_) |
-            TyKind::Ref(_, _, _) | TyKind::Ptr(_, _) | TyKind::Fn(_) => Ok(Kind::Type),
+            TyKind::Tuple(_)
+            | TyKind::Array(_, _)
+            | TyKind::Slice(_)
+            | TyKind::Ref(_, _, _)
+            | TyKind::Ptr(_, _)
+            | TyKind::Fn(_) => Ok(Kind::Type),
 
             // Type variables default to kind *
             TyKind::Var(_) | TyKind::Infer(_) => Ok(Kind::Type),
 
             // Type parameters have their declared kind
-            TyKind::Param(name, _) => {
-                self.param_kind(name)
-                    .cloned()
-                    .ok_or_else(|| KindError::UnboundTypeParam(name.to_string()))
-            }
+            TyKind::Param(name, _) => self
+                .param_kind(name)
+                .cloned()
+                .ok_or_else(|| KindError::UnboundTypeParam(name.to_string())),
 
             // ADTs: check constructor and arguments
             TyKind::Adt(def_id, args) => {
                 // Clone the constructor info to avoid borrow conflict
-                let tc_info = self.get_constructor(*def_id).map(|tc| {
-                    (tc.arity(), tc.name.to_string(), tc.params.clone())
-                });
+                let tc_info = self
+                    .get_constructor(*def_id)
+                    .map(|tc| (tc.arity(), tc.name.to_string(), tc.params.clone()));
 
                 if let Some((arity, name, params)) = tc_info {
                     // Check arity
@@ -522,7 +529,11 @@ pub enum KindError {
     Mismatch { expected: Kind, found: Kind },
 
     /// Wrong number of type arguments.
-    ArityMismatch { expected: usize, found: usize, name: String },
+    ArityMismatch {
+        expected: usize,
+        found: usize,
+        name: String,
+    },
 
     /// Unbound type parameter.
     UnboundTypeParam(String),
@@ -540,9 +551,16 @@ impl fmt::Display for KindError {
             KindError::Mismatch { expected, found } => {
                 write!(f, "kind mismatch: expected {}, found {}", expected, found)
             }
-            KindError::ArityMismatch { expected, found, name } => {
-                write!(f, "wrong number of type arguments for '{}': expected {}, found {}",
-                    name, expected, found)
+            KindError::ArityMismatch {
+                expected,
+                found,
+                name,
+            } => {
+                write!(
+                    f,
+                    "wrong number of type arguments for '{}': expected {}, found {}",
+                    name, expected, found
+                )
             }
             KindError::UnboundTypeParam(name) => {
                 write!(f, "unbound type parameter: {}", name)
@@ -568,54 +586,26 @@ pub fn builtin_constructors() -> Vec<TypeConstructor> {
             "Option",
             vec![HKTParam::type_param("T", 0)],
         ),
-
         // Result<T, E>: * -> * -> *
         TypeConstructor::new(
             DefId::new(0, 1),
             "Result",
-            vec![
-                HKTParam::type_param("T", 0),
-                HKTParam::type_param("E", 1),
-            ],
+            vec![HKTParam::type_param("T", 0), HKTParam::type_param("E", 1)],
         ),
-
         // Vec<T>: * -> *
-        TypeConstructor::new(
-            DefId::new(0, 2),
-            "Vec",
-            vec![HKTParam::type_param("T", 0)],
-        ),
-
+        TypeConstructor::new(DefId::new(0, 2), "Vec", vec![HKTParam::type_param("T", 0)]),
         // HashMap<K, V>: * -> * -> *
         TypeConstructor::new(
             DefId::new(0, 3),
             "HashMap",
-            vec![
-                HKTParam::type_param("K", 0),
-                HKTParam::type_param("V", 1),
-            ],
+            vec![HKTParam::type_param("K", 0), HKTParam::type_param("V", 1)],
         ),
-
         // Box<T>: * -> *
-        TypeConstructor::new(
-            DefId::new(0, 4),
-            "Box",
-            vec![HKTParam::type_param("T", 0)],
-        ),
-
+        TypeConstructor::new(DefId::new(0, 4), "Box", vec![HKTParam::type_param("T", 0)]),
         // Rc<T>: * -> *
-        TypeConstructor::new(
-            DefId::new(0, 5),
-            "Rc",
-            vec![HKTParam::type_param("T", 0)],
-        ),
-
+        TypeConstructor::new(DefId::new(0, 5), "Rc", vec![HKTParam::type_param("T", 0)]),
         // Arc<T>: * -> *
-        TypeConstructor::new(
-            DefId::new(0, 6),
-            "Arc",
-            vec![HKTParam::type_param("T", 0)],
-        ),
+        TypeConstructor::new(DefId::new(0, 6), "Arc", vec![HKTParam::type_param("T", 0)]),
     ]
 }
 
@@ -644,10 +634,7 @@ mod tests {
         let tc = TypeConstructor::new(
             DefId::new(0, 0),
             "Result",
-            vec![
-                HKTParam::type_param("T", 0),
-                HKTParam::type_param("E", 1),
-            ],
+            vec![HKTParam::type_param("T", 0), HKTParam::type_param("E", 1)],
         );
 
         assert_eq!(tc.arity(), 2);
@@ -678,10 +665,7 @@ mod tests {
         let tc = Arc::new(TypeConstructor::new(
             DefId::new(0, 0),
             "Result",
-            vec![
-                HKTParam::type_param("T", 0),
-                HKTParam::type_param("E", 1),
-            ],
+            vec![HKTParam::type_param("T", 0), HKTParam::type_param("E", 1)],
         ));
 
         let partial = PartialApp::new(tc.clone(), vec![]);

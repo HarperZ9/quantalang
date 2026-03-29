@@ -46,17 +46,17 @@
 //! let output = codegen.generate(&module)?;
 //! ```
 
+pub mod backend;
+pub mod builder;
+pub mod debug;
 pub mod ir;
 pub mod lower;
-pub mod builder;
-pub mod backend;
-pub mod debug;
 pub mod runtime;
 
+pub use backend::{Backend, CodegenError, CodegenResult, Target};
+pub use builder::*;
 pub use ir::*;
 pub use lower::*;
-pub use builder::*;
-pub use backend::{Backend, Target, CodegenResult, CodegenError};
 
 use std::sync::Arc;
 
@@ -146,12 +146,18 @@ impl<'ctx> CodeGenerator<'ctx> {
                 } else {
                     backend.generate(mir)?
                 };
-                Ok(GeneratedCode::new(OutputFormat::Hlsl, hlsl_code.into_bytes()))
+                Ok(GeneratedCode::new(
+                    OutputFormat::Hlsl,
+                    hlsl_code.into_bytes(),
+                ))
             }
             Target::Glsl => {
                 let mut backend = backend::glsl::GlslBackend::new();
                 let glsl_code = backend.generate(mir)?;
-                Ok(GeneratedCode::new(OutputFormat::Glsl, glsl_code.into_bytes()))
+                Ok(GeneratedCode::new(
+                    OutputFormat::Glsl,
+                    glsl_code.into_bytes(),
+                ))
             }
         }
     }
@@ -192,9 +198,12 @@ impl GeneratedCode {
     /// Get the code as a string (for text formats).
     pub fn as_string(&self) -> Option<String> {
         match self.format {
-            OutputFormat::CSource | OutputFormat::Assembly | OutputFormat::Wat | OutputFormat::LlvmIr | OutputFormat::Hlsl | OutputFormat::Glsl => {
-                String::from_utf8(self.data.clone()).ok()
-            }
+            OutputFormat::CSource
+            | OutputFormat::Assembly
+            | OutputFormat::Wat
+            | OutputFormat::LlvmIr
+            | OutputFormat::Hlsl
+            | OutputFormat::Glsl => String::from_utf8(self.data.clone()).ok(),
             _ => None,
         }
     }
@@ -255,10 +264,7 @@ mod tests {
 
     #[test]
     fn test_generated_code_new() {
-        let code = GeneratedCode::new(
-            OutputFormat::CSource,
-            b"int main() { return 0; }".to_vec(),
-        );
+        let code = GeneratedCode::new(OutputFormat::CSource, b"int main() { return 0; }".to_vec());
         assert_eq!(code.format, OutputFormat::CSource);
         assert_eq!(code.data, b"int main() { return 0; }");
         assert!(code.debug_info.is_none());
@@ -266,19 +272,16 @@ mod tests {
 
     #[test]
     fn test_generated_code_as_string() {
-        let code = GeneratedCode::new(
-            OutputFormat::CSource,
-            b"int main() { return 0; }".to_vec(),
+        let code = GeneratedCode::new(OutputFormat::CSource, b"int main() { return 0; }".to_vec());
+        assert_eq!(
+            code.as_string(),
+            Some("int main() { return 0; }".to_string())
         );
-        assert_eq!(code.as_string(), Some("int main() { return 0; }".to_string()));
     }
 
     #[test]
     fn test_generated_code_as_string_assembly() {
-        let code = GeneratedCode::new(
-            OutputFormat::Assembly,
-            b"mov rax, 42\nret".to_vec(),
-        );
+        let code = GeneratedCode::new(OutputFormat::Assembly, b"mov rax, 42\nret".to_vec());
         assert_eq!(code.as_string(), Some("mov rax, 42\nret".to_string()));
     }
 
@@ -288,7 +291,10 @@ mod tests {
             OutputFormat::Wat,
             b"(module (func (export \"main\")))".to_vec(),
         );
-        assert_eq!(code.as_string(), Some("(module (func (export \"main\")))".to_string()));
+        assert_eq!(
+            code.as_string(),
+            Some("(module (func (export \"main\")))".to_string())
+        );
     }
 
     #[test]
@@ -319,14 +325,12 @@ mod tests {
     #[test]
     fn test_generated_code_with_debug_info() {
         let debug_info = DebugInfo {
-            source_maps: vec![
-                SourceMap {
-                    generated_offset: 0,
-                    source_file: "main.qta".to_string(),
-                    line: 1,
-                    column: 0,
-                },
-            ],
+            source_maps: vec![SourceMap {
+                generated_offset: 0,
+                source_file: "main.qta".to_string(),
+                line: 1,
+                column: 0,
+            }],
         };
 
         let code = GeneratedCode::new(OutputFormat::CSource, b"int main() {}".to_vec())
@@ -434,14 +438,12 @@ mod tests {
     #[test]
     fn test_debug_info_clone() {
         let debug_info = DebugInfo {
-            source_maps: vec![
-                SourceMap {
-                    generated_offset: 42,
-                    source_file: "test.qta".to_string(),
-                    line: 5,
-                    column: 10,
-                },
-            ],
+            source_maps: vec![SourceMap {
+                generated_offset: 42,
+                source_file: "test.qta".to_string(),
+                line: 5,
+                column: 10,
+            }],
         };
         let cloned = debug_info.clone();
         assert_eq!(cloned.source_maps.len(), 1);

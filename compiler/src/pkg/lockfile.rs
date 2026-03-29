@@ -14,7 +14,7 @@ use std::fmt::{self, Write as FmtWrite};
 use std::io;
 use std::path::Path;
 
-use super::{Version, Resolution, ResolvedPackage};
+use super::{Resolution, ResolvedPackage, Version};
 
 /// Lockfile format version
 const LOCKFILE_VERSION: u32 = 1;
@@ -43,7 +43,11 @@ impl fmt::Display for LockfileError {
             Self::Io(e) => write!(f, "IO error: {}", e),
             Self::Parse(msg) => write!(f, "parse error: {}", msg),
             Self::VersionMismatch { expected, found } => {
-                write!(f, "lockfile version mismatch: expected {}, found {}", expected, found)
+                write!(
+                    f,
+                    "lockfile version mismatch: expected {}, found {}",
+                    expected, found
+                )
             }
             Self::IntegrityError(msg) => write!(f, "integrity error: {}", msg),
             Self::Fmt(e) => write!(f, "formatting error: {}", e),
@@ -86,9 +90,7 @@ pub struct LockedPackage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackageSource {
     /// Registry package
-    Registry {
-        registry: String,
-    },
+    Registry { registry: String },
     /// Git repository
     Git {
         url: String,
@@ -97,9 +99,7 @@ pub enum PackageSource {
         rev: String,
     },
     /// Local path
-    Path {
-        path: String,
-    },
+    Path { path: String },
 }
 
 impl fmt::Display for PackageSource {
@@ -116,7 +116,9 @@ impl PackageSource {
     /// Parse source string
     pub fn parse(s: &str) -> Result<Self, LockfileError> {
         if let Some(registry) = s.strip_prefix("registry+") {
-            Ok(Self::Registry { registry: registry.to_string() })
+            Ok(Self::Registry {
+                registry: registry.to_string(),
+            })
         } else if let Some(rest) = s.strip_prefix("git+") {
             if let Some((url, rev)) = rest.split_once('#') {
                 Ok(Self::Git {
@@ -129,7 +131,9 @@ impl PackageSource {
                 Err(LockfileError::Parse(format!("invalid git source: {}", s)))
             }
         } else if let Some(path) = s.strip_prefix("path+") {
-            Ok(Self::Path { path: path.to_string() })
+            Ok(Self::Path {
+                path: path.to_string(),
+            })
         } else {
             Err(LockfileError::Parse(format!("unknown source type: {}", s)))
         }
@@ -220,7 +224,7 @@ impl Lockfile {
                 in_dependencies = false;
                 in_features = false;
 
-                let section = &line[1..line.len()-1];
+                let section = &line[1..line.len() - 1];
 
                 if section == "lockfile" {
                     current_section = Some("lockfile");
@@ -243,9 +247,11 @@ impl Lockfile {
                 } else if section == "features" {
                     in_features = true;
                 } else {
-                    return Err(LockfileError::Parse(
-                        format!("unknown section '{}' at line {}", section, line_num + 1)
-                    ));
+                    return Err(LockfileError::Parse(format!(
+                        "unknown section '{}' at line {}",
+                        section,
+                        line_num + 1
+                    )));
                 }
                 continue;
             }
@@ -258,10 +264,12 @@ impl Lockfile {
                 match current_section {
                     Some("lockfile") => {
                         if key == "version" {
-                            lockfile.version = value.parse()
-                                .map_err(|_| LockfileError::Parse(
-                                    format!("invalid version at line {}", line_num + 1)
-                                ))?;
+                            lockfile.version = value.parse().map_err(|_| {
+                                LockfileError::Parse(format!(
+                                    "invalid version at line {}",
+                                    line_num + 1
+                                ))
+                            })?;
                         } else if key == "root" {
                             lockfile.root = value.to_string();
                         }
@@ -272,10 +280,14 @@ impl Lockfile {
                     Some("package") => {
                         if let Some(ref mut pkg) = current_package {
                             if in_dependencies {
-                                let ver = Version::parse(value)
-                                    .map_err(|e| LockfileError::Parse(
-                                        format!("invalid version '{}' at line {}: {}", value, line_num + 1, e)
-                                    ))?;
+                                let ver = Version::parse(value).map_err(|e| {
+                                    LockfileError::Parse(format!(
+                                        "invalid version '{}' at line {}: {}",
+                                        value,
+                                        line_num + 1,
+                                        e
+                                    ))
+                                })?;
                                 pkg.dependencies.insert(key.to_string(), ver);
                             } else if in_features {
                                 // Features are stored as feature = "true" or listed
@@ -283,10 +295,13 @@ impl Lockfile {
                             } else {
                                 match key {
                                     "version" => {
-                                        pkg.version = Version::parse(value)
-                                            .map_err(|e| LockfileError::Parse(
-                                                format!("invalid version at line {}: {}", line_num + 1, e)
-                                            ))?;
+                                        pkg.version = Version::parse(value).map_err(|e| {
+                                            LockfileError::Parse(format!(
+                                                "invalid version at line {}: {}",
+                                                line_num + 1,
+                                                e
+                                            ))
+                                        })?;
                                     }
                                     "source" => {
                                         pkg.source = PackageSource::parse(value)?;
@@ -325,7 +340,10 @@ impl Lockfile {
         let mut output = String::new();
 
         // Header
-        writeln!(output, "# This file is automatically generated by quanta-pkg.")?;
+        writeln!(
+            output,
+            "# This file is automatically generated by quanta-pkg."
+        )?;
         writeln!(output, "# Do not edit manually.")?;
         writeln!(output)?;
 
@@ -428,7 +446,11 @@ impl Lockfile {
             is_dev: false,
         };
 
-        Resolution { root, packages, graph }
+        Resolution {
+            root,
+            packages,
+            graph,
+        }
     }
 
     /// Merge with another lockfile (for workspace support)
@@ -447,7 +469,9 @@ impl Lockfile {
         }
 
         for (key, value) in &other.metadata {
-            self.metadata.entry(key.clone()).or_insert_with(|| value.clone());
+            self.metadata
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
         }
 
         Ok(())
@@ -475,7 +499,11 @@ impl Lockfile {
             }
         }
 
-        LockfileDiff { added, removed, updated }
+        LockfileDiff {
+            added,
+            removed,
+            updated,
+        }
     }
 }
 
@@ -551,16 +579,19 @@ mod tests {
             metadata: BTreeMap::new(),
         };
 
-        lockfile.packages.insert("dep-a".to_string(), LockedPackage {
-            name: "dep-a".to_string(),
-            version: Version::new(1, 2, 3),
-            source: PackageSource::Registry {
-                registry: "https://registry.quantalang.org".to_string(),
+        lockfile.packages.insert(
+            "dep-a".to_string(),
+            LockedPackage {
+                name: "dep-a".to_string(),
+                version: Version::new(1, 2, 3),
+                source: PackageSource::Registry {
+                    registry: "https://registry.quantalang.org".to_string(),
+                },
+                checksum: Some("abc123".to_string()),
+                dependencies: BTreeMap::new(),
+                features: BTreeSet::new(),
             },
-            checksum: Some("abc123".to_string()),
-            dependencies: BTreeMap::new(),
-            features: BTreeSet::new(),
-        });
+        );
 
         let serialized = lockfile.serialize()?;
         assert!(serialized.contains("dep-a"));
@@ -578,37 +609,52 @@ mod tests {
             metadata: BTreeMap::new(),
         };
 
-        old.packages.insert("a".to_string(), LockedPackage {
-            name: "a".to_string(),
-            version: Version::new(1, 0, 0),
-            source: PackageSource::Registry { registry: "r".to_string() },
-            checksum: None,
-            dependencies: BTreeMap::new(),
-            features: BTreeSet::new(),
-        });
+        old.packages.insert(
+            "a".to_string(),
+            LockedPackage {
+                name: "a".to_string(),
+                version: Version::new(1, 0, 0),
+                source: PackageSource::Registry {
+                    registry: "r".to_string(),
+                },
+                checksum: None,
+                dependencies: BTreeMap::new(),
+                features: BTreeSet::new(),
+            },
+        );
 
-        old.packages.insert("b".to_string(), LockedPackage {
-            name: "b".to_string(),
-            version: Version::new(1, 0, 0),
-            source: PackageSource::Registry { registry: "r".to_string() },
-            checksum: None,
-            dependencies: BTreeMap::new(),
-            features: BTreeSet::new(),
-        });
+        old.packages.insert(
+            "b".to_string(),
+            LockedPackage {
+                name: "b".to_string(),
+                version: Version::new(1, 0, 0),
+                source: PackageSource::Registry {
+                    registry: "r".to_string(),
+                },
+                checksum: None,
+                dependencies: BTreeMap::new(),
+                features: BTreeSet::new(),
+            },
+        );
 
         let mut new = old.clone();
         new.packages.remove("a");
         if let Some(pkg_b) = new.packages.get_mut("b") {
             pkg_b.version = Version::new(2, 0, 0);
         }
-        new.packages.insert("c".to_string(), LockedPackage {
-            name: "c".to_string(),
-            version: Version::new(1, 0, 0),
-            source: PackageSource::Registry { registry: "r".to_string() },
-            checksum: None,
-            dependencies: BTreeMap::new(),
-            features: BTreeSet::new(),
-        });
+        new.packages.insert(
+            "c".to_string(),
+            LockedPackage {
+                name: "c".to_string(),
+                version: Version::new(1, 0, 0),
+                source: PackageSource::Registry {
+                    registry: "r".to_string(),
+                },
+                checksum: None,
+                dependencies: BTreeMap::new(),
+                features: BTreeSet::new(),
+            },
+        );
 
         let diff = old.diff(&new);
         assert_eq!(diff.added.len(), 1);

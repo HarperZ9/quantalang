@@ -44,16 +44,16 @@
 //! let output = compile(source, Target::Native, CompileOptions::default())?;
 //! ```
 
-pub mod lexer;
 pub mod ast;
-pub mod parser;
-pub mod types;
-pub mod macro_expand;
 pub mod codegen;
-pub mod runtime;
-pub mod lsp;
 pub mod fmt;
+pub mod lexer;
+pub mod lsp;
+pub mod macro_expand;
+pub mod parser;
 pub mod pkg;
+pub mod runtime;
+pub mod types;
 
 /// The compiler version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -68,9 +68,9 @@ pub const AUTHOR: &str = "Zain Dana Harper";
 pub const COPYRIGHT: &str = "Copyright (c) 2022-2026 Zain Dana Harper. MIT License.";
 
 // Re-export commonly used types
-pub use lexer::{Lexer, Token, TokenKind, Span, SourceFile};
-pub use codegen::{CodeGenerator, Target, GeneratedCode, OutputFormat};
-pub use runtime::{Executor, Task, TaskId, Poll, Future, Channel, Semaphore};
-pub use lsp::{LanguageServer, DocumentStore, run_server};
-pub use fmt::{Formatter, FormatConfig, FormatError};
-pub use pkg::{Manifest, Version, VersionReq, Registry, Resolver, Lockfile};
+pub use codegen::{CodeGenerator, GeneratedCode, OutputFormat, Target};
+pub use fmt::{FormatConfig, FormatError, Formatter};
+pub use lexer::{Lexer, SourceFile, Span, Token, TokenKind};
+pub use lsp::{run_server, DocumentStore, LanguageServer};
+pub use pkg::{Lockfile, Manifest, Registry, Resolver, Version, VersionReq};
+pub use runtime::{Channel, Executor, Future, Poll, Semaphore, Task, TaskId};

@@ -8,9 +8,9 @@
 //!
 //! This module handles parsing of all type expressions in QuantaLang.
 
+use super::{ParseError, ParseErrorKind, ParseResult, Parser};
 use crate::ast::*;
 use crate::lexer::{Delimiter, Keyword, TokenKind};
-use super::{Parser, ParseResult, ParseError, ParseErrorKind};
 
 impl<'a> Parser<'a> {
     /// Parse a type.
@@ -52,7 +52,9 @@ impl<'a> Parser<'a> {
                 if self.pos + 2 < self.tokens.len() {
                     let after_comma = &self.tokens[self.pos + 1].kind;
                     let after_that = &self.tokens[self.pos + 2].kind;
-                    if matches!(after_comma, TokenKind::Ident) && matches!(after_that, TokenKind::Colon) {
+                    if matches!(after_comma, TokenKind::Ident)
+                        && matches!(after_that, TokenKind::Colon)
+                    {
                         break; // Next item is a parameter, not an annotation
                     }
                 }
@@ -61,7 +63,13 @@ impl<'a> Parser<'a> {
                 effects.push(next_effect);
             }
             let span = start.merge(&self.tokens[self.pos.saturating_sub(1)].span);
-            ty = Type::new(TypeKind::WithEffect { ty: Box::new(ty), effects }, span);
+            ty = Type::new(
+                TypeKind::WithEffect {
+                    ty: Box::new(ty),
+                    effects,
+                },
+                span,
+            );
         }
 
         Ok(ty)
@@ -91,23 +99,17 @@ impl<'a> Parser<'a> {
             // =================================================================
             // TUPLE / PARENTHESIZED / UNIT
             // =================================================================
-            TokenKind::OpenDelim(Delimiter::Paren) => {
-                self.parse_tuple_or_paren_type()
-            }
+            TokenKind::OpenDelim(Delimiter::Paren) => self.parse_tuple_or_paren_type(),
 
             // =================================================================
             // ARRAY / SLICE: [T] or [T; N]
             // =================================================================
-            TokenKind::OpenDelim(Delimiter::Bracket) => {
-                self.parse_array_or_slice_type()
-            }
+            TokenKind::OpenDelim(Delimiter::Bracket) => self.parse_array_or_slice_type(),
 
             // =================================================================
             // REFERENCE: &T, &mut T, &'a T
             // =================================================================
-            TokenKind::And => {
-                self.parse_ref_type(false)
-            }
+            TokenKind::And => self.parse_ref_type(false),
 
             TokenKind::AndAnd => {
                 // &&T is &&T (double reference)
@@ -135,16 +137,12 @@ impl<'a> Parser<'a> {
             // =================================================================
             // POINTER: *const T, *mut T
             // =================================================================
-            TokenKind::Star => {
-                self.parse_ptr_type()
-            }
+            TokenKind::Star => self.parse_ptr_type(),
 
             // =================================================================
             // FN TYPE: fn(T) -> U
             // =================================================================
-            TokenKind::Keyword(Keyword::Fn) => {
-                self.parse_bare_fn_type(false, false)
-            }
+            TokenKind::Keyword(Keyword::Fn) => self.parse_bare_fn_type(false, false),
 
             TokenKind::Keyword(Keyword::Unsafe) => {
                 self.advance();
@@ -204,7 +202,9 @@ impl<'a> Parser<'a> {
             // =================================================================
             // PATH TYPES (including primitives)
             // =================================================================
-            TokenKind::Ident | TokenKind::RawIdent | TokenKind::ColonColon
+            TokenKind::Ident
+            | TokenKind::RawIdent
+            | TokenKind::ColonColon
             | TokenKind::Keyword(Keyword::Crate | Keyword::Super | Keyword::Self_) => {
                 let path = self.parse_path()?;
                 let span = path.span;
@@ -335,7 +335,9 @@ impl<'a> Parser<'a> {
         if self.eat(&TokenKind::Semi) {
             // Array: [T; N]
             let len = self.parse_expr()?;
-            let end = self.expect(&TokenKind::CloseDelim(Delimiter::Bracket))?.span;
+            let end = self
+                .expect(&TokenKind::CloseDelim(Delimiter::Bracket))?
+                .span;
             let span = start.merge(&end);
 
             Ok(Type::new(
@@ -347,7 +349,9 @@ impl<'a> Parser<'a> {
             ))
         } else {
             // Slice: [T]
-            let end = self.expect(&TokenKind::CloseDelim(Delimiter::Bracket))?.span;
+            let end = self
+                .expect(&TokenKind::CloseDelim(Delimiter::Bracket))?
+                .span;
             let span = start.merge(&end);
 
             Ok(Type::new(TypeKind::Slice(Box::new(elem_ty)), span))
@@ -468,6 +472,10 @@ impl<'a> Parser<'a> {
         let path = self.parse_path()?;
         let span = path.span;
 
-        Ok(TypeBound { path, is_maybe, span })
+        Ok(TypeBound {
+            path,
+            is_maybe,
+            span,
+        })
     }
 }

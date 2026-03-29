@@ -191,7 +191,7 @@ impl MirFunction {
         Self {
             name: name.into(),
             sig,
-            blocks: None,  // Start as declaration, add_block() makes it a definition
+            blocks: None, // Start as declaration, add_block() makes it a definition
             locals: Vec::new(),
             is_public: false,
             linkage: Linkage::Internal,
@@ -493,16 +493,10 @@ impl MirStmt {
 #[derive(Debug, Clone)]
 pub enum MirStmtKind {
     /// Assignment: `local = rvalue`
-    Assign {
-        dest: LocalId,
-        value: MirRValue,
-    },
+    Assign { dest: LocalId, value: MirRValue },
 
     /// Store through a pointer: `*ptr = value`
-    DerefAssign {
-        ptr: LocalId,
-        value: MirRValue,
-    },
+    DerefAssign { ptr: LocalId, value: MirRValue },
 
     /// Store to a field through a pointer: `ptr->field = value`
     FieldDerefAssign {
@@ -542,22 +536,13 @@ pub enum MirRValue {
     },
 
     /// Unary operation.
-    UnaryOp {
-        op: UnaryOp,
-        operand: MirValue,
-    },
+    UnaryOp { op: UnaryOp, operand: MirValue },
 
     /// Create a reference.
-    Ref {
-        is_mut: bool,
-        place: MirPlace,
-    },
+    Ref { is_mut: bool, place: MirPlace },
 
     /// Address of.
-    AddressOf {
-        is_mut: bool,
-        place: MirPlace,
-    },
+    AddressOf { is_mut: bool, place: MirPlace },
 
     /// Cast.
     Cast {
@@ -573,10 +558,7 @@ pub enum MirRValue {
     },
 
     /// Array repeat: `[value; count]`
-    Repeat {
-        value: MirValue,
-        count: u64,
-    },
+    Repeat { value: MirValue, count: u64 },
 
     /// Discriminant read (for enums).
     Discriminant(MirPlace),
@@ -610,10 +592,7 @@ pub enum MirRValue {
     },
 
     /// Dereference a pointer: `*ptr`
-    Deref {
-        ptr: MirValue,
-        pointee_ty: MirType,
-    },
+    Deref { ptr: MirValue, pointee_ty: MirType },
 
     /// Sample a texture at given coordinates: `texture_sample(tex, sampler, uv)`
     TextureSample {
@@ -670,16 +649,9 @@ pub enum PlaceProjection {
     /// Array/slice index.
     Index(LocalId),
     /// Constant index.
-    ConstantIndex {
-        offset: u64,
-        from_end: bool,
-    },
+    ConstantIndex { offset: u64, from_end: bool },
     /// Subslice.
-    Subslice {
-        from: u64,
-        to: u64,
-        from_end: bool,
-    },
+    Subslice { from: u64, to: u64, from_end: bool },
     /// Downcast (enum variant).
     Downcast(u32),
 }
@@ -688,19 +660,37 @@ pub enum PlaceProjection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     // Arithmetic
-    Add, Sub, Mul, Div, Rem,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
     /// Exponentiation (base ** exponent)
     Pow,
     // Bitwise
-    BitAnd, BitOr, BitXor, Shl, Shr,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
     // Comparison
-    Eq, Ne, Lt, Le, Gt, Ge,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
     // Checked arithmetic (returns (result, overflow))
-    AddChecked, SubChecked, MulChecked,
+    AddChecked,
+    SubChecked,
+    MulChecked,
     // Wrapping arithmetic
-    AddWrapping, SubWrapping, MulWrapping,
+    AddWrapping,
+    SubWrapping,
+    MulWrapping,
     // Saturating arithmetic
-    AddSaturating, SubSaturating,
+    AddSaturating,
+    SubSaturating,
 }
 
 /// Unary operators.
@@ -869,29 +859,53 @@ pub enum MirType {
 
 impl MirType {
     /// Create an i8 type.
-    pub fn i8() -> Self { MirType::Int(IntSize::I8, true) }
+    pub fn i8() -> Self {
+        MirType::Int(IntSize::I8, true)
+    }
     /// Create an i16 type.
-    pub fn i16() -> Self { MirType::Int(IntSize::I16, true) }
+    pub fn i16() -> Self {
+        MirType::Int(IntSize::I16, true)
+    }
     /// Create an i32 type.
-    pub fn i32() -> Self { MirType::Int(IntSize::I32, true) }
+    pub fn i32() -> Self {
+        MirType::Int(IntSize::I32, true)
+    }
     /// Create an i64 type.
-    pub fn i64() -> Self { MirType::Int(IntSize::I64, true) }
+    pub fn i64() -> Self {
+        MirType::Int(IntSize::I64, true)
+    }
     /// Create a u8 type.
-    pub fn u8() -> Self { MirType::Int(IntSize::I8, false) }
+    pub fn u8() -> Self {
+        MirType::Int(IntSize::I8, false)
+    }
     /// Create a u16 type.
-    pub fn u16() -> Self { MirType::Int(IntSize::I16, false) }
+    pub fn u16() -> Self {
+        MirType::Int(IntSize::I16, false)
+    }
     /// Create a u32 type.
-    pub fn u32() -> Self { MirType::Int(IntSize::I32, false) }
+    pub fn u32() -> Self {
+        MirType::Int(IntSize::I32, false)
+    }
     /// Create a u64 type.
-    pub fn u64() -> Self { MirType::Int(IntSize::I64, false) }
+    pub fn u64() -> Self {
+        MirType::Int(IntSize::I64, false)
+    }
     /// Create an isize type.
-    pub fn isize() -> Self { MirType::Int(IntSize::ISize, true) }
+    pub fn isize() -> Self {
+        MirType::Int(IntSize::ISize, true)
+    }
     /// Create a usize type.
-    pub fn usize() -> Self { MirType::Int(IntSize::ISize, false) }
+    pub fn usize() -> Self {
+        MirType::Int(IntSize::ISize, false)
+    }
     /// Create an f32 type.
-    pub fn f32() -> Self { MirType::Float(FloatSize::F32) }
+    pub fn f32() -> Self {
+        MirType::Float(FloatSize::F32)
+    }
     /// Create an f64 type.
-    pub fn f64() -> Self { MirType::Float(FloatSize::F64) }
+    pub fn f64() -> Self {
+        MirType::Float(FloatSize::F64)
+    }
 
     /// Create a vector type.
     pub fn vector(elem: MirType, lanes: u32) -> Self {
@@ -899,55 +913,82 @@ impl MirType {
     }
 
     /// Create a 128-bit vector of 4 f32s (for SSE/NEON).
-    pub fn v4f32() -> Self { MirType::vector(MirType::f32(), 4) }
+    pub fn v4f32() -> Self {
+        MirType::vector(MirType::f32(), 4)
+    }
     /// Create a 256-bit vector of 8 f32s (for AVX).
-    pub fn v8f32() -> Self { MirType::vector(MirType::f32(), 8) }
+    pub fn v8f32() -> Self {
+        MirType::vector(MirType::f32(), 8)
+    }
     /// Create a 128-bit vector of 2 f64s.
-    pub fn v2f64() -> Self { MirType::vector(MirType::f64(), 2) }
+    pub fn v2f64() -> Self {
+        MirType::vector(MirType::f64(), 2)
+    }
     /// Create a 256-bit vector of 4 f64s.
-    pub fn v4f64() -> Self { MirType::vector(MirType::f64(), 4) }
+    pub fn v4f64() -> Self {
+        MirType::vector(MirType::f64(), 4)
+    }
     /// Create a 128-bit vector of 4 i32s.
-    pub fn v4i32() -> Self { MirType::vector(MirType::i32(), 4) }
+    pub fn v4i32() -> Self {
+        MirType::vector(MirType::i32(), 4)
+    }
     /// Create a 256-bit vector of 8 i32s.
-    pub fn v8i32() -> Self { MirType::vector(MirType::i32(), 8) }
+    pub fn v8i32() -> Self {
+        MirType::vector(MirType::i32(), 8)
+    }
     /// Create a 128-bit vector of 16 i8s.
-    pub fn v16i8() -> Self { MirType::vector(MirType::i8(), 16) }
+    pub fn v16i8() -> Self {
+        MirType::vector(MirType::i8(), 16)
+    }
     /// Create a 256-bit vector of 32 i8s.
-    pub fn v32i8() -> Self { MirType::vector(MirType::i8(), 32) }
+    pub fn v32i8() -> Self {
+        MirType::vector(MirType::i8(), 32)
+    }
 
     /// Create a 2D texture type with the given element type.
-    pub fn texture2d(elem: MirType) -> Self { MirType::Texture2D(Box::new(elem)) }
+    pub fn texture2d(elem: MirType) -> Self {
+        MirType::Texture2D(Box::new(elem))
+    }
     /// Create a sampler type.
-    pub fn sampler() -> Self { MirType::Sampler }
+    pub fn sampler() -> Self {
+        MirType::Sampler
+    }
     /// Create a combined sampled image type.
-    pub fn sampled_image(elem: MirType) -> Self { MirType::SampledImage(Box::new(elem)) }
+    pub fn sampled_image(elem: MirType) -> Self {
+        MirType::SampledImage(Box::new(elem))
+    }
 
     /// Create a tuple type.
-    pub fn tuple(elems: Vec<MirType>) -> Self { MirType::Tuple(elems) }
+    pub fn tuple(elems: Vec<MirType>) -> Self {
+        MirType::Tuple(elems)
+    }
 
     /// Generate the canonical C typedef name for a tuple type.
     pub fn tuple_type_name(elems: &[MirType]) -> Arc<str> {
-        let parts: Vec<&str> = elems.iter().map(|t| match t {
-            MirType::Void => "void",
-            MirType::Bool => "bool",
-            MirType::Int(IntSize::I8, true) => "i8",
-            MirType::Int(IntSize::I16, true) => "i16",
-            MirType::Int(IntSize::I32, true) => "i32",
-            MirType::Int(IntSize::I64, true) => "i64",
-            MirType::Int(IntSize::I128, true) => "i128",
-            MirType::Int(IntSize::ISize, true) => "isize",
-            MirType::Int(IntSize::I8, false) => "u8",
-            MirType::Int(IntSize::I16, false) => "u16",
-            MirType::Int(IntSize::I32, false) => "u32",
-            MirType::Int(IntSize::I64, false) => "u64",
-            MirType::Int(IntSize::I128, false) => "u128",
-            MirType::Int(IntSize::ISize, false) => "usize",
-            MirType::Float(FloatSize::F32) => "f32",
-            MirType::Float(FloatSize::F64) => "f64",
-            MirType::Ptr(_) => "ptr",
-            MirType::Struct(name) => name.as_ref(),
-            _ => "unknown",
-        }).collect();
+        let parts: Vec<&str> = elems
+            .iter()
+            .map(|t| match t {
+                MirType::Void => "void",
+                MirType::Bool => "bool",
+                MirType::Int(IntSize::I8, true) => "i8",
+                MirType::Int(IntSize::I16, true) => "i16",
+                MirType::Int(IntSize::I32, true) => "i32",
+                MirType::Int(IntSize::I64, true) => "i64",
+                MirType::Int(IntSize::I128, true) => "i128",
+                MirType::Int(IntSize::ISize, true) => "isize",
+                MirType::Int(IntSize::I8, false) => "u8",
+                MirType::Int(IntSize::I16, false) => "u16",
+                MirType::Int(IntSize::I32, false) => "u32",
+                MirType::Int(IntSize::I64, false) => "u64",
+                MirType::Int(IntSize::I128, false) => "u128",
+                MirType::Int(IntSize::ISize, false) => "usize",
+                MirType::Float(FloatSize::F32) => "f32",
+                MirType::Float(FloatSize::F64) => "f64",
+                MirType::Ptr(_) => "ptr",
+                MirType::Struct(name) => name.as_ref(),
+                _ => "unknown",
+            })
+            .collect();
         Arc::from(format!("Tuple_{}", parts.join("_")))
     }
 
@@ -979,22 +1020,18 @@ impl MirType {
             MirType::Int(size, _) => Some(size.bits(ptr_size)),
             MirType::Float(size) => Some(size.bits()),
             MirType::Ptr(_) => Some(ptr_size),
-            MirType::Array(elem, count) => {
-                elem.bit_size(ptr_size).map(|s| s * (*count as u32))
-            }
+            MirType::Array(elem, count) => elem.bit_size(ptr_size).map(|s| s * (*count as u32)),
             MirType::Slice(_) => Some(ptr_size * 2), // ptr + len
-            MirType::Struct(_) => None, // Need type info
+            MirType::Struct(_) => None,              // Need type info
             MirType::FnPtr(_) => Some(ptr_size),
             MirType::Never => Some(0),
-            MirType::Vector(elem, lanes) => {
-                elem.bit_size(ptr_size).map(|s| s * lanes)
-            }
+            MirType::Vector(elem, lanes) => elem.bit_size(ptr_size).map(|s| s * lanes),
             MirType::Texture2D(_) | MirType::Sampler | MirType::SampledImage(_) => {
                 None // Opaque GPU types — no CPU bit size
             }
             MirType::TraitObject(_) => Some(ptr_size * 2), // Fat pointer: data + vtable
-            MirType::Vec(_) => Some(ptr_size), // QuantaVecHandle is a pointer
-            MirType::Map(_, _) => Some(ptr_size), // QuantaMapHandle is a pointer
+            MirType::Vec(_) => Some(ptr_size),             // QuantaVecHandle is a pointer
+            MirType::Map(_, _) => Some(ptr_size),          // QuantaMapHandle is a pointer
             MirType::Tuple(elems) => {
                 let mut total = 0u32;
                 for e in elems {
@@ -1033,7 +1070,9 @@ impl fmt::Display for MirType {
             MirType::FnPtr(sig) => {
                 write!(f, "fn(")?;
                 for (i, p) in sig.params.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}", p)?;
                 }
                 write!(f, ") -> {}", sig.ret)
@@ -1049,7 +1088,9 @@ impl fmt::Display for MirType {
             MirType::Tuple(elems) => {
                 write!(f, "(")?;
                 for (i, e) in elems.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}", e)?;
                 }
                 write!(f, ")")
@@ -1061,7 +1102,12 @@ impl fmt::Display for MirType {
 /// Integer sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntSize {
-    I8, I16, I32, I64, I128, ISize,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    ISize,
 }
 
 impl IntSize {
@@ -1081,7 +1127,8 @@ impl IntSize {
 /// Float sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FloatSize {
-    F32, F64,
+    F32,
+    F64,
 }
 
 impl FloatSize {
@@ -1141,7 +1188,9 @@ impl fmt::Display for MirConst {
             MirConst::Struct(name, fields) => {
                 write!(f, "{}{{", name)?;
                 for (i, fv) in fields.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}", fv)?;
                 }
                 write!(f, "}}")
@@ -1222,9 +1271,7 @@ pub enum TypeDefKind {
         packed: bool,
     },
     /// Union.
-    Union {
-        variants: Vec<(Arc<str>, MirType)>,
-    },
+    Union { variants: Vec<(Arc<str>, MirType)> },
     /// Enum.
     Enum {
         discriminant_ty: MirType,
@@ -1257,7 +1304,10 @@ mod tests {
         assert_eq!(format!("{}", MirType::u64()), "u64");
         assert_eq!(format!("{}", MirType::f32()), "f32");
         assert_eq!(format!("{}", MirType::Bool), "bool");
-        assert_eq!(format!("{}", MirType::Ptr(Box::new(MirType::i32()))), "*i32");
+        assert_eq!(
+            format!("{}", MirType::Ptr(Box::new(MirType::i32()))),
+            "*i32"
+        );
         assert_eq!(format!("{}", MirType::Void), "void");
         assert_eq!(format!("{}", MirType::Never), "!");
     }
@@ -1305,10 +1355,16 @@ mod tests {
         assert_eq!(MirType::i16().bit_size(ptr_size), Some(16));
         assert_eq!(MirType::i32().bit_size(ptr_size), Some(32));
         assert_eq!(MirType::i64().bit_size(ptr_size), Some(64));
-        assert_eq!(MirType::Int(IntSize::I128, true).bit_size(ptr_size), Some(128));
+        assert_eq!(
+            MirType::Int(IntSize::I128, true).bit_size(ptr_size),
+            Some(128)
+        );
         assert_eq!(MirType::f32().bit_size(ptr_size), Some(32));
         assert_eq!(MirType::f64().bit_size(ptr_size), Some(64));
-        assert_eq!(MirType::Ptr(Box::new(MirType::i32())).bit_size(ptr_size), Some(64));
+        assert_eq!(
+            MirType::Ptr(Box::new(MirType::i32())).bit_size(ptr_size),
+            Some(64)
+        );
         assert_eq!(MirType::isize().bit_size(ptr_size), Some(64));
     }
 
@@ -1443,7 +1499,10 @@ mod tests {
 
     #[test]
     fn test_mir_stmt_assign() {
-        let stmt = MirStmt::assign(LocalId(0), MirRValue::Use(MirValue::Const(MirConst::Bool(true))));
+        let stmt = MirStmt::assign(
+            LocalId(0),
+            MirRValue::Use(MirValue::Const(MirConst::Bool(true))),
+        );
         match stmt.kind {
             MirStmtKind::Assign { dest, .. } => assert_eq!(dest.0, 0),
             _ => panic!("Expected Assign"),
@@ -1494,14 +1553,17 @@ mod tests {
         assert_eq!(format!("{}", MirConst::Str(0)), "str#0");
         assert_eq!(format!("{}", MirConst::Unit), "()");
         assert_eq!(
-            format!("{}", MirConst::Struct(
-                Arc::from("Color"),
-                vec![
-                    MirConst::Float(1.0, MirType::f64()),
-                    MirConst::Float(0.5, MirType::f64()),
-                    MirConst::Float(0.0, MirType::f64()),
-                ],
-            )),
+            format!(
+                "{}",
+                MirConst::Struct(
+                    Arc::from("Color"),
+                    vec![
+                        MirConst::Float(1.0, MirType::f64()),
+                        MirConst::Float(0.5, MirType::f64()),
+                        MirConst::Float(0.0, MirType::f64()),
+                    ],
+                )
+            ),
             "Color{1f64, 0.5f64, 0f64}",
         );
     }
@@ -1536,7 +1598,11 @@ mod tests {
             else_block: BlockId(2),
         };
         match term {
-            MirTerminator::If { then_block, else_block, .. } => {
+            MirTerminator::If {
+                then_block,
+                else_block,
+                ..
+            } => {
                 assert_eq!(then_block.0, 1);
                 assert_eq!(else_block.0, 2);
             }
@@ -1592,10 +1658,7 @@ mod tests {
 
     #[test]
     fn test_mir_fn_sig_new() {
-        let sig = MirFnSig::new(
-            vec![MirType::i32(), MirType::f64()],
-            MirType::Bool,
-        );
+        let sig = MirFnSig::new(vec![MirType::i32(), MirType::f64()], MirType::Bool);
         assert_eq!(sig.params.len(), 2);
         assert_eq!(sig.params[0], MirType::i32());
         assert_eq!(sig.params[1], MirType::f64());

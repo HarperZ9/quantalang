@@ -9,8 +9,8 @@
 //! Unification finds a substitution that makes two types equal.
 //! This is the core algorithm for Hindley-Milner type inference.
 
-use super::ty::*;
 use super::error::{TypeError, TypeResult};
+use super::ty::*;
 
 /// Unifier for type inference.
 #[derive(Debug)]
@@ -71,7 +71,9 @@ impl Unifier {
             // Extract the category (e.g., "ColorSpace") and value (e.g., "Linear")
             for ann1 in &t1.annotations {
                 for ann2 in &t2.annotations {
-                    if let (Some(cat1), Some(cat2)) = (ann1.split(':').next(), ann2.split(':').next()) {
+                    if let (Some(cat1), Some(cat2)) =
+                        (ann1.split(':').next(), ann2.split(':').next())
+                    {
                         if cat1 == cat2 && ann1 != ann2 {
                             // Same category, different value — color space mismatch!
                             return Err(TypeError::TypeMismatch {
@@ -130,8 +132,7 @@ impl Unifier {
 
             // String coercion: `str` and `&str` / `&'static str` are
             // interchangeable in QuantaLang (both map to QuantaString).
-            (TyKind::Str, TyKind::Ref(_, _, inner))
-            | (TyKind::Ref(_, _, inner), TyKind::Str)
+            (TyKind::Str, TyKind::Ref(_, _, inner)) | (TyKind::Ref(_, _, inner), TyKind::Str)
                 if inner.kind == TyKind::Str =>
             {
                 Ok(())
@@ -176,9 +177,7 @@ impl Unifier {
             }
 
             // Slices: same element type
-            (TyKind::Slice(elem1), TyKind::Slice(elem2)) => {
-                self.unify(elem1, elem2)
-            }
+            (TyKind::Slice(elem1), TyKind::Slice(elem2)) => self.unify(elem1, elem2),
 
             // References: same mutability and unified pointee
             (TyKind::Ref(lt1, mut1, ty1), TyKind::Ref(lt2, mut2, ty2)) => {
@@ -230,8 +229,7 @@ impl Unifier {
                 // Different explicit ABIs are incompatible
                 match (&fn1.abi, &fn2.abi) {
                     (None, None) => {}
-                    (None, Some(a)) | (Some(a), None)
-                        if &**a == "quanta" => {}
+                    (None, Some(a)) | (Some(a), None) if &**a == "quanta" => {}
                     (Some(a1), Some(a2)) if a1 == a2 => {}
                     (Some(a1), Some(a2)) => {
                         return Err(TypeError::AbiMismatch {
@@ -336,10 +334,9 @@ impl Unifier {
                     || self.occurs_in(var, &fn_ty.ret)
             }
             TyKind::Adt(_, args) => args.iter().any(|t| self.occurs_in(var, t)),
-            TyKind::Projection { self_ty, substs, .. } => {
-                self.occurs_in(var, self_ty)
-                    || substs.iter().any(|t| self.occurs_in(var, t))
-            }
+            TyKind::Projection {
+                self_ty, substs, ..
+            } => self.occurs_in(var, self_ty) || substs.iter().any(|t| self.occurs_in(var, t)),
             _ => false,
         }
     }

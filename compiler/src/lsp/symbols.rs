@@ -45,7 +45,12 @@ impl SymbolProvider {
     }
 
     /// Parse a symbol starting at a line.
-    fn parse_symbol(&self, lines: &[&str], start: usize, doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_symbol(
+        &self,
+        lines: &[&str],
+        start: usize,
+        doc: &Document,
+    ) -> Option<(DocumentSymbol, usize)> {
         let line = lines.get(start)?;
         let trimmed = line.trim();
 
@@ -84,12 +89,18 @@ impl SymbolProvider {
     }
 
     /// Parse a function definition.
-    fn parse_function(&self, lines: &[&str], start: usize, _doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_function(
+        &self,
+        lines: &[&str],
+        start: usize,
+        _doc: &Document,
+    ) -> Option<(DocumentSymbol, usize)> {
         let line = lines[start];
         let trimmed = line.trim();
 
         // Check for function pattern
-        let rest = trimmed.strip_prefix("pub ")
+        let rest = trimmed
+            .strip_prefix("pub ")
             .or_else(|| trimmed.strip_prefix("async "))
             .or_else(|| trimmed.strip_prefix("pub async "))
             .unwrap_or(trimmed);
@@ -135,16 +146,23 @@ impl SymbolProvider {
     }
 
     /// Parse a struct definition.
-    fn parse_struct(&self, lines: &[&str], start: usize, _doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_struct(
+        &self,
+        lines: &[&str],
+        start: usize,
+        _doc: &Document,
+    ) -> Option<(DocumentSymbol, usize)> {
         let line = lines[start];
         let trimmed = line.trim();
 
-        let rest = trimmed.strip_prefix("pub ")
+        let rest = trimmed
+            .strip_prefix("pub ")
             .unwrap_or(trimmed)
             .strip_prefix("struct ")?;
 
         // Extract struct name
-        let name_end = rest.find(|c: char| c == '<' || c == '{' || c == '(' || c == ' ')
+        let name_end = rest
+            .find(|c: char| c == '<' || c == '{' || c == '(' || c == ' ')
             .unwrap_or(rest.len());
         let name = rest[..name_end].trim().to_string();
 
@@ -216,15 +234,22 @@ impl SymbolProvider {
     }
 
     /// Parse an enum definition.
-    fn parse_enum(&self, lines: &[&str], start: usize, _doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_enum(
+        &self,
+        lines: &[&str],
+        start: usize,
+        _doc: &Document,
+    ) -> Option<(DocumentSymbol, usize)> {
         let line = lines[start];
         let trimmed = line.trim();
 
-        let rest = trimmed.strip_prefix("pub ")
+        let rest = trimmed
+            .strip_prefix("pub ")
             .unwrap_or(trimmed)
             .strip_prefix("enum ")?;
 
-        let name_end = rest.find(|c: char| c == '<' || c == '{' || c == ' ')
+        let name_end = rest
+            .find(|c: char| c == '<' || c == '{' || c == ' ')
             .unwrap_or(rest.len());
         let name = rest[..name_end].trim().to_string();
 
@@ -270,7 +295,8 @@ impl SymbolProvider {
             return None;
         }
 
-        let name_end = trimmed.find(|c: char| c == '(' || c == '{' || c == ',' || c == ' ')
+        let name_end = trimmed
+            .find(|c: char| c == '(' || c == '{' || c == ',' || c == ' ')
             .unwrap_or(trimmed.len());
         let name = trimmed[..name_end].trim();
 
@@ -295,15 +321,22 @@ impl SymbolProvider {
     }
 
     /// Parse a trait definition.
-    fn parse_trait(&self, lines: &[&str], start: usize, doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_trait(
+        &self,
+        lines: &[&str],
+        start: usize,
+        doc: &Document,
+    ) -> Option<(DocumentSymbol, usize)> {
         let line = lines[start];
         let trimmed = line.trim();
 
-        let rest = trimmed.strip_prefix("pub ")
+        let rest = trimmed
+            .strip_prefix("pub ")
             .unwrap_or(trimmed)
             .strip_prefix("trait ")?;
 
-        let name_end = rest.find(|c: char| c == '<' || c == '{' || c == ':' || c == ' ')
+        let name_end = rest
+            .find(|c: char| c == '<' || c == '{' || c == ':' || c == ' ')
             .unwrap_or(rest.len());
         let name = rest[..name_end].trim().to_string();
 
@@ -347,7 +380,12 @@ impl SymbolProvider {
     }
 
     /// Parse an impl block.
-    fn parse_impl(&self, lines: &[&str], start: usize, doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_impl(
+        &self,
+        lines: &[&str],
+        start: usize,
+        doc: &Document,
+    ) -> Option<(DocumentSymbol, usize)> {
         let line = lines[start];
         let trimmed = line.trim();
 
@@ -366,7 +404,15 @@ impl SymbolProvider {
                 format!("impl {}", impl_part)
             }
         } else {
-            format!("impl {}", impl_part.trim_start_matches('<').split('>').last().unwrap_or(impl_part).trim())
+            format!(
+                "impl {}",
+                impl_part
+                    .trim_start_matches('<')
+                    .split('>')
+                    .last()
+                    .unwrap_or(impl_part)
+                    .trim()
+            )
         };
 
         let end_line = if line.contains('{') {
@@ -407,11 +453,17 @@ impl SymbolProvider {
     }
 
     /// Parse a const definition.
-    fn parse_const(&self, lines: &[&str], start: usize, _doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_const(
+        &self,
+        lines: &[&str],
+        start: usize,
+        _doc: &Document,
+    ) -> Option<(DocumentSymbol, usize)> {
         let line = lines[start];
         let trimmed = line.trim();
 
-        let rest = trimmed.strip_prefix("pub ")
+        let rest = trimmed
+            .strip_prefix("pub ")
             .unwrap_or(trimmed)
             .strip_prefix("const ")?;
 
@@ -437,11 +489,17 @@ impl SymbolProvider {
     }
 
     /// Parse a type alias.
-    fn parse_type_alias(&self, lines: &[&str], start: usize, _doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_type_alias(
+        &self,
+        lines: &[&str],
+        start: usize,
+        _doc: &Document,
+    ) -> Option<(DocumentSymbol, usize)> {
         let line = lines[start];
         let trimmed = line.trim();
 
-        let rest = trimmed.strip_prefix("pub ")
+        let rest = trimmed
+            .strip_prefix("pub ")
             .unwrap_or(trimmed)
             .strip_prefix("type ")?;
 
@@ -469,17 +527,24 @@ impl SymbolProvider {
     }
 
     /// Parse a module declaration.
-    fn parse_module(&self, lines: &[&str], start: usize, doc: &Document) -> Option<(DocumentSymbol, usize)> {
+    fn parse_module(
+        &self,
+        lines: &[&str],
+        start: usize,
+        doc: &Document,
+    ) -> Option<(DocumentSymbol, usize)> {
         let line = lines[start];
         let trimmed = line.trim();
 
-        let rest = trimmed.strip_prefix("pub ")
+        let rest = trimmed
+            .strip_prefix("pub ")
             .unwrap_or(trimmed)
             .strip_prefix("mod ")?;
 
         // Check if it's an inline module or a declaration
         if rest.contains('{') {
-            let name_end = rest.find(|c: char| c == '{' || c == ' ')
+            let name_end = rest
+                .find(|c: char| c == '{' || c == ' ')
                 .unwrap_or(rest.len());
             let name = rest[..name_end].trim().to_string();
 

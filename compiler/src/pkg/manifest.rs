@@ -6,7 +6,7 @@
 
 //! Package manifest parsing (Quanta.toml).
 
-use super::version::{Version, VersionReq, VersionError};
+use super::version::{Version, VersionError, VersionReq};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -79,8 +79,8 @@ impl Manifest {
 
     /// Parse manifest from a file.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ManifestError> {
-        let content = std::fs::read_to_string(path.as_ref())
-            .map_err(|e| ManifestError::Io(e.to_string()))?;
+        let content =
+            std::fs::read_to_string(path.as_ref()).map_err(|e| ManifestError::Io(e.to_string()))?;
         Self::from_str(&content)
     }
 
@@ -565,8 +565,7 @@ fn parse_dependency(value: &str) -> Result<Dependency, ManifestError> {
     // Simple version string
     if value.starts_with('"') && value.ends_with('"') {
         let version_str = &value[1..value.len() - 1];
-        return Dependency::version(version_str)
-            .map_err(|e| ManifestError::Parse(e.to_string()));
+        return Dependency::version(version_str).map_err(|e| ManifestError::Parse(e.to_string()));
     }
 
     // Complex dependency { ... }

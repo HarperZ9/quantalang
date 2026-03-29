@@ -24,9 +24,9 @@
 //! ```
 
 pub mod config;
-pub mod pretty;
 pub mod formatter;
+pub mod pretty;
 
 pub use config::*;
-pub use pretty::*;
 pub use formatter::*;
+pub use pretty::*;

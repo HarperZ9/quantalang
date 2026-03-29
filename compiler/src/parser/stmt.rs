@@ -8,9 +8,9 @@
 //!
 //! This module handles parsing of statements, blocks, and local bindings.
 
+use super::{ParseError, ParseErrorKind, ParseResult, Parser};
 use crate::ast::*;
 use crate::lexer::{Delimiter, Keyword, TokenKind};
-use super::{Parser, ParseResult, ParseError, ParseErrorKind};
 
 impl<'a> Parser<'a> {
     /// Parse a block: `{ statements... }`
@@ -32,7 +32,11 @@ impl<'a> Parser<'a> {
         let end = self.expect(&TokenKind::CloseDelim(Delimiter::Brace))?.span;
         let span = start.merge(&end);
 
-        Ok(Block { stmts, span, id: NodeId::DUMMY })
+        Ok(Block {
+            stmts,
+            span,
+            id: NodeId::DUMMY,
+        })
     }
 
     /// Parse a statement.
@@ -51,9 +55,7 @@ impl<'a> Parser<'a> {
             // =================================================================
             // LET STATEMENT
             // =================================================================
-            TokenKind::Keyword(Keyword::Let) => {
-                self.parse_let_stmt(attrs)
-            }
+            TokenKind::Keyword(Keyword::Let) => self.parse_let_stmt(attrs),
 
             // =================================================================
             // SEMICOLON (empty statement)
@@ -66,9 +68,7 @@ impl<'a> Parser<'a> {
             // =================================================================
             // EXPRESSION STATEMENT
             // =================================================================
-            _ => {
-                self.parse_expr_stmt(attrs)
-            }
+            _ => self.parse_expr_stmt(attrs),
         }
     }
 
@@ -144,7 +144,10 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::new(StmtKind::Expr(Box::new(expr)), start))
             } else {
                 // Missing semicolon
-                Err(ParseError::new(ParseErrorKind::ExpectedSemicolon, self.current_span()))
+                Err(ParseError::new(
+                    ParseErrorKind::ExpectedSemicolon,
+                    self.current_span(),
+                ))
             }
         } else {
             // Block expression, no semicolon needed
@@ -208,9 +211,7 @@ impl<'a> Parser<'a> {
     pub fn parse_stmts(&mut self) -> ParseResult<Vec<Stmt>> {
         let mut stmts = Vec::new();
 
-        while !self.check(&TokenKind::CloseDelim(Delimiter::Brace))
-            && !self.is_eof()
-        {
+        while !self.check(&TokenKind::CloseDelim(Delimiter::Brace)) && !self.is_eof() {
             match self.parse_stmt() {
                 Ok(stmt) => stmts.push(stmt),
                 Err(e) => {

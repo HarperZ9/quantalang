@@ -491,9 +491,9 @@ pub enum DwarfCfa {
     ValOffsetSf = 0x15,
     ValExpression = 0x16,
     // High 2 bits encode instruction type
-    AdvanceLoc = 0x40,  // 01xxxxxx
-    Offset = 0x80,      // 10xxxxxx
-    Restore = 0xc0,     // 11xxxxxx
+    AdvanceLoc = 0x40, // 01xxxxxx
+    Offset = 0x80,     // 10xxxxxx
+    Restore = 0xc0,    // 11xxxxxx
 }
 
 // =============================================================================
@@ -726,9 +726,7 @@ impl DwarfGenerator {
         if let Some(&offset) = self.string_offsets.get(s) {
             return offset;
         }
-        let offset = self.string_table.iter()
-            .map(|s| s.len() + 1)
-            .sum::<usize>() as u32;
+        let offset = self.string_table.iter().map(|s| s.len() + 1).sum::<usize>() as u32;
         self.string_offsets.insert(s.to_string(), offset);
         self.string_table.push(s.to_string());
         offset
@@ -738,10 +736,22 @@ impl DwarfGenerator {
     pub fn build_from_mir(&mut self, mir: &MirModule) {
         // Create compile unit DIE
         let mut cu = DebugInfoEntry::new(DwarfTag::CompileUnit);
-        cu.add_attr(DwarfAttr::Producer, DwarfAttrValue::String(self.producer.clone()));
-        cu.add_attr(DwarfAttr::Language, DwarfAttrValue::Data2(DwarfLang::QuantaLang as u16));
-        cu.add_attr(DwarfAttr::Name, DwarfAttrValue::String(mir.name.to_string()));
-        cu.add_attr(DwarfAttr::CompDir, DwarfAttrValue::String(self.comp_dir.clone()));
+        cu.add_attr(
+            DwarfAttr::Producer,
+            DwarfAttrValue::String(self.producer.clone()),
+        );
+        cu.add_attr(
+            DwarfAttr::Language,
+            DwarfAttrValue::Data2(DwarfLang::QuantaLang as u16),
+        );
+        cu.add_attr(
+            DwarfAttr::Name,
+            DwarfAttrValue::String(mir.name.to_string()),
+        );
+        cu.add_attr(
+            DwarfAttr::CompDir,
+            DwarfAttrValue::String(self.comp_dir.clone()),
+        );
         cu.add_attr(DwarfAttr::UseUtf8, DwarfAttrValue::Flag(true));
 
         // Add base types
@@ -789,7 +799,8 @@ impl DwarfGenerator {
             ty.add_attr(DwarfAttr::Name, DwarfAttrValue::String(name.to_string()));
             ty.add_attr(DwarfAttr::ByteSize, DwarfAttrValue::Data1(size));
             ty.add_attr(DwarfAttr::Encoding, DwarfAttrValue::Data1(encoding as u8));
-            self.type_cache.insert(name.to_string(), self.next_type_offset);
+            self.type_cache
+                .insert(name.to_string(), self.next_type_offset);
             self.next_type_offset += 1;
             cu.add_child(ty);
         }
@@ -798,13 +809,19 @@ impl DwarfGenerator {
     /// Create a variable DIE.
     fn create_variable_die(&self, global: &MirGlobal) -> DebugInfoEntry {
         let mut var = DebugInfoEntry::new(DwarfTag::Variable);
-        var.add_attr(DwarfAttr::Name, DwarfAttrValue::String(global.name.to_string()));
-        var.add_attr(DwarfAttr::External, DwarfAttrValue::Flag(global.linkage == crate::codegen::ir::Linkage::External));
+        var.add_attr(
+            DwarfAttr::Name,
+            DwarfAttrValue::String(global.name.to_string()),
+        );
+        var.add_attr(
+            DwarfAttr::External,
+            DwarfAttrValue::Flag(global.linkage == crate::codegen::ir::Linkage::External),
+        );
 
         // Location expression (address)
         let mut loc = Vec::new();
         loc.push(DwarfOp::Addr as u8);
-        loc.extend_from_slice(&0u64.to_le_bytes());  // Will be fixed up by linker
+        loc.extend_from_slice(&0u64.to_le_bytes()); // Will be fixed up by linker
         var.add_attr(DwarfAttr::Location, DwarfAttrValue::ExprLoc(loc));
 
         var
@@ -813,7 +830,10 @@ impl DwarfGenerator {
     /// Create a subprogram DIE.
     fn create_subprogram_die(&self, func: &MirFunction) -> DebugInfoEntry {
         let mut subprog = DebugInfoEntry::new(DwarfTag::Subprogram);
-        subprog.add_attr(DwarfAttr::Name, DwarfAttrValue::String(func.name.to_string()));
+        subprog.add_attr(
+            DwarfAttr::Name,
+            DwarfAttrValue::String(func.name.to_string()),
+        );
         subprog.add_attr(DwarfAttr::External, DwarfAttrValue::Flag(func.is_public));
         subprog.add_attr(DwarfAttr::Prototyped, DwarfAttrValue::Flag(true));
 
@@ -1077,7 +1097,8 @@ impl DwarfGenerator {
 
         // Fix up header length
         let header_length = (data.len() - header_start) as u32;
-        data[header_length_pos..header_length_pos + 4].copy_from_slice(&header_length.to_le_bytes());
+        data[header_length_pos..header_length_pos + 4]
+            .copy_from_slice(&header_length.to_le_bytes());
 
         // Line number program
         self.write_line_program(&mut data, line_base, line_range, opcode_base);
@@ -1090,7 +1111,13 @@ impl DwarfGenerator {
     }
 
     /// Write the line number program.
-    fn write_line_program(&self, data: &mut Vec<u8>, line_base: i8, line_range: u8, opcode_base: u8) {
+    fn write_line_program(
+        &self,
+        data: &mut Vec<u8>,
+        line_base: i8,
+        line_range: u8,
+        opcode_base: u8,
+    ) {
         let mut current_addr = 0u64;
         let mut current_file = 1u32;
         let mut current_line = 1u32;
@@ -1369,8 +1396,7 @@ pub fn encode_sleb128(mut value: i64) -> Vec<u8> {
     loop {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
-        let done = (value == 0 && (byte & 0x40) == 0) ||
-                   (value == -1 && (byte & 0x40) != 0);
+        let done = (value == 0 && (byte & 0x40) == 0) || (value == -1 && (byte & 0x40) != 0);
         if !done {
             byte |= 0x80;
         }
@@ -2078,7 +2104,10 @@ mod tests {
         gen.set_comp_dir("/test");
 
         let mut cu = DebugInfoEntry::new(DwarfTag::CompileUnit);
-        cu.add_attr(DwarfAttr::Name, DwarfAttrValue::String("test.qta".to_string()));
+        cu.add_attr(
+            DwarfAttr::Name,
+            DwarfAttrValue::String("test.qta".to_string()),
+        );
         gen.root = Some(cu);
 
         let info = gen.generate_debug_info();
@@ -2125,8 +2154,14 @@ mod tests {
     fn test_generate_debug_aranges() {
         let gen = DwarfGenerator::new();
         let ranges = vec![
-            AddressRange { start: 0x1000, length: 0x100 },
-            AddressRange { start: 0x2000, length: 0x200 },
+            AddressRange {
+                start: 0x1000,
+                length: 0x100,
+            },
+            AddressRange {
+                start: 0x2000,
+                length: 0x200,
+            },
         ];
 
         let aranges = gen.generate_debug_aranges(&ranges);

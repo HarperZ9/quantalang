@@ -232,7 +232,10 @@ impl DocumentStore {
             item.version,
             item.text,
         ));
-        self.documents.write().unwrap().insert(item.uri, doc.clone());
+        self.documents
+            .write()
+            .unwrap()
+            .insert(item.uri, doc.clone());
         doc
     }
 
@@ -433,7 +436,11 @@ impl RopeNode {
                     left.collect_range(start, end.min(left_len), result);
                 }
                 if end > left_len {
-                    let right_start = if start > left_len { start - left_len } else { 0 };
+                    let right_start = if start > left_len {
+                        start - left_len
+                    } else {
+                        0
+                    };
                     right.collect_range(right_start, end - left_len, result);
                 }
             }

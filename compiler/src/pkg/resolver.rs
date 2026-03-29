@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
-use super::{Manifest, Version, VersionReq, Registry, RegistryError, PackageMetadata, VersionInfo};
+use super::{Manifest, PackageMetadata, Registry, RegistryError, Version, VersionInfo, VersionReq};
 
 /// Resolution error types
 #[derive(Debug)]
@@ -37,10 +37,7 @@ pub enum ResolveError {
     /// Registry error
     Registry(RegistryError),
     /// Feature not found
-    FeatureNotFound {
-        package: String,
-        feature: String,
-    },
+    FeatureNotFound { package: String, feature: String },
     /// Maximum iterations exceeded
     MaxIterations,
 }
@@ -48,7 +45,11 @@ pub enum ResolveError {
 impl fmt::Display for ResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoMatchingVersion { package, requirement, available } => {
+            Self::NoMatchingVersion {
+                package,
+                requirement,
+                available,
+            } => {
                 write!(f, "no matching version for '{}' {}", package, requirement)?;
                 if !available.is_empty() {
                     write!(f, " (available: ")?;
@@ -65,7 +66,10 @@ impl fmt::Display for ResolveError {
                 }
                 Ok(())
             }
-            Self::Conflict { package, requirements } => {
+            Self::Conflict {
+                package,
+                requirements,
+            } => {
                 writeln!(f, "conflicting requirements for '{}':", package)?;
                 for (from, req) in requirements {
                     writeln!(f, "  - {} requires {}", from, req)?;
@@ -84,7 +88,11 @@ impl fmt::Display for ResolveError {
             }
             Self::Registry(e) => write!(f, "registry error: {}", e),
             Self::FeatureNotFound { package, feature } => {
-                write!(f, "feature '{}' not found in package '{}'", feature, package)
+                write!(
+                    f,
+                    "feature '{}' not found in package '{}'",
+                    feature, package
+                )
             }
             Self::MaxIterations => write!(f, "maximum resolution iterations exceeded"),
         }
@@ -248,7 +256,9 @@ impl DependencyGraph {
 
         for start in self.edges.keys() {
             if !visited.contains(start.as_str()) {
-                if let Some(cycle) = self.find_cycle_from(start, &mut visited, &mut path, &mut path_set) {
+                if let Some(cycle) =
+                    self.find_cycle_from(start, &mut visited, &mut path, &mut path_set)
+                {
                     return Some(cycle);
                 }
             }
@@ -273,7 +283,8 @@ impl DependencyGraph {
                 if path_set.contains(dep.as_str()) {
                     // Found cycle
                     let cycle_start = path.iter().position(|&n| n == dep.as_str()).unwrap();
-                    let mut cycle: Vec<_> = path[cycle_start..].iter().map(|s| s.to_string()).collect();
+                    let mut cycle: Vec<_> =
+                        path[cycle_start..].iter().map(|s| s.to_string()).collect();
                     cycle.push(dep.to_string());
                     return Some(cycle);
                 }
@@ -332,7 +343,8 @@ impl<'a> Resolver<'a> {
         let mut graph = DependencyGraph::new();
 
         // Track pending requirements: (package, requirement, from, features, is_dev)
-        let mut pending: VecDeque<(String, VersionReq, String, Vec<String>, bool)> = VecDeque::new();
+        let mut pending: VecDeque<(String, VersionReq, String, Vec<String>, bool)> =
+            VecDeque::new();
 
         // Track all requirements for each package (for conflict reporting)
         let mut all_requirements: HashMap<String, Vec<(String, VersionReq)>> = HashMap::new();
@@ -499,7 +511,8 @@ impl<'a> Resolver<'a> {
         for (name, pkg) in &mut resolved {
             for dep_name in graph.dependencies(name) {
                 if let Some(version) = dep_versions.get(dep_name) {
-                    pkg.dependencies.insert(dep_name.to_string(), version.clone());
+                    pkg.dependencies
+                        .insert(dep_name.to_string(), version.clone());
                 }
             }
         }
@@ -509,7 +522,8 @@ impl<'a> Resolver<'a> {
             name: root_name.clone(),
             version: self.root_manifest.package.version.clone(),
             features: BTreeSet::new(),
-            dependencies: resolved.iter()
+            dependencies: resolved
+                .iter()
                 .filter(|(_, p)| !p.is_dev)
                 .map(|(n, p)| (n.clone(), p.version.clone()))
                 .collect(),
@@ -539,7 +553,8 @@ impl<'a> Resolver<'a> {
         metadata: &PackageMetadata,
         req: &VersionReq,
     ) -> Result<VersionInfo, ResolveError> {
-        let mut matching: Vec<_> = metadata.versions
+        let mut matching: Vec<_> = metadata
+            .versions
             .iter()
             .filter(|v| !v.yanked && req.matches(&v.version))
             .collect();
@@ -548,7 +563,11 @@ impl<'a> Resolver<'a> {
             return Err(ResolveError::NoMatchingVersion {
                 package: metadata.name.clone(),
                 requirement: req.clone(),
-                available: metadata.versions.iter().map(|v| v.version.clone()).collect(),
+                available: metadata
+                    .versions
+                    .iter()
+                    .map(|v| v.version.clone())
+                    .collect(),
             });
         }
 
@@ -596,8 +615,8 @@ impl ResolverBuilder {
 
     /// Build resolver
     pub fn build<'a>(self, registry: &'a Registry, manifest: &'a Manifest) -> Resolver<'a> {
-        let mut resolver = Resolver::new(registry, manifest)
-            .with_max_iterations(self.max_iterations);
+        let mut resolver =
+            Resolver::new(registry, manifest).with_max_iterations(self.max_iterations);
 
         if self.include_dev {
             resolver = resolver.with_dev_dependencies();
@@ -622,12 +641,9 @@ pub struct MinimalUpdateResolver<'a> {
 
 impl<'a> MinimalUpdateResolver<'a> {
     /// Create from existing resolution
-    pub fn new(
-        registry: &'a Registry,
-        manifest: &'a Manifest,
-        existing: &Resolution,
-    ) -> Self {
-        let locked: HashMap<_, _> = existing.packages
+    pub fn new(registry: &'a Registry, manifest: &'a Manifest, existing: &Resolution) -> Self {
+        let locked: HashMap<_, _> = existing
+            .packages
             .iter()
             .map(|(n, p)| (n.clone(), p.version.clone()))
             .collect();

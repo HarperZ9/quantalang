@@ -85,7 +85,10 @@ impl Range {
     }
 
     pub fn point(pos: Position) -> Self {
-        Self { start: pos, end: pos }
+        Self {
+            start: pos,
+            end: pos,
+        }
     }
 
     pub fn contains(&self, pos: Position) -> bool {
@@ -674,7 +677,12 @@ pub struct DocumentSymbol {
 }
 
 impl DocumentSymbol {
-    pub fn new(name: impl Into<String>, kind: SymbolKind, range: Range, selection_range: Range) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        kind: SymbolKind,
+        range: Range,
+        selection_range: Range,
+    ) -> Self {
         Self {
             name: name.into(),
             detail: None,

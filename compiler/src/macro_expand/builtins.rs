@@ -8,12 +8,11 @@
 //!
 //! This module provides built-in macros like `println!`, `vec!`, `format!`, etc.
 
-
-use crate::lexer::{TokenKind, Span, Delimiter, Keyword, LiteralKind};
+use crate::lexer::{Delimiter, Keyword, LiteralKind, Span, TokenKind};
 
 use super::{
-    MacroContext, MacroDef, MacroRule, MacroPattern, PatternElement,
-    MacroExpansion, ExpansionElement, MetaVarKind, RepetitionKind, MacroId,
+    ExpansionElement, MacroContext, MacroDef, MacroExpansion, MacroId, MacroPattern, MacroRule,
+    MetaVarKind, PatternElement, RepetitionKind,
 };
 
 // =============================================================================
@@ -80,7 +79,9 @@ fn simple_macro(
         name: name.into(),
         rules: vec![MacroRule {
             pattern: MacroPattern { elements: pattern },
-            expansion: MacroExpansion { elements: expansion },
+            expansion: MacroExpansion {
+                elements: expansion,
+            },
             span: Span::dummy(),
         }],
         is_exported: true,
@@ -170,69 +171,89 @@ fn register_println(ctx: &mut MacroContext) {
 }
 
 fn register_print(ctx: &mut MacroContext) {
-    let def = simple_macro("print", variadic_tt_pattern(), vec![
-        ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // print_impl
-        ExpansionElement::Token(TokenKind::Not, Span::dummy()),
-        ExpansionElement::Delimited {
-            delimiter: Delimiter::Paren,
-            elements: variadic_tt_expansion(),
-            span: Span::dummy(),
-        },
-    ]);
+    let def = simple_macro(
+        "print",
+        variadic_tt_pattern(),
+        vec![
+            ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // print_impl
+            ExpansionElement::Token(TokenKind::Not, Span::dummy()),
+            ExpansionElement::Delimited {
+                delimiter: Delimiter::Paren,
+                elements: variadic_tt_expansion(),
+                span: Span::dummy(),
+            },
+        ],
+    );
     ctx.register_macro(def);
 }
 
 fn register_eprintln(ctx: &mut MacroContext) {
-    let def = simple_macro("eprintln", variadic_tt_pattern(), vec![
-        ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // eprintln_impl
-        ExpansionElement::Token(TokenKind::Not, Span::dummy()),
-        ExpansionElement::Delimited {
-            delimiter: Delimiter::Paren,
-            elements: variadic_tt_expansion(),
-            span: Span::dummy(),
-        },
-    ]);
+    let def = simple_macro(
+        "eprintln",
+        variadic_tt_pattern(),
+        vec![
+            ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // eprintln_impl
+            ExpansionElement::Token(TokenKind::Not, Span::dummy()),
+            ExpansionElement::Delimited {
+                delimiter: Delimiter::Paren,
+                elements: variadic_tt_expansion(),
+                span: Span::dummy(),
+            },
+        ],
+    );
     ctx.register_macro(def);
 }
 
 fn register_eprint(ctx: &mut MacroContext) {
-    let def = simple_macro("eprint", variadic_tt_pattern(), vec![
-        ExpansionElement::Token(TokenKind::Ident, Span::dummy()),
-        ExpansionElement::Token(TokenKind::Not, Span::dummy()),
-        ExpansionElement::Delimited {
-            delimiter: Delimiter::Paren,
-            elements: variadic_tt_expansion(),
-            span: Span::dummy(),
-        },
-    ]);
+    let def = simple_macro(
+        "eprint",
+        variadic_tt_pattern(),
+        vec![
+            ExpansionElement::Token(TokenKind::Ident, Span::dummy()),
+            ExpansionElement::Token(TokenKind::Not, Span::dummy()),
+            ExpansionElement::Delimited {
+                delimiter: Delimiter::Paren,
+                elements: variadic_tt_expansion(),
+                span: Span::dummy(),
+            },
+        ],
+    );
     ctx.register_macro(def);
 }
 
 fn register_format(ctx: &mut MacroContext) {
-    let def = simple_macro("format", variadic_tt_pattern(), vec![
-        ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // String
-        ExpansionElement::Token(TokenKind::ColonColon, Span::dummy()),
-        ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // from
-        ExpansionElement::Delimited {
-            delimiter: Delimiter::Paren,
-            elements: vec![
-                ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // format_args
-                ExpansionElement::Token(TokenKind::Not, Span::dummy()),
-                ExpansionElement::Delimited {
-                    delimiter: Delimiter::Paren,
-                    elements: variadic_tt_expansion(),
-                    span: Span::dummy(),
-                },
-            ],
-            span: Span::dummy(),
-        },
-    ]);
+    let def = simple_macro(
+        "format",
+        variadic_tt_pattern(),
+        vec![
+            ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // String
+            ExpansionElement::Token(TokenKind::ColonColon, Span::dummy()),
+            ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // from
+            ExpansionElement::Delimited {
+                delimiter: Delimiter::Paren,
+                elements: vec![
+                    ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // format_args
+                    ExpansionElement::Token(TokenKind::Not, Span::dummy()),
+                    ExpansionElement::Delimited {
+                        delimiter: Delimiter::Paren,
+                        elements: variadic_tt_expansion(),
+                        span: Span::dummy(),
+                    },
+                ],
+                span: Span::dummy(),
+            },
+        ],
+    );
     ctx.register_macro(def);
 }
 
 fn register_format_args(ctx: &mut MacroContext) {
     // format_args! is a compiler intrinsic
-    let def = simple_macro("format_args", variadic_tt_pattern(), variadic_tt_expansion());
+    let def = simple_macro(
+        "format_args",
+        variadic_tt_pattern(),
+        variadic_tt_expansion(),
+    );
     ctx.register_macro(def);
 }
 
@@ -269,15 +290,13 @@ fn register_assert(ctx: &mut MacroContext) {
                                 ExpansionElement::Token(TokenKind::Not, Span::dummy()),
                                 ExpansionElement::Delimited {
                                     delimiter: Delimiter::Paren,
-                                    elements: vec![
-                                        ExpansionElement::Token(
-                                            TokenKind::Literal {
-                                                kind: LiteralKind::Str { terminated: true },
-                                                suffix: None,
-                                            },
-                                            Span::dummy(),
-                                        ),
-                                    ],
+                                    elements: vec![ExpansionElement::Token(
+                                        TokenKind::Literal {
+                                            kind: LiteralKind::Str { terminated: true },
+                                            suffix: None,
+                                        },
+                                        Span::dummy(),
+                                    )],
                                     span: Span::dummy(),
                                 },
                             ],
@@ -344,11 +363,18 @@ fn register_assert(ctx: &mut MacroContext) {
 }
 
 fn register_assert_eq(ctx: &mut MacroContext) {
-    let def = simple_macro("assert_eq",
+    let def = simple_macro(
+        "assert_eq",
         vec![
-            PatternElement::MetaVar { name: "left".into(), kind: MetaVarKind::Expr },
+            PatternElement::MetaVar {
+                name: "left".into(),
+                kind: MetaVarKind::Expr,
+            },
             PatternElement::Token(TokenKind::Comma),
-            PatternElement::MetaVar { name: "right".into(), kind: MetaVarKind::Expr },
+            PatternElement::MetaVar {
+                name: "right".into(),
+                kind: MetaVarKind::Expr,
+            },
         ],
         vec![
             ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // assert_eq_impl
@@ -368,11 +394,18 @@ fn register_assert_eq(ctx: &mut MacroContext) {
 }
 
 fn register_assert_ne(ctx: &mut MacroContext) {
-    let def = simple_macro("assert_ne",
+    let def = simple_macro(
+        "assert_ne",
         vec![
-            PatternElement::MetaVar { name: "left".into(), kind: MetaVarKind::Expr },
+            PatternElement::MetaVar {
+                name: "left".into(),
+                kind: MetaVarKind::Expr,
+            },
             PatternElement::Token(TokenKind::Comma),
-            PatternElement::MetaVar { name: "right".into(), kind: MetaVarKind::Expr },
+            PatternElement::MetaVar {
+                name: "right".into(),
+                kind: MetaVarKind::Expr,
+            },
         ],
         vec![
             ExpansionElement::Token(TokenKind::Ident, Span::dummy()),
@@ -392,29 +425,33 @@ fn register_assert_ne(ctx: &mut MacroContext) {
 }
 
 fn register_debug_assert(ctx: &mut MacroContext) {
-    let def = simple_macro("debug_assert", variadic_tt_pattern(), vec![
-        ExpansionElement::Token(TokenKind::Keyword(Keyword::If), Span::dummy()),
-        ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // cfg!
-        ExpansionElement::Token(TokenKind::Not, Span::dummy()),
-        ExpansionElement::Delimited {
-            delimiter: Delimiter::Paren,
-            elements: vec![ExpansionElement::Token(TokenKind::Ident, Span::dummy())], // debug_assertions
-            span: Span::dummy(),
-        },
-        ExpansionElement::Delimited {
-            delimiter: Delimiter::Brace,
-            elements: vec![
-                ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // assert
-                ExpansionElement::Token(TokenKind::Not, Span::dummy()),
-                ExpansionElement::Delimited {
-                    delimiter: Delimiter::Paren,
-                    elements: variadic_tt_expansion(),
-                    span: Span::dummy(),
-                },
-            ],
-            span: Span::dummy(),
-        },
-    ]);
+    let def = simple_macro(
+        "debug_assert",
+        variadic_tt_pattern(),
+        vec![
+            ExpansionElement::Token(TokenKind::Keyword(Keyword::If), Span::dummy()),
+            ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // cfg!
+            ExpansionElement::Token(TokenKind::Not, Span::dummy()),
+            ExpansionElement::Delimited {
+                delimiter: Delimiter::Paren,
+                elements: vec![ExpansionElement::Token(TokenKind::Ident, Span::dummy())], // debug_assertions
+                span: Span::dummy(),
+            },
+            ExpansionElement::Delimited {
+                delimiter: Delimiter::Brace,
+                elements: vec![
+                    ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // assert
+                    ExpansionElement::Token(TokenKind::Not, Span::dummy()),
+                    ExpansionElement::Delimited {
+                        delimiter: Delimiter::Paren,
+                        elements: variadic_tt_expansion(),
+                        span: Span::dummy(),
+                    },
+                ],
+                span: Span::dummy(),
+            },
+        ],
+    );
     ctx.register_macro(def);
 }
 
@@ -448,9 +485,15 @@ fn register_vec(ctx: &mut MacroContext) {
             MacroRule {
                 pattern: MacroPattern {
                     elements: vec![
-                        PatternElement::MetaVar { name: "elem".into(), kind: MetaVarKind::Expr },
+                        PatternElement::MetaVar {
+                            name: "elem".into(),
+                            kind: MetaVarKind::Expr,
+                        },
                         PatternElement::Token(TokenKind::Semi),
-                        PatternElement::MetaVar { name: "n".into(), kind: MetaVarKind::Expr },
+                        PatternElement::MetaVar {
+                            name: "n".into(),
+                            kind: MetaVarKind::Expr,
+                        },
                     ],
                 },
                 expansion: MacroExpansion {
@@ -491,43 +534,47 @@ fn register_vec(ctx: &mut MacroContext) {
                     ],
                 },
                 expansion: MacroExpansion {
-                    elements: vec![
-                        ExpansionElement::Delimited {
-                            delimiter: Delimiter::Brace,
-                            elements: vec![
-                                ExpansionElement::Token(TokenKind::Keyword(Keyword::Let), Span::dummy()),
-                                ExpansionElement::Token(TokenKind::Keyword(Keyword::Mut), Span::dummy()),
-                                ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // v
-                                ExpansionElement::Token(TokenKind::Eq, Span::dummy()),
-                                ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // Vec
-                                ExpansionElement::Token(TokenKind::ColonColon, Span::dummy()),
-                                ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // new
-                                ExpansionElement::Delimited {
-                                    delimiter: Delimiter::Paren,
-                                    elements: vec![],
-                                    span: Span::dummy(),
-                                },
-                                ExpansionElement::Token(TokenKind::Semi, Span::dummy()),
-                                ExpansionElement::Repetition {
-                                    elements: vec![
-                                        ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // v
-                                        ExpansionElement::Token(TokenKind::Dot, Span::dummy()),
-                                        ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // push
-                                        ExpansionElement::Delimited {
-                                            delimiter: Delimiter::Paren,
-                                            elements: vec![ExpansionElement::MetaVar("elem".into())],
-                                            span: Span::dummy(),
-                                        },
-                                        ExpansionElement::Token(TokenKind::Semi, Span::dummy()),
-                                    ],
-                                    separator: None,
-                                    repetition: RepetitionKind::ZeroOrMore,
-                                },
-                                ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // v
-                            ],
-                            span: Span::dummy(),
-                        },
-                    ],
+                    elements: vec![ExpansionElement::Delimited {
+                        delimiter: Delimiter::Brace,
+                        elements: vec![
+                            ExpansionElement::Token(
+                                TokenKind::Keyword(Keyword::Let),
+                                Span::dummy(),
+                            ),
+                            ExpansionElement::Token(
+                                TokenKind::Keyword(Keyword::Mut),
+                                Span::dummy(),
+                            ),
+                            ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // v
+                            ExpansionElement::Token(TokenKind::Eq, Span::dummy()),
+                            ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // Vec
+                            ExpansionElement::Token(TokenKind::ColonColon, Span::dummy()),
+                            ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // new
+                            ExpansionElement::Delimited {
+                                delimiter: Delimiter::Paren,
+                                elements: vec![],
+                                span: Span::dummy(),
+                            },
+                            ExpansionElement::Token(TokenKind::Semi, Span::dummy()),
+                            ExpansionElement::Repetition {
+                                elements: vec![
+                                    ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // v
+                                    ExpansionElement::Token(TokenKind::Dot, Span::dummy()),
+                                    ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // push
+                                    ExpansionElement::Delimited {
+                                        delimiter: Delimiter::Paren,
+                                        elements: vec![ExpansionElement::MetaVar("elem".into())],
+                                        span: Span::dummy(),
+                                    },
+                                    ExpansionElement::Token(TokenKind::Semi, Span::dummy()),
+                                ],
+                                separator: None,
+                                repetition: RepetitionKind::ZeroOrMore,
+                            },
+                            ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // v
+                        ],
+                        span: Span::dummy(),
+                    }],
                 },
                 span: Span::dummy(),
             },
@@ -548,41 +595,53 @@ fn register_dbg(ctx: &mut MacroContext) {
 }
 
 fn register_todo(ctx: &mut MacroContext) {
-    let def = simple_macro("todo", variadic_tt_pattern(), vec![
-        ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // panic
-        ExpansionElement::Token(TokenKind::Not, Span::dummy()),
-        ExpansionElement::Delimited {
-            delimiter: Delimiter::Paren,
-            elements: variadic_tt_expansion(),
-            span: Span::dummy(),
-        },
-    ]);
+    let def = simple_macro(
+        "todo",
+        variadic_tt_pattern(),
+        vec![
+            ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // panic
+            ExpansionElement::Token(TokenKind::Not, Span::dummy()),
+            ExpansionElement::Delimited {
+                delimiter: Delimiter::Paren,
+                elements: variadic_tt_expansion(),
+                span: Span::dummy(),
+            },
+        ],
+    );
     ctx.register_macro(def);
 }
 
 fn register_unimplemented(ctx: &mut MacroContext) {
-    let def = simple_macro("unimplemented", variadic_tt_pattern(), vec![
-        ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // panic
-        ExpansionElement::Token(TokenKind::Not, Span::dummy()),
-        ExpansionElement::Delimited {
-            delimiter: Delimiter::Paren,
-            elements: variadic_tt_expansion(),
-            span: Span::dummy(),
-        },
-    ]);
+    let def = simple_macro(
+        "unimplemented",
+        variadic_tt_pattern(),
+        vec![
+            ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // panic
+            ExpansionElement::Token(TokenKind::Not, Span::dummy()),
+            ExpansionElement::Delimited {
+                delimiter: Delimiter::Paren,
+                elements: variadic_tt_expansion(),
+                span: Span::dummy(),
+            },
+        ],
+    );
     ctx.register_macro(def);
 }
 
 fn register_unreachable(ctx: &mut MacroContext) {
-    let def = simple_macro("unreachable", variadic_tt_pattern(), vec![
-        ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // unreachable_impl
-        ExpansionElement::Token(TokenKind::Not, Span::dummy()),
-        ExpansionElement::Delimited {
-            delimiter: Delimiter::Paren,
-            elements: variadic_tt_expansion(),
-            span: Span::dummy(),
-        },
-    ]);
+    let def = simple_macro(
+        "unreachable",
+        variadic_tt_pattern(),
+        vec![
+            ExpansionElement::Token(TokenKind::Ident, Span::dummy()), // unreachable_impl
+            ExpansionElement::Token(TokenKind::Not, Span::dummy()),
+            ExpansionElement::Delimited {
+                delimiter: Delimiter::Paren,
+                elements: variadic_tt_expansion(),
+                span: Span::dummy(),
+            },
+        ],
+    );
     ctx.register_macro(def);
 }
 
@@ -601,24 +660,36 @@ fn register_concat(ctx: &mut MacroContext) {
 }
 
 fn register_include(ctx: &mut MacroContext) {
-    let def = simple_macro("include",
-        vec![PatternElement::MetaVar { name: "file".into(), kind: MetaVarKind::Literal }],
+    let def = simple_macro(
+        "include",
+        vec![PatternElement::MetaVar {
+            name: "file".into(),
+            kind: MetaVarKind::Literal,
+        }],
         vec![ExpansionElement::MetaVar("file".into())],
     );
     ctx.register_macro(def);
 }
 
 fn register_include_str(ctx: &mut MacroContext) {
-    let def = simple_macro("include_str",
-        vec![PatternElement::MetaVar { name: "file".into(), kind: MetaVarKind::Literal }],
+    let def = simple_macro(
+        "include_str",
+        vec![PatternElement::MetaVar {
+            name: "file".into(),
+            kind: MetaVarKind::Literal,
+        }],
         vec![ExpansionElement::MetaVar("file".into())],
     );
     ctx.register_macro(def);
 }
 
 fn register_include_bytes(ctx: &mut MacroContext) {
-    let def = simple_macro("include_bytes",
-        vec![PatternElement::MetaVar { name: "file".into(), kind: MetaVarKind::Literal }],
+    let def = simple_macro(
+        "include_bytes",
+        vec![PatternElement::MetaVar {
+            name: "file".into(),
+            kind: MetaVarKind::Literal,
+        }],
         vec![ExpansionElement::MetaVar("file".into())],
     );
     ctx.register_macro(def);
@@ -629,28 +700,41 @@ fn register_include_bytes(ctx: &mut MacroContext) {
 // =============================================================================
 
 fn register_env(ctx: &mut MacroContext) {
-    let def = simple_macro("env",
-        vec![PatternElement::MetaVar { name: "name".into(), kind: MetaVarKind::Literal }],
+    let def = simple_macro(
+        "env",
+        vec![PatternElement::MetaVar {
+            name: "name".into(),
+            kind: MetaVarKind::Literal,
+        }],
         vec![ExpansionElement::MetaVar("name".into())],
     );
     ctx.register_macro(def);
 }
 
 fn register_option_env(ctx: &mut MacroContext) {
-    let def = simple_macro("option_env",
-        vec![PatternElement::MetaVar { name: "name".into(), kind: MetaVarKind::Literal }],
+    let def = simple_macro(
+        "option_env",
+        vec![PatternElement::MetaVar {
+            name: "name".into(),
+            kind: MetaVarKind::Literal,
+        }],
         vec![ExpansionElement::MetaVar("name".into())],
     );
     ctx.register_macro(def);
 }
 
 fn register_cfg(ctx: &mut MacroContext) {
-    let def = simple_macro("cfg", variadic_tt_pattern(), vec![
-        ExpansionElement::Token(
-            TokenKind::Literal { kind: LiteralKind::Bool(true), suffix: None },
+    let def = simple_macro(
+        "cfg",
+        variadic_tt_pattern(),
+        vec![ExpansionElement::Token(
+            TokenKind::Literal {
+                kind: LiteralKind::Bool(true),
+                suffix: None,
+            },
             Span::dummy(),
-        ),
-    ]);
+        )],
+    );
     ctx.register_macro(def);
 }
 
@@ -659,56 +743,80 @@ fn register_cfg(ctx: &mut MacroContext) {
 // =============================================================================
 
 fn register_compile_error(ctx: &mut MacroContext) {
-    let def = simple_macro("compile_error",
-        vec![PatternElement::MetaVar { name: "msg".into(), kind: MetaVarKind::Literal }],
+    let def = simple_macro(
+        "compile_error",
+        vec![PatternElement::MetaVar {
+            name: "msg".into(),
+            kind: MetaVarKind::Literal,
+        }],
         vec![ExpansionElement::MetaVar("msg".into())],
     );
     ctx.register_macro(def);
 }
 
 fn register_line(ctx: &mut MacroContext) {
-    let def = simple_macro("line", vec![], vec![
-        ExpansionElement::Token(
+    let def = simple_macro(
+        "line",
+        vec![],
+        vec![ExpansionElement::Token(
             TokenKind::Literal {
-                kind: LiteralKind::Int { base: crate::lexer::IntBase::Decimal, empty_int: false },
+                kind: LiteralKind::Int {
+                    base: crate::lexer::IntBase::Decimal,
+                    empty_int: false,
+                },
                 suffix: None,
             },
             Span::dummy(),
-        ),
-    ]);
+        )],
+    );
     ctx.register_macro(def);
 }
 
 fn register_column(ctx: &mut MacroContext) {
-    let def = simple_macro("column", vec![], vec![
-        ExpansionElement::Token(
+    let def = simple_macro(
+        "column",
+        vec![],
+        vec![ExpansionElement::Token(
             TokenKind::Literal {
-                kind: LiteralKind::Int { base: crate::lexer::IntBase::Decimal, empty_int: false },
+                kind: LiteralKind::Int {
+                    base: crate::lexer::IntBase::Decimal,
+                    empty_int: false,
+                },
                 suffix: None,
             },
             Span::dummy(),
-        ),
-    ]);
+        )],
+    );
     ctx.register_macro(def);
 }
 
 fn register_file(ctx: &mut MacroContext) {
-    let def = simple_macro("file", vec![], vec![
-        ExpansionElement::Token(
-            TokenKind::Literal { kind: LiteralKind::Str { terminated: true }, suffix: None },
+    let def = simple_macro(
+        "file",
+        vec![],
+        vec![ExpansionElement::Token(
+            TokenKind::Literal {
+                kind: LiteralKind::Str { terminated: true },
+                suffix: None,
+            },
             Span::dummy(),
-        ),
-    ]);
+        )],
+    );
     ctx.register_macro(def);
 }
 
 fn register_module_path(ctx: &mut MacroContext) {
-    let def = simple_macro("module_path", vec![], vec![
-        ExpansionElement::Token(
-            TokenKind::Literal { kind: LiteralKind::Str { terminated: true }, suffix: None },
+    let def = simple_macro(
+        "module_path",
+        vec![],
+        vec![ExpansionElement::Token(
+            TokenKind::Literal {
+                kind: LiteralKind::Str { terminated: true },
+                suffix: None,
+            },
             Span::dummy(),
-        ),
-    ]);
+        )],
+    );
     ctx.register_macro(def);
 }
 
