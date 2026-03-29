@@ -1103,6 +1103,15 @@ impl<'ctx> TypeInfer<'ctx> {
         let target_ty = self.infer_expr(target);
         let value_ty = self.infer_expr(value);
         let _ = self.unify(&target_ty, &value_ty, span);
+
+        // Borrow check: if assigning a reference to a named variable,
+        // track the borrow (same as check_borrow_at_binding for let).
+        if let ExprKind::Ident(ident) = &target.kind {
+            self.check_borrow_at_binding(
+                ident.name.as_ref(), value, &value_ty, span
+            );
+        }
+
         Ty::unit()
     }
 
@@ -1312,7 +1321,29 @@ impl<'ctx> TypeInfer<'ctx> {
                     self.current_effects = self.current_effects.merge(&fn_ty.effects);
                 }
 
-                (*fn_ty.ret).clone()
+                // Interprocedural lifetime: if the function returns a reference,
+                // the returned borrow is tied to the argument lifetimes.
+                // Look up the function's signature to check for lifetime params.
+                let ret = (*fn_ty.ret).clone();
+                if let TyKind::Ref(_, _, _) = &ret.kind {
+                    // The return is a reference — check if any argument is a
+                    // reference to a named variable. If so, the returned reference
+                    // borrows from those variables (interprocedural borrow tracking).
+                    for arg in args {
+                        if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
+                            if let ExprKind::Ident(ident) = &inner.kind {
+                                // The returned reference borrows from this variable
+                                self.borrow_state.add_borrow(
+                                    Arc::from(ident.name.as_ref()),
+                                    None, // No binding yet — will be set by let
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                ret
             }
             TyKind::Var(_) | TyKind::Infer(_) => {
                 // Unknown function type - create fresh types for params and return
@@ -2038,7 +2069,24 @@ impl<'ctx> TypeInfer<'ctx> {
             result_ty = self.infer_stmt(stmt);
         }
 
-        self.borrow_state.pop_scope();
+        let dying_borrows = self.borrow_state.pop_scope();
+
+        // Check for dangling references: if a dying borrow's binding
+        // is still alive in an outer scope, the reference outlives its source.
+        for borrow in &dying_borrows {
+            if let Some(ref binding_name) = borrow.binding {
+                // Check if the binding variable exists in an outer scope
+                // (it was declared before this block and will outlive it)
+                if self.ctx.lookup_var(binding_name).is_some() {
+                    // The binding survives but the borrowed variable dies
+                    // → dangling reference
+                    self.error(TypeError::ReferenceEscapesScope {
+                        variable: borrow.variable.to_string(),
+                    }, block.span);
+                }
+            }
+        }
+
         self.ctx.pop_scope();
         result_ty
     }
@@ -2330,17 +2378,31 @@ impl<'ctx> TypeInfer<'ctx> {
 
         let is_mut = matches!(&resolved.kind, TyKind::Ref(_, Mutability::Mutable, _));
 
-        // Extract the borrowed variable name from the initializer
-        let borrowed_var = match &init_expr.kind {
+        // Extract borrowed variable names from the initializer.
+        // Case 1: Direct reference — let r = &x;
+        // Case 2: Function call returning reference — let r = pick(&x, &y);
+        let borrowed_vars: Vec<String> = match &init_expr.kind {
             ExprKind::Ref { expr: inner, .. } => {
                 if let ExprKind::Ident(ident) = &inner.kind {
-                    Some(ident.name.as_ref().to_string())
-                } else { None }
+                    vec![ident.name.as_ref().to_string()]
+                } else { vec![] }
             }
-            _ => None,
+            ExprKind::Call { args, .. } | ExprKind::MethodCall { args, .. } => {
+                // Interprocedural: if a call returns a reference, the borrow
+                // sources are the variables passed as reference arguments.
+                args.iter().filter_map(|arg| {
+                    if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
+                        if let ExprKind::Ident(ident) = &inner.kind {
+                            return Some(ident.name.as_ref().to_string());
+                        }
+                    }
+                    None
+                }).collect()
+            }
+            _ => vec![],
         };
 
-        if let Some(ref source_var) = borrowed_var {
+        for source_var in &borrowed_vars {
             if is_mut {
                 if self.borrow_state.has_any_borrow(source_var) {
                     self.error(TypeError::DoubleMutableBorrow {

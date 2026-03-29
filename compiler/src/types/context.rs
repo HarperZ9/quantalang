@@ -258,6 +258,8 @@ pub struct TypeAlias {
 pub struct FnSig {
     /// Generic parameters.
     pub generics: Vec<GenericParam>,
+    /// Lifetime parameters (e.g., 'a, 'b in `fn foo<'a, 'b>(...)`)
+    pub lifetime_params: Vec<Arc<str>>,
     /// Parameter types (with names).
     pub params: Vec<(Arc<str>, Ty)>,
     /// Return type.

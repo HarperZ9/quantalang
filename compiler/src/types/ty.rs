@@ -117,10 +117,16 @@ impl BorrowState {
         self.scope_depth += 1;
     }
 
-    /// Leave a scope — invalidate all borrows created in this scope.
-    pub fn pop_scope(&mut self) {
+    /// Leave a scope — returns borrows that are dying (created in this scope)
+    /// so the caller can check for dangling references.
+    pub fn pop_scope(&mut self) -> Vec<BorrowEntry> {
+        let dying: Vec<BorrowEntry> = self.borrows.iter()
+            .filter(|b| b.scope_depth >= self.scope_depth)
+            .cloned()
+            .collect();
         self.borrows.retain(|b| b.scope_depth < self.scope_depth);
         self.scope_depth -= 1;
+        dying
     }
 
     /// Record a new borrow of a variable.

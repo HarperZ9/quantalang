@@ -863,8 +863,20 @@ impl<'ctx> TypeChecker<'ctx> {
             .map(|t| self.lower_type(t))
             .unwrap_or(Ty::unit());
 
+        // Extract lifetime parameters from generics
+        let lifetime_params: Vec<Arc<str>> = f.generics.params.iter()
+            .filter_map(|p| {
+                if let ast::GenericParamKind::Lifetime { .. } = &p.kind {
+                    Some(p.ident.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         FnSig {
             generics: Vec::new(),
+            lifetime_params,
             params,
             ret,
             is_unsafe: f.sig.is_unsafe,
@@ -1154,8 +1166,19 @@ impl<'ctx> TypeChecker<'ctx> {
             }).collect()
         }).unwrap_or_default();
 
+        let lifetime_params: Vec<Arc<str>> = generics.params.iter()
+            .filter_map(|p| {
+                if let ast::GenericParamKind::Lifetime { .. } = &p.kind {
+                    Some(p.ident.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         FnSig {
             generics: gen_params,
+            lifetime_params,
             params,
             ret,
             is_unsafe: sig.is_unsafe,
