@@ -192,6 +192,30 @@ pub enum TypeError {
         ty: Ty,
     },
 
+    /// Cannot borrow variable as mutable while it is already borrowed.
+    #[error("cannot borrow `{variable}` as mutable because it is already borrowed")]
+    AlreadyBorrowed {
+        variable: String,
+    },
+
+    /// Cannot borrow variable as mutable more than once at a time.
+    #[error("cannot borrow `{variable}` as mutable more than once at a time")]
+    DoubleMutableBorrow {
+        variable: String,
+    },
+
+    /// Cannot use a moved value.
+    #[error("use of moved value: `{variable}`")]
+    UseAfterMove {
+        variable: String,
+    },
+
+    /// Reference to local variable escapes function scope.
+    #[error("cannot return reference to local variable `{variable}`")]
+    ReferenceEscapesScope {
+        variable: String,
+    },
+
     /// Invalid binary operation.
     #[error("cannot apply binary operator `{op}` to types `{left}` and `{right}`")]
     InvalidBinaryOp {

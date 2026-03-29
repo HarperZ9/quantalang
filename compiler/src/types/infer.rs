@@ -75,6 +75,8 @@ pub struct TypeInfer<'ctx> {
     current_effects: super::effects::EffectRow,
     /// Whether any explicit `return` statement was found.
     has_return: bool,
+    /// Borrow tracking state for the current function body.
+    borrow_state: super::ty::BorrowState,
 }
 
 /// Extract variant names covered by a single pattern.
@@ -150,6 +152,7 @@ impl<'ctx> TypeInfer<'ctx> {
             effect_ctx: super::effects::EffectContext::new(),
             current_effects: super::effects::EffectRow::empty(),
             has_return: false,
+            borrow_state: super::ty::BorrowState::new(),
         }
     }
 
@@ -170,6 +173,7 @@ impl<'ctx> TypeInfer<'ctx> {
             effect_ctx: super::effects::EffectContext::new(),
             current_effects: super::effects::EffectRow::empty(),
             has_return: false,
+            borrow_state: super::ty::BorrowState::new(),
         }
     }
 
@@ -942,10 +946,31 @@ impl<'ctx> TypeInfer<'ctx> {
             }
             UnaryOp::Ref => {
                 // Reference: &expr → &T where T = typeof(expr)
+                // Track the borrow if the inner expression is a variable
+                if let ExprKind::Ident(ident) = &expr.kind {
+                    let var_name = ident.name.as_ref();
+                    // Cannot take shared reference while mutably borrowed
+                    if self.borrow_state.has_mut_borrow(var_name) {
+                        self.error(TypeError::AlreadyBorrowed {
+                            variable: var_name.to_string(),
+                        }, expr.span);
+                    }
+                    self.borrow_state.add_borrow(Arc::from(var_name), false);
+                }
                 Ty::reference(None, Mutability::Immutable, inner_ty)
             }
             UnaryOp::RefMut => {
                 // Mutable reference: &mut expr → &mut T
+                if let ExprKind::Ident(ident) = &expr.kind {
+                    let var_name = ident.name.as_ref();
+                    // Cannot take mutable reference while any borrow is active
+                    if self.borrow_state.has_any_borrow(var_name) {
+                        self.error(TypeError::DoubleMutableBorrow {
+                            variable: var_name.to_string(),
+                        }, expr.span);
+                    }
+                    self.borrow_state.add_borrow(Arc::from(var_name), true);
+                }
                 Ty::reference(None, Mutability::Mutable, inner_ty)
             }
         }
@@ -1939,6 +1964,7 @@ impl<'ctx> TypeInfer<'ctx> {
 
     pub fn infer_block(&mut self, block: &ast::Block) -> Ty {
         self.ctx.push_scope(ScopeKind::Block);
+        self.borrow_state.push_scope();
 
         let mut result_ty = Ty::unit();
 
@@ -1946,6 +1972,7 @@ impl<'ctx> TypeInfer<'ctx> {
             result_ty = self.infer_stmt(stmt);
         }
 
+        self.borrow_state.pop_scope();
         self.ctx.pop_scope();
         result_ty
     }
@@ -2042,6 +2069,15 @@ impl<'ctx> TypeInfer<'ctx> {
         if let Some(init) = &local.init {
             let init_ty = self.infer_expr(&init.expr);
             let _ = self.unify(&ty, &init_ty, local.span);
+
+            // Borrow check: if binding a reference, track the borrow
+            let var_name = match &local.pattern.kind {
+                ast::PatternKind::Ident { name, .. } => Some(name.name.as_ref().to_string()),
+                _ => None,
+            };
+            if let Some(ref name) = var_name {
+                self.check_borrow_at_binding(name, &init.expr, &ty, local.span);
+            }
         }
 
         // Bind pattern variables
@@ -2059,7 +2095,15 @@ impl<'ctx> TypeInfer<'ctx> {
         }
 
         let value_ty = if let Some(expr) = value {
-            self.infer_expr(expr)
+            let ty = self.infer_expr(expr);
+
+            // Borrow check: if returning a reference, verify it doesn't
+            // point to a local variable (which would be destroyed on return).
+            if let Some(return_expr) = value {
+                self.check_return_reference(return_expr, &ty, span);
+            }
+
+            ty
         } else {
             Ty::unit()
         };
@@ -2070,6 +2114,33 @@ impl<'ctx> TypeInfer<'ctx> {
 
         self.has_return = true;
         Ty::never()
+    }
+
+    /// Check that a returned reference doesn't point to a local variable.
+    fn check_return_reference(&mut self, expr: &ast::Expr, ty: &Ty, span: Span) {
+        let resolved = self.apply(ty);
+        if !matches!(&resolved.kind, TyKind::Ref(_, _, _)) {
+            return; // Not returning a reference — nothing to check
+        }
+
+        // If the expression is &local_var, that's always a bug
+        match &expr.kind {
+            ExprKind::Ref { expr: inner, .. } => {
+                if let ExprKind::Ident(ident) = &inner.kind {
+                    self.error(TypeError::ReferenceEscapesScope {
+                        variable: ident.name.to_string(),
+                    }, span);
+                }
+            }
+            ExprKind::Unary { op: UnaryOp::Ref | UnaryOp::RefMut, expr: inner } => {
+                if let ExprKind::Ident(ident) = &inner.kind {
+                    self.error(TypeError::ReferenceEscapesScope {
+                        variable: ident.name.to_string(),
+                    }, span);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn infer_break(&mut self, value: Option<&ast::Expr>, span: Span) -> Ty {
@@ -2141,11 +2212,51 @@ impl<'ctx> TypeInfer<'ctx> {
 
     fn infer_ref(&mut self, mutability: ast::Mutability, expr: &ast::Expr) -> Ty {
         let inner_ty = self.infer_expr(expr);
+        // Borrow checking happens at the let-binding site (infer_local),
+        // not here. Temporary references (&x passed directly to a function)
+        // are consumed immediately and don't need tracking.
         let mut_ = match mutability {
             ast::Mutability::Mutable => Mutability::Mutable,
             ast::Mutability::Immutable => Mutability::Immutable,
         };
         Ty::reference(None, mut_, inner_ty)
+    }
+
+    /// Check borrow rules when a reference is stored in a let binding.
+    /// Called from infer_local when the initializer produces a reference type.
+    fn check_borrow_at_binding(&mut self, var_name: &str, init_expr: &ast::Expr, ty: &Ty, span: crate::lexer::Span) {
+        let resolved = self.apply(ty);
+        let is_ref = matches!(&resolved.kind, TyKind::Ref(_, _, _));
+        if !is_ref { return; }
+
+        let is_mut = matches!(&resolved.kind, TyKind::Ref(_, Mutability::Mutable, _));
+
+        // Extract the borrowed variable name from the initializer
+        let borrowed_var = match &init_expr.kind {
+            ExprKind::Ref { expr: inner, .. } => {
+                if let ExprKind::Ident(ident) = &inner.kind {
+                    Some(ident.name.as_ref().to_string())
+                } else { None }
+            }
+            _ => None,
+        };
+
+        if let Some(ref source_var) = borrowed_var {
+            if is_mut {
+                if self.borrow_state.has_any_borrow(source_var) {
+                    self.error(TypeError::DoubleMutableBorrow {
+                        variable: source_var.clone(),
+                    }, span);
+                }
+            } else {
+                if self.borrow_state.has_mut_borrow(source_var) {
+                    self.error(TypeError::AlreadyBorrowed {
+                        variable: source_var.clone(),
+                    }, span);
+                }
+            }
+            self.borrow_state.add_borrow(Arc::from(source_var.as_str()), is_mut);
+        }
     }
 
     fn infer_deref(&mut self, expr: &ast::Expr, span: Span) -> Ty {

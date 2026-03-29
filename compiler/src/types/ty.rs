@@ -27,6 +27,137 @@ impl TyVarId {
     }
 }
 
+/// A unique identifier for lifetime variables used during borrow checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LifetimeVarId(pub u32);
+
+impl LifetimeVarId {
+    pub fn fresh() -> Self {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        Self(COUNTER.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+impl fmt::Display for LifetimeVarId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "'?{}", self.0)
+    }
+}
+
+/// A lifetime in the borrow checker. Either a concrete named lifetime,
+/// an inference variable, or the special 'static lifetime.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LifetimeKind {
+    /// A named lifetime from source: 'a, 'b
+    Named(Arc<str>),
+    /// An inference variable assigned during borrow checking
+    Var(LifetimeVarId),
+    /// The 'static lifetime — lives for the entire program
+    Static,
+}
+
+impl fmt::Display for LifetimeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LifetimeKind::Named(name) => write!(f, "'{}", name),
+            LifetimeKind::Var(id) => write!(f, "{}", id),
+            LifetimeKind::Static => write!(f, "'static"),
+        }
+    }
+}
+
+/// A constraint between two lifetimes: the left must outlive the right.
+/// 'a: 'b means 'a lives at least as long as 'b.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlivesConstraint {
+    /// The longer lifetime (must outlive `shorter`).
+    pub longer: LifetimeKind,
+    /// The shorter lifetime (must be outlived by `longer`).
+    pub shorter: LifetimeKind,
+}
+
+/// Tracks borrows and lifetime constraints within a function body.
+#[derive(Debug, Clone)]
+pub struct BorrowState {
+    /// Active borrows: variable name → (lifetime, mutability, span of borrow site)
+    pub borrows: Vec<BorrowEntry>,
+    /// Collected lifetime constraints from reference usage.
+    pub constraints: Vec<OutlivesConstraint>,
+    /// Scope depth counter for assigning scope-based lifetimes.
+    scope_depth: u32,
+}
+
+/// A single active borrow.
+#[derive(Debug, Clone)]
+pub struct BorrowEntry {
+    /// The variable being borrowed.
+    pub variable: Arc<str>,
+    /// The lifetime assigned to this borrow.
+    pub lifetime: LifetimeKind,
+    /// Whether this is a mutable borrow.
+    pub is_mut: bool,
+    /// The scope depth where the borrow was created.
+    pub scope_depth: u32,
+}
+
+impl BorrowState {
+    pub fn new() -> Self {
+        Self {
+            borrows: Vec::new(),
+            constraints: Vec::new(),
+            scope_depth: 0,
+        }
+    }
+
+    /// Enter a new scope (block, loop, etc.)
+    pub fn push_scope(&mut self) {
+        self.scope_depth += 1;
+    }
+
+    /// Leave a scope — invalidate all borrows created in this scope.
+    pub fn pop_scope(&mut self) {
+        self.borrows.retain(|b| b.scope_depth < self.scope_depth);
+        self.scope_depth -= 1;
+    }
+
+    /// Record a new borrow of a variable.
+    pub fn add_borrow(&mut self, variable: Arc<str>, is_mut: bool) -> LifetimeKind {
+        let lifetime = LifetimeKind::Var(LifetimeVarId::fresh());
+        self.borrows.push(BorrowEntry {
+            variable,
+            lifetime: lifetime.clone(),
+            is_mut,
+            scope_depth: self.scope_depth,
+        });
+        lifetime
+    }
+
+    /// Check if a variable has an active mutable borrow.
+    pub fn has_mut_borrow(&self, variable: &str) -> bool {
+        self.borrows.iter().any(|b| b.variable.as_ref() == variable && b.is_mut)
+    }
+
+    /// Check if a variable has any active borrow (shared or mutable).
+    pub fn has_any_borrow(&self, variable: &str) -> bool {
+        self.borrows.iter().any(|b| b.variable.as_ref() == variable)
+    }
+
+    /// Get all active borrows of a variable.
+    pub fn borrows_of(&self, variable: &str) -> Vec<&BorrowEntry> {
+        self.borrows.iter().filter(|b| b.variable.as_ref() == variable).collect()
+    }
+
+    /// Add a constraint: `longer` must outlive `shorter`.
+    pub fn add_outlives(&mut self, longer: LifetimeKind, shorter: LifetimeKind) {
+        self.constraints.push(OutlivesConstraint { longer, shorter });
+    }
+
+    /// Current scope depth.
+    pub fn current_scope_depth(&self) -> u32 {
+        self.scope_depth
+    }
+}
+
 impl fmt::Display for TyVarId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Display as ?T0, ?T1, etc.
