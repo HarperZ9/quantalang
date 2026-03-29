@@ -90,8 +90,11 @@ pub struct BorrowState {
 /// A single active borrow.
 #[derive(Debug, Clone)]
 pub struct BorrowEntry {
-    /// The variable being borrowed.
+    /// The variable being borrowed (the source: `x` in `let r = &x`).
     pub variable: Arc<str>,
+    /// The binding that holds the reference (`r` in `let r = &x`).
+    /// None for temporary borrows (function call arguments).
+    pub binding: Option<Arc<str>>,
     /// The lifetime assigned to this borrow.
     pub lifetime: LifetimeKind,
     /// Whether this is a mutable borrow.
@@ -121,10 +124,11 @@ impl BorrowState {
     }
 
     /// Record a new borrow of a variable.
-    pub fn add_borrow(&mut self, variable: Arc<str>, is_mut: bool) -> LifetimeKind {
+    pub fn add_borrow(&mut self, variable: Arc<str>, binding: Option<Arc<str>>, is_mut: bool) -> LifetimeKind {
         let lifetime = LifetimeKind::Var(LifetimeVarId::fresh());
         self.borrows.push(BorrowEntry {
             variable,
+            binding,
             lifetime: lifetime.clone(),
             is_mut,
             scope_depth: self.scope_depth,

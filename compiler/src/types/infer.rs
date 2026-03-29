@@ -85,6 +85,67 @@ pub struct TypeInfer<'ctx> {
 /// Returns the variant name for path-like patterns (`Some(x)`, `None`).
 /// Extract the enum name from a variant pattern.
 /// `Color::Red` → `"Color"`, `Shape::Circle(r)` → `"Shape"`.
+/// Check if a statement references a variable by name (for NLL dead borrow detection).
+fn stmt_mentions_var(stmt: &ast::Stmt, var_name: &str) -> bool {
+    match &stmt.kind {
+        ast::StmtKind::Expr(expr) | ast::StmtKind::Semi(expr) => {
+            expr_mentions_var(expr, var_name)
+        }
+        ast::StmtKind::Local(local) => {
+            if let Some(init) = &local.init {
+                expr_mentions_var(&init.expr, var_name)
+            } else {
+                false
+            }
+        }
+        ast::StmtKind::Item(_) => false,
+        ast::StmtKind::Empty => false,
+        // Macros may reference any variable — conservatively assume they do.
+        // This prevents NLL from releasing borrows too early when a macro
+        // like println!("{}", *r) uses a borrowed variable.
+        ast::StmtKind::Macro { .. } => true,
+    }
+}
+
+/// Recursively check if an expression references a variable by name.
+fn expr_mentions_var(expr: &ast::Expr, var_name: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(ident) => ident.name.as_ref() == var_name,
+        ExprKind::Unary { expr: inner, .. } => expr_mentions_var(inner, var_name),
+        ExprKind::Binary { left, right, .. } => {
+            expr_mentions_var(left, var_name) || expr_mentions_var(right, var_name)
+        }
+        ExprKind::Call { func, args } => {
+            expr_mentions_var(func, var_name) || args.iter().any(|a| expr_mentions_var(a, var_name))
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            expr_mentions_var(receiver, var_name) || args.iter().any(|a| expr_mentions_var(a, var_name))
+        }
+        ExprKind::Field { expr: inner, .. } => expr_mentions_var(inner, var_name),
+        ExprKind::Index { expr: inner, index } => {
+            expr_mentions_var(inner, var_name) || expr_mentions_var(index, var_name)
+        }
+        ExprKind::Ref { expr: inner, .. } => expr_mentions_var(inner, var_name),
+        ExprKind::Deref(inner) => expr_mentions_var(inner, var_name),
+        ExprKind::Block(block) => block.stmts.iter().any(|s| stmt_mentions_var(s, var_name)),
+        ExprKind::If { condition, then_branch, else_branch } => {
+            expr_mentions_var(condition, var_name)
+                || then_branch.stmts.iter().any(|s| stmt_mentions_var(s, var_name))
+                || else_branch.as_ref().map_or(false, |e| expr_mentions_var(e, var_name))
+        }
+        ExprKind::Return(Some(inner)) => expr_mentions_var(inner, var_name),
+        ExprKind::Assign { target, value, .. } => {
+            expr_mentions_var(target, var_name) || expr_mentions_var(value, var_name)
+        }
+        ExprKind::Tuple(elems) | ExprKind::Array(elems) => {
+            elems.iter().any(|e| expr_mentions_var(e, var_name))
+        }
+        // Macro calls may reference any variable — conservatively assume yes
+        ExprKind::Macro { .. } => true,
+        _ => false,
+    }
+}
+
 fn extract_enum_name_from_pattern(pattern: &ast::Pattern) -> Option<String> {
     match &pattern.kind {
         ast::PatternKind::TupleStruct { path, .. }
@@ -955,7 +1016,7 @@ impl<'ctx> TypeInfer<'ctx> {
                             variable: var_name.to_string(),
                         }, expr.span);
                     }
-                    self.borrow_state.add_borrow(Arc::from(var_name), false);
+                    self.borrow_state.add_borrow(Arc::from(var_name), None, false);
                 }
                 Ty::reference(None, Mutability::Immutable, inner_ty)
             }
@@ -969,7 +1030,7 @@ impl<'ctx> TypeInfer<'ctx> {
                             variable: var_name.to_string(),
                         }, expr.span);
                     }
-                    self.borrow_state.add_borrow(Arc::from(var_name), true);
+                    self.borrow_state.add_borrow(Arc::from(var_name), None, true);
                 }
                 Ty::reference(None, Mutability::Mutable, inner_ty)
             }
@@ -1968,13 +2029,51 @@ impl<'ctx> TypeInfer<'ctx> {
 
         let mut result_ty = Ty::unit();
 
-        for stmt in &block.stmts {
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            // NLL: before processing each statement, release borrows whose
+            // binding variables have no further uses in remaining statements.
+            let remaining = &block.stmts[i + 1..];
+            self.release_dead_borrows(remaining);
+
             result_ty = self.infer_stmt(stmt);
         }
 
         self.borrow_state.pop_scope();
         self.ctx.pop_scope();
         result_ty
+    }
+
+    /// Release borrows whose binding variables are not referenced in any
+    /// of the remaining statements. This implements simplified Non-Lexical
+    /// Lifetimes: a borrow dies at its last use, not at scope end.
+    ///
+    /// Only considers borrows with a named binding (e.g., `let r = &x` where
+    /// binding="r"). Temporary borrows (function arguments) have no binding
+    /// and are never tracked past their creation.
+    fn release_dead_borrows(&mut self, remaining_stmts: &[ast::Stmt]) {
+        // Collect (index, binding_name) for borrows that have named bindings
+        let entries: Vec<(usize, Arc<str>)> = self.borrow_state.borrows.iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.binding.as_ref().map(|name| (i, name.clone())))
+            .collect();
+
+        let mut to_remove = Vec::new();
+        for (idx, binding_name) in &entries {
+            // A borrow is dead if the binding variable (e.g., `r`) is not
+            // referenced in any remaining statement
+            let is_used = remaining_stmts.iter()
+                .any(|s| stmt_mentions_var(s, binding_name));
+            if !is_used {
+                to_remove.push(*idx);
+            }
+        }
+
+        // Remove in reverse order to preserve indices
+        for idx in to_remove.into_iter().rev() {
+            if idx < self.borrow_state.borrows.len() {
+                self.borrow_state.borrows.remove(idx);
+            }
+        }
     }
 
     fn infer_stmt(&mut self, stmt: &ast::Stmt) -> Ty {
@@ -2255,7 +2354,11 @@ impl<'ctx> TypeInfer<'ctx> {
                     }, span);
                 }
             }
-            self.borrow_state.add_borrow(Arc::from(source_var.as_str()), is_mut);
+            self.borrow_state.add_borrow(
+                Arc::from(source_var.as_str()),
+                Some(Arc::from(var_name)),
+                is_mut,
+            );
         }
     }
 
@@ -3462,7 +3565,7 @@ mod tests {
     #[test]
     fn borrow_state_tracks_borrows() {
         let mut state = super::super::ty::BorrowState::new();
-        let _lt = state.add_borrow(Arc::from("x"), false);
+        let _lt = state.add_borrow(Arc::from("x"), None, false);
         assert!(state.has_any_borrow("x"));
         assert!(!state.has_mut_borrow("x"));
     }
@@ -3470,7 +3573,7 @@ mod tests {
     #[test]
     fn borrow_state_tracks_mut_borrows() {
         let mut state = super::super::ty::BorrowState::new();
-        state.add_borrow(Arc::from("x"), true);
+        state.add_borrow(Arc::from("x"), None, true);
         assert!(state.has_any_borrow("x"));
         assert!(state.has_mut_borrow("x"));
     }
@@ -3479,7 +3582,7 @@ mod tests {
     fn borrow_state_scope_expiry() {
         let mut state = super::super::ty::BorrowState::new();
         state.push_scope();
-        state.add_borrow(Arc::from("x"), true);
+        state.add_borrow(Arc::from("x"), None, true);
         assert!(state.has_mut_borrow("x"));
         state.pop_scope();
         assert!(!state.has_any_borrow("x"));
@@ -3488,7 +3591,7 @@ mod tests {
     #[test]
     fn borrow_state_outer_persists_through_inner() {
         let mut state = super::super::ty::BorrowState::new();
-        state.add_borrow(Arc::from("x"), true);
+        state.add_borrow(Arc::from("x"), None, true);
         state.push_scope();
         // Borrow from outer scope still visible in inner scope
         assert!(state.has_mut_borrow("x"));
@@ -3500,9 +3603,9 @@ mod tests {
     #[test]
     fn borrow_state_multiple_shared_ok() {
         let mut state = super::super::ty::BorrowState::new();
-        state.add_borrow(Arc::from("x"), false);
-        state.add_borrow(Arc::from("x"), false);
-        state.add_borrow(Arc::from("x"), false);
+        state.add_borrow(Arc::from("x"), None, false);
+        state.add_borrow(Arc::from("x"), None, false);
+        state.add_borrow(Arc::from("x"), None, false);
         assert!(state.has_any_borrow("x"));
         assert!(!state.has_mut_borrow("x"));
         assert_eq!(state.borrows_of("x").len(), 3);
@@ -3512,9 +3615,9 @@ mod tests {
     fn borrow_state_nested_scope_expiry() {
         let mut state = super::super::ty::BorrowState::new();
         state.push_scope(); // depth 1
-        state.add_borrow(Arc::from("x"), true);
+        state.add_borrow(Arc::from("x"), None, true);
         state.push_scope(); // depth 2
-        state.add_borrow(Arc::from("y"), false);
+        state.add_borrow(Arc::from("y"), None, false);
         assert!(state.has_mut_borrow("x"));
         assert!(state.has_any_borrow("y"));
         state.pop_scope(); // back to 1: y's borrow dies
