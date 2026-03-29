@@ -1966,18 +1966,13 @@ fn resolve_modules_with_prefix(ast: &mut Module, source_dir: &Path, prefix: &str
             }
         }).collect();
 
-        // Pass 2: Prefix each definition and rename intra-module references.
+        // Merge module items into the main AST without name mangling.
+        // Module functions keep their original names — name collisions
+        // across modules will be handled by the future namespace system.
         for item in mod_ast.items {
             match item.kind {
                 ItemKind::Function(f) => {
-                    let mut prefixed_fn = *f;
-                    let mangled_name = format!("{}_{}", full_prefix, prefixed_fn.name.name);
-                    prefixed_fn.name = Ident::dummy(mangled_name);
-
-                    // Walk the function body and rename calls to same-module functions.
-                    if let Some(ref mut body) = prefixed_fn.body {
-                        rename_calls_in_block(body, &full_prefix, &module_fns);
-                    }
+                    let prefixed_fn = *f;
 
                     new_items.push(ast::Item::new(
                         ItemKind::Function(Box::new(prefixed_fn)),
@@ -2001,6 +1996,52 @@ fn resolve_modules_with_prefix(ast: &mut Module, source_dir: &Path, prefix: &str
 
     // Append module items to the main AST
     ast.items.extend(new_items);
+
+    // Rename calls in the main program's existing functions to use
+    // the mangled module function names.
+    let all_module_fns: HashSet<String> = ast.items.iter().filter_map(|item| {
+        if let ItemKind::Mod(ref m) = item.kind {
+            if m.content.is_none() {
+                return Some(m.name.name.to_string());
+            }
+        }
+        None
+    }).collect();
+
+    // For each module, collect its exported functions and rename call sites
+    // in the original (non-module) items.
+    for mod_name in &mod_names {
+        let mod_prefix = if prefix.is_empty() {
+            mod_name.clone()
+        } else {
+            format!("{}_{}", prefix, mod_name)
+        };
+
+        // Find which functions this module defines (by checking for prefixed names)
+        let prefixed_fns: HashSet<String> = ast.items.iter().filter_map(|item| {
+            if let ItemKind::Function(ref f) = item.kind {
+                let name = f.name.name.to_string();
+                if name.starts_with(&format!("{}_", mod_prefix)) {
+                    let original = name[mod_prefix.len() + 1..].to_string();
+                    return Some(original);
+                }
+            }
+            None
+        }).collect();
+
+        // Rename calls in ALL items (main program functions will have their
+        // calls to module functions updated to the mangled names).
+        for item in ast.items.iter_mut() {
+            if let ItemKind::Function(ref mut f) = item.kind {
+                // Don't rename inside the module's own functions (already done)
+                if !f.name.name.starts_with(&format!("{}_", mod_prefix)) {
+                    if let Some(ref mut body) = f.body {
+                        rename_calls_in_block(body, &mod_prefix, &prefixed_fns);
+                    }
+                }
+            }
+        }
+    }
 
     Ok(())
 }
