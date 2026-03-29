@@ -923,16 +923,30 @@ impl<'ctx> TypeInfer<'ctx> {
                 inner_ty
             }
             UnaryOp::Deref => {
-                // Dereference: *T -> value of T
-                Ty::fresh_var()
+                // Dereference: *ref → T (strip one reference layer)
+                let resolved = self.apply(&inner_ty);
+                match &resolved.kind {
+                    TyKind::Ref(_, _, pointee) => (**pointee).clone(),
+                    TyKind::Ptr(_, pointee) => (**pointee).clone(),
+                    // If the type is an unresolved variable, return a fresh var
+                    // that will be constrained later through unification
+                    TyKind::Var(_) | TyKind::Infer(_) => Ty::fresh_var(),
+                    // Dereferencing a non-reference type is an error
+                    _ => {
+                        self.error(TypeError::NotDereferenceable {
+                            ty: resolved.clone(),
+                        }, expr.span);
+                        Ty::error()
+                    }
+                }
             }
             UnaryOp::Ref => {
-                // Reference: &T
-                Ty::fresh_var()
+                // Reference: &expr → &T where T = typeof(expr)
+                Ty::reference(None, Mutability::Immutable, inner_ty)
             }
             UnaryOp::RefMut => {
-                // Mutable reference: &mut T
-                Ty::fresh_var()
+                // Mutable reference: &mut expr → &mut T
+                Ty::reference(None, Mutability::Mutable, inner_ty)
             }
         }
     }
@@ -2143,10 +2157,11 @@ impl<'ctx> TypeInfer<'ctx> {
             // Inference variables — allow deref, return fresh var
             TyKind::Var(_) | TyKind::Infer(_) => Ty::fresh_var(),
             TyKind::Error => Ty::error(),
-            // Allow deref on Copy primitives — common when pattern-bound
-            // variables from `&self` match arms are dereferenced with `*x`.
+            // Primitives: deref is an error (not a reference type).
+            // Pattern-bound variables from &self should use auto-deref, not *.
             TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char => {
-                expr_ty.clone()
+                self.error(TypeError::NotDereferenceable { ty: expr_ty }, span);
+                Ty::error()
             }
             _ => {
                 self.error(TypeError::NotDereferenceable { ty: expr_ty }, span);
