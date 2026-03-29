@@ -3454,4 +3454,88 @@ mod tests {
         let covered = extract_covered_variants(&pat);
         assert_eq!(covered, vec!["Point"]);
     }
+
+    // =====================================================================
+    // Borrow checker tests
+    // =====================================================================
+
+    #[test]
+    fn borrow_state_tracks_borrows() {
+        let mut state = super::super::ty::BorrowState::new();
+        let _lt = state.add_borrow(Arc::from("x"), false);
+        assert!(state.has_any_borrow("x"));
+        assert!(!state.has_mut_borrow("x"));
+    }
+
+    #[test]
+    fn borrow_state_tracks_mut_borrows() {
+        let mut state = super::super::ty::BorrowState::new();
+        state.add_borrow(Arc::from("x"), true);
+        assert!(state.has_any_borrow("x"));
+        assert!(state.has_mut_borrow("x"));
+    }
+
+    #[test]
+    fn borrow_state_scope_expiry() {
+        let mut state = super::super::ty::BorrowState::new();
+        state.push_scope();
+        state.add_borrow(Arc::from("x"), true);
+        assert!(state.has_mut_borrow("x"));
+        state.pop_scope();
+        assert!(!state.has_any_borrow("x"));
+    }
+
+    #[test]
+    fn borrow_state_outer_persists_through_inner() {
+        let mut state = super::super::ty::BorrowState::new();
+        state.add_borrow(Arc::from("x"), true);
+        state.push_scope();
+        // Borrow from outer scope still visible in inner scope
+        assert!(state.has_mut_borrow("x"));
+        state.pop_scope();
+        // Still active after inner scope ends
+        assert!(state.has_mut_borrow("x"));
+    }
+
+    #[test]
+    fn borrow_state_multiple_shared_ok() {
+        let mut state = super::super::ty::BorrowState::new();
+        state.add_borrow(Arc::from("x"), false);
+        state.add_borrow(Arc::from("x"), false);
+        state.add_borrow(Arc::from("x"), false);
+        assert!(state.has_any_borrow("x"));
+        assert!(!state.has_mut_borrow("x"));
+        assert_eq!(state.borrows_of("x").len(), 3);
+    }
+
+    #[test]
+    fn borrow_state_nested_scope_expiry() {
+        let mut state = super::super::ty::BorrowState::new();
+        state.push_scope(); // depth 1
+        state.add_borrow(Arc::from("x"), true);
+        state.push_scope(); // depth 2
+        state.add_borrow(Arc::from("y"), false);
+        assert!(state.has_mut_borrow("x"));
+        assert!(state.has_any_borrow("y"));
+        state.pop_scope(); // back to 1: y's borrow dies
+        assert!(state.has_mut_borrow("x"));
+        assert!(!state.has_any_borrow("y"));
+        state.pop_scope(); // back to 0: x's borrow dies
+        assert!(!state.has_any_borrow("x"));
+    }
+
+    #[test]
+    fn lifetime_var_id_is_fresh() {
+        let a = super::super::ty::LifetimeVarId::fresh();
+        let b = super::super::ty::LifetimeVarId::fresh();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn lifetime_kind_display() {
+        let named = super::super::ty::LifetimeKind::Named(Arc::from("a"));
+        assert_eq!(format!("{}", named), "'a");
+        let stat = super::super::ty::LifetimeKind::Static;
+        assert_eq!(format!("{}", stat), "'static");
+    }
 }
