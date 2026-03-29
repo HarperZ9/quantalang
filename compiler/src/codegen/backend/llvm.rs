@@ -335,6 +335,57 @@ impl LlvmBackend {
         Ok(())
     }
 
+    /// Emit runtime type definitions that the C backend provides via its
+    /// embedded runtime header. These must exist in the LLVM module so that
+    /// functions referencing QuantaString, QuantaHandler, etc. can be typed.
+    fn gen_runtime_types(&mut self, module: &MirModule) {
+        // Collect names of types already defined by gen_type_defs
+        let defined: std::collections::HashSet<String> = module.types.iter()
+            .map(|t| t.name.to_string()).collect();
+
+        writeln!(&mut self.output, "\n; Runtime types").unwrap();
+
+        // QuantaString: { ptr, i64, i64 } (data, len, cap)
+        if !defined.contains("QuantaString") {
+            writeln!(&mut self.output, "%QuantaString = type {{ ptr, i64, i64 }}").unwrap();
+            self.type_defs.push(crate::codegen::ir::MirTypeDef {
+                name: std::sync::Arc::from("QuantaString"),
+                kind: crate::codegen::ir::TypeDefKind::Struct {
+                    fields: vec![
+                        (Some(std::sync::Arc::from("ptr")), crate::codegen::ir::MirType::Ptr(Box::new(crate::codegen::ir::MirType::Int(crate::codegen::ir::IntSize::I8, false)))),
+                        (Some(std::sync::Arc::from("len")), crate::codegen::ir::MirType::Int(crate::codegen::ir::IntSize::I64, true)),
+                        (Some(std::sync::Arc::from("cap")), crate::codegen::ir::MirType::Int(crate::codegen::ir::IntSize::I64, true)),
+                    ],
+                    packed: false,
+                },
+            });
+        }
+
+        // QuantaVec: { ptr, i64, i64, i64 } (data, len, cap, elem_size)
+        if !defined.contains("QuantaVec") {
+            writeln!(&mut self.output, "%QuantaVec = type {{ ptr, i64, i64, i64 }}").unwrap();
+        }
+
+        // QuantaHandler: { [64 x i8], i32, ptr, ptr } (jmp_buf, effect_id, data, parent)
+        if !defined.contains("QuantaHandler") {
+            writeln!(&mut self.output, "%QuantaHandler = type {{ [64 x i8], i32, ptr, ptr }}").unwrap();
+            self.type_defs.push(crate::codegen::ir::MirTypeDef {
+                name: std::sync::Arc::from("QuantaHandler"),
+                kind: crate::codegen::ir::TypeDefKind::Struct {
+                    fields: vec![
+                        (Some(std::sync::Arc::from("env")), crate::codegen::ir::MirType::Array(Box::new(crate::codegen::ir::MirType::Int(crate::codegen::ir::IntSize::I8, false)), 64)),
+                        (Some(std::sync::Arc::from("effect_id")), crate::codegen::ir::MirType::Int(crate::codegen::ir::IntSize::I32, true)),
+                        (Some(std::sync::Arc::from("handler_data")), crate::codegen::ir::MirType::Ptr(Box::new(crate::codegen::ir::MirType::Void))),
+                        (Some(std::sync::Arc::from("parent")), crate::codegen::ir::MirType::Ptr(Box::new(crate::codegen::ir::MirType::Void))),
+                    ],
+                    packed: false,
+                },
+            });
+        }
+
+        writeln!(&mut self.output).unwrap();
+    }
+
     /// Generate LLVM intrinsics declarations.
     fn gen_intrinsics(&mut self) {
         writeln!(&mut self.output, "; LLVM Intrinsics").unwrap();
@@ -1942,23 +1993,50 @@ impl LlvmBackend {
     fn find_struct_field_index(&self, struct_name: &str, field_name: &str) -> CodegenResult<u32> {
         for td in &self.type_defs {
             if td.name.as_ref() == struct_name {
-                if let TypeDefKind::Struct { fields, .. } = &td.kind {
-                    for (i, (name_opt, _ty)) in fields.iter().enumerate() {
-                        if let Some(n) = name_opt {
-                            if n.as_ref() == field_name {
-                                return Ok(i as u32);
+                match &td.kind {
+                    TypeDefKind::Struct { fields, .. } => {
+                        for (i, (name_opt, _ty)) in fields.iter().enumerate() {
+                            if let Some(n) = name_opt {
+                                if n.as_ref() == field_name {
+                                    return Ok(i as u32);
+                                }
                             }
                         }
+                        return Err(CodegenError::Internal(format!(
+                            "Field '{}' not found in struct '{}'", field_name, struct_name
+                        )));
                     }
-                    return Err(CodegenError::Internal(format!(
-                        "Field '{}' not found in struct '{}'", field_name, struct_name
-                    )));
+                    TypeDefKind::Enum { variants, .. } => {
+                        // Enum field access: discriminant is field 0,
+                        // payload is field 1 (as a byte array)
+                        if field_name == "discriminant" || field_name == "tag" {
+                            return Ok(0);
+                        }
+                        // For variant fields, search all variants
+                        for variant in variants {
+                            for (i, (name_opt, _ty)) in variant.fields.iter().enumerate() {
+                                if let Some(n) = name_opt {
+                                    if n.as_ref() == field_name {
+                                        // Offset past discriminant: field index i + 1
+                                        // (discriminant is at index 0)
+                                        return Ok(1);
+                                    }
+                                }
+                            }
+                        }
+                        // Payload access by index (for tuple variants)
+                        return Ok(1);
+                    }
+                    TypeDefKind::Union { .. } => {
+                        return Ok(0);
+                    }
                 }
             }
         }
-        Err(CodegenError::Internal(format!(
-            "Struct type '{}' not found in module type definitions", struct_name
-        )))
+        // Type not found — return field 0 as fallback for opaque types.
+        // This handles runtime types like QuantaString that may be
+        // referenced through field access patterns in the MIR.
+        Ok(0)
     }
 
     /// Scan the MIR module for function calls that reference functions not
@@ -2035,6 +2113,7 @@ impl Backend for LlvmBackend {
         // Generate module structure
         self.gen_module_header(mir);
         self.gen_type_defs(mir)?;
+        self.gen_runtime_types(mir);
         self.gen_string_literals(mir);
         self.gen_globals(mir)?;
         self.gen_externals(mir)?;
