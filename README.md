@@ -86,9 +86,9 @@ Use `--target` to select a code generation backend:
 
 | Target   | Flag                          | Output  | Status       |
 |----------|-------------------------------|---------|--------------|
-| C        | `--target c` (default)        | `.c`    | Stable       |
-| HLSL     | `--target hlsl`               | `.hlsl` | Stable       |
-| GLSL     | `--target glsl`               | `.glsl` | Stable       |
+| C        | `--target c` (default)        | `.c`    | Working      |
+| HLSL     | `--target hlsl`               | `.hlsl` | Working      |
+| GLSL     | `--target glsl`               | `.glsl` | Working      |
 | SPIR-V   | `--target spirv`              | `.spv`  | Experimental |
 | LLVM IR  | `--target llvm`               | `.ll`   | Experimental |
 | WASM     | `--target wasm`               | `.wasm` | Experimental |

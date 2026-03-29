@@ -5,7 +5,7 @@ All notable changes to QuantaLang will be documented in this file.
 ## [1.0.5] - 2026-03-28 — Self-Hosted Compiler Verification
 
 ### Proven — Self-Hosting: Complete Audit of All 9 Versions
-- All 9 versions compile through QuantaLang to native executables
+- All 9 versions compile to C through QuantaLang; 6 run to completion, 3 have runtime bugs
 - **6 of 9 run to completion with verified correct output**:
   - v1: 3-pass pipeline generating C (`int x = 3 + 4; int y = x * 2;`)
   - v2: Functions + if/else + while (`square()`, `abs_val()`, `sum_to()`)

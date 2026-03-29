@@ -1,6 +1,6 @@
 # QuantaLang End-to-End Test Results
 
-**132/132 programs compile successfully. 108 have verified runtime output.**
+**132/132 test programs compile successfully.**
 
 Pipeline: `.quanta` → `quantac` (Rust compiler) → `.c` (C99) → `cl.exe` (MSVC) → `.exe` → run
 
@@ -113,42 +113,9 @@ Programs test the full language feature set:
 | Color spaces, Delta E | 71, 78 | Pass |
 | Calibration pipeline | 79-83, 98-99 | Pass |
 
-## Native Utilities (Compiled from QuantaLang)
-
-**56/56 coreutils-compatible programs compile and run correctly.**
-
-All written in QuantaLang, compiled via the C backend to native Windows x86-64 binaries:
-
-| Utility | Size | GNU-compatible | Description |
-|---------|------|---------------|-------------|
-| qwc | 158KB | Exact match | Word/line/byte count |
-| qgrep | 158KB | Yes | Pattern search |
-| qsort | 171KB | Yes | Line sorting |
-| qsed | 189KB | Subset | Stream editor |
-| qawk | 182KB | Subset | Text processing |
-| qfind | 160KB | Subset | File search |
-| qdiff | 164KB | Yes | File comparison |
-| qdb | 274KB | N/A | SQL database |
-| qjq | 186KB | Subset | JSON query |
-| qcalc | 216KB | N/A | Math expression evaluator |
-| qhttp | 154KB | N/A | HTTP client |
-| +45 more | 140-220KB | Various | Full coreutils suite |
-
-### Verified: `qwc` vs GNU `wc`
-
-```
-$ wc README.md
- 126  614 4413 README.md
-
-$ qwc README.md
-126 614 4413 README.md
-```
-
-Identical output on all test files (lines, words, bytes).
-
 ## Self-Hosted Compiler (Written in QuantaLang)
 
-9 versions of a compiler written IN QuantaLang, each adding a compiler phase. All 9 compile through the QuantaLang compiler to native executables via the C backend.
+9 versions of a compiler written IN QuantaLang, each adding a compiler phase. 6 of 9 compile and run to completion. 3 (v7-v9) compile but have runtime bugs (infinite loops in while-loop exit logic).
 
 ### Verified: Runs to Completion with Correct Output
 
@@ -239,40 +206,6 @@ Correct. Proves the self-hosted lexer and parser produce semantically valid C fr
 | 1000-line synthetic | 1,003 | 29ms |
 
 Compilation is I/O-bound (process startup). Incremental cost is ~5ms per 1,000 lines.
-
-## Utility Edge Cases
-
-### qwc
-
-| Test Case | GNU wc | qwc | Match |
-|-----------|--------|-----|-------|
-| Normal file (README.md) | 126 614 4413 | 126 614 4413 | Exact |
-| No trailing newline | 0 1 5 | 0 1 5 | Exact |
-| Only newlines | 3 0 3 | 3 0 3 | Exact |
-| Single character | 0 1 1 | 0 1 1 | Exact |
-| 10,000-char line | 1 1 10001 | 1 1 10001 | Exact |
-| Multiple non-empty files | Shows total | Shows total | Exact |
-| stdin | 1 2 12 | 1 2 12 | Exact |
-| `-l`, `-w`, `-c` flags | Works | Works | Match |
-| Empty file (single) | 0 0 0 | (empty) | Differs |
-| Multiple files with empty | Works | **Segfault** | **Bug** |
-
-**Known bug**: `qwc` segfaults when processing multiple files where one is empty. Filed for fix. Single-file and stdin modes work correctly on all inputs including edge cases.
-
-### Other Utilities
-
-| Utility | Test | Result |
-|---------|------|--------|
-| qsort | empty input | Handles correctly |
-| qsort -r | reverse sort | Correct |
-| qgrep | no match | Exit 1 (correct) |
-| qgrep -i | case insensitive | Correct |
-| quniq -c | count mode | Correct format |
-| qbase64 | encode/decode roundtrip | Exact roundtrip |
-| qsed | substitution `s/x/y/` | Correct |
-| qtr | char translation a-z → A-Z | Correct |
-| qloc | line counting with language detection | Correct |
-| qcalc | `(2+3)*(7-4)/3` = 5 | Correct |
 
 ## Environment
 
