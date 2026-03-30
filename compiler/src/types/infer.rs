@@ -924,12 +924,56 @@ impl<'ctx> TypeInfer<'ctx> {
 
         // Handle qualified paths (e.g., std::vec::Vec, Type::method)
 
-        // Check for associated function: Type::func (2-segment path)
+        // Handle standard library paths (std::iter::repeat, std::mem::replace, etc.)
         let segments: Vec<&str> = path
             .segments
             .iter()
             .map(|s| s.ident.name.as_ref())
             .collect();
+        if segments.len() >= 3 && segments[0] == "std" {
+            let full_path = segments.join("::");
+            match full_path.as_str() {
+                "std::iter::repeat" => {
+                    // repeat(value) -> impl Iterator<Item=T>
+                    return Ty::function(vec![Ty::fresh_var()], Ty::fresh_var());
+                }
+                "std::mem::replace" => {
+                    // replace(&mut T, T) -> T
+                    let t = Ty::fresh_var();
+                    return Ty::function(vec![t.clone(), t.clone()], t);
+                }
+                "std::mem::swap" => {
+                    return Ty::function(vec![Ty::fresh_var(), Ty::fresh_var()], Ty::unit());
+                }
+                "std::mem::size_of" | "std::mem::align_of" => {
+                    return Ty::function(vec![], Ty::int(IntTy::Usize));
+                }
+                "std::mem::drop" | "std::mem::forget" => {
+                    return Ty::function(vec![Ty::fresh_var()], Ty::unit());
+                }
+                "std::ptr::null" | "std::ptr::null_mut" => {
+                    return Ty::fresh_var();
+                }
+                "std::ptr::write" | "std::ptr::read" | "std::ptr::copy"
+                | "std::ptr::copy_nonoverlapping" => {
+                    return Ty::function(vec![Ty::fresh_var(), Ty::fresh_var()], Ty::unit());
+                }
+                "std::cmp::min" | "std::cmp::max" => {
+                    let t = Ty::fresh_var();
+                    return Ty::function(vec![t.clone(), t.clone()], t);
+                }
+                "std::cmp::Ordering::Less" | "std::cmp::Ordering::Equal"
+                | "std::cmp::Ordering::Greater" => {
+                    return Ty::fresh_var();
+                }
+                _ => {
+                    // Unknown std:: path — return fresh var
+                    return Ty::fresh_var();
+                }
+            }
+        }
+
+        // Check for associated function: Type::func (2-segment path)
         if segments.len() == 2 {
             let mut type_name = segments[0];
             let func_name = segments[1];
