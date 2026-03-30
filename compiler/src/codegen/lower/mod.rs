@@ -81,6 +81,10 @@ pub struct MirLowerer<'ctx> {
     /// When inside `pub mod foo { pub mod bar { ... } }`, this contains ["foo", "bar"].
     /// Item names are prefixed with "foo_bar_" for name mangling.
     module_prefix: Vec<Arc<str>>,
+    /// Maps module short names to their mangling prefix.
+    /// For `pub module std::math`, maps "math" → "std" so that
+    /// `math::add()` resolves to `std_add` (not `math_add`).
+    module_aliases: HashMap<Arc<str>, Arc<str>>,
     /// Set of tuple type names already registered as MIR type defs.
     tuple_type_defs: HashSet<Arc<str>>,
 }
@@ -145,6 +149,7 @@ impl<'ctx> MirLowerer<'ctx> {
             current_item_vis: None,
             current_impl_type: None,
             module_prefix: Vec::new(),
+            module_aliases: HashMap::new(),
             tuple_type_defs: HashSet::new(),
         }
     }
@@ -173,6 +178,7 @@ impl<'ctx> MirLowerer<'ctx> {
             current_item_vis: None,
             current_impl_type: None,
             module_prefix: Vec::new(),
+            module_aliases: HashMap::new(),
             tuple_type_defs: HashSet::new(),
         }
     }
