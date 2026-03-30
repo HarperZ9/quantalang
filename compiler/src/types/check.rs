@@ -328,6 +328,14 @@ impl<'ctx> TypeChecker<'ctx> {
                 self.ctx.define_var(s.name.name.clone(), fn_ty);
             }
         }
+
+        // For unit structs (e.g., `struct Stdin;`), register the name as a
+        // variable so it can be used as a value expression: `Stdin` or `let x = Stdin;`
+        if matches!(&s.fields, StructFields::Unit) {
+            let substs: Vec<Ty> = (0..num_generics).map(|_| Ty::fresh_var()).collect();
+            let val_ty = Ty::adt(def_id, substs);
+            self.ctx.define_var(s.name.name.clone(), val_ty);
+        }
     }
 
     fn collect_enum(&mut self, e: &ast::EnumDef, _span: Span) {
