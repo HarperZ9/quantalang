@@ -447,6 +447,17 @@ impl MirModuleBuilder {
     pub fn find_type(&self, name: &str) -> Option<&MirTypeDef> {
         self.module.types.iter().find(|t| t.name.as_ref() == name)
     }
+
+    /// Find a type whose name ends with `_suffix`.
+    /// Used to resolve cross-module references: `Operator` → `tonemap_Operator`.
+    pub fn find_type_by_suffix(&self, suffix: &str) -> Option<String> {
+        let pattern = format!("_{}", suffix);
+        self.module
+            .types
+            .iter()
+            .find(|t| t.name.ends_with(&pattern))
+            .map(|t| t.name.to_string())
+    }
 }
 
 /// Helper to create common MIR values.

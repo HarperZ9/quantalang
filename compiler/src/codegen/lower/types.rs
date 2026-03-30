@@ -221,13 +221,9 @@ impl<'ctx> MirLowerer<'ctx> {
                     // also use `std_Vec3`, not bare `Vec3`.
                     if !self.module_prefix.is_empty() {
                         let prefixed = self.prefixed_name(&Arc::from(name));
-                        // Use prefixed name if it exists as a typedef.
-                        // Otherwise check if the bare name exists — if so,
-                        // use the bare name (parent-scope type, not prefixed).
                         if self.module.find_type(prefixed.as_ref()).is_some() {
                             return MirType::Struct(prefixed);
                         }
-                        // Don't prefix types from parent scopes
                     }
                     MirType::Struct(Arc::from(name))
                 }
