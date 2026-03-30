@@ -1,6 +1,6 @@
 # 🎉 Announcing QuantaLang v1.0.0
 
-**The first stable release of QuantaLang is here!**
+**The first public release of QuantaLang is here!**
 
 After extensive development and testing, we're thrilled to announce the public release of QuantaLang v1.0.0 — a modern systems programming language designed for safety, performance, and expressiveness.
 
@@ -50,7 +50,7 @@ Compile to efficient native code with 36 optimization passes:
 
 ### 📦 Complete Standard Library
 
-23,000+ lines of production-ready code:
+23,000+ lines of standard library code:
 
 - **Collections**: Vec, HashMap, BTreeMap
 - **I/O**: Files, networking, HTTP

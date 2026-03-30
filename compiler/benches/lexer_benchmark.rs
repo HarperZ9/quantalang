@@ -2,7 +2,6 @@
 // QUANTALANG LEXER - BENCHMARKS
 // ===============================================================================
 // Copyright (c) 2024-2025 Zain Dana Harper. All Rights Reserved.
-// CONFIDENTIAL - Trade Secret - Patent Pending
 // ===============================================================================
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};

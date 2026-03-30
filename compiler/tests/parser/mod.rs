@@ -2,7 +2,6 @@
 // QUANTALANG PARSER - TESTS
 // ===============================================================================
 // Copyright (c) 2024-2025 Zain Dana Harper. All Rights Reserved.
-// CONFIDENTIAL - Trade Secret - Patent Pending
 // ===============================================================================
 
 //! Comprehensive tests for the QuantaLang parser.

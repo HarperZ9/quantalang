@@ -3110,4 +3110,95 @@ fn main() {
             code
         );
     }
+
+    // =========================================================================
+    // SNAPSHOT TESTS (insta)
+    // =========================================================================
+
+    /// Helper: parse source → type-check → generate C code string.
+    fn snapshot_codegen(source: &str) -> String {
+        use crate::codegen::{CodeGenerator, Target};
+        use crate::parser::parse_source;
+        use crate::types::TypeContext;
+
+        let module = parse_source("test.quanta", source).expect("Failed to parse");
+        let ctx = TypeContext::new();
+        let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
+        let output = codegen.generate(&module).expect("Failed to generate C code");
+        output.as_string().unwrap().to_string()
+    }
+
+    #[test]
+    fn test_snapshot_hello() {
+        let source = r#"
+fn main() {
+    println!("Hello");
+}
+"#;
+        let code = snapshot_codegen(source);
+        insta::assert_snapshot!(code);
+    }
+
+    #[test]
+    fn test_snapshot_arithmetic() {
+        let source = r#"
+fn main() {
+    let x = 3 + 4 * 5;
+    println!("{}", x);
+}
+"#;
+        let code = snapshot_codegen(source);
+        insta::assert_snapshot!(code);
+    }
+
+    #[test]
+    fn test_snapshot_struct() {
+        let source = r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn main() {
+    let p = Point { x: 1, y: 2 };
+}
+"#;
+        let code = snapshot_codegen(source);
+        insta::assert_snapshot!(code);
+    }
+
+    #[test]
+    fn test_snapshot_if_else() {
+        let source = r#"
+fn main() {
+    let x = 10;
+    if x > 5 {
+        println!("big");
+    } else {
+        println!("small");
+    }
+}
+"#;
+        let code = snapshot_codegen(source);
+        insta::assert_snapshot!(code);
+    }
+
+    #[test]
+    fn test_snapshot_recursion() {
+        let source = r#"
+fn factorial(n: i32) -> i32 {
+    if n <= 1 {
+        1
+    } else {
+        n * factorial(n - 1)
+    }
+}
+
+fn main() {
+    println!("{}", factorial(5));
+}
+"#;
+        let code = snapshot_codegen(source);
+        insta::assert_snapshot!(code);
+    }
 }
