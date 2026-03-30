@@ -1348,15 +1348,29 @@ impl<'ctx> TypeInfer<'ctx> {
         let index_ty = self.infer_expr(index);
         let expr_ty = self.apply(&expr_ty);
 
+        // Detect if index is a range expression (a..b, a..=b, ..b, a..)
+        let is_range = matches!(&index.kind, ast::ExprKind::Range { .. });
+
         // Check that index type is usize (or can be unified with usize)
-        let _ = self.unify(&index_ty, &Ty::int(IntTy::Usize), span);
+        // Skip for range expressions which have their own type
+        if !is_range {
+            let _ = self.unify(&index_ty, &Ty::int(IntTy::Usize), span);
+        }
 
         match &expr_ty.kind {
-            TyKind::Array(elem, _) | TyKind::Slice(elem) => (**elem).clone(),
-            TyKind::Str => Ty::int(IntTy::U8), // string indexing returns bytes
+            TyKind::Array(elem, _) | TyKind::Slice(elem) => {
+                if is_range { Ty::slice((**elem).clone()) } else { (**elem).clone() }
+            }
+            TyKind::Str => {
+                if is_range { Ty::str() } else { Ty::int(IntTy::U8) }
+            }
             TyKind::Ref(_, _, inner) => match &inner.kind {
-                TyKind::Array(elem, _) | TyKind::Slice(elem) => (**elem).clone(),
-                TyKind::Str => Ty::int(IntTy::U8),
+                TyKind::Array(elem, _) | TyKind::Slice(elem) => {
+                    if is_range { Ty::slice((**elem).clone()) } else { (**elem).clone() }
+                }
+                TyKind::Str => {
+                    if is_range { Ty::str() } else { Ty::int(IntTy::U8) }
+                }
                 TyKind::Var(_) | TyKind::Infer(_) => Ty::fresh_var(),
                 _ => {
                     self.error(TypeError::NotIndexable { ty: expr_ty }, span);
