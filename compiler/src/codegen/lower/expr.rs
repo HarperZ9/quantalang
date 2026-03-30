@@ -548,6 +548,14 @@ impl<'ctx> MirLowerer<'ctx> {
             .map(|s| s.ident.name.as_ref())
             .collect::<Vec<_>>()
             .join("_");
+        // Inside a module, check if the prefixed name exists in the module.
+        // e.g., `Vec3_new` → `std_Vec3_new` when inside `mod math`.
+        if !self.module_prefix.is_empty() {
+            let prefixed = self.prefixed_name(&Arc::from(name.as_str()));
+            if self.module.find_function(prefixed.as_ref()).is_some() {
+                return Ok(values::global(prefixed.to_string()));
+            }
+        }
         Ok(values::global(name))
     }
 
@@ -1465,6 +1473,13 @@ impl<'ctx> MirLowerer<'ctx> {
             // Check module-level function declarations first.
             if let Some(func) = self.module.find_function(fn_name.as_str()) {
                 return func.sig.ret.clone();
+            }
+            // Inside a module, also try the prefixed name (e.g., Vec3_new → std_Vec3_new)
+            if !self.module_prefix.is_empty() {
+                let prefixed = self.prefixed_name(&Arc::from(fn_name.as_str()));
+                if let Some(func) = self.module.find_function(prefixed.as_ref()) {
+                    return func.sig.ret.clone();
+                }
             }
             // Check if the callee is a local variable with function pointer type
             // (e.g., a closure or higher-order function parameter).

@@ -765,11 +765,31 @@ impl CBackend {
 
                 if is_array_dest {
                     if let MirRValue::Aggregate { operands, .. } = value {
-                        // Emit element-by-element assignment for array initialization
+                        // Emit element-by-element assignment for array initialization.
+                        // If elements are arrays themselves (nested arrays like [[f64; 4]; 4]),
+                        // use memcpy since C doesn't allow direct array assignment.
                         for (i, op) in operands.iter().enumerate() {
                             self.write_indent();
                             let val = self.value_to_c(op, locals);
-                            write!(self.output, "{}[{}] = {};\n", dest_name, i, val).unwrap();
+                            // Check if the operand is a local with array type
+                            let is_array_elem = if let MirValue::Local(local_id) = op {
+                                locals
+                                    .get(local_id.0 as usize)
+                                    .map(|l| matches!(l.ty, MirType::Array(_, _)))
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            };
+                            if is_array_elem {
+                                write!(
+                                    self.output,
+                                    "memcpy({}[{}], {}, sizeof({}));\n",
+                                    dest_name, i, val, val
+                                )
+                                .unwrap();
+                            } else {
+                                write!(self.output, "{}[{}] = {};\n", dest_name, i, val).unwrap();
+                            }
                         }
                     } else if let MirRValue::Use(src_val) = value {
                         // Array-to-array copy: use memcpy since C does not
