@@ -119,6 +119,38 @@ impl CBackend {
             return Ok(());
         }
 
+        // Pre-emit typedefs for tuple types used in struct fields.
+        // (f32, f32) → typedef struct Tuple_f32_f32 { float field0; float field1; } Tuple_f32_f32;
+        let mut emitted_tuples = std::collections::HashSet::new();
+        for ty in types {
+            if let TypeDefKind::Struct { fields, .. } = &ty.kind {
+                for (_, field_ty) in fields {
+                    if let MirType::Struct(name) = field_ty {
+                        if name.starts_with("Tuple_") && !emitted_tuples.contains(name.as_ref()) {
+                            emitted_tuples.insert(name.to_string());
+                            // Parse the tuple element types from the mangled name
+                            let parts: Vec<&str> = name[6..].split('_').collect();
+                            write!(self.output, "typedef struct {} {{\n", name).unwrap();
+                            for (i, part) in parts.iter().enumerate() {
+                                let c_type = match *part {
+                                    "f32" => "float",
+                                    "f64" => "double",
+                                    "i32" => "int32_t",
+                                    "i64" => "int64_t",
+                                    "u32" => "uint32_t",
+                                    "u64" => "uint64_t",
+                                    "bool" => "bool",
+                                    _ => "int32_t",
+                                };
+                                write!(self.output, "    {} field{};\n", c_type, i).unwrap();
+                            }
+                            write!(self.output, "}} {};\n\n", name).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+
         self.output.push_str("// Type definitions\n");
 
         // Runtime-provided types that must not be re-emitted.
