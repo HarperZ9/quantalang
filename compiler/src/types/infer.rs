@@ -1950,8 +1950,38 @@ impl<'ctx> TypeInfer<'ctx> {
             | "is_ascii_lowercase"
             | "is_ascii_uppercase"
             | "is_ascii_whitespace"
-            | "is_char_boundary" => {
+            | "is_ascii_punctuation"
+            | "is_char_boundary"
+            | "is_alphanumeric"
+            | "is_alphabetic"
+            | "is_numeric"
+            | "is_whitespace"
+            | "is_lowercase"
+            | "is_uppercase"
+            | "is_control"
+            | "is_digit"
+            | "is_ascii_control"
+            | "is_ascii_graphic"
+            | "is_ascii_hexdigit" => {
                 return Ty::bool();
+            }
+            "len_utf8" | "len_utf16" => {
+                return Ty::int(IntTy::Usize);
+            }
+            "to_ascii_lowercase" | "to_ascii_uppercase" | "to_lowercase" | "to_uppercase" => {
+                return Ty::char();
+            }
+            "char_indices" | "chars" | "bytes" => {
+                return Ty::fresh_var(); // Iterator — return fresh var for now
+            }
+            "components" | "to_path_buf" => {
+                return Ty::fresh_var(); // Path methods
+            }
+            "is_dir" | "is_file" | "is_absolute" | "is_relative" | "exists" => {
+                return Ty::bool();
+            }
+            "map_or" | "unwrap_or_else" | "and_then" | "or_else" => {
+                return Ty::fresh_var(); // Combinator methods
             }
 
             // =================================================================
