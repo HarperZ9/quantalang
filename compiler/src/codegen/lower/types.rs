@@ -214,14 +214,19 @@ impl<'ctx> MirLowerer<'ctx> {
                     }
                 }
                 name => {
-                    // Inside inline modules, try the prefixed struct name
-                    // first so that types defined in the current module are
-                    // resolved correctly (e.g., `SPD` -> `spectral_SPD`).
-                    // Fall back to the bare name for parent-scope types
-                    // imported via `use super::*`.
+                    // Inside inline modules, use the prefixed struct name
+                    // for types defined in the current module scope.
+                    // This ensures consistent naming: if the struct typedef
+                    // is emitted as `std_Vec3`, function return types must
+                    // also use `std_Vec3`, not bare `Vec3`.
                     if !self.module_prefix.is_empty() {
                         let prefixed = self.prefixed_name(&Arc::from(name));
-                        if self.module.find_type(prefixed.as_ref()).is_some() {
+                        // Use prefixed name if the type exists in the module,
+                        // OR if the bare name is known as a user-defined type
+                        // (to maintain consistency with struct typedefs).
+                        if self.module.find_type(prefixed.as_ref()).is_some()
+                            || self.module.find_type(name).is_some()
+                        {
                             return MirType::Struct(prefixed);
                         }
                     }

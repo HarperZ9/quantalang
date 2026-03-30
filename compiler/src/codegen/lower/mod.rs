@@ -1083,13 +1083,31 @@ impl<'ctx> MirLowerer<'ctx> {
 
     /// Extract a type name from an AST Type node (used for impl block self_ty).
     fn resolve_type_name(&self, ty: &ast::Type) -> Arc<str> {
-        match &ty.kind {
+        let bare_name = match &ty.kind {
             ast::TypeKind::Path(path) => path
                 .last_ident()
                 .map(|i| i.name.clone())
                 .unwrap_or(Arc::from("Unknown")),
             _ => Arc::from("Unknown"),
+        };
+        // Inside a module, use the prefixed name for user-defined types
+        // to match struct typedefs (e.g., `Vec3` -> `std_Vec3`).
+        // Do NOT prefix builtins (Vec, HashMap, String, etc.).
+        if !self.module_prefix.is_empty() {
+            let name = bare_name.as_ref();
+            let is_builtin = matches!(
+                name,
+                "Vec" | "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet"
+                    | "String" | "Option" | "Result" | "Box"
+            );
+            if !is_builtin {
+                let prefixed = self.prefixed_name(&bare_name);
+                if self.module.find_type(prefixed.as_ref()).is_some() {
+                    return prefixed;
+                }
+            }
         }
+        bare_name
     }
 
     // =========================================================================
