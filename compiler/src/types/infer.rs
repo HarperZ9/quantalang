@@ -410,29 +410,43 @@ impl<'ctx> TypeInfer<'ctx> {
         }
 
         // Look up inherent methods (impl Type { fn method(...) } without a trait).
-        // Extract the type name from the DefId to query the inherent_methods registry.
-        let type_name = match &ty.kind {
-            TyKind::Adt(def_id, _) => self.ctx.lookup_type(*def_id).map(|td| td.name.to_string()),
-            // Also handle references: &Adt -> strip the ref and try the inner type
+        // Extract the type name and generic substitutions from the receiver.
+        let (type_name, adt_substs) = match &ty.kind {
+            TyKind::Adt(def_id, substs) => (
+                self.ctx.lookup_type(*def_id).map(|td| td.name.to_string()),
+                substs.clone(),
+            ),
             TyKind::Ref(_, _, inner) => {
-                if let TyKind::Adt(def_id, _) = &inner.kind {
-                    self.ctx.lookup_type(*def_id).map(|td| td.name.to_string())
+                if let TyKind::Adt(def_id, substs) = &inner.kind {
+                    (
+                        self.ctx.lookup_type(*def_id).map(|td| td.name.to_string()),
+                        substs.clone(),
+                    )
                 } else {
-                    None
+                    (None, vec![])
                 }
             }
-            _ => None,
+            _ => (None, vec![]),
         };
         if let Some(ref tname) = type_name {
             if let Some(method) = self.ctx.lookup_inherent_method(tname, method_name) {
+                // If receiver has concrete substs (e.g. Foo<i32>), substitute params.
+                // Otherwise, freshen params to fresh vars so the unifier can solve them.
+                let apply = |ty: &Ty| -> Ty {
+                    if !adt_substs.is_empty() {
+                        ty.substitute_params(&adt_substs)
+                    } else {
+                        ty.freshen_params()
+                    }
+                };
                 let params: Vec<Ty> = method
                     .sig
                     .params
                     .iter()
                     .skip_while(|(name, _)| name.as_ref() == "self")
-                    .map(|(_, ty)| ty.clone())
+                    .map(|(_, ty)| apply(ty))
                     .collect();
-                let ret = method.sig.ret.clone();
+                let ret = apply(&method.sig.ret);
                 return Some(Ty::function(params, ret));
             }
         }
@@ -935,9 +949,15 @@ impl<'ctx> TypeInfer<'ctx> {
 
             // Look up as an inherent method/associated function
             if let Some(method) = self.ctx.lookup_inherent_method(type_name, func_name) {
-                let param_tys: Vec<Ty> =
-                    method.sig.params.iter().map(|(_, ty)| ty.clone()).collect();
-                return Ty::function(param_tys, method.sig.ret.clone());
+                // Freshen generic params so the unifier can solve them from context.
+                // e.g., SimpleMap::new() returns SimpleMap<K,V> → SimpleMap<?0,?1>
+                let param_tys: Vec<Ty> = method
+                    .sig
+                    .params
+                    .iter()
+                    .map(|(_, ty)| ty.freshen_params())
+                    .collect();
+                return Ty::function(param_tys, method.sig.ret.freshen_params());
             }
 
             // For module-qualified paths (e.g., convert::xyz_to_lab), the first

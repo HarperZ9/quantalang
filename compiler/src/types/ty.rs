@@ -493,6 +493,81 @@ impl Ty {
         }
         result
     }
+
+    /// Substitute type parameters (Param) by their index position.
+    /// Used when instantiating generic methods: if the receiver is
+    /// `Foo<i32, String>`, then Param(_, 0) → i32, Param(_, 1) → String.
+    pub fn substitute_params(&self, param_substs: &[Ty]) -> Ty {
+        match &self.kind {
+            TyKind::Param(_, idx) => {
+                let idx = *idx as usize;
+                if idx < param_substs.len() {
+                    param_substs[idx].clone()
+                } else {
+                    self.clone()
+                }
+            }
+            TyKind::Tuple(elems) => {
+                Ty::tuple(elems.iter().map(|t| t.substitute_params(param_substs)).collect())
+            }
+            TyKind::Array(elem, len) => Ty::array(elem.substitute_params(param_substs), *len),
+            TyKind::Slice(elem) => Ty::slice(elem.substitute_params(param_substs)),
+            TyKind::Ref(lt, m, ty) => {
+                Ty::reference(lt.clone(), *m, ty.substitute_params(param_substs))
+            }
+            TyKind::Ptr(m, ty) => Ty::ptr(*m, ty.substitute_params(param_substs)),
+            TyKind::Fn(fn_ty) => Ty::new(TyKind::Fn(FnTy {
+                params: fn_ty.params.iter().map(|t| t.substitute_params(param_substs)).collect(),
+                ret: Box::new(fn_ty.ret.substitute_params(param_substs)),
+                is_unsafe: fn_ty.is_unsafe,
+                abi: fn_ty.abi.clone(),
+                effects: fn_ty.effects.clone(),
+            })),
+            TyKind::Adt(def_id, substs) => Ty::adt(
+                *def_id,
+                substs.iter().map(|t| t.substitute_params(param_substs)).collect(),
+            ),
+            _ => self.clone(),
+        }
+    }
+
+    /// Replace all Param types with fresh type variables.
+    /// Used when instantiating generic methods so the unifier
+    /// can solve type parameters from calling context.
+    pub fn freshen_params(&self) -> Ty {
+        use std::collections::HashMap;
+        fn freshen(ty: &Ty, cache: &mut HashMap<(Arc<str>, u32), Ty>) -> Ty {
+            match &ty.kind {
+                TyKind::Param(name, idx) => {
+                    let key = (name.clone(), *idx);
+                    cache.entry(key).or_insert_with(Ty::fresh_var).clone()
+                }
+                TyKind::Tuple(elems) => {
+                    Ty::tuple(elems.iter().map(|t| freshen(t, cache)).collect())
+                }
+                TyKind::Array(elem, len) => Ty::array(freshen(elem, cache), *len),
+                TyKind::Slice(elem) => Ty::slice(freshen(elem, cache)),
+                TyKind::Ref(lt, m, inner) => {
+                    Ty::reference(lt.clone(), *m, freshen(inner, cache))
+                }
+                TyKind::Ptr(m, inner) => Ty::ptr(*m, freshen(inner, cache)),
+                TyKind::Fn(fn_ty) => Ty::new(TyKind::Fn(FnTy {
+                    params: fn_ty.params.iter().map(|t| freshen(t, cache)).collect(),
+                    ret: Box::new(freshen(&fn_ty.ret, cache)),
+                    is_unsafe: fn_ty.is_unsafe,
+                    abi: fn_ty.abi.clone(),
+                    effects: fn_ty.effects.clone(),
+                })),
+                TyKind::Adt(def_id, substs) => Ty::adt(
+                    *def_id,
+                    substs.iter().map(|t| freshen(t, cache)).collect(),
+                ),
+                _ => ty.clone(),
+            }
+        }
+        let mut cache = HashMap::new();
+        freshen(self, &mut cache)
+    }
 }
 
 impl fmt::Display for Ty {
