@@ -1276,10 +1276,18 @@ impl CBackend {
                 let needs_dot = !s.contains('.') && !s.contains('e') && !s.contains('E');
                 match ty {
                     MirType::Float(FloatSize::F32) => {
-                        if needs_dot { format!("{}.0f", s) } else { format!("{}f", s) }
+                        if needs_dot {
+                            format!("{}.0f", s)
+                        } else {
+                            format!("{}f", s)
+                        }
                     }
                     _ => {
-                        if needs_dot { format!("{}.0", s) } else { s }
+                        if needs_dot {
+                            format!("{}.0", s)
+                        } else {
+                            s
+                        }
                     }
                 }
             }
@@ -3183,7 +3191,9 @@ fn main() {
         let module = parse_source("test.quanta", source).expect("Failed to parse");
         let ctx = TypeContext::new();
         let mut codegen = CodeGenerator::with_source(&ctx, Target::C, Arc::from(source));
-        let output = codegen.generate(&module).expect("Failed to generate C code");
+        let output = codegen
+            .generate(&module)
+            .expect("Failed to generate C code");
         output.as_string().unwrap().to_string()
     }
 

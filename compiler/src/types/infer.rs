@@ -954,7 +954,9 @@ impl<'ctx> TypeInfer<'ctx> {
                 "std::ptr::null" | "std::ptr::null_mut" => {
                     return Ty::fresh_var();
                 }
-                "std::ptr::write" | "std::ptr::read" | "std::ptr::copy"
+                "std::ptr::write"
+                | "std::ptr::read"
+                | "std::ptr::copy"
                 | "std::ptr::copy_nonoverlapping" => {
                     return Ty::function(vec![Ty::fresh_var(), Ty::fresh_var()], Ty::unit());
                 }
@@ -962,7 +964,8 @@ impl<'ctx> TypeInfer<'ctx> {
                     let t = Ty::fresh_var();
                     return Ty::function(vec![t.clone(), t.clone()], t);
                 }
-                "std::cmp::Ordering::Less" | "std::cmp::Ordering::Equal"
+                "std::cmp::Ordering::Less"
+                | "std::cmp::Ordering::Equal"
                 | "std::cmp::Ordering::Greater" => {
                     return Ty::fresh_var();
                 }
@@ -993,12 +996,18 @@ impl<'ctx> TypeInfer<'ctx> {
 
             // Handle well-known type constants (f64::INFINITY, f32::NAN, etc.)
             match (type_name, func_name) {
-                ("f64", "INFINITY" | "NEG_INFINITY" | "NAN" | "MIN" | "MAX"
-                      | "MIN_POSITIVE" | "EPSILON") => {
+                (
+                    "f64",
+                    "INFINITY" | "NEG_INFINITY" | "NAN" | "MIN" | "MAX" | "MIN_POSITIVE"
+                    | "EPSILON",
+                ) => {
                     return Ty::float(FloatTy::F64);
                 }
-                ("f32", "INFINITY" | "NEG_INFINITY" | "NAN" | "MIN" | "MAX"
-                      | "MIN_POSITIVE" | "EPSILON") => {
+                (
+                    "f32",
+                    "INFINITY" | "NEG_INFINITY" | "NAN" | "MIN" | "MAX" | "MIN_POSITIVE"
+                    | "EPSILON",
+                ) => {
                     return Ty::float(FloatTy::F32);
                 }
                 ("i32", "MIN" | "MAX") => return Ty::int(IntTy::I32),
@@ -1442,17 +1451,33 @@ impl<'ctx> TypeInfer<'ctx> {
 
         match &expr_ty.kind {
             TyKind::Array(elem, _) | TyKind::Slice(elem) => {
-                if is_range { Ty::slice((**elem).clone()) } else { (**elem).clone() }
+                if is_range {
+                    Ty::slice((**elem).clone())
+                } else {
+                    (**elem).clone()
+                }
             }
             TyKind::Str => {
-                if is_range { Ty::str() } else { Ty::int(IntTy::U8) }
+                if is_range {
+                    Ty::str()
+                } else {
+                    Ty::int(IntTy::U8)
+                }
             }
             TyKind::Ref(_, _, inner) => match &inner.kind {
                 TyKind::Array(elem, _) | TyKind::Slice(elem) => {
-                    if is_range { Ty::slice((**elem).clone()) } else { (**elem).clone() }
+                    if is_range {
+                        Ty::slice((**elem).clone())
+                    } else {
+                        (**elem).clone()
+                    }
                 }
                 TyKind::Str => {
-                    if is_range { Ty::str() } else { Ty::int(IntTy::U8) }
+                    if is_range {
+                        Ty::str()
+                    } else {
+                        Ty::int(IntTy::U8)
+                    }
                 }
                 TyKind::Var(_) | TyKind::Infer(_) => Ty::fresh_var(),
                 _ => {

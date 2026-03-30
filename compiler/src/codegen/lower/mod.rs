@@ -1103,8 +1103,15 @@ impl<'ctx> MirLowerer<'ctx> {
             let name = bare_name.as_ref();
             let is_builtin = matches!(
                 name,
-                "Vec" | "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet"
-                    | "String" | "Option" | "Result" | "Box"
+                "Vec"
+                    | "HashMap"
+                    | "HashSet"
+                    | "BTreeMap"
+                    | "BTreeSet"
+                    | "String"
+                    | "Option"
+                    | "Result"
+                    | "Box"
             );
             if !is_builtin {
                 let prefixed = self.prefixed_name(&bare_name);

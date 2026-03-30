@@ -507,9 +507,12 @@ impl Ty {
                     self.clone()
                 }
             }
-            TyKind::Tuple(elems) => {
-                Ty::tuple(elems.iter().map(|t| t.substitute_params(param_substs)).collect())
-            }
+            TyKind::Tuple(elems) => Ty::tuple(
+                elems
+                    .iter()
+                    .map(|t| t.substitute_params(param_substs))
+                    .collect(),
+            ),
             TyKind::Array(elem, len) => Ty::array(elem.substitute_params(param_substs), *len),
             TyKind::Slice(elem) => Ty::slice(elem.substitute_params(param_substs)),
             TyKind::Ref(lt, m, ty) => {
@@ -517,7 +520,11 @@ impl Ty {
             }
             TyKind::Ptr(m, ty) => Ty::ptr(*m, ty.substitute_params(param_substs)),
             TyKind::Fn(fn_ty) => Ty::new(TyKind::Fn(FnTy {
-                params: fn_ty.params.iter().map(|t| t.substitute_params(param_substs)).collect(),
+                params: fn_ty
+                    .params
+                    .iter()
+                    .map(|t| t.substitute_params(param_substs))
+                    .collect(),
                 ret: Box::new(fn_ty.ret.substitute_params(param_substs)),
                 is_unsafe: fn_ty.is_unsafe,
                 abi: fn_ty.abi.clone(),
@@ -525,7 +532,10 @@ impl Ty {
             })),
             TyKind::Adt(def_id, substs) => Ty::adt(
                 *def_id,
-                substs.iter().map(|t| t.substitute_params(param_substs)).collect(),
+                substs
+                    .iter()
+                    .map(|t| t.substitute_params(param_substs))
+                    .collect(),
             ),
             _ => self.clone(),
         }
@@ -547,9 +557,7 @@ impl Ty {
                 }
                 TyKind::Array(elem, len) => Ty::array(freshen(elem, cache), *len),
                 TyKind::Slice(elem) => Ty::slice(freshen(elem, cache)),
-                TyKind::Ref(lt, m, inner) => {
-                    Ty::reference(lt.clone(), *m, freshen(inner, cache))
-                }
+                TyKind::Ref(lt, m, inner) => Ty::reference(lt.clone(), *m, freshen(inner, cache)),
                 TyKind::Ptr(m, inner) => Ty::ptr(*m, freshen(inner, cache)),
                 TyKind::Fn(fn_ty) => Ty::new(TyKind::Fn(FnTy {
                     params: fn_ty.params.iter().map(|t| freshen(t, cache)).collect(),
@@ -558,10 +566,9 @@ impl Ty {
                     abi: fn_ty.abi.clone(),
                     effects: fn_ty.effects.clone(),
                 })),
-                TyKind::Adt(def_id, substs) => Ty::adt(
-                    *def_id,
-                    substs.iter().map(|t| freshen(t, cache)).collect(),
-                ),
+                TyKind::Adt(def_id, substs) => {
+                    Ty::adt(*def_id, substs.iter().map(|t| freshen(t, cache)).collect())
+                }
                 _ => ty.clone(),
             }
         }

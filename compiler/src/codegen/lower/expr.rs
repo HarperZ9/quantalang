@@ -521,10 +521,16 @@ impl<'ctx> MirLowerer<'ctx> {
                 ("f64", "INFINITY") => return Ok(values::global("INFINITY".to_string())),
                 ("f64", "NEG_INFINITY") => return Ok(values::global("(-INFINITY)".to_string())),
                 ("f64", "NAN") => return Ok(values::global("NAN".to_string())),
-                ("f64", "MIN") => return Ok(values::global("(-1.7976931348623157e+308)".to_string())),
+                ("f64", "MIN") => {
+                    return Ok(values::global("(-1.7976931348623157e+308)".to_string()))
+                }
                 ("f64", "MAX") => return Ok(values::global("1.7976931348623157e+308".to_string())),
-                ("f64", "EPSILON") => return Ok(values::global("2.2204460492503131e-16".to_string())),
-                ("f64", "MIN_POSITIVE") => return Ok(values::global("2.2250738585072014e-308".to_string())),
+                ("f64", "EPSILON") => {
+                    return Ok(values::global("2.2204460492503131e-16".to_string()))
+                }
+                ("f64", "MIN_POSITIVE") => {
+                    return Ok(values::global("2.2250738585072014e-308".to_string()))
+                }
                 ("f32", "INFINITY") => return Ok(values::global("INFINITY".to_string())),
                 ("f32", "NEG_INFINITY") => return Ok(values::global("(-INFINITY)".to_string())),
                 ("f32", "NAN") => return Ok(values::global("NAN".to_string())),
