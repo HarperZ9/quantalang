@@ -1269,10 +1269,20 @@ impl CBackend {
                 MirType::Int(IntSize::I64, _) => format!("{}ULL", v),
                 _ => format!("{}U", v),
             },
-            MirConst::Float(v, ty) => match ty {
-                MirType::Float(FloatSize::F32) => format!("{}f", v),
-                _ => format!("{}", v),
-            },
+            MirConst::Float(v, ty) => {
+                // Ensure float constants always have a decimal point in C
+                // so that `1.0 / 3.0` doesn't become `1 / 3` (integer division).
+                let s = format!("{}", v);
+                let needs_dot = !s.contains('.') && !s.contains('e') && !s.contains('E');
+                match ty {
+                    MirType::Float(FloatSize::F32) => {
+                        if needs_dot { format!("{}.0f", s) } else { format!("{}f", s) }
+                    }
+                    _ => {
+                        if needs_dot { format!("{}.0", s) } else { s }
+                    }
+                }
+            }
             MirConst::Str(idx) => format!("__str{}", idx),
             MirConst::ByteStr(bytes) => {
                 let escaped: String = bytes.iter().map(|b| format!("\\x{:02x}", b)).collect();
