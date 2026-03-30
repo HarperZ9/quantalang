@@ -85,6 +85,10 @@ pub struct MirLowerer<'ctx> {
     /// For `pub module std::math`, maps "math" → "std" so that
     /// `math::add()` resolves to `std_add` (not `math_add`).
     module_aliases: HashMap<Arc<str>, Arc<str>>,
+    /// Maps bare type names to their full module-prefixed names.
+    /// E.g., "Operator" → "tonemap_Operator" when Operator is defined
+    /// inside `mod tonemap`. Used for cross-module type references.
+    type_module_map: HashMap<Arc<str>, Arc<str>>,
     /// Set of tuple type names already registered as MIR type defs.
     tuple_type_defs: HashSet<Arc<str>>,
 }
@@ -150,6 +154,7 @@ impl<'ctx> MirLowerer<'ctx> {
             current_impl_type: None,
             module_prefix: Vec::new(),
             module_aliases: HashMap::new(),
+            type_module_map: HashMap::new(),
             tuple_type_defs: HashSet::new(),
         }
     }
@@ -179,6 +184,7 @@ impl<'ctx> MirLowerer<'ctx> {
             current_impl_type: None,
             module_prefix: Vec::new(),
             module_aliases: HashMap::new(),
+            type_module_map: HashMap::new(),
             tuple_type_defs: HashSet::new(),
         }
     }
