@@ -1793,11 +1793,15 @@ impl<'ctx> TypeInfer<'ctx> {
                 return Ty::fresh_var();
             }
             "split" | "splitn" | "rsplit" | "split_once" | "rsplit_once" | "split_whitespace"
-            | "split_at" | "chunks" | "chunks_mut" | "chunks_exact" | "windows" | "lines" => {
+            | "split_at" | "chunks" | "chunks_mut" | "chunks_exact" | "windows" | "lines"
+            | "drain" | "splice" => {
+                return Ty::fresh_var();
+            }
+            "binary_search" | "binary_search_by" | "binary_search_by_key" => {
                 return Ty::fresh_var();
             }
             "join" => return Ty::str(),
-            "with_capacity" | "from_slice" | "to_vec" | "into_vec" => {
+            "with_capacity" | "from_slice" | "to_vec" | "into_vec" | "into_boxed_slice" => {
                 return Ty::fresh_var();
             }
 
