@@ -486,8 +486,14 @@ impl TypeContext {
     }
 
     /// Look up a type definition by name.
+    /// When multiple types share the same name (e.g., in different modules),
+    /// returns the one with the lowest DefId for deterministic behavior.
     pub fn lookup_type_by_name(&self, name: &str) -> Option<&TypeDef> {
-        self.types.values().find(|t| t.name.as_ref() == name)
+        self.types
+            .iter()
+            .filter(|(_, t)| t.name.as_ref() == name)
+            .min_by_key(|(def_id, _)| *def_id)
+            .map(|(_, t)| t)
     }
 
     // =========================================================================
@@ -504,9 +510,13 @@ impl TypeContext {
         self.traits.get(&def_id)
     }
 
-    /// Look up a trait by name.
+    /// Look up a trait by name (deterministic: lowest DefId wins).
     pub fn lookup_trait_by_name(&self, name: &str) -> Option<&TraitDef> {
-        self.traits.values().find(|t| t.name.as_ref() == name)
+        self.traits
+            .iter()
+            .filter(|(_, t)| t.name.as_ref() == name)
+            .min_by_key(|(def_id, _)| *def_id)
+            .map(|(_, t)| t)
     }
 
     // =========================================================================

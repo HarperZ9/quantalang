@@ -911,7 +911,7 @@ pub struct FnTy {
 }
 
 /// A definition ID for ADTs, traits, etc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DefId {
     /// Module/crate index.
     pub krate: u32,
