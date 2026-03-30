@@ -607,6 +607,35 @@ impl CBackend {
             }
         }
 
+        // Emit parameter aliases when MIR renames differ from C signature names.
+        // The C signature uses the original name (e.g., `x`) but the MIR body
+        // uses a disambiguated name (e.g., `x_0`). Emit `type x_0 = x;` so the
+        // body can reference the parameter by its MIR name.
+        for local in &func.locals {
+            if local.is_param && !matches!(local.ty, MirType::Void) {
+                let mir_name = self.local_name(local.id, &func.locals);
+                if let Some(ref orig) = local.name {
+                    let orig_str = orig.to_string();
+                    let c_name = if Self::is_c_reserved(&orig_str) {
+                        format!("_{}", orig_str)
+                    } else {
+                        orig_str
+                    };
+                    if mir_name != c_name {
+                        self.write_indent();
+                        write!(
+                            self.output,
+                            "{} {} = {};\n",
+                            self.type_to_c(&local.ty),
+                            mir_name,
+                            c_name
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
+
         if !func.locals.iter().filter(|l| !l.is_param).next().is_none() {
             self.output.push('\n');
         }

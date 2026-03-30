@@ -991,6 +991,25 @@ impl<'ctx> TypeInfer<'ctx> {
                 }
             }
 
+            // Handle well-known type constants (f64::INFINITY, f32::NAN, etc.)
+            match (type_name, func_name) {
+                ("f64", "INFINITY" | "NEG_INFINITY" | "NAN" | "MIN" | "MAX"
+                      | "MIN_POSITIVE" | "EPSILON") => {
+                    return Ty::float(FloatTy::F64);
+                }
+                ("f32", "INFINITY" | "NEG_INFINITY" | "NAN" | "MIN" | "MAX"
+                      | "MIN_POSITIVE" | "EPSILON") => {
+                    return Ty::float(FloatTy::F32);
+                }
+                ("i32", "MIN" | "MAX") => return Ty::int(IntTy::I32),
+                ("i64", "MIN" | "MAX") => return Ty::int(IntTy::I64),
+                ("u32", "MIN" | "MAX") => return Ty::int(IntTy::U32),
+                ("u64", "MIN" | "MAX") => return Ty::int(IntTy::U64),
+                ("usize", "MIN" | "MAX") => return Ty::int(IntTy::Usize),
+                ("isize", "MIN" | "MAX") => return Ty::int(IntTy::Isize),
+                _ => {}
+            }
+
             // Look up as an inherent method/associated function
             if let Some(method) = self.ctx.lookup_inherent_method(type_name, func_name) {
                 // Freshen generic params so the unifier can solve them from context.

@@ -513,6 +513,32 @@ impl<'ctx> MirLowerer<'ctx> {
             }
         }
 
+        // Handle well-known type constants (f64::INFINITY, i32::MAX, etc.)
+        if path.segments.len() == 2 {
+            let type_seg = path.segments[0].ident.name.as_ref();
+            let const_seg = path.segments[1].ident.name.as_ref();
+            match (type_seg, const_seg) {
+                ("f64", "INFINITY") => return Ok(values::global("INFINITY".to_string())),
+                ("f64", "NEG_INFINITY") => return Ok(values::global("(-INFINITY)".to_string())),
+                ("f64", "NAN") => return Ok(values::global("NAN".to_string())),
+                ("f64", "MIN") => return Ok(values::global("(-1.7976931348623157e+308)".to_string())),
+                ("f64", "MAX") => return Ok(values::global("1.7976931348623157e+308".to_string())),
+                ("f64", "EPSILON") => return Ok(values::global("2.2204460492503131e-16".to_string())),
+                ("f64", "MIN_POSITIVE") => return Ok(values::global("2.2250738585072014e-308".to_string())),
+                ("f32", "INFINITY") => return Ok(values::global("INFINITY".to_string())),
+                ("f32", "NEG_INFINITY") => return Ok(values::global("(-INFINITY)".to_string())),
+                ("f32", "NAN") => return Ok(values::global("NAN".to_string())),
+                ("i32", "MIN") => return Ok(values::global("INT32_MIN".to_string())),
+                ("i32", "MAX") => return Ok(values::global("INT32_MAX".to_string())),
+                ("i64", "MIN") => return Ok(values::global("INT64_MIN".to_string())),
+                ("i64", "MAX") => return Ok(values::global("INT64_MAX".to_string())),
+                ("u32", "MAX") => return Ok(values::global("UINT32_MAX".to_string())),
+                ("u64", "MAX") => return Ok(values::global("UINT64_MAX".to_string())),
+                ("usize", "MAX") => return Ok(values::global("SIZE_MAX".to_string())),
+                _ => {}
+            }
+        }
+
         // Complex path - treat as module-qualified reference.
         // Join segments with `_` so that `mod::func` resolves to the
         // mangled name `mod_func` produced by the module loader.
