@@ -1479,6 +1479,15 @@ impl<'ctx> TypeInfer<'ctx> {
                         Ty::int(IntTy::U8)
                     }
                 }
+                // ADT through reference (&Vec<T>, &mut HashMap<K,V>, etc.)
+                // Auto-deref: index the inner ADT type
+                TyKind::Adt(_, substs) => {
+                    if !substs.is_empty() {
+                        substs[0].clone()
+                    } else {
+                        Ty::fresh_var()
+                    }
+                }
                 TyKind::Var(_) | TyKind::Infer(_) => Ty::fresh_var(),
                 _ => {
                     self.error(TypeError::NotIndexable { ty: expr_ty }, span);
