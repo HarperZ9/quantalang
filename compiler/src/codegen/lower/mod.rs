@@ -1106,7 +1106,8 @@ impl<'ctx> MirLowerer<'ctx> {
                     .as_ref()
                     .map(|t| self.lower_type_from_ast(t))
                     .unwrap_or(MirType::Void);
-                self.module.declare_function(mangled, MirFnSig::new(params, ret));
+                self.module
+                    .declare_function(mangled, MirFnSig::new(params, ret));
             }
         }
 
@@ -1505,11 +1506,7 @@ impl<'ctx> MirLowerer<'ctx> {
 
     /// Forward-declare an impl method's signature without lowering the body.
     /// This enables forward references within the same impl block.
-    fn declare_impl_method(
-        &mut self,
-        type_name: &Arc<str>,
-        f: &ast::FnDef,
-    ) -> CodegenResult<()> {
+    fn declare_impl_method(&mut self, type_name: &Arc<str>, f: &ast::FnDef) -> CodegenResult<()> {
         let mangled_name: Arc<str> = Arc::from(format!("{}_{}", type_name, f.name.name));
 
         // Build parameter types
