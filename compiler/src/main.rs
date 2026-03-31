@@ -2136,11 +2136,7 @@ fn resolve_modules_with_prefix(
 }
 
 /// Rewrite calls to module-local functions within a function body.
-fn rewrite_intra_module_calls(
-    body: &mut ast::Block,
-    mod_defined: &HashSet<String>,
-    prefix: &str,
-) {
+fn rewrite_intra_module_calls(body: &mut ast::Block, mod_defined: &HashSet<String>, prefix: &str) {
     for stmt in &mut body.stmts {
         match &mut stmt.kind {
             ast::StmtKind::Expr(expr) | ast::StmtKind::Semi(expr) => {
@@ -2156,11 +2152,7 @@ fn rewrite_intra_module_calls(
     }
 }
 
-fn rewrite_expr_node(
-    expr: &mut ast::Expr,
-    mod_defined: &HashSet<String>,
-    prefix: &str,
-) {
+fn rewrite_expr_node(expr: &mut ast::Expr, mod_defined: &HashSet<String>, prefix: &str) {
     match &mut expr.kind {
         ast::ExprKind::Call { func, args } => {
             if let ast::ExprKind::Ident(ref mut ident) = func.kind {
