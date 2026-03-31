@@ -1480,10 +1480,13 @@ impl<'ctx> TypeInfer<'ctx> {
                     }
                 }
                 // ADT through reference (&Vec<T>, &mut HashMap<K,V>, etc.)
-                // Auto-deref: index the inner ADT type
                 TyKind::Adt(_, substs) => {
                     if !substs.is_empty() {
-                        substs[0].clone()
+                        if is_range {
+                            Ty::slice(substs[0].clone())
+                        } else {
+                            substs[0].clone()
+                        }
                     } else {
                         Ty::fresh_var()
                     }
@@ -1494,10 +1497,15 @@ impl<'ctx> TypeInfer<'ctx> {
                     Ty::error()
                 }
             },
-            // ADT types (Vec, HashMap, etc.) — return fresh var for element type
+            // ADT types (Vec, HashMap, etc.)
             TyKind::Adt(_, substs) => {
                 if !substs.is_empty() {
-                    substs[0].clone()
+                    if is_range {
+                        // Range indexing on Vec<T> returns [T] (slice)
+                        Ty::slice(substs[0].clone())
+                    } else {
+                        substs[0].clone()
+                    }
                 } else {
                     Ty::fresh_var()
                 }
