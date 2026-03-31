@@ -1080,7 +1080,33 @@ impl<'ctx> MirLowerer<'ctx> {
                 let mangled: Arc<str> = Arc::from(format!("{}_{}", type_name, method_name));
                 self.impl_methods
                     .insert((type_name.clone(), method_name.clone()), mangled.clone());
-                impl_method_names.push(mangled);
+                impl_method_names.push(mangled.clone());
+
+                // Forward-declare the method signature so resolve_call_return_type
+                // can find the correct return type during lowering.
+                let mut params = Vec::new();
+                for param in &f.sig.params {
+                    let is_self = matches!(
+                        &param.pattern.kind,
+                        ast::PatternKind::Ident { name, .. } if name.name.as_ref() == "self"
+                    );
+                    if is_self {
+                        if matches!(param.ty.kind, ast::TypeKind::Ref { .. }) {
+                            params.push(MirType::Ptr(Box::new(MirType::Struct(type_name.clone()))));
+                        } else {
+                            params.push(MirType::Struct(type_name.clone()));
+                        }
+                    } else {
+                        params.push(self.lower_type_from_ast(&param.ty));
+                    }
+                }
+                let ret = f
+                    .sig
+                    .return_ty
+                    .as_ref()
+                    .map(|t| self.lower_type_from_ast(t))
+                    .unwrap_or(MirType::Void);
+                self.module.declare_function(mangled, MirFnSig::new(params, ret));
             }
         }
 
