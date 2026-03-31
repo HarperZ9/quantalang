@@ -12,6 +12,7 @@ use clap::{Parser as ClapParser, Subcommand};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use quantalang::ast::{self, ItemKind, Module, Visibility};
 use quantalang::codegen::{CodeGenerator, Target};
@@ -2083,14 +2084,35 @@ fn resolve_modules_with_prefix(
         // Recursively resolve sub-modules within this module
         resolve_modules_with_prefix(&mut mod_ast, &sub_source_dir, &full_prefix)?;
 
-        // Merge module items into the main AST without name mangling.
-        // Module functions keep their original names — name collisions
-        // across modules will be handled by the future namespace system.
+        // Collect names defined in this module (for intra-module rewriting)
+        let mod_defined: std::collections::HashSet<String> = mod_ast
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::Function(f) => Some(f.name.name.to_string()),
+                _ => None,
+            })
+            .collect();
+
+        // Merge module items with name prefixing.
+        // Functions are prefixed: `add` → `math_helpers_add`
+        // This matches how lower_path joins path segments with `_`:
+        // `math_helpers::add(...)` emits a call to `math_helpers_add`.
         for item in mod_ast.items {
             match item.kind {
                 ItemKind::Function(f) => {
-                    let prefixed_fn = *f;
-
+                    let mut prefixed_fn = *f;
+                    let original_name = prefixed_fn.name.name.to_string();
+                    prefixed_fn.name = ast::Ident {
+                        name: Arc::from(format!("{}_{}", full_prefix, original_name)),
+                        span: prefixed_fn.name.span,
+                    };
+                    // Rewrite intra-module calls in the function body:
+                    // if this function calls `helper()` and `helper` is defined
+                    // in the same module, rewrite to `math_helpers_helper()`.
+                    if let Some(ref mut body) = prefixed_fn.body {
+                        rewrite_intra_module_calls(body, &mod_defined, &full_prefix);
+                    }
                     new_items.push(ast::Item::new(
                         ItemKind::Function(Box::new(prefixed_fn)),
                         Visibility::default(),
@@ -2099,9 +2121,6 @@ fn resolve_modules_with_prefix(
                     ));
                 }
                 ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Impl(_) => {
-                    // Types (structs, enums) and impl blocks are NOT prefixed —
-                    // they are referenced by their original name in user code.
-                    // Only functions are prefixed with the module path.
                     new_items.push(item);
                 }
                 _ => {
@@ -2113,15 +2132,75 @@ fn resolve_modules_with_prefix(
 
     // Append module items to the main AST
     ast.items.extend(new_items);
-
-    // Rename calls in the main program's existing functions to use
-    // Name mangling removed — modules are merged with original names.
-    // Future namespace system will handle name collisions across modules.
-
     Ok(())
 }
 
-// Dead rename functions removed — modules merge without name mangling.
+/// Rewrite calls to module-local functions within a function body.
+fn rewrite_intra_module_calls(
+    body: &mut ast::Block,
+    mod_defined: &HashSet<String>,
+    prefix: &str,
+) {
+    for stmt in &mut body.stmts {
+        match &mut stmt.kind {
+            ast::StmtKind::Expr(expr) | ast::StmtKind::Semi(expr) => {
+                rewrite_expr_node(expr, mod_defined, prefix);
+            }
+            ast::StmtKind::Local(local) => {
+                if let Some(ref mut init) = local.init {
+                    rewrite_expr_node(&mut init.expr, mod_defined, prefix);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn rewrite_expr_node(
+    expr: &mut ast::Expr,
+    mod_defined: &HashSet<String>,
+    prefix: &str,
+) {
+    match &mut expr.kind {
+        ast::ExprKind::Call { func, args } => {
+            if let ast::ExprKind::Ident(ref mut ident) = func.kind {
+                if mod_defined.contains(ident.name.as_ref()) {
+                    ident.name = Arc::from(format!("{}_{}", prefix, ident.name));
+                }
+            }
+            rewrite_expr_node(func, mod_defined, prefix);
+            for arg in args {
+                rewrite_expr_node(arg, mod_defined, prefix);
+            }
+        }
+        ast::ExprKind::Binary { left, right, .. } => {
+            rewrite_expr_node(left, mod_defined, prefix);
+            rewrite_expr_node(right, mod_defined, prefix);
+        }
+        ast::ExprKind::Unary { expr: inner, .. } => {
+            rewrite_expr_node(inner, mod_defined, prefix);
+        }
+        ast::ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            rewrite_expr_node(condition, mod_defined, prefix);
+            rewrite_intra_module_calls(then_branch, mod_defined, prefix);
+            if let Some(ref mut eb) = else_branch {
+                rewrite_expr_node(eb, mod_defined, prefix);
+            }
+        }
+        ast::ExprKind::Block(block) => {
+            rewrite_intra_module_calls(block, mod_defined, prefix);
+        }
+        ast::ExprKind::Return(Some(ref mut inner)) => {
+            rewrite_expr_node(inner, mod_defined, prefix);
+        }
+        _ => {}
+    }
+}
 
 fn cmd_compile(
     input: &PathBuf,
