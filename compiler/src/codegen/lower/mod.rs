@@ -1457,6 +1457,16 @@ impl<'ctx> MirLowerer<'ctx> {
         // Set current impl type so Self resolves correctly in type lowering
         self.current_impl_type = Some(type_name.clone());
 
+        // PASS 1: Forward-declare ALL method signatures before lowering bodies.
+        // This fixes forward references: method A can call method B even if B
+        // is defined after A in the source, because B's signature is already known.
+        for impl_item in &impl_def.items {
+            if let ast::ImplItemKind::Function(f) = &impl_item.kind {
+                self.declare_impl_method(&type_name, f)?;
+            }
+        }
+
+        // PASS 2: Lower method bodies (signatures already declared).
         for impl_item in &impl_def.items {
             if let ast::ImplItemKind::Function(f) = &impl_item.kind {
                 self.lower_impl_method(&type_name, f)?;
@@ -1464,6 +1474,45 @@ impl<'ctx> MirLowerer<'ctx> {
         }
 
         self.current_impl_type = None;
+        Ok(())
+    }
+
+    /// Forward-declare an impl method's signature without lowering the body.
+    /// This enables forward references within the same impl block.
+    fn declare_impl_method(
+        &mut self,
+        type_name: &Arc<str>,
+        f: &ast::FnDef,
+    ) -> CodegenResult<()> {
+        let mangled_name: Arc<str> = Arc::from(format!("{}_{}", type_name, f.name.name));
+
+        // Build parameter types
+        let mut params = Vec::new();
+        for param in &f.sig.params {
+            let is_self = matches!(
+                &param.pattern.kind,
+                ast::PatternKind::Ident { name, .. } if name.name.as_ref() == "self"
+            );
+            if is_self {
+                if matches!(param.ty.kind, ast::TypeKind::Ref { .. }) {
+                    params.push(MirType::Ptr(Box::new(MirType::Struct(type_name.clone()))));
+                } else {
+                    params.push(MirType::Struct(type_name.clone()));
+                }
+            } else {
+                params.push(self.lower_type_from_ast(&param.ty));
+            }
+        }
+
+        let ret = f
+            .sig
+            .return_ty
+            .as_ref()
+            .map(|t| self.lower_type_from_ast(t))
+            .unwrap_or(MirType::Void);
+
+        let sig = MirFnSig::new(params, ret);
+        self.module.declare_function(mangled_name, sig);
         Ok(())
     }
 

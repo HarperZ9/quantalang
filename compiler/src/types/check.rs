@@ -869,30 +869,32 @@ impl<'ctx> TypeChecker<'ctx> {
         // Extract the type name for inherent method registration
         let type_name = Self::extract_type_name_from_ast(&impl_.self_ty);
 
-        // Pre-register associated constants so they're accessible by bare name
-        // within the impl block (e.g., `BRADFORD` instead of `Self::BRADFORD`).
+        // PASS 1: Pre-register ALL method signatures and constants before
+        // checking any bodies. This fixes forward references: method A can
+        // call method B even if B is defined after A in the source.
         for item in &impl_.items {
-            if let ImplItemKind::Const { name, ty, .. } = &item.kind {
-                let const_ty = self.lower_type(ty);
-                self.ctx.define_var(name.name.clone(), const_ty);
+            match &item.kind {
+                ImplItemKind::Const { name, ty, .. } => {
+                    let const_ty = self.lower_type(ty);
+                    self.ctx.define_var(name.name.clone(), const_ty);
+                }
+                ImplItemKind::Function(f) => {
+                    if let Some(ref tname) = type_name {
+                        let sig = self.build_fn_sig_from_ast(f);
+                        self.ctx.register_inherent_method(
+                            Arc::from(tname.as_str()),
+                            f.name.name.clone(),
+                            sig,
+                        );
+                    }
+                }
+                _ => {}
             }
         }
 
+        // PASS 2: Check method bodies (all signatures already registered).
         for item in &impl_.items {
-            let _error_count_before = self.errors.len();
             self.check_impl_item(item, self_ty);
-
-            // Register each method so lookup_method can find it
-            if let ImplItemKind::Function(f) = &item.kind {
-                if let Some(ref tname) = type_name {
-                    let sig = self.build_fn_sig_from_ast(f);
-                    self.ctx.register_inherent_method(
-                        Arc::from(tname.as_str()),
-                        f.name.name.clone(),
-                        sig,
-                    );
-                }
-            }
         }
     }
 
