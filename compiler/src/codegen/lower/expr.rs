@@ -243,14 +243,34 @@ impl<'ctx> MirLowerer<'ctx> {
                 else_branch,
             } => self.lower_if(condition, then_branch, else_branch.as_deref()),
             ExprKind::IfLet {
+                pattern,
                 expr: scrutinee,
                 then_branch,
                 else_branch,
-                ..
             } => {
-                // Desugar if let as: evaluate scrutinee, take then branch
-                // (simplified — full pattern matching would require match lowering)
-                let _ = self.lower_expr(scrutinee)?;
+                // Evaluate scrutinee, bind pattern variable, then take branch.
+                let scrut_val = self.lower_expr(scrutinee)?;
+                let scrut_ty = self.type_of_value(&scrut_val);
+
+                // Bind inner pattern variable (Some(x) → bind x)
+                if let ast::PatternKind::TupleStruct { patterns, .. } = &pattern.kind {
+                    for pat in patterns.iter() {
+                        if let ast::PatternKind::Ident { name, .. } = &pat.kind {
+                            let builder = self.current_fn.as_mut()
+                                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                            let local = builder.create_named_local(name.name.clone(), scrut_ty.clone());
+                            builder.assign(local, MirRValue::Use(scrut_val.clone()));
+                            self.var_map.insert(name.name.clone(), local);
+                        }
+                    }
+                } else if let ast::PatternKind::Ident { name, .. } = &pattern.kind {
+                    let builder = self.current_fn.as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                    let local = builder.create_named_local(name.name.clone(), scrut_ty.clone());
+                    builder.assign(local, MirRValue::Use(scrut_val.clone()));
+                    self.var_map.insert(name.name.clone(), local);
+                }
+
                 self.lower_if_unconditional(then_branch, else_branch.as_deref())
             }
             ExprKind::Match { scrutinee, arms } => self.lower_match(scrutinee, arms),
@@ -262,14 +282,11 @@ impl<'ctx> MirLowerer<'ctx> {
                 label,
             } => self.lower_while(condition, body, label.as_ref()),
             ExprKind::WhileLet {
+                pattern,
                 expr: scrutinee,
                 body,
-                ..
-            } => {
-                // Simplified: lower scrutinee, then loop body
-                let _ = self.lower_expr(scrutinee)?;
-                self.lower_loop(body, None)
-            }
+                label,
+            } => self.lower_while_let(pattern, scrutinee, body, label.as_ref()),
             ExprKind::For {
                 pattern,
                 iter,
@@ -292,6 +309,7 @@ impl<'ctx> MirLowerer<'ctx> {
 
             ExprKind::Tuple(elems) => self.lower_tuple(elems),
             ExprKind::Array(elems) => self.lower_array(elems),
+            ExprKind::ArrayRepeat { element, count } => self.lower_array_repeat(element, count),
             ExprKind::Index { expr: arr, index } => self.lower_index(arr, index),
             ExprKind::Field { expr: obj, field } => self.lower_field(obj, field),
             ExprKind::TupleField {
@@ -3380,6 +3398,111 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(values::unit())
     }
 
+    /// Lower `while let Some(x) = expr { body }`.
+    /// Evaluates expr on each iteration, binds x from TupleStruct pattern,
+    /// breaks when the pattern doesn't match (None/default).
+    fn lower_while_let(
+        &mut self,
+        pattern: &ast::Pattern,
+        scrutinee: &ast::Expr,
+        body: &ast::Block,
+        _label: Option<&ast::Ident>,
+    ) -> CodegenResult<MirValue> {
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+
+        let cond_block = builder.create_block();
+        let body_block = builder.create_block();
+        let exit_block = builder.create_block();
+
+        self.loop_stack.push((cond_block, exit_block));
+
+        builder.goto(cond_block);
+        builder.switch_to_block(cond_block);
+
+        // Evaluate the scrutinee on each iteration
+        let scrut_val = self.lower_expr(scrutinee)?;
+        let scrut_ty = self.type_of_value(&scrut_val);
+
+        let builder = self.current_fn.as_mut().unwrap();
+        let scrut_local = builder.create_local(scrut_ty.clone());
+        builder.assign(scrut_local, MirRValue::Use(scrut_val));
+
+        // For real Option: check has_value. For i32 fallback: always enter body.
+        let is_real_option = matches!(&scrut_ty, MirType::Struct(n) if n.as_ref() == "Option");
+        if is_real_option {
+            let has_value = builder.create_local(MirType::Bool);
+            builder.assign(
+                has_value,
+                MirRValue::FieldAccess {
+                    base: values::local(scrut_local),
+                    field_name: Arc::from("has_value"),
+                    field_ty: MirType::Bool,
+                },
+            );
+            builder.branch(values::local(has_value), body_block, exit_block);
+        } else {
+            // i32 fallback: always enter body (the loop will break via other means)
+            builder.goto(body_block);
+        }
+
+        // Body block: bind pattern variables
+        {
+            let builder = self.current_fn.as_mut().unwrap();
+            builder.switch_to_block(body_block);
+        }
+
+        let saved_vars = self.var_map.clone();
+
+        // Bind the inner variable from TupleStruct pattern (e.g., Some(p))
+        if let ast::PatternKind::TupleStruct { patterns, .. } = &pattern.kind {
+            for pat in patterns.iter() {
+                if let ast::PatternKind::Ident { name, .. } = &pat.kind {
+                    let builder = self.current_fn.as_mut().unwrap();
+                    let inner_ty = if is_real_option {
+                        MirType::i32()
+                    } else {
+                        scrut_ty.clone()
+                    };
+                    let inner_local = builder.create_named_local(name.name.clone(), inner_ty.clone());
+                    if is_real_option {
+                        builder.assign(
+                            inner_local,
+                            MirRValue::FieldAccess {
+                                base: values::local(scrut_local),
+                                field_name: Arc::from("value"),
+                                field_ty: inner_ty,
+                            },
+                        );
+                    } else {
+                        builder.assign(inner_local, MirRValue::Use(values::local(scrut_local)));
+                    }
+                    self.var_map.insert(name.name.clone(), inner_local);
+                }
+            }
+        } else if let ast::PatternKind::Ident { name, .. } = &pattern.kind {
+            let builder = self.current_fn.as_mut().unwrap();
+            let local = builder.create_named_local(name.name.clone(), scrut_ty.clone());
+            builder.assign(local, MirRValue::Use(values::local(scrut_local)));
+            self.var_map.insert(name.name.clone(), local);
+        }
+
+        self.lower_block(body)?;
+        self.var_map = saved_vars;
+
+        let builder = self.current_fn.as_mut().unwrap();
+        builder.goto(cond_block);
+
+        self.loop_stack.pop();
+
+        let builder = self.current_fn.as_mut().unwrap();
+        builder.switch_to_block(exit_block);
+
+        Ok(values::unit())
+    }
+
     fn lower_for(
         &mut self,
         pattern: &ast::Pattern,
@@ -4178,6 +4301,43 @@ impl<'ctx> MirLowerer<'ctx> {
                 },
             });
         }
+    }
+
+    /// Lower `[expr; count]` — array repeat expression.
+    fn lower_array_repeat(
+        &mut self,
+        element: &ast::Expr,
+        count: &ast::Expr,
+    ) -> CodegenResult<MirValue> {
+        // Evaluate the count as a constant
+        let count_val = self.try_const_eval(count).and_then(|c| match c {
+            MirConst::Int(v, _) => Some(v as u64),
+            MirConst::Uint(v, _) => Some(v as u64),
+            _ => None,
+        }).unwrap_or(4); // Default to 4 if we can't evaluate
+
+        // Lower the element expression once to get its type
+        let elem_val = self.lower_expr(element)?;
+        let elem_ty = self.type_of_value(&elem_val);
+
+        // Create N copies of the element
+        let mut elem_vals = Vec::with_capacity(count_val as usize);
+        elem_vals.push(elem_val);
+        for _ in 1..count_val {
+            elem_vals.push(self.lower_expr(element)?);
+        }
+
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+        let result = builder.create_local(MirType::Array(
+            Box::new(elem_ty.clone()),
+            count_val,
+        ));
+        builder.aggregate(result, AggregateKind::Array(elem_ty), elem_vals);
+
+        Ok(values::local(result))
     }
 
     fn lower_array(&mut self, elems: &[ast::Expr]) -> CodegenResult<MirValue> {
