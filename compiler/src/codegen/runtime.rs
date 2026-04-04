@@ -67,6 +67,13 @@ typedef struct {
 typedef struct { void* data; size_t len; size_t cap; size_t front; } VecDeque;
 typedef struct { void* buckets; size_t len; size_t cap; } HashSet;
 
+// --- Type aliases ---
+
+typedef QuantaString string;
+typedef uint64_t Time;
+typedef uint64_t Duration;
+typedef uint64_t Instant;
+
 static QuantaString quanta_string_new(const char* s) {
     QuantaString qs;
     qs.ptr = s;
@@ -358,6 +365,7 @@ typedef struct {
 } QuantaStrF64Map;
 
 typedef struct { QuantaStrF64Map* inner; } QuantaStrF64MapHandle;
+typedef QuantaStrF64MapHandle Map;
 
 static uint32_t __quanta_hash_str(const char* s) {
     uint32_t h = 2166136261u;
