@@ -152,8 +152,10 @@ impl CBackend {
         }
 
         // Runtime-provided types that must not be re-emitted.
-        const RUNTIME_TYPES: &[&str] =
-            &["quanta_vec2", "quanta_vec3", "quanta_vec4", "quanta_mat4"];
+        const RUNTIME_TYPES: &[&str] = &[
+            "quanta_vec2", "quanta_vec3", "quanta_vec4", "quanta_mat4",
+            "VecDeque", "HashSet", "Option", "Result",
+        ];
 
         // Emit forward declarations for ALL struct/union types first.
         // This prevents use-before-declare errors when struct A has a
@@ -271,11 +273,25 @@ impl CBackend {
                             .as_ref()
                             .map(|n| n.to_string())
                             .unwrap_or_else(|| format!("field{}", i));
+                        // Escape C reserved words in field names
+                        let field_name = Self::escape_c_keyword(&field_name);
                         if matches!(field_ty, MirType::Array(_, _)) {
                             write!(
                                 self.output,
                                 "{};\n",
                                 self.fmt_array_decl(field_ty, &field_name)
+                            )
+                            .unwrap();
+                        } else if let MirType::FnPtr(ref sig) = field_ty {
+                            // Function pointer fields need special syntax:
+                            // ret_type (*field_name)(param_types)
+                            let ret = self.type_to_c(&sig.ret);
+                            let params: Vec<_> = sig.params.iter().map(|p| self.type_to_c(p)).collect();
+                            write!(
+                                self.output,
+                                "{} (*{})({}){}\n",
+                                ret, field_name, params.join(", "),
+                                ";"
                             )
                             .unwrap();
                         } else {
@@ -342,6 +358,7 @@ impl CBackend {
                                     .as_ref()
                                     .map(|n| n.to_string())
                                     .unwrap_or_else(|| format!("f{}", i));
+                                let field_name = Self::escape_c_keyword(&field_name);
                                 if matches!(fty, MirType::Array(_, _)) {
                                     write!(
                                         self.output,
@@ -349,6 +366,10 @@ impl CBackend {
                                         self.fmt_array_decl(fty, &field_name)
                                     )
                                     .unwrap();
+                                } else if let MirType::FnPtr(ref sig) = fty {
+                                    let ret = self.type_to_c(&sig.ret);
+                                    let params: Vec<_> = sig.params.iter().map(|p| self.type_to_c(p)).collect();
+                                    write!(self.output, "{} (*{})({}){}\n", ret, field_name, params.join(", "), ";").unwrap();
                                 } else {
                                     write!(
                                         self.output,
@@ -1673,6 +1694,18 @@ impl CBackend {
 
     /// Check if a function name is a QuantaLang runtime helper or a standard
     /// C math/stdlib function that must NOT be escaped.  These names are
+    /// Escape C reserved keywords used as identifiers by appending an underscore.
+    fn escape_c_keyword(name: &str) -> String {
+        match name {
+            "default" | "register" | "volatile" | "signed" | "unsigned"
+            | "auto" | "extern" | "static" | "typedef" | "union" | "enum"
+            | "struct" | "switch" | "case" | "break" | "continue" | "goto"
+            | "return" | "if" | "else" | "while" | "do" | "for" | "inline"
+            | "restrict" | "const" => format!("{}_", name),
+            _ => name.to_string(),
+        }
+    }
+
     /// produced by the lowerer for builtin operations and should pass through
     /// to C unchanged.
     fn is_runtime_or_builtin_fn(name: &str) -> bool {
