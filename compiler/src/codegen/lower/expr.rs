@@ -2553,6 +2553,125 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(then_val.unwrap_or(values::unit()))
     }
 
+    /// Lower `match opt { Some(x) => body1, None => body2 }` for runtime Option.
+    /// The runtime Option struct has `has_value: bool` and `value: union { i64 i; double f; void* p; }`.
+    fn lower_runtime_option_match(
+        &mut self,
+        scrutinee_val: MirValue,
+        scrutinee_ty: &MirType,
+        arms: &[ast::MatchArm],
+    ) -> CodegenResult<MirValue> {
+        let builder = self
+            .current_fn
+            .as_mut()
+            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+
+        let scrut_local = builder.create_local(scrutinee_ty.clone());
+        builder.assign(scrut_local, MirRValue::Use(scrutinee_val));
+
+        // Extract has_value field
+        let has_value = builder.create_local(MirType::Bool);
+        builder.assign(
+            has_value,
+            MirRValue::FieldAccess {
+                base: values::local(scrut_local),
+                field_name: Arc::from("has_value"),
+                field_ty: MirType::Bool,
+            },
+        );
+
+        let merge_block = builder.create_block();
+        let some_block = builder.create_block();
+        let none_block = builder.create_block();
+
+        // Determine result type from function return type
+        let ret_ty = builder.return_type().clone();
+        let result_ty = if ret_ty == MirType::Void { MirType::i32() } else { ret_ty };
+        let result = builder.create_local(result_ty);
+
+        builder.branch(values::local(has_value), some_block, none_block);
+
+        // Process each arm
+        for arm in arms {
+            let is_none = matches!(&arm.pattern.kind,
+                ast::PatternKind::Ident { name, .. } if name.name.as_ref() == "None"
+            ) || matches!(&arm.pattern.kind,
+                ast::PatternKind::TupleStruct { path, patterns } if {
+                    let name = path.segments.last().map(|s| s.ident.name.as_ref()).unwrap_or("");
+                    name == "None" && patterns.is_empty()
+                }
+            );
+
+            let is_some = matches!(&arm.pattern.kind,
+                ast::PatternKind::TupleStruct { path, .. } if {
+                    let name = path.segments.last().map(|s| s.ident.name.as_ref()).unwrap_or("");
+                    name == "Some"
+                }
+            );
+
+            if is_none {
+                let builder = self.current_fn.as_mut().unwrap();
+                builder.switch_to_block(none_block);
+                let body_val = self.lower_expr(&arm.body)?;
+                let builder = self.current_fn.as_mut().unwrap();
+                if !matches!(body_val, MirValue::Const(MirConst::Unit)) {
+                    builder.assign(result, MirRValue::Use(body_val));
+                }
+                builder.goto(merge_block);
+            } else if is_some {
+                let builder = self.current_fn.as_mut().unwrap();
+                builder.switch_to_block(some_block);
+
+                // Bind the inner pattern variable — extract from value.i (int64)
+                // For simplicity, treat the inner value as i32 (most common case
+                // for general-purpose code using runtime Option).
+                if let ast::PatternKind::TupleStruct { patterns, .. } = &arm.pattern.kind {
+                    for (i, pat) in patterns.iter().enumerate() {
+                        if let ast::PatternKind::Ident { name, .. } = &pat.kind {
+                            let builder = self.current_fn.as_mut().unwrap();
+                            let inner_local = builder.create_named_local(
+                                name.name.clone(),
+                                MirType::i32(),
+                            );
+                            // Extract value from Option's value union
+                            // Use FieldAccess on the value union's `i` field
+                            builder.assign(
+                                inner_local,
+                                MirRValue::FieldAccess {
+                                    base: values::local(scrut_local),
+                                    field_name: Arc::from("value"),
+                                    field_ty: MirType::i32(),
+                                },
+                            );
+                            self.var_map.insert(name.name.clone(), inner_local);
+                        }
+                    }
+                }
+
+                let body_val = self.lower_expr(&arm.body)?;
+                let builder = self.current_fn.as_mut().unwrap();
+                if !matches!(body_val, MirValue::Const(MirConst::Unit)) {
+                    builder.assign(result, MirRValue::Use(body_val));
+                }
+                builder.goto(merge_block);
+            } else {
+                // Wildcard / other — treat as default arm going to merge
+                let builder = self.current_fn.as_mut().unwrap();
+                builder.switch_to_block(none_block);
+                let body_val = self.lower_expr(&arm.body)?;
+                let builder = self.current_fn.as_mut().unwrap();
+                if !matches!(body_val, MirValue::Const(MirConst::Unit)) {
+                    builder.assign(result, MirRValue::Use(body_val));
+                }
+                builder.goto(merge_block);
+            }
+        }
+
+        let builder = self.current_fn.as_mut().unwrap();
+        builder.switch_to_block(merge_block);
+        Ok(values::local(result))
+    }
+
     fn lower_match(
         &mut self,
         scrutinee: &ast::Expr,
@@ -2561,6 +2680,13 @@ impl<'ctx> MirLowerer<'ctx> {
         // Evaluate the scrutinee once and store in a temporary.
         let scrutinee_val = self.lower_expr(scrutinee)?;
         let scrutinee_ty = self.type_of_value(&scrutinee_val);
+
+        // Runtime Option match: `match opt { Some(x) => ..., None => ... }`
+        // The runtime Option struct has fields `has_value: bool` and `value: union`.
+        let is_runtime_option = matches!(&scrutinee_ty, MirType::Struct(n) if n.as_ref() == "Option");
+        if is_runtime_option {
+            return self.lower_runtime_option_match(scrutinee_val, &scrutinee_ty, arms);
+        }
 
         // Check if this is an enum match (scrutinee type is a known enum).
         let is_enum_match = if let MirType::Struct(ref name) = scrutinee_ty {
@@ -3247,9 +3373,7 @@ impl<'ctx> MirLowerer<'ctx> {
         // Bind pattern variable and save var_map so loop-body `let`
         // bindings do not leak into the enclosing scope.
         let saved_vars = self.var_map.clone();
-        if let ast::PatternKind::Ident { name, .. } = &pattern.kind {
-            self.var_map.insert(name.name.clone(), elem_local);
-        }
+        self.bind_for_pattern(pattern, elem_local, &elem_ty)?;
 
         self.lower_block(body)?;
         self.var_map = saved_vars;
@@ -3539,16 +3663,14 @@ impl<'ctx> MirLowerer<'ctx> {
                 base: values::local(next_result),
                 variant_name: some_variant_name,
                 field_index: 0,
-                field_ty: payload_ty,
+                field_ty: payload_ty.clone(),
             },
         );
 
         // Bind pattern variable and save var_map so loop-body `let`
         // bindings do not leak into the enclosing scope.
         let saved_vars = self.var_map.clone();
-        if let ast::PatternKind::Ident { name, .. } = &pattern.kind {
-            self.var_map.insert(name.name.clone(), payload);
-        }
+        self.bind_for_pattern(pattern, payload, &payload_ty)?;
 
         self.lower_block(body)?;
         self.var_map = saved_vars;
@@ -3562,6 +3684,65 @@ impl<'ctx> MirLowerer<'ctx> {
         builder.switch_to_block(exit_block);
 
         Ok(values::unit())
+    }
+
+    /// Bind a for-loop pattern to a local value.  Handles Ident, Tuple,
+    /// Ref, and Wildcard patterns so that `for (a, b) in ...` and
+    /// `for &x in ...` declare all needed locals.
+    fn bind_for_pattern(
+        &mut self,
+        pattern: &ast::Pattern,
+        value_local: LocalId,
+        value_ty: &MirType,
+    ) -> CodegenResult<()> {
+        match &pattern.kind {
+            ast::PatternKind::Ident { name, .. } => {
+                self.var_map.insert(name.name.clone(), value_local);
+            }
+            ast::PatternKind::Tuple(patterns) => {
+                // Destructure tuple: create a local for each element and
+                // extract via field access (_0, _1, ...).
+                let elem_types: Vec<MirType> = if let MirType::Tuple(tys) = value_ty {
+                    tys.clone()
+                } else {
+                    // If the type isn't a tuple, fall back to i32 for each element
+                    vec![MirType::i32(); patterns.len()]
+                };
+                for (i, sub_pat) in patterns.iter().enumerate() {
+                    let field_ty = elem_types
+                        .get(i)
+                        .cloned()
+                        .unwrap_or(MirType::i32());
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                    let field_local = builder.create_local(field_ty.clone());
+                    builder.assign(
+                        field_local,
+                        MirRValue::FieldAccess {
+                            base: values::local(value_local),
+                            field_name: Arc::from(format!("_{}", i)),
+                            field_ty: field_ty.clone(),
+                        },
+                    );
+                    self.bind_for_pattern(sub_pat, field_local, &field_ty)?;
+                }
+            }
+            ast::PatternKind::Ref { pattern: inner, .. } => {
+                // &x pattern — bind the inner pattern to the same local
+                // (we don't dereference in MIR for loop bindings)
+                self.bind_for_pattern(inner, value_local, value_ty)?;
+            }
+            ast::PatternKind::Wildcard => {
+                // _ — ignore the value
+            }
+            _ => {
+                // Fallback: try to extract an ident name from the pattern
+                // to avoid completely losing the binding.
+            }
+        }
+        Ok(())
     }
 
     fn lower_return(&mut self, value: Option<&ast::Expr>) -> CodegenResult<MirValue> {

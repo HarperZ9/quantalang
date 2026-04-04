@@ -1235,6 +1235,49 @@ impl CBackend {
                     _ => func_str,
                 };
 
+                // Runtime None/Some: emit zero-initialized Option struct.
+                if func_str == "None" && args.is_empty() {
+                    if let Some(dest_local) = dest {
+                        let dest_name = self.local_name(*dest_local, locals);
+                        write!(
+                            self.output,
+                            "{}.has_value = false;\n",
+                            dest_name,
+                        )
+                        .unwrap();
+                    }
+                    if let Some(target) = target {
+                        self.write_indent();
+                        write!(self.output, "goto bb{};\n", target.0).unwrap();
+                    }
+                    return Ok(());
+                }
+
+                // Unit struct constructors: Stdin, Stdout, Stderr — emit zero-init.
+                const UNIT_STRUCTS: &[(&str, &str)] = &[
+                    ("Stdin", "io_Stdin"),
+                    ("Stdout", "io_Stdout"),
+                    ("Stderr", "io_Stderr"),
+                ];
+                if args.is_empty() {
+                    if let Some((_, c_name)) = UNIT_STRUCTS.iter().find(|(ql, _)| func_str == *ql) {
+                        if let Some(dest_local) = dest {
+                            let dest_name = self.local_name(*dest_local, locals);
+                            write!(
+                                self.output,
+                                "{} = ({}){{ 0 }};\n",
+                                dest_name, c_name,
+                            )
+                            .unwrap();
+                        }
+                        if let Some(target) = target {
+                            self.write_indent();
+                            write!(self.output, "goto bb{};\n", target.0).unwrap();
+                        }
+                        return Ok(());
+                    }
+                }
+
                 // Special-case setjmp: when passed a QuantaHandler local,
                 // emit `setjmp(handler.env)` instead of `setjmp(handler)`.
                 //
