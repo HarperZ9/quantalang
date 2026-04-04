@@ -156,12 +156,23 @@ impl<'ctx> MirLowerer<'ctx> {
         // Compute type from annotation if present
         let explicit_ty = local.ty.as_ref().map(|t| self.lower_type_from_ast(t));
 
+        // Propagate expected type to init expression lowering so that
+        // constructor calls (HashMap::new, Vec::new, etc.) can use the
+        // annotation type instead of falling back to i32.
+        let prev_expected = self.expected_type.take();
+        if let Some(ref ty) = explicit_ty {
+            self.expected_type = Some(ty.clone());
+        }
+
         // Compute init value if present
         let init_val = if let Some(init) = &local.init {
             Some(self.lower_expr(&init.expr)?)
         } else {
             None
         };
+
+        // Restore previous expected type
+        self.expected_type = prev_expected;
 
         // Determine final type: explicit annotation > inferred from init > i32 fallback
         let ty = if let Some(ref t) = explicit_ty {
@@ -1651,8 +1662,15 @@ impl<'ctx> MirLowerer<'ctx> {
                 _ => {}
             }
         }
-        // Fallback when we cannot resolve the callee
-        MirType::i32()
+        // Use expected type from let binding annotation if available,
+        // otherwise fall back to i32.  This makes constructor calls like
+        // HashMap::new() return the correct type when used in an annotated
+        // let binding: `let mut dist: HashMap<String, f64> = HashMap::new();`
+        if let Some(ref expected) = self.expected_type {
+            expected.clone()
+        } else {
+            MirType::i32()
+        }
     }
 
     /// Check if a path expression refers to an enum variant (e.g. Shape::Circle).
