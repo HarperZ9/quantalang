@@ -2445,8 +2445,73 @@ impl<'ctx> MirLowerer<'ctx> {
             }
         }
 
+        // HashMap<K,V> / Map method dispatch → typed runtime calls
+        if let MirType::Map(ref _key_ty, ref _val_ty) = receiver_ty {
+            let method_name = method.name.as_ref();
+            let (runtime_fn, ret_ty): (Option<&str>, MirType) = match method_name {
+                "insert" => (Some("quanta_hmap_insert_str_f64"), MirType::Void),
+                "get" => (Some("quanta_hmap_get_str_f64"), MirType::f64()),
+                "contains" | "contains_key" => (Some("quanta_hmap_contains_str_f64"), MirType::Bool),
+                "len" => (Some("quanta_hmap_len_str_f64"), MirType::usize()),
+                "remove" => (Some("quanta_hmap_remove_str_f64"), MirType::Void),
+                "is_empty" => (Some("quanta_hmap_len_str_f64"), MirType::usize()),
+                "clone" => (None, receiver_ty.clone()), // handled below
+                _ => (None, MirType::i32()),
+            };
+            if method_name == "is_empty" {
+                // Lower as len() == 0
+                let builder = self.current_fn.as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                let len_result = builder.create_local(MirType::usize());
+                let cont = builder.create_block();
+                builder.call(MirValue::Function(Arc::from("quanta_hmap_len_str_f64")), vec![receiver_val], Some(len_result), cont);
+                builder.switch_to_block(cont);
+                let zero = builder.create_local(MirType::usize());
+                builder.assign_const(zero, MirConst::Int(0, MirType::usize()));
+                let result = builder.create_local(MirType::Bool);
+                builder.binary_op(result, BinOp::Eq, values::local(len_result), values::local(zero));
+                return Ok(values::local(result));
+            }
+            if let Some(fn_name) = runtime_fn {
+                let mut arg_vals = vec![receiver_val];
+                for arg in args { arg_vals.push(self.lower_expr(arg)?); }
+                let builder = self.current_fn.as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                let result = builder.create_local(ret_ty);
+                let cont = builder.create_block();
+                builder.call(MirValue::Function(Arc::from(fn_name)), arg_vals, Some(result), cont);
+                builder.switch_to_block(cont);
+                return Ok(values::local(result));
+            }
+        }
+
+        // HashSet method dispatch
+        if let MirType::Struct(ref name) = receiver_ty {
+            if name.as_ref() == "HashSet" {
+                let method_name = method.name.as_ref();
+                let (runtime_fn, ret_ty): (Option<&str>, MirType) = match method_name {
+                    "insert" => (Some("quanta_hset_insert"), MirType::Void),
+                    "contains" => (Some("quanta_hset_contains"), MirType::Bool),
+                    "len" => (None, MirType::usize()),
+                    "is_empty" => (None, MirType::Bool),
+                    "clone" => (None, receiver_ty.clone()),
+                    _ => (None, MirType::i32()),
+                };
+                if let Some(fn_name) = runtime_fn {
+                    let mut arg_vals = vec![receiver_val];
+                    for arg in args { arg_vals.push(self.lower_expr(arg)?); }
+                    let builder = self.current_fn.as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                    let result = builder.create_local(ret_ty);
+                    let cont = builder.create_block();
+                    builder.call(MirValue::Function(Arc::from(fn_name)), arg_vals, Some(result), cont);
+                    builder.switch_to_block(cont);
+                    return Ok(values::local(result));
+                }
+            }
+        }
+
         // Fallback: lower as a regular function call with receiver as first argument.
-        // Use the receiver type to make a better guess at the return type than i32.
         let mut arg_vals = vec![receiver_val];
         for arg in args {
             arg_vals.push(self.lower_expr(arg)?);

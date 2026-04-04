@@ -72,12 +72,12 @@ static HashSet quanta_hset_new(void) {
     HashSet h = { NULL, 0, 0 };
     return h;
 }
-static void quanta_hset_insert(HashSet* h, const void* key, size_t key_size) {
-    (void)h; (void)key; (void)key_size; // stub
+static void quanta_hset_insert(HashSet h, QuantaString val) {
+    (void)h; (void)val; // stub — full impl needs hash table
 }
-static bool quanta_hset_contains(HashSet* h, const void* key, size_t key_size) {
-    (void)h; (void)key; (void)key_size;
-    return false; // stub
+static bool quanta_hset_contains(HashSet h, QuantaString val) {
+    (void)h; (void)val;
+    return false; // stub — full impl needs hash table
 }
 
 // --- Type aliases ---
