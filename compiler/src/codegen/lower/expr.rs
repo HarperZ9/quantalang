@@ -1602,6 +1602,16 @@ impl<'ctx> MirLowerer<'ctx> {
                 "map_contains_i32" | "map_remove_i32" => return MirType::Bool,
                 "map_insert_i32" => return MirType::Void,
                 // HashMap builtins (str->f64, default)
+                // Type::new() constructor calls (from path resolution)
+                "HashMap_new" => {
+                    return MirType::Map(
+                        Box::new(MirType::Struct(Arc::from("QuantaString"))),
+                        Box::new(MirType::f64()),
+                    )
+                }
+                "HashSet_new" => return MirType::Struct(Arc::from("HashSet")),
+                "String_new" => return MirType::Struct(Arc::from("QuantaString")),
+                "VecDeque_new" => return MirType::Struct(Arc::from("VecDeque")),
                 "map_new" => {
                     return MirType::Map(
                         Box::new(MirType::Struct(Arc::from("QuantaString"))),
@@ -2505,6 +2515,35 @@ impl<'ctx> MirLowerer<'ctx> {
                     let result = builder.create_local(ret_ty);
                     let cont = builder.create_block();
                     builder.call(MirValue::Function(Arc::from(fn_name)), arg_vals, Some(result), cont);
+                    builder.switch_to_block(cont);
+                    return Ok(values::local(result));
+                }
+            }
+        }
+
+        // clone()/to_owned() — return receiver type for safe (non-cascading) types.
+        // String, primitives, Ptr, Option are safe. Collections (Vec/Map/HashSet)
+        // are NOT safe because their typed return cascades through i32-typed consumers.
+        {
+            let method_name = method.name.as_ref();
+            if method_name == "clone" || method_name == "to_owned" {
+                let is_safe_clone = matches!(&receiver_ty,
+                    MirType::Struct(n) if n.as_ref() == "QuantaString"
+                ) || matches!(&receiver_ty,
+                    MirType::Int(..) | MirType::Float(..) | MirType::Bool
+                    | MirType::Ptr(..)
+                );
+                if is_safe_clone {
+                    let builder = self.current_fn.as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                    let result = builder.create_local(receiver_ty.clone());
+                    let cont = builder.create_block();
+                    builder.call(
+                        MirValue::Function(Arc::from("clone")),
+                        vec![receiver_val],
+                        Some(result),
+                        cont,
+                    );
                     builder.switch_to_block(cont);
                     return Ok(values::local(result));
                 }

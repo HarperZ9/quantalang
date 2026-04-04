@@ -1232,8 +1232,39 @@ impl CBackend {
                     "intrinsic_fmax" => "fmax".to_string(),
                     "intrinsic_copysign" => "copysign".to_string(),
                     "intrinsic_hypot" => "hypot".to_string(),
+                    // Constructor calls → runtime functions
+                    "HashMap_new" => "quanta_hmap_new_str_f64".to_string(),
+                    "HashSet_new" => "quanta_hset_new".to_string(),
+                    "VecDeque_new" => "quanta_vdeque_new".to_string(),
                     _ => func_str,
                 };
+
+                // String::new() → quanta_string_new("")
+                if func_str == "String_new" && args.is_empty() {
+                    if let Some(dest_local) = dest {
+                        let dest_name = self.local_name(*dest_local, locals);
+                        write!(self.output, "{} = quanta_string_new(\"\");\n", dest_name).unwrap();
+                    }
+                    if let Some(target) = target {
+                        self.write_indent();
+                        write!(self.output, "goto bb{};\n", target.0).unwrap();
+                    }
+                    return Ok(());
+                }
+
+                // clone(x) → direct copy (x is value-typed in C)
+                if func_str == "clone" && args.len() == 1 {
+                    let arg_str = self.value_to_c(&args[0], locals);
+                    if let Some(dest_local) = dest {
+                        let dest_name = self.local_name(*dest_local, locals);
+                        write!(self.output, "{} = {};\n", dest_name, arg_str).unwrap();
+                    }
+                    if let Some(target) = target {
+                        self.write_indent();
+                        write!(self.output, "goto bb{};\n", target.0).unwrap();
+                    }
+                    return Ok(());
+                }
 
                 // Runtime None/Some: emit zero-initialized Option struct.
                 if func_str == "None" && args.is_empty() {
@@ -1498,8 +1529,26 @@ impl CBackend {
         match value {
             MirValue::Local(id) => self.local_name(*id, locals),
             MirValue::Const(c) => self.const_to_c(c),
-            MirValue::Global(name) => name.to_string(),
+            MirValue::Global(name) => {
+                match name.as_ref() {
+                    "None" => return "((Option){ .has_value = false })".to_string(),
+                    "Stdin" => return "((io_Stdin){ 0 })".to_string(),
+                    "Stdout" => return "((io_Stdout){ 0 })".to_string(),
+                    "Stderr" => return "((io_Stderr){ 0 })".to_string(),
+                    _ => name.to_string(),
+                }
+            }
             MirValue::Function(name) => {
+                // Map well-known value-position names to C struct literals.
+                // These appear when the MIR uses a function name as a value
+                // (e.g., `return None;`, `current = None;`).
+                match name.as_ref() {
+                    "None" => return "((Option){ .has_value = false })".to_string(),
+                    "Stdin" => return "((io_Stdin){ 0 })".to_string(),
+                    "Stdout" => return "((io_Stdout){ 0 })".to_string(),
+                    "Stderr" => return "((io_Stderr){ 0 })".to_string(),
+                    _ => {}
+                }
                 // Escape user-defined function names that conflict with C
                 // reserved words or macros — but never escape runtime helpers
                 // (quanta_*), standard C math/stdlib functions, or other
