@@ -151,12 +151,31 @@ impl CBackend {
             }
         }
 
-        self.output.push_str("// Type definitions\n");
-
         // Runtime-provided types that must not be re-emitted.
         const RUNTIME_TYPES: &[&str] =
             &["quanta_vec2", "quanta_vec3", "quanta_vec4", "quanta_mat4"];
 
+        // Emit forward declarations for ALL struct/union types first.
+        // This prevents use-before-declare errors when struct A has a
+        // field of type struct B and B is defined later in the MIR.
+        self.output.push_str("// Forward declarations\n");
+        for ty in types {
+            if RUNTIME_TYPES.contains(&ty.name.as_ref()) {
+                continue;
+            }
+            match &ty.kind {
+                TypeDefKind::Struct { .. } => {
+                    write!(self.output, "typedef struct {} {};\n", ty.name, ty.name).unwrap();
+                }
+                TypeDefKind::Union { .. } => {
+                    write!(self.output, "typedef union {} {};\n", ty.name, ty.name).unwrap();
+                }
+                _ => {}
+            }
+        }
+        self.output.push('\n');
+
+        self.output.push_str("// Type definitions\n");
         for ty in types {
             // Skip types already defined in the runtime header.
             if RUNTIME_TYPES.contains(&ty.name.as_ref()) {
@@ -167,8 +186,14 @@ impl CBackend {
                     if *packed {
                         self.output.push_str("#pragma pack(push, 1)\n");
                     }
-                    write!(self.output, "typedef struct {} {{\n", ty.name).unwrap();
+                    // Use struct tag only (not typedef) since forward decl already typedef'd
+                    write!(self.output, "struct {} {{\n", ty.name).unwrap();
                     self.indent += 1;
+                    // C requires at least one member in a struct
+                    if fields.is_empty() {
+                        self.write_indent();
+                        self.output.push_str("char _pad;\n");
+                    }
                     for (i, (name, field_ty)) in fields.iter().enumerate() {
                         self.write_indent();
                         let field_name = name
@@ -193,20 +218,20 @@ impl CBackend {
                         }
                     }
                     self.indent -= 1;
-                    write!(self.output, "}} {};\n\n", ty.name).unwrap();
+                    self.output.push_str("};\n\n");
                     if *packed {
                         self.output.push_str("#pragma pack(pop)\n");
                     }
                 }
                 TypeDefKind::Union { variants } => {
-                    write!(self.output, "typedef union {} {{\n", ty.name).unwrap();
+                    write!(self.output, "union {} {{\n", ty.name).unwrap();
                     self.indent += 1;
                     for (name, var_ty) in variants {
                         self.write_indent();
                         write!(self.output, "{} {};\n", self.type_to_c(var_ty), name).unwrap();
                     }
                     self.indent -= 1;
-                    write!(self.output, "}} {};\n\n", ty.name).unwrap();
+                    self.output.push_str("};\n\n");
                 }
                 TypeDefKind::Enum {
                     discriminant_ty: _,
@@ -2140,17 +2165,17 @@ fn main() {
         let output = codegen.generate(&module).expect("Failed to generate");
         let code = output.as_string().unwrap();
 
-        // Verify struct type definition
+        // Verify struct type definition (forward decl + definition)
         assert!(
-            code.contains("typedef struct Point"),
-            "Missing struct typedef in:\n{}",
+            code.contains("struct Point {"),
+            "Missing struct definition in:\n{}",
             code
         );
         assert!(code.contains("int32_t x;"), "Missing field x in:\n{}", code);
         assert!(code.contains("int32_t y;"), "Missing field y in:\n{}", code);
         assert!(
-            code.contains("} Point;"),
-            "Missing struct close in:\n{}",
+            code.contains("};") && code.contains("struct Point {"),
+            "Missing struct definition in:\n{}",
             code
         );
 
