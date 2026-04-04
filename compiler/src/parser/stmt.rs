@@ -185,24 +185,37 @@ impl<'a> Parser<'a> {
         }
 
         match self.current_kind() {
-            TokenKind::Keyword(kw) => matches!(
-                kw,
-                Keyword::Fn
-                    | Keyword::Struct
-                    | Keyword::Enum
-                    | Keyword::Trait
-                    | Keyword::Impl
-                    | Keyword::Type
-                    | Keyword::Const
-                    | Keyword::Static
-                    | Keyword::Mod
-                    | Keyword::Use
-                    | Keyword::Extern
-                    | Keyword::Unsafe
-                    | Keyword::Async
-                    | Keyword::Effect
-                    | Keyword::Macro
-            ),
+            TokenKind::Keyword(kw) => match kw {
+                // unsafe/async are only item starts when followed by fn/impl/trait/mod
+                // (e.g., `unsafe fn`, `unsafe impl`). Standalone `unsafe { ... }` blocks
+                // are expressions, not items.
+                Keyword::Unsafe | Keyword::Async => {
+                    matches!(
+                        self.peek().kind,
+                        TokenKind::Keyword(Keyword::Fn)
+                            | TokenKind::Keyword(Keyword::Impl)
+                            | TokenKind::Keyword(Keyword::Trait)
+                            | TokenKind::Keyword(Keyword::Mod)
+                            | TokenKind::Keyword(Keyword::Extern)
+                    )
+                }
+                _ => matches!(
+                    kw,
+                    Keyword::Fn
+                        | Keyword::Struct
+                        | Keyword::Enum
+                        | Keyword::Trait
+                        | Keyword::Impl
+                        | Keyword::Type
+                        | Keyword::Const
+                        | Keyword::Static
+                        | Keyword::Mod
+                        | Keyword::Use
+                        | Keyword::Extern
+                        | Keyword::Effect
+                        | Keyword::Macro
+                ),
+            },
             _ => false,
         }
     }

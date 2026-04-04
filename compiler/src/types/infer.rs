@@ -411,25 +411,19 @@ impl<'ctx> TypeInfer<'ctx> {
 
         // Look up inherent methods (impl Type { fn method(...) } without a trait).
         // Extract the type name and generic substitutions from the receiver.
-        let (type_name, adt_substs) = match &ty.kind {
-            TyKind::Adt(def_id, substs) => (
-                self.ctx.lookup_type(*def_id).map(|td| td.name.to_string()),
-                substs.clone(),
-            ),
+        let (type_def_id, adt_substs) = match &ty.kind {
+            TyKind::Adt(def_id, substs) => (Some(*def_id), substs.clone()),
             TyKind::Ref(_, _, inner) => {
                 if let TyKind::Adt(def_id, substs) = &inner.kind {
-                    (
-                        self.ctx.lookup_type(*def_id).map(|td| td.name.to_string()),
-                        substs.clone(),
-                    )
+                    (Some(*def_id), substs.clone())
                 } else {
                     (None, vec![])
                 }
             }
             _ => (None, vec![]),
         };
-        if let Some(ref tname) = type_name {
-            if let Some(method) = self.ctx.lookup_inherent_method(tname, method_name) {
+        if let Some(def_id) = type_def_id {
+            if let Some(method) = self.ctx.lookup_inherent_method(def_id, method_name) {
                 // If receiver has concrete substs (e.g. Foo<i32>), substitute params.
                 // Otherwise, freshen params to fresh vars so the unifier can solve them.
                 let apply = |ty: &Ty| -> Ty {
@@ -857,7 +851,8 @@ impl<'ctx> TypeInfer<'ctx> {
                 name,
                 // Math builtins
                 "sqrt" | "sin" | "cos" | "tan" | "pow" | "abs" |
-                "log" | "log2" | "log10" | "exp" | "atan2" |
+                "sinh" | "cosh" | "tanh" | "asin" | "acos" | "atan" |
+                "log" | "log2" | "log10" | "exp" | "exp2" | "atan2" |
                 "floor" | "ceil" | "round" | "min" | "max" |
                 // Vector constructors
                 "vec2" | "vec3" | "vec4" | "mat4" |
@@ -1019,8 +1014,8 @@ impl<'ctx> TypeInfer<'ctx> {
                 _ => {}
             }
 
-            // Look up as an inherent method/associated function
-            if let Some(method) = self.ctx.lookup_inherent_method(type_name, func_name) {
+            // Look up as an inherent method/associated function (by type name → DefId)
+            if let Some(method) = self.ctx.lookup_inherent_method_by_name(type_name, func_name) {
                 // Freshen generic params so the unifier can solve them from context.
                 // e.g., SimpleMap::new() returns SimpleMap<K,V> → SimpleMap<?0,?1>
                 let param_tys: Vec<Ty> = method
@@ -1039,7 +1034,7 @@ impl<'ctx> TypeInfer<'ctx> {
             // 2-param version).  Only fall back to bare-name lookup when the
             // first segment is a known type (Type::method pattern).
             let first_is_type = self.ctx.lookup_type_by_name(type_name).is_some()
-                || self.ctx.lookup_inherent_method(type_name, "new").is_some();
+                || self.ctx.lookup_inherent_method_by_name(type_name, "new").is_some();
             if first_is_type {
                 if let Some(scheme) = self.ctx.lookup_var_scheme(func_name) {
                     return scheme.instantiate();

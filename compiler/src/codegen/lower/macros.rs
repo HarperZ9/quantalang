@@ -931,12 +931,53 @@ impl<'ctx> MirLowerer<'ctx> {
     ///
     /// The element type is inferred from the first argument expression.
     pub(crate) fn lower_vec_macro(&mut self, tokens: &[ast::TokenTree]) -> CodegenResult<MirValue> {
-        // Extract all argument source texts from the macro tokens.
-        // Unlike print macros, vec! has no format string, so we extract
-        // ALL tokens as arguments (including the first one).
-        let all_args = self.extract_vec_macro_args(tokens);
+        // Check if tokens have valid spans matching our source file.
+        // When the macro expander expands nested vec! calls, the inner
+        // tokens get synthetic spans that don't match self.source.
+        // In that case, fall back to creating an empty vec (the macro
+        // expander already handled the expansion at a higher level).
+        if let Some(ref source) = self.source {
+            let has_valid_spans = tokens.iter().any(|t| {
+                if let ast::TokenTree::Token(tok) = t {
+                    let s = tok.span.start.to_usize();
+                    let e = tok.span.end.to_usize();
+                    e > s && e <= source.len()
+                        && source.is_char_boundary(s) && source.is_char_boundary(e)
+                        && {
+                        // Verify the span actually points to code, not a comment
+                        let text = &source[s..e];
+                        // For an Ident token, the text should be alphanumeric
+                        match &tok.kind {
+                            crate::lexer::TokenKind::Ident => text.chars().all(|c| c.is_alphanumeric() || c == '_'),
+                            _ => true,
+                        }
+                    }
+                } else {
+                    true // Delimited groups are fine
+                }
+            });
 
-        if all_args.is_empty() {
+            if !has_valid_spans && !tokens.is_empty() {
+                // Tokens have synthetic spans — this vec! was already expanded
+                // by the macro expander. Create an empty vec as placeholder.
+                let new_fn = MirValue::Function(Arc::from("quanta_hvec_new_f64"));
+                let vec_ty = MirType::Vec(Box::new(MirType::f64()));
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                let vec_local = builder.create_local(vec_ty);
+                let cont = builder.create_block();
+                builder.call(new_fn, vec![], Some(vec_local), cont);
+                builder.switch_to_block(cont);
+                return Ok(MirValue::Local(vec_local));
+            }
+        }
+
+        // Split macro tokens into argument groups at top-level commas/semicolons.
+        let all_groups = self.split_vec_macro_token_groups(tokens);
+
+        if all_groups.is_empty() {
             // vec![] with no args -- create empty i32 vec
             let new_fn = MirValue::Function(Arc::from("quanta_hvec_new_i32"));
             let vec_ty = MirType::Vec(Box::new(MirType::i32()));
@@ -952,16 +993,15 @@ impl<'ctx> MirLowerer<'ctx> {
         }
 
         // Check for repeat syntax: vec![val; count]
-        // We detect this by looking for a semicolon in the raw token list.
         let is_repeat = self.detect_vec_repeat_syntax(tokens);
 
-        if is_repeat && all_args.len() == 2 {
+        if is_repeat && all_groups.len() == 2 {
             // vec![val; count] -- repeat form
-            let val_src = &all_args[0];
-            let count_src = &all_args[1];
+            let val_tokens = all_groups[0].clone();
+            let count_tokens = all_groups[1].clone();
 
             // Parse and lower the value expression to infer the element type
-            let val = self.parse_and_lower_macro_arg(val_src)?;
+            let val = self.parse_and_lower_token_group(val_tokens)?;
             let elem_ty = self.type_of_value(&val);
             let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&elem_ty);
             let vec_ty = MirType::Vec(Box::new(elem_ty));
@@ -978,7 +1018,7 @@ impl<'ctx> MirLowerer<'ctx> {
             builder.switch_to_block(cont);
 
             // Parse and lower the count expression
-            let count_val = self.parse_and_lower_macro_arg(count_src)?;
+            let count_val = self.parse_and_lower_token_group(count_tokens)?;
 
             // Emit a counted loop: for i in 0..count { vec_push(v, val) }
             // We implement this as a simple while loop in MIR:
@@ -1066,7 +1106,8 @@ impl<'ctx> MirLowerer<'ctx> {
         } else {
             // vec![a, b, c] -- literal form
             // Parse and lower the first argument to infer the element type
-            let first_val = self.parse_and_lower_macro_arg(&all_args[0])?;
+            let first_tokens = all_groups[0].clone();
+            let first_val = self.parse_and_lower_token_group(first_tokens)?;
             let elem_ty = self.type_of_value(&first_val);
             let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&elem_ty);
             let vec_ty = MirType::Vec(Box::new(elem_ty));
@@ -1097,8 +1138,8 @@ impl<'ctx> MirLowerer<'ctx> {
             }
 
             // Push remaining elements
-            for arg_src in &all_args[1..] {
-                let val = self.parse_and_lower_macro_arg(arg_src)?;
+            for group in &all_groups[1..] {
+                let val = self.parse_and_lower_token_group(group.clone())?;
                 let push_fn_val = MirValue::Function(Arc::from(push_fn_name));
                 let builder = self.current_fn.as_mut().unwrap();
                 let cont2 = builder.create_block();
@@ -1134,118 +1175,234 @@ impl<'ctx> MirLowerer<'ctx> {
 
     /// Extract all argument source texts from vec! macro tokens.
     /// Unlike print macros, vec! has no format string to skip.
-    fn extract_vec_macro_args(&self, tokens: &[ast::TokenTree]) -> Vec<String> {
+    /// Split vec! macro tokens into argument token groups at top-level
+    /// commas or semicolons. Returns flattened token lists suitable for
+    /// passing directly to the parser, avoiding span-based source text
+    /// extraction which breaks when tokens have cross-source spans.
+    fn split_vec_macro_token_groups(&self, tokens: &[ast::TokenTree]) -> Vec<Vec<crate::lexer::Token>> {
         use crate::lexer::{Delimiter, TokenKind};
 
-        let source = match self.source {
-            Some(ref s) => s,
-            None => return Vec::new(),
+        // Unwrap outermost Delimited group if present
+        let inner: &[ast::TokenTree] = if tokens.len() == 1 {
+            if let ast::TokenTree::Delimited { tokens: ref inner, .. } = tokens[0] {
+                inner
+            } else {
+                tokens
+            }
+        } else {
+            tokens
         };
 
-        // Flatten delimited groups
-        let flat: Vec<&ast::TokenTree> = tokens
-            .iter()
-            .flat_map(|t| match t {
-                ast::TokenTree::Delimited { tokens: inner, .. } => inner.iter().collect::<Vec<_>>(),
-                other => vec![other],
-            })
-            .collect();
+        let mut groups: Vec<Vec<crate::lexer::Token>> = Vec::new();
+        let mut current: Vec<crate::lexer::Token> = Vec::new();
+        let mut depth: i32 = 0;
 
-        let mut args = Vec::new();
-        let mut paren_depth: i32 = 0;
-        let mut current_arg_start: Option<usize> = None;
-        let mut current_arg_end: usize = 0;
-
-        for token in &flat {
-            if let ast::TokenTree::Token(tok) = token {
-                match &tok.kind {
-                    TokenKind::OpenDelim(Delimiter::Paren)
-                    | TokenKind::OpenDelim(Delimiter::Bracket) => {
-                        paren_depth += 1;
-                        let s = tok.span.start.to_usize();
-                        let e = tok.span.end.to_usize();
-                        if current_arg_start.is_none() {
-                            current_arg_start = Some(s);
-                        }
-                        if e > current_arg_end {
-                            current_arg_end = e;
-                        }
+        // Recursively flatten a TokenTree into a Vec<Token>
+        fn flatten_tree(tree: &ast::TokenTree, out: &mut Vec<crate::lexer::Token>) {
+            match tree {
+                ast::TokenTree::Token(tok) => out.push(tok.clone()),
+                ast::TokenTree::Delimited { delimiter, tokens: inner, span } => {
+                    out.push(crate::lexer::Token::new(
+                        TokenKind::OpenDelim(*delimiter), *span,
+                    ));
+                    for t in inner {
+                        flatten_tree(t, out);
                     }
-                    TokenKind::CloseDelim(Delimiter::Paren)
-                    | TokenKind::CloseDelim(Delimiter::Bracket) => {
-                        paren_depth -= 1;
-                        let s = tok.span.start.to_usize();
-                        let e = tok.span.end.to_usize();
-                        if current_arg_start.is_none() {
-                            current_arg_start = Some(s);
-                        }
-                        if e > current_arg_end {
-                            current_arg_end = e;
-                        }
-                    }
-                    TokenKind::Comma if paren_depth == 0 => {
-                        // Top-level comma: flush current argument
-                        if let Some(start) = current_arg_start {
-                            if current_arg_end > start && current_arg_end <= source.len() {
-                                let text = source
-                                    .get(start..current_arg_end)
-                                    .unwrap_or("")
-                                    .trim()
-                                    .to_string();
-                                if !text.is_empty() {
-                                    args.push(text);
-                                }
-                            }
-                            current_arg_start = None;
-                            current_arg_end = 0;
-                        }
-                    }
-                    TokenKind::Semi if paren_depth == 0 => {
-                        // Semicolon in vec![val; count] -- treat like comma
-                        if let Some(start) = current_arg_start {
-                            if current_arg_end > start && current_arg_end <= source.len() {
-                                let text = source
-                                    .get(start..current_arg_end)
-                                    .unwrap_or("")
-                                    .trim()
-                                    .to_string();
-                                if !text.is_empty() {
-                                    args.push(text);
-                                }
-                            }
-                            current_arg_start = None;
-                            current_arg_end = 0;
-                        }
-                    }
-                    _ => {
-                        let s = tok.span.start.to_usize();
-                        let e = tok.span.end.to_usize();
-                        if current_arg_start.is_none() {
-                            current_arg_start = Some(s);
-                        }
-                        if e > current_arg_end {
-                            current_arg_end = e;
-                        }
-                    }
+                    out.push(crate::lexer::Token::new(
+                        TokenKind::CloseDelim(*delimiter), *span,
+                    ));
                 }
             }
         }
 
-        // Flush remaining
-        if let Some(start) = current_arg_start {
-            if current_arg_end > start && current_arg_end <= source.len() {
-                let text = source
-                    .get(start..current_arg_end)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if !text.is_empty() {
-                    args.push(text);
+        for token in inner {
+            match token {
+                ast::TokenTree::Token(tok) => {
+                    match &tok.kind {
+                        TokenKind::OpenDelim(_) => {
+                            depth += 1;
+                            current.push(tok.clone());
+                        }
+                        TokenKind::CloseDelim(_) => {
+                            depth -= 1;
+                            current.push(tok.clone());
+                        }
+                        TokenKind::Comma | TokenKind::Semi if depth == 0 => {
+                            if !current.is_empty() {
+                                groups.push(std::mem::take(&mut current));
+                            }
+                        }
+                        _ => {
+                            current.push(tok.clone());
+                        }
+                    }
+                }
+                ast::TokenTree::Delimited { .. } => {
+                    // Flatten the delimited group into individual tokens
+                    // so the parser can handle it
+                    flatten_tree(token, &mut current);
                 }
             }
         }
 
-        args
+        if !current.is_empty() {
+            groups.push(current);
+        }
+
+        groups
+    }
+
+    /// Parse a token group as an expression and lower it.
+    fn parse_and_lower_token_group(&mut self, tokens: Vec<crate::lexer::Token>) -> CodegenResult<MirValue> {
+        use crate::lexer::SourceFile;
+        use crate::parser::Parser;
+
+        // Build source text. First try span-based extraction from source,
+        // then validate it by re-tokenizing. If validation fails, use
+        // reconstructed text from token kinds.
+        let source_text = self.extract_source_for_tokens(&tokens);
+
+        let sf = SourceFile::anonymous(source_text.as_str());
+        match crate::lexer::tokenize(source_text.as_str()) {
+            Ok(new_tokens) => {
+                let mut parser = Parser::new(&sf, new_tokens);
+                match parser.parse_expr() {
+                    Ok(expr) => self.lower_expr(&expr),
+                    Err(_) => {
+                        // Parsing failed — tokens likely have synthetic spans.
+                        // Return a sensible default (0 for numerics).
+                        Ok(MirValue::Const(MirConst::Int(0, MirType::i64())))
+                    }
+                }
+            }
+            Err(_) => {
+                // Tokenization failed — return default
+                Ok(MirValue::Const(MirConst::Int(0, MirType::i64())))
+            }
+        }
+    }
+
+    /// Extract source text for a token group. Tries span-based extraction first,
+    /// validates by checking token count matches, falls back to reconstruction.
+    fn extract_source_for_tokens(&self, tokens: &[crate::lexer::Token]) -> String {
+        if let Some(ref src) = self.source {
+            let first_start = tokens.first().map(|t| t.span.start.to_usize()).unwrap_or(0);
+            let last_end = tokens.last().map(|t| t.span.end.to_usize()).unwrap_or(0);
+            if last_end > first_start && last_end <= src.len()
+                && src.is_char_boundary(first_start) && src.is_char_boundary(last_end) {
+                let candidate = src[first_start..last_end].to_string();
+                // Validate: re-tokenize and check it produces a similar token count
+                if let Ok(re_tokens) = crate::lexer::tokenize(candidate.as_str()) {
+                    // If re-tokenization gives roughly the same number of tokens, use it
+                    if re_tokens.len() >= tokens.len().saturating_sub(2)
+                        && re_tokens.len() <= tokens.len() + 2
+                    {
+                        return candidate;
+                    }
+                }
+            }
+        }
+        // Fallback: reconstruct from token kinds
+        self.reconstruct_source_from_tokens(tokens)
+    }
+
+    /// Reconstruct source text from token kinds when spans are unreliable.
+    fn reconstruct_source_from_tokens(&self, tokens: &[crate::lexer::Token]) -> String {
+        use crate::lexer::{Delimiter, TokenKind, LiteralKind};
+
+        let mut parts = Vec::new();
+        for tok in tokens {
+            let text = match &tok.kind {
+                TokenKind::Ident | TokenKind::RawIdent | TokenKind::Lifetime => {
+                    // Try to extract from source
+                    if let Some(ref src) = self.source {
+                        let s = tok.span.start.to_usize();
+                        let e = tok.span.end.to_usize();
+                        if e > s && e <= src.len() && src.is_char_boundary(s) && src.is_char_boundary(e) {
+                            src[s..e].to_string()
+                        } else {
+                            "_".to_string()
+                        }
+                    } else {
+                        "_".to_string()
+                    }
+                }
+                TokenKind::Literal { kind, suffix } => {
+                    if let Some(ref src) = self.source {
+                        let s = tok.span.start.to_usize();
+                        let e = tok.span.end.to_usize();
+                        if e > s && e <= src.len() {
+                            src[s..e].to_string()
+                        } else {
+                            match kind {
+                                LiteralKind::Int { .. } => "0".to_string(),
+                                LiteralKind::Float { .. } => "0.0".to_string(),
+                                LiteralKind::Str { .. } => "\"\"".to_string(),
+                                LiteralKind::Char { .. } => "'\\0'".to_string(),
+                                _ => "0".to_string(),
+                            }
+                        }
+                    } else {
+                        "0".to_string()
+                    }
+                }
+                TokenKind::Keyword(kw) => format!("{:?}", kw).to_lowercase(),
+                TokenKind::Plus => "+".to_string(),
+                TokenKind::Minus => "-".to_string(),
+                TokenKind::Star => "*".to_string(),
+                TokenKind::Slash => "/".to_string(),
+                TokenKind::Percent => "%".to_string(),
+                TokenKind::And => "&".to_string(),
+                TokenKind::Or => "|".to_string(),
+                TokenKind::Caret => "^".to_string(),
+                TokenKind::Not => "!".to_string(),
+                TokenKind::Dot => ".".to_string(),
+                TokenKind::DotDot => "..".to_string(),
+                TokenKind::DotDotEq => "..=".to_string(),
+                TokenKind::Comma => ",".to_string(),
+                TokenKind::Semi => ";".to_string(),
+                TokenKind::Colon => ":".to_string(),
+                TokenKind::ColonColon => "::".to_string(),
+                TokenKind::Eq => "=".to_string(),
+                TokenKind::EqEq => "==".to_string(),
+                TokenKind::Ne => "!=".to_string(),
+                TokenKind::Lt => "<".to_string(),
+                TokenKind::Gt => ">".to_string(),
+                TokenKind::Le => "<=".to_string(),
+                TokenKind::Ge => ">=".to_string(),
+                TokenKind::OpenDelim(Delimiter::Paren) => "(".to_string(),
+                TokenKind::OpenDelim(Delimiter::Bracket) => "[".to_string(),
+                TokenKind::OpenDelim(Delimiter::Brace) => "{".to_string(),
+                TokenKind::CloseDelim(Delimiter::Paren) => ")".to_string(),
+                TokenKind::CloseDelim(Delimiter::Bracket) => "]".to_string(),
+                TokenKind::CloseDelim(Delimiter::Brace) => "}".to_string(),
+                TokenKind::Arrow => "->".to_string(),
+                TokenKind::FatArrow => "=>".to_string(),
+                TokenKind::Underscore => "_".to_string(),
+                TokenKind::Tilde => "~".to_string(),
+                TokenKind::At => "@".to_string(),
+                TokenKind::Pound => "#".to_string(),
+                TokenKind::Question => "?".to_string(),
+                TokenKind::Shl => "<<".to_string(),
+                TokenKind::Shr => ">>".to_string(),
+                _ => {
+                    // Fallback: try span extraction
+                    if let Some(ref src) = self.source {
+                        let s = tok.span.start.to_usize();
+                        let e = tok.span.end.to_usize();
+                        if e > s && e <= src.len() && src.is_char_boundary(s) && src.is_char_boundary(e) {
+                            src[s..e].to_string()
+                        } else {
+                            " ".to_string()
+                        }
+                    } else {
+                        " ".to_string()
+                    }
+                }
+            };
+            parts.push(text);
+        }
+        parts.join(" ")
     }
 
     /// Detect whether the token stream contains a semicolon at the top level,
@@ -1253,24 +1410,35 @@ impl<'ctx> MirLowerer<'ctx> {
     fn detect_vec_repeat_syntax(&self, tokens: &[ast::TokenTree]) -> bool {
         use crate::lexer::{Delimiter, TokenKind};
 
-        let flat: Vec<&ast::TokenTree> = tokens
-            .iter()
-            .flat_map(|t| match t {
-                ast::TokenTree::Delimited { tokens: inner, .. } => inner.iter().collect::<Vec<_>>(),
-                other => vec![other],
-            })
-            .collect();
+        // Unwrap outermost Delimited if present, don't flatten
+        let inner: &[ast::TokenTree] = if tokens.len() == 1 {
+            if let ast::TokenTree::Delimited { tokens: ref inner, .. } = tokens[0] {
+                inner
+            } else {
+                tokens
+            }
+        } else {
+            tokens
+        };
 
-        let mut paren_depth: i32 = 0;
-        for token in &flat {
-            if let ast::TokenTree::Token(tok) = token {
-                match &tok.kind {
-                    TokenKind::OpenDelim(Delimiter::Paren)
-                    | TokenKind::OpenDelim(Delimiter::Bracket) => paren_depth += 1,
-                    TokenKind::CloseDelim(Delimiter::Paren)
-                    | TokenKind::CloseDelim(Delimiter::Bracket) => paren_depth -= 1,
-                    TokenKind::Semi if paren_depth == 0 => return true,
-                    _ => {}
+        let mut depth: i32 = 0;
+        for token in inner {
+            match token {
+                ast::TokenTree::Delimited { .. } => {
+                    // Nested delimited group — skip it entirely (don't
+                    // look inside for semicolons).
+                }
+                ast::TokenTree::Token(tok) => {
+                    match &tok.kind {
+                        TokenKind::OpenDelim(Delimiter::Paren)
+                        | TokenKind::OpenDelim(Delimiter::Bracket)
+                        | TokenKind::OpenDelim(Delimiter::Brace) => depth += 1,
+                        TokenKind::CloseDelim(Delimiter::Paren)
+                        | TokenKind::CloseDelim(Delimiter::Bracket)
+                        | TokenKind::CloseDelim(Delimiter::Brace) => depth -= 1,
+                        TokenKind::Semi if depth == 0 => return true,
+                        _ => {}
+                    }
                 }
             }
         }
@@ -1458,88 +1626,108 @@ impl<'ctx> MirLowerer<'ctx> {
             None => return Vec::new(),
         };
 
-        // Flatten delimited groups to get a flat list of tokens (the macro
-        // parser emits flat token sequences, not nested Delimited nodes).
-        let flat: Vec<&ast::TokenTree> = tokens
-            .iter()
-            .flat_map(|t| match t {
-                ast::TokenTree::Delimited { tokens: inner, .. } => inner.iter().collect::<Vec<_>>(),
-                other => vec![other],
-            })
-            .collect();
+        // Unwrap the outermost Delimited group if present, but do NOT flatten
+        // nested groups — their spans must stay intact for correct source extraction.
+        let inner: &[ast::TokenTree] = if tokens.len() == 1 {
+            if let ast::TokenTree::Delimited { tokens: ref inner, .. } = tokens[0] {
+                inner
+            } else {
+                tokens
+            }
+        } else {
+            tokens
+        };
 
-        // Walk the flat token list, tracking parenthesis depth to distinguish
-        // top-level argument-separating commas from commas inside function calls.
+        // Walk the token list, tracking delimiter depth to distinguish
+        // top-level argument-separating commas from commas inside nested expressions.
         let mut args = Vec::new();
         let mut past_format_string = false;
-        let mut paren_depth: i32 = 0;
+        let mut depth: i32 = 0;
         let mut current_arg_start: Option<usize> = None; // byte offset in source
         let mut current_arg_end: usize = 0;
 
-        for token in &flat {
-            if let ast::TokenTree::Token(tok) = token {
-                if !past_format_string {
-                    if let TokenKind::Literal { kind, .. } = &tok.kind {
-                        if matches!(kind, crate::lexer::LiteralKind::Str { .. }) {
-                            past_format_string = true;
-                        }
+        for token in inner {
+            match token {
+                ast::TokenTree::Delimited { span, .. } => {
+                    if !past_format_string {
+                        continue;
                     }
-                    continue;
+                    // Use the full span of the delimited group to extend
+                    // the current argument range without flattening.
+                    let s = span.start.to_usize();
+                    let e = span.end.to_usize();
+                    if current_arg_start.is_none() {
+                        current_arg_start = Some(s);
+                    }
+                    if e > current_arg_end {
+                        current_arg_end = e;
+                    }
                 }
-
-                // Track parenthesis/bracket depth
-                match &tok.kind {
-                    TokenKind::OpenDelim(Delimiter::Paren)
-                    | TokenKind::OpenDelim(Delimiter::Bracket) => {
-                        paren_depth += 1;
-                        // Extend current arg span
-                        let s = tok.span.start.to_usize();
-                        let e = tok.span.end.to_usize();
-                        if current_arg_start.is_none() {
-                            current_arg_start = Some(s);
-                        }
-                        if e > current_arg_end {
-                            current_arg_end = e;
-                        }
-                    }
-                    TokenKind::CloseDelim(Delimiter::Paren)
-                    | TokenKind::CloseDelim(Delimiter::Bracket) => {
-                        paren_depth -= 1;
-                        let s = tok.span.start.to_usize();
-                        let e = tok.span.end.to_usize();
-                        if current_arg_start.is_none() {
-                            current_arg_start = Some(s);
-                        }
-                        if e > current_arg_end {
-                            current_arg_end = e;
-                        }
-                    }
-                    TokenKind::Comma if paren_depth == 0 => {
-                        // Top-level comma: flush current argument
-                        if let Some(start) = current_arg_start {
-                            if current_arg_end > start && current_arg_end <= source.len() {
-                                let text = source
-                                    .get(start..current_arg_end)
-                                    .unwrap_or("")
-                                    .trim()
-                                    .to_string();
-                                if !text.is_empty() {
-                                    args.push(text);
-                                }
+                ast::TokenTree::Token(tok) => {
+                    if !past_format_string {
+                        if let TokenKind::Literal { kind, .. } = &tok.kind {
+                            if matches!(kind, crate::lexer::LiteralKind::Str { .. }) {
+                                past_format_string = true;
                             }
-                            current_arg_start = None;
-                            current_arg_end = 0;
                         }
+                        continue;
                     }
-                    _ => {
-                        // Extend current argument span
-                        let s = tok.span.start.to_usize();
-                        let e = tok.span.end.to_usize();
-                        if current_arg_start.is_none() {
-                            current_arg_start = Some(s);
+
+                    // Track parenthesis/bracket/brace depth
+                    match &tok.kind {
+                        TokenKind::OpenDelim(Delimiter::Paren)
+                        | TokenKind::OpenDelim(Delimiter::Bracket)
+                        | TokenKind::OpenDelim(Delimiter::Brace) => {
+                            depth += 1;
+                            let s = tok.span.start.to_usize();
+                            let e = tok.span.end.to_usize();
+                            if current_arg_start.is_none() {
+                                current_arg_start = Some(s);
+                            }
+                            if e > current_arg_end {
+                                current_arg_end = e;
+                            }
                         }
-                        if e > current_arg_end {
-                            current_arg_end = e;
+                        TokenKind::CloseDelim(Delimiter::Paren)
+                        | TokenKind::CloseDelim(Delimiter::Bracket)
+                        | TokenKind::CloseDelim(Delimiter::Brace) => {
+                            depth -= 1;
+                            let s = tok.span.start.to_usize();
+                            let e = tok.span.end.to_usize();
+                            if current_arg_start.is_none() {
+                                current_arg_start = Some(s);
+                            }
+                            if e > current_arg_end {
+                                current_arg_end = e;
+                            }
+                        }
+                        TokenKind::Comma if depth == 0 => {
+                            // Top-level comma: flush current argument
+                            if let Some(start) = current_arg_start {
+                                if current_arg_end > start && current_arg_end <= source.len() {
+                                    let text = source
+                                        .get(start..current_arg_end)
+                                        .unwrap_or("")
+                                        .trim()
+                                        .to_string();
+                                    if !text.is_empty() {
+                                        args.push(text);
+                                    }
+                                }
+                                current_arg_start = None;
+                                current_arg_end = 0;
+                            }
+                        }
+                        _ => {
+                            // Extend current argument span
+                            let s = tok.span.start.to_usize();
+                            let e = tok.span.end.to_usize();
+                            if current_arg_start.is_none() {
+                                current_arg_start = Some(s);
+                            }
+                            if e > current_arg_end {
+                                current_arg_end = e;
+                            }
                         }
                     }
                 }

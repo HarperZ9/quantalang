@@ -225,6 +225,15 @@ impl<'ctx> MirLowerer<'ctx> {
                             return MirType::Struct(prefixed);
                         }
                     }
+                    // Check the type_module_map for cross-module references
+                    // (e.g., bare "Operator" → "tonemap_Operator")
+                    if let Some(qualified) = self.type_module_map.get(name) {
+                        return MirType::Struct(qualified.clone());
+                    }
+                    // Check if the type exists as-is in the module
+                    if self.module.find_type(name).is_some() {
+                        return MirType::Struct(Arc::from(name));
+                    }
                     MirType::Struct(Arc::from(name))
                 }
             }

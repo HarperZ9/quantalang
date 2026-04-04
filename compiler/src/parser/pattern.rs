@@ -61,14 +61,30 @@ impl<'a> Parser<'a> {
             // =================================================================
             // REFERENCE PATTERN: &pat, &mut pat
             // =================================================================
-            TokenKind::And => {
+            TokenKind::And | TokenKind::AndAnd => {
+                let is_double = matches!(self.current_kind(), TokenKind::AndAnd);
                 self.advance();
                 let mutability = if self.eat_keyword(Keyword::Mut) {
                     Mutability::Mutable
                 } else {
                     Mutability::Immutable
                 };
-                let inner = self.parse_pattern()?;
+                // Use parse_pattern_primary (not parse_pattern) so that `|`
+                // isn't consumed as an or-pattern separator — critical for
+                // closure params like `|&x|` where `|` delimits the param list.
+                let inner = self.parse_pattern_primary()?;
+                // For `&&x` (tokenized as AndAnd), wrap in double Ref
+                let inner = if is_double {
+                    Pattern::new(
+                        PatternKind::Ref {
+                            mutability: Mutability::Immutable,
+                            pattern: Box::new(inner),
+                        },
+                        start,
+                    )
+                } else {
+                    inner
+                };
                 let span = start.merge(&inner.span);
                 Ok(Pattern::new(
                     PatternKind::Ref {

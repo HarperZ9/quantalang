@@ -44,10 +44,10 @@ pub struct TypeContext {
     /// The current Self type (set when inside an impl block).
     current_self_ty: Option<Ty>,
 
-    /// Inherent methods: (type_name, method_name) → method signature.
-    /// Populated by check_inherent_impl so that lookup_method can resolve
-    /// method calls on user-defined types without a trait.
-    inherent_methods: HashMap<(Arc<str>, Arc<str>), TraitMethod>,
+    /// Inherent methods: (type_def_id, method_name) → method signature.
+    /// Keyed by DefId (not type name string) to avoid collisions when
+    /// multiple types in different modules share the same name.
+    inherent_methods: HashMap<(DefId, Arc<str>), TraitMethod>,
 
     /// Type parameter trait bounds: param_name → [trait_name, ...].
     /// Populated when entering a generic function so that lookup_method can
@@ -571,12 +571,12 @@ impl TypeContext {
     /// This is used for `impl Type { fn method(...) }` without a trait.
     pub fn register_inherent_method(
         &mut self,
-        type_name: Arc<str>,
+        type_def_id: DefId,
         method_name: Arc<str>,
         sig: FnSig,
     ) {
         self.inherent_methods.insert(
-            (type_name, method_name.clone()),
+            (type_def_id, method_name.clone()),
             TraitMethod {
                 name: method_name,
                 sig,
@@ -585,24 +585,27 @@ impl TypeContext {
         );
     }
 
-    /// Look up an inherent method on a type by name.
+    /// Look up an inherent method on a type by DefId.
     pub fn lookup_inherent_method(
+        &self,
+        type_def_id: DefId,
+        method_name: &str,
+    ) -> Option<&TraitMethod> {
+        self.inherent_methods
+            .get(&(type_def_id, Arc::from(method_name)))
+    }
+
+    /// Look up an inherent method by type name string (fallback for path-based resolution).
+    /// Looks up the type's DefId first, then searches by DefId.
+    pub fn lookup_inherent_method_by_name(
         &self,
         type_name: &str,
         method_name: &str,
     ) -> Option<&TraitMethod> {
-        self.inherent_methods
-            .get(&(Arc::from(type_name), Arc::from(method_name)))
-    }
-
-    /// Find the type name that has an inherent method with the given name.
-    /// Used as a fallback when DefId-based type lookup fails.
-    pub fn lookup_type_by_name_containing_method(&self, method_name: &str) -> Option<String> {
-        let method_arc = Arc::from(method_name);
-        for (type_name, mname) in self.inherent_methods.keys() {
-            if mname == &method_arc {
-                return Some(type_name.to_string());
-            }
+        // Find the type's DefId by name
+        if let Some(type_def) = self.lookup_type_by_name(type_name) {
+            let def_id = type_def.def_id;
+            return self.lookup_inherent_method(def_id, method_name);
         }
         None
     }

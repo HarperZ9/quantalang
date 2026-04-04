@@ -85,6 +85,7 @@ impl CBackend {
         self.output.push_str("#include <stdlib.h>\n");
         self.output.push_str("#include <string.h>\n");
         self.output.push_str("#include <math.h>\n");
+        self.output.push_str("#include <ctype.h>\n");
         self.output.push_str("#include <time.h>\n");
         self.output.push('\n');
 
@@ -175,22 +176,22 @@ impl CBackend {
             "VecDeque", "HashSet", "Option", "Result",
         ];
 
-        // Emit forward declarations for struct/union types.
-        // Note: enum types are NOT forward-declared because their typedef
-        // struct pattern conflicts with MSVC when re-declared.
+        // Emit forward declarations for struct/union/enum types.
+        // Enums are emitted as tagged structs, so they get struct forward
+        // declarations.  The body later uses `struct X { ... };` (not
+        // `typedef struct X { ... } X;`) to avoid MSVC redefinition errors.
         self.output.push_str("// Forward declarations\n");
         for ty in types {
             if RUNTIME_TYPES.contains(&ty.name.as_ref()) {
                 continue;
             }
             match &ty.kind {
-                TypeDefKind::Struct { .. } => {
+                TypeDefKind::Struct { .. } | TypeDefKind::Enum { .. } => {
                     write!(self.output, "typedef struct {} {};\n", ty.name, ty.name).unwrap();
                 }
                 TypeDefKind::Union { .. } => {
                     write!(self.output, "typedef union {} {};\n", ty.name, ty.name).unwrap();
                 }
-                _ => {}
             }
         }
         self.output.push('\n');
@@ -205,6 +206,32 @@ impl CBackend {
             emitted.insert(rt);
         }
 
+        // Recursively collect named-type dependencies from a MirType.
+        // Only value types (not behind a pointer) require ordering.
+        fn collect_type_deps<'a>(
+            mir_ty: &'a MirType,
+            type_names: &std::collections::HashSet<&str>,
+            out: &mut Vec<&'a str>,
+        ) {
+            match mir_ty {
+                MirType::Struct(name) => {
+                    if type_names.contains(name.as_ref()) {
+                        out.push(name.as_ref());
+                    }
+                }
+                MirType::Array(inner, _) | MirType::Slice(inner) => {
+                    collect_type_deps(inner, type_names, out);
+                }
+                MirType::Tuple(elems) => {
+                    for e in elems {
+                        collect_type_deps(e, type_names, out);
+                    }
+                }
+                // Vec/Map/Ptr are behind pointers — no ordering needed
+                _ => {}
+            }
+        }
+
         // Collect value dependencies for each type
         let deps: std::collections::HashMap<&str, Vec<&str>> = types
             .iter()
@@ -213,25 +240,21 @@ impl CBackend {
                 match &ty.kind {
                     TypeDefKind::Struct { fields, .. } => {
                         for (_, ft) in fields {
-                            if let MirType::Struct(name) = ft {
-                                if type_names.contains(name.as_ref()) {
-                                    d.push(name.as_ref());
-                                }
-                            }
+                            collect_type_deps(ft, &type_names, &mut d);
                         }
                     }
                     TypeDefKind::Enum { variants, .. } => {
                         for v in variants {
                             for (_, ft) in &v.fields {
-                                if let MirType::Struct(name) = ft {
-                                    if type_names.contains(name.as_ref()) {
-                                        d.push(name.as_ref());
-                                    }
-                                }
+                                collect_type_deps(ft, &type_names, &mut d);
                             }
                         }
                     }
-                    _ => {}
+                    TypeDefKind::Union { variants } => {
+                        for (_, vt) in variants {
+                            collect_type_deps(vt, &type_names, &mut d);
+                        }
+                    }
                 }
                 (ty.name.as_ref(), d)
             })
@@ -357,8 +380,8 @@ impl CBackend {
                     self.indent -= 1;
                     write!(self.output, "}} {}_Tag;\n\n", ty.name).unwrap();
 
-                    // Generate tagged union
-                    write!(self.output, "typedef struct {} {{\n", ty.name).unwrap();
+                    // Generate tagged union (forward decl already typedef'd)
+                    write!(self.output, "struct {} {{\n", ty.name).unwrap();
                     self.indent += 1;
                     self.write_indent();
                     write!(self.output, "{}_Tag tag;\n", ty.name).unwrap();
@@ -412,7 +435,7 @@ impl CBackend {
                     self.write_indent();
                     self.output.push_str("} data;\n");
                     self.indent -= 1;
-                    write!(self.output, "}} {};\n\n", ty.name).unwrap();
+                    self.output.push_str("};\n\n");
                 }
             }
     }
@@ -1184,6 +1207,34 @@ impl CBackend {
                     }
                 }
 
+                // Map intrinsic_* calls to C standard library functions.
+                let func_str = match func_str.as_str() {
+                    "intrinsic_trunc" => "trunc".to_string(),
+                    "intrinsic_exp2" => "exp2".to_string(),
+                    "intrinsic_asin" => "asin".to_string(),
+                    "intrinsic_acos" => "acos".to_string(),
+                    "intrinsic_atan" => "atan".to_string(),
+                    "intrinsic_atan2" => "atan2".to_string(),
+                    "intrinsic_sinh" => "sinh".to_string(),
+                    "intrinsic_cosh" => "cosh".to_string(),
+                    "intrinsic_tanh" => "tanh".to_string(),
+                    "intrinsic_cbrt" => "cbrt".to_string(),
+                    "intrinsic_log" => "log".to_string(),
+                    "intrinsic_log2" => "log2".to_string(),
+                    "intrinsic_log10" => "log10".to_string(),
+                    "intrinsic_fabs" => "fabs".to_string(),
+                    "intrinsic_sqrt" => "sqrt".to_string(),
+                    "intrinsic_ceil" => "ceil".to_string(),
+                    "intrinsic_floor" => "floor".to_string(),
+                    "intrinsic_round" => "round".to_string(),
+                    "intrinsic_pow" => "pow".to_string(),
+                    "intrinsic_fmin" => "fmin".to_string(),
+                    "intrinsic_fmax" => "fmax".to_string(),
+                    "intrinsic_copysign" => "copysign".to_string(),
+                    "intrinsic_hypot" => "hypot".to_string(),
+                    _ => func_str,
+                };
+
                 // Special-case setjmp: when passed a QuantaHandler local,
                 // emit `setjmp(handler.env)` instead of `setjmp(handler)`.
                 //
@@ -1615,10 +1666,28 @@ impl CBackend {
                 let base_str = self.value_to_c(base, locals);
                 format!("{}.data.{}.f{}", base_str, variant_name, field_index)
             }
-            MirRValue::IndexAccess { base, index, .. } => {
+            MirRValue::IndexAccess { base, index, elem_ty } => {
                 let base_str = self.value_to_c(base, locals);
                 let index_str = self.value_to_c(index, locals);
-                format!("{}[{}]", base_str, index_str)
+                // For Vec types, use typed runtime getter instead of raw subscript.
+                let base_is_vec = match base {
+                    MirValue::Local(id) => locals
+                        .get(id.0 as usize)
+                        .map(|l| matches!(l.ty, MirType::Vec(_)))
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if base_is_vec {
+                    let suffix = match elem_ty {
+                        MirType::Float(_) => "f64",
+                        MirType::Int(IntSize::I64, _) => "i64",
+                        MirType::Struct(n) if n.as_ref() == "QuantaString" => "str",
+                        _ => "i32",
+                    };
+                    format!("quanta_hvec_get_{}({}, {})", suffix, base_str, index_str)
+                } else {
+                    format!("{}[{}]", base_str, index_str)
+                }
             }
             MirRValue::Deref { ptr, .. } => {
                 let ptr_str = self.value_to_c(ptr, locals);
@@ -2196,8 +2265,13 @@ mod tests {
             code
         );
         assert!(
-            code.contains("} Shape;"),
-            "Expected struct typedef in:\n{}",
+            code.contains("typedef struct Shape Shape;"),
+            "Expected forward declaration in:\n{}",
+            code
+        );
+        assert!(
+            code.contains("struct Shape {"),
+            "Expected struct definition in:\n{}",
             code
         );
     }
@@ -2355,8 +2429,13 @@ fn area(s: Shape) -> f64 {
         );
         assert!(code.contains("Shape_Tag"), "Missing tag type in:\n{}", code);
         assert!(
-            code.contains("} Shape;"),
-            "Missing enum close in:\n{}",
+            code.contains("typedef struct Shape Shape;"),
+            "Missing enum forward decl in:\n{}",
+            code
+        );
+        assert!(
+            code.contains("struct Shape {"),
+            "Missing enum struct body in:\n{}",
             code
         );
         assert!(code.contains("union"), "Missing union in:\n{}", code);

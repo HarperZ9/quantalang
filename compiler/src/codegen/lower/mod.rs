@@ -596,7 +596,23 @@ impl<'ctx> MirLowerer<'ctx> {
             ast::StructFields::Unit => Vec::new(),
         };
 
-        self.module.create_struct(s.name.name.clone(), fields);
+        let full_name = s.name.name.clone();
+        self.module.create_struct(full_name.clone(), fields);
+
+        // Register the bare→prefixed mapping so cross-module type
+        // references can resolve (e.g., bare "Operator" → "tonemap_Operator").
+        if !self.module_prefix.is_empty() {
+            // Extract the bare name by stripping the prefix
+            let prefix = self.module_prefix.iter()
+                .map(|s| s.as_ref())
+                .collect::<Vec<_>>()
+                .join("_");
+            let prefix_with_sep = format!("{}_", prefix);
+            if let Some(bare) = full_name.strip_prefix(&prefix_with_sep) {
+                self.type_module_map.insert(Arc::from(bare), full_name);
+            }
+        }
+
         Ok(())
     }
 
@@ -687,8 +703,22 @@ impl<'ctx> MirLowerer<'ctx> {
             })
             .collect();
 
+        let full_name = e.name.name.clone();
         self.module
-            .create_enum(e.name.name.clone(), MirType::i32(), variants);
+            .create_enum(full_name.clone(), MirType::i32(), variants);
+
+        // Register bare→prefixed mapping for cross-module resolution
+        if !self.module_prefix.is_empty() {
+            let prefix = self.module_prefix.iter()
+                .map(|s| s.as_ref())
+                .collect::<Vec<_>>()
+                .join("_");
+            let prefix_with_sep = format!("{}_", prefix);
+            if let Some(bare) = full_name.strip_prefix(&prefix_with_sep) {
+                self.type_module_map.insert(Arc::from(bare), full_name);
+            }
+        }
+
         Ok(())
     }
 

@@ -2380,6 +2380,71 @@ impl<'ctx> MirLowerer<'ctx> {
             return Ok(values::local(result));
         }
 
+        // Vec<T> method dispatch: map .push/.len/.get/.pop/.is_empty/.clear
+        // to typed runtime functions (quanta_hvec_*).
+        if let MirType::Vec(ref elem_ty) = receiver_ty {
+            let method_name = method.name.as_ref();
+            let type_suffix = match elem_ty.as_ref() {
+                MirType::Float(_) => "f64",
+                MirType::Int(IntSize::I64, _) => "i64",
+                MirType::Struct(n) if n.as_ref() == "QuantaString" => "str",
+                _ => "i32",
+            };
+
+            let (runtime_fn, ret_ty): (Option<String>, MirType) = match method_name {
+                "push" => (
+                    Some(format!("quanta_hvec_push_{}", type_suffix)),
+                    MirType::Void,
+                ),
+                "pop" => (
+                    Some(format!("quanta_hvec_pop_{}", type_suffix)),
+                    *elem_ty.clone(),
+                ),
+                "get" | "index" => (
+                    Some(format!("quanta_hvec_get_{}", type_suffix)),
+                    *elem_ty.clone(),
+                ),
+                "len" => (Some("quanta_hvec_len".to_string()), MirType::usize()),
+                "is_empty" => {
+                    // Lower as len() == 0
+                    let mut arg_vals = vec![receiver_val];
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                    let len_result = builder.create_local(MirType::usize());
+                    let cont = builder.create_block();
+                    let func = MirValue::Function(Arc::from("quanta_hvec_len"));
+                    builder.call(func, arg_vals, Some(len_result), cont);
+                    builder.switch_to_block(cont);
+                    let zero = builder.create_local(MirType::usize());
+                    builder.assign_const(zero, MirConst::Int(0, MirType::usize()));
+                    let result = builder.create_local(MirType::Bool);
+                    builder.binary_op(result, BinOp::Eq, values::local(len_result), values::local(zero));
+                    return Ok(values::local(result));
+                }
+                "clear" => (Some("quanta_hvec_free".to_string()), MirType::Void),
+                _ => (None, MirType::Void),
+            };
+
+            if let Some(fn_name) = runtime_fn {
+                let mut arg_vals = vec![receiver_val];
+                for arg in args {
+                    arg_vals.push(self.lower_expr(arg)?);
+                }
+                let builder = self
+                    .current_fn
+                    .as_mut()
+                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                let result = builder.create_local(ret_ty);
+                let cont = builder.create_block();
+                let func = MirValue::Function(Arc::from(fn_name.as_str()));
+                builder.call(func, arg_vals, Some(result), cont);
+                builder.switch_to_block(cont);
+                return Ok(values::local(result));
+            }
+        }
+
         // Fallback: lower as a regular function call with receiver as first argument
         let mut arg_vals = vec![receiver_val];
         for arg in args {

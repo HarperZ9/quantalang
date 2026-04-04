@@ -253,16 +253,29 @@ impl<'ctx> TypeChecker<'ctx> {
             return;
         }
 
+        // Push a scope for generic type parameters so they don't leak
+        // into the surrounding module's type namespace.
+        self.ctx.push_scope(ScopeKind::Block);
+        for (idx, param) in impl_.generics.params.iter().enumerate() {
+            if let ast::GenericParamKind::Type { .. } = &param.kind {
+                let ty = Ty::param(param.ident.name.clone(), idx as u32);
+                self.ctx.define_type_param(param.ident.name.clone(), ty);
+            }
+        }
+
         let _self_ty = self.lower_type(&impl_.self_ty);
         let type_name = Self::extract_type_name_from_ast(&impl_.self_ty);
+        let type_def_id = type_name.as_ref().and_then(|n| {
+            self.ctx.lookup_type_by_name(n).map(|td| td.def_id)
+        });
 
         for item in &impl_.items {
             match &item.kind {
                 ImplItemKind::Function(f) => {
-                    if let Some(ref tname) = type_name {
+                    if let Some(def_id) = type_def_id {
                         let sig = self.build_fn_sig_from_ast(f);
                         self.ctx.register_inherent_method(
-                            Arc::from(tname.as_str()),
+                            def_id,
                             f.name.name.clone(),
                             sig,
                         );
@@ -278,6 +291,8 @@ impl<'ctx> TypeChecker<'ctx> {
                 _ => {}
             }
         }
+
+        self.ctx.pop_scope();
     }
 
     fn collect_struct(&mut self, s: &ast::StructDef, _span: Span) {
@@ -866,8 +881,11 @@ impl<'ctx> TypeChecker<'ctx> {
     }
 
     fn check_inherent_impl(&mut self, impl_: &ast::ImplDef, self_ty: &Ty, _span: Span) {
-        // Extract the type name for inherent method registration
+        // Extract the type DefId for inherent method registration
         let type_name = Self::extract_type_name_from_ast(&impl_.self_ty);
+        let type_def_id = type_name.as_ref().and_then(|n| {
+            self.ctx.lookup_type_by_name(n).map(|td| td.def_id)
+        });
 
         // PASS 1: Pre-register ALL method signatures and constants before
         // checking any bodies. This fixes forward references: method A can
@@ -879,10 +897,10 @@ impl<'ctx> TypeChecker<'ctx> {
                     self.ctx.define_var(name.name.clone(), const_ty);
                 }
                 ImplItemKind::Function(f) => {
-                    if let Some(ref tname) = type_name {
+                    if let Some(def_id) = type_def_id {
                         let sig = self.build_fn_sig_from_ast(f);
                         self.ctx.register_inherent_method(
-                            Arc::from(tname.as_str()),
+                            def_id,
                             f.name.name.clone(),
                             sig,
                         );
