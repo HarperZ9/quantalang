@@ -1098,6 +1098,37 @@ impl CBackend {
                         let rvalue = self.rvalue_to_c(value, locals)?;
                         write!(self.output, "{} = {};\n", dest_name, rvalue).unwrap();
                     }
+                } else if let MirRValue::Use(src_val) = value {
+                    // Detect type mismatch between dest and src for Use assignments.
+                    // When one is a struct and the other is a primitive (or different
+                    // struct), use memcpy to avoid C type errors.
+                    let dest_ty = locals.get(dest.0 as usize).map(|l| &l.ty);
+                    let src_ty = match src_val {
+                        MirValue::Local(id) => locals.get(id.0 as usize).map(|l| &l.ty),
+                        _ => None,
+                    };
+                    let needs_cast = if let (Some(dt), Some(st)) = (dest_ty, src_ty) {
+                        let dt_is_struct = matches!(dt,
+                            MirType::Struct(_) | MirType::Vec(_) | MirType::Map(_, _) | MirType::Tuple(_));
+                        let st_is_struct = matches!(st,
+                            MirType::Struct(_) | MirType::Vec(_) | MirType::Map(_, _) | MirType::Tuple(_));
+                        (dt_is_struct || st_is_struct) && dt != st
+                    } else {
+                        false
+                    };
+                    if needs_cast {
+                        let src_str = self.value_to_c(src_val, locals);
+                        self.write_indent();
+                        write!(
+                            self.output,
+                            "memcpy(&{}, &{}, sizeof({}) < sizeof({}) ? sizeof({}) : sizeof({}));\n",
+                            dest_name, src_str, dest_name, src_str, dest_name, src_str
+                        ).unwrap();
+                    } else {
+                        self.write_indent();
+                        let rvalue = self.rvalue_to_c(value, locals)?;
+                        write!(self.output, "{} = {};\n", dest_name, rvalue).unwrap();
+                    }
                 } else {
                     self.write_indent();
                     let rvalue = self.rvalue_to_c(value, locals)?;

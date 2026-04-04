@@ -2554,7 +2554,15 @@ impl<'ctx> MirLowerer<'ctx> {
 
             let (runtime_fn, ret_ty): (Option<String>, MirType) = match method_name {
                 "insert" => (Some("quanta_hmap_insert_str_f64".to_string()), MirType::Void),
-                "get" => (Some("quanta_hmap_get_str_f64".to_string()), MirType::f64()),
+                "get" => {
+                    let val_c = match val_ty.as_ref() {
+                        MirType::Float(_) => None,
+                        _ => Some(format!("quanta_hmap_get_val_{}",
+                            Self::type_to_c_name(val_ty))),
+                    };
+                    let fn_name = val_c.unwrap_or_else(|| "quanta_hmap_get_str_f64".to_string());
+                    (Some(fn_name), *val_ty.clone())
+                }
                 "contains" | "contains_key" => (Some("quanta_hmap_contains_str_f64".to_string()), MirType::Bool),
                 "len" => (Some("quanta_hmap_len_str_f64".to_string()), MirType::usize()),
                 "remove" => (Some("quanta_hmap_remove_str_f64".to_string()), MirType::Void),
