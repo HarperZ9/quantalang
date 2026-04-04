@@ -536,6 +536,18 @@ static int64_t quanta_hmap_get_str_i64(QuantaStrF64MapHandle h, const char* key)
     return v;
 }
 
+// --- Typed HashMap: str key -> generic 8-byte value (for Vec/Struct values) ---
+
+static void quanta_hmap_insert_str_gen(QuantaStrF64MapHandle h, const char* key, void* value_ptr, size_t value_size) {
+    double d = 0;
+    memcpy(&d, value_ptr, value_size < sizeof(d) ? value_size : sizeof(d));
+    quanta_hmap_insert_str_f64(h, key, d);
+}
+static void quanta_hmap_get_str_gen(QuantaStrF64MapHandle h, const char* key, void* out, size_t out_size) {
+    double d = quanta_hmap_get_str_f64(h, key);
+    memcpy(out, &d, out_size < sizeof(d) ? out_size : sizeof(d));
+}
+
 // --- Typed HashMap: i64 key -> f64 value ---
 
 typedef struct {
