@@ -1427,22 +1427,26 @@ impl CBackend {
                     .enumerate()
                     .map(|(i, a)| {
                         let s = self.value_to_c(a, locals);
-                        // Auto-ref: if arg is QuantaString value but param is Ptr(QuantaString),
-                        // emit &arg to match the pointer parameter convention.
+                        // Auto-coerce arguments based on parameter types.
                         if let Some(ref params) = target_params {
                             if let Some(param_ty) = params.get(i) {
+                                let arg_is_string = if let MirValue::Local(id) = a {
+                                    locals.get(id.0 as usize)
+                                        .map(|l| matches!(l.ty, MirType::Struct(ref n) if n.as_ref() == "QuantaString"))
+                                        .unwrap_or(false)
+                                } else { false };
+
+                                // QuantaString → &QuantaString (auto-ref for &String params)
                                 if let MirType::Ptr(ref inner) = param_ty {
                                     if let MirType::Struct(ref pname) = inner.as_ref() {
-                                        if pname.as_ref() == "QuantaString" {
-                                            if let MirValue::Local(id) = a {
-                                                if let Some(local) = locals.get(id.0 as usize) {
-                                                    if let MirType::Struct(ref aname) = local.ty {
-                                                        if aname.as_ref() == "QuantaString" {
-                                                            return format!("&{}", s);
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                        if pname.as_ref() == "QuantaString" && arg_is_string {
+                                            return format!("&{}", s);
+                                        }
+                                    }
+                                    // QuantaString → const char* (extract .ptr)
+                                    if let MirType::Int(IntSize::I8, _) = inner.as_ref() {
+                                        if arg_is_string {
+                                            return format!("{}.ptr", s);
                                         }
                                     }
                                 }
