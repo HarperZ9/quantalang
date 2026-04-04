@@ -29,8 +29,9 @@ pub struct CBackend {
     /// Temp variable counter.
     temp_counter: u32,
     /// Function parameter types — indexed by function name, stores param types.
-    /// Populated during code generation for signature-aware argument emission.
     fn_params: std::collections::HashMap<String, Vec<MirType>>,
+    /// Return type of the current function being generated.
+    current_ret_ty: MirType,
 }
 
 impl CBackend {
@@ -41,6 +42,7 @@ impl CBackend {
             indent: 0,
             temp_counter: 0,
             fn_params: std::collections::HashMap::new(),
+            current_ret_ty: MirType::Void,
         }
     }
 
@@ -801,6 +803,7 @@ impl CBackend {
     }
 
     fn generate_function(&mut self, func: &MirFunction) -> CodegenResult<()> {
+        self.current_ret_ty = func.sig.ret.clone();
         self.generate_function_signature(func)?;
         self.output.push_str(" {\n");
         self.indent += 1;
@@ -1125,14 +1128,10 @@ impl CBackend {
                             dest_name, src_str, dest_name, src_str, dest_name, src_str
                         ).unwrap();
                     } else {
-                        self.write_indent();
-                        let rvalue = self.rvalue_to_c(value, locals)?;
-                        write!(self.output, "{} = {};\n", dest_name, rvalue).unwrap();
+                        self.emit_typed_assign(dest_name.clone(), value, *dest, locals)?;
                     }
                 } else {
-                    self.write_indent();
-                    let rvalue = self.rvalue_to_c(value, locals)?;
-                    write!(self.output, "{} = {};\n", dest_name, rvalue).unwrap();
+                    self.emit_typed_assign(dest_name.clone(), value, *dest, locals)?;
                 }
             }
             MirStmtKind::DerefAssign { ptr, value } => {
@@ -1518,7 +1517,27 @@ impl CBackend {
                 self.write_indent();
                 if let Some(val) = value {
                     let val_str = self.value_to_c(val, locals);
-                    write!(self.output, "return {};\n", val_str).unwrap();
+                    // Check for type mismatch between return value and function
+                    // return type.  Use memcpy cast for struct/primitive mismatches.
+                    let val_ty = match val {
+                        MirValue::Local(id) => locals.get(id.0 as usize).map(|l| &l.ty),
+                        _ => None,
+                    };
+                    let ret_is_struct = matches!(&self.current_ret_ty,
+                        MirType::Struct(_) | MirType::Vec(_) | MirType::Map(_, _) | MirType::Tuple(_));
+                    let val_is_struct = val_ty.map(|t| matches!(t,
+                        MirType::Struct(_) | MirType::Vec(_) | MirType::Map(_, _) | MirType::Tuple(_)))
+                        .unwrap_or(false);
+                    let types_mismatch = val_ty.map(|t| t != &self.current_ret_ty).unwrap_or(false);
+                    if types_mismatch && (ret_is_struct || val_is_struct)
+                        && self.current_ret_ty != MirType::Void
+                    {
+                        let ret_c = self.type_to_c(&self.current_ret_ty);
+                        write!(self.output, "{{ {} _cast; memset(&_cast, 0, sizeof(_cast)); memcpy(&_cast, &{}, sizeof({}) < sizeof(_cast) ? sizeof({}) : sizeof(_cast)); return _cast; }}\n",
+                            ret_c, val_str, val_str, val_str).unwrap();
+                    } else {
+                        write!(self.output, "return {};\n", val_str).unwrap();
+                    }
                 } else {
                     self.output.push_str("return;\n");
                 }
@@ -1940,6 +1959,53 @@ impl CBackend {
                 "/* texture_sample: GPU-only */ 0".to_string()
             }
         })
+    }
+
+    /// Emit an assignment, using memcpy for struct/primitive type mismatches.
+    fn emit_typed_assign(
+        &mut self,
+        dest_name: String,
+        value: &MirRValue,
+        dest_id: LocalId,
+        locals: &[MirLocal],
+    ) -> CodegenResult<()> {
+        // Check for type mismatch that needs memcpy
+        let dest_ty = locals.get(dest_id.0 as usize).map(|l| &l.ty);
+        let src_ty = if let MirRValue::Use(MirValue::Local(id)) = value {
+            locals.get(id.0 as usize).map(|l| &l.ty)
+        } else if let MirRValue::FieldAccess { field_ty, .. } = value {
+            Some(field_ty)
+        } else {
+            None
+        };
+        let needs_cast = if let (Some(dt), Some(st)) = (dest_ty, src_ty) {
+            let is_struct = |t: &MirType| matches!(t,
+                MirType::Struct(_) | MirType::Vec(_) | MirType::Map(_, _) | MirType::Tuple(_));
+            (is_struct(dt) || is_struct(st)) && dt != st
+        } else {
+            false
+        };
+        if needs_cast {
+            if let MirRValue::Use(src_val) = value {
+                let src_str = self.value_to_c(src_val, locals);
+                self.write_indent();
+                write!(
+                    self.output,
+                    "memcpy(&{}, &{}, sizeof({}) < sizeof({}) ? sizeof({}) : sizeof({}));\n",
+                    dest_name, src_str, dest_name, src_str, dest_name, src_str
+                ).unwrap();
+            } else {
+                // For non-Use rvalues (FieldAccess etc.), use a temp
+                let rvalue = self.rvalue_to_c(value, locals)?;
+                self.write_indent();
+                write!(self.output, "{} = {};\n", dest_name, rvalue).unwrap();
+            }
+        } else {
+            self.write_indent();
+            let rvalue = self.rvalue_to_c(value, locals)?;
+            write!(self.output, "{} = {};\n", dest_name, rvalue).unwrap();
+        }
+        Ok(())
     }
 
     fn binop_to_c(&self, op: BinOp) -> &'static str {
