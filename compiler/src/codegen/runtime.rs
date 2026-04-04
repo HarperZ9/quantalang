@@ -491,6 +491,21 @@ static bool quanta_hmap_remove_str_f64(QuantaStrF64MapHandle h, const char* key)
 
 static size_t quanta_hmap_len_str_f64(QuantaStrF64MapHandle h) { return h.inner->len; }
 
+// QuantaString-accepting wrappers (used by method dispatch which
+// passes QuantaString values, not const char* pointers).
+static void quanta_hmap_insert_qs(QuantaStrF64MapHandle h, QuantaString key, double value) {
+    quanta_hmap_insert_str_f64(h, key.ptr, value);
+}
+static double quanta_hmap_get_qs(QuantaStrF64MapHandle h, QuantaString key) {
+    return quanta_hmap_get_str_f64(h, key.ptr);
+}
+static bool quanta_hmap_contains_qs(QuantaStrF64MapHandle h, QuantaString key) {
+    return quanta_hmap_contains_str_f64(h, key.ptr);
+}
+static bool quanta_hmap_remove_qs(QuantaStrF64MapHandle h, QuantaString key) {
+    return quanta_hmap_remove_str_f64(h, key.ptr);
+}
+
 // --- Typed HashMap: i64 key -> f64 value ---
 
 typedef struct {
