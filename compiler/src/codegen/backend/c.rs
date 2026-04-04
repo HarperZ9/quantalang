@@ -1023,6 +1023,39 @@ impl CBackend {
                         let rvalue = self.rvalue_to_c(value, locals)?;
                         write!(self.output, "{} = {};\n", dest_name, rvalue).unwrap();
                     }
+                } else if let MirRValue::Aggregate {
+                    kind: AggregateKind::Struct(_),
+                    operands,
+                } = value
+                {
+                    // Check if any operand is an array — if so, use memcpy
+                    // because C compound literals can't initialize array fields
+                    // from array variables.
+                    let has_array_operand = operands.iter().any(|op| {
+                        if let MirValue::Local(id) = op {
+                            locals
+                                .get(id.0 as usize)
+                                .map(|l| matches!(l.ty, MirType::Array(_, _)))
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    });
+                    if has_array_operand && operands.len() == 1 {
+                        // Single array field → memcpy the array into the struct
+                        let src = self.value_to_c(&operands[0], locals);
+                        self.write_indent();
+                        write!(
+                            self.output,
+                            "memcpy(&{}, &{}, sizeof({}));\n",
+                            dest_name, src, dest_name
+                        )
+                        .unwrap();
+                    } else {
+                        self.write_indent();
+                        let rvalue = self.rvalue_to_c(value, locals)?;
+                        write!(self.output, "{} = {};\n", dest_name, rvalue).unwrap();
+                    }
                 } else {
                     self.write_indent();
                     let rvalue = self.rvalue_to_c(value, locals)?;
@@ -1867,7 +1900,9 @@ impl CBackend {
             // printf itself
             "printf" | "fprintf" | "sprintf" |
             // Common macros / functions from stdlib that may collide
-            "min" | "max" | "abs"
+            "min" | "max" | "abs" |
+            // Win16 legacy keywords (defined as macros in windef.h)
+            "near" | "far"
         )
     }
 
