@@ -1478,6 +1478,22 @@ impl<'ctx> MirLowerer<'ctx> {
 
     /// Attempt to resolve the return type of a function call by looking up
     /// already-lowered function declarations in the module.
+    /// Convert a MirType to a C-safe identifier suffix for monomorphized functions.
+    fn type_to_c_name(ty: &MirType) -> String {
+        match ty {
+            MirType::Int(IntSize::I32, true) => "int32_t".to_string(),
+            MirType::Int(IntSize::I64, true) => "int64_t".to_string(),
+            MirType::Int(IntSize::ISize, false) => "uintptr_t".to_string(),
+            MirType::Float(FloatSize::F64) => "double".to_string(),
+            MirType::Float(FloatSize::F32) => "float".to_string(),
+            MirType::Bool => "bool".to_string(),
+            MirType::Struct(name) => name.replace("::", "_").replace(" ", "_"),
+            MirType::Vec(_) => "QuantaVecHandle".to_string(),
+            MirType::Map(_, _) => "QuantaStrF64MapHandle".to_string(),
+            _ => "int32_t".to_string(),
+        }
+    }
+
     fn resolve_call_return_type(&self, func: &ast::Expr) -> MirType {
         let name = match &func.kind {
             ExprKind::Ident(ident) => {

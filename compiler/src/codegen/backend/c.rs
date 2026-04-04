@@ -135,6 +135,36 @@ impl CBackend {
             );
         }
 
+        // Generate monomorphized HashMap wrappers for non-f64 value types.
+        // Scan all function locals to discover Map types used in the module.
+        {
+            let mut map_val_types: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for func in &module.functions {
+                for local in &func.locals {
+                    if let MirType::Map(_, ref val_ty) = local.ty {
+                        let val_c = self.type_to_c(val_ty);
+                        if val_c != "double" {
+                            map_val_types.insert(val_c);
+                        }
+                    }
+                }
+            }
+            if !map_val_types.is_empty() {
+                self.output.push_str("// Monomorphized HashMap wrappers for non-f64 value types\n");
+                for val_c in &map_val_types {
+                    let safe_name = val_c.replace("*", "ptr").replace(" ", "_");
+                    write!(self.output, "static {} quanta_hmap_get_val_{}(QuantaStrF64MapHandle h, const char* key) {{\n", val_c, safe_name).unwrap();
+                    write!(self.output, "    double d = quanta_hmap_get_str_f64(h, key);\n").unwrap();
+                    write!(self.output, "    {} v; memset(&v, 0, sizeof(v));\n", val_c).unwrap();
+                    write!(self.output, "    memcpy(&v, &d, sizeof(d) < sizeof(v) ? sizeof(d) : sizeof(v));\n").unwrap();
+                    write!(self.output, "    return v;\n}}\n").unwrap();
+                    write!(self.output, "static void quanta_hmap_insert_val_{}(QuantaStrF64MapHandle h, const char* key, {} value) {{\n", safe_name, val_c).unwrap();
+                    write!(self.output, "    double d = 0; memcpy(&d, &value, sizeof(value) < sizeof(d) ? sizeof(value) : sizeof(d));\n").unwrap();
+                    write!(self.output, "    quanta_hmap_insert_str_f64(h, key, d);\n}}\n\n").unwrap();
+                }
+            }
+        }
+
         // Function definitions
         for func in &module.functions {
             if !func.is_declaration() {
