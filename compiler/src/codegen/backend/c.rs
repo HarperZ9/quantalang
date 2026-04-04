@@ -1695,6 +1695,26 @@ impl CBackend {
                 if *op == BinOp::Pow {
                     return Ok(format!("pow({}, {})", l, r));
                 }
+                // String comparison: use strcmp when either operand is QuantaString
+                if *op == BinOp::Eq || *op == BinOp::Ne {
+                    let is_string = |v: &MirValue| -> bool {
+                        match v {
+                            MirValue::Local(id) => locals
+                                .get(id.0 as usize)
+                                .map(|loc| matches!(loc.ty, MirType::Struct(ref n) if n.as_ref() == "QuantaString"))
+                                .unwrap_or(false),
+                            _ => false,
+                        }
+                    };
+                    if is_string(left) && is_string(right) {
+                        let cmp = format!("strcmp({}.ptr, {}.ptr)", l, r);
+                        return Ok(if *op == BinOp::Eq {
+                            format!("({} == 0)", cmp)
+                        } else {
+                            format!("({} != 0)", cmp)
+                        });
+                    }
+                }
                 let op_str = self.binop_to_c(*op);
                 format!("({} {} {})", l, op_str, r)
             }
