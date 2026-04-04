@@ -2846,28 +2846,31 @@ impl<'ctx> MirLowerer<'ctx> {
             return self.lower_runtime_option_match(scrutinee_val, &scrutinee_ty, arms);
         }
 
-        // Pattern-based Option detection: if the arms contain Some/None
-        // patterns but the scrutinee is an i32 fallback (from untyped
-        // method calls like pop_front()), still use the Option match path
-        // to properly declare the inner binding variable.
-        if scrutinee_ty == MirType::i32() {
-            let has_option_arms = arms.iter().any(|arm| {
-                matches!(&arm.pattern.kind,
-                    ast::PatternKind::TupleStruct { path, .. }
-                        if path.segments.last().map(|s| s.ident.name.as_ref()) == Some("Some")
-                )
-            });
-            if has_option_arms {
-                return self.lower_runtime_option_match(scrutinee_val, &scrutinee_ty, arms);
-            }
-        }
-
         // Check if this is an enum match (scrutinee type is a known enum).
         let is_enum_match = if let MirType::Struct(ref name) = scrutinee_ty {
             self.is_enum_type(name)
         } else {
             false
         };
+
+        // Pattern-based Option detection: if the arms contain Some/None
+        // patterns but the scrutinee is a primitive (i32/f64/bool from a
+        // fallback-typed method call), use the runtime Option match path
+        // to properly declare inner binding variables.
+        if !is_enum_match {
+            let is_primitive_scrutinee = scrutinee_ty == MirType::i32();
+            if is_primitive_scrutinee {
+                let has_option_arms = arms.iter().any(|arm| {
+                    matches!(&arm.pattern.kind,
+                        ast::PatternKind::TupleStruct { path, .. }
+                            if path.segments.last().map(|s| s.ident.name.as_ref()) == Some("Some")
+                    )
+                });
+                if has_option_arms {
+                    return self.lower_runtime_option_match(scrutinee_val, &scrutinee_ty, arms);
+                }
+            }
+        }
 
         let builder = self
             .current_fn
