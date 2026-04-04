@@ -28,6 +28,9 @@ pub struct CBackend {
     indent: usize,
     /// Temp variable counter.
     temp_counter: u32,
+    /// Function parameter types — indexed by function name, stores param types.
+    /// Populated during code generation for signature-aware argument emission.
+    fn_params: std::collections::HashMap<String, Vec<MirType>>,
 }
 
 impl CBackend {
@@ -37,6 +40,7 @@ impl CBackend {
             output: String::new(),
             indent: 0,
             temp_counter: 0,
+            fn_params: std::collections::HashMap::new(),
         }
     }
 
@@ -122,6 +126,14 @@ impl CBackend {
 
         // Vtable INSTANCES (after forward declarations so function names are known)
         self.generate_vtable_instances(module)?;
+
+        // Build function parameter type index for auto-ref at call sites
+        for func in &module.functions {
+            self.fn_params.insert(
+                func.name.to_string(),
+                func.sig.params.clone(),
+            );
+        }
 
         // Function definitions
         for func in &module.functions {
@@ -1347,11 +1359,35 @@ impl CBackend {
                 //
                 // Special-case printf: bool arguments used with %s must be
                 // converted to "true"/"false" strings via a ternary.
+                // Look up target function's parameter types for auto-ref.
+                let target_params = self.fn_params.get(func_str.as_str()).cloned();
                 let is_printf = func_str == "printf";
                 let args_str: Vec<_> = args
                     .iter()
-                    .map(|a| {
+                    .enumerate()
+                    .map(|(i, a)| {
                         let s = self.value_to_c(a, locals);
+                        // Auto-ref: if arg is QuantaString value but param is Ptr(QuantaString),
+                        // emit &arg to match the pointer parameter convention.
+                        if let Some(ref params) = target_params {
+                            if let Some(param_ty) = params.get(i) {
+                                if let MirType::Ptr(ref inner) = param_ty {
+                                    if let MirType::Struct(ref pname) = inner.as_ref() {
+                                        if pname.as_ref() == "QuantaString" {
+                                            if let MirValue::Local(id) = a {
+                                                if let Some(local) = locals.get(id.0 as usize) {
+                                                    if let MirType::Struct(ref aname) = local.ty {
+                                                        if aname.as_ref() == "QuantaString" {
+                                                            return format!("&{}", s);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if func_str == "setjmp" {
                             if let MirValue::Local(id) = a {
                                 if let Some(local) = locals.get(id.0 as usize) {
