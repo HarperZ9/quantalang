@@ -2426,6 +2426,28 @@ impl<'ctx> MirLowerer<'ctx> {
             return Ok(values::local(result));
         }
 
+        // &QuantaString method dispatch: handle chars/as_bytes on pointer receivers.
+        // These dereference the pointer and return the QuantaString value.
+        if let MirType::Ptr(ref inner) = receiver_ty {
+            if let MirType::Struct(ref name) = inner.as_ref() {
+                if name.as_ref() == "QuantaString" {
+                    let method_name = method.name.as_ref();
+                    if method_name == "chars" || method_name == "as_bytes" || method_name == "bytes"
+                        || method_name == "clone" || method_name == "to_owned"
+                    {
+                        let builder = self.current_fn.as_mut()
+                            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                        let derefed = builder.create_local(MirType::Struct(Arc::from("QuantaString")));
+                        builder.assign(derefed, MirRValue::Deref {
+                            ptr: receiver_val,
+                            pointee_ty: MirType::Struct(Arc::from("QuantaString")),
+                        });
+                        return Ok(values::local(derefed));
+                    }
+                }
+            }
+        }
+
         // Vec<T> method dispatch: map .push/.len/.get/.pop/.is_empty/.clear
         // to typed runtime functions (quanta_hvec_*).
         if let MirType::Vec(ref elem_ty) = receiver_ty {
@@ -3052,6 +3074,25 @@ impl<'ctx> MirLowerer<'ctx> {
                     let local = builder.create_local(scrutinee_ty.clone());
                     builder.assign(local, MirRValue::Use(values::local(scrutinee_local)));
                     self.var_map.insert(name.name.clone(), local);
+                } else if let ast::PatternKind::TupleStruct { patterns, .. } = &arm.pattern.kind {
+                    // Bind inner pattern variables from TupleStruct patterns
+                    // like Some(x), Ok(val), etc.  Use the scrutinee type for
+                    // the inner binding — it won't be semantically correct but
+                    // ensures the variable is declared in the C output.
+                    for pat in patterns.iter() {
+                        if let ast::PatternKind::Ident { name, .. } = &pat.kind {
+                            let builder = self.current_fn.as_mut().unwrap();
+                            let local = builder.create_named_local(
+                                name.name.clone(),
+                                scrutinee_ty.clone(),
+                            );
+                            builder.assign(
+                                local,
+                                MirRValue::Use(values::local(scrutinee_local)),
+                            );
+                            self.var_map.insert(name.name.clone(), local);
+                        }
+                    }
                 }
             }
 
