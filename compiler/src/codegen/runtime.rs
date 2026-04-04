@@ -39,6 +39,29 @@ typedef struct {
     size_t cap;    // 0 for string literals (not heap-allocated)
 } QuantaString;
 
+// --- Option type (generic, stores value as 64-bit union) ---
+
+typedef struct {
+    bool has_value;
+    union {
+        int64_t i;
+        double f;
+        void* p;
+    } value;
+} Option;
+
+// --- Result type (generic, stores Ok/Err as tagged union) ---
+
+typedef struct {
+    bool is_ok;
+    union {
+        int64_t ok_i;
+        double ok_f;
+        void* ok_p;
+    } ok;
+    QuantaString err;
+} Result;
+
 static QuantaString quanta_string_new(const char* s) {
     QuantaString qs;
     qs.ptr = s;
