@@ -129,6 +129,15 @@ impl MirBuilder {
             .map(|l| l.ty.clone())
     }
 
+    /// Change the type of an existing local.  Used when a let binding has
+    /// an explicit type annotation but the init expression produced a
+    /// fallback type (i32).
+    pub fn retype_local(&mut self, id: LocalId, new_ty: MirType) {
+        if let Some(local) = self.func.locals.iter_mut().find(|l| l.id == id) {
+            local.ty = new_ty;
+        }
+    }
+
     /// Check if a local ID exists in this function.
     pub fn local_exists(&self, id: LocalId) -> bool {
         self.func.locals.iter().any(|l| l.id == id)
