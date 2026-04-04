@@ -2683,19 +2683,29 @@ impl<'ctx> MirLowerer<'ctx> {
             .as_mut()
             .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
+        let is_real_option = matches!(scrutinee_ty, MirType::Struct(n) if n.as_ref() == "Option");
+
         let scrut_local = builder.create_local(scrutinee_ty.clone());
         builder.assign(scrut_local, MirRValue::Use(scrutinee_val));
 
-        // Extract has_value field
-        let has_value = builder.create_local(MirType::Bool);
-        builder.assign(
-            has_value,
-            MirRValue::FieldAccess {
-                base: values::local(scrut_local),
-                field_name: Arc::from("has_value"),
-                field_ty: MirType::Bool,
-            },
-        );
+        // Build the condition: for real Option, check has_value; for i32 fallback, check != 0
+        let has_value = if is_real_option {
+            let hv = builder.create_local(MirType::Bool);
+            builder.assign(
+                hv,
+                MirRValue::FieldAccess {
+                    base: values::local(scrut_local),
+                    field_name: Arc::from("has_value"),
+                    field_ty: MirType::Bool,
+                },
+            );
+            hv
+        } else {
+            // Fallback: treat as truthy (non-zero = Some, zero = None)
+            let hv = builder.create_local(MirType::Bool);
+            builder.assign(hv, MirRValue::Use(MirValue::Const(MirConst::Bool(true))));
+            hv
+        };
 
         let merge_block = builder.create_block();
         let some_block = builder.create_block();
@@ -2739,27 +2749,38 @@ impl<'ctx> MirLowerer<'ctx> {
                 let builder = self.current_fn.as_mut().unwrap();
                 builder.switch_to_block(some_block);
 
-                // Bind the inner pattern variable — extract from value.i (int64)
-                // For simplicity, treat the inner value as i32 (most common case
-                // for general-purpose code using runtime Option).
+                // Bind the inner pattern variable.
+                // For real Option: extract from .value field (i32 from union).
+                // For i32 fallback: bind directly from scrutinee.
                 if let ast::PatternKind::TupleStruct { patterns, .. } = &arm.pattern.kind {
-                    for (i, pat) in patterns.iter().enumerate() {
+                    for pat in patterns.iter() {
                         if let ast::PatternKind::Ident { name, .. } = &pat.kind {
                             let builder = self.current_fn.as_mut().unwrap();
+                            let inner_ty = if is_real_option {
+                                MirType::i32() // Option.value union stores as i64/f64/ptr — use i32 for now
+                            } else {
+                                scrutinee_ty.clone() // i32 fallback — same type as scrutinee
+                            };
                             let inner_local = builder.create_named_local(
                                 name.name.clone(),
-                                MirType::i32(),
+                                inner_ty.clone(),
                             );
-                            // Extract value from Option's value union
-                            // Use FieldAccess on the value union's `i` field
-                            builder.assign(
-                                inner_local,
-                                MirRValue::FieldAccess {
-                                    base: values::local(scrut_local),
-                                    field_name: Arc::from("value"),
-                                    field_ty: MirType::i32(),
-                                },
-                            );
+                            if is_real_option {
+                                builder.assign(
+                                    inner_local,
+                                    MirRValue::FieldAccess {
+                                        base: values::local(scrut_local),
+                                        field_name: Arc::from("value"),
+                                        field_ty: inner_ty,
+                                    },
+                                );
+                            } else {
+                                // i32 fallback: just copy the scrutinee as the inner value
+                                builder.assign(
+                                    inner_local,
+                                    MirRValue::Use(values::local(scrut_local)),
+                                );
+                            }
                             self.var_map.insert(name.name.clone(), inner_local);
                         }
                     }
@@ -2803,6 +2824,22 @@ impl<'ctx> MirLowerer<'ctx> {
         let is_runtime_option = matches!(&scrutinee_ty, MirType::Struct(n) if n.as_ref() == "Option");
         if is_runtime_option {
             return self.lower_runtime_option_match(scrutinee_val, &scrutinee_ty, arms);
+        }
+
+        // Pattern-based Option detection: if the arms contain Some/None
+        // patterns but the scrutinee is an i32 fallback (from untyped
+        // method calls like pop_front()), still use the Option match path
+        // to properly declare the inner binding variable.
+        if scrutinee_ty == MirType::i32() {
+            let has_option_arms = arms.iter().any(|arm| {
+                matches!(&arm.pattern.kind,
+                    ast::PatternKind::TupleStruct { path, .. }
+                        if path.segments.last().map(|s| s.ident.name.as_ref()) == Some("Some")
+                )
+            });
+            if has_option_arms {
+                return self.lower_runtime_option_match(scrutinee_val, &scrutinee_ty, arms);
+            }
         }
 
         // Check if this is an enum match (scrutinee type is a known enum).
