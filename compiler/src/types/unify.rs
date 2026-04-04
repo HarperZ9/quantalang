@@ -179,6 +179,11 @@ impl Unifier {
             // Slices: same element type
             (TyKind::Slice(elem1), TyKind::Slice(elem2)) => self.unify(elem1, elem2),
 
+            // Array-to-slice coercion: [T; N] unifies with [T]
+            // This allows passing fixed-size arrays where slices are expected.
+            (TyKind::Array(elem1, _), TyKind::Slice(elem2)) => self.unify(elem1, elem2),
+            (TyKind::Slice(elem1), TyKind::Array(elem2, _)) => self.unify(elem1, elem2),
+
             // References: same mutability and unified pointee
             (TyKind::Ref(lt1, mut1, ty1), TyKind::Ref(lt2, mut2, ty2)) => {
                 if mut1 != mut2 {
@@ -297,13 +302,20 @@ impl Unifier {
             return self.unify(&existing.clone(), &ty);
         }
 
+        // Apply current substitution to resolve already-bound variables
+        // before the occurs check. Without this, the occurs check can
+        // false-positive when ?T appears inside &?U and ?U is already
+        // bound to the same struct type (common with auto-deref on
+        // reference parameters in functions returning struct literals).
+        let resolved = self.apply(&ty);
+
         // Occurs check: prevent infinite types
-        if self.occurs_in(var, &ty) {
-            return Err(TypeError::InfiniteType { var, ty });
+        if self.occurs_in(var, &resolved) {
+            return Err(TypeError::InfiniteType { var, ty: resolved });
         }
 
         // Add the binding
-        self.subst.insert(var, ty);
+        self.subst.insert(var, resolved);
         Ok(())
     }
 
