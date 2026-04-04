@@ -1951,7 +1951,19 @@ impl CBackend {
                     };
                     format!("quanta_hvec_get_{}({}, {})", suffix, base_str, index_str)
                 } else {
-                    format!("{}[{}]", base_str, index_str)
+                    // QuantaString indexing: access .ptr[index] for byte access
+                    let base_is_string = match base {
+                        MirValue::Local(id) => locals
+                            .get(id.0 as usize)
+                            .map(|l| matches!(l.ty, MirType::Struct(ref n) if n.as_ref() == "QuantaString"))
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if base_is_string {
+                        format!("((uint8_t*){}.ptr)[{}]", base_str, index_str)
+                    } else {
+                        format!("{}[{}]", base_str, index_str)
+                    }
                 }
             }
             MirRValue::Deref { ptr, .. } => {
