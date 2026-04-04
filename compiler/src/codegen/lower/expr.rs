@@ -2582,7 +2582,9 @@ impl<'ctx> MirLowerer<'ctx> {
             // Size-returning methods
             "len" | "count" | "capacity" => MirType::usize(),
             // Void-returning mutators
-            "push" | "pop" | "insert" | "remove" | "clear" | "sort" | "reverse" => MirType::Void,
+            "push" | "insert" | "remove" | "clear" | "sort" | "reverse" => MirType::Void,
+            // pop returns the removed element (i32 fallback)
+            "pop" | "pop_front" | "pop_back" => MirType::i32(),
             _ => MirType::i32(),
         };
 
