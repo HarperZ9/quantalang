@@ -2445,17 +2445,30 @@ impl<'ctx> MirLowerer<'ctx> {
             }
         }
 
-        // Fallback: lower as a regular function call with receiver as first argument
+        // Fallback: lower as a regular function call with receiver as first argument.
+        // Use the receiver type to make a better guess at the return type than i32.
         let mut arg_vals = vec![receiver_val];
         for arg in args {
             arg_vals.push(self.lower_expr(arg)?);
         }
 
+        let method_name = method.name.as_ref();
+        let fallback_ret_ty = match method_name {
+            // Boolean-returning methods
+            "is_some" | "is_none" | "is_ok" | "is_err" | "is_empty"
+            | "contains" | "contains_key" | "starts_with" | "ends_with" => MirType::Bool,
+            // Size-returning methods
+            "len" | "count" | "capacity" => MirType::usize(),
+            // Void-returning mutators
+            "push" | "pop" | "insert" | "remove" | "clear" | "sort" | "reverse" => MirType::Void,
+            _ => MirType::i32(),
+        };
+
         let builder = self
             .current_fn
             .as_mut()
             .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
-        let result = builder.create_local(MirType::i32());
+        let result = builder.create_local(fallback_ret_ty);
         let cont = builder.create_block();
         let func = MirValue::Function(method.name.clone());
         builder.call(func, arg_vals, Some(result), cont);
