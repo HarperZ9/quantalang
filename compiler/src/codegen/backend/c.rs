@@ -175,14 +175,85 @@ impl CBackend {
         }
         self.output.push('\n');
 
-        self.output.push_str("// Type definitions\n");
-        for ty in types {
-            // Skip types already defined in the runtime header.
-            if RUNTIME_TYPES.contains(&ty.name.as_ref()) {
-                continue;
+        // Topological sort: emit types in dependency order.
+        // A type must be emitted after all types it references by value.
+        let type_names: std::collections::HashSet<&str> =
+            types.iter().map(|t| t.name.as_ref()).collect();
+
+        let mut emitted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for rt in RUNTIME_TYPES {
+            emitted.insert(rt);
+        }
+
+        // Collect value dependencies for each type
+        let deps: std::collections::HashMap<&str, Vec<&str>> = types
+            .iter()
+            .map(|ty| {
+                let mut d = Vec::new();
+                match &ty.kind {
+                    TypeDefKind::Struct { fields, .. } => {
+                        for (_, ft) in fields {
+                            if let MirType::Struct(name) = ft {
+                                if type_names.contains(name.as_ref()) {
+                                    d.push(name.as_ref());
+                                }
+                            }
+                        }
+                    }
+                    TypeDefKind::Enum { variants, .. } => {
+                        for v in variants {
+                            for (_, ft) in &v.fields {
+                                if let MirType::Struct(name) = ft {
+                                    if type_names.contains(name.as_ref()) {
+                                        d.push(name.as_ref());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                (ty.name.as_ref(), d)
+            })
+            .collect();
+
+        // Emit types in dependency order (simple iterative approach)
+        self.output.push_str("// Type definitions (dependency-ordered)\n");
+        let mut remaining: Vec<&MirTypeDef> = types
+            .iter()
+            .filter(|t| !RUNTIME_TYPES.contains(&t.name.as_ref()))
+            .collect();
+        let max_passes = remaining.len() + 1;
+        for _ in 0..max_passes {
+            if remaining.is_empty() {
+                break;
             }
-            match &ty.kind {
-                TypeDefKind::Struct { fields, packed } => {
+            let mut next_remaining = Vec::new();
+            for ty in &remaining {
+                let type_deps = deps.get(ty.name.as_ref()).cloned().unwrap_or_default();
+                if type_deps.iter().all(|d| emitted.contains(d)) {
+                    self.emit_type_def(ty);
+                    emitted.insert(ty.name.as_ref());
+                } else {
+                    next_remaining.push(*ty);
+                }
+            }
+            if next_remaining.len() == remaining.len() {
+                // Circular dependency — emit remaining in original order
+                for ty in &next_remaining {
+                    self.emit_type_def(ty);
+                }
+                break;
+            }
+            remaining = next_remaining;
+        }
+
+        Ok(())
+    }
+
+    fn emit_type_def(&mut self, ty: &MirTypeDef) {
+        match &ty.kind {
+            TypeDefKind::Struct { fields, packed } => {
                     if *packed {
                         self.output.push_str("#pragma pack(push, 1)\n");
                     }
@@ -305,9 +376,6 @@ impl CBackend {
                     write!(self.output, "}} {};\n\n", ty.name).unwrap();
                 }
             }
-        }
-
-        Ok(())
     }
 
     fn generate_vtable_types(&mut self, module: &MirModule) -> CodegenResult<()> {
