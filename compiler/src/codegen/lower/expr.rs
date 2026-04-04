@@ -1844,6 +1844,24 @@ impl<'ctx> MirLowerer<'ctx> {
                     return Ok(values::local(result));
                 }
 
+                // --- Identity methods that return the string itself ---
+                // chars()/as_bytes()/collect() in .quanta are identity ops
+                // in C because strings are already byte-accessible.
+                // For Ptr receivers, dereference first.
+                if method_name == "chars" || method_name == "as_bytes" || method_name == "bytes" {
+                    if matches!(&receiver_ty, MirType::Ptr(_)) {
+                        let builder = self.current_fn.as_mut()
+                            .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                        let derefed = builder.create_local(MirType::Struct(Arc::from("QuantaString")));
+                        builder.assign(derefed, MirRValue::Deref {
+                            ptr: receiver_val,
+                            pointee_ty: MirType::Struct(Arc::from("QuantaString")),
+                        });
+                        return Ok(values::local(derefed));
+                    }
+                    return Ok(receiver_val);
+                }
+
                 // --- No-arg methods returning QuantaString ---
                 let no_arg_str_fn: Option<&str> = match method_name {
                     "to_uppercase" => Some("quanta_string_to_upper"),
