@@ -5,11 +5,18 @@
 // ===============================================================================
 
 //! Diagnostics provider for QuantaLang.
+//!
+//! Provides both text-pattern-based checks (brackets, syntax) and
+//! real type checker diagnostics (undefined variables, type mismatches).
 
 use super::document::{Document, DocumentStore};
 use super::message::PublishDiagnosticsParams;
 use super::types::*;
 use std::sync::Arc;
+
+use crate::lexer::{Lexer, SourceFile};
+use crate::parser::Parser;
+use crate::types::{TypeChecker, TypeContext};
 
 // =============================================================================
 // DIAGNOSTICS PROVIDER
@@ -31,16 +38,135 @@ impl DiagnosticsProvider {
     pub fn compute(&self, doc: &Document) -> PublishDiagnosticsParams {
         let mut diagnostics = Vec::new();
 
-        // Run various checks
+        // Run pattern-based checks (fast, always available)
         self.check_syntax(&doc.content, &mut diagnostics);
         self.check_brackets(&doc.content, doc, &mut diagnostics);
-        self.check_common_issues(&doc.content, doc, &mut diagnostics);
-        self.check_unused_variables(&doc.content, doc, &mut diagnostics);
+
+        // Run the real type checker for semantic diagnostics
+        self.check_types(&doc.content, &mut diagnostics);
 
         PublishDiagnosticsParams {
             uri: doc.uri.clone(),
             version: Some(doc.version),
             diagnostics,
+        }
+    }
+
+    /// Run the full lexer → parser → type checker pipeline and convert
+    /// errors to LSP diagnostics with accurate source positions.
+    fn check_types(&self, content: &str, diagnostics: &mut Vec<Diagnostic>) {
+        let source_file = SourceFile::new("buffer", content.to_string());
+
+        // Lex
+        let mut lexer = Lexer::new(&source_file);
+        let tokens = match lexer.tokenize() {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 1,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::Error),
+                    code: None,
+                    source: Some("quantalang".to_string()),
+                    message: format!("Lexer error: {}", e),
+                    tags: Vec::new(),
+                    related_information: Vec::new(),
+                });
+                return;
+            }
+        };
+
+        // Parse
+        let mut parser = Parser::new(&source_file, tokens);
+        let ast = match parser.parse() {
+            Ok(ast) => ast,
+            Err(e) => {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 1,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::Error),
+                    code: None,
+                    source: Some("quantalang".to_string()),
+                    message: format!("Parse error: {}", e),
+                    tags: Vec::new(),
+                    related_information: Vec::new(),
+                });
+                return;
+            }
+        };
+
+        // Report parse errors with positions
+        for err in parser.errors() {
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 1 },
+                },
+                severity: Some(DiagnosticSeverity::Error),
+                code: None,
+                source: Some("quantalang".to_string()),
+                message: format!("{}", err),
+                tags: Vec::new(),
+                related_information: Vec::new(),
+            });
+        }
+
+        // Type check
+        let mut ctx = TypeContext::new();
+        let mut checker = TypeChecker::new(&mut ctx);
+        checker.check_module(&ast);
+
+        // Convert type errors to diagnostics with source positions
+        for err in checker.errors() {
+            let span = err.span;
+            let (start_line, start_col, end_line, end_col) =
+                if span.start.to_usize() < content.len() {
+                    let start_pos = source_file.lookup_position(span.start);
+                    let end_pos = source_file.lookup_position(span.end);
+                    (
+                        start_pos.line.saturating_sub(1),
+                        start_pos.column.saturating_sub(1),
+                        end_pos.line.saturating_sub(1),
+                        end_pos.column.saturating_sub(1),
+                    )
+                } else {
+                    (0, 0, 0, 1)
+                };
+
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: start_line,
+                        character: start_col,
+                    },
+                    end: Position {
+                        line: end_line,
+                        character: end_col,
+                    },
+                },
+                severity: Some(DiagnosticSeverity::Error),
+                code: None,
+                source: Some("quantalang".to_string()),
+                message: format!("{}", err),
+                tags: Vec::new(),
+                related_information: Vec::new(),
+            });
         }
     }
 
