@@ -885,7 +885,8 @@ impl CBackend {
             self.output.push('\n');
         }
 
-        // Generate basic blocks
+        // Generate basic blocks (all labels emitted; trivial goto→label pairs
+        // are cleaned up by eliminate_trivial_gotos after generation).
         if let Some(blocks) = &func.blocks {
             for (i, block) in blocks.iter().enumerate() {
                 // Generate label (except for entry block)
@@ -907,9 +908,6 @@ impl CBackend {
                 if let Some(term) = &block.terminator {
                     self.generate_terminator(term, &func.locals, blocks)?;
                 } else if block.stmts.is_empty() && (i > 0 || block.label.is_some()) {
-                    // Empty block with a label but no terminator (e.g. unreachable
-                    // blocks after early returns in try/? codegen).  C requires a
-                    // statement after a label, so emit a null statement.
                     self.write_indent();
                     self.output.push_str("(void)0;\n");
                 }
@@ -919,7 +917,63 @@ impl CBackend {
         self.indent -= 1;
         self.output.push_str("}\n\n");
 
+        // Post-process: eliminate trivial goto→label pairs.
+        // Pattern: `    goto bbN;\nbbN:\n` → just the label (or nothing if label
+        // is also unreferenced). This cleans up MIR block boundaries in the C output.
+        self.eliminate_trivial_gotos();
+
         Ok(())
+    }
+
+    /// Remove `goto bbN;\nbbN:\n` pairs from the output where the goto targets
+    /// the immediately following label. Preserves the label if other jumps
+    /// reference it; removes both if the label has only one predecessor.
+    fn eliminate_trivial_gotos(&mut self) {
+        use std::collections::HashSet;
+        // Find all goto targets in the output to know which labels are multi-referenced
+        let mut multi_ref_labels: HashSet<String> = HashSet::new();
+        let mut label_refs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for line in self.output.lines() {
+            let trimmed = line.trim();
+            if let Some(target) = trimmed.strip_prefix("goto ") {
+                if let Some(label) = target.strip_suffix(';') {
+                    *label_refs.entry(label.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        for (label, count) in &label_refs {
+            if *count > 1 {
+                multi_ref_labels.insert(label.clone());
+            }
+        }
+
+        let old = std::mem::take(&mut self.output);
+        let lines: Vec<&str> = old.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let trimmed = lines[i].trim();
+            // Check for `goto bbN;` followed by `bbN:`
+            if let Some(target) = trimmed.strip_prefix("goto ") {
+                if let Some(label) = target.strip_suffix(';') {
+                    let expected_label = format!("{}:", label);
+                    if i + 1 < lines.len() && lines[i + 1].trim() == expected_label {
+                        // Skip the goto; keep the label only if multi-referenced
+                        if multi_ref_labels.contains(label) {
+                            // Keep the label, skip the goto
+                            i += 1;
+                            continue;
+                        } else {
+                            // Skip both goto and label
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+            self.output.push_str(lines[i]);
+            self.output.push('\n');
+            i += 1;
+        }
     }
 
     fn generate_function_signature(&mut self, func: &MirFunction) -> CodegenResult<()> {
@@ -2200,6 +2254,60 @@ impl CBackend {
 
     /// produced by the lowerer for builtin operations and should pass through
     /// to C unchanged.
+    /// Collect block IDs that need labels (targeted by non-sequential jumps).
+    /// A block needs a label if ANY block other than its immediate predecessor
+    /// has a jump (goto/if/switch/call) targeting it.
+    fn collect_needed_labels(blocks: &[MirBlock]) -> std::collections::HashSet<BlockId> {
+        use crate::codegen::ir::*;
+        let mut needed = std::collections::HashSet::new();
+
+        for (i, block) in blocks.iter().enumerate() {
+            let next_id = blocks.get(i + 1).map(|b| b.id);
+            if let Some(ref term) = block.terminator {
+                match term {
+                    MirTerminator::Goto(target) => {
+                        // Only need label if NOT the next sequential block
+                        if Some(*target) != next_id {
+                            needed.insert(*target);
+                        }
+                    }
+                    MirTerminator::If {
+                        then_block,
+                        else_block,
+                        ..
+                    } => {
+                        needed.insert(*then_block);
+                        needed.insert(*else_block);
+                    }
+                    MirTerminator::Switch { targets, default, .. } => {
+                        for (_, target) in targets {
+                            needed.insert(*target);
+                        }
+                        needed.insert(*default);
+                    }
+                    MirTerminator::Call { target, .. } => {
+                        if let Some(t) = target {
+                            // Call continuation: need label if not next block
+                            if Some(*t) != next_id {
+                                needed.insert(*t);
+                            }
+                        }
+                    }
+                    MirTerminator::Assert {
+                        target, unwind, ..
+                    } => {
+                        needed.insert(*target);
+                        if let Some(u) = unwind {
+                            needed.insert(*u);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        needed
+    }
+
     /// Collect all LocalId values that are referenced in the function body.
     /// Used for dead local elimination — locals not in this set can be skipped.
     fn collect_used_locals(func: &MirFunction) -> std::collections::HashSet<LocalId> {
