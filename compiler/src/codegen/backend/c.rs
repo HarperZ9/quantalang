@@ -93,6 +93,7 @@ impl CBackend {
         self.output.push_str("#include <math.h>\n");
         self.output.push_str("#include <ctype.h>\n");
         self.output.push_str("#include <time.h>\n");
+        self.output.push_str("#include <assert.h>\n");
         self.output.push('\n');
 
         // Undefine known Windows API macros that collide with common type names
@@ -1341,6 +1342,10 @@ impl CBackend {
                     "HashMap_new" => "quanta_hmap_new_str_f64".to_string(),
                     "HashSet_new" => "quanta_hset_new".to_string(),
                     "VecDeque_new" => "quanta_vdeque_new".to_string(),
+                    // println(args) without ! → printf
+                    "println" => "printf".to_string(),
+                    "print" => "printf".to_string(),
+                    "eprintln" | "eprint" => "fprintf".to_string(),
                     _ => func_str,
                 };
 
@@ -2011,7 +2016,8 @@ impl CBackend {
                     dest_name, src_str, dest_name, src_str, dest_name, src_str
                 ).unwrap();
             } else {
-                // For non-Use rvalues (FieldAccess etc.), use a temp
+                // For non-Use rvalues, fall back to direct assignment
+                // (the type mismatch is from FieldAccess or other non-local sources)
                 let rvalue = self.rvalue_to_c(value, locals)?;
                 self.write_indent();
                 write!(self.output, "{} = {};\n", dest_name, rvalue).unwrap();
