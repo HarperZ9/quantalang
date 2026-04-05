@@ -13,7 +13,7 @@ The Effects Language -- algebraic effects as a first-class feature.
 - **Effects**: Parse -> type check -> codegen pipeline (setjmp/longjmp C runtime).
 - **Programs that compile**: Variables, functions, if/else, loops, match, recursion, arithmetic, effects -- all compile to C and execute via `quantac build`.
 - **Auto-compile**: `quantac build` discovers and invokes system C compiler (gcc/clang/MSVC).
-- **CLI subcommands**: `lex`, `parse`, `check`, `build`, `run`, `repl`, `version`.
+- **CLI subcommands**: `lex`, `parse`, `check`, `build`, `run`, `test`, `repl`, `version`, `lsp`, `fmt`, `pkg`, `watch`.
 - **MIR pipeline**: Full MIR builder (codegen/builder.rs, 29 tests), MIR IR (codegen/ir.rs, 31 tests), debug info (codegen/debug.rs, 24 tests), embedded C runtime (codegen/runtime.rs, 7 tests).
 - **Macro expansion**: Builtin macros, pattern matching, hygiene. Unit tests present.
 - **Interprocedural Lifetime Analysis** (Phase 1): Lifetime parameters flow through `FnTy` (function types), enabling precise borrow tracking at call sites. Functions like `fn pick<'a, 'b>(x: &'a i32, y: &'b i32) -> &'a i32` correctly propagate only the `'a`-linked borrow. Return lifetime mismatches (returning `'b` where `'a` expected) are rejected with clear errors. 8 new unit tests, 3 integration test programs.
@@ -71,7 +71,7 @@ quantac watch [path]        # Watch files and recompile on change
 quantac version             # Print version
 ```
 
-Not yet wired: `test`, `doc`, `lint` subcommands (modules exist but have no CLI integration).
+Not yet wired: `doc`, `lint` subcommands (modules exist but have no CLI integration). `test` is now wired — `quantac test` compiles, runs, and verifies .quanta programs against .expected output (102/118 pass, 86%).
 
 ## Summary
 QuantaLang has a **working compiler core** (lexer -> parser -> type checker -> MIR -> C backend -> executable) with 591 tests. It can compile and run real programs with variables, functions, control flow, pattern matching, recursion, and algebraic effects. All 8 backends (C, LLVM, x86-64, ARM64, WASM, SPIR-V, HLSL, GLSL) are accessible from the CLI via `quantac build --target <target>`. The C backend is production-verified; LLVM can optionally link with clang; native/WASM backends output assembly/binary for external toolchain linking. The LSP (`quantac lsp`), formatter (`quantac fmt`), and package manager (`quantac pkg`) are wired into the CLI. The self-hosted compiler and standard library (268,567 lines of `.quanta` code) represent an ambitious long-term vision but cannot be compiled or executed today.
