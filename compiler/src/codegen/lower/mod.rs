@@ -1577,6 +1577,26 @@ impl<'ctx> MirLowerer<'ctx> {
             .map(|t| self.lower_type_from_ast(t))
             .unwrap_or(MirType::Void);
 
+        // Resolve any remaining Self in return type to the concrete impl type.
+        // This ensures callers outside the impl block see the real type.
+        let ret = match ret {
+            MirType::Struct(ref name) if name.as_ref() == "Self" => {
+                MirType::Struct(type_name.clone())
+            }
+            MirType::Ptr(ref inner) => {
+                if let MirType::Struct(ref name) = **inner {
+                    if name.as_ref() == "Self" {
+                        MirType::Ptr(Box::new(MirType::Struct(type_name.clone())))
+                    } else {
+                        ret
+                    }
+                } else {
+                    ret
+                }
+            }
+            _ => ret,
+        };
+
         let sig = MirFnSig::new(params, ret);
         self.module.declare_function(mangled_name, sig);
         Ok(())
@@ -1613,6 +1633,25 @@ impl<'ctx> MirLowerer<'ctx> {
             .as_ref()
             .map(|t| self.lower_type_from_ast(t))
             .unwrap_or(MirType::Void);
+
+        // Resolve Self in return type to concrete impl type
+        let ret = match ret {
+            MirType::Struct(ref name) if name.as_ref() == "Self" => {
+                MirType::Struct(type_name.clone())
+            }
+            MirType::Ptr(ref inner) => {
+                if let MirType::Struct(ref name) = **inner {
+                    if name.as_ref() == "Self" {
+                        MirType::Ptr(Box::new(MirType::Struct(type_name.clone())))
+                    } else {
+                        ret
+                    }
+                } else {
+                    ret
+                }
+            }
+            _ => ret,
+        };
 
         let sig = MirFnSig::new(params, ret);
 

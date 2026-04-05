@@ -23,6 +23,29 @@ impl<'ctx> MirLowerer<'ctx> {
     // =========================================================================
 
     pub(crate) fn lower_type_from_ast(&self, ty: &ast::Type) -> MirType {
+        let result = self.lower_type_from_ast_inner(ty);
+        // Post-hoc: resolve any leftover Self to the current impl type.
+        // This catches cases where Self leaks through nested type paths.
+        if let MirType::Struct(ref name) = result {
+            if name.as_ref() == "Self" {
+                if let Some(ref impl_ty) = self.current_impl_type {
+                    return MirType::Struct(impl_ty.clone());
+                }
+            }
+        }
+        if let MirType::Ptr(ref inner) = result {
+            if let MirType::Struct(ref name) = **inner {
+                if name.as_ref() == "Self" {
+                    if let Some(ref impl_ty) = self.current_impl_type {
+                        return MirType::Ptr(Box::new(MirType::Struct(impl_ty.clone())));
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn lower_type_from_ast_inner(&self, ty: &ast::Type) -> MirType {
         match &ty.kind {
             ast::TypeKind::Never => MirType::Never,
             ast::TypeKind::Infer => MirType::i32(), // Inference placeholder: i32 is a safe default

@@ -32,6 +32,8 @@ pub struct CBackend {
     fn_params: std::collections::HashMap<String, Vec<MirType>>,
     /// Return type of the current function being generated.
     current_ret_ty: MirType,
+    /// Name of the current function being generated (for Self resolution).
+    current_fn_name: Option<String>,
 }
 
 impl CBackend {
@@ -43,6 +45,7 @@ impl CBackend {
             temp_counter: 0,
             fn_params: std::collections::HashMap::new(),
             current_ret_ty: MirType::Void,
+            current_fn_name: None,
         }
     }
 
@@ -805,6 +808,7 @@ impl CBackend {
 
     fn generate_function(&mut self, func: &MirFunction) -> CodegenResult<()> {
         self.current_ret_ty = func.sig.ret.clone();
+        self.current_fn_name = Some(func.name.to_string());
         self.generate_function_signature(func)?;
         self.output.push_str(" {\n");
         self.indent += 1;
@@ -1342,12 +1346,53 @@ impl CBackend {
                     "HashMap_new" => "quanta_hmap_new_str_f64".to_string(),
                     "HashSet_new" => "quanta_hset_new".to_string(),
                     "VecDeque_new" => "quanta_vdeque_new".to_string(),
-                    // println(args) without ! → printf
-                    "println" => "printf".to_string(),
-                    "print" => "printf".to_string(),
-                    "eprintln" | "eprint" => "fprintf".to_string(),
+                    // println/print without ! — keep name, handle below
                     _ => func_str,
                 };
+
+                // println/print (without !) → printf with QuantaString handling
+                if matches!(func_str.as_str(), "println" | "print" | "eprintln" | "eprint") {
+                    let is_err = matches!(func_str.as_str(), "eprintln" | "eprint");
+                    let newline = matches!(func_str.as_str(), "println" | "eprintln");
+                    let arg_str = if !args.is_empty() {
+                        let a = self.value_to_c(&args[0], locals);
+                        // Check if the arg is a QuantaString — use .ptr
+                        let is_qstr = if let MirValue::Local(id) = &args[0] {
+                            locals
+                                .get(id.0 as usize)
+                                .map(|l| {
+                                    matches!(l.ty, MirType::Struct(ref n) if n.as_ref() == "QuantaString")
+                                })
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        if is_qstr {
+                            format!("{}.ptr", a)
+                        } else {
+                            a
+                        }
+                    } else {
+                        "\"\"".to_string()
+                    };
+                    let nl = if newline { "\\n" } else { "" };
+                    if is_err {
+                        write!(self.output, "fprintf(stderr, \"%s{}\", {});\n", nl, arg_str)
+                            .unwrap();
+                    } else {
+                        write!(self.output, "printf(\"%s{}\", {});\n", nl, arg_str).unwrap();
+                    }
+                    if let Some(target_block) = target {
+                        self.write_indent();
+                        write!(
+                            self.output,
+                            "goto {};\n",
+                            self.block_label(target_block, blocks)
+                        )
+                        .unwrap();
+                    }
+                    return Ok(());
+                }
 
                 // String::new() → quanta_string_new("")
                 if func_str == "String_new" && args.is_empty() {
@@ -1486,12 +1531,18 @@ impl CBackend {
                     .collect();
 
                 if let Some(dest_local) = dest {
-                    // Skip assignment for void-returning functions
+                    // Skip assignment for void-returning functions.
+                    // Check both the dest type and known void functions
+                    // (assert returns void but MIR may type the dest as i32).
                     let dest_is_void = locals
                         .get(dest_local.0 as usize)
                         .map(|l| matches!(l.ty, MirType::Void))
                         .unwrap_or(false);
-                    if dest_is_void {
+                    let fn_returns_void = matches!(
+                        func_str.as_str(),
+                        "assert" | "free" | "exit" | "abort" | "process_exit"
+                    );
+                    if dest_is_void || fn_returns_void {
                         write!(self.output, "{}({});\n", func_str, args_str.join(", ")).unwrap();
                     } else {
                         let dest_name = self.local_name(*dest_local, locals);
@@ -1630,7 +1681,18 @@ impl CBackend {
                 // Slice as fat pointer struct
                 format!("struct {{ {}* ptr; size_t len; }}", self.type_to_c(elem))
             }
-            MirType::Struct(name) => name.to_string(),
+            MirType::Struct(name) => {
+                // Resolve unresolved Self to the enclosing function's impl type.
+                // E.g., in function "Point_new", Self → Point.
+                if name.as_ref() == "Self" {
+                    if let Some(ref fn_name) = self.current_fn_name {
+                        if let Some(idx) = fn_name.rfind('_') {
+                            return fn_name[..idx].to_string();
+                        }
+                    }
+                }
+                name.to_string()
+            }
             MirType::FnPtr(sig) => {
                 let ret = self.type_to_c(&sig.ret);
                 let params: Vec<_> = sig.params.iter().map(|p| self.type_to_c(p)).collect();
