@@ -707,7 +707,7 @@ fn cmd_check(file: &PathBuf) -> Result<(), i32> {
 
     // Parse (continues past errors, collecting valid items)
     let mut parser = Parser::new(&source_file, tokens);
-    let ast = parser.parse().unwrap(); // Always Ok now (errors stored in parser)
+    let mut ast = parser.parse().unwrap(); // Always Ok now (errors stored in parser)
     let parse_errors = parser.errors().to_vec();
 
     if parse_errors.is_empty() {
@@ -719,6 +719,9 @@ fn cmd_check(file: &PathBuf) -> Result<(), i32> {
             parse_errors.len()
         );
     }
+
+    // Resolve `mod foo;` declarations — load and merge external module files
+    resolve_modules(&mut ast, chk_base)?;
 
     // Type check the successfully parsed items
     let mut ctx = TypeContext::new();
@@ -2230,6 +2233,38 @@ fn cmd_pkg(cmd: PkgCommands) -> Result<(), i32> {
 ///
 /// Multi-segment paths like `foo::bar::baz()` resolve to `foo_bar_baz`
 /// during lowering since lower_path joins segments with `_`.
+/// Find the stdlib directory. Searches:
+/// 1. `stdlib/` relative to the compiler executable
+/// 2. `../stdlib/` relative to the compiler executable (for dev builds)
+/// 3. `QUANTALANG_STDLIB` environment variable
+fn find_stdlib_path() -> Option<PathBuf> {
+    // Check env var first
+    if let Ok(path) = std::env::var("QUANTALANG_STDLIB") {
+        let p = PathBuf::from(path);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    // Relative to the compiler executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            // stdlib/ next to the executable
+            let candidate = exe_dir.join("stdlib");
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+            // ../stdlib/ (dev layout: compiler/target/release/quantac → ../../stdlib)
+            for ancestor in exe_dir.ancestors().skip(1).take(4) {
+                let candidate = ancestor.join("stdlib");
+                if candidate.is_dir() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn resolve_modules(ast: &mut Module, source_dir: &Path) -> Result<(), i32> {
     resolve_modules_with_prefix(ast, source_dir, "")
 }
@@ -2266,14 +2301,20 @@ fn resolve_modules_with_prefix(
         let mod_file = source_dir.join(format!("{}.quanta", mod_name));
         let mod_dir_file = source_dir.join(mod_name).join("mod.quanta");
 
+        // Search order: source directory → stdlib directory → skip
+        let stdlib_file = find_stdlib_path().map(|p| p.join(format!("{}.quanta", mod_name)));
+
         let (actual_file, sub_source_dir) = if mod_file.exists() {
             (mod_file, source_dir.to_path_buf())
         } else if mod_dir_file.exists() {
             (mod_dir_file, source_dir.join(mod_name))
+        } else if let Some(ref sf) = stdlib_file {
+            if sf.exists() {
+                (sf.clone(), sf.parent().unwrap_or(Path::new(".")).to_path_buf())
+            } else {
+                continue;
+            }
         } else {
-            // Module file not found — skip silently for single-file compilation.
-            // The `module foo::bar` declaration is informational when compiling
-            // a standalone file.
             continue;
         };
 
