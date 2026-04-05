@@ -479,9 +479,9 @@ impl<'ctx> TypeChecker<'ctx> {
         let sig = self.lower_fn_sig(&f.generics, &f.sig);
         self.ctx.register_function(def_id, sig.clone());
 
-        // Add function to current scope
+        // Add function to current scope — carry lifetime params for interprocedural analysis
         let param_tys: Vec<_> = sig.params.iter().map(|(_, ty)| ty.clone()).collect();
-        let fn_ty = Ty::function(param_tys, sig.ret);
+        let fn_ty = Ty::function_with_lifetimes(param_tys, sig.ret, sig.lifetime_params.clone());
         self.ctx.define_var(f.name.name.clone(), fn_ty);
     }
 

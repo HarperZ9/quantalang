@@ -1548,22 +1548,43 @@ impl<'ctx> TypeInfer<'ctx> {
                 }
 
                 // Interprocedural lifetime: if the function returns a reference,
-                // the returned borrow is tied to the argument lifetimes.
-                // Look up the function's signature to check for lifetime params.
+                // track which argument variables the return borrows from.
                 let ret = (*fn_ty.ret).clone();
-                if let TyKind::Ref(_, _, _) = &ret.kind {
-                    // The return is a reference — check if any argument is a
-                    // reference to a named variable. If so, the returned reference
-                    // borrows from those variables (interprocedural borrow tracking).
-                    for arg in args {
-                        if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
-                            if let ExprKind::Ident(ident) = &inner.kind {
-                                // The returned reference borrows from this variable
-                                self.borrow_state.add_borrow(
-                                    Arc::from(ident.name.as_ref()),
-                                    None, // No binding yet — will be set by let
-                                    false,
-                                );
+                if let TyKind::Ref(ref ret_lt, _, _) = &ret.kind {
+                    if !fn_ty.lifetime_params.is_empty() {
+                        // Lifetime-guided: only track args whose param lifetime
+                        // matches the return type's lifetime parameter.
+                        let ret_lt_name = ret_lt.as_ref().map(|l| &l.name);
+                        for (param_ty, arg) in fn_ty.params.iter().zip(args.iter()) {
+                            if let TyKind::Ref(Some(ref param_lt), _, _) = &param_ty.kind {
+                                let shares_lifetime = match ret_lt_name {
+                                    Some(name) => param_lt.name == *name,
+                                    None => true, // elided return: conservative
+                                };
+                                if shares_lifetime {
+                                    if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
+                                        if let ExprKind::Ident(ident) = &inner.kind {
+                                            self.borrow_state.add_borrow(
+                                                Arc::from(ident.name.as_ref()),
+                                                None,
+                                                false,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // No lifetime params: heuristic — all ref args are sources
+                        for arg in args {
+                            if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
+                                if let ExprKind::Ident(ident) = &inner.kind {
+                                    self.borrow_state.add_borrow(
+                                        Arc::from(ident.name.as_ref()),
+                                        None,
+                                        false,
+                                    );
+                                }
                             }
                         }
                     }
@@ -2713,9 +2734,71 @@ impl<'ctx> TypeInfer<'ctx> {
                     vec![]
                 }
             }
-            ExprKind::Call { args, .. } | ExprKind::MethodCall { args, .. } => {
-                // Interprocedural: if a call returns a reference, the borrow
-                // sources are the variables passed as reference arguments.
+            ExprKind::Call { func, args } => {
+                // Interprocedural: resolve the callee to check for lifetime params.
+                let func_ty = self.infer_expr(func);
+                let func_ty = self.apply(&func_ty);
+                if let TyKind::Fn(ref fn_ty) = &func_ty.kind {
+                    if !fn_ty.lifetime_params.is_empty() {
+                        // Lifetime-guided: only borrow from args whose param
+                        // lifetime matches the return type's lifetime.
+                        let ret_lt_name = if let TyKind::Ref(Some(ref lt), _, _) = &fn_ty.ret.kind
+                        {
+                            Some(lt.name.clone())
+                        } else {
+                            None
+                        };
+                        fn_ty
+                            .params
+                            .iter()
+                            .zip(args.iter())
+                            .filter_map(|(param_ty, arg)| {
+                                if let TyKind::Ref(Some(ref param_lt), _, _) = &param_ty.kind {
+                                    let matches = ret_lt_name
+                                        .as_ref()
+                                        .map(|n| param_lt.name == *n)
+                                        .unwrap_or(true);
+                                    if matches {
+                                        if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
+                                            if let ExprKind::Ident(ident) = &inner.kind {
+                                                return Some(ident.name.as_ref().to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                None
+                            })
+                            .collect()
+                    } else {
+                        // No lifetime params: heuristic — all ref args
+                        args.iter()
+                            .filter_map(|arg| {
+                                if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
+                                    if let ExprKind::Ident(ident) = &inner.kind {
+                                        return Some(ident.name.as_ref().to_string());
+                                    }
+                                }
+                                None
+                            })
+                            .collect()
+                    }
+                } else {
+                    // Not a known function type: heuristic fallback
+                    args.iter()
+                        .filter_map(|arg| {
+                            if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
+                                if let ExprKind::Ident(ident) = &inner.kind {
+                                    return Some(ident.name.as_ref().to_string());
+                                }
+                            }
+                            None
+                        })
+                        .collect()
+                }
+            }
+            ExprKind::MethodCall { args, .. } => {
+                // Method calls: use heuristic for now (lifetime-aware method
+                // resolution is deferred to Phase 2).
                 args.iter()
                     .filter_map(|arg| {
                         if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
@@ -3110,6 +3193,7 @@ impl<'ctx> TypeInfer<'ctx> {
                     is_unsafe: *is_unsafe,
                     abi: None,
                     effects: super::effects::EffectRow::empty(),
+                    lifetime_params: Vec::new(),
                 }))
             }
             ast::TypeKind::Path(path) => self.lower_type_path(path),
@@ -4087,5 +4171,97 @@ mod tests {
         assert_eq!(format!("{}", named), "'a");
         let stat = super::super::ty::LifetimeKind::Static;
         assert_eq!(format!("{}", stat), "'static");
+    }
+
+    // =====================================================================
+    // Interprocedural lifetime analysis tests
+    // =====================================================================
+
+    #[test]
+    fn fn_ty_with_lifetimes_constructor() {
+        use super::super::ty::{FnTy, Ty, TyKind};
+        let fn_ty = Ty::function_with_lifetimes(
+            vec![Ty::reference(
+                Some(super::super::ty::Lifetime::new("a")),
+                super::super::ty::Mutability::Immutable,
+                Ty::int(super::super::ty::IntTy::I32),
+            )],
+            Ty::reference(
+                Some(super::super::ty::Lifetime::new("a")),
+                super::super::ty::Mutability::Immutable,
+                Ty::int(super::super::ty::IntTy::I32),
+            ),
+            vec![Arc::from("a")],
+        );
+        if let TyKind::Fn(ref ft) = &fn_ty.kind {
+            assert_eq!(ft.lifetime_params.len(), 1);
+            assert_eq!(ft.lifetime_params[0].as_ref(), "a");
+        } else {
+            panic!("expected FnTy");
+        }
+    }
+
+    #[test]
+    fn fn_ty_lifetime_params_preserved_through_substitute() {
+        use super::super::ty::{FnTy, Substitution, Ty, TyKind};
+        let fn_ty = Ty::function_with_lifetimes(
+            vec![Ty::fresh_var()],
+            Ty::int(super::super::ty::IntTy::I32),
+            vec![Arc::from("a"), Arc::from("b")],
+        );
+        // Substitute with an empty substitution — lifetime params must survive
+        let subst = Substitution::new();
+        let result = fn_ty.substitute(&subst);
+        if let TyKind::Fn(ref ft) = &result.kind {
+            assert_eq!(ft.lifetime_params.len(), 2);
+            assert_eq!(ft.lifetime_params[0].as_ref(), "a");
+            assert_eq!(ft.lifetime_params[1].as_ref(), "b");
+        } else {
+            panic!("expected FnTy");
+        }
+    }
+
+    #[test]
+    fn fn_ty_lifetime_params_preserved_through_freshen() {
+        use super::super::ty::{FnTy, Ty, TyKind};
+        let fn_ty = Ty::function_with_lifetimes(
+            vec![Ty::param(Arc::from("T"), 0)],
+            Ty::param(Arc::from("T"), 0),
+            vec![Arc::from("a")],
+        );
+        let freshened = fn_ty.freshen_params();
+        if let TyKind::Fn(ref ft) = &freshened.kind {
+            assert_eq!(ft.lifetime_params.len(), 1);
+            assert_eq!(ft.lifetime_params[0].as_ref(), "a");
+        } else {
+            panic!("expected FnTy");
+        }
+    }
+
+    #[test]
+    fn fn_ty_display_with_lifetimes() {
+        use super::super::ty::Ty;
+        let fn_ty = Ty::function_with_lifetimes(
+            vec![Ty::int(super::super::ty::IntTy::I32)],
+            Ty::bool(),
+            vec![Arc::from("a"), Arc::from("b")],
+        );
+        let display = format!("{}", fn_ty);
+        assert!(display.starts_with("for<'a, 'b>"));
+        assert!(display.contains("fn("));
+    }
+
+    #[test]
+    fn fn_ty_default_has_no_lifetime_params() {
+        use super::super::ty::{Ty, TyKind};
+        let fn_ty = Ty::function(
+            vec![Ty::int(super::super::ty::IntTy::I32)],
+            Ty::bool(),
+        );
+        if let TyKind::Fn(ref ft) = &fn_ty.kind {
+            assert!(ft.lifetime_params.is_empty());
+        } else {
+            panic!("expected FnTy");
+        }
     }
 }

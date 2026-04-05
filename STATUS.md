@@ -1,6 +1,6 @@
 # QuantaLang Project Status
 
-Last audited: 2026-03-21
+Last audited: 2026-04-04
 
 ## Identity
 The Effects Language -- algebraic effects as a first-class feature.
@@ -8,7 +8,7 @@ The Effects Language -- algebraic effects as a first-class feature.
 ## What Works (verified, tested, compiles)
 - **Lexer**: Complete Unicode-aware tokenizer with comprehensive token types, spans, error recovery. 59 unit tests + 51 integration tests.
 - **Parser**: Full recursive descent with Pratt parsing for expressions. Handles functions, structs, enums, match, if/else, loops, effects, generics, patterns. 4 unit tests + 85 integration tests.
-- **Type Checker**: Hindley-Milner inference, effect tracking, unification, trait resolution, const generics, higher-kinded types. Unit tests across multiple files.
+- **Type Checker**: Hindley-Milner inference, effect tracking, unification, trait resolution, const generics, higher-kinded types. **Interprocedural lifetime analysis**: lifetime parameters in function types (`FnTy`), lifetime-aware call-site borrow tracking, return lifetime validation via unification. Unit tests across multiple files.
 - **C Backend**: Generates valid C99 from QuantaLang source. Handles structs, unions, globals, string tables, branching, all binary/unary ops. 11 unit tests. This is the only backend wired into the CLI.
 - **Effects**: Parse -> type check -> codegen pipeline (setjmp/longjmp C runtime).
 - **Programs that compile**: Variables, functions, if/else, loops, match, recursion, arithmetic, effects -- all compile to C and execute via `quantac build`.
@@ -16,7 +16,8 @@ The Effects Language -- algebraic effects as a first-class feature.
 - **CLI subcommands**: `lex`, `parse`, `check`, `build`, `run`, `repl`, `version`.
 - **MIR pipeline**: Full MIR builder (codegen/builder.rs, 29 tests), MIR IR (codegen/ir.rs, 31 tests), debug info (codegen/debug.rs, 24 tests), embedded C runtime (codegen/runtime.rs, 7 tests).
 - **Macro expansion**: Builtin macros, pattern matching, hygiene. Unit tests present.
-- **591 total `#[test]` annotations** (455 in compiler/src/, 136 in compiler/tests/).
+- **Interprocedural Lifetime Analysis** (Phase 1): Lifetime parameters flow through `FnTy` (function types), enabling precise borrow tracking at call sites. Functions like `fn pick<'a, 'b>(x: &'a i32, y: &'b i32) -> &'a i32` correctly propagate only the `'a`-linked borrow. Return lifetime mismatches (returning `'b` where `'a` expected) are rejected with clear errors. 8 new unit tests, 3 integration test programs.
+- **612 total `#[test]` annotations** (476 in compiler/src/, 136 in compiler/tests/).
 
 ## What's Partial (has real code, wired into CLI but not end-to-end verified)
 - **x86-64 Backend** (1615 lines, 22 tests): Generates assembly from MIR. Wired into CLI via `quantac build --target x86-64`. No linker integration yet — outputs .s assembly.

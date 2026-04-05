@@ -140,13 +140,21 @@ impl Unifier {
 
             // Reference coercion: `&T` unifies with `T` (auto-deref).
             // Only for concrete types (ADT, primitives), not for Never/Error.
+            // Excludes Ref-vs-Ref: when both sides are references, fall through
+            // to the Ref/Ref arm which checks lifetime compatibility.
             (TyKind::Ref(_, _, inner), other)
-                if !matches!(other, TyKind::Never | TyKind::Error | TyKind::Var(_)) =>
+                if !matches!(
+                    other,
+                    TyKind::Never | TyKind::Error | TyKind::Var(_) | TyKind::Ref(_, _, _)
+                ) =>
             {
                 self.unify_impl(inner, t2)
             }
             (other, TyKind::Ref(_, _, inner))
-                if !matches!(other, TyKind::Never | TyKind::Error | TyKind::Var(_)) =>
+                if !matches!(
+                    other,
+                    TyKind::Never | TyKind::Error | TyKind::Var(_) | TyKind::Ref(_, _, _)
+                ) =>
             {
                 self.unify_impl(t1, inner)
             }
@@ -461,5 +469,51 @@ mod tests {
 
         let result = unifier.apply(&Ty::var(v1));
         assert_eq!(result, Ty::int(IntTy::I32));
+    }
+
+    #[test]
+    fn test_ref_lifetime_mismatch_is_error() {
+        let t1 = Ty::reference(
+            Some(Lifetime::new("a")),
+            Mutability::Immutable,
+            Ty::int(IntTy::I32),
+        );
+        let t2 = Ty::reference(
+            Some(Lifetime::new("b")),
+            Mutability::Immutable,
+            Ty::int(IntTy::I32),
+        );
+        let result = unify(&t1, &t2);
+        assert!(result.is_err(), "expected LifetimeMismatch error for 'a vs 'b");
+    }
+
+    #[test]
+    fn test_ref_same_lifetime_ok() {
+        let t1 = Ty::reference(
+            Some(Lifetime::new("a")),
+            Mutability::Immutable,
+            Ty::int(IntTy::I32),
+        );
+        let t2 = Ty::reference(
+            Some(Lifetime::new("a")),
+            Mutability::Immutable,
+            Ty::int(IntTy::I32),
+        );
+        assert!(unify(&t1, &t2).is_ok());
+    }
+
+    #[test]
+    fn test_ref_elided_lifetime_ok() {
+        let t1 = Ty::reference(
+            None,
+            Mutability::Immutable,
+            Ty::int(IntTy::I32),
+        );
+        let t2 = Ty::reference(
+            Some(Lifetime::new("a")),
+            Mutability::Immutable,
+            Ty::int(IntTy::I32),
+        );
+        assert!(unify(&t1, &t2).is_ok(), "elided lifetime should unify with named");
     }
 }

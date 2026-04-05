@@ -288,7 +288,7 @@ impl Ty {
         Self::new(TyKind::Ptr(mutability, Box::new(ty)))
     }
 
-    /// Create a function type (pure, no effects).
+    /// Create a function type (pure, no effects, no lifetime params).
     pub fn function(params: Vec<Ty>, ret: Ty) -> Self {
         Self::new(TyKind::Fn(FnTy {
             params,
@@ -296,6 +296,7 @@ impl Ty {
             is_unsafe: false,
             abi: None,
             effects: super::effects::EffectRow::empty(),
+            lifetime_params: Vec::new(),
         }))
     }
 
@@ -311,6 +312,23 @@ impl Ty {
             is_unsafe: false,
             abi: None,
             effects,
+            lifetime_params: Vec::new(),
+        }))
+    }
+
+    /// Create a function type with lifetime parameters for interprocedural analysis.
+    pub fn function_with_lifetimes(
+        params: Vec<Ty>,
+        ret: Ty,
+        lifetime_params: Vec<Arc<str>>,
+    ) -> Self {
+        Self::new(TyKind::Fn(FnTy {
+            params,
+            ret: Box::new(ret),
+            is_unsafe: false,
+            abi: None,
+            effects: super::effects::EffectRow::empty(),
+            lifetime_params,
         }))
     }
 
@@ -462,6 +480,7 @@ impl Ty {
                 is_unsafe: fn_ty.is_unsafe,
                 abi: fn_ty.abi.clone(),
                 effects: fn_ty.effects.clone(),
+                lifetime_params: fn_ty.lifetime_params.clone(),
             })),
             TyKind::Adt(def_id, substs) => Ty::adt(
                 *def_id,
@@ -529,6 +548,7 @@ impl Ty {
                 is_unsafe: fn_ty.is_unsafe,
                 abi: fn_ty.abi.clone(),
                 effects: fn_ty.effects.clone(),
+                lifetime_params: fn_ty.lifetime_params.clone(),
             })),
             TyKind::Adt(def_id, substs) => Ty::adt(
                 *def_id,
@@ -565,6 +585,7 @@ impl Ty {
                     is_unsafe: fn_ty.is_unsafe,
                     abi: fn_ty.abi.clone(),
                     effects: fn_ty.effects.clone(),
+                    lifetime_params: fn_ty.lifetime_params.clone(),
                 })),
                 TyKind::Adt(def_id, substs) => {
                     Ty::adt(*def_id, substs.iter().map(|t| freshen(t, cache)).collect())
@@ -626,6 +647,16 @@ impl fmt::Display for Ty {
                 write!(f, "{}", ty)
             }
             TyKind::Fn(fn_ty) => {
+                if !fn_ty.lifetime_params.is_empty() {
+                    write!(f, "for<")?;
+                    for (i, lt) in fn_ty.lifetime_params.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "'{}", lt)?;
+                    }
+                    write!(f, "> ")?;
+                }
                 if fn_ty.is_unsafe {
                     write!(f, "unsafe ")?;
                 }
@@ -891,7 +922,11 @@ impl Lifetime {
 
 impl fmt::Display for Lifetime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name)
+        if self.name.starts_with('\'') {
+            write!(f, "{}", self.name)
+        } else {
+            write!(f, "'{}", self.name)
+        }
     }
 }
 
@@ -908,6 +943,9 @@ pub struct FnTy {
     pub abi: Option<Arc<str>>,
     /// Algebraic effect row for this function.
     pub effects: super::effects::EffectRow,
+    /// Lifetime parameters declared on this function (e.g., `'a`, `'b` in `fn foo<'a, 'b>(...)`).
+    /// Used for interprocedural borrow tracking at call sites.
+    pub lifetime_params: Vec<Arc<str>>,
 }
 
 /// A definition ID for ADTs, traits, etc.
