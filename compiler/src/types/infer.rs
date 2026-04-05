@@ -1575,15 +1575,41 @@ impl<'ctx> TypeInfer<'ctx> {
                             }
                         }
                     } else {
-                        // No lifetime params: heuristic — all ref args are sources
-                        for arg in args {
-                            if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
-                                if let ExprKind::Ident(ident) = &inner.kind {
-                                    self.borrow_state.add_borrow(
-                                        Arc::from(ident.name.as_ref()),
-                                        None,
-                                        false,
-                                    );
+                        // No explicit lifetime params: apply elision rules.
+                        // Count reference parameters to decide which args propagate.
+                        let ref_param_indices: Vec<usize> = fn_ty
+                            .params
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, p)| matches!(&p.kind, TyKind::Ref(_, _, _)))
+                            .map(|(i, _)| i)
+                            .collect();
+
+                        if ref_param_indices.len() == 1 {
+                            // Elision rule 1: single ref param → return borrows from it
+                            let idx = ref_param_indices[0];
+                            if let Some(arg) = args.get(idx) {
+                                if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
+                                    if let ExprKind::Ident(ident) = &inner.kind {
+                                        self.borrow_state.add_borrow(
+                                            Arc::from(ident.name.as_ref()),
+                                            None,
+                                            false,
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            // Multiple ref params or none: conservative fallback
+                            for arg in args {
+                                if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
+                                    if let ExprKind::Ident(ident) = &inner.kind {
+                                        self.borrow_state.add_borrow(
+                                            Arc::from(ident.name.as_ref()),
+                                            None,
+                                            false,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2770,17 +2796,42 @@ impl<'ctx> TypeInfer<'ctx> {
                             })
                             .collect()
                     } else {
-                        // No lifetime params: heuristic — all ref args
-                        args.iter()
-                            .filter_map(|arg| {
-                                if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
-                                    if let ExprKind::Ident(ident) = &inner.kind {
-                                        return Some(ident.name.as_ref().to_string());
+                        // No lifetime params: apply elision rules
+                        let ref_param_indices: Vec<usize> = fn_ty
+                            .params
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, p)| matches!(&p.kind, TyKind::Ref(_, _, _)))
+                            .map(|(i, _)| i)
+                            .collect();
+
+                        if ref_param_indices.len() == 1 {
+                            // Single ref param → only that arg is a borrow source
+                            let idx = ref_param_indices[0];
+                            args.get(idx)
+                                .and_then(|arg| {
+                                    if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
+                                        if let ExprKind::Ident(ident) = &inner.kind {
+                                            return Some(ident.name.as_ref().to_string());
+                                        }
                                     }
-                                }
-                                None
-                            })
-                            .collect()
+                                    None
+                                })
+                                .into_iter()
+                                .collect()
+                        } else {
+                            // Multiple ref params: conservative fallback
+                            args.iter()
+                                .filter_map(|arg| {
+                                    if let ExprKind::Ref { expr: inner, .. } = &arg.kind {
+                                        if let ExprKind::Ident(ident) = &inner.kind {
+                                            return Some(ident.name.as_ref().to_string());
+                                        }
+                                    }
+                                    None
+                                })
+                                .collect()
+                        }
                     }
                 } else {
                     // Not a known function type: heuristic fallback
