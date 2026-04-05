@@ -921,7 +921,9 @@ impl CBackend {
         // 1. Trivial goto elimination: remove goto→label pairs for sequential blocks
         // 2. Copy propagation: inline single-use temporaries
         self.eliminate_trivial_gotos();
-        // Copy propagation: disabled pending investigation of 114_iterators/57_try_operator
+        // Copy propagation needs MIR-level dataflow analysis to be correct.
+        // Text-based approach fails on reassigned temps and cross-block values.
+        // Deferred to MIR optimization pass.
         // self.propagate_copies();
 
         Ok(())
@@ -1017,9 +1019,15 @@ impl CBackend {
                     let next_trimmed = next.trim();
                     let occurrences = Self::count_ident_occurrences(next_trimmed, &temp_name);
 
+                    // Skip if the next line REASSIGNS the same temp (lvalue use)
+                    let next_is_reassign = next_trimmed.starts_with(&format!("{} = ", temp_name))
+                        || next_trimmed.starts_with(&format!("{} =", temp_name));
                     // Inline if: used exactly once on next line, not as lvalue,
                     // and expr is safe to inline (no side effects when reordered)
-                    if occurrences == 1 && Self::is_safe_to_inline(&expr) {
+                    if occurrences == 1
+                        && !next_is_reassign
+                        && Self::is_safe_to_inline(&expr)
+                    {
                         let inlined = Self::replace_ident(next, &temp_name, &expr);
                         result.push(inlined);
                         skip_next = true;
