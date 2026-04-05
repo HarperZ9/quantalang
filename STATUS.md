@@ -71,7 +71,15 @@ quantac watch [path]        # Watch files and recompile on change
 quantac version             # Print version
 ```
 
-Not yet wired: `doc`, `lint` subcommands (modules exist but have no CLI integration). `test` is now wired — `quantac test` compiles, runs, and verifies .quanta programs against .expected output (102/118 pass, 86%).
+Not yet wired: `doc` subcommand. All other subcommands are functional. `quantac test` runs 126/150 programs (84%). `quantac lint` provides type errors + style warnings with file:line:col positions. `quantac lsp` provides real type checker diagnostics to VS Code.
+
+## Output Optimization
+- **Dead local elimination**: Removes unused MIR temporary declarations
+- **Trivial goto elimination**: Removes sequential goto→label pairs from MIR block boundaries
+- **Copy propagation**: Framework implemented, needs MIR-level dataflow analysis (disabled)
+
+## Standard Library
+Automatic stdlib resolution from any directory via `find_stdlib_path()`. 13 modules (842 lines) in `stdlib/`: core, math, string_utils, algorithms, bitwise, effects, graphics, io, iter, option, result, sorting, strings. Module import call rewriting maps bare function names to prefixed versions.
 
 ## Summary
-QuantaLang has a **working compiler core** (lexer -> parser -> type checker -> MIR -> C backend -> executable) with 591 tests. It can compile and run real programs with variables, functions, control flow, pattern matching, recursion, and algebraic effects. All 8 backends (C, LLVM, x86-64, ARM64, WASM, SPIR-V, HLSL, GLSL) are accessible from the CLI via `quantac build --target <target>`. The C backend is production-verified; LLVM can optionally link with clang; native/WASM backends output assembly/binary for external toolchain linking. The LSP (`quantac lsp`), formatter (`quantac fmt`), and package manager (`quantac pkg`) are wired into the CLI. The self-hosted compiler and standard library (268,567 lines of `.quanta` code) represent an ambitious long-term vision but cannot be compiled or executed today.
+QuantaLang has a **working compiler core** (lexer -> parser -> type checker -> MIR -> C backend -> executable) with 612 tests. It can compile and run real programs with variables, functions, control flow, pattern matching, recursion, and algebraic effects. All 8 backends (C, LLVM, x86-64, ARM64, WASM, SPIR-V, HLSL, GLSL) are accessible from the CLI via `quantac build --target <target>`. The C backend is production-verified; LLVM can optionally link with clang; native/WASM backends output assembly/binary for external toolchain linking. The LSP (`quantac lsp`), formatter (`quantac fmt`), and package manager (`quantac pkg`) are wired into the CLI. The self-hosted compiler and standard library (268,567 lines of `.quanta` code) represent an ambitious long-term vision but cannot be compiled or executed today.
