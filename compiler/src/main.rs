@@ -969,10 +969,11 @@ fn invoke_c_compiler(
             std::env::var("QUANTALANG_MSVC_BIN"),
         ) {
             let bat_path = c_file.with_extension("bat");
+            let exe_path = exe_file.to_string_lossy().replace('/', "\\");
             // Write bat file with MSVC env setup and compilation
             let bat_content = format!(
-                "set \"INCLUDE={}\"\r\nset \"LIB={}\"\r\nset \"PATH={};%PATH%\"\r\ncl.exe /nologo /W0 /std:c11 {} \"{}\" /Fe\"temp.exe\" 1>&2\r\n",
-                inc, lib, bin, opt_flag, c_path
+                "set \"INCLUDE={}\"\r\nset \"LIB={}\"\r\nset \"PATH={};%PATH%\"\r\ncl.exe /nologo /W0 /std:c11 {} \"{}\" /Fe\"{}\" 1>&2\r\n",
+                inc, lib, bin, opt_flag, c_path, exe_path
             );
             std::fs::write(&bat_path, &bat_content).map_err(|e| {
                 eprintln!("Failed to write build script: {}", e);
