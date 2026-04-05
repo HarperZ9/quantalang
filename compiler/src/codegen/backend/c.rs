@@ -1350,6 +1350,9 @@ impl CBackend {
                     _ => func_str,
                 };
 
+                // Future: type-dispatch for map builtins (i32 vs str→f64) based on
+                // argument types. Currently map_get/map_insert default to str→f64.
+
                 // println/print (without !) → printf with QuantaString handling
                 if matches!(func_str.as_str(), "println" | "print" | "eprintln" | "eprint") {
                     let is_err = matches!(func_str.as_str(), "eprintln" | "eprint");
