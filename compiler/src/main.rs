@@ -174,6 +174,12 @@ enum Commands {
         no_fail_fast: bool,
     },
 
+    /// Lint QuantaLang source files
+    Lint {
+        /// Input file to lint
+        file: PathBuf,
+    },
+
     /// Print version information
     Version,
 }
@@ -227,6 +233,7 @@ fn main() -> ExitCode {
         Some(Commands::Watch { path, target }) => cmd_watch(&path, &target),
         Some(Commands::Fmt { file, check, write }) => cmd_fmt(&file, check, write),
         Some(Commands::Pkg { command }) => cmd_pkg(command),
+        Some(Commands::Lint { file }) => cmd_lint(&file),
         Some(Commands::Test {
             directory,
             filter,
@@ -1804,6 +1811,125 @@ fn cmd_test(
     );
 
     if failed > 0 || errors > 0 {
+        Err(1)
+    } else {
+        Ok(())
+    }
+}
+
+fn cmd_lint(file: &PathBuf) -> Result<(), i32> {
+    let source = std::fs::read_to_string(file).map_err(|e| {
+        eprintln!("Error reading file '{}': {}", file.display(), e);
+        1
+    })?;
+
+    let source = resolve_imports(&source, file)?;
+    let base = file.parent().unwrap_or(Path::new("."));
+    let source = preprocess_includes(&source, base)?;
+
+    let source_file = SourceFile::new(file.to_string_lossy(), source.clone());
+
+    // Lex
+    let mut lexer = Lexer::new(&source_file);
+    let tokens = lexer.tokenize().map_err(|e| {
+        eprintln!("Lexer error: {}", e);
+        1
+    })?;
+
+    // Parse
+    let mut parser = Parser::new(&source_file, tokens);
+    let mut ast = parser.parse().map_err(|e| {
+        eprintln!("Parse error: {}", e);
+        1
+    })?;
+
+    resolve_modules(&mut ast, base)?;
+
+    // Type check
+    let mut ctx = TypeContext::new();
+    let mut checker = TypeChecker::new(&mut ctx);
+    checker.set_source_dir(base.to_path_buf());
+    checker.check_module(&ast);
+
+    let mut warnings = 0u32;
+    let mut errors = 0u32;
+
+    // Report type errors
+    for err in checker.errors() {
+        let span = err.span;
+        let pos = source_file.lookup_position(span.start);
+        eprintln!(
+            "\x1b[31merror\x1b[0m: {} ({}:{}:{})",
+            err, file.display(), pos.line, pos.column
+        );
+        errors += 1;
+    }
+
+    // Report parse errors
+    for err in parser.errors() {
+        eprintln!("\x1b[31merror\x1b[0m: {} ({})", err, file.display());
+        errors += 1;
+    }
+
+    // Lint checks: style warnings
+    for (line_num, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        let line_num = line_num + 1;
+
+        // Trailing whitespace
+        if line.len() > trimmed.len() + (line.len() - line.trim_end().len())
+            && line.trim_end().len() < line.len()
+        {
+            eprintln!(
+                "\x1b[33mwarning\x1b[0m: trailing whitespace ({}:{})",
+                file.display(),
+                line_num
+            );
+            warnings += 1;
+        }
+
+        // TODO/FIXME markers
+        if trimmed.contains("TODO") || trimmed.contains("FIXME") || trimmed.contains("HACK") {
+            eprintln!(
+                "\x1b[33mwarning\x1b[0m: {} ({}:{})",
+                if trimmed.contains("TODO") {
+                    "TODO marker"
+                } else if trimmed.contains("FIXME") {
+                    "FIXME marker"
+                } else {
+                    "HACK marker"
+                },
+                file.display(),
+                line_num
+            );
+            warnings += 1;
+        }
+
+        // Lines > 120 chars
+        if line.len() > 120 {
+            eprintln!(
+                "\x1b[33mwarning\x1b[0m: line exceeds 120 characters ({} chars) ({}:{})",
+                line.len(),
+                file.display(),
+                line_num
+            );
+            warnings += 1;
+        }
+    }
+
+    // Summary
+    if errors == 0 && warnings == 0 {
+        println!("No issues found in '{}'", file.display());
+    } else {
+        println!(
+            "{} error(s), {} warning(s) in '{}'",
+            errors,
+            warnings,
+            file.display()
+        );
+    }
+
+    if errors > 0 {
         Err(1)
     } else {
         Ok(())
