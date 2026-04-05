@@ -2359,8 +2359,41 @@ fn resolve_modules_with_prefix(
         }
     }
 
+    // Build a map of all imported function names: bare_name → prefixed_name
+    let mut imported_fns: HashMap<String, String> = HashMap::new();
+    for item in &new_items {
+        if let ItemKind::Function(f) = &item.kind {
+            let prefixed = f.name.name.to_string();
+            // Extract the bare name by stripping the module prefix
+            // e.g., "core_i32_min" → "i32_min", "math_lerp_f64" → "lerp_f64"
+            for mod_name in &mod_names {
+                let module_prefix = if prefix.is_empty() {
+                    mod_name.clone()
+                } else {
+                    format!("{}_{}", prefix, mod_name)
+                };
+                let prefix_with_sep = format!("{}_", module_prefix);
+                if let Some(bare) = prefixed.strip_prefix(&prefix_with_sep) {
+                    imported_fns.insert(bare.to_string(), prefixed.clone());
+                }
+            }
+        }
+    }
+
     // Append module items to the main AST
     ast.items.extend(new_items);
+
+    // Rewrite calls in the main program's existing functions to use prefixed names
+    if !imported_fns.is_empty() {
+        for item in &mut ast.items {
+            if let ItemKind::Function(f) = &mut item.kind {
+                if let Some(ref mut body) = f.body {
+                    rewrite_imported_calls(body, &imported_fns);
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2418,6 +2451,69 @@ fn rewrite_expr_node(expr: &mut ast::Expr, mod_defined: &HashSet<String>, prefix
         }
         ast::ExprKind::Return(Some(ref mut inner)) => {
             rewrite_expr_node(inner, mod_defined, prefix);
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite bare function calls in the main program to use module-prefixed names.
+/// E.g., `i32_min(a, b)` → `core_i32_min(a, b)` when `core.quanta` defines `i32_min`.
+fn rewrite_imported_calls(body: &mut ast::Block, imported: &HashMap<String, String>) {
+    for stmt in &mut body.stmts {
+        match &mut stmt.kind {
+            ast::StmtKind::Expr(expr) | ast::StmtKind::Semi(expr) => {
+                rewrite_imported_expr(expr, imported);
+            }
+            ast::StmtKind::Local(local) => {
+                if let Some(ref mut init) = local.init {
+                    rewrite_imported_expr(&mut init.expr, imported);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn rewrite_imported_expr(expr: &mut ast::Expr, imported: &HashMap<String, String>) {
+    match &mut expr.kind {
+        ast::ExprKind::Call { func, args } => {
+            if let ast::ExprKind::Ident(ref mut ident) = func.kind {
+                if let Some(prefixed) = imported.get(ident.name.as_ref()) {
+                    ident.name = Arc::from(prefixed.as_str());
+                }
+            }
+            rewrite_imported_expr(func, imported);
+            for arg in args {
+                rewrite_imported_expr(arg, imported);
+            }
+        }
+        ast::ExprKind::Binary { left, right, .. } => {
+            rewrite_imported_expr(left, imported);
+            rewrite_imported_expr(right, imported);
+        }
+        ast::ExprKind::Unary { expr: inner, .. } => {
+            rewrite_imported_expr(inner, imported);
+        }
+        ast::ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            rewrite_imported_expr(condition, imported);
+            rewrite_imported_calls(then_branch, imported);
+            if let Some(ref mut eb) = else_branch {
+                rewrite_imported_expr(eb, imported);
+            }
+        }
+        ast::ExprKind::Block(block) => {
+            rewrite_imported_calls(block, imported);
+        }
+        ast::ExprKind::Return(Some(ref mut inner)) => {
+            rewrite_imported_expr(inner, imported);
+        }
+        ast::ExprKind::Assign { value, .. } => {
+            rewrite_imported_expr(value, imported);
         }
         _ => {}
     }
