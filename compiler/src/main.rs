@@ -155,6 +155,25 @@ enum Commands {
         command: PkgCommands,
     },
 
+    /// Run tests — compile .quanta programs and verify output against .expected files
+    Test {
+        /// Directory containing test programs [default: tests/programs]
+        #[arg(default_value = "tests/programs")]
+        directory: PathBuf,
+
+        /// Only run tests matching this substring
+        #[arg(short, long)]
+        filter: Option<String>,
+
+        /// Show output for passing tests
+        #[arg(long)]
+        verbose: bool,
+
+        /// Don't stop on first failure
+        #[arg(long)]
+        no_fail_fast: bool,
+    },
+
     /// Print version information
     Version,
 }
@@ -208,6 +227,12 @@ fn main() -> ExitCode {
         Some(Commands::Watch { path, target }) => cmd_watch(&path, &target),
         Some(Commands::Fmt { file, check, write }) => cmd_fmt(&file, check, write),
         Some(Commands::Pkg { command }) => cmd_pkg(command),
+        Some(Commands::Test {
+            directory,
+            filter,
+            verbose,
+            no_fail_fast,
+        }) => cmd_test(&directory, filter.as_deref(), verbose, no_fail_fast),
         Some(Commands::Version) => {
             print_version();
             Ok(())
@@ -1148,8 +1173,9 @@ fn cmd_build(
     }
     println!("[3/{}] Type checking... OK", total_steps);
 
-    // Code generation
-    let mut codegen = CodeGenerator::new(&ctx, target);
+    // Code generation — pass source for macro string extraction
+    let mut codegen =
+        CodeGenerator::with_source(&ctx, target, Arc::from(source_file.source()));
     let output = codegen.generate(&ast).map_err(|e| {
         eprintln!("Code generation error: {}", e);
         1
@@ -1499,8 +1525,9 @@ fn cmd_run(file: &PathBuf, args: &[String]) -> Result<(), i32> {
         return Err(1);
     }
 
-    // Generate C code
-    let mut codegen = CodeGenerator::new(&ctx, Target::C);
+    // Generate C code — pass source for macro string extraction
+    let mut codegen =
+        CodeGenerator::with_source(&ctx, Target::C, Arc::from(source_file.source()));
     let output = codegen.generate(&ast).map_err(|e| {
         eprintln!("Code generation error: {}", e);
         1
@@ -1575,6 +1602,207 @@ fn cmd_run(file: &PathBuf, args: &[String]) -> Result<(), i32> {
         Ok(())
     } else {
         Err(status.code().unwrap_or(1))
+    }
+}
+
+fn cmd_test(
+    directory: &PathBuf,
+    filter: Option<&str>,
+    verbose: bool,
+    no_fail_fast: bool,
+) -> Result<(), i32> {
+    // Discover .quanta test files
+    let entries: Vec<_> = match std::fs::read_dir(directory) {
+        Ok(dir) => dir
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "quanta")
+                    .unwrap_or(false)
+            })
+            .collect(),
+        Err(e) => {
+            eprintln!("Error reading test directory '{}': {}", directory.display(), e);
+            return Err(1);
+        }
+    };
+
+    let mut tests: Vec<PathBuf> = entries.iter().map(|e| e.path()).collect();
+    tests.sort();
+
+    // Apply filter
+    if let Some(pattern) = filter {
+        tests.retain(|t| {
+            t.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.contains(pattern))
+                .unwrap_or(false)
+        });
+    }
+
+    // Only include tests that have .expected files
+    let test_pairs: Vec<(PathBuf, PathBuf)> = tests
+        .iter()
+        .filter_map(|quanta_file| {
+            let expected = quanta_file.with_extension("expected");
+            if expected.exists() {
+                Some((quanta_file.clone(), expected))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let total = test_pairs.len();
+    let skipped = tests.len() - total;
+    if total == 0 {
+        println!("No tests found with .expected files in '{}'", directory.display());
+        return Ok(());
+    }
+
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut errors = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    println!("running {} tests\n", total);
+
+    for (quanta_file, expected_file) in &test_pairs {
+        let name = quanta_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("???");
+
+        // --- Compile and capture output ---
+        let result = (|| -> Result<String, String> {
+            let source = std::fs::read_to_string(quanta_file)
+                .map_err(|e| format!("read: {}", e))?;
+            let source = resolve_imports(&source, quanta_file).map_err(|_| "import".to_string())?;
+            let run_base = quanta_file.parent().unwrap_or(Path::new("."));
+            let source =
+                preprocess_includes(&source, run_base).map_err(|_| "include".to_string())?;
+
+            let source_file = SourceFile::new(quanta_file.to_string_lossy(), source);
+            let mut lexer = Lexer::new(&source_file);
+            let tokens = lexer.tokenize().map_err(|e| format!("lex: {}", e))?;
+            let mut parser = Parser::new(&source_file, tokens);
+            let mut ast = parser.parse().map_err(|e| format!("parse: {}", e))?;
+
+            let source_dir = quanta_file.parent().unwrap_or(Path::new("."));
+            let _ = resolve_modules(&mut ast, source_dir);
+
+            let mut ctx = TypeContext::new();
+            let mut checker = TypeChecker::new(&mut ctx);
+            checker.set_source_dir(source_dir.to_path_buf());
+            checker.check_module(&ast);
+            if checker.has_errors() {
+                let errs: Vec<_> = checker.errors().iter().map(|e| e.to_string()).collect();
+                return Err(format!("type: {}", errs.join("; ")));
+            }
+
+            let mut codegen = CodeGenerator::with_source(
+                &ctx,
+                Target::C,
+                Arc::from(source_file.source()),
+            );
+            let output = codegen.generate(&ast).map_err(|e| format!("codegen: {}", e))?;
+
+            // Use a unique temp directory per test to avoid MSVC bat conflicts
+            let test_dir = std::env::temp_dir().join(format!("quantatest_{}", name));
+            let _ = std::fs::create_dir_all(&test_dir);
+            let c_file = test_dir.join("main.c");
+            let exe_file = test_dir.join(if cfg!(windows) { "main.exe" } else { "main" });
+
+            std::fs::write(&c_file, &output.data).map_err(|e| format!("write: {}", e))?;
+
+            let compiler = find_c_compiler().ok_or_else(|| "no C compiler".to_string())?;
+            invoke_c_compiler(&compiler, &c_file, &exe_file, false)
+                .map_err(|_| "cc".to_string())?;
+
+            // MSVC bat outputs temp.exe in the c_file directory
+            if !exe_file.exists() {
+                let alt = test_dir.join("temp.exe");
+                if alt.exists() {
+                    let _ = std::fs::rename(&alt, &exe_file);
+                }
+            }
+            if !exe_file.exists() {
+                return Err("exe not created (link failed)".to_string());
+            }
+
+            let run_output = std::process::Command::new(&exe_file)
+                .output()
+                .map_err(|e| format!("run: {}", e))?;
+
+            let _ = std::fs::remove_dir_all(&test_dir);
+
+            let stdout =
+                String::from_utf8_lossy(&run_output.stdout).replace("\r\n", "\n");
+            Ok(stdout)
+        })();
+
+        match result {
+            Ok(actual) => {
+                let expected = std::fs::read_to_string(expected_file)
+                    .unwrap_or_default()
+                    .replace("\r\n", "\n");
+
+                if actual.trim_end() == expected.trim_end() {
+                    passed += 1;
+                    println!("test {} ... \x1b[32mok\x1b[0m", name);
+                    if verbose {
+                        for line in actual.lines() {
+                            println!("  {}", line);
+                        }
+                    }
+                } else {
+                    failed += 1;
+                    println!("test {} ... \x1b[31mFAILED\x1b[0m", name);
+                    failures.push(format!(
+                        "---- {} ----\nexpected:\n{}\nactual:\n{}\n",
+                        name,
+                        expected.trim_end(),
+                        actual.trim_end()
+                    ));
+                    if !no_fail_fast {
+                        break;
+                    }
+                }
+            }
+            Err(stage) => {
+                errors += 1;
+                println!("test {} ... \x1b[33mERROR\x1b[0m ({})", name, stage);
+                if !no_fail_fast {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Summary
+    println!();
+    if !failures.is_empty() {
+        println!("failures:\n");
+        for f in &failures {
+            println!("{}", f);
+        }
+    }
+
+    let status = if failed == 0 && errors == 0 {
+        "\x1b[32mok\x1b[0m"
+    } else {
+        "\x1b[31mFAILED\x1b[0m"
+    };
+    println!(
+        "test result: {}. {} passed; {} failed; {} errors; {} skipped\n",
+        status, passed, failed, errors, skipped
+    );
+
+    if failed > 0 || errors > 0 {
+        Err(1)
+    } else {
+        Ok(())
     }
 }
 
