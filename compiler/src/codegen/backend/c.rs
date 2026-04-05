@@ -821,11 +821,19 @@ impl CBackend {
             self.output.push_str("quanta_args_init(argc, argv);\n");
         }
 
-        // Generate local declarations
+        // Dead local elimination: collect all referenced local IDs from the
+        // function body. Only declare locals that are actually used.
+        let used_locals = Self::collect_used_locals(func);
+
+        // Generate local declarations (skip dead locals)
         for local in &func.locals {
             if !local.is_param {
                 // Skip void-typed locals -- C does not allow `void x;`
                 if matches!(local.ty, MirType::Void) {
+                    continue;
+                }
+                // Skip locals that are never referenced in the function body
+                if !used_locals.contains(&local.id) {
                     continue;
                 }
                 self.write_indent();
@@ -2192,6 +2200,119 @@ impl CBackend {
 
     /// produced by the lowerer for builtin operations and should pass through
     /// to C unchanged.
+    /// Collect all LocalId values that are referenced in the function body.
+    /// Used for dead local elimination — locals not in this set can be skipped.
+    fn collect_used_locals(func: &MirFunction) -> std::collections::HashSet<LocalId> {
+        use crate::codegen::ir::*;
+        let mut used = std::collections::HashSet::new();
+
+        let blocks = match &func.blocks {
+            Some(blocks) => blocks,
+            None => return used,
+        };
+
+        fn collect_val(val: &MirValue, used: &mut std::collections::HashSet<LocalId>) {
+            if let MirValue::Local(id) = val {
+                used.insert(*id);
+            }
+        }
+        fn collect_place(place: &MirPlace, used: &mut std::collections::HashSet<LocalId>) {
+            used.insert(place.local);
+        }
+
+        for block in blocks {
+            for stmt in &block.stmts {
+                match &stmt.kind {
+                    MirStmtKind::Assign { dest, value } => {
+                        used.insert(*dest);
+                        match value {
+                            MirRValue::Use(v) => collect_val(v, &mut used),
+                            MirRValue::BinaryOp { left, right, .. } => {
+                                collect_val(left, &mut used);
+                                collect_val(right, &mut used);
+                            }
+                            MirRValue::UnaryOp { operand, .. } => {
+                                collect_val(operand, &mut used);
+                            }
+                            MirRValue::Ref { place, .. }
+                            | MirRValue::AddressOf { place, .. } => {
+                                collect_place(place, &mut used);
+                            }
+                            MirRValue::Cast { value, .. } => collect_val(value, &mut used),
+                            MirRValue::Aggregate { operands, .. } => {
+                                for op in operands {
+                                    collect_val(op, &mut used);
+                                }
+                            }
+                            MirRValue::FieldAccess { base, .. }
+                            | MirRValue::VariantField { base, .. } => {
+                                collect_val(base, &mut used);
+                            }
+                            MirRValue::IndexAccess { base, index, .. } => {
+                                collect_val(base, &mut used);
+                                collect_val(index, &mut used);
+                            }
+                            MirRValue::Repeat { value, .. } => collect_val(value, &mut used),
+                            MirRValue::Discriminant(p) | MirRValue::Len(p) => {
+                                collect_place(p, &mut used);
+                            }
+                            MirRValue::TextureSample {
+                                texture,
+                                sampler,
+                                coords,
+                            } => {
+                                collect_val(texture, &mut used);
+                                collect_val(sampler, &mut used);
+                                collect_val(coords, &mut used);
+                            }
+                            _ => {}
+                        }
+                    }
+                    MirStmtKind::DerefAssign { ptr, value } => {
+                        used.insert(*ptr);
+                        match value {
+                            MirRValue::Use(v) => collect_val(v, &mut used),
+                            _ => {}
+                        }
+                    }
+                    MirStmtKind::StorageLive(id) | MirStmtKind::StorageDead(id) => {
+                        used.insert(*id);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(ref term) = block.terminator {
+                match term {
+                    MirTerminator::Return(v) => {
+                        if let Some(v) = v {
+                            collect_val(v, &mut used);
+                        }
+                    }
+                    MirTerminator::If { cond, .. } => collect_val(cond, &mut used),
+                    MirTerminator::Switch { value, .. } => collect_val(value, &mut used),
+                    MirTerminator::Call {
+                        func: f,
+                        args,
+                        dest,
+                        ..
+                    } => {
+                        collect_val(f, &mut used);
+                        for a in args {
+                            collect_val(a, &mut used);
+                        }
+                        if let Some(d) = dest {
+                            used.insert(*d);
+                        }
+                    }
+                    MirTerminator::Assert { cond, .. } => collect_val(cond, &mut used),
+                    _ => {}
+                }
+            }
+        }
+
+        used
+    }
+
     fn is_runtime_or_builtin_fn(name: &str) -> bool {
         // Runtime helpers all start with "quanta_"
         if name.starts_with("quanta_") {
