@@ -917,10 +917,12 @@ impl CBackend {
         self.indent -= 1;
         self.output.push_str("}\n\n");
 
-        // Post-process: eliminate trivial goto→label pairs.
-        // Pattern: `    goto bbN;\nbbN:\n` → just the label (or nothing if label
-        // is also unreferenced). This cleans up MIR block boundaries in the C output.
+        // Post-process optimizations on generated C output:
+        // 1. Trivial goto elimination: remove goto→label pairs for sequential blocks
+        // 2. Copy propagation: inline single-use temporaries
         self.eliminate_trivial_gotos();
+        // Copy propagation: disabled pending investigation of 114_iterators/57_try_operator
+        // self.propagate_copies();
 
         Ok(())
     }
@@ -974,6 +976,158 @@ impl CBackend {
             self.output.push('\n');
             i += 1;
         }
+    }
+
+    /// Copy propagation: inline single-use temporaries.
+    /// When `_N = expr;` appears and `_N` is used exactly once on the next line
+    /// as a simple value (not an lvalue), replace the use with expr and remove
+    /// the assignment.
+    ///
+    /// `_1 = add(3, 4);  result = _1;` → `result = add(3, 4);`
+    /// `_3 = __str0;  printf(_3, x);` → `printf(__str0, x);`
+    fn propagate_copies(&mut self) {
+        // Run multiple passes until no more changes (cascading copies)
+        for _ in 0..3 {
+            if !self.propagate_copies_pass() {
+                break;
+            }
+        }
+    }
+
+    fn propagate_copies_pass(&mut self) -> bool {
+        let old = std::mem::take(&mut self.output);
+        let lines: Vec<&str> = old.lines().collect();
+        let mut result = Vec::with_capacity(lines.len());
+        let mut changed = false;
+        let mut skip_next = false;
+
+        for i in 0..lines.len() {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+
+            let trimmed = lines[i].trim();
+
+            // Match pattern: `_N = expr;` where _N is a MIR temporary
+            if let Some((temp_name, expr)) = Self::parse_temp_assign(trimmed) {
+                // Check if the temp is used exactly once in the NEXT line
+                if i + 1 < lines.len() {
+                    let next = lines[i + 1];
+                    let next_trimmed = next.trim();
+                    let occurrences = Self::count_ident_occurrences(next_trimmed, &temp_name);
+
+                    // Inline if: used exactly once on next line, not as lvalue,
+                    // and expr is safe to inline (no side effects when reordered)
+                    if occurrences == 1 && Self::is_safe_to_inline(&expr) {
+                        let inlined = Self::replace_ident(next, &temp_name, &expr);
+                        result.push(inlined);
+                        skip_next = true;
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+
+            result.push(lines[i].to_string());
+        }
+
+        self.output = result.join("\n");
+        if !self.output.is_empty() {
+            self.output.push('\n');
+        }
+        changed
+    }
+
+    /// Parse `_N = expr;` or `name = expr;` for MIR temporaries.
+    /// Returns (temp_name, expr) if the line is a simple assignment to a temp.
+    fn parse_temp_assign(line: &str) -> Option<(String, String)> {
+        // Must start with _ and a digit (MIR temporary like _1, _23)
+        let parts: Vec<&str> = line.splitn(2, " = ").collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let name = parts[0].trim();
+        let expr = parts[1].trim().strip_suffix(';')?.trim();
+
+        // Only inline MIR temporaries (_N), not user-named variables
+        if !name.starts_with('_') || name.len() < 2 {
+            return None;
+        }
+        if !name[1..].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            return None;
+        }
+
+        Some((name.to_string(), expr.to_string()))
+    }
+
+    /// Count occurrences of an identifier in a line (whole-word match).
+    fn count_ident_occurrences(line: &str, ident: &str) -> usize {
+        let mut count = 0;
+        let ident_bytes = ident.as_bytes();
+        let line_bytes = line.as_bytes();
+        let ilen = ident_bytes.len();
+
+        for pos in 0..line_bytes.len() {
+            if pos + ilen > line_bytes.len() {
+                break;
+            }
+            if &line_bytes[pos..pos + ilen] == ident_bytes {
+                // Check word boundary before
+                let before_ok = pos == 0
+                    || !line_bytes[pos - 1].is_ascii_alphanumeric()
+                        && line_bytes[pos - 1] != b'_';
+                // Check word boundary after
+                let after_ok = pos + ilen >= line_bytes.len()
+                    || !line_bytes[pos + ilen].is_ascii_alphanumeric()
+                        && line_bytes[pos + ilen] != b'_';
+                if before_ok && after_ok {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Check if an expression is safe to inline. Only inline trivial values:
+    /// variables, constants, string literals, and field access. NOT expressions
+    /// with operators or function calls.
+    fn is_safe_to_inline(expr: &str) -> bool {
+        // Only inline: identifiers, __strN, numeric literals, field access (x.y)
+        // Reject: function calls, operators, casts, complex expressions
+        if expr.contains('(') || expr.contains('+') || expr.contains('-')
+            || expr.contains('*') || expr.contains('/') || expr.contains('?')
+            || expr.contains('{') || expr.contains('[')
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Replace an identifier with an expression, respecting word boundaries.
+    fn replace_ident(line: &str, ident: &str, replacement: &str) -> String {
+        let mut result = String::with_capacity(line.len() + replacement.len());
+        let bytes = line.as_bytes();
+        let ident_bytes = ident.as_bytes();
+        let ilen = ident_bytes.len();
+        let mut pos = 0;
+
+        while pos < bytes.len() {
+            if pos + ilen <= bytes.len() && &bytes[pos..pos + ilen] == ident_bytes {
+                let before_ok = pos == 0
+                    || (!bytes[pos - 1].is_ascii_alphanumeric() && bytes[pos - 1] != b'_');
+                let after_ok = pos + ilen >= bytes.len()
+                    || (!bytes[pos + ilen].is_ascii_alphanumeric() && bytes[pos + ilen] != b'_');
+                if before_ok && after_ok {
+                    result.push_str(replacement);
+                    pos += ilen;
+                    continue;
+                }
+            }
+            result.push(bytes[pos] as char);
+            pos += 1;
+        }
+        result
     }
 
     fn generate_function_signature(&mut self, func: &MirFunction) -> CodegenResult<()> {
