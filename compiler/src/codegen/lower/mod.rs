@@ -95,6 +95,11 @@ pub struct MirLowerer<'ctx> {
     /// Set from let binding type annotations before lowering init expressions.
     /// Used by resolve_call_return_type to override the i32 fallback.
     pub(crate) expected_type: Option<MirType>,
+    /// Tracks the inner type T for locals holding runtime Option<T> values.
+    /// Populated from let-binding type annotations (`let x: Option<HashMap<K,V>> = ...`)
+    /// and from Some(value) construction. Used by lower_runtime_option_match
+    /// to bind pattern variables with the correct type instead of i32.
+    pub(crate) option_inner_types: HashMap<LocalId, MirType>,
 }
 
 // =============================================================================
@@ -161,6 +166,7 @@ impl<'ctx> MirLowerer<'ctx> {
             type_module_map: HashMap::new(),
             tuple_type_defs: HashSet::new(),
             expected_type: None,
+            option_inner_types: HashMap::new(),
         }
     }
 
@@ -192,6 +198,7 @@ impl<'ctx> MirLowerer<'ctx> {
             type_module_map: HashMap::new(),
             tuple_type_defs: HashSet::new(),
             expected_type: None,
+            option_inner_types: HashMap::new(),
         }
     }
 

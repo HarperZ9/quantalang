@@ -195,6 +195,33 @@ impl<'ctx> MirLowerer<'ctx> {
             val
         });
 
+        // Track Option<T> inner type from AST type annotation BEFORE borrowing builder.
+        // When the user writes `let x: Option<HashMap<K,V>> = ...`,
+        // extract the inner type so pattern matching can bind correctly.
+        let option_inner = if let Some(ref ast_ty) = local.ty {
+            if let ast::TypeKind::Path(ref path) = ast_ty.kind {
+                let is_option = path
+                    .last_ident()
+                    .map(|i| i.name.as_ref() == "Option")
+                    .unwrap_or(false);
+                if is_option {
+                    path.last_generics().and_then(|args| {
+                        if let Some(ast::GenericArg::Type(ref inner_ast_ty)) = args.first() {
+                            Some(self.lower_type_from_ast(inner_ast_ty))
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Now borrow current_fn and use it
         let builder = self
             .current_fn
@@ -205,6 +232,11 @@ impl<'ctx> MirLowerer<'ctx> {
         if let ast::PatternKind::Ident { name, .. } = &local.pattern.kind {
             let local_id = builder.create_named_local(name.name.clone(), ty.clone());
             self.var_map.insert(name.name.clone(), local_id);
+
+            // Record the Option inner type if extracted from annotation
+            if let Some(inner_ty) = option_inner {
+                self.option_inner_types.insert(local_id, inner_ty);
+            }
 
             // Initialize if there's an init expression
             if let Some(ref val) = init_val {
@@ -264,12 +296,21 @@ impl<'ctx> MirLowerer<'ctx> {
                 let scrut_ty = self.type_of_value(&scrut_val);
 
                 // Bind inner pattern variable (Some(x) → bind x)
+                // Use tracked Option inner type when available.
+                let if_let_binding_ty = if let MirValue::Local(id) = &scrut_val {
+                    self.option_inner_types
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| scrut_ty.clone())
+                } else {
+                    scrut_ty.clone()
+                };
                 if let ast::PatternKind::TupleStruct { patterns, .. } = &pattern.kind {
                     for pat in patterns.iter() {
                         if let ast::PatternKind::Ident { name, .. } = &pat.kind {
                             let builder = self.current_fn.as_mut()
                                 .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
-                            let local = builder.create_named_local(name.name.clone(), scrut_ty.clone());
+                            let local = builder.create_named_local(name.name.clone(), if_let_binding_ty.clone());
                             builder.assign(local, MirRValue::Use(scrut_val.clone()));
                             self.var_map.insert(name.name.clone(), local);
                         }
@@ -2859,7 +2900,12 @@ impl<'ctx> MirLowerer<'ctx> {
                         if let ast::PatternKind::Ident { name, .. } = &pat.kind {
                             let builder = self.current_fn.as_mut().unwrap();
                             let inner_ty = if is_real_option {
-                                MirType::i32() // Option.value union stores as i64/f64/ptr — use i32 for now
+                                // Look up tracked inner type from let-binding annotation.
+                                // Falls back to i32 when no annotation is available.
+                                self.option_inner_types
+                                    .get(&scrut_local)
+                                    .cloned()
+                                    .unwrap_or_else(MirType::i32)
                             } else {
                                 scrutinee_ty.clone() // i32 fallback — same type as scrutinee
                             };
@@ -3118,15 +3164,20 @@ impl<'ctx> MirLowerer<'ctx> {
                     self.var_map.insert(name.name.clone(), local);
                 } else if let ast::PatternKind::TupleStruct { patterns, .. } = &arm.pattern.kind {
                     // Bind inner pattern variables from TupleStruct patterns
-                    // like Some(x), Ok(val), etc.  Use the scrutinee type for
-                    // the inner binding — it won't be semantically correct but
-                    // ensures the variable is declared in the C output.
+                    // like Some(x), Ok(val), etc. Use tracked inner type if the
+                    // scrutinee is a runtime Option with a known inner type;
+                    // otherwise fall back to the scrutinee type.
+                    let binding_ty = self
+                        .option_inner_types
+                        .get(&scrutinee_local)
+                        .cloned()
+                        .unwrap_or_else(|| scrutinee_ty.clone());
                     for pat in patterns.iter() {
                         if let ast::PatternKind::Ident { name, .. } = &pat.kind {
                             let builder = self.current_fn.as_mut().unwrap();
                             let local = builder.create_named_local(
                                 name.name.clone(),
-                                scrutinee_ty.clone(),
+                                binding_ty.clone(),
                             );
                             builder.assign(
                                 local,
