@@ -4564,6 +4564,15 @@ impl<'ctx> TypeInfer<'ctx> {
                 .map(|op| op.name.as_ref().to_string())
                 .collect();
 
+            // Snapshot each operation's declared parameter types (owned) so the
+            // `&self.effect_ctx` borrow is released before the loop below, which
+            // calls `&mut self` methods (push_scope, bind_pattern, infer_expr).
+            let op_param_tys: Vec<(String, Vec<Ty>)> = effect_def
+                .operations
+                .iter()
+                .map(|op| (op.name.as_ref().to_string(), op.params.clone()))
+                .collect();
+
             // Collect which operations the handlers cover
             let mut handled_ops: Vec<String> = Vec::new();
 
@@ -4583,8 +4592,31 @@ impl<'ctx> TypeInfer<'ctx> {
                     handled_ops.push(handler_op.to_string());
                 }
 
+                // Bind the arm's parameters -- the operation's arguments -- into a
+                // fresh scope before inferring the body. Each param takes the
+                // declared type of the matching operation parameter, so a param
+                // used in a real expression (a call argument, arithmetic) resolves.
+                // Without this the body sees the arm params as undefined; a bare
+                // println! masked the gap because its args bypass name resolution.
+                let op_params: &[Ty] = op_param_tys
+                    .iter()
+                    .find(|(name, _)| name == handler_op)
+                    .map(|(_, tys)| tys.as_slice())
+                    .unwrap_or(&[]);
+                self.push_scope(ScopeKind::Function);
+                for (i, p) in handler.params.iter().enumerate() {
+                    let ty = if let Some(ty_ast) = &p.ty {
+                        self.lower_type(ty_ast)
+                    } else if let Some(t) = op_params.get(i) {
+                        t.clone()
+                    } else {
+                        Ty::fresh_var()
+                    };
+                    self.bind_pattern(&p.pattern, &ty);
+                }
                 // Infer the handler body type
                 let _ = self.infer_expr(&handler.body);
+                self.pop_scope();
             }
 
             // Check for missing handler clauses: all operations must be handled
@@ -4614,7 +4646,20 @@ impl<'ctx> TypeInfer<'ctx> {
             ));
             self.errors.push(err_with_span);
             for handler in handlers {
+                // Even for an unknown effect, bind the arm params (from their
+                // annotations, else fresh vars) so the body's references resolve
+                // instead of cascading "undefined variable" onto the real error.
+                self.push_scope(ScopeKind::Function);
+                for p in &handler.params {
+                    let ty = if let Some(ty_ast) = &p.ty {
+                        self.lower_type(ty_ast)
+                    } else {
+                        Ty::fresh_var()
+                    };
+                    self.bind_pattern(&p.pattern, &ty);
+                }
                 let _ = self.infer_expr(&handler.body);
+                self.pop_scope();
             }
         }
 

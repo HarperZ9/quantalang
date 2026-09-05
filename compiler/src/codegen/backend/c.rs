@@ -2656,9 +2656,19 @@ impl CBackend {
                     base, field_name, ..
                 } = value
                 {
-                    // Special case: loading from handler_data needs cast+deref
-                    // handler_data is a void* that holds a pointer to the perform argument
-                    if field_name.as_ref() == "handler_data" {
+                    // Special case: loading from handler_data needs cast+deref.
+                    // handler_data holds a `void*[N]` argv array; slot `i` points
+                    // to the perform argument for parameter `i`. The field marker
+                    // is `handler_data#<i>` (plain `handler_data` means index 0).
+                    let hd_index = if field_name.as_ref() == "handler_data" {
+                        Some(0usize)
+                    } else {
+                        field_name
+                            .as_ref()
+                            .strip_prefix("handler_data#")
+                            .and_then(|s| s.parse::<usize>().ok())
+                    };
+                    if let Some(idx) = hd_index {
                         let base_str = self.value_to_c(base, locals);
                         let dest_type = locals
                             .get(dest.0 as usize)
@@ -2667,8 +2677,8 @@ impl CBackend {
                         self.write_indent();
                         write!(
                             self.output,
-                            "{} = *({}*){}.handler_data;\n",
-                            dest_name, dest_type, base_str
+                            "{} = *({}*)((void**){}.handler_data)[{}];\n",
+                            dest_name, dest_type, base_str, idx
                         )
                         .unwrap();
                     } else {

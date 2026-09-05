@@ -757,19 +757,17 @@ impl<'ctx> MirLowerer<'ctx> {
                     let local = builder.create_named_local(name.name.clone(), ty.clone());
                     self.var_map.insert(name.name.clone(), local);
 
-                    // Load the argument from handler_data.
-                    // The perform site stores a pointer to the argument in handler_data.
-                    // We generate a FieldAccess that the C backend renders as:
-                    //   msg = *(ParamType*)__handler_EffectName.handler_data
+                    // Load argument `param_idx` from handler_data.
+                    // The perform site stores a `void*[N]` argv array in
+                    // handler_data, where argv[i] points to argument i. The
+                    // `handler_data#<i>` field marker tells the C backend which
+                    // argument to read; it renders as:
+                    //   msg = *(ParamType*)((void**)__handler_EffectName.handler_data)[i]
                     let handler_data_field = MirRValue::FieldAccess {
                         base: MirValue::Local(handler_local),
-                        field_name: Arc::from("handler_data"),
+                        field_name: Arc::from(format!("handler_data#{}", param_idx)),
                         field_ty: MirType::Ptr(Box::new(MirType::Void)),
                     };
-                    // Store the void* into a temp, then cast and deref.
-                    // Simpler approach: use a special marker that the C backend
-                    // can detect. We'll use FieldAccess with field "handler_data"
-                    // and let the C backend emit the cast+deref.
                     builder.assign(local, handler_data_field);
                 }
             }
@@ -855,15 +853,19 @@ impl<'ctx> MirLowerer<'ctx> {
             h.abs()
         };
 
-        // Lower the first argument (if any) - it becomes the `arg` pointer.
-        let arg_val = if let Some(first) = args.first() {
-            self.lower_expr(first)?
-        } else {
-            MirValue::Const(MirConst::Null(MirType::Void))
-        };
+        // Lower every argument. Each is marshalled into a `void*[N]` argv
+        // array whose i-th slot holds the address of argument i; the handler
+        // reads argument i back via `((void**)handler_data)[i]`. Passing the
+        // whole argv (not just the first arg) is what lets a multi-parameter
+        // operation see all of its arguments. A zero-argument operation passes
+        // a null `arg` pointer, which its handler never dereferences.
+        let arg_vals: Vec<MirValue> = args
+            .iter()
+            .map(|a| self.lower_expr(a))
+            .collect::<CodegenResult<Vec<_>>>()?;
 
-        // Compute the argument type before borrowing current_fn mutably.
-        let arg_ty = self.type_of_value(&arg_val);
+        // Compute each argument's type before borrowing current_fn mutably.
+        let arg_tys: Vec<MirType> = arg_vals.iter().map(|v| self.type_of_value(v)).collect();
 
         let builder = self
             .current_fn
@@ -875,19 +877,34 @@ impl<'ctx> MirLowerer<'ctx> {
         // times with the same effect/operation.
         let result_local = builder.create_local(MirType::i32());
 
-        // Store the argument value into a local so we can take its address.
-        let arg_local = builder.create_local(arg_ty.clone());
-        builder.assign(arg_local, MirRValue::Use(arg_val));
+        // Build the argv array of pointers-to-arguments. Each argument value is
+        // stored into its own local so its address is stable, then written into
+        // `argv[i]`; a `T*` slot value decays to the `void*` element type in C.
+        let n = arg_vals.len();
+        let arg_ptr_value: MirValue = if n == 0 {
+            MirValue::Const(MirConst::Null(MirType::Void))
+        } else {
+            let argv = builder.create_local(MirType::Array(
+                Box::new(MirType::Ptr(Box::new(MirType::Void))),
+                n as u64,
+            ));
+            for (i, (val, ty)) in arg_vals.into_iter().zip(arg_tys.into_iter()).enumerate() {
+                let arg_local = builder.create_local(ty);
+                builder.assign(arg_local, MirRValue::Use(val));
+                builder.push_index_store(
+                    MirValue::Local(argv),
+                    MirValue::Const(MirConst::Int(i as i128, MirType::i32())),
+                    MirType::Ptr(Box::new(MirType::Void)),
+                    MirRValue::AddressOf {
+                        is_mut: false,
+                        place: MirPlace::local(arg_local),
+                    },
+                );
+            }
+            MirValue::Local(argv)
+        };
 
-        // Take address of arg and result for the void* parameters.
-        let arg_ptr = builder.create_local(MirType::Ptr(Box::new(arg_ty)));
-        builder.assign(
-            arg_ptr,
-            MirRValue::AddressOf {
-                is_mut: false,
-                place: MirPlace::local(arg_local),
-            },
-        );
+        // Take the address of the result slot for the void* result parameter.
         let result_ptr = builder.create_local(MirType::Ptr(Box::new(MirType::i32())));
         builder.assign(
             result_ptr,
@@ -897,7 +914,7 @@ impl<'ctx> MirLowerer<'ctx> {
             },
         );
 
-        // build_perform(effect_id, op_id, &arg, &result)
+        // build_perform(effect_id, op_id, argv, &result)
         let perform_fn = MirValue::Function(Arc::from("build_perform"));
         let eid_val = MirValue::Const(MirConst::Int(eid as i128, MirType::i32()));
         let op_val = MirValue::Const(MirConst::Int(op_id as i128, MirType::i32()));
@@ -908,7 +925,7 @@ impl<'ctx> MirLowerer<'ctx> {
             vec![
                 eid_val,
                 op_val,
-                MirValue::Local(arg_ptr),
+                arg_ptr_value,
                 MirValue::Local(result_ptr),
             ],
             None,

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use buildlang::ast::{self, ItemKind, Module, Visibility};
 use buildlang::codegen::{CodeGenerator, Target};
 use buildlang::lexer::{Lexer, SourceFile, Span};
-use buildlang::parser::Parser;
+use buildlang::parser::{ParseError, Parser};
 use buildlang::types::{
     capability_effect_names, FunctionEffectSummary, TypeChecker, TypeContext, TypeError,
     TypeErrorWithSpan,
@@ -6351,6 +6351,56 @@ fn user_link_flags(libs: &[String], is_msvc: bool) -> Vec<String> {
 // BUILD COMMAND
 // =============================================================================
 
+/// Fail closed on recovered parse errors before an artifact is produced.
+///
+/// `Parser::parse` returns `Ok` even when it recovered from errors, so the type
+/// checker can still see the file's valid items. That is right for `check`,
+/// `lint`, and the LSP, but a code-producing path must never emit from a
+/// recovered (truncated) AST: a statement that fails to parse is dropped from
+/// its block, and the code that remains type-checks and compiles to a silently
+/// wrong result. Every artifact path calls this after `parse()` and returns its
+/// `Err` so the failure is located, not silent. Returns `Ok(())` when the
+/// parser recovered nothing (no errors), so a clean parse is unaffected.
+fn report_parse_errors(
+    path: &Path,
+    source_file: &SourceFile,
+    errors: &[ParseError],
+) -> Result<(), i32> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    for err in errors {
+        let line = source_file.lookup_line(err.span.start);
+        let line_start = source_file.line_start(line).unwrap_or(err.span.start);
+        let col = err.span.start.0.saturating_sub(line_start.0) as usize;
+        eprintln!(
+            "error[{}:{}:{}]: {}",
+            path.display(),
+            line + 1,
+            col + 1,
+            err.message()
+        );
+        if let Some(src_line) = source_file.source().lines().nth(line) {
+            eprintln!("  {} | {}", line + 1, src_line);
+            let padding = format!("{}", line + 1).len();
+            let underline_len = (err.span.end.0.saturating_sub(err.span.start.0) as usize).max(1);
+            eprintln!(
+                "  {} | {}{}",
+                " ".repeat(padding),
+                " ".repeat(col),
+                "^".repeat(underline_len.min(src_line.len().saturating_sub(col)))
+            );
+        }
+        if let Some(help) = &err.help {
+            eprintln!("  help: {}", help);
+        }
+        for note in &err.notes {
+            eprintln!("  note: {}", note);
+        }
+    }
+    Err(1)
+}
+
 fn cmd_build(
     path: &PathBuf,
     release: bool,
@@ -6450,6 +6500,7 @@ fn cmd_build(
         }
         1
     })?;
+    report_parse_errors(&main_path, &source_file, parser.errors())?;
     println!(
         "[2/{}] Parsing... OK ({} items)",
         total_steps,
@@ -7052,6 +7103,7 @@ fn compile_program_to_exe(
         }
         1
     })?;
+    report_parse_errors(file, &source_file, parser.errors())?;
 
     // Resolve `mod foo;` declarations - load and merge external module files
     let source_dir = file.parent().unwrap_or(Path::new("."));
@@ -7305,6 +7357,7 @@ fn compile_program_to_rust_exe(file: &Path, rustc_path: &str) -> Result<Compiled
         }
         1
     })?;
+    report_parse_errors(file, &source_file, parser.errors())?;
 
     let source_dir = file.parent().unwrap_or(Path::new("."));
     resolve_modules(&mut ast, source_dir)?;
@@ -8228,6 +8281,12 @@ fn cmd_test(
             let tokens = lexer.tokenize().map_err(|e| format!("lex: {}", e))?;
             let mut parser = Parser::new(&source_file, tokens);
             let mut ast = parser.parse().map_err(|e| format!("parse: {}", e))?;
+            // A recovered (truncated) AST would run tests against dropped code and
+            // could report a false pass, so treat any recovered parse error as a
+            // test error rather than compile the remainder.
+            if !parser.errors().is_empty() {
+                return Err(format!("parse: {} error(s)", parser.errors().len()));
+            }
 
             let source_dir = build_file.parent().unwrap_or(Path::new("."));
             let _ = resolve_modules(&mut ast, source_dir);
@@ -9036,6 +9095,7 @@ fn resolve_modules_with_prefix(
             }
             1
         })?;
+        report_parse_errors(&actual_file, &mod_source_file, mod_parser.errors())?;
 
         // The full prefix for this module's items
         let full_prefix = if prefix.is_empty() {
@@ -9570,6 +9630,8 @@ fn cmd_compile(
         }
         1
     })?;
+
+    report_parse_errors(input, &source_file, parser.errors())?;
 
     // Resolve `mod foo;` declarations - load and merge external module files
     let source_dir = input.parent().unwrap_or(Path::new("."));

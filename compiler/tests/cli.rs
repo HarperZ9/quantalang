@@ -2373,6 +2373,79 @@ fn main() {
 }
 
 #[test]
+fn check_emits_distinct_argv_slots_for_multi_arg_effect() {
+    // Regression: a multi-parameter effect operation must marshal every
+    // argument, and each handler parameter must read its OWN argument. The
+    // earlier lowering dropped arguments 2..N at the perform site and made
+    // every handler parameter alias the first argument, so `Coord.point(10,
+    // 20, 30)` handled as `(x, y, z)` silently produced `x=10 y=10 z=10`.
+    // The perform site now builds a `void*[N]` argv array and each parameter
+    // reads slot `i` via `((void**)handler_data)[i]`; assert the emitted C
+    // reads three DISTINCT slots rather than the same one three times.
+    let fixture = std::env::temp_dir().join(format!(
+        "buildlang_multi_arg_effect_marshal_{}.bld",
+        std::process::id()
+    ));
+    let out_c = std::env::temp_dir().join(format!(
+        "buildlang_multi_arg_effect_marshal_{}.c",
+        std::process::id()
+    ));
+    fs::write(
+        &fixture,
+        r#"
+effect Coord {
+    fn point(x: i32, y: i32, z: i32) -> (),
+}
+
+fn emit() ~ Coord {
+    perform Coord.point(10, 20, 30);
+}
+
+fn main() ~ Console {
+    handle {
+        emit()
+    } with {
+        Coord.point(x, y, z) => {
+            println!("x={} y={} z={}", x, y, z);
+        },
+    }
+}
+"#,
+    )
+    .expect("write multi-arg effect fixture");
+
+    let output = buildc()
+        .arg(&fixture)
+        .arg("-o")
+        .arg(&out_c)
+        .output()
+        .expect("run buildc to emit C");
+
+    assert!(
+        output.status.success(),
+        "multi-arg effect program should compile to C\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let code = fs::read_to_string(&out_c).expect("read emitted C");
+    let _ = fs::remove_file(&fixture);
+    let _ = fs::remove_file(&out_c);
+
+    for idx in 0..3 {
+        let needle = format!("handler_data)[{}]", idx);
+        assert!(
+            code.contains(&needle),
+            "handler parameter {} should read its own argv slot `{}`; \
+             emitted C:\n{}",
+            idx,
+            needle,
+            code
+        );
+    }
+}
+
+#[test]
 fn check_reports_effect_for_effectful_closure_alias_call() {
     let fixture = std::env::temp_dir().join(format!(
         "buildlang_effectful_closure_alias_gate_{}.bld",
