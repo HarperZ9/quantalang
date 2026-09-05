@@ -654,6 +654,20 @@ impl<'a> Parser<'a> {
             if self.check_lifetime() {
                 let lifetime = self.expect_lifetime()?;
                 args.push(GenericArg::Lifetime(lifetime));
+            } else if (self.check_ident() || self.is_contextual_keyword())
+                && matches!(self.peek().kind, TokenKind::Eq)
+            {
+                // Associated type binding: `Item = T` in `Iterator<Item = T>`.
+                // Inside a call-site generic argument list, `IDENT = TYPE` is
+                // only ever a binding -- no other production puts `=` after a
+                // name here -- so this never shadows a real type argument.
+                let name = self.expect_ident()?;
+                self.expect(&TokenKind::Eq)?;
+                let ty = self.parse_type()?;
+                args.push(GenericArg::AssocType {
+                    name,
+                    ty: Box::new(ty),
+                });
             } else {
                 let ty = self.parse_type()?;
                 args.push(GenericArg::Type(Box::new(ty)));

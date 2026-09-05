@@ -1190,14 +1190,21 @@ impl<'ctx> MirLowerer<'ctx> {
             return result;
         };
 
-        for (i, arg) in generic_args.iter().enumerate() {
+        // Positional type parameters are indexed among themselves: lifetime
+        // and associated-type-binding arguments do not occupy a type-parameter
+        // slot, so count only `Type` args. (This also corrects a latent offset
+        // for `Foo<'a, T>`, where the lifetime previously shifted `T` off the
+        // end of `param_names` and dropped its substitution.)
+        let mut type_pos = 0;
+        for arg in generic_args.iter() {
             if let ast::GenericArg::Type(arg_ty) = arg {
-                if let Some(param_name) = param_names.get(i) {
+                if let Some(param_name) = param_names.get(type_pos) {
                     result.insert(
                         param_name.clone(),
                         self.substitute_type_from_ast(arg_ty, outer_subst),
                     );
                 }
+                type_pos += 1;
             }
         }
 

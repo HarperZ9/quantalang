@@ -1937,6 +1937,77 @@ mod tests {
         }
     }
 
+    // Extract the generic arguments on the last path segment of a function's
+    // return type, so an associated-type-binding assertion can read them.
+    fn return_type_generics(item: &Item) -> Vec<crate::ast::GenericArg> {
+        let ret = match &item.kind {
+            ItemKind::Function(f) => f.sig.return_ty.as_ref().expect("return type"),
+            other => panic!("expected Function, got {:?}", other),
+        };
+        match &ret.kind {
+            crate::ast::TypeKind::Path(p) => p.segments.last().unwrap().generics.clone(),
+            other => panic!("expected Path type, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn associated_type_binding_parses_as_assoc_type() {
+        // `Item = i32` in `Iterator<Item = i32>` is an associated-type
+        // binding, not a positional type argument. It must parse as
+        // `GenericArg::AssocType` carrying the bound name and type.
+        let item = parse_item_str("fn f() -> Iterator<Item = i32> { 0 }").unwrap();
+        let generics = return_type_generics(&item);
+        assert_eq!(generics.len(), 1, "one binding, no positional args");
+        match &generics[0] {
+            crate::ast::GenericArg::AssocType { name, ty } => {
+                assert_eq!(name.as_str(), "Item");
+                assert!(matches!(&ty.kind, crate::ast::TypeKind::Path(_)));
+            }
+            other => panic!("expected AssocType binding, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn binding_and_positional_args_coexist() {
+        // A positional type argument and a binding parse side by side, each
+        // into its own `GenericArg` kind. This guards the disambiguation: a
+        // bare `i32` stays a `Type`, only `Output = bool` becomes a binding.
+        let item = parse_item_str("fn f() -> Op<i32, Output = bool> { 0 }").unwrap();
+        let generics = return_type_generics(&item);
+        assert_eq!(generics.len(), 2);
+        assert!(
+            matches!(&generics[0], crate::ast::GenericArg::Type(_)),
+            "leading `i32` must stay a positional type argument"
+        );
+        match &generics[1] {
+            crate::ast::GenericArg::AssocType { name, .. } => assert_eq!(name.as_str(), "Output"),
+            other => panic!("expected AssocType binding, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multiple_associated_type_bindings_parse() {
+        // Two comma-separated bindings, the shape corpus trait bounds use
+        // (`SerializeSeq<Ok = ..., Error = ...>`). Each binding parses
+        // independently into its own kind, and the right-hand side accepts a
+        // multi-segment path (`io::Error`) as well as a plain name. (A
+        // `Self::`-qualified right-hand side is a separate, pre-existing gap
+        // in type-position `Self` projection, not exercised here.)
+        let item =
+            parse_item_str("fn f() -> Seq<Ok = String, Error = io::Error> { 0 }").unwrap();
+        let generics = return_type_generics(&item);
+        assert_eq!(generics.len(), 2, "two bindings, no positional args");
+        for (arg, expected) in generics.iter().zip(["Ok", "Error"]) {
+            match arg {
+                crate::ast::GenericArg::AssocType { name, ty } => {
+                    assert_eq!(name.as_str(), expected);
+                    assert!(matches!(&ty.kind, crate::ast::TypeKind::Path(_)));
+                }
+                other => panic!("expected AssocType binding, got {:?}", other),
+            }
+        }
+    }
+
     #[test]
     fn pub_function() {
         let item = parse_item_str("pub fn greet() {}").unwrap();
