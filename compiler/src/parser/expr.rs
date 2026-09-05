@@ -132,6 +132,14 @@ impl<'a> Parser<'a> {
             // =====================================================================
             TokenKind::Ident | TokenKind::RawIdent => self.parse_path_or_struct_expr(),
 
+            // Contextual keywords used as a plain value (a variable, field, call,
+            // or path named `default`/`module`/`effect`/`auto`). Their declaration
+            // forms are consumed by the item parser before expression parsing, so
+            // here they are ordinary identifiers and parse as such.
+            TokenKind::Keyword(_) if self.is_value_context_keyword() => {
+                self.parse_path_or_struct_expr()
+            }
+
             TokenKind::Keyword(Keyword::Self_) => {
                 self.advance();
                 let ident = Ident::new("self", start);
@@ -1881,6 +1889,29 @@ mod tests {
         parser.advance(); // )
         parser.advance(); // {
         parser.parse_expr()
+    }
+
+    // =========================================================================
+    // CONTEXTUAL KEYWORDS IN VALUE POSITION
+    // =========================================================================
+
+    #[test]
+    fn value_context_keywords_parse_as_identifiers() {
+        // `default`/`module`/`effect`/`auto` are keywords only in item
+        // position; used as a plain value each is an ordinary identifier.
+        // Their declaration forms are consumed by the item parser before an
+        // expression is ever parsed, so here they must route through the same
+        // path/identifier parser as any other name.
+        for word in ["default", "module", "effect", "auto"] {
+            let expr = parse_expr_str(word)
+                .unwrap_or_else(|e| panic!("`{word}` should parse as a value expression: {e:?}"));
+            match &expr.kind {
+                ExprKind::Ident(id) => {
+                    assert_eq!(id.as_str(), word, "identifier name should be preserved")
+                }
+                other => panic!("`{word}` parsed as {other:?}, expected ExprKind::Ident"),
+            }
+        }
     }
 
     // =========================================================================

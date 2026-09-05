@@ -262,6 +262,27 @@ impl<'a> Parser<'a> {
                 | TokenKind::Keyword(Keyword::SelfType)
                 | TokenKind::Keyword(Keyword::Handle)
                 | TokenKind::Keyword(Keyword::Effect)
+                | TokenKind::Keyword(Keyword::Auto)
+        )
+    }
+
+    /// Check if the current token is a contextual keyword that can begin an
+    /// expression as a plain value (variable, field access, call, path).
+    ///
+    /// These keywords carry a declaration meaning only in item position
+    /// (`default impl`, `auto trait`, `module m { .. }`, `effect E { .. }`),
+    /// which the item parser consumes before an expression is ever parsed. When
+    /// one of them reaches expression parsing it is being used as an ordinary
+    /// identifier, so it routes to the same path/struct-expression parser as any
+    /// identifier. `handle`, `resume`, and `perform` are deliberately excluded:
+    /// they have their own expression forms.
+    fn is_value_context_keyword(&self) -> bool {
+        matches!(
+            self.current_kind(),
+            TokenKind::Keyword(Keyword::Default)
+                | TokenKind::Keyword(Keyword::Module)
+                | TokenKind::Keyword(Keyword::Effect)
+                | TokenKind::Keyword(Keyword::Auto)
         )
     }
 
