@@ -160,6 +160,7 @@ impl<'a> Parser<'a> {
         matches!(
             expr.kind,
             ExprKind::If { .. }
+                | ExprKind::IfLet { .. }
                 | ExprKind::Match { .. }
                 | ExprKind::Loop { .. }
                 | ExprKind::While { .. }
@@ -287,5 +288,43 @@ mod tests {
     fn test_expr_stmt() {
         let result = parse_stmt_from_str("x + 1;");
         assert!(result.is_ok());
+    }
+
+    /// Parse a whole function body and return the parser's collected errors.
+    fn parse_fn_body_errors(body: &str) -> Vec<String> {
+        let source = LexerSourceFile::new("test.bld", format!("fn test() {{ {} }}", body));
+        let mut lexer = Lexer::new(&source);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(&source, tokens);
+        let _ = parser.parse();
+        parser.errors().iter().map(|e| e.message()).collect()
+    }
+
+    #[test]
+    fn if_let_block_statement_needs_no_semicolon() {
+        // A non-tail `if let { ... }` is a block-expression statement, so no
+        // trailing `;` is required -- the same as a plain `if { ... }`. A second
+        // statement follows the first, so the first is not in tail position.
+        let errors = parse_fn_body_errors(
+            "if let Some(x) = opt { use_it(x); }\n\
+             if let Some(y) = other { use_it(y); }\n\
+             done();",
+        );
+        assert!(
+            errors.is_empty(),
+            "consecutive `if let` statements should parse without a semicolon, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn plain_if_block_statement_needs_no_semicolon() {
+        // Control: the plain `if` case that already worked, guarding the shared
+        // `expr_is_complete` path against regression.
+        let errors = parse_fn_body_errors(
+            "if a { one(); }\n\
+             if b { two(); }\n\
+             done();",
+        );
+        assert!(errors.is_empty(), "consecutive `if` statements should parse, got: {errors:?}");
     }
 }
