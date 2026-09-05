@@ -1249,6 +1249,11 @@ struct CheckOutcome {
     tokens: usize,
     parse_errors: Vec<ParseDiagnostic>,
     type_errors: Vec<TypeErrorWithSpan>,
+    /// 1-based `(line, col)` for each `type_errors` entry, resolved while the
+    /// `SourceFile` was live (a type error carries only a byte `Span`, and
+    /// `CheckOutcome` outlives that borrow). Index-aligned with `type_errors`;
+    /// `None` where the error's span is a synthetic-node dummy (no location).
+    type_error_locations: Vec<Option<(usize, usize)>>,
     function_summaries: Vec<FunctionEffectSummary>,
 }
 
@@ -5737,20 +5742,18 @@ fn build_check_receipt(
                 notes: diag.notes.clone(),
             }),
     );
-    diagnostics.extend(
-        outcome
-            .type_errors
-            .iter()
-            .map(|err| CheckReceiptDiagnostic {
-                stage: "type",
-                kind: type_error_kind(&err.error).to_string(),
-                message: err.error.to_string(),
-                line: None,
-                col: None,
-                help: err.help.clone(),
-                notes: err.notes.clone(),
-            }),
-    );
+    diagnostics.extend(outcome.type_errors.iter().enumerate().map(|(i, err)| {
+        let loc = outcome.type_error_locations.get(i).copied().flatten();
+        CheckReceiptDiagnostic {
+            stage: "type",
+            kind: type_error_kind(&err.error).to_string(),
+            message: err.error.to_string(),
+            line: loc.map(|(line, _)| line),
+            col: loc.map(|(_, col)| col),
+            help: err.help.clone(),
+            notes: err.notes.clone(),
+        }
+    }));
 
     let policy_failed = policy
         .map(|decision| !decision.violations.is_empty())
@@ -5877,6 +5880,26 @@ fn run_check(file: &Path) -> Result<CheckOutcome, i32> {
         }
     }
 
+    // Resolve each type error's byte span to 1-based `line:col` now, while
+    // `source_file` is still borrowable. Same arithmetic as the parse-error
+    // path above, so a type error reports the identical location shape. Done
+    // AFTER the codegen linear errors were appended, so the vec stays
+    // index-aligned with the final `type_errors`. A dummy span (synthetic
+    // node) has `end == 0`; it resolves to `None` so the receipt omits the
+    // field instead of reporting a false `1:1`.
+    let type_error_locations = type_errors
+        .iter()
+        .map(|err| {
+            if err.span.end.0 == 0 {
+                return None;
+            }
+            let line = source_file.lookup_line(err.span.start);
+            let line_start = source_file.line_start(line).unwrap_or(err.span.start);
+            let col = err.span.start.0.saturating_sub(line_start.0) as usize;
+            Some((line + 1, col + 1))
+        })
+        .collect::<Vec<_>>();
+
     let input_digests = input_digest_ledger.into_sorted_records();
     let input_graph_digest = input_graph_digest(&input_digests);
 
@@ -5891,6 +5914,7 @@ fn run_check(file: &Path) -> Result<CheckOutcome, i32> {
         tokens: token_count,
         parse_errors,
         type_errors,
+        type_error_locations,
         function_summaries,
     })
 }
@@ -5959,8 +5983,11 @@ fn render_check_human_output(outcome: &CheckOutcome, receipt_to_stdout: bool) {
     }
     if !outcome.type_errors.is_empty() {
         eprintln!("Type errors found:");
-        for err in &outcome.type_errors {
-            eprintln!("  {}", err);
+        for (i, err) in outcome.type_errors.iter().enumerate() {
+            match outcome.type_error_locations.get(i).copied().flatten() {
+                Some((line, col)) => eprintln!("  {}:{}: {}", line, col, err),
+                None => eprintln!("  {}", err),
+            }
         }
     }
 
@@ -10506,6 +10533,7 @@ mod tests {
             tokens: 1,
             parse_errors: Vec::new(),
             type_errors: Vec::new(),
+            type_error_locations: Vec::new(),
             function_summaries: vec![
                 FunctionEffectSummary {
                     function: "b".to_string(),
@@ -10592,6 +10620,7 @@ mod tests {
             tokens: 1,
             parse_errors: Vec::new(),
             type_errors: Vec::new(),
+            type_error_locations: Vec::new(),
             function_summaries: Vec::new(),
         };
 
