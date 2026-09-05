@@ -1480,8 +1480,24 @@ impl<'a> Parser<'a> {
             // pattern -- its trailing comma is optional. A value body resumes
             // the ordinary Pratt loop so operators bind (`x + 1`, `f()?`, `a.b`)
             // and must be terminated by `,` or the closing `}`.
+            //
+            // Exception: a trailing `.` or `?` immediately after a block-like
+            // head reopens the expression, so `X => if c {a} else {b}.to_string(),`
+            // binds the method call, matching Rust. This is unambiguous because
+            // no arm pattern can begin with `.` or `?` (range patterns use the
+            // distinct `..`/`..=` tokens), so the continuation cannot swallow the
+            // following arm. `(` and `[` are deliberately NOT reopened: a bare
+            // `(pat)`/`[slice]` arm after a block body must stay a separate arm,
+            // and infix stays terminal for the same reason. A reopened body is a
+            // value expression, so its comma is then required.
             let atom = self.parse_prefix_expr()?;
-            let body_is_block = Self::is_block_like_expr(&atom);
+            let head_is_block = Self::is_block_like_expr(&atom);
+            let reopen_postfix = head_is_block
+                && matches!(
+                    self.current_kind(),
+                    TokenKind::Dot | TokenKind::Question
+                );
+            let body_is_block = head_is_block && !reopen_postfix;
             let body = if body_is_block {
                 atom
             } else {
@@ -2191,6 +2207,55 @@ mod tests {
         assert!(
             parse_expr_str(src).is_err(),
             "a block-like body must not bind a trailing operator"
+        );
+    }
+
+    #[test]
+    fn block_like_arm_body_binds_trailing_dot_method() {
+        // A `.method()` (or `?`) immediately after a block-like arm body reopens
+        // the expression and binds, matching Rust: `X => if c {a} else {b}.f(),`
+        // parses as `(if c {a} else {b}).f()`. `.`/`?` cannot begin an arm
+        // pattern (range patterns use the distinct `..`/`..=` tokens), so the
+        // continuation is unambiguous and cannot swallow the following arm.
+        for src in [
+            "match b { true => if b { \"a\" } else { \"c\" }.to_string(), _ => \"d\".to_string() }",
+            "match n { 0 => match n { _ => 1 }.clone(), _ => 2 }",
+            "match n { _ => { 5 }.clone() }",
+        ] {
+            parse_expr_str(src).unwrap_or_else(|e| {
+                panic!("block-like body followed by `.method()` must parse: {src:?}: {e:?}")
+            });
+        }
+        // The reopened body is a method call whose receiver is the block-like head.
+        let expr = parse_expr_str("match b { true => if b { 1 } else { 2 }.min(3), _ => 0 }")
+            .expect("reopened arm body should parse");
+        let arms = match_arms(&expr);
+        match &arms[0].body.kind {
+            ExprKind::MethodCall { receiver, method, .. } => {
+                assert_eq!(&*method.name, "min", "method name should be `min`");
+                assert!(
+                    matches!(&receiver.kind, ExprKind::If { .. }),
+                    "method receiver should be the if-expression, got {:?}",
+                    receiver.kind
+                );
+            }
+            other => panic!("expected a method-call arm body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_like_arm_body_does_not_reopen_on_call_or_index() {
+        // `(` and `[` after a block-like body are NOT reopened: a following
+        // `(pat)` / `[slice]` arm must stay a separate arm, preserving the
+        // no-swallow guarantee while `.`/`?` are allowed to continue.
+        let src = "match x { _ => { f() } (a, b) => a + b }";
+        let expr = parse_expr_str(src)
+            .unwrap_or_else(|e| panic!("a block body before a `(` arm must stay separate: {e:?}"));
+        let arms = match_arms(&expr);
+        assert_eq!(
+            arms.len(),
+            2,
+            "the `(a, b)` arm must not be consumed as a call on the block body"
         );
     }
 
