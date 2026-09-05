@@ -1191,8 +1191,17 @@ impl<'ctx> MirLowerer<'ctx> {
             MirType::Int(IntSize::I64, _) | MirType::Int(IntSize::ISize, _) => {
                 ("build_hvec_new_i64", "build_hvec_push_i64")
             }
+            // String elements need the str-typed handle; the i32 helpers take an
+            // int32_t and passing a BuildString to them fails to compile. Keep the
+            // BuildString -> "str" mapping in sync with the canonical element ->
+            // suffix table the vec method/free-function paths use in
+            // codegen/lower/expr.rs, so `vec!["a", "b"]` builds the same typed
+            // handle those accessors later read.
+            MirType::Struct(n) if n.as_ref() == "BuildString" => {
+                ("build_hvec_new_str", "build_hvec_push_str")
+            }
             _ => {
-                // Default to i32 for everything else
+                // Default to i32 for everything else (bool, i32, u32, char).
                 ("build_hvec_new_i32", "build_hvec_push_i32")
             }
         }

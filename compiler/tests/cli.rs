@@ -2446,6 +2446,69 @@ fn main() ~ Console {
 }
 
 #[test]
+fn check_vec_string_literal_uses_str_push_helper() {
+    // Regression: `vec!["a", "b"]` must build a str-typed handle. The macro
+    // lowering picked the vec helper from a type -> name table that had only
+    // f64/i64/i32 arms, so string elements fell to the i32 default and the
+    // emitted C called `build_hvec_push_i32(handle, <BuildString>)` -- passing a
+    // BuildString where an int32_t is expected, which does not compile. Assert
+    // the emitted C pushes through the str helper and never through the i32 one.
+    let fixture = std::env::temp_dir().join(format!(
+        "buildlang_vec_str_literal_{}.bld",
+        std::process::id()
+    ));
+    let out_c = std::env::temp_dir().join(format!(
+        "buildlang_vec_str_literal_{}.c",
+        std::process::id()
+    ));
+    fs::write(
+        &fixture,
+        r#"
+fn main() ~ Console {
+    let words = vec!["alpha", "beta", "gamma"];
+    println!("count={}", words.len());
+    println!("a={}", words.get(0));
+}
+"#,
+    )
+    .expect("write vec string-literal fixture");
+
+    let output = buildc()
+        .arg(&fixture)
+        .arg("-o")
+        .arg(&out_c)
+        .output()
+        .expect("run buildc to emit C");
+
+    assert!(
+        output.status.success(),
+        "vec string-literal program should compile to C\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let code = fs::read_to_string(&out_c).expect("read emitted C");
+    let _ = fs::remove_file(&fixture);
+    let _ = fs::remove_file(&out_c);
+
+    // The runtime prelude DEFINES every helper, so a bare substring check cannot
+    // tell a call from a definition; match the call form `name(_` (temporary
+    // arguments), which the definitions `name(BuildVecHandle ..)` never produce.
+    assert!(
+        code.contains("build_hvec_push_str(_"),
+        "vec![\"..\"] should push string elements through the str helper; \
+         emitted C:\n{}",
+        code
+    );
+    assert!(
+        !code.contains("build_hvec_push_i32(_"),
+        "vec![\"..\"] must not push string elements through the i32 helper; \
+         emitted C:\n{}",
+        code
+    );
+}
+
+#[test]
 fn check_reports_effect_for_effectful_closure_alias_call() {
     let fixture = std::env::temp_dir().join(format!(
         "buildlang_effectful_closure_alias_gate_{}.bld",
