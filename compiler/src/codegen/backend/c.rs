@@ -1650,6 +1650,22 @@ impl CBackend {
             return Ok(());
         }
 
+        // The vtable method sigs carry `void*` as the self param (that is the
+        // C-level type stored in the function-pointer table), so they cannot say
+        // whether the concrete method takes `self` by value or `&self` by
+        // reference. Read that from the concrete function's real first parameter
+        // instead, keyed by its mangled name.
+        let concrete_self_by_ref: std::collections::HashMap<&str, bool> = module
+            .functions
+            .iter()
+            .map(|f| {
+                (
+                    f.name.as_ref(),
+                    f.sig.params.first().map(|p| p.is_pointer()).unwrap_or(false),
+                )
+            })
+            .collect();
+
         // Generate wrapper functions that dereference void* to concrete type
         for vtable in &module.vtables {
             for (method_name, mangled_fn, sig) in &vtable.methods {
@@ -1662,10 +1678,15 @@ impl CBackend {
                 // Generate: ret wrapper(void* self, ...) { return concrete(<self>, ...); }
                 // The receiver is passed as a pointer when the method takes
                 // `&self`/`&mut self` (a pointer self param), or dereferenced to a
-                // value when it takes `self` by value. Always dereferencing broke
-                // `&self` trait methods (passing a value where a pointer was
-                // expected).
-                let self_is_ref = sig.params.first().map(|p| p.is_pointer()).unwrap_or(false);
+                // value when it takes `self` by value. The vtable sig always
+                // reports the self param as `void*`, so consult the concrete
+                // function's real first parameter to decide.
+                let self_is_ref = concrete_self_by_ref
+                    .get(mangled_fn.as_ref())
+                    .copied()
+                    .unwrap_or_else(|| {
+                        sig.params.first().map(|p| p.is_pointer()).unwrap_or(false)
+                    });
                 let self_arg = if self_is_ref {
                     format!("({}*)__self", vtable.type_name)
                 } else {
