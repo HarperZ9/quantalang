@@ -1794,7 +1794,7 @@ impl CBackend {
 
             if let Some(init) = &global.init {
                 decl.push_str(" = ");
-                decl.push_str(&self.const_to_c(init));
+                decl.push_str(&self.const_to_c_static(init));
             }
 
             decl.push_str(";\n");
@@ -2778,7 +2778,8 @@ impl CBackend {
                 let ptr_name = self.local_name(*ptr, locals);
                 self.write_indent();
                 let rvalue = self.rvalue_to_c(value, locals)?;
-                write!(self.output, "{}->{} = {};\n", ptr_name, field_name, rvalue).unwrap();
+                let field = Self::escape_c_keyword(field_name);
+                write!(self.output, "{}->{} = {};\n", ptr_name, field, rvalue).unwrap();
             }
             MirStmtKind::FieldAssign {
                 base,
@@ -2788,7 +2789,8 @@ impl CBackend {
                 let base_name = self.local_name(*base, locals);
                 self.write_indent();
                 let rvalue = self.rvalue_to_c(value, locals)?;
-                write!(self.output, "{}.{} = {};\n", base_name, field_name, rvalue).unwrap();
+                let field = Self::escape_c_keyword(field_name);
+                write!(self.output, "{}.{} = {};\n", base_name, field, rvalue).unwrap();
             }
             MirStmtKind::GlobalStore { name, value } => {
                 // `GLOBAL = value;` - the C global identifier matches the
@@ -3866,6 +3868,25 @@ impl CBackend {
         }
     }
 
+    /// Emit a constant as a C static initializer (file-scope `const`/global).
+    /// Aggregate constants become plain brace-init lists `{ ... }` rather than
+    /// compound literals `(T){ ... }`: C requires the initializer of an object
+    /// with static storage duration to be a constant expression, and a compound
+    /// literal is not one, so MSVC rejects `const Color W = (Color){...};` with
+    /// C2099. Nested structs recurse the same way; scalars and strings are
+    /// already constant expressions and defer to `const_to_c`.
+    fn const_to_c_static(&self, c: &MirConst) -> String {
+        match c {
+            MirConst::Struct(_, fields) => {
+                let field_strs: Vec<String> =
+                    fields.iter().map(|f| self.const_to_c_static(f)).collect();
+                format!("{{ {} }}", field_strs.join(", "))
+            }
+            MirConst::Zeroed(_) => "{0}".to_string(),
+            _ => self.const_to_c(c),
+        }
+    }
+
     /// If `base` indexes a slice (fat pointer `{ptr, len}`) or a pointer-to-slice
     /// (`&[T]` -> `Ptr(Slice)`), return the correct element access. A slice value
     /// is `base.ptr[index]`; a pointer-to-slice (a slice/array *parameter*) is
@@ -4193,10 +4214,11 @@ impl CBackend {
                         .unwrap_or(false),
                     _ => false,
                 };
+                let field = Self::escape_c_keyword(field_name);
                 if is_ptr {
-                    format!("{}->{}", base_str, field_name)
+                    format!("{}->{}", base_str, field)
                 } else {
-                    format!("{}.{}", base_str, field_name)
+                    format!("{}.{}", base_str, field)
                 }
             }
             MirRValue::VariantField {
@@ -4633,21 +4655,19 @@ impl CBackend {
         )
     }
 
-    /// Check if a function name is a BuildLang runtime helper or a standard
-    /// C math/stdlib function that must NOT be escaped.  These names are
-    /// Escape C reserved keywords used as identifiers by appending an underscore.
+    /// Escape a struct/field identifier that collides with a reserved C word by
+    /// appending an underscore. Delegates to `is_c_reserved` so the definition
+    /// site and every access site share one list; a narrower hand-maintained set
+    /// here let MSVC-reserved names such as `near`/`far` (Win16 legacy keywords)
+    /// leak through as `double near;`, which MSVC rejects with C2208.
     fn escape_c_keyword(name: &str) -> String {
-        match name {
-            "default" | "register" | "volatile" | "signed" | "unsigned" | "auto" | "extern"
-            | "static" | "typedef" | "union" | "enum" | "struct" | "switch" | "case" | "break"
-            | "continue" | "goto" | "return" | "if" | "else" | "while" | "do" | "for"
-            | "inline" | "restrict" | "const" => format!("{}_", name),
-            _ => name.to_string(),
+        if Self::is_c_reserved(name) {
+            format!("{}_", name)
+        } else {
+            name.to_string()
         }
     }
 
-    /// produced by the lowerer for builtin operations and should pass through
-    /// to C unchanged.
     /// Collect block IDs that need labels (targeted by non-sequential jumps).
     /// A block needs a label if ANY block other than its immediate predecessor
     /// has a jump (goto/if/switch/call) targeting it.
@@ -6980,14 +7000,18 @@ fn main() {
             .expect("Failed to generate C code");
         let code = output.as_string().unwrap();
 
-        // Verify struct constant globals are emitted with initializers
+        // Verify struct constant globals are emitted with initializers.
+        // Static-storage globals use a brace-init list `{ ... }`, NOT a compound
+        // literal `(Color){ ... }`: a compound literal is not a constant
+        // expression, so MSVC rejects it as a file-scope initializer with C2099.
+        // See `const_to_c_static`. Do not reintroduce the `(Color)` cast here.
         assert!(
-            code.contains("const Color WHITE = (Color)"),
+            code.contains("const Color WHITE = {"),
             "Expected const Color WHITE global in:\n{}",
             code
         );
         assert!(
-            code.contains("const Color BLACK = (Color)"),
+            code.contains("const Color BLACK = {"),
             "Expected const Color BLACK global in:\n{}",
             code
         );

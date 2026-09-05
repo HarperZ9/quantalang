@@ -1580,14 +1580,13 @@ impl<'ctx> MirLowerer<'ctx> {
         // user-defined function with the same name in the module.
         let func_val = if let Some(builtin_name) = self.try_resolve_math_builtin(func) {
             // Don't shadow a user-defined function with the same name.
-            // Inside inline modules, also check the prefixed name.
-            let fn_name = self.extract_call_name(func);
-            let user_defined = fn_name
-                .map(|n| {
-                    let resolved = self.resolve_fn_name(n);
-                    self.module.find_function(resolved.as_ref()).is_some()
-                })
-                .unwrap_or(false);
+            // Inside inline modules, also check the prefixed name, and resolve
+            // qualified module paths (`math_utils::dot`) to their mangled
+            // function name. Without the qualified-path case a user module
+            // function whose last segment matches a math builtin (dot, length,
+            // ...) is hijacked to the runtime builtin, which takes the wrong
+            // argument type.
+            let user_defined = self.call_resolves_to_user_fn(func);
             if user_defined {
                 self.lower_expr(func)?
             } else {
@@ -1728,6 +1727,43 @@ impl<'ctx> MirLowerer<'ctx> {
             builder.switch_to_block(cont);
             Ok(values::local(result))
         }
+    }
+
+    /// True when this call target resolves to a user-defined function in the
+    /// current module, so a same-named math builtin must not shadow it. Handles
+    /// bare names (via the module-prefix-aware `resolve_fn_name`) and qualified
+    /// module paths like `math_utils::dot`, which the module loader mangles to
+    /// `math_utils_dot`. `extract_call_name` returns `None` for a multi-segment
+    /// path, so the joined name is resolved here directly.
+    fn call_resolves_to_user_fn(&self, func: &ast::Expr) -> bool {
+        // Bare name or single-segment path.
+        if let Some(name) = self.extract_call_name(func) {
+            let resolved = self.resolve_fn_name(name);
+            return self.module.find_function(resolved.as_ref()).is_some();
+        }
+        // Qualified path: join segments with `_` to match the module loader's
+        // mangling, and also try the module-prefixed form for calls made from
+        // inside another inline module.
+        if let ExprKind::Path(path) = &func.kind {
+            if path.segments.len() > 1 {
+                let joined: String = path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.name.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("_");
+                if self.module.find_function(joined.as_str()).is_some() {
+                    return true;
+                }
+                if !self.module_prefix.is_empty() {
+                    let prefixed = self.prefixed_name(&Arc::from(joined.as_str()));
+                    if self.module.find_function(prefixed.as_ref()).is_some() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// If `func` resolves to a recognised math built-in (abs, sqrt, pow, ...),
