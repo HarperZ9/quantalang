@@ -1189,6 +1189,11 @@ impl<'a> Parser<'a> {
         let mut rest = None;
 
         while !self.check(&TokenKind::CloseDelim(Delimiter::Brace)) && !self.is_eof() {
+            // A field may carry outer attributes, e.g. `#[cfg(unix)] ino`.
+            // Parse them before the `..rest` check so a bare `..` is still
+            // recognized after any leading attributes.
+            let attrs = self.parse_outer_attrs()?;
+
             // Check for ..rest
             if self.check(&TokenKind::DotDot) {
                 self.advance();
@@ -1214,7 +1219,7 @@ impl<'a> Parser<'a> {
             fields.push(FieldExpr {
                 name,
                 value,
-                attrs: Vec::new(),
+                attrs,
                 span: field_span,
             });
 
@@ -1306,6 +1311,10 @@ impl<'a> Parser<'a> {
             return Ok(Expr::new(ExprKind::Array(Vec::new()), start.merge(&end)));
         }
 
+        // An element may carry outer attributes, e.g. `#[cfg(windows)] path`.
+        // `ExprKind::Array` holds bare expressions, so the attributes are
+        // parsed and dropped rather than attached.
+        let _ = self.parse_outer_attrs()?;
         let first = self.parse_expr()?;
 
         // Repeat: [expr; count]
@@ -1330,6 +1339,7 @@ impl<'a> Parser<'a> {
 
         if self.eat(&TokenKind::Comma) {
             while !self.check(&TokenKind::CloseDelim(Delimiter::Bracket)) && !self.is_eof() {
+                let _ = self.parse_outer_attrs()?;
                 elements.push(self.parse_expr()?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
@@ -2088,6 +2098,30 @@ mod tests {
                 }
                 other => panic!("`{src}` parsed as {other:?}, expected ExprKind::Closure"),
             }
+        }
+    }
+
+    #[test]
+    fn outer_attributes_are_accepted_on_struct_fields_and_array_elements() {
+        // `#[cfg(..)]` and friends may prefix a struct-literal field or an
+        // array element. The struct field keeps its attributes; the array
+        // element's are parsed and dropped (the AST holds bare expressions).
+        let s = parse_expr_str("Foo { #[cfg(unix)] ino, path: p }")
+            .unwrap_or_else(|e| panic!("attributed struct field should parse: {e:?}"));
+        match &s.kind {
+            ExprKind::Struct { fields, .. } => {
+                assert_eq!(fields.len(), 2, "both fields present");
+                assert_eq!(fields[0].attrs.len(), 1, "first field keeps its attribute");
+                assert!(fields[1].attrs.is_empty(), "second field has no attribute");
+            }
+            other => panic!("parsed as {other:?}, expected ExprKind::Struct"),
+        }
+
+        let a = parse_expr_str("[#[cfg(windows)] a, b, #[cfg(unix)] c]")
+            .unwrap_or_else(|e| panic!("attributed array element should parse: {e:?}"));
+        match &a.kind {
+            ExprKind::Array(elems) => assert_eq!(elems.len(), 3, "all three elements present"),
+            other => panic!("parsed as {other:?}, expected ExprKind::Array"),
         }
     }
 
