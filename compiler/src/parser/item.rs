@@ -843,7 +843,21 @@ impl<'a> Parser<'a> {
         let attrs = self.parse_outer_attrs()?;
         let start = self.current_span();
 
-        let is_const = self.eat_keyword(Keyword::Const);
+        // Only consume `const` as a modifier when it is followed by `fn`
+        // (`const fn foo();`). A bare `const NAME: TYPE;` begins an associated
+        // const declaration and must be left for the `Const` arm below; eating
+        // it here unconditionally left that arm unreachable, so every associated
+        // const in a trait failed with "expected trait item". Mirrors the impl
+        // item parser.
+        let is_const = if self.check_keyword(Keyword::Const) {
+            if matches!(&self.peek().kind, TokenKind::Keyword(Keyword::Fn)) {
+                self.eat_keyword(Keyword::Const)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let is_async = self.eat_keyword(Keyword::Async);
         let is_unsafe = self.eat_keyword(Keyword::Unsafe);
 
@@ -1912,6 +1926,40 @@ mod tests {
                         assert!(f.body.is_none(), "trait method should be bodyless");
                     }
                     other => panic!("expected trait Function item, got {:?}", other),
+                }
+            }
+            other => panic!("expected Trait, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn trait_associated_const() {
+        // A bare `const NAME: TYPE;` and a defaulted `const NAME: TYPE = val;`
+        // are both associated const declarations; `const fn` stays a function.
+        let item = parse_item_str(
+            "trait Hash { const OUTPUT_SIZE: usize; const SEED: u64 = 0; const fn reset(); }",
+        )
+        .unwrap();
+        match &item.kind {
+            ItemKind::Trait(t) => {
+                assert_eq!(t.items.len(), 3, "three trait items");
+                match &t.items[0].kind {
+                    TraitItemKind::Const { name, default, .. } => {
+                        assert_eq!(name.as_str(), "OUTPUT_SIZE");
+                        assert!(default.is_none(), "no default on the first const");
+                    }
+                    other => panic!("expected associated Const, got {:?}", other),
+                }
+                match &t.items[1].kind {
+                    TraitItemKind::Const { name, default, .. } => {
+                        assert_eq!(name.as_str(), "SEED");
+                        assert!(default.is_some(), "second const carries a default");
+                    }
+                    other => panic!("expected defaulted Const, got {:?}", other),
+                }
+                match &t.items[2].kind {
+                    TraitItemKind::Function(f) => assert_eq!(f.name.as_str(), "reset"),
+                    other => panic!("`const fn` should stay a Function, got {:?}", other),
                 }
             }
             other => panic!("expected Trait, got {:?}", other),
