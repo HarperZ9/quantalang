@@ -3709,7 +3709,19 @@ impl CBackend {
             MirType::SampledImage(_) => "void*".to_string(), // Opaque GPU handle
             MirType::TraitObject(name) => format!("dyn_{}", name), // vtable struct
             MirType::Vec(_) => "BuildVecHandle".to_string(),
-            MirType::Map(_, _) => "BuildStrF64MapHandle".to_string(),
+            // The handle-struct name depends on key/value types. Default map is
+            // str->f64 (BuildStrF64MapHandle), which also backs the value-typed
+            // str-key families (build_hmap_*_val_*). The i64->f64 family has its
+            // own handle. The i32->i32 family never flows through here: map_new_i32
+            // returns Struct("BuildMapHandle") directly. Without this split, a
+            // `map_new_i64()` local was declared BuildStrF64MapHandle while the
+            // runtime returned BuildI64F64MapHandle, a real C2440.
+            MirType::Map(ref k, ref v) => match (k.as_ref(), v.as_ref()) {
+                (MirType::Int(IntSize::I64, _), MirType::Float(..)) => {
+                    "BuildI64F64MapHandle".to_string()
+                }
+                _ => "BuildStrF64MapHandle".to_string(),
+            },
             MirType::Tuple(ref elems) => {
                 if elems.is_empty() {
                     "void".to_string()

@@ -3089,8 +3089,17 @@ impl<'ctx> TypeInfer<'ctx> {
                 "vec_new_i64" | "vec_push_i64" | "vec_get_i64" | "vec_pop_i64" |
                 // Format builtins
                 "to_string_i32" | "to_string_f64" |
-                // HashMap builtins
+                // HashMap builtins (default str->f64)
                 "map_new" | "map_insert" | "map_get" | "map_contains" | "map_len" | "map_remove" |
+                // HashMap builtins (typed i32->i32). Fully wired in codegen
+                // (math_builtin_to_c -> build_map_*, return-type table, runtime
+                // funcs) but were never registered here, so a call resolved to
+                // `undefined variable` before codegen ever ran. See 68_hashmap.
+                "map_new_i32" | "map_insert_i32" | "map_get_i32" | "map_contains_i32" | "map_len_i32" | "map_remove_i32" |
+                // HashMap builtins (typed i64->f64). Same completion as the i32
+                // family: runtime (build_hmap_*_i64_f64), mapping, and return
+                // types all exist; only this allow-list entry was missing.
+                "map_new_i64" | "map_insert_i64" | "map_get_i64" | "map_contains_i64" | "map_len_i64" | "map_remove_i64" |
                 // Vulkan runtime builtins
                 "build_vk_init" | "build_vk_load_shader_file" | "build_vk_run_compute" | "build_vk_shutdown" |
                 // Math constants
