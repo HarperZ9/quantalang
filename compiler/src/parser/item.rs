@@ -2009,6 +2009,46 @@ mod tests {
     }
 
     #[test]
+    fn self_projection_parses_in_type_position() {
+        // `Self::Output` in type position is a two-segment path (`Self`, then
+        // `Output`). The `Self` type arm used to consume only `Self` and leave
+        // the `::` dangling, so `Poll<Self::Output>` and `Option<Self::Item>`
+        // failed to parse. The projection must now parse to the full path.
+        let item = parse_item_str("fn f() -> Self::Output { 0 }").unwrap();
+        let ret = match &item.kind {
+            ItemKind::Function(f) => f.sig.return_ty.as_ref().expect("return type"),
+            other => panic!("expected Function, got {:?}", other),
+        };
+        match &ret.kind {
+            crate::ast::TypeKind::Path(p) => {
+                let names: Vec<_> = p.segments.iter().map(|s| s.ident.as_str()).collect();
+                assert_eq!(names, ["Self", "Output"]);
+            }
+            other => panic!("expected Path type, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn self_projection_carries_generics_on_the_head() {
+        // A projection nested inside a generic argument list, the corpus shape
+        // (`Poll<Self::Output>`). The outer `Poll` gets one type argument, and
+        // that argument is the two-segment `Self::Output` path.
+        let item = parse_item_str("fn f() -> Poll<Self::Output> { 0 }").unwrap();
+        let generics = return_type_generics(&item);
+        assert_eq!(generics.len(), 1);
+        match &generics[0] {
+            crate::ast::GenericArg::Type(ty) => match &ty.kind {
+                crate::ast::TypeKind::Path(p) => {
+                    let names: Vec<_> = p.segments.iter().map(|s| s.ident.as_str()).collect();
+                    assert_eq!(names, ["Self", "Output"]);
+                }
+                other => panic!("expected Path argument, got {:?}", other),
+            },
+            other => panic!("expected Type argument, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn pub_function() {
         let item = parse_item_str("pub fn greet() {}").unwrap();
         assert!(matches!(&item.vis, Visibility::Public(_)));
