@@ -65,7 +65,7 @@ impl<'a> Parser<'a> {
     /// Parse an expression with minimum binding power.
     fn parse_expr_with_bp(&mut self, min_bp: u8) -> ParseResult<Expr> {
         // Parse prefix (atoms and unary operators)
-        let mut lhs = self.parse_prefix_expr()?;
+        let lhs = self.parse_prefix_expr()?;
 
         // Control flow expressions (while, for, loop, if-without-value) are
         // statement-level constructs that cannot be the left operand of a
@@ -77,9 +77,16 @@ impl<'a> Parser<'a> {
             return Ok(lhs);
         }
 
-        loop {
-            // Type cast handled outside the loop (see above)
+        self.continue_expr_with_bp(lhs, min_bp)
+    }
 
+    /// Continue an expression from an already-parsed prefix atom, binding
+    /// postfix and infix operators at or above `min_bp`. Split out of
+    /// `parse_expr_with_bp` so a caller that has parsed the atom itself -- a
+    /// match-arm body, which must classify the atom as block-like or value
+    /// before any operator binds -- can resume the ordinary Pratt loop.
+    fn continue_expr_with_bp(&mut self, mut lhs: Expr, min_bp: u8) -> ParseResult<Expr> {
+        loop {
             // Try postfix operators first (highest precedence)
             if let Some(postfix_bp) = self.postfix_binding_power() {
                 if postfix_bp >= min_bp {
@@ -110,6 +117,27 @@ impl<'a> Parser<'a> {
         matches!(
             &expr.kind,
             ExprKind::While { .. } | ExprKind::Loop { .. } | ExprKind::For { .. }
+        )
+    }
+
+    /// Check whether an expression is "block-like" (Rust's ExprWithBlock): a
+    /// construct that closes on a brace and is complete on its own. As a
+    /// match-arm body such an expression does not continue into trailing
+    /// postfix/infix operators, so it cannot swallow the following arm's
+    /// pattern, and its trailing comma is optional. A value body (anything
+    /// else) binds operators normally and must be terminated by `,` or `}`.
+    fn is_block_like_expr(expr: &Expr) -> bool {
+        matches!(
+            &expr.kind,
+            ExprKind::Block(_)
+                | ExprKind::If { .. }
+                | ExprKind::Match { .. }
+                | ExprKind::Loop { .. }
+                | ExprKind::While { .. }
+                | ExprKind::For { .. }
+                | ExprKind::Unsafe(_)
+                | ExprKind::Async { .. }
+                | ExprKind::Handle { .. }
         )
     }
 
@@ -1404,7 +1432,22 @@ impl<'a> Parser<'a> {
             };
 
             self.expect(&TokenKind::FatArrow)?;
-            let body = self.parse_expr()?;
+
+            // Parse the arm body under Rust's ExprWithBlock / ExprWithoutBlock
+            // rule. Parse the prefix atom first, then classify it: a block-like
+            // body (block, if, match, loop/while/for, unsafe/async/handle
+            // block) ends at its closing brace and does NOT bind trailing
+            // postfix/infix operators, so it cannot consume the following arm's
+            // pattern -- its trailing comma is optional. A value body resumes
+            // the ordinary Pratt loop so operators bind (`x + 1`, `f()?`, `a.b`)
+            // and must be terminated by `,` or the closing `}`.
+            let atom = self.parse_prefix_expr()?;
+            let body_is_block = Self::is_block_like_expr(&atom);
+            let body = if body_is_block {
+                atom
+            } else {
+                self.continue_expr_with_bp(atom, 0)?
+            };
 
             let arm_span = arm_start.merge(&body.span);
 
@@ -1416,21 +1459,13 @@ impl<'a> Parser<'a> {
                 span: arm_span,
             });
 
-            // Comma is optional after block expression bodies (Rust convention)
-            if !self.eat(&TokenKind::Comma) {
-                if !self.check(&TokenKind::CloseDelim(Delimiter::Brace)) {
-                    // Check if this looks like the start of another arm - if so, allow missing comma
-                    let looks_like_next_arm = self.check_ident()
-                        || self.check(&TokenKind::Underscore)
-                        || self.check(&TokenKind::Pound)
-                        || self.check(&TokenKind::At)
-                        || self.check_keyword(Keyword::Self_)
-                        || self.check_keyword(Keyword::SelfType)
-                        || self.check(&TokenKind::Or);
-                    if !looks_like_next_arm {
-                        return Err(self.error_expected("`,` or `}`"));
-                    }
-                }
+            // Comma is required after a value body and optional after a
+            // block-like body; a closing `}` ends the arm list in either case.
+            if !self.eat(&TokenKind::Comma)
+                && !self.check(&TokenKind::CloseDelim(Delimiter::Brace))
+                && !body_is_block
+            {
+                return Err(self.error_expected("`,` or `}`"));
             }
         }
 
@@ -1950,6 +1985,75 @@ mod tests {
                 other => panic!("`{src}` parsed as {other:?}, expected ExprKind::Closure"),
             }
         }
+    }
+
+    // =========================================================================
+    // MATCH-ARM BODIES: ExprWithBlock / ExprWithoutBlock comma rule
+    // =========================================================================
+
+    fn match_arms(expr: &Expr) -> &[MatchArm] {
+        match &expr.kind {
+            ExprKind::Match { arms, .. } => arms,
+            other => panic!("expected a match expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_bodied_arm_does_not_swallow_next_tuple_pattern() {
+        // A block-like body ends at its `}`; the arm that follows may begin
+        // with `(` (a tuple/or pattern) and must NOT be consumed as a call on
+        // the block. Before the ExprWithBlock rule the block body greedily
+        // parsed `(a, _) | (_, a)` as `block(a, _) | (_, a)` and then failed at
+        // the `=>` of that next arm. Reaching two arms proves they stayed
+        // separate -- a merge would have been a parse error, not two arms.
+        let src = "match (x, x) { \
+            (a, b) if a != b => { a + b } \
+            (a, _) | (_, a) => a \
+        }";
+        let expr = parse_expr_str(src)
+            .unwrap_or_else(|e| panic!("comma-optional block arm should parse: {e:?}"));
+        let arms = match_arms(&expr);
+        assert_eq!(arms.len(), 2, "both arms must survive as separate arms");
+        assert!(
+            matches!(&arms[0].body.kind, ExprKind::Block(_)),
+            "first arm body stays a block, not an over-consumed call expression"
+        );
+    }
+
+    #[test]
+    fn block_bodied_arm_allows_comma_less_literal_next_arm() {
+        // The following arm may also start with a literal. The block body does
+        // not bind it and no trailing comma is required after the block.
+        let src = "match x { 0 => { 1 } 1 => 2, _ => 3 }";
+        let expr = parse_expr_str(src)
+            .unwrap_or_else(|e| panic!("comma-optional block arm should parse: {e:?}"));
+        let arms = match_arms(&expr);
+        assert_eq!(arms.len(), 3, "three arms, none merged");
+    }
+
+    #[test]
+    fn value_bodied_arm_requires_a_trailing_comma() {
+        // A value (ExprWithoutBlock) body must be terminated by `,` or `}`.
+        // Omitting the comma between two value arms is a hard error; the parser
+        // fails closed rather than silently accepting it, matching Rust.
+        let src = "match x { 0 => 1 _ => 2 }";
+        assert!(
+            parse_expr_str(src).is_err(),
+            "comma-less value arms must be rejected"
+        );
+    }
+
+    #[test]
+    fn block_like_arm_body_does_not_bind_a_trailing_operator() {
+        // An `if/else` arm body is block-like: it terminates at the final `}`
+        // and does not absorb a trailing `+ 1`. The leftover `+` then fails to
+        // parse as the next arm's pattern, so the match is rejected rather than
+        // silently re-associating the operator onto the if-expression.
+        let src = "match x { _ => if x > 0 { 1 } else { 2 } + 1 }";
+        assert!(
+            parse_expr_str(src).is_err(),
+            "a block-like body must not bind a trailing operator"
+        );
     }
 
     // =========================================================================
