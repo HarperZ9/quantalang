@@ -2367,6 +2367,37 @@ impl<'ctx> TypeInfer<'ctx> {
                 if Some(*def_id) == self.well_known_types.result && !substs.is_empty() {
                     return Some(substs[0].clone());
                 }
+                // Structural fallback: a user-defined enum shaped like Result or
+                // Option is tryable too. The corpus defines its own non-generic
+                // `enum Result { Ok(i32), Err(i32) }` / `enum Option { Some(i32),
+                // None }`, which are plain ADTs (not the well-known def ids and
+                // carry no substs), yet the rest of the compiler already treats
+                // them as the builtin sum types. Resolve `?`'s Output to the
+                // payload of the success variant (`Ok`/`Some`).
+                if let Some(type_def) = self.ctx.lookup_type(*def_id) {
+                    if let TypeDefKind::Enum(enum_def) = &type_def.kind {
+                        if let Some(success) = enum_def
+                            .variants
+                            .iter()
+                            .find(|v| matches!(v.name.as_ref(), "Ok" | "Some"))
+                        {
+                            if let Some((_, field_ty)) = success.fields.first() {
+                                // A generic payload is filled from the type's own
+                                // substs by the parameter's index; a concrete
+                                // payload (the non-generic corpus enums) is used
+                                // directly.
+                                if let TyKind::Param(_, idx) = &field_ty.kind {
+                                    if let Some(arg) = substs.get(*idx as usize) {
+                                        return Some(arg.clone());
+                                    }
+                                }
+                                return Some(field_ty.clone());
+                            }
+                            // Success variant with no payload → Output is unit.
+                            return Some(Ty::unit());
+                        }
+                    }
+                }
                 None
             }
             TyKind::Var(_) | TyKind::Infer(_) => Some(Ty::fresh_var()),
