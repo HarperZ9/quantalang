@@ -204,6 +204,13 @@ impl<'a> Parser<'a> {
                             | TokenKind::Keyword(Keyword::Extern)
                     )
                 }
+                // `effect` starts an item only when followed by the effect
+                // name (`effect Foo { .. }`). Used as a value (`effect.run()`,
+                // or a local named `effect`), it is an expression handled by
+                // the value-context-keyword path, not an item declaration.
+                Keyword::Effect => {
+                    matches!(self.peek().kind, TokenKind::Ident | TokenKind::RawIdent)
+                }
                 _ => matches!(
                     kw,
                     Keyword::Fn
@@ -217,7 +224,6 @@ impl<'a> Parser<'a> {
                         | Keyword::Mod
                         | Keyword::Use
                         | Keyword::Extern
-                        | Keyword::Effect
                         | Keyword::Macro
                 ),
             },
@@ -341,6 +347,41 @@ mod tests {
         assert!(
             errors.is_empty(),
             "a block-like expression in value position must still parse, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn effect_as_value_is_not_an_item_start() {
+        // `effect` is a value-context keyword. When it names a value -- a local
+        // called `effect`, a method call on one -- a statement that starts with
+        // it must parse as an expression, not an effect declaration. These are
+        // the corpus forms (photon/post_processing, refract/system, refract/lib,
+        // wavelength/video) that reported `expected identifier, found `.`` when
+        // `effect` was treated as an unconditional item start.
+        let bodies = [
+            "effect.execute(ctx, cmd, input, out);",
+            "effect.apply(ctx);",
+            "effect.process(&mut frame);",
+            "let e = effect;",
+        ];
+        for body in bodies {
+            let errors = parse_fn_body_errors(body);
+            assert!(
+                errors.is_empty(),
+                "`effect` as a value should parse as an expression, got errors for {body:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effect_declaration_is_still_an_item_start() {
+        // The value-context change above must not stop `effect <Name> { .. }`
+        // from parsing as an effect declaration: `effect` followed by an
+        // identifier is still an item start.
+        let errors = parse_fn_body_errors("effect Logger {}");
+        assert!(
+            errors.is_empty(),
+            "`effect Name {{}}` should still parse as an effect declaration, got: {errors:?}"
         );
     }
 
