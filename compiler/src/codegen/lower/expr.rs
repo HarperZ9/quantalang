@@ -1566,6 +1566,15 @@ impl<'ctx> MirLowerer<'ctx> {
             }
         }
 
+        // Element-generic Vec builtins (vec_push/vec_get/vec_pop) dispatch to
+        // the correctly-typed runtime helper based on the receiver vec's
+        // element type, instead of the i32 default baked into math_builtin_to_c.
+        if let Some(callee_name) = self.extract_call_name(func) {
+            if let Some(dispatched) = self.try_dispatch_vec_builtin(callee_name, args) {
+                return dispatched;
+            }
+        }
+
         // Check for math built-in functions and rewrite the call target to the
         // corresponding C / runtime function name - but only if there is no
         // user-defined function with the same name in the module.
@@ -1774,6 +1783,98 @@ impl<'ctx> MirLowerer<'ctx> {
             "build_vec3" => Some(3),
             "build_vec4" => Some(4),
             _ => None,
+        }
+    }
+
+    /// Dispatch the element-generic Vec builtins (`vec_push`, `vec_get`,
+    /// `vec_pop`) to the correctly-typed runtime helper, keyed by the receiver
+    /// vec's element type. Without this the generic names always resolved to the
+    /// i32 helpers (`build_hvec_push_i32`, ...) via `math_builtin_to_c`, which
+    /// truncated i64 elements to 32 bits, read f64/str vecs through the wrong
+    /// accessor, and emitted a C type error for string elements. This mirrors
+    /// the element-typed dispatch already used for the `v.push()`/`v.get()`
+    /// method forms. The explicitly-typed names (`vec_push_i64`, `vec_get_str`,
+    /// ...) are untouched; they still resolve through `math_builtin_to_c`.
+    ///
+    /// Returns `None` (deferring to normal handling) when the callee is not one
+    /// of these builtins, when a user-defined function shadows the name, or when
+    /// the first argument is not a `Vec` (which the type checker rejects for a
+    /// real call, so that path is effectively unreachable for valid programs).
+    fn try_dispatch_vec_builtin(
+        &mut self,
+        name: &str,
+        args: &[ast::Expr],
+    ) -> Option<CodegenResult<MirValue>> {
+        let op = match name {
+            "vec_push" | "vec_get" | "vec_pop" => name,
+            _ => return None,
+        };
+        if args.is_empty() {
+            return None;
+        }
+        // Don't shadow a user-defined function of the same name.
+        let resolved = self.resolve_fn_name(name);
+        if self.module.find_function(resolved.as_ref()).is_some() {
+            return None;
+        }
+
+        // Lower the receiver (first arg) and read its element type.
+        let recv_val = match self.lower_expr(&args[0]) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        let recv_ty = self.type_of_value(&recv_val);
+        let elem_ty = match &recv_ty {
+            MirType::Vec(elem) => (**elem).clone(),
+            _ => return None,
+        };
+        // Same element -> suffix mapping the method-call path uses, so the two
+        // call forms stay in lockstep for every element type.
+        let suffix: String = match &elem_ty {
+            MirType::Float(_) => "f64".to_string(),
+            MirType::Int(IntSize::I64, _) => "i64".to_string(),
+            MirType::Struct(n) if n.as_ref() == "BuildString" => "str".to_string(),
+            MirType::Struct(n) => n.to_string(),
+            MirType::Vec(_) => "BuildVecHandle".to_string(),
+            MirType::Map(_, _) => "BuildMapHandle".to_string(),
+            _ => "i32".to_string(),
+        };
+
+        // Lower the remaining args (push value / get index).
+        let mut arg_vals = vec![recv_val];
+        for a in &args[1..] {
+            match self.lower_expr(a) {
+                Ok(v) => arg_vals.push(v),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        let (c_fn, ret_ty): (String, MirType) = match op {
+            "vec_push" => (format!("build_hvec_push_{}", suffix), MirType::Void),
+            "vec_get" => (format!("build_hvec_get_{}", suffix), elem_ty.clone()),
+            "vec_pop" => (format!("build_hvec_pop_{}", suffix), elem_ty.clone()),
+            _ => unreachable!(),
+        };
+
+        let builder = match self.current_fn.as_mut() {
+            Some(b) => b,
+            None => {
+                return Some(Err(CodegenError::Internal(
+                    "No current function".to_string(),
+                )))
+            }
+        };
+        let cont = builder.create_block();
+        let func_val = MirValue::Function(Arc::from(c_fn.as_str()));
+        if matches!(ret_ty, MirType::Void) {
+            builder.call(func_val, arg_vals, None, cont);
+            builder.switch_to_block(cont);
+            Some(Ok(values::unit()))
+        } else {
+            let result = builder.create_local(ret_ty);
+            builder.call(func_val, arg_vals, Some(result), cont);
+            builder.switch_to_block(cont);
+            Some(Ok(values::local(result)))
         }
     }
 
