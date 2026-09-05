@@ -4199,6 +4199,14 @@ impl<'ctx> MirLowerer<'ctx> {
                 return ty.clone();
             }
         }
+        // A user-defined `enum Result { Ok(T), Err(E) }` carries the real payload
+        // types; read Ok's field directly so a matched local whose annotation and
+        // callee are both unavailable is not silently defaulted to the wrong slot.
+        if let Some((_, fields)) = self.lookup_enum_variant("Result", "Ok") {
+            if let Some((_, ty)) = fields.first() {
+                return ty.clone();
+            }
+        }
         MirType::i32()
     }
 
@@ -4245,6 +4253,14 @@ impl<'ctx> MirLowerer<'ctx> {
         }
         if let Some(name) = self.scrutinee_callee_name(scrutinee) {
             if let Some(ty) = self.fn_result_err_types.get(&name) {
+                return ty.clone();
+            }
+        }
+        // A user-defined `enum Result { Ok(T), Err(E) }` carries the real Err
+        // payload type; read it directly so a scalar-error match (e.g. `Err(i32)`)
+        // reads the `err_i` slot instead of dereferencing it as a boxed String.
+        if let Some((_, fields)) = self.lookup_enum_variant("Result", "Err") {
+            if let Some((_, ty)) = fields.first() {
                 return ty.clone();
             }
         }

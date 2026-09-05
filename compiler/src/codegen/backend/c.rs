@@ -3997,7 +3997,55 @@ impl CBackend {
                         }
                     }
                     AggregateKind::Variant(name, disc, variant_name) => {
-                        if vals.is_empty() {
+                        // Option/Result are prelude builtins with a fixed field
+                        // layout (`.has_value`/`.value`, `.is_ok`/`.ok`/`.err`)
+                        // that the runtime methods and match-lowering read. A
+                        // path-qualified construction (`Option::Some(x)`) reaches
+                        // this generic aggregate path when the program also
+                        // declares `enum Option`; emit the builtin shape so it
+                        // agrees with those readers instead of the generic
+                        // `.tag`/`.data` shape (which the Option typedef lacks).
+                        let is_builtin_sum = matches!(name.as_ref(), "Option" | "Result");
+                        if is_builtin_sum {
+                            // Pick the 8-byte union slot from the payload type.
+                            let slot = match operands.first() {
+                                Some(MirValue::Local(id)) => {
+                                    match locals.get(id.0 as usize).map(|l| &l.ty) {
+                                        Some(MirType::Float(_)) => "f",
+                                        Some(MirType::Ptr(_)) => "p",
+                                        _ => "i",
+                                    }
+                                }
+                                Some(MirValue::Const(MirConst::Float(..))) => "f",
+                                _ => "i",
+                            };
+                            let cast = match slot {
+                                "f" => "(double)",
+                                "p" => "(void*)",
+                                _ => "(int64_t)",
+                            };
+                            match (name.as_ref(), variant_name.as_ref()) {
+                                ("Option", "Some") if !vals.is_empty() => format!(
+                                    "((Option){{ .has_value = true, .value = {{ .{} = {}{} }} }})",
+                                    slot, cast, vals[0]
+                                ),
+                                ("Option", "Some") => {
+                                    "((Option){ .has_value = true })".to_string()
+                                }
+                                ("Option", _) => "((Option){ .has_value = false })".to_string(),
+                                ("Result", "Ok") if !vals.is_empty() => format!(
+                                    "((Result){{ .is_ok = true, .ok = {{ .ok_{} = {}{} }} }})",
+                                    slot, cast, vals[0]
+                                ),
+                                ("Result", "Ok") => "((Result){ .is_ok = true })".to_string(),
+                                ("Result", _) if !vals.is_empty() => format!(
+                                    "((Result){{ .is_ok = false, .err = {{ .err_{} = {}{} }} }})",
+                                    slot, cast, vals[0]
+                                ),
+                                ("Result", _) => "((Result){ .is_ok = false })".to_string(),
+                                _ => unreachable!(),
+                            }
+                        } else if vals.is_empty() {
                             // Unit variant - no data fields
                             format!("({}){{ .tag = {} }}", name, disc)
                         } else {
