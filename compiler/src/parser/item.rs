@@ -481,31 +481,54 @@ impl<'a> Parser<'a> {
     ) -> ParseResult<Option<Param>> {
         use crate::ast::{Mutability, Path, PathSegment, Pattern, PatternKind, Type, TypeKind};
 
-        // Check for &self or &mut self
+        // Check for a reference self receiver: `&self`, `&'a self`,
+        // `&mut self`, or `&'a mut self`. Look past the `&`, an optional
+        // lifetime, and an optional `mut` to confirm `self` before consuming
+        // anything; otherwise this is an ordinary reference-typed parameter
+        // (`&Frustum`, `&'a T`) and we fall through to the pattern parser.
         if self.check(&TokenKind::And) {
-            // Look ahead to see if this is &self or &mut self
-            let is_ref_self = self.peek().kind == TokenKind::Keyword(Keyword::Self_);
-            let is_ref_mut_self = self.peek().kind == TokenKind::Keyword(Keyword::Mut)
-                && self.pos + 2 < self.tokens.len()
-                && self.tokens[self.pos + 2].kind == TokenKind::Keyword(Keyword::Self_);
+            let mut offset = 1;
+            let has_lifetime = self.peek_n(offset).kind == TokenKind::Lifetime;
+            if has_lifetime {
+                offset += 1;
+            }
+            let has_mut = self.peek_n(offset).kind == TokenKind::Keyword(Keyword::Mut);
+            if has_mut {
+                offset += 1;
+            }
 
-            if is_ref_self {
-                // &self
+            if self.peek_n(offset).kind == TokenKind::Keyword(Keyword::Self_) {
                 self.advance(); // consume &
+
+                // An explicit receiver lifetime (`&'a self`); the corpus pairs
+                // it with a `<'a>` generic on the method.
+                let lifetime = if has_lifetime {
+                    Some(self.expect_lifetime()?)
+                } else {
+                    None
+                };
+
+                let mutability = if has_mut {
+                    self.advance(); // consume mut
+                    Mutability::Mutable
+                } else {
+                    Mutability::Immutable
+                };
+
                 let self_span = self.current_span();
                 self.advance(); // consume self
 
                 let self_ident = Ident::new("self", self_span);
                 let pattern = Pattern::new(
                     PatternKind::Ident {
-                        mutability: Mutability::Immutable,
+                        mutability,
                         name: self_ident,
                         subpattern: None,
                     },
                     self_span,
                 );
 
-                // Type is &Self
+                // Type is `&Self` / `&'a Self` / `&mut Self` / `&'a mut Self`.
                 let self_type_path = Path {
                     segments: vec![PathSegment {
                         ident: Ident::new("Self", self_span),
@@ -520,55 +543,8 @@ impl<'a> Parser<'a> {
                 };
                 let ty = Type {
                     kind: TypeKind::Ref {
-                        lifetime: None,
-                        mutability: Mutability::Immutable,
-                        ty: Box::new(inner_ty),
-                    },
-                    span: start.merge(&self_span),
-                    id: NodeId::DUMMY,
-                };
-
-                return Ok(Some(Param {
-                    attrs: attrs.to_vec(),
-                    pattern,
-                    ty: Box::new(ty),
-                    default: None,
-                    span: start.merge(&self_span),
-                }));
-            } else if is_ref_mut_self {
-                // &mut self
-                self.advance(); // consume &
-                self.advance(); // consume mut
-                let self_span = self.current_span();
-                self.advance(); // consume self
-
-                let self_ident = Ident::new("self", self_span);
-                let pattern = Pattern::new(
-                    PatternKind::Ident {
-                        mutability: Mutability::Mutable,
-                        name: self_ident,
-                        subpattern: None,
-                    },
-                    self_span,
-                );
-
-                // Type is &mut Self
-                let self_type_path = Path {
-                    segments: vec![PathSegment {
-                        ident: Ident::new("Self", self_span),
-                        generics: vec![],
-                    }],
-                    span: self_span,
-                };
-                let inner_ty = Type {
-                    kind: TypeKind::Path(self_type_path),
-                    span: self_span,
-                    id: NodeId::DUMMY,
-                };
-                let ty = Type {
-                    kind: TypeKind::Ref {
-                        lifetime: None,
-                        mutability: Mutability::Mutable,
+                        lifetime,
+                        mutability,
                         ty: Box::new(inner_ty),
                     },
                     span: start.merge(&self_span),
@@ -1694,6 +1670,47 @@ mod tests {
                 assert!(f.body.is_some());
             }
             other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reference_self_receiver_with_lifetime_parses() {
+        // `&'a self` and `&'a mut self` are reference receivers carrying an
+        // explicit lifetime; the corpus pairs them with a `<'a>` method
+        // generic on iterator-returning methods. Confirm all four reference
+        // receiver shapes parse and that the lifetime and mutability land on
+        // the receiver's `&Self` type. `&self`/`&mut self` are checked here
+        // too so the refactor that added the lifetime forms is pinned as
+        // behaviour-preserving.
+        let cases = [
+            ("fn f<'a>(&'a self) {}", true, Mutability::Immutable),
+            ("fn f<'a>(&'a mut self) {}", true, Mutability::Mutable),
+            ("fn f(&self) {}", false, Mutability::Immutable),
+            ("fn f(&mut self) {}", false, Mutability::Mutable),
+        ];
+        for (src, has_lifetime, mutability) in cases {
+            let item =
+                parse_item_str(src).unwrap_or_else(|e| panic!("`{src}` should parse: {e:?}"));
+            let f = match &item.kind {
+                ItemKind::Function(f) => f,
+                other => panic!("`{src}` parsed as {other:?}, expected Function"),
+            };
+            assert_eq!(f.sig.params.len(), 1, "`{src}` should have one (self) param");
+            match &f.sig.params[0].ty.kind {
+                TypeKind::Ref {
+                    lifetime,
+                    mutability: m,
+                    ..
+                } => {
+                    assert_eq!(
+                        lifetime.is_some(),
+                        has_lifetime,
+                        "`{src}` receiver lifetime presence"
+                    );
+                    assert_eq!(*m, mutability, "`{src}` receiver mutability");
+                }
+                other => panic!("`{src}` receiver type was {other:?}, expected Ref"),
+            }
         }
     }
 
