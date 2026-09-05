@@ -1069,6 +1069,14 @@ struct CheckReceiptDiagnostic {
     stage: &'static str,
     kind: String,
     message: String,
+    /// 1-based line of the diagnostic's start, when the stage resolved it.
+    /// Omitted (not `null`) when absent, so a v1 consumer that never read the
+    /// field keeps parsing unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<usize>,
+    /// 1-based column of the diagnostic's start. Omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    col: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     help: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1205,6 +1213,31 @@ struct ReceiptVerificationCheck {
     message: Option<String>,
 }
 
+/// A parse diagnostic with its source location resolved once, at check time,
+/// while the `SourceFile` is still live. `CheckOutcome` outlives that borrow,
+/// so a raw `ParseError` (which only carries a byte `Span`) could not be
+/// turned into `line:col` later. Resolving here lets both the human renderer
+/// and the receipt report a location, matching the `error[path:line:col]`
+/// shape that `build`/`run` already print via `report_parse_errors`.
+struct ParseDiagnostic {
+    /// The kind message alone (`ParseError::message`), with no path, location,
+    /// help, or notes folded in. Help and notes ride their own fields so the
+    /// receipt entry matches the shape of a type diagnostic.
+    message: String,
+    /// 1-based line of the error's start.
+    line: usize,
+    /// 1-based column of the error's start.
+    col: usize,
+    /// The full source line, kept for the caret underline. `None` when the
+    /// span points past the last line (recovered EOF errors).
+    snippet: Option<String>,
+    /// Caret length under the start column (at least 1), clamped to the
+    /// snippet at render time.
+    underline: usize,
+    help: Option<String>,
+    notes: Vec<String>,
+}
+
 struct CheckOutcome {
     source: String,
     compiler_version: &'static str,
@@ -1214,7 +1247,7 @@ struct CheckOutcome {
     input_digests: Vec<CheckReceiptInputDigest>,
     items: usize,
     tokens: usize,
-    parse_errors: Vec<String>,
+    parse_errors: Vec<ParseDiagnostic>,
     type_errors: Vec<TypeErrorWithSpan>,
     function_summaries: Vec<FunctionEffectSummary>,
 }
@@ -5694,12 +5727,14 @@ fn build_check_receipt(
         outcome
             .parse_errors
             .iter()
-            .map(|message| CheckReceiptDiagnostic {
+            .map(|diag| CheckReceiptDiagnostic {
                 stage: "parse",
                 kind: "ParseError".to_string(),
-                message: message.clone(),
-                help: None,
-                notes: Vec::new(),
+                message: diag.message.clone(),
+                line: Some(diag.line),
+                col: Some(diag.col),
+                help: diag.help.clone(),
+                notes: diag.notes.clone(),
             }),
     );
     diagnostics.extend(
@@ -5710,6 +5745,8 @@ fn build_check_receipt(
                 stage: "type",
                 kind: type_error_kind(&err.error).to_string(),
                 message: err.error.to_string(),
+                line: None,
+                col: None,
                 help: err.help.clone(),
                 notes: err.notes.clone(),
             }),
@@ -5782,10 +5819,29 @@ fn run_check(file: &Path) -> Result<CheckOutcome, i32> {
 
     let mut parser = Parser::new(&source_file, tokens);
     let mut ast = parser.parse().unwrap();
+    // Resolve each parse error's byte span to `line:col` and grab its source
+    // line now, while `source_file` is borrowable. Same arithmetic as
+    // `report_parse_errors` (the `build`/`run` renderer), so `check` reports
+    // the identical location for the identical error.
     let parse_errors = parser
         .errors()
         .iter()
-        .map(ToString::to_string)
+        .map(|err| {
+            let line = source_file.lookup_line(err.span.start);
+            let line_start = source_file.line_start(line).unwrap_or(err.span.start);
+            let col = err.span.start.0.saturating_sub(line_start.0) as usize;
+            let snippet = source_file.source().lines().nth(line).map(str::to_string);
+            let underline = (err.span.end.0.saturating_sub(err.span.start.0) as usize).max(1);
+            ParseDiagnostic {
+                message: err.message(),
+                line: line + 1,
+                col: col + 1,
+                snippet,
+                underline,
+                help: err.help.clone(),
+                notes: err.notes.clone(),
+            }
+        })
         .collect::<Vec<_>>();
     let item_count = ast.items.len();
 
@@ -5847,6 +5903,34 @@ fn render_check_line(receipt_to_stdout: bool, message: impl AsRef<str>) {
     }
 }
 
+/// Render one parse diagnostic to stderr as `error[path:line:col]: message`
+/// with the source line and a caret underline. Mirrors `report_parse_errors`
+/// (the `build`/`run` renderer) so a parse error reads the same whether it is
+/// found by `check` or by `build`; the location was resolved in `run_check`.
+fn render_parse_diagnostic(source_path: &str, diag: &ParseDiagnostic) {
+    eprintln!(
+        "error[{}:{}:{}]: {}",
+        source_path, diag.line, diag.col, diag.message
+    );
+    if let Some(src_line) = &diag.snippet {
+        eprintln!("  {} | {}", diag.line, src_line);
+        let padding = format!("{}", diag.line).len();
+        let col0 = diag.col.saturating_sub(1);
+        eprintln!(
+            "  {} | {}{}",
+            " ".repeat(padding),
+            " ".repeat(col0),
+            "^".repeat(diag.underline.min(src_line.len().saturating_sub(col0)))
+        );
+    }
+    if let Some(help) = &diag.help {
+        eprintln!("  help: {}", help);
+    }
+    for note in &diag.notes {
+        eprintln!("  note: {}", note);
+    }
+}
+
 fn render_check_human_output(outcome: &CheckOutcome, receipt_to_stdout: bool) {
     render_check_line(
         receipt_to_stdout,
@@ -5869,9 +5953,8 @@ fn render_check_human_output(outcome: &CheckOutcome, receipt_to_stdout: bool) {
     }
 
     if !outcome.parse_errors.is_empty() {
-        eprintln!("Parse errors:");
-        for err in &outcome.parse_errors {
-            eprintln!("  {}", err);
+        for diag in &outcome.parse_errors {
+            render_parse_diagnostic(&outcome.source, diag);
         }
     }
     if !outcome.type_errors.is_empty() {

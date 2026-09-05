@@ -18703,3 +18703,71 @@ fn check_mod_self_import_cycle_fails_closed() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn check_parse_error_reports_line_and_column() {
+    // `check` used to print parse errors with no location, while `build`/`run`
+    // printed `error[path:line:col]` with a caret underline. This locks in that
+    // `check` now resolves the same location -- in both the human output and
+    // the receipt -- so a parse failure is as locatable from `check` as from a
+    // build, and the corpus can be triaged by exact site.
+    let dir = std::env::temp_dir().join(format!("buildlang_parseloc_{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let file = dir.join("parseloc.bld");
+    // The missing `;` after `let x = 5` is reported at the next token,
+    // `println!` on line 3, which starts at column 5 (a four-space indent).
+    fs::write(
+        &file,
+        "fn main() ~ Console {\n    let x = 5\n    println!(\"{}\", x);\n}\n",
+    )
+    .expect("write parse-location fixture");
+
+    // Human output: `error[<path>:3:5]: expected `;`` plus a caret line.
+    let (status, _stdout, stderr) = check_within(&file, 30);
+    assert!(
+        !status.success(),
+        "a missing semicolon must fail closed\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(":3:5]:"),
+        "check must report the parse error at line 3, column 5\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("expected `;`"),
+        "the diagnostic must name the missing semicolon\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains('^'),
+        "check must underline the offending token with a caret\nstderr:\n{stderr}"
+    );
+
+    // Receipt: the parse diagnostic carries structured line/col, so machine
+    // consumers get the location too (type diagnostics still omit it).
+    let output = buildc()
+        .arg("check")
+        .arg(&file)
+        .arg("--receipt")
+        .arg("-")
+        .output()
+        .expect("run buildc check --receipt -");
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON receipt");
+    let parse_diag = receipt["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .find(|d| d["stage"] == "parse")
+        .expect("a parse diagnostic in the receipt");
+    assert_eq!(parse_diag["line"], 3, "receipt parse diagnostic line");
+    assert_eq!(parse_diag["col"], 5, "receipt parse diagnostic column");
+    assert_eq!(parse_diag["kind"], "ParseError");
+    assert!(
+        parse_diag["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("expected `;`"),
+        "receipt message must name the missing semicolon: {parse_diag}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
