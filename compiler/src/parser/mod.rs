@@ -338,7 +338,10 @@ impl<'a> Parser<'a> {
         let mut items = Vec::new();
 
         while !self.check(&TokenKind::CloseDelim(close)) && !self.is_eof() {
-            items.push(parse_elem(self)?);
+            // A `{` inside a delimited group is an unambiguous struct literal,
+            // never a block, so an enclosing scrutinee/condition restriction
+            // does not apply here.
+            items.push(self.without_struct_restriction(|p| parse_elem(p))?);
 
             if !self.eat(sep) {
                 break;
@@ -349,6 +352,21 @@ impl<'a> Parser<'a> {
         let span = open_span.merge(&close_span);
 
         Ok((items, span))
+    }
+
+    /// Parse with the `no_struct_literal` restriction cleared, then restore the
+    /// prior restrictions. Used at delimited boundaries (`( )`, `[ ]`, call
+    /// arguments) where a `{` cannot be mistaken for a block, so struct literals
+    /// are always allowed regardless of an enclosing scrutinee/condition.
+    fn without_struct_restriction<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> ParseResult<T>,
+    ) -> ParseResult<T> {
+        let saved = self.restrictions;
+        self.restrictions.no_struct_literal = false;
+        let result = f(self);
+        self.restrictions = saved;
+        result
     }
 
     /// Parse a comma-separated list in parentheses.

@@ -601,7 +601,7 @@ impl<'a> Parser<'a> {
             // Index: expr[index]
             TokenKind::OpenDelim(Delimiter::Bracket) => {
                 self.advance();
-                let index = self.parse_expr()?;
+                let index = self.without_struct_restriction(|p| p.parse_expr())?;
                 let end = self
                     .expect(&TokenKind::CloseDelim(Delimiter::Bracket))?
                     .span;
@@ -1276,7 +1276,7 @@ impl<'a> Parser<'a> {
             return Ok(Expr::new(ExprKind::Tuple(Vec::new()), start.merge(&end)));
         }
 
-        let first = self.parse_expr()?;
+        let first = self.without_struct_restriction(|p| p.parse_expr())?;
 
         // Check for tuple
         if self.check(&TokenKind::Comma) {
@@ -1284,7 +1284,7 @@ impl<'a> Parser<'a> {
             let mut elements = vec![first];
 
             while !self.check(&TokenKind::CloseDelim(Delimiter::Paren)) && !self.is_eof() {
-                elements.push(self.parse_expr()?);
+                elements.push(self.without_struct_restriction(|p| p.parse_expr())?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -1315,12 +1315,12 @@ impl<'a> Parser<'a> {
         // `ExprKind::Array` holds bare expressions, so the attributes are
         // parsed and dropped rather than attached.
         let _ = self.parse_outer_attrs()?;
-        let first = self.parse_expr()?;
+        let first = self.without_struct_restriction(|p| p.parse_expr())?;
 
         // Repeat: [expr; count]
         if self.check(&TokenKind::Semi) {
             self.advance();
-            let count = self.parse_expr()?;
+            let count = self.without_struct_restriction(|p| p.parse_expr())?;
             let end = self
                 .expect(&TokenKind::CloseDelim(Delimiter::Bracket))?
                 .span;
@@ -1340,7 +1340,7 @@ impl<'a> Parser<'a> {
         if self.eat(&TokenKind::Comma) {
             while !self.check(&TokenKind::CloseDelim(Delimiter::Bracket)) && !self.is_eof() {
                 let _ = self.parse_outer_attrs()?;
-                elements.push(self.parse_expr()?);
+                elements.push(self.without_struct_restriction(|p| p.parse_expr())?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -2568,5 +2568,35 @@ mod tests {
             }
             other => panic!("expected Mul(Add(1,2), 3), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn struct_literal_allowed_in_scrutinee_call_argument() {
+        // A `match`/`if` scrutinee forbids a bare struct literal (so `match S {`
+        // is not read as a struct), but that restriction must not leak into a
+        // call argument: `f(S { x: 1 })` inside the scrutinee is unambiguous.
+        let expr = parse_expr_str("match f(S { x: 1 }) { _ => 0 }")
+            .expect("struct literal inside a scrutinee call argument should parse");
+        let scrutinee = match &expr.kind {
+            ExprKind::Match { scrutinee, .. } => scrutinee,
+            other => panic!("expected Match, got {:?}", other),
+        };
+        let args = match &scrutinee.kind {
+            ExprKind::Call { args, .. } => args,
+            other => panic!("expected Call scrutinee, got {:?}", other),
+        };
+        assert!(
+            matches!(&args[0].kind, ExprKind::Struct { .. }),
+            "call argument should be a struct literal, got {:?}",
+            args[0].kind
+        );
+
+        // The same holds for an `if` condition and for bracket/paren nesting.
+        parse_expr_str("if f(S { x: 1 }) { 1 } else { 0 }")
+            .expect("struct literal inside an if-condition call argument should parse");
+        parse_expr_str("match arr[S { x: 1 }] { _ => 0 }")
+            .expect("struct literal inside a scrutinee index should parse");
+        parse_expr_str("match (S { x: 1 }) { _ => 0 }")
+            .expect("parenthesized struct literal in a scrutinee should parse");
     }
 }
