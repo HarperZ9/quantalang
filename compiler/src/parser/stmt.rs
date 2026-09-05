@@ -327,4 +327,17 @@ mod tests {
         );
         assert!(errors.is_empty(), "consecutive `if` statements should parse, got: {errors:?}");
     }
+
+    #[test]
+    fn turbofish_on_path_call_parses() {
+        // `path::seg::<T>()` turbofish on a plain `::`-path (not a `.method`
+        // call and not `Self::`) was rejected with `expected identifier, found
+        // `<``, because the path loop ate the `::` and then demanded an ident.
+        let errors = parse_fn_body_errors(
+            "let n = std::mem::size_of::<i32>();\n\
+             let r = rand::random::<f32>();\n\
+             let v = Vec::<u8>::new();",
+        );
+        assert!(errors.is_empty(), "turbofish path calls should parse, got: {errors:?}");
+    }
 }

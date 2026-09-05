@@ -587,15 +587,27 @@ impl<'a> Parser<'a> {
 
         loop {
             let ident = self.expect_ident()?;
-            // In expression context, only parse generic args after turbofish `::<`.
-            // A bare `<` is ambiguous with the comparison operator.
-            let generics = if expr_context {
-                Vec::new() // Turbofish handled elsewhere in the expression parser
-            } else if self.check(&TokenKind::Lt) {
+            // In type context a bare `<` opens a generic argument list. In
+            // expression context a bare `<` is ambiguous with the less-than
+            // operator, so generics there come only from a turbofish `::<...>`
+            // (handled just below).
+            let mut generics = if !expr_context && self.check(&TokenKind::Lt) {
                 self.parse_generic_args()?
             } else {
                 Vec::new()
             };
+
+            // Turbofish `::<...>` binds its generics to the segment just parsed,
+            // e.g. `size_of::<i32>()` or `Vec::<u8>::new()`. Consume the `::<`
+            // here so the path loop does not then demand an identifier after the
+            // `::`, which was the cause of `expected identifier, found `<``.
+            if expr_context
+                && self.check(&TokenKind::ColonColon)
+                && self.peek().kind == TokenKind::Lt
+            {
+                self.advance(); // consume `::`
+                generics = self.parse_generic_args()?;
+            }
 
             segments.push(PathSegment::with_generics(ident, generics));
 
