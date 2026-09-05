@@ -419,12 +419,9 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // CLOSURES
             // =====================================================================
-            TokenKind::Or => self.parse_closure_expr(false, false),
-            TokenKind::OrOr => {
-                // || - closure with no params
-                self.advance();
-                self.parse_closure_body(Vec::new(), None, start, false, false)
-            }
+            // `|params|` and `||` (zero params) both route through the closure
+            // parser, which handles the `OrOr` empty-list case itself.
+            TokenKind::Or | TokenKind::OrOr => self.parse_closure_expr(false, false),
 
             TokenKind::Keyword(Keyword::Move) => {
                 self.advance();
@@ -1612,6 +1609,19 @@ impl<'a> Parser<'a> {
     fn parse_closure_expr(&mut self, is_move: bool, is_async: bool) -> ParseResult<Expr> {
         let start = self.current_span();
 
+        // `||` lexes as a single `OrOr` token, so a zero-parameter closure never
+        // presents two separate `|`s. Consume it as an empty parameter list. This
+        // covers bare `|| body`, `move || body`, and `async || body` uniformly,
+        // including an explicit `-> T` return type.
+        if self.eat(&TokenKind::OrOr) {
+            let return_type = if self.eat(&TokenKind::Arrow) {
+                Some(Box::new(self.parse_type()?))
+            } else {
+                None
+            };
+            return self.parse_closure_body(Vec::new(), return_type, start, is_move, is_async);
+        }
+
         self.expect(&TokenKind::Or)?;
 
         let mut params = Vec::new();
@@ -1910,6 +1920,34 @@ mod tests {
                     assert_eq!(id.as_str(), word, "identifier name should be preserved")
                 }
                 other => panic!("`{word}` parsed as {other:?}, expected ExprKind::Ident"),
+            }
+        }
+    }
+
+    // =========================================================================
+    // ZERO-PARAMETER CLOSURES
+    // =========================================================================
+
+    #[test]
+    fn zero_param_closures_parse_in_every_flavor() {
+        // `||` is a single `OrOr` token, so the empty parameter list must be
+        // accepted by the closure parser directly -- not only by the bare
+        // prefix path. `move ||` and `async ||` route through
+        // `parse_closure_expr`, and an explicit `-> T` must still parse.
+        for src in [
+            "|| 1",
+            "move || 1",
+            "async || 1",
+            "|| -> i32 { 1 }",
+            "move || -> i32 { 1 }",
+        ] {
+            let expr = parse_expr_str(src)
+                .unwrap_or_else(|e| panic!("`{src}` should parse as a closure: {e:?}"));
+            match &expr.kind {
+                ExprKind::Closure { params, .. } => {
+                    assert!(params.is_empty(), "`{src}` should have zero params")
+                }
+                other => panic!("`{src}` parsed as {other:?}, expected ExprKind::Closure"),
             }
         }
     }
