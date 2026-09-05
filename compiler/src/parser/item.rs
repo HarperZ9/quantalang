@@ -1221,6 +1221,7 @@ impl<'a> Parser<'a> {
             name,
             content,
             is_unsafe,
+            is_file_module: false,
         })
     }
 
@@ -1272,6 +1273,7 @@ impl<'a> Parser<'a> {
             name,
             content,
             is_unsafe,
+            is_file_module: true,
         })
     }
 

@@ -650,7 +650,40 @@ enum ChainCommands {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let result = match cli.command {
+    // Type checking and the other AST-recursive passes recurse on the native
+    // stack in proportion to a program's nesting and size. A large but finite
+    // program -- deep expression trees, or a long function reachable from an
+    // entry point, which triggers a second whole-program effect pass -- can
+    // exceed the default 8 MB main-thread stack and abort the process. The
+    // engine must fail closed with a diagnostic and never abort, so run the
+    // whole command on a worker thread with a large stack. This is the same
+    // technique rustc uses for the same recursion. A stack this large clears
+    // every realistic program; a truly pathological input would still need a
+    // recursion-depth guard in the checker to turn a would-be overflow into a
+    // diagnostic, which this does not add.
+    let result = std::thread::Builder::new()
+        .name("buildc".into())
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || run_cli(cli))
+        .expect("failed to spawn compiler worker thread")
+        .join()
+        .unwrap_or_else(|_| {
+            eprintln!("error: internal compiler error (worker thread panicked)");
+            Err(70)
+        });
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(code) => ExitCode::from(code as u8),
+    }
+}
+
+/// Dispatch a parsed CLI invocation to its command handler.
+///
+/// Split out of `main` so it can run on a large-stack worker thread; see the
+/// comment there for why.
+fn run_cli(cli: Cli) -> Result<(), i32> {
+    match cli.command {
         Some(Commands::Lex { file, verbose }) => cmd_lex(&file, verbose),
         Some(Commands::Parse { file, json }) => cmd_parse(&file, json),
         Some(Commands::Check {
@@ -786,11 +819,6 @@ fn main() -> ExitCode {
                 Err(1)
             }
         }
-    };
-
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(code) => ExitCode::from(code as u8),
     }
 }
 
@@ -5082,6 +5110,7 @@ fn type_error_kind(error: &TypeError) -> &'static str {
         TypeError::NotAwaitable { .. } => "NotAwaitable",
         TypeError::UnitMismatch { .. } => "UnitMismatch",
         TypeError::UnitOperationMismatch { .. } => "UnitOperationMismatch",
+        TypeError::ModuleImportCycle { .. } => "ModuleImportCycle",
         _ => "TypeError",
     }
 }
@@ -8994,7 +9023,8 @@ fn find_stdlib_path() -> Option<PathBuf> {
 
 fn resolve_modules(ast: &mut Module, source_dir: &Path) -> Result<(), i32> {
     let mut ledger = None;
-    resolve_modules_with_prefix(ast, source_dir, "", &mut ledger)
+    let mut visiting = HashSet::new();
+    resolve_modules_with_prefix(ast, source_dir, "", &mut ledger, &mut visiting)
 }
 
 fn resolve_modules_recording_inputs(
@@ -9003,24 +9033,37 @@ fn resolve_modules_recording_inputs(
     ledger: &mut InputDigestLedger,
 ) -> Result<(), i32> {
     let mut ledger = Some(ledger);
-    resolve_modules_with_prefix(ast, source_dir, "", &mut ledger)
+    let mut visiting = HashSet::new();
+    resolve_modules_with_prefix(ast, source_dir, "", &mut ledger, &mut visiting)
 }
 
 /// Resolve modules with a prefix for nested module support.
 /// The prefix is prepended to all mangled names (e.g., "utils_" for sub-modules of utils).
+///
+/// `visiting` holds the canonical paths of the module files on the current
+/// resolution stack. It turns an import cycle -- including a `mod NAME;` in a
+/// file that resolves back to a file already being resolved -- into a
+/// fail-closed diagnostic instead of unbounded recursion.
 fn resolve_modules_with_prefix(
     ast: &mut Module,
     source_dir: &Path,
     prefix: &str,
     ledger: &mut Option<&mut InputDigestLedger>,
+    visiting: &mut HashSet<PathBuf>,
 ) -> Result<(), i32> {
     // Collect module names from `mod foo;` declarations (content == None).
+    //
+    // A file-level `module NAME` header is skipped here: it names the module
+    // the file provides, it is not a request to load `NAME.bld`. Loading it
+    // would read the declaring file itself whenever the file is named after
+    // its module (e.g. `benchmarks.bld` declaring `module benchmarks`), which
+    // recurses forever.
     let mod_names: Vec<String> = ast
         .items
         .iter()
         .filter_map(|item| {
             if let ItemKind::Mod(ref m) = item.kind {
-                if m.content.is_none() {
+                if m.content.is_none() && !m.is_file_module {
                     return Some(m.name.name.to_string());
                 }
             }
@@ -9058,6 +9101,21 @@ fn resolve_modules_with_prefix(
         } else {
             continue;
         };
+
+        // Fail-closed cycle guard: if this module file is already on the
+        // resolution stack, a `mod` import cycle (a->b->a, or a file importing
+        // itself) would recurse forever. Emit a diagnostic instead of hanging.
+        // Canonicalize so the same file reached by two spellings compares equal.
+        let module_key =
+            std::fs::canonicalize(&actual_file).unwrap_or_else(|_| actual_file.clone());
+        if !visiting.insert(module_key.clone()) {
+            eprintln!(
+                "error: module import cycle detected at '{}' (module '{}' is already being resolved)",
+                actual_file.display(),
+                mod_name
+            );
+            return Err(1);
+        }
 
         // Read and parse the module file
         let mod_bytes = std::fs::read(&actual_file).map_err(|e| {
@@ -9105,7 +9163,11 @@ fn resolve_modules_with_prefix(
         };
 
         // Recursively resolve sub-modules within this module
-        resolve_modules_with_prefix(&mut mod_ast, &sub_source_dir, &full_prefix, ledger)?;
+        resolve_modules_with_prefix(&mut mod_ast, &sub_source_dir, &full_prefix, ledger, visiting)?;
+        // Done with this module's subtree; drop it from the stack so a sibling
+        // branch may legitimately include the same module again (a diamond is
+        // not a cycle).
+        visiting.remove(&module_key);
 
         // Collect names defined in this module (for intra-module rewriting)
         let mod_defined: std::collections::HashSet<String> = mod_ast

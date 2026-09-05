@@ -9,7 +9,8 @@
 //! This module handles type checking at the item level, while `infer.rs`
 //! handles expression-level type inference.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::ast::{self, ImplItemKind, ItemKind, StructFields, TraitItemKind};
@@ -38,6 +39,13 @@ pub struct TypeChecker<'ctx> {
     effect_ctx: super::effects::EffectContext,
     /// Source directory for resolving external module files.
     source_dir: Option<std::path::PathBuf>,
+    /// Canonicalized paths of `mod foo;` files currently on the load stack.
+    /// A file that is already being loaded must not be loaded again, or a
+    /// `mod NAME;` chain that comes back to itself would recurse until the
+    /// stack overflows. Fail closed: a repeated path is a cycle diagnostic,
+    /// not a crash. Paths are removed after their subtree finishes so a
+    /// diamond (two siblings importing the same leaf) is not a false cycle.
+    loading_modules: HashSet<PathBuf>,
     /// Source text for span-backed token evidence during inference.
     source_text: Option<Arc<str>>,
     /// Source ID associated with `source_text`.
@@ -54,6 +62,7 @@ impl<'ctx> TypeChecker<'ctx> {
             errors: Vec::new(),
             effect_ctx: super::effects::EffectContext::new(),
             source_dir: None,
+            loading_modules: HashSet::new(),
             source_text: None,
             source_id: None,
             function_effect_summaries: Vec::new(),
@@ -286,11 +295,29 @@ impl<'ctx> TypeChecker<'ctx> {
             for item in &content.items {
                 self.collect_item(item);
             }
+        } else if m.is_file_module {
+            // File-level `module NAME` header: the rest of the file already IS
+            // the body, so there is nothing to load. Loading `NAME.bld` here
+            // would re-open the file that declared the header (its own stem)
+            // and recurse until the stack overflows.
         } else if let Some(ref dir) = self.source_dir.clone() {
-            // External module: load from disk
+            // External submodule: `mod NAME;` loads NAME.bld from disk.
             let mod_name = m.name.name.as_ref();
             let mod_path = dir.join(format!("{}.bld", mod_name));
             if mod_path.exists() {
+                let key = std::fs::canonicalize(&mod_path).unwrap_or_else(|_| mod_path.clone());
+                if !self.loading_modules.insert(key.clone()) {
+                    // Already on the load stack: a cycle. Fail closed with a
+                    // diagnostic instead of recursing into a stack overflow.
+                    self.error(
+                        TypeError::ModuleImportCycle {
+                            path: mod_path.display().to_string(),
+                            module: mod_name.to_string(),
+                        },
+                        m.name.span,
+                    );
+                    return;
+                }
                 if let Ok(source_text) = std::fs::read_to_string(&mod_path) {
                     let source = crate::lexer::SourceFile::new(
                         mod_path.to_string_lossy().as_ref(),
@@ -306,6 +333,7 @@ impl<'ctx> TypeChecker<'ctx> {
                         }
                     }
                 }
+                self.loading_modules.remove(&key);
             }
         }
     }
@@ -1411,10 +1439,30 @@ impl<'ctx> TypeChecker<'ctx> {
     fn check_mod(&mut self, m: &ast::ModDef) {
         // External module: `mod foo;` loads foo.bld from disk
         if m.content.is_none() {
+            if m.is_file_module {
+                // File-level `module NAME` header: the rest of the file already
+                // IS the body, so there is nothing to load. Loading `NAME.bld`
+                // here would re-open the declaring file and recurse forever.
+                return;
+            }
             if let Some(ref dir) = self.source_dir {
                 let mod_name = m.name.name.as_ref();
                 let mod_path = dir.join(format!("{}.bld", mod_name));
                 if mod_path.exists() {
+                    let key = std::fs::canonicalize(&mod_path)
+                        .unwrap_or_else(|_| mod_path.clone());
+                    if !self.loading_modules.insert(key.clone()) {
+                        // Already on the load stack: fail closed with a cycle
+                        // diagnostic instead of overflowing the stack.
+                        self.error(
+                            TypeError::ModuleImportCycle {
+                                path: mod_path.display().to_string(),
+                                module: mod_name.to_string(),
+                            },
+                            m.name.span,
+                        );
+                        return;
+                    }
                     if let Ok(source_text) = std::fs::read_to_string(&mod_path) {
                         let source = crate::lexer::SourceFile::new(
                             mod_path.to_string_lossy().as_ref(),
@@ -1475,6 +1523,7 @@ impl<'ctx> TypeChecker<'ctx> {
                             }
                         }
                     }
+                    self.loading_modules.remove(&key);
                 }
             }
             return;
@@ -1786,6 +1835,73 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.error, TypeError::ArityMismatch { .. })),
             "a non-variadic call with extra args must still raise ArityMismatch: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn call_through_fn_pointer_array_element_is_callable() {
+        // Iterating an array of function pointers binds each element by
+        // reference, so the callee is a `&fn(..) -> _`. Calling it must
+        // auto-deref to the underlying function rather than report the type
+        // as NotCallable. Regression for benchmarks.bld's
+        // `for bench in [bench_a, bench_b, ..] { let r = bench(); }`.
+        let errors = check_source(
+            "fn a() -> i32 { 1 }\n\
+             fn b() -> i32 { 2 }\n\
+             fn run() -> i32 {\n\
+                 let mut total = 0;\n\
+                 for f in [a, b] {\n\
+                     total = total + f();\n\
+                 }\n\
+                 total\n\
+             }",
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e.error, TypeError::NotCallable { .. })),
+            "calling an element of a function-pointer array must not be NotCallable: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn call_through_plain_reference_to_fn_is_callable() {
+        // A bare `&fn(..)` binding (not via an array) is equally callable:
+        // `let g = &f; g()` auto-derefs to call `f`.
+        let errors = check_source(
+            "fn f() -> i32 { 7 }\n\
+             fn run() -> i32 {\n\
+                 let g = &f;\n\
+                 g()\n\
+             }",
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e.error, TypeError::NotCallable { .. })),
+            "calling through a reference to a function must not be NotCallable: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn call_on_reference_to_non_function_still_errors() {
+        // Auto-deref applies only when the reference's target is a function.
+        // `(&i32)()` must still be reported as not callable (fail closed).
+        let errors = check_source(
+            "fn run() -> i32 {\n\
+                 let x = 5;\n\
+                 let r = &x;\n\
+                 r()\n\
+             }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e.error, TypeError::NotCallable { .. })),
+            "calling a reference to a non-function must still be NotCallable: {:?}",
             errors
         );
     }

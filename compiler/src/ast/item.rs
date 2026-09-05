@@ -409,6 +409,14 @@ pub struct ModDef {
     pub content: Option<ModContent>,
     /// Whether this is unsafe.
     pub is_unsafe: bool,
+    /// True for a file-level `module NAME` header (the rest of the file IS the
+    /// body), false for a `mod NAME;`/`mod NAME { .. }` submodule declaration.
+    ///
+    /// A bodyless `mod NAME;` tells the resolver to load `NAME.bld`; a bodyless
+    /// `module NAME` header must not, or a file named `NAME.bld` that declares
+    /// `module NAME` would load itself and recurse forever. The two forms are
+    /// otherwise identical in the AST, so the resolver relies on this flag.
+    pub is_file_module: bool,
 }
 
 /// Module content.

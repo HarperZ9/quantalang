@@ -4316,6 +4316,24 @@ impl<'ctx> TypeInfer<'ctx> {
         let func_ty = self.infer_expr(func);
         let func_ty = self.apply(&func_ty);
 
+        // Auto-deref a reference (or chain of references) to a function
+        // pointer: calling `f()` where `f: &fn() -> R` calls the underlying
+        // function. This is how `for f in [a, b] { f() }` type-checks, since
+        // iterating an array binds each element by reference, so the callee
+        // is a `&fn(..)`. Only peel when the target is a concrete function;
+        // `&i32`, `&Param`, `&Var`, and friends keep their own arms below.
+        let func_ty = {
+            let mut target = &func_ty;
+            while let TyKind::Ref(_, _, inner) = &target.kind {
+                target = inner;
+            }
+            if matches!(target.kind, TyKind::Fn(_)) {
+                target.clone()
+            } else {
+                func_ty.clone()
+            }
+        };
+
         match &func_ty.kind {
             TyKind::Fn(fn_ty) => {
                 // A C-style variadic function accepts at least its fixed
@@ -4503,12 +4521,16 @@ impl<'ctx> TypeInfer<'ctx> {
                 }
                 Ty::fresh_var()
             }
-            TyKind::Ref(_, _, ref inner)
-                if matches!(
-                    inner.kind,
-                    TyKind::Param(..) | TyKind::Var(_) | TyKind::Infer(_)
-                ) =>
-            {
+            // A call through `&F` where `F` is a generic type parameter is
+            // lenient: the `Fn` bound is not tracked here, so let
+            // monomorphization supply the concrete callee (mirrors the bare
+            // `TyKind::Param` arm above). This does NOT extend to a reference
+            // whose pointee is an unresolved inference variable: `let x = 5;
+            // let r = &x; r()` has `r: &{integer}`, which is not a function.
+            // Peeling it leniently would accept `(&i32)()` and silently return
+            // a fresh type -- a fail-open hole. Such a reference falls through
+            // to the `NotCallable` arm below and fails closed.
+            TyKind::Ref(_, _, ref inner) if matches!(inner.kind, TyKind::Param(..)) => {
                 let arg_tys: Vec<_> = args.iter().map(|a| self.infer_expr(a)).collect();
                 for (arg, ty) in args.iter().zip(arg_tys.iter()) {
                     self.reject_linear_escape(

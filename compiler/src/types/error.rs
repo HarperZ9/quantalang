@@ -427,12 +427,25 @@ pub enum TypeError {
         left: String,
         right: String,
     },
+
+    // =========================================================================
+    // MODULE ERRORS
+    // =========================================================================
+    /// A `mod NAME;` chain resolves back to a file already being loaded.
+    /// Reported instead of recursing into a stack overflow: the module graph
+    /// has a cycle and cannot be loaded. Names the path and the module that
+    /// closed the loop.
+    #[error("module import cycle: `{path}` is already being loaded (module `{module}` imports back into it)")]
+    ModuleImportCycle { path: String, module: String },
 }
 
 impl TypeError {
     /// Check if this is a fatal error that should stop type checking.
     pub fn is_fatal(&self) -> bool {
-        matches!(self, TypeError::Internal(_))
+        matches!(
+            self,
+            TypeError::Internal(_) | TypeError::ModuleImportCycle { .. }
+        )
     }
 
     /// Get a suggested fix for this error.

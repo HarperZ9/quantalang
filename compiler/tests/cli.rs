@@ -18608,3 +18608,98 @@ fn model_receipt_chains_beside_a_scientific_receipt_and_tamper_breaks_it() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Spawn `buildc check <file>` and wait up to `timeout_secs`, killing the
+/// process and failing the test if it does not exit. A module-resolution
+/// regression would otherwise hang the whole suite (this repo has a documented
+/// CI-hang failure class), so the wait is always bounded. Assumes the command's
+/// output is small enough not to fill the OS pipe buffer while we poll, which
+/// holds for `check` on the tiny fixtures below.
+fn check_within(file: &Path, timeout_secs: u64) -> (std::process::ExitStatus, String, String) {
+    use std::io::Read;
+    let mut child = buildc()
+        .arg("check")
+        .arg(file)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn buildc check");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll buildc check") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "buildc check '{}' did not terminate within {timeout_secs}s -- \
+                 module resolution likely regressed into unbounded recursion",
+                file.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    (status, stdout, stderr)
+}
+
+#[test]
+fn check_file_module_named_after_its_file_terminates() {
+    // A file `benchmarks.bld` that declares `module benchmarks` must NOT be
+    // read back as a `mod benchmarks;` submodule import of itself. This is the
+    // regression for the corpus hang: the file-level `module` header used to be
+    // indistinguishable from a bodyless `mod`, so the resolver loaded the
+    // declaring file again and recursed forever.
+    let dir = std::env::temp_dir().join(format!("buildlang_filemod_{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let file = dir.join("benchmarks.bld");
+    fs::write(
+        &file,
+        "module benchmarks\n\npub fn main() -> i32 {\n    return 0\n}\n",
+    )
+    .expect("write file-module fixture");
+
+    let (status, stdout, stderr) = check_within(&file, 30);
+    assert!(
+        status.success(),
+        "a file declaring `module <own filename>` must type-check, not hang or error\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_mod_self_import_cycle_fails_closed() {
+    // A `mod selfref;` inside `selfref.bld` asks the resolver to load the very
+    // file that declares it -- an import cycle. The resolver must emit a
+    // diagnostic and exit non-zero, never recurse forever.
+    let dir = std::env::temp_dir().join(format!("buildlang_modcycle_{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let file = dir.join("selfref.bld");
+    fs::write(
+        &file,
+        "mod selfref;\n\npub fn main() -> i32 {\n    return 0\n}\n",
+    )
+    .expect("write mod-cycle fixture");
+
+    let (status, _stdout, stderr) = check_within(&file, 30);
+    assert!(
+        !status.success(),
+        "a self-importing `mod` must fail closed, not succeed"
+    );
+    assert!(
+        stderr.contains("cycle detected"),
+        "a module import cycle must report a diagnostic\nstderr:\n{stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
