@@ -62,6 +62,29 @@ impl<'a> Parser<'a> {
         self.parse_expr_with_bp(0)
     }
 
+    /// Parse an expression in statement position under Rust's ExprWithBlock
+    /// rule. A block-like leading atom (`if`, `match`, a bare `{...}` block,
+    /// `loop`/`while`/`for`, `unsafe`/`async`/`handle`) is a complete statement
+    /// on its own: it does not bind a trailing infix or postfix operator, so a
+    /// following `*x` / `-x` / `&x` / `.foo()` begins a NEW statement instead of
+    /// being read as `block * x`, `block - x`, and so on. Without this a body
+    /// like `if c { .. } \n *ptr = v;` parses the `*` as multiplication
+    /// continuing the `if`, then the later `=` makes the whole `if * ptr` an
+    /// invalid assignment target.
+    ///
+    /// Any other leading atom resumes the ordinary Pratt loop, so
+    /// value-position parsing (the right side of `=`, call arguments, operands)
+    /// is untouched: only a statement that STARTS with a block-like expression
+    /// is affected. This mirrors the match-arm body rule; `continue_expr_with_bp`
+    /// is the shared tail.
+    pub fn parse_stmt_expr(&mut self) -> ParseResult<Expr> {
+        let lhs = self.parse_prefix_expr()?;
+        if Self::is_block_like_expr(&lhs) {
+            return Ok(lhs);
+        }
+        self.continue_expr_with_bp(lhs, 0)
+    }
+
     /// Parse an expression with minimum binding power.
     fn parse_expr_with_bp(&mut self, min_bp: u8) -> ParseResult<Expr> {
         // Parse prefix (atoms and unary operators)

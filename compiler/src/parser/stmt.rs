@@ -127,7 +127,11 @@ impl<'a> Parser<'a> {
 
     /// Parse an expression statement.
     fn parse_expr_stmt(&mut self, _attrs: Vec<Attribute>) -> ParseResult<Stmt> {
-        let expr = self.parse_expr()?;
+        // Statement position: a block-like leading expression (`if`, `match`,
+        // `{...}`, a loop, `unsafe`/`async`/`handle`) terminates at its closing
+        // brace and does not bind a trailing operator, so `if c { .. }` on one
+        // line and `*ptr = v;` on the next parse as two statements.
+        let expr = self.parse_stmt_expr()?;
         let start = expr.span;
 
         // Check if this is a block expression that doesn't need semicolon
@@ -298,6 +302,46 @@ mod tests {
         let mut parser = Parser::new(&source, tokens);
         let _ = parser.parse();
         parser.errors().iter().map(|e| e.message()).collect()
+    }
+
+    #[test]
+    fn block_like_statement_does_not_swallow_next_deref_assignment() {
+        // A block-like statement (`if`, `match`, bare block, loop, `unsafe`)
+        // is complete at its closing brace: a following line that begins with
+        // a prefix operator (`*ptr = v`, `*acc += n`, `-x`) is a SEPARATE
+        // statement, not a trailing operand of the block. Before the
+        // ExprWithBlock fix the `*` bound as multiplication continuing the
+        // block, and the later `=`/`+=` made the block the invalid left side
+        // of an assignment ("invalid left-hand side of assignment"). Each case
+        // is the shape found in the corpus (oracle/lib, nexus/diagnostics).
+        let bodies = [
+            "if sum > 0.0 { normalize(); }\n*run_length_probs = new_probs;",
+            "if a > b { record(); }\n*self.usage.entry(k).or_insert(0) += size;",
+            "match tag { A => one(), B => two() }\n*out = done;",
+            "unsafe { touch(); }\n*p = q;",
+            "{ let t = 1; use_it(t); }\n*p = q;",
+        ];
+        for body in bodies {
+            let errors = parse_fn_body_errors(body);
+            assert!(
+                errors.is_empty(),
+                "block-like statement followed by a deref-assignment should parse \
+                 as two statements, got errors for {body:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_with_block_like_right_side_still_binds() {
+        // The fix is scoped to statement position: a block-like expression on
+        // the RIGHT of `=` (value position) is unaffected and still parses as
+        // the assignment's value. This guards against a fix that stopped
+        // operator binding everywhere.
+        let errors = parse_fn_body_errors("let x = if c { 1 } else { 2 };\nuse_it(x);");
+        assert!(
+            errors.is_empty(),
+            "a block-like expression in value position must still parse, got: {errors:?}"
+        );
     }
 
     #[test]
