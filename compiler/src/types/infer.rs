@@ -22,6 +22,40 @@ use super::traits::{BuiltinTraits, TraitEnv, TraitResolver};
 use super::ty::*;
 use super::unify::Unifier;
 
+/// Default binding mode for match ergonomics (RFC 2005). When a structural
+/// pattern is matched against a reference type, the reference is peeled and the
+/// mode weakens from `Move` toward `Ref`/`RefMut`, so identifier leaves bind by
+/// reference instead of by value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatBindMode {
+    Move,
+    Ref,
+    RefMut,
+}
+
+impl PatBindMode {
+    /// Weaken the mode after peeling one reference layer of mutability `m`.
+    /// `Ref` is sticky: once a shared reference is peeled, a later `&mut` layer
+    /// still binds shared. A `&` layer downgrades an existing `RefMut` to `Ref`.
+    fn weaken(self, m: Mutability) -> PatBindMode {
+        match (self, m) {
+            (PatBindMode::Ref, _) => PatBindMode::Ref,
+            (_, Mutability::Immutable) => PatBindMode::Ref,
+            (_, Mutability::Mutable) => PatBindMode::RefMut,
+        }
+    }
+
+    /// Apply the mode to a bound leaf type: `Move` binds by value, `Ref`/`RefMut`
+    /// wrap the type in a shared/mutable reference.
+    fn apply_to(self, ty: &Ty) -> Ty {
+        match self {
+            PatBindMode::Move => ty.clone(),
+            PatBindMode::Ref => Ty::reference(None, Mutability::Immutable, ty.clone()),
+            PatBindMode::RefMut => Ty::reference(None, Mutability::Mutable, ty.clone()),
+        }
+    }
+}
+
 /// Well-known type definition IDs for built-in types.
 #[derive(Debug, Clone, Copy)]
 pub struct WellKnownTypes {
@@ -3001,6 +3035,27 @@ impl<'ctx> TypeInfer<'ctx> {
                 );
                 return Ty::error();
             }
+        }
+        // Prelude value constructors (`Some`, `None`, `Ok`, `Err`) must be
+        // instantiated fresh at every occurrence. The prelude registers each as
+        // a single shared variable (check.rs); returning that binding directly
+        // lets the first use in a body bind the variable and then poison every
+        // later use with a different type argument, so `Some(a_string)` followed
+        // by `Some(a_struct)` in one function wrongly conflicts. Option and
+        // Result are not registered as ADTs (an `Option<T>` annotation itself
+        // lowers to a fresh variable), so the most precise type available is a
+        // fresh functional shape per occurrence: this removes the cross-site
+        // poisoning without adding constraints the rest of the checker cannot
+        // yet honour. `Some`/`Ok`/`Err` take exactly one argument; `None` is a
+        // value.
+        match name {
+            "Some" | "Ok" | "Err" => {
+                return Ty::function(vec![Ty::fresh_var()], Ty::fresh_var());
+            }
+            "None" => {
+                return Ty::fresh_var();
+            }
+            _ => {}
         }
         if let Some(ty) = self.ctx.lookup_var(name) {
             if self.ctx.is_foreign_static(name) {
@@ -6364,26 +6419,53 @@ impl<'ctx> TypeInfer<'ctx> {
     }
 
     fn bind_pattern(&mut self, pattern: &ast::Pattern, ty: &Ty) {
+        self.bind_pattern_mode(pattern, ty, PatBindMode::Move);
+    }
+
+    /// Bind a pattern's variables, threading the default binding mode of match
+    /// ergonomics (RFC 2005). When a non-reference (structural) pattern is
+    /// matched against a reference type `&T`/`&mut T`, the reference is peeled
+    /// and the default binding mode becomes `ref`/`ref mut`, so each identifier
+    /// leaf binds by reference. This makes `match &ev { Ev::Move { x, y } => *x }`
+    /// and `let Point { x, y } = &p;` bind `x`/`y` as references, matching how
+    /// the corpus dereferences them, instead of binding the bare field type and
+    /// rejecting `*x` as "cannot be dereferenced".
+    fn bind_pattern_mode(&mut self, pattern: &ast::Pattern, ty: &Ty, mode: PatBindMode) {
+        // Non-reference patterns auto-deref the scrutinee and weaken the binding
+        // mode; identifier, wildcard, and reference patterns do not.
+        let mut ty = self.apply(ty);
+        let mut mode = mode;
+        if Self::pattern_peels_references(&pattern.kind) {
+            while let TyKind::Ref(_, m, inner) = &ty.kind {
+                mode = mode.weaken(*m);
+                ty = self.apply(inner);
+            }
+        }
+        let ty = &ty;
         match &pattern.kind {
             ast::PatternKind::Wildcard => {}
-            ast::PatternKind::Ident { name, .. } => {
-                self.ctx.define_var(name.name.clone(), ty.clone());
+            ast::PatternKind::Ident { name, subpattern, .. } => {
+                let bound = mode.apply_to(ty);
+                self.ctx.define_var(name.name.clone(), bound.clone());
                 // Track `#[linear]` bindings (lets, params, destructured fields)
                 // for no-cloning enforcement.
-                self.register_linear_local(name.name.as_ref(), ty);
+                self.register_linear_local(name.name.as_ref(), &bound);
+                if let Some(sub) = subpattern {
+                    self.bind_pattern_mode(sub, ty, mode);
+                }
             }
             ast::PatternKind::Tuple(patterns) => {
                 match &ty.kind {
                     TyKind::Tuple(elem_tys) => {
                         for (pat, elem_ty) in patterns.iter().zip(elem_tys.iter()) {
-                            self.bind_pattern(pat, elem_ty);
+                            self.bind_pattern_mode(pat, elem_ty, mode);
                         }
                     }
                     // For inference variables or unknown types, generate fresh
                     // vars for each pattern element so variables get bound.
                     _ => {
                         for pat in patterns {
-                            self.bind_pattern(pat, &Ty::fresh_var());
+                            self.bind_pattern_mode(pat, &Ty::fresh_var(), mode);
                         }
                     }
                 }
@@ -6464,9 +6546,11 @@ impl<'ctx> TypeInfer<'ctx> {
                     })
                     .collect();
 
-                // Now bind patterns with the extracted types
+                // Now bind patterns with the extracted types, threading the
+                // default binding mode so `match &S { S { x } => *x }` binds
+                // `x` by reference.
                 for (field, field_ty) in fields.iter().zip(field_types.iter()) {
-                    self.bind_pattern(&field.pattern, field_ty);
+                    self.bind_pattern_mode(&field.pattern, field_ty, mode);
                 }
             }
             ast::PatternKind::TupleStruct { path, patterns, .. } => {
@@ -6511,9 +6595,10 @@ impl<'ctx> TypeInfer<'ctx> {
                     })
                     .collect();
 
-                // Now bind patterns with the extracted types
+                // Now bind patterns with the extracted types, threading the
+                // default binding mode (see the struct arm above).
                 for (pattern, field_ty) in patterns.iter().zip(field_types.iter()) {
-                    self.bind_pattern(pattern, field_ty);
+                    self.bind_pattern_mode(pattern, field_ty, mode);
                 }
             }
             ast::PatternKind::Slice(patterns) => {
@@ -6523,26 +6608,44 @@ impl<'ctx> TypeInfer<'ctx> {
                     Ty::fresh_var()
                 };
                 for pat in patterns {
-                    self.bind_pattern(pat, &elem_ty);
+                    self.bind_pattern_mode(pat, &elem_ty, mode);
                 }
             }
             ast::PatternKind::Or(patterns) => {
+                // Or patterns do not peel references themselves; each alternative
+                // re-derives the binding mode from the incoming type, so pass the
+                // pre-peel `ty`/`mode` through unchanged.
                 for pat in patterns {
-                    self.bind_pattern(pat, ty);
+                    self.bind_pattern_mode(pat, ty, mode);
                 }
             }
             ast::PatternKind::Ref { pattern, .. } => {
+                // An explicit reference pattern consumes one reference layer and
+                // resets the default binding mode to move for the inner pattern.
                 if let TyKind::Ref(_, _, inner) = &ty.kind {
-                    self.bind_pattern(pattern, inner);
+                    self.bind_pattern_mode(pattern, inner, PatBindMode::Move);
                 } else {
                     // When a `&x` pattern is used but the type isn't Ref
                     // (e.g. iterators yielding owned values), bind the inner
                     // pattern to the type directly - the `&` just dereferences.
-                    self.bind_pattern(pattern, ty);
+                    self.bind_pattern_mode(pattern, ty, PatBindMode::Move);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Whether a pattern auto-dereferences a reference scrutinee and updates the
+    /// default binding mode (RFC 2005). Structural patterns do; identifier,
+    /// wildcard, reference, and the leaf patterns that bind nothing do not.
+    fn pattern_peels_references(kind: &ast::PatternKind) -> bool {
+        matches!(
+            kind,
+            ast::PatternKind::Struct { .. }
+                | ast::PatternKind::TupleStruct { .. }
+                | ast::PatternKind::Tuple(_)
+                | ast::PatternKind::Slice(_)
+        )
     }
 
     // =========================================================================
