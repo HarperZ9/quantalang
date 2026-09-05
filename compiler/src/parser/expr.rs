@@ -481,9 +481,16 @@ impl<'a> Parser<'a> {
 
             TokenKind::Keyword(Keyword::Async) => {
                 self.advance();
+                // Eat an optional `move` first: it captures for both the async
+                // block (`async move { .. }`) and the async closure
+                // (`async move || ..`). The block-vs-closure decision is made on
+                // the token that follows it, so `move` must be consumed before
+                // the `{` check rather than inside the block branch (where it
+                // was unreachable and left `async move { .. }` to fall through to
+                // the closure parser and fail with `expected |, found {`).
+                let is_move = self.eat_keyword(Keyword::Move);
                 if self.check(&TokenKind::OpenDelim(Delimiter::Brace)) {
-                    // async { ... }
-                    let is_move = self.eat_keyword(Keyword::Move);
+                    // async { ... } or async move { ... }
                     let block = self.parse_block()?;
                     let span = start.merge(&block.span);
                     Ok(Expr::new(
@@ -494,8 +501,7 @@ impl<'a> Parser<'a> {
                         span,
                     ))
                 } else {
-                    // async || or async move ||
-                    let is_move = self.eat_keyword(Keyword::Move);
+                    // async || ... or async move || ...
                     self.parse_closure_expr(is_move, true)
                 }
             }
@@ -2040,6 +2046,45 @@ mod tests {
             match &expr.kind {
                 ExprKind::Closure { params, .. } => {
                     assert!(params.is_empty(), "`{src}` should have zero params")
+                }
+                other => panic!("`{src}` parsed as {other:?}, expected ExprKind::Closure"),
+            }
+        }
+    }
+
+    #[test]
+    fn async_move_block_parses_as_an_async_block_not_a_closure() {
+        // `async move { .. }` is an async block that captures by move, distinct
+        // from a move closure. The block-vs-closure decision is made on the
+        // token after an optional `move`, so `move` must be consumed before the
+        // `{` check. Before the fix the async arm tested for `{` first and let
+        // `async move { .. }` fall through to the closure parser, which failed
+        // with `expected |, found {`.
+        let block_cases = [("async { 1 }", false), ("async move { 1 }", true)];
+        for (src, want_move) in block_cases {
+            let expr = parse_expr_str(src)
+                .unwrap_or_else(|e| panic!("`{src}` should parse as an async block: {e:?}"));
+            match &expr.kind {
+                ExprKind::Async { is_move, .. } => assert_eq!(
+                    *is_move, want_move,
+                    "`{src}` should have is_move={want_move}"
+                ),
+                other => panic!("`{src}` parsed as {other:?}, expected ExprKind::Async"),
+            }
+        }
+
+        // The closure forms are unaffected: `async ||` and `async move ||` stay
+        // async closures, with the move flag tracking the keyword.
+        let closure_cases = [("async || 1", false), ("async move || 1", true)];
+        for (src, want_move) in closure_cases {
+            let expr = parse_expr_str(src)
+                .unwrap_or_else(|e| panic!("`{src}` should parse as an async closure: {e:?}"));
+            match &expr.kind {
+                ExprKind::Closure {
+                    is_async, is_move, ..
+                } => {
+                    assert!(*is_async, "`{src}` should be an async closure");
+                    assert_eq!(*is_move, want_move, "`{src}` should have is_move={want_move}");
                 }
                 other => panic!("`{src}` parsed as {other:?}, expected ExprKind::Closure"),
             }
