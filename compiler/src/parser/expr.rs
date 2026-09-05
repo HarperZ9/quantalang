@@ -1936,6 +1936,15 @@ mod tests {
         parser.parse_expr()
     }
 
+    /// Parse a standalone type from its source text.
+    fn parse_type_str(s: &str) -> ParseResult<Type> {
+        let source = LexerSourceFile::new("test.bld", s.to_string());
+        let mut lexer = Lexer::new(&source);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(&source, tokens);
+        parser.parse_type()
+    }
+
     // =========================================================================
     // CONTEXTUAL KEYWORDS IN VALUE POSITION
     // =========================================================================
@@ -1955,6 +1964,33 @@ mod tests {
                     assert_eq!(id.as_str(), word, "identifier name should be preserved")
                 }
                 other => panic!("`{word}` parsed as {other:?}, expected ExprKind::Ident"),
+            }
+        }
+    }
+
+    #[test]
+    fn path_root_keywords_parse_in_type_position() {
+        // `super`/`crate`/`self`/`Self` are legal as the FIRST segment of a
+        // qualified TYPE path (`super::T`, `crate::m::Foo`, `self::Bar`,
+        // `Self::Assoc`). The expression parser has its own primary arms for
+        // these roots, but the shared path parser rejected them, so a
+        // `super::`-qualified return type, field type, or bound failed to
+        // parse while its expression-position twin (`super::CONST`) did not.
+        for (src, root) in [
+            ("super::DecodeError", "super"),
+            ("crate::codec::Frame", "crate"),
+            ("self::Bar", "self"),
+            ("Self::Assoc", "Self"),
+        ] {
+            let ty = parse_type_str(src)
+                .unwrap_or_else(|e| panic!("`{src}` should parse as a type path: {e:?}"));
+            match &ty.kind {
+                TypeKind::Path(path) => assert_eq!(
+                    path.segments.first().unwrap().ident.as_str(),
+                    root,
+                    "`{src}` first path segment should be `{root}`"
+                ),
+                other => panic!("`{src}` parsed as {other:?}, expected TypeKind::Path"),
             }
         }
     }

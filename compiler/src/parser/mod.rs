@@ -286,6 +286,25 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// If the current token is a path-root keyword (`self`, `Self`, `super`,
+    /// `crate`), consume it and return it as an `Ident` carrying the keyword's
+    /// spelling. These are legal only as the FIRST segment of a path
+    /// (`super::T`, `crate::m::f`, `self::x`, `Self::Assoc`); a later segment
+    /// still routes through `expect_ident`. Returns `None` without advancing
+    /// when the current token is not a path root, so the caller falls back to
+    /// the ordinary identifier rule.
+    fn eat_path_root_keyword(&mut self) -> Option<Ident> {
+        let name = match self.current_kind() {
+            TokenKind::Keyword(Keyword::Self_) => "self",
+            TokenKind::Keyword(Keyword::SelfType) => "Self",
+            TokenKind::Keyword(Keyword::Super) => "super",
+            TokenKind::Keyword(Keyword::Crate) => "crate",
+            _ => return None,
+        };
+        let span = self.advance().span;
+        Some(Ident::new(name, span))
+    }
+
     /// Expect a lifetime.
     fn expect_lifetime(&mut self) -> ParseResult<Lifetime> {
         if self.check_lifetime() {
@@ -607,7 +626,20 @@ impl<'a> Parser<'a> {
         }
 
         loop {
-            let ident = self.expect_ident()?;
+            // A path-root keyword (`self`, `Self`, `super`, `crate`) is legal
+            // only as the first segment; every later segment is an ordinary
+            // identifier. The expression parser has its own primary-expression
+            // arms for these roots, so this path is reached from type, pattern,
+            // and use-tree contexts, where `super::T` / `crate::m::f` had been
+            // rejected by `expect_ident`.
+            let ident = if segments.is_empty() {
+                match self.eat_path_root_keyword() {
+                    Some(root) => root,
+                    None => self.expect_ident()?,
+                }
+            } else {
+                self.expect_ident()?
+            };
             // In type context a bare `<` opens a generic argument list. In
             // expression context a bare `<` is ambiguous with the less-than
             // operator, so generics there come only from a turbofish `::<...>`
