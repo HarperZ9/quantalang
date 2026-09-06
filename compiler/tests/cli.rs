@@ -12956,6 +12956,25 @@ fn c_backend_run(program_path: &Path) -> RunResult {
     }
 }
 
+/// Run a program through the C path (`buildc run`) WITHOUT asserting success,
+/// returning stdout, stderr (both CRLF-normalized) and the process exit code.
+/// `buildc run` forwards the compiled program's exit code as its own and runs
+/// it with inherited stdio, so a runtime abort surfaces here as a nonzero exit
+/// plus the abort message on stderr. Used by fail-closed controls that expect a
+/// program to abort at runtime.
+fn c_backend_run_capture(program_path: &Path) -> (String, String, Option<i32>) {
+    let output = buildc()
+        .arg("run")
+        .arg(program_path)
+        .output()
+        .unwrap_or_else(|err| panic!("run buildc run for {}: {}", program_path.display(), err));
+    (
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n"),
+        output.status.code(),
+    )
+}
+
 /// Foundation: overflow-safe checked + saturating integer arithmetic
 /// (examples/finance/safe_math.bld) runs end-to-end. Exercises the i64-literal,
 /// `Option<i64>`-return, `match`-with-if-arms, `&&`/`else if`, and `0 - MAX - 1`
@@ -13740,6 +13759,163 @@ fn main() ~ Console {
         assert_eq!(
             result.stdout, expected,
             "vec supported-element case `{name}` must build and read its element type"
+        );
+    }
+}
+
+/// Fail-closed control (memory safety): an out-of-bounds index aborts at runtime
+/// with a diagnostic instead of reading or writing past the allocation. Rust
+/// bounds-checks every index unconditionally, in release as well as debug, and
+/// BuildLang follows that contract. Before this fix each case ran to completion
+/// with exit 0: a fixed-array OOB read returned an adjacent value, an OOB write
+/// corrupted neighbouring memory, a heap-Vec OOB read returned heap garbage, a
+/// heap-Vec OOB write silently no-oped, and a negative index wrapped to a huge
+/// unsigned index and read wild memory. Each case now aborts (nonzero exit) and
+/// prints `index out of bounds` on stderr, so this control FAILS on the pre-fix
+/// binary (which exits 0 with no such message). It pins the fixed-array read and
+/// write paths (static length check at the C emission site), the heap-Vec read
+/// and write paths (the check inside `build_vec_get`, which every getter and
+/// setter routes through), and the negative-index path (caught by the same
+/// checks after the signed index wraps).
+#[test]
+fn out_of_bounds_index_aborts_fail_closed() {
+    if !c_backend_ready() {
+        eprintln!("skipping OOB fail-closed e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    // (name, source) -- each must abort at runtime, not return a value.
+    let cases: [(&str, &str); 5] = [
+        (
+            "array_read_oob",
+            r#"fn main() ~ Console {
+    let a = [11, 22, 33];
+    let i = 5;
+    println!("{}", a[i]);
+}
+"#,
+        ),
+        (
+            "array_write_oob",
+            r#"fn main() ~ Console {
+    let mut a = [11, 22, 33];
+    let i = 7;
+    a[i] = 99;
+    println!("{}", a[0]);
+}
+"#,
+        ),
+        (
+            "vec_read_oob",
+            r#"fn main() ~ Console {
+    let v: Vec<i64> = vec![1, 2, 3];
+    let i = 5;
+    println!("{}", v[i]);
+}
+"#,
+        ),
+        (
+            "vec_write_oob",
+            r#"fn main() ~ Console {
+    let mut v: Vec<i64> = vec![1, 2, 3];
+    let i = 5;
+    v[i] = 9;
+    println!("{}", v[0]);
+}
+"#,
+        ),
+        (
+            "array_negative_index",
+            r#"fn main() ~ Console {
+    let a = [11, 22, 33];
+    let i = 0 - 1;
+    println!("{}", a[i]);
+}
+"#,
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_oob_fail_closed");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write OOB fail-closed case");
+        let (stdout, stderr, exit_code) = c_backend_run_capture(&path);
+        assert_ne!(
+            exit_code,
+            Some(0),
+            "OOB case `{name}` must abort, not exit 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("index out of bounds"),
+            "OOB case `{name}` must print the bounds diagnostic; got exit {exit_code:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// Positive companion to `out_of_bounds_index_aborts_fail_closed`: the bounds
+/// check must not disturb in-bounds indexing, including the last valid index
+/// (index == len - 1). Fixed-array and heap-Vec read and write all return the
+/// correct value. This passes on the pre-fix binary too; it guards against the
+/// check rejecting a valid access (an off-by-one in the bound).
+#[test]
+fn in_bounds_index_reads_and_writes_correctly() {
+    if !c_backend_ready() {
+        eprintln!("skipping in-bounds positive e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    // (name, source, expected stdout) -- boundary index len-1 included.
+    let cases: [(&str, &str, &str); 4] = [
+        (
+            "array_read_last",
+            r#"fn main() ~ Console {
+    let a = [11, 22, 33];
+    let i = 2;
+    println!("{}", a[i]);
+}
+"#,
+            "33\n",
+        ),
+        (
+            "array_write_mid",
+            r#"fn main() ~ Console {
+    let mut a = [11, 22, 33];
+    let i = 1;
+    a[i] = 99;
+    println!("{}", a[i]);
+}
+"#,
+            "99\n",
+        ),
+        (
+            "vec_read_mid",
+            r#"fn main() ~ Console {
+    let v: Vec<i64> = vec![10, 20, 30];
+    let i = 1;
+    println!("{}", v[i]);
+}
+"#,
+            "20\n",
+        ),
+        (
+            "vec_write_last",
+            r#"fn main() ~ Console {
+    let mut v: Vec<i64> = vec![10, 20, 30];
+    let i = 2;
+    v[i] = 77;
+    println!("{}", v[i]);
+}
+"#,
+            "77\n",
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_in_bounds_positive");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src, expected) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write in-bounds positive case");
+        let result = c_backend_run(&path);
+        assert_eq!(
+            result.stdout, expected,
+            "in-bounds case `{name}` must read/write the correct value at the boundary"
         );
     }
 }

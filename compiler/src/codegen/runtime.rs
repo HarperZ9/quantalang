@@ -238,6 +238,27 @@ static int32_t build_string_byte_at(BuildString s, size_t i) {
     return (int32_t)(unsigned char)s.ptr[i];
 }
 
+// --- Bounds checking ---
+// Rust checks every index against the length and panics on out-of-bounds, in
+// release as well as debug. BuildLang follows that contract: an out-of-bounds
+// index aborts with a diagnostic instead of reading or writing past the
+// allocation. Exit code 101 matches a Rust panic. `bl_idx_chk` returns the
+// validated index so a generated subscript reads `a[bl_idx_chk(i, n)]` and
+// serves as both an rvalue and a store target; `bl_index_oob` is the shared
+// abort the Vec runtime calls, where the index is already a size_t (a negative
+// source index has wrapped, so it prints back through the signed cast).
+static void bl_index_oob(long long index, size_t len) {
+    fprintf(stderr, "index out of bounds: the len is %llu but the index is %lld\n",
+            (unsigned long long)len, index);
+    exit(101);
+}
+static size_t bl_idx_chk(long long index, size_t len) {
+    if (index < 0 || (unsigned long long)index >= (unsigned long long)len) {
+        bl_index_oob(index, len);
+    }
+    return (size_t)index;
+}
+
 // --- Vec (dynamic array) type ---
 
 typedef struct {
@@ -266,6 +287,7 @@ static void build_vec_push(BuildVec* v, const void* elem) {
 }
 
 static void* build_vec_get(BuildVec* v, size_t index) {
+    if (index >= v->len) bl_index_oob((long long)index, v->len);
     return (char*)v->ptr + index * v->elem_size;
 }
 
@@ -332,17 +354,19 @@ static void build_hvec_sort_i64(BuildVecHandle h) {
 static void build_hvec_sort_f64(BuildVecHandle h) {
     if (h.inner->len > 1) qsort(h.inner->ptr, h.inner->len, sizeof(double), __build_cmp_f64);
 }
+// Storing out of bounds aborts through build_vec_get rather than silently
+// dropping the write, matching Rust's `v[i] = x` panic.
 static void build_hvec_set_i32(BuildVecHandle h, size_t i, int32_t val) {
-    if (i < h.inner->len) *(int32_t*)build_vec_get(h.inner, i) = val;
+    *(int32_t*)build_vec_get(h.inner, i) = val;
 }
 static void build_hvec_set_i64(BuildVecHandle h, size_t i, int64_t val) {
-    if (i < h.inner->len) *(int64_t*)build_vec_get(h.inner, i) = val;
+    *(int64_t*)build_vec_get(h.inner, i) = val;
 }
 static void build_hvec_set_f64(BuildVecHandle h, size_t i, double val) {
-    if (i < h.inner->len) *(double*)build_vec_get(h.inner, i) = val;
+    *(double*)build_vec_get(h.inner, i) = val;
 }
 static void build_hvec_set_str(BuildVecHandle h, size_t i, BuildString val) {
-    if (i < h.inner->len) *(BuildString*)build_vec_get(h.inner, i) = val;
+    *(BuildString*)build_vec_get(h.inner, i) = val;
 }
 static bool build_hvec_contains_i32(BuildVecHandle h, int32_t val) {
     for (size_t i = 0; i < h.inner->len; i++) {

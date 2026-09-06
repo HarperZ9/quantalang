@@ -10,6 +10,34 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+- **An out-of-bounds index aborts instead of reading or writing past the
+  allocation**: indexing was unchecked on every path. A fixed-array read past the
+  end returned an adjacent stack value, a fixed-array write past the end corrupted
+  neighbouring memory, a heap-`Vec` read past the end returned heap garbage, a
+  heap-`Vec` write past the end silently did nothing, and a negative index wrapped
+  to a huge unsigned index and read wild memory. Every case ran to completion with
+  exit 0, a silent wrong answer and, on the write paths, memory corruption. Rust
+  bounds-checks every index unconditionally, in release as well as debug, and
+  BuildLang now follows that contract: an out-of-bounds index prints `index out of
+  bounds: the len is N but the index is I` and aborts with exit 101, matching a
+  Rust panic. The check sits in one place per storage kind. A heap `Vec` routes
+  every getter and setter through `build_vec_get`, so a single length check there
+  covers reads and writes for scalar, string, and aggregate elements; the setters
+  no longer swallow an out-of-bounds write. A fixed array `[T; N]` carries its
+  length in its type, so the C backend emits a static-bound check
+  `a[bl_idx_chk(i, N)]` at the read and write sites. A slice checks the index
+  against its runtime `len` field, and a string byte index checks against its
+  length. A raw pointer has no length and stays an unchecked subscript, the same
+  as an `unsafe` pointer dereference. Covered by
+  `out_of_bounds_index_aborts_fail_closed` (fixed-array read and write, heap-`Vec`
+  read and write, and a negative index, each of which ran silently to exit 0 on
+  the pre-fix binary) and by `in_bounds_index_reads_and_writes_correctly` (the
+  same paths at an in-bounds index including the last valid element, so the check
+  does not reject a valid access). Honest null: integer add and multiply still
+  wrap on overflow, matching Rust's release semantics, and division or remainder
+  by zero and `INT_MIN / -1` are not yet turned into a clean panic; those are
+  separate arithmetic-trap fixes.
+
 - **An aggregate literal is built at its expected element width, not the i32/f64
   default**: a tuple or vector literal lowered its bare integer and float elements
   at the `i32`/`f64` default even when the surrounding type said otherwise, then the

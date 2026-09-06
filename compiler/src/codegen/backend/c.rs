@@ -2844,7 +2844,13 @@ impl CBackend {
                 } else if let Some(target) =
                     Self::slice_element_access(base, &base_str, &index_str, locals)
                 {
-                    // Slice / pointer-to-slice store: `base->ptr[i] = value`.
+                    // Slice / pointer-to-slice store: `base->ptr[i] = value`,
+                    // bounds-checked against the slice length.
+                    write!(self.output, "{} = {};\n", target, rvalue).unwrap();
+                } else if let Some(target) =
+                    Self::array_element_access(base, &base_str, &index_str, locals)
+                {
+                    // Fixed-array store: `base[bl_idx_chk(i, N)] = value`.
                     write!(self.output, "{} = {};\n", target, rvalue).unwrap();
                 } else {
                     write!(self.output, "{}[{}] = {};\n", base_str, index_str, rvalue).unwrap();
@@ -3927,11 +3933,38 @@ impl CBackend {
             MirValue::Local(id) => &locals.get(id.0 as usize)?.ty,
             _ => return None,
         };
+        // A slice carries its length, so the index is bounds-checked against it
+        // (fail closed, Rust semantics) before the subscript on read and write.
         match ty {
-            MirType::Slice(_) => Some(format!("{}.ptr[{}]", base_str, index_str)),
-            MirType::Ptr(inner) if matches!(inner.as_ref(), MirType::Slice(_)) => {
-                Some(format!("{}->ptr[{}]", base_str, index_str))
-            }
+            MirType::Slice(_) => Some(format!(
+                "{base_str}.ptr[bl_idx_chk((long long)({index_str}), {base_str}.len)]"
+            )),
+            MirType::Ptr(inner) if matches!(inner.as_ref(), MirType::Slice(_)) => Some(format!(
+                "{base_str}->ptr[bl_idx_chk((long long)({index_str}), {base_str}->len)]"
+            )),
+            _ => None,
+        }
+    }
+
+    /// If `base` indexes a fixed array `[T; N]`, return the bounds-checked
+    /// element access `base[bl_idx_chk(index, N)]`. The length N is a compile-time
+    /// constant carried by the array type, so the check is a static bound. Returns
+    /// `None` for non-array bases (a raw pointer has no length and stays an
+    /// unchecked subscript, matching an `unsafe` pointer deref).
+    fn array_element_access(
+        base: &MirValue,
+        base_str: &str,
+        index_str: &str,
+        locals: &[MirLocal],
+    ) -> Option<String> {
+        let ty = match base {
+            MirValue::Local(id) => &locals.get(id.0 as usize)?.ty,
+            _ => return None,
+        };
+        match ty {
+            MirType::Array(_, len) => Some(format!(
+                "{base_str}[bl_idx_chk((long long)({index_str}), {len}ULL)]"
+            )),
             _ => None,
         }
     }
@@ -4396,9 +4429,15 @@ impl CBackend {
                         _ => false,
                     };
                     if base_is_string {
-                        format!("((uint8_t*){}.ptr)[{}]", base_str, index_str)
+                        format!(
+                            "((uint8_t*){base_str}.ptr)[bl_idx_chk((long long)({index_str}), {base_str}.len)]"
+                        )
                     } else if let Some(access) =
                         Self::slice_element_access(base, &base_str, &index_str, locals)
+                    {
+                        access
+                    } else if let Some(access) =
+                        Self::array_element_access(base, &base_str, &index_str, locals)
                     {
                         access
                     } else {
