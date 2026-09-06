@@ -13372,6 +13372,76 @@ fn main() ~ Console {
     }
 }
 
+/// Regression (call-argument aggregate element width, false-success control).
+/// An aggregate literal passed as a call argument defaulted its element literals
+/// to i32 because the callee's declared parameter type was never threaded in as
+/// the expected type. Passing `(7, 8)` to a `(i64, i64)` parameter built a
+/// `Tuple_i32_i32` the callee's body reads as `Tuple_i64_i64`, a passed
+/// `vec![10, 20, 30]` to a `Vec<i64>` parameter built an i32-strided vec the
+/// callee indexes at the i64 width, and a passed `[5, 6, 7]` to a `[i64; 3]`
+/// parameter built an i32-strided array. On the pre-fix binary the tuple case
+/// failed the C compile (`incompatible type ... Tuple_i32_i32`) and the vec and
+/// array cases ran and printed the corrupt value in each comment, so every case
+/// fails its assertion on the pre-fix binary.
+#[test]
+fn call_argument_aggregate_is_built_at_parameter_width() {
+    if !c_backend_ready() {
+        eprintln!("skipping call-arg-width e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    // (name, source, expected stdout, value/behaviour the pre-fix binary showed)
+    let cases: [(&str, &str, &str, &str); 3] = [
+        (
+            "tuple_arg",
+            r#"fn take_t(t: (i64, i64)) ~ Console {
+    println!("{}", t.0);
+    println!("{}", t.1);
+}
+fn main() ~ Console {
+    take_t((7, 8));
+}
+"#,
+            "7\n8\n",
+            "C compile error: incompatible type Tuple_i32_i32 for a Tuple_i64_i64 parameter",
+        ),
+        (
+            "vec_arg",
+            r#"fn take_v(v: Vec<i64>) ~ Console {
+    println!("{}", v[1]);
+}
+fn main() ~ Console {
+    take_v(vec![10, 20, 30]);
+}
+"#,
+            "20\n",
+            "128849018900 = (30<<32)|20 read at i64 over an i32-strided vec",
+        ),
+        (
+            "array_arg",
+            r#"fn take_a(a: [i64; 3]) ~ Console {
+    println!("{}", a[2]);
+}
+fn main() ~ Console {
+    take_a([5, 6, 7]);
+}
+"#,
+            "7\n",
+            "garbage from an out-of-stride 8-byte read over an i32-strided array",
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_call_arg_width");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src, expected, prefix_value) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write call-arg-width case");
+        let result = c_backend_run(&path);
+        assert_eq!(
+            result.stdout, expected,
+            "call-arg-width case `{name}` must build the aggregate at the parameter width; pre-fix showed `{prefix_value}`"
+        );
+    }
+}
+
 /// Regression (reference-pointee width, must-reject controls). A borrow whose
 /// pointee width disagrees with the callee parameter is a silent wrong answer:
 /// the callee stores or loads at its own width through storage laid out at a

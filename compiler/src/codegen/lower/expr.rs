@@ -1816,6 +1816,39 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(values::unit())
     }
 
+    /// Lower call arguments, threading each declared parameter type into the
+    /// matching argument as its expected type. An aggregate literal argument (a
+    /// tuple, vec, or array literal) then adopts the parameter's element widths
+    /// instead of the i32/f64 default, the same bidirectional hint a `let`
+    /// annotation or a return type supplies. Without it, `take((7, 8))` into a
+    /// `(i64, i64)` parameter builds a `Tuple_i32_i32` the callee reads as
+    /// `Tuple_i64_i64`: a hard C type error for a tuple argument and a silent
+    /// wrong answer for a vec or array argument, whose narrow storage the callee
+    /// indexes at the wider declared width. An argument past the end of the known
+    /// parameter list, or a call whose callee is not a resolvable direct function
+    /// (`params` is `None`: a builtin, a function value, an overload the resolver
+    /// rejected), lowers with no hint.
+    fn lower_args_with_param_hints(
+        &mut self,
+        params: Option<&[MirType]>,
+        args: &[ast::Expr],
+    ) -> CodegenResult<Vec<MirValue>> {
+        let prev_expected = self.expected_type.take();
+        let mut vals = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            self.expected_type = params.and_then(|p| p.get(i)).cloned();
+            match self.lower_expr(a) {
+                Ok(v) => vals.push(v),
+                Err(e) => {
+                    self.expected_type = prev_expected;
+                    return Err(e);
+                }
+            }
+        }
+        self.expected_type = prev_expected;
+        Ok(vals)
+    }
+
     fn lower_call(&mut self, func: &ast::Expr, args: &[ast::Expr]) -> CodegenResult<MirValue> {
         // Check for enum variant construction: Shape::Circle(5.0)
         if let Some((enum_name, variant_name)) = self.try_resolve_enum_variant_path(func) {
@@ -1896,15 +1929,13 @@ impl<'ctx> MirLowerer<'ctx> {
                     args.iter().map(|a| self.infer_single_arg_type(a)).collect();
                 match self.resolve_overloaded_call_name(resolved.as_ref(), &arg_tys) {
                     Some(OverloadTarget::Concrete(mangled)) => {
-                        let ret_ty = self
-                            .module
-                            .find_function(mangled.as_ref())
-                            .map(|f| f.sig.ret.clone())
-                            .unwrap_or(MirType::i32());
-                        let arg_vals: Vec<_> = args
-                            .iter()
-                            .map(|a| self.lower_expr(a))
-                            .collect::<CodegenResult<_>>()?;
+                        let target = self.module.find_function(mangled.as_ref());
+                        let ret_ty =
+                            target.map(|f| f.sig.ret.clone()).unwrap_or(MirType::i32());
+                        let param_types: Option<Vec<MirType>> =
+                            target.map(|f| f.sig.params.clone());
+                        let arg_vals: Vec<_> =
+                            self.lower_args_with_param_hints(param_types.as_deref(), args)?;
                         let builder = self.current_fn.as_mut().ok_or_else(|| {
                             CodegenError::Internal("No current function".to_string())
                         })?;
@@ -1987,10 +2018,17 @@ impl<'ctx> MirLowerer<'ctx> {
         // Try to resolve the function's return type from declared signatures
         let ret_ty = self.resolve_call_return_type(func);
 
-        let mut arg_vals: Vec<_> = args
-            .iter()
-            .map(|a| self.lower_expr(a))
-            .collect::<CodegenResult<_>>()?;
+        // Resolve the callee's declared parameter types (direct user functions
+        // only) so each argument is lowered with its parameter type as the
+        // expected type. This threads a parameter's element width into an
+        // aggregate literal argument the same way a let annotation or a return
+        // type does.
+        let param_types: Option<Vec<MirType>> = self
+            .extract_call_name(func)
+            .and_then(|name| self.module.find_function(name))
+            .map(|f| f.sig.params.clone());
+        let mut arg_vals: Vec<_> =
+            self.lower_args_with_param_hints(param_types.as_deref(), args)?;
 
         // ---- Guard: a reference argument's pointee width must match the
         // callee's declared parameter pointee. ----

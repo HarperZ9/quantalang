@@ -32,6 +32,29 @@ tracked in `STATUS.md`, `README.md`, and
   width because the `let` had no annotation to thread, and a closure body is not
   yet threaded with its declared return type.
 
+- **An aggregate literal passed as a call argument is built at the parameter's
+  element width**: this reaches the one position the fix above did not, a tuple,
+  vector, or array literal handed straight to a function parameter. The argument
+  lowered at the `i32`/`f64` default while the callee read and indexed its
+  parameter at the width it was declared with, so the construction stride and the
+  access stride disagreed across the call boundary. The fix threads each callee
+  parameter's declared type into the matching argument as its expected type,
+  resolved through the called function's signature at the general call path and at
+  the overloaded-concrete path. On the pre-fix binary, `take_t((7, 8))` for a
+  `(i64, i64)` parameter failed to compile because the argument's `Tuple_i32_i32`
+  typedef did not match the parameter's `Tuple_i64_i64`; `take_v(vec![10, 20, 30])`
+  read `v[1]` as `128849018900` (that is `(30 << 32) | 20`); and `take_a([5, 6, 7])`
+  read `a[2]` as garbage. The vector case corrects an earlier reading that a vector
+  argument was already safe through runtime element tagging. The callee indexes at
+  its compile-time declared element width, not a runtime size tag, so a narrow build
+  still corrupted the wide read. Covered by
+  `call_argument_aggregate_is_built_at_parameter_width` over a tuple, a vector, and
+  an array argument, each wrong on the pre-fix binary. Honest null: the parameter
+  hint threads only for a direct or overloaded-concrete call resolved through the
+  callee's signature. A call through a function value, a builtin, or a generic call
+  (which routes to the monomorphizer before this path) passes no hint and lowers the
+  argument at the default width.
+
 - **Compound assignment through a plain dereference reads before it stores**:
   `*p += v` and its nine siblings (`-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`,
   `>>=`) lowered as `*p = v`. The dereference-assignment path never inspected the
