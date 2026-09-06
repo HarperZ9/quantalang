@@ -10,6 +10,51 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+- **A reference whose pointee width disagrees with its storage is laid out to match
+  or rejected**: the checker could infer an integer or float array's element width
+  through a later borrow while codegen defaulted an unannotated integer array literal
+  to `[i32; N]` and an unannotated float to a narrower width. The two widths
+  disagreed only across a function-call boundary, where the callee compiled its own
+  load and store at the pointee width it was declared with. A `&mut i64` handed the
+  address of an `i32` slot let the callee's 8-byte store run past the element, and a
+  `&i64` read loaded 8 bytes from a 4-byte slot. Each was a silent wrong answer with
+  no diagnostic. `set88(&mut arr[1])` over `let mut arr = [10, 20, 30]` printed
+  `10`, `88`, `0` on the pre-fix binary: arr[2] was clobbered to zero. The annotated
+  form `let mut arr: [i64; 3] = [10, 20, 30]` was worse, printing `85899345930`,
+  `88`, `0`, because arr[0] read `(20 << 32) | 10` out of the i32 storage. A shared
+  `get(&arr[1])` misread `arr[1]` as `128849018900`. The scalar path had the same
+  shape: a `let mut a: i32` passed to a `&mut i64` parameter let the callee corrupt
+  the stack (pre-fix printed `7`), and an `f32` passed to a `&mut f64` parameter
+  printed `0`.
+
+  The fix works in three layers. The unifier unifies reference and pointer pointees
+  invariantly, so a pinned-width scalar mismatch such as `i32` against `i64` or `f32`
+  against `f64` is rejected at the checker with a type-mismatch error rather than
+  silently widened. Literal and array lowering thread the expected type through, so
+  an annotated array lays its elements out at the annotated width and the borrow
+  reaches real storage. A codegen call-site guard compares the byte width and the
+  integer-or-float class of every pointer argument's pointee against the callee's
+  declared parameter, and fails closed with an actionable message ("add a type
+  annotation ... so the storage matches the borrow") when an inferred-through-borrow
+  width was left unannotated. The guard is the backstop for the case the checker
+  cannot see, where an unannotated array's storage width and its borrow width are
+  decided in different passes.
+
+  Two end-to-end tests in `compiler/tests/cli.rs` pin both sides. The positive test
+  runs a matched scalar `&mut`, a matched float `&mut`, an annotated wide-array
+  `&mut` borrow, and an annotated wide-array read, and asserts the corrected values
+  `6`, `2`, `10`/`88`/`30`, and `10`/`20`/`30`. The must-reject test runs the four
+  unannotated mismatches and asserts each fails for its own reason: the scalar cases
+  carry the checker's `type mismatch` token, the array cases carry the guard's
+  `byte integer reference` token. All four compile and run silently wrong on the
+  pre-fix binary, printing `7`, `0`, `10`/`88`/`0`, and `128849018900`. This closes
+  the array-literal element-type gap left as an honest null by the projected-place
+  entry below. Scoped out and left as honest nulls: an unannotated integer array
+  literal borrowed at a wider width still rejects rather than inferring the wider
+  layout and rewriting the literal, so the annotation is required; the guard checks
+  only direct calls to functions defined in the module, not indirect calls through a
+  function value; and it compares only scalar int and float pointees, so a
+  pointer-to-pointer or an aggregate pointee is not width-checked.
 - **Rust backend projects struct fields by name and compiles numeric printing**:
   two defects kept the Rust source backend from building programs the C backend
   already ran. A field place lowered to a positional `.field0`, which does not

@@ -497,7 +497,22 @@ impl<'ctx> MirLowerer<'ctx> {
                         ast::IntSuffix::Usize => (MirType::usize(), false),
                     })
                     .unwrap_or_else(|| {
-                        // Unsuffixed: default to i32, but widen for values that
+                        // Unsuffixed literal. Honor a scalar integer type hint
+                        // (the element type of an annotated array, or a
+                        // `let x: T = ...` annotation) when the value fits in
+                        // that width without truncation, so the literal is laid
+                        // out at the intended width. Without this, an annotated
+                        // `let a: [i64; 3] = [1, 2, 3]` lays the array out as
+                        // [i32; 3] and a later `&mut a[i]` typed `&mut i64`
+                        // stores 8 bytes into a 4-byte slot -> silent wrong
+                        // answer. The hint only fires for a scalar Int type, so
+                        // a struct or generic annotation cannot capture it.
+                        if let Some(MirType::Int(size, esigned)) = &self.expected_type {
+                            if int_literal_fits(*value, *size, *esigned) {
+                                return (MirType::Int(*size, *esigned), *esigned);
+                            }
+                        }
+                        // Otherwise default to i32, widening for values that
                         // exceed it so the literal is not silently truncated
                         // (mirrors the type checker's literal widening).
                         if *value > i64::MAX as u128 {
@@ -522,7 +537,17 @@ impl<'ctx> MirLowerer<'ctx> {
                         ast::FloatSuffix::F16 | ast::FloatSuffix::F32 => MirType::f32(),
                         ast::FloatSuffix::F64 => MirType::f64(),
                     })
-                    .unwrap_or(MirType::f64());
+                    .unwrap_or_else(|| {
+                        // Unsuffixed float: honor a scalar float type hint (an
+                        // annotated `[f32; N]` element, or `let x: f32 = ...`)
+                        // so an annotated f32 array is laid out four bytes wide
+                        // rather than defaulting to f64 and mismatching a later
+                        // `&f32` borrow. Falls back to f64.
+                        if let Some(MirType::Float(fsize)) = &self.expected_type {
+                            return MirType::Float(*fsize);
+                        }
+                        MirType::f64()
+                    });
                 Ok(MirValue::Const(MirConst::Float(*value, ty)))
             }
             Literal::Bool(b) => Ok(values::bool(*b)),
@@ -1898,6 +1923,56 @@ impl<'ctx> MirLowerer<'ctx> {
             .iter()
             .map(|a| self.lower_expr(a))
             .collect::<CodegenResult<_>>()?;
+
+        // ---- Guard: a reference argument's pointee width must match the
+        // callee's declared parameter pointee. ----
+        // The checker unifies reference pointees invariantly (types/unify.rs),
+        // but codegen defaults an unannotated integer array or local to i32
+        // while the checker may have inferred a wider element through a later
+        // borrow. Passing such a `&mut arr[i]` (a `Ptr(i32)` here) to a
+        // parameter declared `&mut i64` (a `Ptr(i64)` in the callee) lets the
+        // callee store 8 bytes through a 4-byte slot -> silent memory
+        // corruption; a `&arr[i]` read path reads past the element. buildc
+        // cannot yet lay the storage out at the inferred width without an
+        // annotation, so it fails closed here rather than miscompiling.
+        // Annotating the element type (`let arr: [i64; N] = ...`) makes it
+        // compile through the array-literal element-type path. Only scalar
+        // int/float pointees are checked, and equal widths (the correct-width
+        // borrow) pass, so a well-typed program is never rejected.
+        if let Some(fn_name) = self.extract_call_name(func) {
+            if let Some(target_fn) = self.module.find_function(fn_name) {
+                let params = target_fn.sig.params.clone();
+                let callee = fn_name.to_string();
+                for (i, arg_val) in arg_vals.iter().enumerate() {
+                    if let Some(MirType::Ptr(param_pointee)) = params.get(i) {
+                        let arg_ty = self.type_of_value(arg_val);
+                        if let MirType::Ptr(arg_pointee) = &arg_ty {
+                            if let (Some((pw, pc)), Some((aw, ac))) = (
+                                scalar_pointee_shape(param_pointee),
+                                scalar_pointee_shape(arg_pointee),
+                            ) {
+                                if pw != aw || pc != ac {
+                                    return Err(CodegenError::TypeError(format!(
+                                        "argument {n} to `{callee}` is a {aw}-byte {ac} \
+                                         reference but the parameter is declared as a {pw}-byte \
+                                         {pc} reference. This happens when an array or variable's \
+                                         element type is inferred through a later borrow while its \
+                                         storage width is left unannotated. Add a type annotation \
+                                         (for example `let x: [i64; N] = ...`) so the storage \
+                                         matches the borrow.",
+                                        n = i + 1,
+                                        aw = aw,
+                                        ac = ac.name(),
+                                        pw = pw,
+                                        pc = pc.name(),
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // ---- Coerce BuildString args to raw char* for FFI calls ----
         // When calling an extern "C" function that expects `const char*`
@@ -6937,16 +7012,40 @@ impl<'ctx> MirLowerer<'ctx> {
             })
             .unwrap_or(4); // Default to 4 if we can't evaluate
 
+        // Honor an expected `[T; N]` element type so `let a: [i64; 4] = [0; 4]`
+        // is laid out at the annotated width rather than the i32 default (see
+        // lower_array for why the width must match later borrows).
+        let expected_elem = match &self.expected_type {
+            Some(MirType::Array(elem, _)) => Some((**elem).clone()),
+            _ => None,
+        };
+        let prev_expected = self.expected_type.take();
+
         // Lower the element expression once to get its type
-        let elem_val = self.lower_expr(element)?;
-        let elem_ty = self.type_of_value(&elem_val);
+        self.expected_type = expected_elem.clone();
+        let elem_val = match self.lower_expr(element) {
+            Ok(v) => v,
+            Err(err) => {
+                self.expected_type = prev_expected;
+                return Err(err);
+            }
+        };
+        let elem_ty = expected_elem.unwrap_or_else(|| self.type_of_value(&elem_val));
 
         // Create N copies of the element
         let mut elem_vals = Vec::with_capacity(count_val as usize);
         elem_vals.push(elem_val);
         for _ in 1..count_val {
-            elem_vals.push(self.lower_expr(element)?);
+            self.expected_type = Some(elem_ty.clone());
+            match self.lower_expr(element) {
+                Ok(v) => elem_vals.push(v),
+                Err(err) => {
+                    self.expected_type = prev_expected;
+                    return Err(err);
+                }
+            }
         }
+        self.expected_type = prev_expected;
 
         let builder = self
             .current_fn
@@ -6959,16 +7058,37 @@ impl<'ctx> MirLowerer<'ctx> {
     }
 
     fn lower_array(&mut self, elems: &[ast::Expr]) -> CodegenResult<MirValue> {
-        let elem_vals: Vec<_> = elems
-            .iter()
-            .map(|e| self.lower_expr(e))
-            .collect::<CodegenResult<_>>()?;
+        // When a `[T; N]` type is expected (from a let annotation or another
+        // bidirectional hint), lower each element with T as its expected type
+        // so integer and float literals adopt the annotated width instead of
+        // the i32/f64 default, and use T as the array's element type. Without
+        // this an annotated `let a: [i64; 3] = [1, 2, 3]` is laid out [i32; 3]
+        // and a later `&a[i]` typed `&i64` reads or writes past the element ->
+        // silent wrong answer.
+        let expected_elem = match &self.expected_type {
+            Some(MirType::Array(elem, _)) => Some((**elem).clone()),
+            _ => None,
+        };
 
-        // Infer element type from the first element; fall back to i32 for
-        // empty array literals.
-        let elem_ty = elem_vals
-            .first()
-            .map(|v| self.type_of_value(v))
+        let prev_expected = self.expected_type.take();
+        let mut elem_vals = Vec::with_capacity(elems.len());
+        for e in elems {
+            self.expected_type = expected_elem.clone();
+            let v = self.lower_expr(e);
+            match v {
+                Ok(val) => elem_vals.push(val),
+                Err(err) => {
+                    self.expected_type = prev_expected;
+                    return Err(err);
+                }
+            }
+        }
+        self.expected_type = prev_expected;
+
+        // Element type: the annotated element type when present, else inferred
+        // from the first element, falling back to i32 for an empty literal.
+        let elem_ty = expected_elem
+            .or_else(|| elem_vals.first().map(|v| self.type_of_value(v)))
             .unwrap_or(MirType::i32());
 
         let builder = self
@@ -7415,5 +7535,57 @@ impl<'ctx> MirLowerer<'ctx> {
         builder.cast(result, cast_kind, inner_val, target_ty);
 
         Ok(values::local(result))
+    }
+}
+
+/// Scalar class of a reference pointee, distinguishing an integer store/load
+/// from a float one. Used by the call-site reference-width guard so a pointee
+/// mismatch that shares a byte width but not a class (an `&i32` where an `&f32`
+/// is declared) is still rejected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalarPointeeClass {
+    Int,
+    Float,
+}
+
+impl ScalarPointeeClass {
+    fn name(self) -> &'static str {
+        match self {
+            ScalarPointeeClass::Int => "integer",
+            ScalarPointeeClass::Float => "float",
+        }
+    }
+}
+
+/// Byte width and scalar class of a pointee type, if it is a scalar integer or
+/// float. Returns None for a non-scalar pointee (struct, array, nested
+/// pointer), which is out of scope for the reference-width guard and left to
+/// the backend's existing shape matching. The C target is 64-bit, so `ISize`
+/// and `USize` measure eight bytes.
+fn scalar_pointee_shape(ty: &MirType) -> Option<(u32, ScalarPointeeClass)> {
+    match ty {
+        MirType::Int(size, _) => Some((size.bits(64) / 8, ScalarPointeeClass::Int)),
+        MirType::Float(f) => Some((f.bits() / 8, ScalarPointeeClass::Float)),
+        _ => None,
+    }
+}
+
+/// Whether an unsuffixed integer literal of magnitude `value` fits in a target
+/// integer type of the given size and signedness without truncation. `value`
+/// is the literal's non-negative magnitude (negation is a separate unary op),
+/// so only the upper bound is checked. The C target is 64-bit, so `ISize` and
+/// `USize` are treated as 64-bit here.
+fn int_literal_fits(value: u128, size: IntSize, signed: bool) -> bool {
+    let bits = size.bits(64);
+    if signed {
+        if bits >= 128 {
+            value <= i128::MAX as u128
+        } else {
+            value <= (1u128 << (bits - 1)) - 1
+        }
+    } else if bits >= 128 {
+        true
+    } else {
+        value <= (1u128 << bits) - 1
     }
 }

@@ -13018,9 +13018,11 @@ fn large_unsuffixed_int_literal_not_truncated_end_to_end() {
 ///   p5  `&mut` of a struct field             `set77(&mut p.x)`     -> 77
 ///   p6  `&mut` of an array element           `set88(&mut arr[1])`  -> 10/88/30
 /// p6 keeps the borrow element type equal to the array element type (i32) so it
-/// tests projection-ref aliasing alone. A borrow of a wider element type than the
-/// literal defaults to is a separate array-literal element-type gap, disclosed in
-/// the changelog, not exercised here.
+/// tests projection-ref aliasing alone. The separate case of a borrow whose
+/// pointee width differs from the array's storage width is now covered by
+/// `reference_pointee_width_matched_and_annotated_array_end_to_end` (annotated,
+/// compiles correctly) and `reference_pointee_width_mismatch_is_rejected`
+/// (unannotated, fails closed).
 #[test]
 fn place_projection_stores_and_borrows_reach_real_storage_end_to_end() {
     if !c_backend_ready() {
@@ -13116,6 +13118,181 @@ fn main() ~ Console {
         assert_eq!(
             result.stdout, expected,
             "cluster-p case `{name}` must store or borrow through the real place"
+        );
+    }
+}
+
+/// Regression (reference-pointee width, positive path). A borrow whose pointee
+/// width matches the callee parameter must reach the real storage, and an
+/// annotated integer array must be laid out at its annotated element width so a
+/// borrow or a read through it is correct. These are the fixed counterparts of
+/// the must-reject controls in the next test. Each row prints one value per line:
+///   a  matched-width scalar borrow  `let mut a: i64; set6(&mut a)`      -> 6
+///   b  matched-width float borrow   `let mut a: f64; setf(&mut a)`      -> 2
+///   c  annotated [i64;3] wide borrow `let arr: [i64;3]; set88(&mut arr[1])` -> 10/88/30
+///   d  annotated [i64;3] plain read  `let arr: [i64;3]; print each`      -> 10/20/30
+/// Cases c and d fail on the pre-fix binary: without threading the annotation
+/// into array-literal lowering the storage defaults to i32, so the read prints a
+/// truncated-then-sign-extended `85899345930` and the wide borrow corrupts the
+/// neighbours.
+#[test]
+fn reference_pointee_width_matched_and_annotated_array_end_to_end() {
+    if !c_backend_ready() {
+        eprintln!("skipping ref-width positive e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let cases: [(&str, &str, &str); 4] = [
+        (
+            "refwidth_matched_scalar_borrow",
+            r#"fn set6(r: &mut i64) { *r = 6; }
+fn main() ~ Console {
+    let mut a: i64 = 5;
+    set6(&mut a);
+    println!("{}", a);
+}
+"#,
+            "6\n",
+        ),
+        (
+            "refwidth_matched_float_borrow",
+            r#"fn setf(r: &mut f64) { *r = 2.0; }
+fn main() ~ Console {
+    let mut a: f64 = 1.0;
+    setf(&mut a);
+    let n: i64 = a as i64;
+    println!("{}", n);
+}
+"#,
+            "2\n",
+        ),
+        (
+            "refwidth_annotated_array_wide_borrow",
+            r#"fn set88(r: &mut i64) { *r = 88; }
+fn main() ~ Console {
+    let mut arr: [i64; 3] = [10, 20, 30];
+    set88(&mut arr[1]);
+    println!("{}", arr[0]);
+    println!("{}", arr[1]);
+    println!("{}", arr[2]);
+}
+"#,
+            "10\n88\n30\n",
+        ),
+        (
+            "refwidth_annotated_array_read",
+            r#"fn main() ~ Console {
+    let arr: [i64; 3] = [10, 20, 30];
+    println!("{}", arr[0]);
+    println!("{}", arr[1]);
+    println!("{}", arr[2]);
+}
+"#,
+            "10\n20\n30\n",
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_refwidth_positive");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src, expected) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write ref-width positive case");
+        let result = c_backend_run(&path);
+        assert_eq!(
+            result.stdout, expected,
+            "ref-width positive case `{name}` must reach storage at the correct width"
+        );
+    }
+}
+
+/// Regression (reference-pointee width, must-reject controls). A borrow whose
+/// pointee width disagrees with the callee parameter is a silent wrong answer:
+/// the callee stores or loads at its own width through storage laid out at a
+/// different width, corrupting neighbouring memory or reading past the element.
+/// buildc must reject each of these, not run it. Every case COMPILED AND RAN on
+/// the pre-fix binary, printing the wrong value noted:
+///   pinned scalar `&mut i32` -> `&mut i64` param   (checker) pre-fix printed 7
+///   pinned scalar `&mut f32` -> `&mut f64` param   (checker) pre-fix ran, corrupted
+///   unannotated array `&mut arr[i]` inferred wider (codegen) pre-fix printed 10/88/0
+///   unannotated array `&arr[i]` read wider          (codegen) pre-fix printed 128849018900
+/// The scalar cases are caught at the type checker (invariant unification of a
+/// reference pointee); the array cases are caught at the codegen call-site guard,
+/// which cannot lay unannotated storage out at the inferred width and so fails
+/// closed. Each assertion checks the rejection reason, not merely that the run
+/// failed, so an unrelated future error cannot make the control pass silently.
+#[test]
+fn reference_pointee_width_mismatch_is_rejected() {
+    if !c_backend_ready() {
+        eprintln!("skipping ref-width reject e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    // (name, source, reason-token expected in stderr)
+    let cases: [(&str, &str, &str); 4] = [
+        (
+            "refwidth_reject_scalar_int",
+            r#"fn set88(r: &mut i64) { *r = 88; }
+fn main() ~ Console {
+    let mut a: i32 = 5;
+    set88(&mut a);
+    println!("{}", a);
+}
+"#,
+            "type mismatch",
+        ),
+        (
+            "refwidth_reject_scalar_float",
+            r#"fn setf(r: &mut f64) { *r = 2.0; }
+fn main() ~ Console {
+    let mut a: f32 = 1.0;
+    setf(&mut a);
+    println!("{}", a);
+}
+"#,
+            "type mismatch",
+        ),
+        (
+            "refwidth_reject_array_mut_borrow",
+            r#"fn set88(r: &mut i64) { *r = 88; }
+fn main() ~ Console {
+    let mut arr = [10, 20, 30];
+    set88(&mut arr[1]);
+    println!("{}", arr[0]);
+    println!("{}", arr[1]);
+    println!("{}", arr[2]);
+}
+"#,
+            "byte integer reference",
+        ),
+        (
+            "refwidth_reject_array_shared_read",
+            r#"fn get(r: &i64) -> i64 { *r }
+fn main() ~ Console {
+    let arr = [10, 20, 30];
+    let x = get(&arr[1]);
+    println!("{}", x);
+}
+"#,
+            "byte integer reference",
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_refwidth_reject");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src, reason) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write ref-width reject case");
+        let output = buildc()
+            .arg("run")
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|err| panic!("run buildc for {name}: {err}"));
+        assert!(
+            !output.status.success(),
+            "ref-width reject case `{name}` must fail to compile, not silently miscompile\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(reason),
+            "ref-width reject case `{name}` must fail for the width-mismatch reason (expected `{reason}` in the diagnostic), not an unrelated error:\n{stderr}"
         );
     }
 }
@@ -14320,6 +14497,52 @@ fn transpile_preservation_c_and_rust_backends_agree_on_stdout() {
         "transpile-preservation: C and Rust backends agree on stdout + exit status \
          for {cross_checked} corpus program(s)"
     );
+}
+
+/// False-success control for the Rust-backend numeric-print path. Printing a
+/// float with `println!("{}", x)` lowers to `build_f64_to_string(x)` followed by
+/// a `.ptr` projection off the resulting runtime string. The C runtime defines
+/// that function and models the string as a `BuildString` with a `ptr` field;
+/// the Rust source backend did neither, so any float-printing program failed to
+/// compile with `error[E0425]: cannot find function build_f64_to_string` and
+/// `error[E0609]: no field ptr on type String`. The C path never exercised this
+/// (its own runtime is complete) and the cross-backend receipt lane was the
+/// first caller to reach it. This test lowers a float- and int-printing program
+/// through the Rust backend, compiles it with `rustc`, runs it, and pins the
+/// output. On the pre-fix binary it fails at the compile step; the assertion
+/// message carries the generated source and rustc's diagnostics.
+#[test]
+fn rust_backend_lowers_float_and_int_println_end_to_end() {
+    if !rustc_available() {
+        eprintln!("skipping rust-backend numeric-print control: rustc not available");
+        return;
+    }
+
+    // `2.0` prints as `2` and `0.1 + 0.2` prints as `0.30000000000000004` under
+    // Rust's shortest round-trip Display, which is the same positional decimal
+    // the C `bl_fmt_f64` helper produces. The integer print takes the direct
+    // format path and is included so a regression there would also surface.
+    let source = r#"
+fn main() ~ Console {
+    let n: i32 = 1234567;
+    let whole: f64 = 2.0;
+    let tenth: f64 = 0.1;
+    let sum: f64 = 0.1 + 0.2;
+    println!("{}", n);
+    println!("{}", whole);
+    println!("{}", tenth);
+    println!("{}", sum);
+}
+"#;
+
+    let rust_source = lower_source_to_rust(source);
+    let result = rustc_compile_and_run("rust_numeric_println", &rust_source);
+    assert_eq!(
+        result.stdout, "1234567\n2\n0.1\n0.30000000000000004\n",
+        "Rust backend must define build_f64_to_string and project `.ptr` off a \
+         runtime string so float printing compiles and round-trips"
+    );
+    assert_eq!(result.exit_code, Some(0), "generated program must exit 0");
 }
 
 // =============================================================================
