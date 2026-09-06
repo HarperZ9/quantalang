@@ -71,6 +71,10 @@ static void bl_arith_panic(const char* what) {
     fprintf(stderr, "%s\n", what);
     exit(101);
 }
+static void bl_match_fail(void) {
+    fprintf(stderr, "non-exhaustive match: no arm matched the scrutinee\n");
+    exit(101);
+}
 static int8_t   bl_idiv_i8  (int8_t   a, int8_t   b){ if(b==0) bl_arith_panic("attempt to divide by zero"); if(a==INT8_MIN  && b==-1) bl_arith_panic("attempt to divide with overflow"); return a/b; }
 static int16_t  bl_idiv_i16 (int16_t  a, int16_t  b){ if(b==0) bl_arith_panic("attempt to divide by zero"); if(a==INT16_MIN && b==-1) bl_arith_panic("attempt to divide with overflow"); return a/b; }
 static int32_t  bl_idiv_i32 (int32_t  a, int32_t  b){ if(b==0) bl_arith_panic("attempt to divide by zero"); if(a==INT32_MIN && b==-1) bl_arith_panic("attempt to divide with overflow"); return a/b; }

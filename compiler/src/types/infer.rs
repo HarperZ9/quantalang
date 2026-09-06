@@ -309,6 +309,67 @@ fn extract_covered_variants(pattern: &ast::Pattern) -> Vec<String> {
     }
 }
 
+/// A match arm is an unguarded catch-all when it has no guard and its pattern
+/// matches every value of the scrutinee type. Only such an arm makes a scalar
+/// match exhaustive on its own; a guard can always fail, so a guarded arm never
+/// closes the match.
+fn arm_is_unguarded_catch_all(arm: &ast::MatchArm) -> bool {
+    arm.guard.is_none() && pattern_is_irrefutable(&arm.pattern)
+}
+
+/// Whether a pattern matches every value of its type, ignoring any guard. A bare
+/// binding (`x`) and `_` are irrefutable; `x @ inner`, parentheses, and `a | b`
+/// follow their inner patterns.
+fn pattern_is_irrefutable(pat: &ast::Pattern) -> bool {
+    match &pat.kind {
+        ast::PatternKind::Wildcard => true,
+        ast::PatternKind::Ident {
+            subpattern: None, ..
+        } => true,
+        ast::PatternKind::Ident {
+            subpattern: Some(inner),
+            ..
+        }
+        | ast::PatternKind::Paren(inner) => pattern_is_irrefutable(inner),
+        ast::PatternKind::Or(alts) => alts.iter().any(pattern_is_irrefutable),
+        _ => false,
+    }
+}
+
+/// Whether a pattern uses a range anywhere (`0..=9`, including inside `a | b`,
+/// parentheses, or an `x @` binding). Range coverage over an integer or char
+/// type is not computed here, so a match that uses any range is accepted rather
+/// than risk rejecting a program a range makes exhaustive.
+fn pattern_uses_range(pat: &ast::Pattern) -> bool {
+    match &pat.kind {
+        ast::PatternKind::Range { .. } => true,
+        ast::PatternKind::Ident {
+            subpattern: Some(inner),
+            ..
+        }
+        | ast::PatternKind::Paren(inner) => pattern_uses_range(inner),
+        ast::PatternKind::Or(alts) => alts.iter().any(pattern_uses_range),
+        _ => false,
+    }
+}
+
+/// Record which boolean literals a pattern covers, following `a | b` and
+/// parentheses. Used to tell whether the `true` and `false` cases are both
+/// present in a `bool` match.
+fn collect_bool_literals(pat: &ast::Pattern, covers_true: &mut bool, covers_false: &mut bool) {
+    match &pat.kind {
+        ast::PatternKind::Literal(ast::Literal::Bool(true)) => *covers_true = true,
+        ast::PatternKind::Literal(ast::Literal::Bool(false)) => *covers_false = true,
+        ast::PatternKind::Paren(inner) => collect_bool_literals(inner, covers_true, covers_false),
+        ast::PatternKind::Or(alts) => {
+            for alt in alts {
+                collect_bool_literals(alt, covers_true, covers_false);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Whether an array element type may participate in elementwise broadcasting
 /// (`.+ .- .* ./`). Broadcasting is defined only for numeric elements
 /// (integer/float): the C backend lowers each element to a scalar arithmetic op,
@@ -5434,6 +5495,58 @@ impl<'ctx> TypeInfer<'ctx> {
                         span,
                     );
                 }
+            }
+        } else {
+            // Scalar exhaustiveness. A `bool`, integer, or `char` scrutinee is
+            // not an enum, so the variant check above never covers it. Without
+            // an unguarded catch-all arm the C backend fell through to a
+            // zero/garbage default at runtime (a silent wrong value), so reject
+            // a provably non-exhaustive scalar match the way Rust does. The
+            // check only fires when non-exhaustiveness is certain, so no valid
+            // program is rejected.
+            let resolved = self.apply(&scrutinee_ty);
+            let has_catch_all = arms.iter().any(arm_is_unguarded_catch_all);
+            match &resolved.kind {
+                TyKind::Bool if !has_catch_all => {
+                    let (mut covers_true, mut covers_false) = (false, false);
+                    for arm in arms.iter().filter(|arm| arm.guard.is_none()) {
+                        collect_bool_literals(&arm.pattern, &mut covers_true, &mut covers_false);
+                    }
+                    if !(covers_true && covers_false) {
+                        let mut missing = Vec::new();
+                        if !covers_true {
+                            missing.push("true".to_string());
+                        }
+                        if !covers_false {
+                            missing.push("false".to_string());
+                        }
+                        self.error(
+                            TypeError::NonExhaustiveMatch {
+                                missing_variants: missing,
+                            },
+                            span,
+                        );
+                    }
+                }
+                (TyKind::Int(_)
+                | TyKind::Char
+                | TyKind::Infer(InferTy {
+                    kind: InferKind::Int,
+                    ..
+                }))
+                    if !has_catch_all =>
+                {
+                    // Finitely many literal arms can never cover a whole integer
+                    // or char type. An integer inference variable (a literal
+                    // scrutinee not yet defaulted to a concrete width) only ever
+                    // resolves to some integer type, so it is discrete too. Skip
+                    // when any arm uses a range, since range coverage is not
+                    // computed here and could be exhaustive.
+                    if !arms.iter().any(|arm| pattern_uses_range(&arm.pattern)) {
+                        self.error(TypeError::NonExhaustivePatterns, span);
+                    }
+                }
+                _ => {}
             }
         }
 

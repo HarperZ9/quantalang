@@ -10,6 +10,35 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+- **A non-exhaustive scalar `match` is caught at compile time where coverage can
+  be proven, and aborts with a clean panic at run time where it cannot, instead
+  of returning a stale value**: `match` lowering left the no-arm-matched path
+  falling through to the merge block, which then read an uninitialised result
+  local. A `match n { 0 => .., 1 => .. }` over an `n` that was neither `0` nor `1`
+  printed whatever that local happened to hold (after `let mut out = 7` it printed
+  `7`) or nothing at all, with exit 0. Two layers now close this. The type checker
+  rejects a scalar or `bool` `match` whose arms cannot cover the scrutinee's
+  domain: a `bool` missing `true` or `false` reports `non-exhaustive match:
+  missing variants ...`, and an integer or `char` scrutinee with no range arm and
+  no catch-all reports `non-exhaustive patterns`, both before any C is emitted and
+  both with a help line pointing at a `_` arm. The check fires only when
+  non-exhaustiveness is certain, so it never rejects a valid match. A scrutinee
+  whose concrete integer type is pinned only by later whole-program inference (a
+  value read from a `Vec`, as in `let n = v[0]`) slips past the checker; for that
+  residual case the backend routes the no-match path to a runtime helper
+  `bl_match_fail`, which prints `non-exhaustive match: no arm matched the
+  scrutinee` and aborts with exit 101, matching the divide-by-zero and
+  out-of-bounds panics. An enum `match` keeps its existing compile-time
+  exhaustiveness check, which recovers the missing variants from the pattern
+  paths. Covered by `non_exhaustive_scalar_match_is_rejected_at_compile_time`
+  (bool, annotated-`let` i32, and typed-parameter i32, each of which compiled and
+  ran on the pre-fix binary),
+  `non_exhaustive_match_over_runtime_value_aborts_fail_closed` (the two
+  `Vec`-value cases that printed a stale value or nothing pre-fix), and
+  `exhaustive_scalar_match_still_compiles_and_runs` (wildcard, bare binding, and
+  both bool arms, guarding against over-rejection). Honest null: a scalar `match`
+  made exhaustive only by a range arm is not statically range-analysed, so its
+  coverage is enforced by the runtime backstop rather than at compile time.
 - **Integer divide-by-zero and `MIN / -1` abort with a clean panic instead of
   crashing, hanging, or returning a wrong value**: the backend emitted integer
   `/` and `%` as raw C `/` and `%`, which deviate from Rust's contract three ways.

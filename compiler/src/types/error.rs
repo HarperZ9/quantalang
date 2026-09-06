@@ -510,6 +510,9 @@ impl TypeError {
                     missing_variants.join(", ")
                 ))
             }
+            TypeError::NonExhaustivePatterns => {
+                Some("add a wildcard `_` arm to cover the remaining values".to_string())
+            }
             _ => None,
         }
     }

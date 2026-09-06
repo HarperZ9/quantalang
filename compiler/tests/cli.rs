@@ -4786,6 +4786,12 @@ fn main() ~ FileSystem {
     );
 }
 
+/// A guarded arm never satisfies match exhaustiveness (the guard may be false),
+/// so the `true if allow_secret` arm alone does not cover `true`. The unguarded
+/// `true => {}` arm supplies that coverage, and it is also the path on which the
+/// pre-match `load_config` binding survives when the guard fails, which is the
+/// alias-source propagation this test pins. Do not remove that arm: without it
+/// the type checker rejects the fixture as a non-exhaustive `bool` match.
 #[test]
 fn check_receipt_keeps_pre_match_alias_source_after_guarded_match_assignment() {
     let fixture = std::env::temp_dir().join(format!(
@@ -4813,6 +4819,7 @@ fn main() ~ FileSystem {
     let mut loader = load_config;
     match mode {
         true if allow_secret => { loader = load_secret; },
+        true => {},
         false => { loader = load_backup; }
     };
     loader("ops.txt");
@@ -14172,6 +14179,238 @@ fn integer_divide_and_remainder_compute_correctly() {
         assert_eq!(
             result.stdout, expected,
             "div/rem case `{name}` must compute the correct value"
+        );
+    }
+}
+
+/// The type checker rejects a scalar or bool `match` whose arms cannot cover
+/// every value, at compile time, before any C is emitted. Pre-fix, every case
+/// here compiled and ran: a bool match missing `false`, an `i32` match over two
+/// literals with no `_`, an annotated-`let` `i32` scrutinee, and a typed
+/// parameter scrutinee all slipped through and either printed a stale
+/// zero-initialised result or fell off the end. Each assertion fails on the
+/// pre-fix binary, which exits 0 with no diagnostic. The scrutinee type is fixed
+/// concretely (a bool from a signature, an annotated `let`, or a typed
+/// parameter) so the checker can prove non-exhaustiveness without whole-program
+/// inference. The emit-C path (`buildc FILE -o OUT.c`) runs the type checker and
+/// fails on a type error, so this control needs no C backend.
+#[test]
+fn non_exhaustive_scalar_match_is_rejected_at_compile_time() {
+    // (name, source, required stderr substring)
+    let cases: [(&str, &str, &str); 4] = [
+        (
+            "bool_missing_false",
+            r#"fn pick(b: bool) -> i32 {
+    match b {
+        true => 42,
+    }
+}
+fn main() ~ Console {
+    println!("{}", pick(true));
+}
+"#,
+            "non-exhaustive match: missing variants",
+        ),
+        (
+            "i32_two_literals",
+            r#"fn classify(n: i32) -> i32 {
+    match n {
+        0 => 100,
+        1 => 200,
+    }
+}
+fn main() ~ Console {
+    println!("{}", classify(9));
+}
+"#,
+            "non-exhaustive patterns",
+        ),
+        (
+            "annotated_let_i32",
+            r#"fn main() ~ Console {
+    let n: i32 = 9;
+    let mut out = 7;
+    match n {
+        0 => { out = 1; }
+        1 => { out = 2; }
+    }
+    println!("{}", out);
+}
+"#,
+            "non-exhaustive patterns",
+        ),
+        (
+            "typed_param_i32",
+            r#"fn go(n: i32) ~ Console {
+    let mut out = 7;
+    match n {
+        0 => { out = 1; }
+        1 => { out = 2; }
+    }
+    println!("{}", out);
+}
+fn main() ~ Console {
+    go(9);
+}
+"#,
+            "non-exhaustive patterns",
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_match_nonexhaustive_reject");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src, needle) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write non-exhaustive case");
+        let out_c = dir.join(format!("{name}.c"));
+        let output = buildc()
+            .arg(&path)
+            .arg("-o")
+            .arg(&out_c)
+            .output()
+            .expect("run buildc to emit C");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "case `{name}` must fail to compile (non-exhaustive match)\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(needle),
+            "case `{name}` must report `{needle}`\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// Companion to the rejection control: a scalar `match` that IS exhaustive must
+/// still compile and run, so the new check never over-rejects. A wildcard `_`
+/// arm, a bare binding arm, and a bool match covering both `true` and `false`
+/// each cover their domain. This passes on the pre-fix binary too; it guards
+/// against the checker rejecting a valid match.
+#[test]
+fn exhaustive_scalar_match_still_compiles_and_runs() {
+    if !c_backend_ready() {
+        eprintln!("skipping exhaustive-match e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let cases: [(&str, &str, &str); 3] = [
+        (
+            "wildcard_arm",
+            r#"fn classify(n: i32) -> i32 {
+    match n {
+        0 => 100,
+        1 => 200,
+        _ => 999,
+    }
+}
+fn main() ~ Console {
+    println!("{}", classify(9));
+}
+"#,
+            "999",
+        ),
+        (
+            "binding_arm",
+            r#"fn classify(n: i32) -> i32 {
+    match n {
+        0 => 100,
+        other => other + 1,
+    }
+}
+fn main() ~ Console {
+    println!("{}", classify(41));
+}
+"#,
+            "42",
+        ),
+        (
+            "bool_both_arms",
+            r#"fn pick(b: bool) -> i32 {
+    match b {
+        true => 42,
+        false => 7,
+    }
+}
+fn main() ~ Console {
+    println!("{}", pick(false));
+}
+"#,
+            "7",
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_match_exhaustive_ok");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src, expected) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write exhaustive case");
+        let (stdout, stderr, exit_code) = c_backend_run_capture(&path);
+        assert_eq!(
+            exit_code,
+            Some(0),
+            "exhaustive case `{name}` must run cleanly\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.trim(),
+            expected,
+            "exhaustive case `{name}` must print `{expected}`\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// The residual hole the compile-time check cannot close: when the scrutinee's
+/// concrete integer type is pinned only by later whole-program inference (a value
+/// read from a `Vec`), the checker cannot prove non-exhaustiveness, so the match
+/// reaches codegen. Pre-fix, the no-match path fell through and read an
+/// uninitialised result: `let n = v[0]; match n { 0 => .., 1 => .. }` printed the
+/// stale `7`, and `match v[0] { .. }` printed nothing, both exit 0. The codegen
+/// backstop now routes that path to `bl_match_fail`, which aborts with exit 101
+/// and a stderr diagnostic. Each assertion fails on the pre-fix binary, which
+/// exits 0.
+#[test]
+fn non_exhaustive_match_over_runtime_value_aborts_fail_closed() {
+    if !c_backend_ready() {
+        eprintln!("skipping match backstop e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let cases: [(&str, &str); 2] = [
+        (
+            "let_bound_vec_value",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![9];
+    let n = v[0];
+    let mut out = 7;
+    match n {
+        0 => { out = 1; }
+        1 => { out = 2; }
+    }
+    println!("{}", out);
+}
+"#,
+        ),
+        (
+            "direct_vec_index",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![9];
+    match v[0] {
+        0 => { println!("z"); }
+        1 => { println!("o"); }
+    }
+}
+"#,
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_match_backstop");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write match backstop case");
+        let (stdout, stderr, exit_code) = c_backend_run_capture(&path);
+        assert_eq!(
+            exit_code,
+            Some(101),
+            "match backstop case `{name}` must abort with exit 101\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("non-exhaustive match: no arm matched the scrutinee"),
+            "match backstop case `{name}` must print the no-match diagnostic\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 }

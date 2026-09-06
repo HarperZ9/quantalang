@@ -4827,6 +4827,30 @@ impl<'ctx> MirLowerer<'ctx> {
         None
     }
 
+    /// True when an arm has no guard and its pattern matches every value, so
+    /// the match is exhaustive by that arm alone.  Mirrors the type checker's
+    /// `pattern_is_irrefutable`; used to decide whether a scalar match needs a
+    /// fail-closed no-match backstop in codegen.
+    fn arm_is_unguarded_catch_all(arm: &ast::MatchArm) -> bool {
+        arm.guard.is_none() && Self::pattern_is_irrefutable(&arm.pattern)
+    }
+
+    fn pattern_is_irrefutable(pat: &ast::Pattern) -> bool {
+        match &pat.kind {
+            ast::PatternKind::Wildcard => true,
+            ast::PatternKind::Ident {
+                subpattern: None, ..
+            } => true,
+            ast::PatternKind::Ident {
+                subpattern: Some(inner),
+                ..
+            }
+            | ast::PatternKind::Paren(inner) => Self::pattern_is_irrefutable(inner),
+            ast::PatternKind::Or(alts) => alts.iter().any(Self::pattern_is_irrefutable),
+            _ => false,
+        }
+    }
+
     fn lower_match(
         &mut self,
         scrutinee: &ast::Expr,
@@ -4929,6 +4953,30 @@ impl<'ctx> MirLowerer<'ctx> {
 
         let merge_block = builder.create_block();
 
+        // Fail-closed backstop for scalar (non-enum) matches that have no
+        // irrefutable catch-all arm.  The type checker rejects provably
+        // non-exhaustive scalar matches at compile time, but a scrutinee whose
+        // concrete integer type is pinned only by later global constraint
+        // solving (`let n = v[i]; match n { 0 => .. }`), or an int match made
+        // exhaustive only by a range the checker does not range-analyse, can
+        // reach codegen without full coverage.  Without a backstop the no-match
+        // path falls through to `merge_block` and reads an uninitialised result
+        // -- a silent wrong answer.  Route that path to a block that calls
+        // `bl_match_fail` (stderr + exit 101) instead.  Enum matches keep their
+        // existing behaviour: the checker catches them reliably via pattern-path
+        // variant recovery.  When the match is in fact exhaustive (a bool over
+        // both literals, an int with a wildcard) the backstop block is emitted
+        // but never reached; that dead block is the cost of a uniform, provably
+        // fail-closed no-match path.
+        let has_unguarded_catch_all = arms.iter().any(Self::arm_is_unguarded_catch_all);
+        let needs_match_backstop = !is_enum_match && !has_unguarded_catch_all;
+        let no_match_block = if needs_match_backstop {
+            Some(builder.create_block())
+        } else {
+            None
+        };
+        let final_fallthrough = no_match_block.unwrap_or(merge_block);
+
         // Pre-create one body block per arm, plus test blocks and optional
         // guard blocks.
         let mut arm_body_blocks: Vec<BlockId> = Vec::with_capacity(arms.len());
@@ -5025,7 +5073,9 @@ impl<'ctx> MirLowerer<'ctx> {
             } else if let Some(&body_blk) = arm_body_blocks.first() {
                 builder.goto(body_blk);
             } else {
-                builder.goto(merge_block);
+                // No arms at all: route the unmatched entry to the backstop
+                // (or merge_block when no backstop was created).
+                builder.goto(final_fallthrough);
             }
         }
 
@@ -5033,11 +5083,13 @@ impl<'ctx> MirLowerer<'ctx> {
         for (i, arm) in arms.iter().enumerate() {
             let body_block = arm_body_blocks[i];
 
-            // Compute the fall-through target (next arm's test, body, or merge).
+            // Compute the fall-through target (next arm's test, body, or the
+            // final fall-through -- merge_block, or the no-match backstop when
+            // this scalar match has no irrefutable catch-all arm).
             let next_target = if i + 1 < arms.len() {
                 arm_test_blocks[i + 1].unwrap_or(arm_body_blocks[i + 1])
             } else {
-                merge_block
+                final_fallthrough
             };
 
             // --- Test block (if there is one) ---
@@ -5185,6 +5237,19 @@ impl<'ctx> MirLowerer<'ctx> {
                 builder.assign(result, MirRValue::Use(body_val));
             }
             builder.goto(merge_block);
+        }
+
+        // Emit the no-match backstop: call `bl_match_fail` (which exits 101)
+        // then nominally continue to merge_block so the terminator has a
+        // successor.  The call never returns, so the merge edge is dead.
+        if let Some(nm) = no_match_block {
+            let builder = self.current_fn.as_mut().unwrap();
+            builder.switch_to_block(nm);
+            builder.call_void(
+                MirValue::Function(Arc::from("bl_match_fail")),
+                vec![],
+                merge_block,
+            );
         }
 
         let builder = self.current_fn.as_mut().unwrap();
