@@ -541,13 +541,23 @@ fn test_boolean_keywords() {
 }
 
 #[test]
-fn test_build_specific_keywords() {
-    expect_single_token("ai", TokenKind::Keyword(Keyword::AI));
-    expect_single_token("neural", TokenKind::Keyword(Keyword::Neural));
-    expect_single_token("infer", TokenKind::Keyword(Keyword::Infer));
+fn test_effect_handler_keywords() {
+    // The effect-handler grammar keeps these three as real keywords.
     expect_single_token("effect", TokenKind::Keyword(Keyword::Effect));
     expect_single_token("handle", TokenKind::Keyword(Keyword::Handle));
     expect_single_token("with", TokenKind::Keyword(Keyword::With));
+}
+
+#[test]
+fn test_demoted_reserved_words_lex_as_identifiers() {
+    // `ai`, `neural`, and `infer` have no grammar production, so the scanner
+    // lexes them as ordinary identifiers. This keeps a field named `ai`, a
+    // module `neural`, or a method `infer` usable in real code. The scanner
+    // unit test `demoted_words_lex_as_identifiers` covers the same demotion at
+    // the lexer layer.
+    expect_single_token("ai", TokenKind::Ident);
+    expect_single_token("neural", TokenKind::Ident);
+    expect_single_token("infer", TokenKind::Ident);
 }
 
 // =============================================================================
