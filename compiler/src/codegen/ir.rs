@@ -801,8 +801,9 @@ impl MirPlace {
     }
 
     /// Add a field projection. Carries the field NAME as well as the ordinal
-    /// index and type: the C backend renders a place lvalue by name (`x.field`),
-    /// while index-based backends (LLVM GEP, Rust positional) use the index.
+    /// index and type. The C and Rust backends render a place lvalue by name
+    /// (`x.field`), because both emit named-field structs; LLVM GEP uses the
+    /// ordinal index.
     pub fn field(mut self, idx: u32, name: Arc<str>, ty: MirType) -> Self {
         self.projections.push(PlaceProjection::Field(idx, name, ty));
         self

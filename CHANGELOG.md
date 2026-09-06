@@ -10,6 +10,32 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+- **Rust backend projects struct fields by name and compiles numeric printing**:
+  two defects kept the Rust source backend from building programs the C backend
+  already ran. A field place lowered to a positional `.field0`, which does not
+  compile against a generated struct whose fields carry their real names, so any
+  program that read a named struct field through the Rust backend failed at
+  rustc. Separately the backend never defined the `build_i32_to_string`,
+  `build_i64_to_string`, `build_f32_to_string`, and `build_f64_to_string` runtime
+  functions its own output calls, and it modeled a runtime string as a C
+  `BuildString` with a `ptr` field, so `println!("{}", x)` on a float emitted a
+  call to a missing function followed by a `.ptr` access on a native `String`.
+  Both were hard compile errors (`E0425` and `E0609`) that the cross-backend
+  receipt lane was the first caller to reach, because the C path carries its own
+  complete runtime. A field place now lowers by name, the four numeric-to-string
+  functions are emitted in the Rust prelude returning `String` whose `Display`
+  reproduces the C output (integers in decimal, floats in Rust's shortest
+  round-trip, which is the same positional decimal the C helpers produce), and a
+  `ptr`, `len`, or `cap` projection off a string base is redirected to the
+  matching `String` operation. The `generated_rust_compiles_for_struct_field_references`
+  unit test pins the field path, the cross-backend receipt lane pins the numeric
+  path, and `rust_backend_lowers_float_and_int_println_end_to_end` lowers a
+  float- and int-printing program through the Rust backend, compiles it with
+  `rustc`, and pins its stdout; the end-to-end control fails to compile on the
+  pre-fix binary with `E0425` and `E0609`. Scoped out and left as honest nulls:
+  `ptr` yields a `'static` slice by leaking a copy of the bytes, deliberate
+  because the generated program runs once and exits; and the Rust backend still
+  returns `Unsupported` for enum, union, and texture lowering.
 - **Projected assignment targets and `&mut` of a place reach real storage**: four
   codegen defects let a store or a mutable borrow of a projected lvalue miss its
   target, each a silent wrong answer because the write vanished with no diagnostic.
