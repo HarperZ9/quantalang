@@ -911,6 +911,47 @@ fn print_substrate_evidence(corpus_root: Option<&Path>) {
     }
 }
 
+/// How far each `--target` goes: the flag you type, the rank, and what the
+/// backend emits. `buildc doctor` prints this table, the README lists the same
+/// nine flags, and docs/art/backend-maturity.svg draws it. Tests hold all three
+/// to this one array, so a re-ranked backend cannot leave a stale rank behind
+/// on a surface nobody remembered to edit.
+const BACKEND_MATURITY: [(&str, &str, &str); 9] = [
+    ("c", "primary", "executable C99 path used by buildc run"),
+    ("hlsl", "supported", "shader source output"),
+    ("glsl", "supported", "shader source output"),
+    (
+        "rust",
+        "experimental",
+        "source output with semantic-corpus subset checks",
+    ),
+    (
+        "llvm",
+        "experimental",
+        "LLVM IR; executable path depends on clang",
+    ),
+    (
+        "wasm",
+        "experimental",
+        "WASM/WAT output; runtime depends on wasmtime",
+    ),
+    (
+        "spirv",
+        "experimental",
+        "SPIR-V output; validate with spirv-val",
+    ),
+    (
+        "x86-64",
+        "experimental",
+        "assembly/object output; linker integration is partial",
+    ),
+    (
+        "arm64",
+        "experimental",
+        "assembly/object output; linker integration is partial",
+    ),
+];
+
 fn cmd_doctor() -> Result<(), i32> {
     println!("BuildLang Doctor");
     println!("=================");
@@ -951,15 +992,9 @@ fn cmd_doctor() -> Result<(), i32> {
 
     println!();
     println!("Backend maturity:");
-    println!("  c        primary       executable C99 path used by buildc run");
-    println!("  hlsl     supported     shader source output");
-    println!("  glsl     supported     shader source output");
-    println!("  rust     experimental  source output with semantic-corpus subset checks");
-    println!("  llvm     experimental  LLVM IR; executable path depends on clang");
-    println!("  wasm     experimental  WASM/WAT output; runtime depends on wasmtime");
-    println!("  spirv    experimental  SPIR-V output; validate with spirv-val");
-    println!("  x86-64   experimental  assembly/object output; linker integration is partial");
-    println!("  arm64    experimental  assembly/object output; linker integration is partial");
+    for (flag, rank, output) in BACKEND_MATURITY {
+        println!("  {flag:<9}{rank:<14}{output}");
+    }
 
     // GPU row: report exactly what was probed for the real GPU path. Layer A
     // (valid compute SPIR-V) needs only spirv-val; Layer B (device dispatch)
@@ -10693,5 +10728,165 @@ mod tests {
         assert!(name.starts_with("buildlang_run_weird_file__"));
         assert!(!name.contains(' '));
         assert!(!name.contains('!'));
+    }
+
+    // docs/art/backend-maturity.svg draws one row per --target flag. That is a
+    // claim about this compiler and about the substrate receipt, not about the
+    // picture, so nothing under tools/ can settle it. The four tests below
+    // drive the drawn rows against the array doctor prints, against the flag
+    // parser, against the README table, and against the receipt.
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler manifest should have a repository parent")
+            .to_path_buf()
+    }
+
+    fn read_repo_json(relative: &str) -> serde_json::Value {
+        let path = repo_root().join(relative);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        serde_json::from_str(&text)
+            .unwrap_or_else(|err| panic!("{} is JSON: {err}", path.display()))
+    }
+
+    fn backend_card() -> serde_json::Value {
+        read_repo_json("docs/art/buildlang.art.json")["cards"]
+            .as_array()
+            .expect("the art spec carries cards")
+            .iter()
+            .find(|card| card["file"] == "backend-maturity.svg")
+            .expect("the backend card is in the art spec")
+            .clone()
+    }
+
+    fn drawn_rows() -> Vec<(String, String)> {
+        backend_card()["fields"]
+            .as_array()
+            .expect("the card draws fields")
+            .iter()
+            .map(|field| {
+                (
+                    field["key"].as_str().expect("a row key").to_string(),
+                    field["value"].as_str().expect("a row value").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Every backend, by way of a match with no wildcard arm: adding a Target
+    /// stops this file compiling until the flag it answers to is written down.
+    fn flag_for(target: Target) -> &'static str {
+        match target {
+            Target::C => "c",
+            Target::Hlsl => "hlsl",
+            Target::Glsl => "glsl",
+            Target::Rust => "rust",
+            Target::LlvmIr => "llvm",
+            Target::Wasm => "wasm",
+            Target::SpirV => "spirv",
+            Target::X86_64 => "x86-64",
+            Target::Arm64 => "arm64",
+        }
+    }
+
+    #[test]
+    fn the_card_draws_the_table_doctor_prints() {
+        let printed: Vec<(String, String)> = BACKEND_MATURITY
+            .iter()
+            .map(|(flag, rank, _)| (flag.to_string(), rank.to_uppercase()))
+            .collect();
+
+        assert_eq!(
+            drawn_rows(),
+            printed,
+            "the card and buildc doctor disagree about the backends"
+        );
+    }
+
+    #[test]
+    fn every_flag_the_card_draws_reaches_a_backend_of_its_own() {
+        // flag_for covers every variant and nothing else, so nine drawn flags
+        // resolving to nine distinct targets is every backend, once each.
+        let mut reached: Vec<Target> = Vec::new();
+        for (flag, _) in drawn_rows().iter().map(|(f, v)| (f.clone(), v)) {
+            let target = parse_codegen_target(&flag)
+                .unwrap_or_else(|err| panic!("the card draws {flag}, which does not parse: {err}"));
+            assert_eq!(
+                flag_for(target),
+                flag,
+                "{flag} parses to a backend the card names differently"
+            );
+            assert!(
+                !reached.contains(&target),
+                "{flag} is a second name for a backend already drawn"
+            );
+            reached.push(target);
+        }
+        assert_eq!(reached.len(), 9, "a backend is drawn twice or not at all");
+    }
+
+    #[test]
+    fn the_readme_backends_table_offers_the_same_flags() {
+        // Line by line, because a Windows checkout arrives with CRLF unless a
+        // file is pinned, and the README is prose that should stay unpinned.
+        // str::lines drops the carriage return, so this reads what the section
+        // says rather than how it happens to be stored.
+        let readme =
+            std::fs::read_to_string(repo_root().join("README.md")).expect("read the README");
+        let mut lines = readme.lines();
+        assert!(
+            lines.any(|line| line == "## Backends"),
+            "the README has a Backends section"
+        );
+        let section: Vec<&str> = lines.take_while(|line| !line.starts_with("## ")).collect();
+        assert!(!section.is_empty(), "the Backends section says nothing");
+
+        for (flag, _, _) in BACKEND_MATURITY {
+            let offered = format!("`--target {flag}`");
+            assert!(
+                section.iter().any(|line| line.contains(&offered)),
+                "the README Backends table never offers --target {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_substrate_receipt_backs_the_row_the_card_accents() {
+        let card = backend_card();
+        let marked: Vec<&str> = card["fields"]
+            .as_array()
+            .expect("the card draws fields")
+            .iter()
+            .filter(|field| field["tone"].as_str().unwrap_or("none") != "none")
+            .map(|field| field["key"].as_str().expect("a row key"))
+            .collect();
+        assert_eq!(marked, ["c"], "the accent should sit on the primary path");
+
+        let primary: Vec<&str> = BACKEND_MATURITY
+            .iter()
+            .filter(|(_, rank, _)| *rank == "primary")
+            .map(|(flag, _, _)| *flag)
+            .collect();
+        assert_eq!(primary, ["c"], "doctor ranks more than one backend primary");
+
+        let receipt =
+            read_repo_json("semantic-corpus/receipts/substrate-semantic-corpus-2026-06-18.json");
+        let surface = receipt["execution_surface"]
+            .as_object()
+            .expect("the substrate receipt carries an execution surface");
+
+        // The footnote says three of the nine reach the receipt at all, and
+        // says what each of the three is recorded as.
+        let mut covered: Vec<&str> = surface.keys().map(String::as_str).collect();
+        covered.sort_unstable();
+        assert_eq!(covered, ["c", "rust", "spirv"]);
+        assert_eq!(surface["c"]["maturity"], "production-anchor");
+        assert!(
+            surface["rust"]["receipt"].is_string(),
+            "rust should carry the execution receipt the footnote cites"
+        );
+        assert_eq!(surface["spirv"]["status"], "unverified");
     }
 }

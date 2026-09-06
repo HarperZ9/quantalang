@@ -1,4 +1,4 @@
-<p align="center"><img src=".github/assets/banner.svg" alt="buildlang: A real systems language: typed capability effects, sum and linear types, C FFI, native binaries." width="100%"></p>
+<p align="center"><img src="docs/art/buildlang-header.svg" alt="buildlang: systems language with typed effects. What a program is allowed to reach is part of its type." width="100%"></p>
 
 **A real systems language: typed capability effects, sum and linear types, C FFI, native binaries.**
 
@@ -143,6 +143,8 @@ No errors found in 'examples/quickstart/hello.bld'
 }
 ```
 
+<p align="center"><img src="docs/art/effect-lane.svg" alt="Eight stages from source to re-verify, ending in passed or rejected." width="100%"></p>
+
 If the program also read a file, the check would fail until `main` declared
 `~ FileSystem` and the policy allowed it. Built-in profiles: `pure`,
 `console-only`, `offline`, `ci-review`, and `strict-accountability`
@@ -176,6 +178,8 @@ Full flags: `buildc --help` and `buildc <command> --help`. The command
 reference with expected output lives in [USAGE.md](USAGE.md).
 
 ## Backends
+
+<p align="center"><img src="docs/art/backend-maturity.svg" alt="A record card titled Every backend you can select, and how far each one goes, listing the nine buildc --target flags with the rank buildc doctor gives each one. The c row is accented as the only primary backend, the one the substrate receipt records as the production anchor. hlsl and glsl are supported shader source output, and the remaining six are experimental." width="100%"></p>
 
 | Target | Flag | Output | Status |
 |---|---|---|---|
@@ -218,6 +222,14 @@ tamper-evident bundle. A `Model` capability exists for calling out to a
 model over TCP; the receipt layer refuses outright to emit or verify a
 receipt over a Model-observing program, because models propose and oracles
 dispose.
+
+<p align="center"><img src="docs/art/receipt-lane.svg" alt="Eight stages from kernel to re-derive, ending in verified, failed, or refused." width="100%"></p>
+
+The mode is not decoration on the seal. A Monte Carlo receipt carries its
+estimator, its sample count, and the interval method that produced the interval;
+a budgeted-search receipt carries the step ceiling and whether the search
+exhausted it. A number without the terms it was measured under is not a result,
+so those terms are sealed beside it rather than left in the prose around it.
 
 Run it now:
 
@@ -294,6 +306,15 @@ with the scientific receipt verifier, and compose into receipt chains.
 - Peers: [build-universe](https://github.com/HarperZ9/build-universe),
   [buildlang-vscode](https://github.com/HarperZ9/buildlang-vscode),
   [buildlang-tmLanguage](https://github.com/HarperZ9/buildlang-tmLanguage)
+
+<p align="center"><img src=".github/assets/banner.svg" alt="buildlang: A real systems language: typed capability effects, sum and linear types, C FFI, native binaries." width="100%"></p>
+
+The mark at the top of this page is generated from the repository name, so every
+tool in this family carries a different one. The banner above is buildlang's own,
+drawn by hand and kept. The mark and the two diagrams on this page are rendered
+from `docs/art/buildlang.art.json` by `tools/render_repo_art.py`, and a gate
+re-renders each drawing and compares it against what is committed, so a label
+edited without a re-render fails CI instead of shipping.
 
 Contributor checks before changing public behavior: `cargo test` and
 `cargo fmt --check` from `compiler/`, `buildc doctor`, and
