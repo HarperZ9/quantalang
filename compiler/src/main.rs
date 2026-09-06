@@ -5149,6 +5149,7 @@ fn type_error_kind(error: &TypeError) -> &'static str {
         TypeError::UnitMismatch { .. } => "UnitMismatch",
         TypeError::UnitOperationMismatch { .. } => "UnitOperationMismatch",
         TypeError::ModuleImportCycle { .. } => "ModuleImportCycle",
+        TypeError::UndefinedLoopLabel { .. } => "UndefinedLoopLabel",
         _ => "TypeError",
     }
 }

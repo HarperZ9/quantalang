@@ -304,6 +304,10 @@ pub enum TypeError {
     #[error("`continue` outside of loop")]
     ContinueOutsideLoop,
 
+    /// Reference to a loop label that is not in scope.
+    #[error("use of undefined loop label `'{label}`")]
+    UndefinedLoopLabel { label: String },
+
     /// Return outside of function.
     #[error("`return` outside of function")]
     ReturnOutsideFunction,
@@ -492,6 +496,12 @@ impl TypeError {
                 Some(format!(
                     "add a handler clause for `{}`:\n  {}.{}(params) => |resume| {{\n      // handle the {} operation\n      resume(())\n  }},",
                     operation, effect_name, operation, operation
+                ))
+            }
+            TypeError::UndefinedLoopLabel { label } => {
+                Some(format!(
+                    "label an enclosing loop with `'{}:` (for example `'{}: loop {{ ... }}`)",
+                    label, label
                 ))
             }
             TypeError::NonExhaustiveMatch { missing_variants } => {

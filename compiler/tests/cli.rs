@@ -13052,6 +13052,89 @@ fn labeled_break_continue_target_named_loop_end_to_end() {
     );
 }
 
+/// Check-the-check: `break 'x` / `continue 'x` against a label that names no
+/// enclosing loop cannot compile, so `check` must reject it at the type stage
+/// rather than reporting "no errors" and deferring the failure to codegen. A
+/// valid labeled loop must still pass. Runs without a C backend.
+#[test]
+fn check_rejects_undefined_loop_label() {
+    let id = std::process::id();
+
+    // Undefined break label: `'nope` is never declared.
+    let bad = std::env::temp_dir().join(format!("buildlang_undef_break_label_{id}.bld"));
+    fs::write(&bad, "fn main() {\n    loop {\n        break 'nope;\n    }\n}\n")
+        .expect("write undefined-label fixture");
+    let output = buildc()
+        .arg("check")
+        .arg(&bad)
+        .arg("--receipt")
+        .arg("-")
+        .output()
+        .expect("run buildc check --receipt -");
+    let stdout = output.stdout.clone();
+    let _ = fs::remove_file(&bad);
+    assert!(
+        !output.status.success(),
+        "check must fail for an undefined loop label\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("stdout should be JSON receipt");
+    assert_eq!(receipt["status"], "failed");
+    let diagnostics = receipt["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    assert!(
+        diagnostics.iter().any(|diag| {
+            diag["stage"] == "type"
+                && diag["kind"] == "UndefinedLoopLabel"
+                && diag["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("'nope")
+        }),
+        "expected an UndefinedLoopLabel type diagnostic naming 'nope in {diagnostics:#?}"
+    );
+
+    // Undefined continue label, where a different label is in scope.
+    let bad_cont = std::env::temp_dir().join(format!("buildlang_undef_cont_label_{id}.bld"));
+    fs::write(
+        &bad_cont,
+        "fn main() {\n    'a: loop {\n        continue 'b;\n    }\n}\n",
+    )
+    .expect("write undefined-continue-label fixture");
+    let cont_out = buildc()
+        .arg("check")
+        .arg(&bad_cont)
+        .output()
+        .expect("run buildc check");
+    let _ = fs::remove_file(&bad_cont);
+    assert!(
+        !cont_out.status.success(),
+        "check must fail for `continue` to an undefined label"
+    );
+
+    // A valid labeled loop must still pass `check`.
+    let good = std::env::temp_dir().join(format!("buildlang_valid_label_{id}.bld"));
+    fs::write(
+        &good,
+        "fn main() {\n    'outer: loop {\n        loop {\n            break 'outer;\n        }\n    }\n}\n",
+    )
+    .expect("write valid-label fixture");
+    let good_out = buildc()
+        .arg("check")
+        .arg(&good)
+        .output()
+        .expect("run buildc check");
+    let _ = fs::remove_file(&good);
+    assert!(
+        good_out.status.success(),
+        "a labeled loop with a resolvable `break` target must pass check\nstderr:\n{}",
+        String::from_utf8_lossy(&good_out.stderr)
+    );
+}
+
 /// Regression: an `Option<i64>`-returning function whose result is matched must
 /// compile and run end-to-end. Previously the if-expression result local was
 /// typed `int32_t` (the `None` branch defaulted to i32), so the 64-bit Option

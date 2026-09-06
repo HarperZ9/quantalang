@@ -142,6 +142,11 @@ pub struct TypeInfer<'ctx> {
     /// On scope exit these are restored, so an inner shadow cannot revive or
     /// alter the outer binding's consumed state.
     linear_shadow_stack: Vec<HashMap<String, Option<LinearSlot>>>,
+    /// Loop labels currently in scope, innermost last. One entry per enclosing
+    /// loop; `None` for an unlabeled loop. `break 'x` / `continue 'x` must find
+    /// `'x` here, so an undefined label is rejected at `check` rather than
+    /// slipping through to codegen.
+    loop_label_stack: Vec<Option<String>>,
 }
 
 /// Tracking state for a single `#[linear]`-typed binding.
@@ -361,6 +366,7 @@ impl<'ctx> TypeInfer<'ctx> {
             loop_depth: 0,
             linear_loop_markers: Vec::new(),
             linear_shadow_stack: Vec::new(),
+            loop_label_stack: Vec::new(),
         }
     }
 
@@ -405,6 +411,7 @@ impl<'ctx> TypeInfer<'ctx> {
             loop_depth: 0,
             linear_loop_markers: Vec::new(),
             linear_shadow_stack: Vec::new(),
+            loop_label_stack: Vec::new(),
         }
     }
 
@@ -2793,16 +2800,18 @@ impl<'ctx> TypeInfer<'ctx> {
                 expr.span,
             ),
             ExprKind::Match { scrutinee, arms } => self.infer_match(scrutinee, arms, expr.span),
-            ExprKind::Loop { body, .. } => self.infer_loop(body),
+            ExprKind::Loop { body, label } => self.infer_loop(body, label.as_ref()),
             ExprKind::While {
-                condition, body, ..
-            } => self.infer_while(condition, body),
+                condition,
+                body,
+                label,
+            } => self.infer_while(condition, body, label.as_ref()),
             ExprKind::For {
                 pattern,
                 iter,
                 body,
-                ..
-            } => self.infer_for(pattern, iter, body, expr.span),
+                label,
+            } => self.infer_for(pattern, iter, body, label.as_ref(), expr.span),
 
             ExprKind::Block(block) => self.infer_block(block),
             ExprKind::Unsafe(block) => self.infer_block(block),
@@ -2834,8 +2843,10 @@ impl<'ctx> TypeInfer<'ctx> {
             }
 
             ExprKind::Return(value) => self.infer_return(value.as_deref(), expr.span),
-            ExprKind::Break { value, .. } => self.infer_break(value.as_deref(), expr.span),
-            ExprKind::Continue { .. } => self.infer_continue(expr.span),
+            ExprKind::Break { value, label } => {
+                self.infer_break(value.as_deref(), label.as_ref(), expr.span)
+            }
+            ExprKind::Continue { label } => self.infer_continue(label.as_ref(), expr.span),
 
             ExprKind::Closure {
                 params,
@@ -2872,8 +2883,8 @@ impl<'ctx> TypeInfer<'ctx> {
                 pattern,
                 expr,
                 body,
-                ..
-            } => self.infer_while_let(pattern, expr, body),
+                label,
+            } => self.infer_while_let(pattern, expr, body, label.as_ref()),
 
             // Type ascription: `expr: Type`
             ExprKind::TypeAscription { expr: inner, ty } => {
@@ -5474,14 +5485,16 @@ impl<'ctx> TypeInfer<'ctx> {
         None
     }
 
-    fn infer_loop(&mut self, body: &ast::Block) -> Ty {
+    fn infer_loop(&mut self, body: &ast::Block, label: Option<&ast::Ident>) -> Ty {
         let pre_loop_scope_count = self.source_bindings.len();
         self.loop_break_source_frames
             .push(BreakSourceFrame::new(pre_loop_scope_count));
 
+        self.push_loop_label(label);
         self.push_scope(ScopeKind::Loop);
         let _ = self.infer_block(body);
         self.pop_scope();
+        self.pop_loop_label();
         let body_exit_sources = self.source_bindings.clone();
 
         let break_source_snapshots = self
@@ -5500,7 +5513,12 @@ impl<'ctx> TypeInfer<'ctx> {
         Ty::never()
     }
 
-    fn infer_while(&mut self, condition: &ast::Expr, body: &ast::Block) -> Ty {
+    fn infer_while(
+        &mut self,
+        condition: &ast::Expr,
+        body: &ast::Block,
+        label: Option<&ast::Ident>,
+    ) -> Ty {
         // The condition is re-evaluated every iteration, so consuming an outer
         // linear value there is a potential repeat-consume: treat it as in-loop.
         self.loop_depth += 1;
@@ -5509,9 +5527,11 @@ impl<'ctx> TypeInfer<'ctx> {
         let _ = self.unify(&cond_ty, &Ty::bool(), condition.span);
         let pre_loop_sources = self.source_bindings.clone();
 
+        self.push_loop_label(label);
         self.push_scope(ScopeKind::Loop);
         let _ = self.infer_block(body);
         self.pop_scope();
+        self.pop_loop_label();
         let body_exit_sources = self.source_bindings.clone();
 
         self.source_bindings =
@@ -5525,6 +5545,7 @@ impl<'ctx> TypeInfer<'ctx> {
         pattern: &ast::Pattern,
         iter: &ast::Expr,
         body: &ast::Block,
+        label: Option<&ast::Ident>,
         _span: Span,
     ) -> Ty {
         let iter_ty = self.infer_expr(iter);
@@ -5534,10 +5555,12 @@ impl<'ctx> TypeInfer<'ctx> {
         let item_ty = self.resolve_iterator_item(&iter_ty);
         let pre_loop_sources = self.source_bindings.clone();
 
+        self.push_loop_label(label);
         self.push_scope(ScopeKind::Loop);
         self.check_pattern(pattern, &item_ty);
         let _ = self.infer_block(body);
         self.pop_scope();
+        self.pop_loop_label();
         let body_exit_sources = self.source_bindings.clone();
 
         self.source_bindings =
@@ -5551,6 +5574,7 @@ impl<'ctx> TypeInfer<'ctx> {
         pattern: &ast::Pattern,
         expr: &ast::Expr,
         body: &ast::Block,
+        label: Option<&ast::Ident>,
     ) -> Ty {
         // The scrutinee is re-evaluated every iteration, so consuming an outer
         // linear value there is a potential repeat-consume: treat it as in-loop.
@@ -5559,11 +5583,13 @@ impl<'ctx> TypeInfer<'ctx> {
         self.loop_depth = self.loop_depth.saturating_sub(1);
         let pre_loop_sources = self.source_bindings.clone();
 
+        self.push_loop_label(label);
         self.push_scope(ScopeKind::Loop);
         self.check_pattern(pattern, &expr_ty);
         self.bind_pattern_call_sources(pattern, expr);
         let _ = self.infer_block(body);
         self.pop_scope();
+        self.pop_loop_label();
         let body_exit_sources = self.source_bindings.clone();
 
         self.source_bindings =
@@ -5855,9 +5881,42 @@ impl<'ctx> TypeInfer<'ctx> {
         }
     }
 
-    fn infer_break(&mut self, value: Option<&ast::Expr>, span: Span) -> Ty {
+    /// Enter a loop for label tracking; `None` for an unlabeled loop.
+    fn push_loop_label(&mut self, label: Option<&ast::Ident>) {
+        self.loop_label_stack
+            .push(label.map(|l| l.as_str().to_string()));
+    }
+
+    /// Leave a loop, dropping its label entry.
+    fn pop_loop_label(&mut self) {
+        self.loop_label_stack.pop();
+    }
+
+    /// Whether a loop label is in scope. Used to reject `break 'x` / `continue 'x`
+    /// against a label that names no enclosing loop.
+    fn loop_label_in_scope(&self, name: &str) -> bool {
+        self.loop_label_stack
+            .iter()
+            .any(|lbl| lbl.as_deref() == Some(name))
+    }
+
+    fn infer_break(
+        &mut self,
+        value: Option<&ast::Expr>,
+        label: Option<&ast::Ident>,
+        span: Span,
+    ) -> Ty {
         if !self.ctx.in_loop() {
             self.error(TypeError::BreakOutsideLoop, span);
+        } else if let Some(l) = label {
+            if !self.loop_label_in_scope(l.as_str()) {
+                self.error(
+                    TypeError::UndefinedLoopLabel {
+                        label: l.as_str().to_string(),
+                    },
+                    span,
+                );
+            }
         }
 
         if let Some(expr) = value {
@@ -5871,9 +5930,18 @@ impl<'ctx> TypeInfer<'ctx> {
         Ty::never()
     }
 
-    fn infer_continue(&mut self, span: Span) -> Ty {
+    fn infer_continue(&mut self, label: Option<&ast::Ident>, span: Span) -> Ty {
         if !self.ctx.in_loop() {
             self.error(TypeError::ContinueOutsideLoop, span);
+        } else if let Some(l) = label {
+            if !self.loop_label_in_scope(l.as_str()) {
+                self.error(
+                    TypeError::UndefinedLoopLabel {
+                        label: l.as_str().to_string(),
+                    },
+                    span,
+                );
+            }
         }
         Ty::never()
     }
