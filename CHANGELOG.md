@@ -10,6 +10,379 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+- **A non-exhaustive scalar `match` is caught at compile time where coverage can
+  be proven, and aborts with a clean panic at run time where it cannot, instead
+  of returning a stale value**: `match` lowering left the no-arm-matched path
+  falling through to the merge block, which then read an uninitialised result
+  local. A `match n { 0 => .., 1 => .. }` over an `n` that was neither `0` nor `1`
+  printed whatever that local happened to hold (after `let mut out = 7` it printed
+  `7`) or nothing at all, with exit 0. Two layers now close this. The type checker
+  rejects a scalar or `bool` `match` whose arms cannot cover the scrutinee's
+  domain: a `bool` missing `true` or `false` reports `non-exhaustive match:
+  missing variants ...`, and an integer or `char` scrutinee with no range arm and
+  no catch-all reports `non-exhaustive patterns`, both before any C is emitted and
+  both with a help line pointing at a `_` arm. The check fires only when
+  non-exhaustiveness is certain, so it never rejects a valid match. A scrutinee
+  whose concrete integer type is pinned only by later whole-program inference (a
+  value read from a `Vec`, as in `let n = v[0]`) slips past the checker; for that
+  residual case the backend routes the no-match path to a runtime helper
+  `bl_match_fail`, which prints `non-exhaustive match: no arm matched the
+  scrutinee` and aborts with exit 101, matching the divide-by-zero and
+  out-of-bounds panics. An enum `match` keeps its existing compile-time
+  exhaustiveness check, which recovers the missing variants from the pattern
+  paths. Covered by `non_exhaustive_scalar_match_is_rejected_at_compile_time`
+  (bool, annotated-`let` i32, and typed-parameter i32, each of which compiled and
+  ran on the pre-fix binary),
+  `non_exhaustive_match_over_runtime_value_aborts_fail_closed` (the two
+  `Vec`-value cases that printed a stale value or nothing pre-fix), and
+  `exhaustive_scalar_match_still_compiles_and_runs` (wildcard, bare binding, and
+  both bool arms, guarding against over-rejection). Honest null: a scalar `match`
+  made exhaustive only by a range arm is not statically range-analysed, so its
+  coverage is enforced by the runtime backstop rather than at compile time.
+- **Integer divide-by-zero and `MIN / -1` abort with a clean panic instead of
+  crashing, hanging, or returning a wrong value**: the backend emitted integer
+  `/` and `%` as raw C `/` and `%`, which deviate from Rust's contract three ways.
+  Rust panics on a zero divisor and on the single signed overflow `MIN / -1`, in
+  release as well as debug. Raw C instead raised a hardware divide error on a zero
+  divisor, so the process died with exit 148 and no diagnostic; on `i32::MIN / -1`
+  and `i64::MIN / -1` the active toolchain turned that fault into an infinite loop,
+  so the process hung until a timeout killed it; and on the narrow widths
+  `i8::MIN / -1` and `i16::MIN / -1` it was a silent wrong answer, because a
+  sub-`int` operand promotes to 32-bit `int`, so `(int8_t)-128 / -1` computes 128
+  and truncates back to -128 and the program printed it with exit 0. Every integer
+  `/` and `%` now routes through a per-width, signedness-aware runtime helper
+  (`bl_idiv_*`/`bl_irem_*` for signed, `bl_udiv_*`/`bl_urem_*` for unsigned) that
+  checks the divisor and, for signed types, the `MIN / -1` overflow, then aborts
+  with exit 101 and the exact Rust panic text (`attempt to divide by zero`,
+  `attempt to calculate the remainder with a divisor of zero`, `attempt to divide
+  with overflow`, `attempt to calculate the remainder with overflow`). The
+  overflow check keys on exactly `b == -1`, so `MIN / 1`, `MIN % 1`, and `MIN / -2`
+  compute normally. Unsigned division cannot overflow, so those helpers check only
+  the zero divisor. A float `/` is untouched and stays IEEE (`1.0 / 0.0` is `inf`,
+  matching Rust), and a float `%` still lowers to `fmod`/`fmodf`. Covered by
+  `integer_divide_by_zero_and_overflow_abort_fail_closed` (zero and overflow across
+  i32, u32, i8, i64, and both `/` and `%`, each of which crashed, hung, or ran
+  silently wrong on the pre-fix binary) and by
+  `integer_divide_and_remainder_compute_correctly` (truncation toward zero for
+  negative operands, an unsigned and a narrow width, and the three boundary cases
+  that prove the overflow guard fires on `b == -1` alone). Honest null: integer
+  add, subtract, and multiply still wrap on overflow, matching Rust's release
+  semantics; only division and remainder trap.
+
+- **An out-of-bounds index aborts instead of reading or writing past the
+  allocation**: indexing was unchecked on every path. A fixed-array read past the
+  end returned an adjacent stack value, a fixed-array write past the end corrupted
+  neighbouring memory, a heap-`Vec` read past the end returned heap garbage, a
+  heap-`Vec` write past the end silently did nothing, and a negative index wrapped
+  to a huge unsigned index and read wild memory. Every case ran to completion with
+  exit 0, a silent wrong answer and, on the write paths, memory corruption. Rust
+  bounds-checks every index unconditionally, in release as well as debug, and
+  BuildLang now follows that contract: an out-of-bounds index prints `index out of
+  bounds: the len is N but the index is I` and aborts with exit 101, matching a
+  Rust panic. The check sits in one place per storage kind. A heap `Vec` routes
+  every getter and setter through `build_vec_get`, so a single length check there
+  covers reads and writes for scalar, string, and aggregate elements; the setters
+  no longer swallow an out-of-bounds write. A fixed array `[T; N]` carries its
+  length in its type, so the C backend emits a static-bound check
+  `a[bl_idx_chk(i, N)]` at the read and write sites. A slice checks the index
+  against its runtime `len` field, and a string byte index checks against its
+  length. A raw pointer has no length and stays an unchecked subscript, the same
+  as an `unsafe` pointer dereference. Covered by
+  `out_of_bounds_index_aborts_fail_closed` (fixed-array read and write, heap-`Vec`
+  read and write, and a negative index, each of which ran silently to exit 0 on
+  the pre-fix binary) and by `in_bounds_index_reads_and_writes_correctly` (the
+  same paths at an in-bounds index including the last valid element, so the check
+  does not reject a valid access). Honest null: integer add and multiply still
+  wrap on overflow, matching Rust's release semantics; division and remainder by
+  zero and `MIN / -1` are handled separately (see the arithmetic-trap entry
+  above).
+
+- **An aggregate literal is built at its expected element width, not the i32/f64
+  default**: a tuple or vector literal lowered its bare integer and float elements
+  at the `i32`/`f64` default even when the surrounding type said otherwise, then the
+  access side read each element at the wider annotated width. The construction
+  stride and the read stride disagreed, so an 8-byte read spanned two 4-byte slots.
+  It was a silent wrong answer with no diagnostic. The fix threads the expected
+  component type into each element at every position where a wider type is already
+  known: a `let` annotation (`let a: (i64, i64) = (7, 8)`, `let v: Vec<i64> =
+  vec![1, 2, 3]`), a function's tail expression (`fn f() -> (i64, i64) { (11, 22) }`),
+  and an explicit `return` (`return (33, 44);`, `return vec![1, 2, 3];`,
+  `return [5, 6, 7];`). A block only applies its expected type to its own tail
+  statement, so a `-> i64` return type can no longer widen a `0..3` loop counter in
+  an intermediate statement. On the pre-fix binary a returned `(11, 22)` printed
+  `94489280523` then `0`, a returned `vec![1, 2, 3]` read `v[1]` as `12884901890`,
+  and a returned `[5, 6, 7]` read `a[2]` as garbage. Covered by
+  `return_position_aggregate_is_built_at_declared_width` over returned tuples, a
+  returned vector, and a returned array; each case runs silently wrong on the
+  pre-fix binary. Two honest nulls remain: an aggregate stored in an unannotated
+  local and then returned (`{ let t = (1, 2); t }`) is still built at the default
+  width because the `let` had no annotation to thread, and a closure body is not
+  yet threaded with its declared return type.
+
+- **An aggregate literal passed as a call argument is built at the parameter's
+  element width**: this reaches the one position the fix above did not, a tuple,
+  vector, or array literal handed straight to a function parameter. The argument
+  lowered at the `i32`/`f64` default while the callee read and indexed its
+  parameter at the width it was declared with, so the construction stride and the
+  access stride disagreed across the call boundary. The fix threads each callee
+  parameter's declared type into the matching argument as its expected type,
+  resolved through the called function's signature at the general call path and at
+  the overloaded-concrete path. On the pre-fix binary, `take_t((7, 8))` for a
+  `(i64, i64)` parameter failed to compile because the argument's `Tuple_i32_i32`
+  typedef did not match the parameter's `Tuple_i64_i64`; `take_v(vec![10, 20, 30])`
+  read `v[1]` as `128849018900` (that is `(30 << 32) | 20`); and `take_a([5, 6, 7])`
+  read `a[2]` as garbage. The vector case corrects an earlier reading that a vector
+  argument was already safe through runtime element tagging. The callee indexes at
+  its compile-time declared element width, not a runtime size tag, so a narrow build
+  still corrupted the wide read. Covered by
+  `call_argument_aggregate_is_built_at_parameter_width` over a tuple, a vector, and
+  an array argument, each wrong on the pre-fix binary. Honest null: the parameter
+  hint threads only for a direct or overloaded-concrete call resolved through the
+  callee's signature. A call through a function value, a builtin, or a generic call
+  (which routes to the monomorphizer before this path) passes no hint and lowers the
+  argument at the default width.
+
+- **A vector of a struct, nested-vector, or map element builds through the `vec!`
+  macro, and a vector of a tuple or array element is rejected instead of
+  miscompiled**: a `Vec<T>` stores its element one of two ways. Scalars and strings
+  ride a built-in `build_hvec_*_<suffix>` family (`f64`, `i64`, `i32`, `str`); a user
+  struct, a nested vector, or a map rides a monomorphized element-sized wrapper the C
+  backend emits per element type. Three element-to-suffix tables select the helper:
+  the `vec![...]` macro, the `vec_push`/`vec_get`/`vec_pop` free functions, and the
+  `.push()`/`.get()`/`.pop()` methods. The method table already selected the wrapper
+  for a struct or nested-vector element, so `v.push(Point { .. })` built and read
+  correctly, but the macro table did not, so `let v: Vec<Point> = vec![Point { .. }]`
+  leaked a raw C type error. Worse, every table defaulted a tuple or array element to
+  the `i32` helper, whose parameter is `int32_t`: for an array that was a silent wrong
+  answer, the array decaying to a pointer that `int32_t` truncated to 32 bits under
+  `-Wint-conversion` (warn only), so `let v: Vec<[i64; 2]> = vec![[1, 2], [3, 4]]`
+  compiled and read `v[0][0]` back as a bogus value; for a tuple it leaked a raw C
+  type error. All three tables now agree: a struct, nested-vector, or map element
+  selects the backend wrapper (so the macro path matches the method path), and a tuple
+  or array element fails closed with one diagnostic. Enabling the macro path for a
+  nested vector surfaced a second defect it had been masking: `vec!` re-tokenizes each
+  element group into an anonymous source string, but the recursive lowering of an inner
+  `vec!` still sliced the original file by the outer element's span, so
+  `vec![vec![1, 2], vec![3, 4]]` pushed a stray identifier and a parse-failure `0`
+  rather than the inner literals. The fix points the codegen source at the re-tokenized
+  string while an element group lowers, then restores it, so an inner macro extracts its
+  own text; the inner pushes now carry the real `1`, `2`, `3`, `4`. Covered by
+  `vec_of_tuple_or_array_element_is_rejected` (array and tuple, on both the `vec!`
+  macro and the `Vec::new()` + `.push()` builder paths, each rejected for the
+  unsupported-element reason) and by `vec_of_supported_element_builds_and_reads`, which
+  reads back `i64`, `f32`, `i32`, `bool`, and string vectors plus struct and
+  nested-vector vectors built through both the macro and the push paths. Honest null: a
+  tuple or array element is still unsupported; it needs a wrapper that stores and
+  projects the aggregate, the same path structs and nested vectors already take.
+
+- **Compound assignment through a plain dereference reads before it stores**:
+  `*p += v` and its nine siblings (`-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`,
+  `>>=`) lowered as `*p = v`. The dereference-assignment path never inspected the
+  operator, so the load of the current pointee and the operator itself were both
+  dropped and the bare right-hand side was stored. It was a silent wrong answer with
+  no diagnostic: `fn addv(r: &mut i64, v: i64) { *r += v; }` called on `a = 5` with
+  `v = 3` printed `3` instead of `8`, and `*r *= 7` on `6` printed `7` instead of
+  `42`. The fix reads the pointee back through the already-computed pointer (the
+  place is evaluated once, so no side effect in the pointer expression re-runs),
+  applies the mapped binary operator, then stores the result. A plain `*p = v` is
+  unchanged. Covered for arithmetic, bitwise, and shift operators, through both a
+  `&mut` parameter and a local `&mut` binding, over integer and float pointees.
+
+- **A reference whose pointee width disagrees with its storage is laid out to match
+  or rejected**: the checker could infer an integer or float array's element width
+  through a later borrow while codegen defaulted an unannotated integer array literal
+  to `[i32; N]` and an unannotated float to a narrower width. The two widths
+  disagreed only across a function-call boundary, where the callee compiled its own
+  load and store at the pointee width it was declared with. A `&mut i64` handed the
+  address of an `i32` slot let the callee's 8-byte store run past the element, and a
+  `&i64` read loaded 8 bytes from a 4-byte slot. Each was a silent wrong answer with
+  no diagnostic. `set88(&mut arr[1])` over `let mut arr = [10, 20, 30]` printed
+  `10`, `88`, `0` on the pre-fix binary: arr[2] was clobbered to zero. The annotated
+  form `let mut arr: [i64; 3] = [10, 20, 30]` was worse, printing `85899345930`,
+  `88`, `0`, because arr[0] read `(20 << 32) | 10` out of the i32 storage. A shared
+  `get(&arr[1])` misread `arr[1]` as `128849018900`. The scalar path had the same
+  shape: a `let mut a: i32` passed to a `&mut i64` parameter let the callee corrupt
+  the stack (pre-fix printed `7`), and an `f32` passed to a `&mut f64` parameter
+  printed `0`.
+
+  The fix works in three layers. The unifier unifies reference and pointer pointees
+  invariantly, so a pinned-width scalar mismatch such as `i32` against `i64` or `f32`
+  against `f64` is rejected at the checker with a type-mismatch error rather than
+  silently widened. Literal and array lowering thread the expected type through, so
+  an annotated array lays its elements out at the annotated width and the borrow
+  reaches real storage. A codegen call-site guard compares the byte width and the
+  integer-or-float class of every pointer argument's pointee against the callee's
+  declared parameter, and fails closed with an actionable message ("add a type
+  annotation ... so the storage matches the borrow") when an inferred-through-borrow
+  width was left unannotated. The guard is the backstop for the case the checker
+  cannot see, where an unannotated array's storage width and its borrow width are
+  decided in different passes.
+
+  Two end-to-end tests in `compiler/tests/cli.rs` pin both sides. The positive test
+  runs a matched scalar `&mut`, a matched float `&mut`, an annotated wide-array
+  `&mut` borrow, and an annotated wide-array read, and asserts the corrected values
+  `6`, `2`, `10`/`88`/`30`, and `10`/`20`/`30`. The must-reject test runs the four
+  unannotated mismatches and asserts each fails for its own reason: the scalar cases
+  carry the checker's `type mismatch` token, the array cases carry the guard's
+  `byte integer reference` token. All four compile and run silently wrong on the
+  pre-fix binary, printing `7`, `0`, `10`/`88`/`0`, and `128849018900`. This closes
+  the array-literal element-type gap left as an honest null by the projected-place
+  entry below. Scoped out and left as honest nulls: an unannotated integer array
+  literal borrowed at a wider width still rejects rather than inferring the wider
+  layout and rewriting the literal, so the annotation is required; the guard checks
+  only direct calls to functions defined in the module, not indirect calls through a
+  function value; and it compares only scalar int and float pointees, so a
+  pointer-to-pointer or an aggregate pointee is not width-checked.
+- **Rust backend projects struct fields by name and compiles numeric printing**:
+  two defects kept the Rust source backend from building programs the C backend
+  already ran. A field place lowered to a positional `.field0`, which does not
+  compile against a generated struct whose fields carry their real names, so any
+  program that read a named struct field through the Rust backend failed at
+  rustc. Separately the backend never defined the `build_i32_to_string`,
+  `build_i64_to_string`, `build_f32_to_string`, and `build_f64_to_string` runtime
+  functions its own output calls, and it modeled a runtime string as a C
+  `BuildString` with a `ptr` field, so `println!("{}", x)` on a float emitted a
+  call to a missing function followed by a `.ptr` access on a native `String`.
+  Both were hard compile errors (`E0425` and `E0609`) that the cross-backend
+  receipt lane was the first caller to reach, because the C path carries its own
+  complete runtime. A field place now lowers by name, the four numeric-to-string
+  functions are emitted in the Rust prelude returning `String` whose `Display`
+  reproduces the C output (integers in decimal, floats in Rust's shortest
+  round-trip, which is the same positional decimal the C helpers produce), and a
+  `ptr`, `len`, or `cap` projection off a string base is redirected to the
+  matching `String` operation. The `generated_rust_compiles_for_struct_field_references`
+  unit test pins the field path, the cross-backend receipt lane pins the numeric
+  path, and `rust_backend_lowers_float_and_int_println_end_to_end` lowers a
+  float- and int-printing program through the Rust backend, compiles it with
+  `rustc`, and pins its stdout; the end-to-end control fails to compile on the
+  pre-fix binary with `E0425` and `E0609`. Scoped out and left as honest nulls:
+  `ptr` yields a `'static` slice by leaking a copy of the bytes, deliberate
+  because the generated program runs once and exits; and the Rust backend still
+  returns `Unsupported` for enum, union, and texture lowering.
+- **Projected assignment targets and `&mut` of a place reach real storage**: four
+  codegen defects let a store or a mutable borrow of a projected lvalue miss its
+  target, each a silent wrong answer because the write vanished with no diagnostic.
+  The `lower_assign` field arm copied a non-local base into a temp and stored into
+  the copy, so `arr[0].x = v` and `a.b.c = v` updated a value that was then
+  discarded. On that same path a compound form such as `p.x += k` also dropped the
+  compound operator. No tuple-field target arm existed, so `t.0 = v` was lowered as
+  nothing at all. And `lower_ref` borrowed a materialized copy of its operand, so
+  `set(&mut p.x)` and `set(&mut arr[i])` handed the callee a pointer to a
+  throwaway temp and the store never reached `p.x` or `arr[i]`. The fix threads a
+  syntactic place through lowering instead of copying: `PlaceProjection::Field`
+  now carries the field name and MIR type, a new `lower_place` builds a `MirPlace`
+  for an ident, field, tuple field, by-value index, or deref base without
+  materializing a copy, a projected store lowers as `AddressOf(place)` into a fresh
+  pointer temp followed by the existing `DerefAssign` (the identity
+  `*(&place) = v` equals `place = v`, so no new statement kind is added), and the C
+  backend composes the projected lvalue for both the store and the `&place`
+  operand. Six end-to-end controls in `compiler/tests/cli.rs` pin the struct-field
+  compound-assign, array-element field, nested struct field, tuple field,
+  struct-field borrow, and array-element borrow paths; all six print the dropped or
+  misdirected pre-fix values on the pre-fix binary. Scoped out and left as honest
+  nulls: a store whose base is a slice or array behind a pointer still routes
+  through the prior index-store path, so its ABI is unchanged and
+  `slice_param[i].field = v` is untouched; a compound-assign through a plain deref
+  (`*p += v`) still ignores the operator and remains a separate gap; and an integer
+  array literal whose element is borrowed as a wider type than the literal defaults
+  to (`&mut i64` against `[10, 20, 30]`, whose elements default to i32) is a
+  separate array-literal element-type defect that neither unifies to the wider type
+  nor rejects the mismatch, so the array-element borrow control fixes both sides at
+  i32 to test the borrow aliasing alone.
+- **Float `{}` Display matches Rust's shortest round-trip**: the
+  `println!`/`format!` lowering baked C's `%g` specifier into the format string
+  for a default `{}` float placeholder. `%g` caps output at six significant
+  digits and switches to exponent form, so `0.1 + 0.2` printed `0.3`,
+  `1234567.0` printed `1.23457e+06`, and `3.14159265358979` lost every digit
+  past the sixth. Each was a silent wrong answer. A plain `{}` on an `f32` or
+  `f64` now routes through a shortest-decimal formatter (`bl_fmt_f32` /
+  `bl_fmt_f64`) that searches for the fewest digits whose value round-trips
+  through `strtof`/`strtod` and emits plain positional decimal, so Display
+  reproduces Rust byte for byte: whole-number floats print without a trailing
+  `.0`, and `inf` / `-inf` / `NaN` / signed zero carry through. An explicit spec
+  such as `{:.3}` keeps its `%.3f` path. The f32 case uses its own formatter so
+  the shortest f32 round-trip is printed rather than the wider f64 value. One
+  end-to-end control in `compiler/tests/cli.rs` pins the f64 and f32 cases and
+  prints the `%g` values on the pre-fix binary.
+- **Float-to-int casts saturate like Rust's `as`**: the C backend lowered a
+  float-to-int cast to a raw C cast, which is undefined behaviour when the value
+  is out of the target integer's range or is NaN. On x86 an out-of-range
+  magnitude wrapped to the target `INT_MIN` and NaN produced a garbage integer,
+  both silent wrong answers. A `FloatToInt` cast now calls a per-width
+  saturating helper (`bl_f2i_i8` through `bl_f2i_i64`, their unsigned forms, and
+  `bl_f2i_i128`) that returns 0 for NaN, clamps to the target MIN/MAX outside
+  the representable range, and truncates toward zero inside it, matching Rust's
+  saturating `as`. The range thresholds use exact power-of-two hex-float
+  constants so the boundary comparison itself never rounds. One end-to-end
+  control in `compiler/tests/cli.rs` pins the positive-overflow,
+  negative-overflow, NaN, unsigned, and 64-bit paths and prints the wrapped UB
+  values on the pre-fix binary.
+- **Shifts mask the count to the operand width like Rust's release shift**: the
+  C backend emitted a bare `a << b` / `a >> b`. C promotes a sub-`int` operand to
+  a 32-bit `int` before shifting, so a narrow type shifted by a count at or past
+  its own width used the full 32-bit count instead of Rust's wrapped count
+  (`b % bits`). `255u8 >> 9` printed 0 instead of 127, `1u8 << 8` printed 0
+  instead of 1, `-128i8 >> 9` printed -1 instead of -64, and `1u16 << 16` printed
+  0 instead of 1. Each was a silent wrong answer. The backend now masks the shift
+  count to the left operand's bit width for every integer width, emitting
+  `(a << ((b) & (bits - 1)))`. At i32 and i64 this equals the count masking x86
+  already performs, so those widths stay correct and the emitted C no longer
+  relies on a target-specific shift rule. One end-to-end control in
+  `compiler/tests/cli.rs` reads the shift amounts from mutable locals so the value
+  flows through codegen, pins the six narrow-width cases plus two already-correct
+  wide controls, and prints the un-masked `0 0 -1 0 0 0` values on the pre-fix
+  binary.
+- **`match` pattern tests and result type**: five codegen defects in match
+  lowering are fixed, four of which produced a silent wrong answer. An
+  open-ended range pattern (`100..`) compared the scrutinee against an
+  `i32::MAX` sentinel for the absent bound, so a value past that sentinel
+  failed to match; the lowering now emits only the comparisons for bounds that
+  are present, and a fully open `..` is always true. An `@`-binding tested
+  nothing and matched unconditionally, so `n @ 1..=5` accepted an out-of-range
+  value and returned it; the binder now tests the subpattern. An enum
+  or-pattern arm (`Green | Blue`) was unhandled in the enum matcher and fell
+  through a match-anything catch-all, so the first arm always won; the matcher
+  now folds the alternatives with a bitwise-or of their tests, tests an
+  `@`-binding's variant subpattern, and looks through parentheses. The
+  remaining catch-all in the enum matcher returns an `unsupported pattern`
+  error rather than silently matching, so an unhandled pattern kind fails
+  closed. Last, a match on a non-integer scrutinee took the scrutinee type as
+  the result type, so `match b { true => 42, false => 7 }` stored 42 into a
+  `_Bool` and printed `true`; the result now takes the arm type for a bool,
+  float, or aggregate scrutinee and keeps the scrutinee width for an integer
+  one. One end-to-end control in `compiler/tests/cli.rs` pins all five paths and
+  fails on the pre-fix binary.
+- **Unary complement and float remainder in the C backend**: two codegen
+  defects that produced silent wrong answers or a failed compile are fixed.
+  Unary complement lowered `~` and integer `!` onto a single logical-not node,
+  so the C backend emitted `!` for both; BuildLang follows Rust, where `!` is
+  logical complement on `bool` and bitwise complement on integers and `~` is
+  always bitwise complement. MIR gains a `BitNot` unary op, and lowering now
+  chooses the operator from the operand type, so `~5` and `!5` produce `-6` and
+  a `u8` complement keeps its width (`~5u8` is `250`), while `!bool` stays
+  logical. The remainder operator on floats emitted C's `%`, which rejects
+  floating-point operands, so `5.5 % 2.0` failed to compile; float remainder
+  now lowers to `fmod`/`fmodf` and computes `1.5`. Every non-C backend's unary
+  match gains the `BitNot` arm so the enum stays exhaustive. Two end-to-end
+  controls in `compiler/tests/cli.rs` each fail on the pre-fix binary (wrong
+  value, or gcc rejecting the emitted `%`).
+- **Tuple patterns in `match`: correct selection, scalar results, and
+  bindings**: `match` over a tuple scrutinee had three codegen defects, now
+  fixed. A literal tuple pattern fell through `lower_pattern_test`'s
+  always-true catch-all, so `(1, 2)` matched any pair and the first arm won
+  regardless of the value; it now tests every element and recurses into nested
+  tuples. Scalar arms over a tuple scrutinee took the tuple as the result type
+  and emitted C that assigned an int to a tuple struct; the result type is now
+  the scalar. Tuple elements bound no variables, since the binding section had
+  no tuple arm, so `(a, b) => a + b` emitted undeclared C names; a recursive
+  binder now binds elements in both the body and guard blocks, covering nested
+  `((a, b), c)` and mixed literal/binding `(1, x)`. Pattern kinds the backend
+  cannot yet lower (slice, struct with a refutable field, refutable
+  tuple-struct/ref/box) now fail closed with an `unsupported feature`
+  diagnostic instead of silently always matching. Six end-to-end controls in
+  `compiler/tests/cli.rs` each fail on the pre-fix binary (wrong arm, invalid
+  C, or a false always-match); cli suite 359 pass, lib suite 1037 pass, no
+  regression.
 - **Tool-call receipt verify arm**: `buildc receipt verify` gains a third
   schema dispatch for `flywheel.tool-call-receipt/v1`, the sealed per-tool-call
   receipt emitted by Flywheel's agent loop. Mirrors `model_receipt.rs` in

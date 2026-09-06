@@ -73,8 +73,10 @@ pub struct MirLowerer<'ctx> {
     module: MirModuleBuilder,
     /// Variable to local mapping (per function).
     var_map: HashMap<Arc<str>, LocalId>,
-    /// Loop context stack (continue_block, break_block).
-    loop_stack: Vec<(BlockId, BlockId)>,
+    /// Loop context stack (continue_block, break_block, optional loop label).
+    /// The label lets `break 'name` / `continue 'name` target an enclosing loop
+    /// instead of the innermost one.
+    loop_stack: Vec<(BlockId, BlockId, Option<String>)>,
     /// Current function builder.
     current_fn: Option<MirBuilder>,
     /// Source code (for extracting token text in macro expansion).
@@ -1190,14 +1192,21 @@ impl<'ctx> MirLowerer<'ctx> {
             return result;
         };
 
-        for (i, arg) in generic_args.iter().enumerate() {
+        // Positional type parameters are indexed among themselves: lifetime
+        // and associated-type-binding arguments do not occupy a type-parameter
+        // slot, so count only `Type` args. (This also corrects a latent offset
+        // for `Foo<'a, T>`, where the lifetime previously shifted `T` off the
+        // end of `param_names` and dropped its substitution.)
+        let mut type_pos = 0;
+        for arg in generic_args.iter() {
             if let ast::GenericArg::Type(arg_ty) = arg {
-                if let Some(param_name) = param_names.get(i) {
+                if let Some(param_name) = param_names.get(type_pos) {
                     result.insert(
                         param_name.clone(),
                         self.substitute_type_from_ast(arg_ty, outer_subst),
                     );
                 }
+                type_pos += 1;
             }
         }
 
@@ -2013,8 +2022,8 @@ impl<'ctx> MirLowerer<'ctx> {
 
             self.current_fn = Some(builder);
 
-            // Lower function body
-            let result = self.lower_block(body)?;
+            // Lower function body (tail expression sees the declared return type)
+            let result = self.lower_fn_body(body)?;
 
             // Add return if needed
             let mut builder = self.current_fn.take().unwrap();
@@ -2269,7 +2278,7 @@ impl<'ctx> MirLowerer<'ctx> {
 
             self.current_fn = Some(builder);
 
-            let result = self.lower_block(body)?;
+            let result = self.lower_fn_body(body)?;
 
             let mut builder = self.current_fn.take().unwrap();
             if f.sig.return_ty.is_some() {
@@ -2348,7 +2357,7 @@ impl<'ctx> MirLowerer<'ctx> {
             }
 
             self.current_fn = Some(builder);
-            let result = self.lower_block(body)?;
+            let result = self.lower_fn_body(body)?;
 
             let mut builder = self.current_fn.take().unwrap();
             if f.sig.return_ty.is_some() {
@@ -2526,6 +2535,24 @@ impl<'ctx> MirLowerer<'ctx> {
         // `i32` default — required for the MIR linear checker to see the field
         // extract as a move of a linear payload out of a shared borrow.
         self.module.find_variant_field_type(struct_name, field_name)
+    }
+
+    /// Look up a struct field's ordinal index (0-based declaration order) by
+    /// name. Index-based backends (LLVM GEP, Rust positional) use this in a
+    /// place projection; the C backend renders by name.
+    fn lookup_struct_field_index(&self, struct_name: &str, field_name: &str) -> Option<u32> {
+        if let Some(type_def) = self.module.find_type(struct_name) {
+            if let TypeDefKind::Struct { fields, .. } = &type_def.kind {
+                for (i, (fname, _)) in fields.iter().enumerate() {
+                    if let Some(name) = fname {
+                        if name.as_ref() == field_name {
+                            return Some(i as u32);
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Look up an enum variant by enum name and variant name.

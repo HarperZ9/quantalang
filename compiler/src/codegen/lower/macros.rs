@@ -757,19 +757,17 @@ impl<'ctx> MirLowerer<'ctx> {
                     let local = builder.create_named_local(name.name.clone(), ty.clone());
                     self.var_map.insert(name.name.clone(), local);
 
-                    // Load the argument from handler_data.
-                    // The perform site stores a pointer to the argument in handler_data.
-                    // We generate a FieldAccess that the C backend renders as:
-                    //   msg = *(ParamType*)__handler_EffectName.handler_data
+                    // Load argument `param_idx` from handler_data.
+                    // The perform site stores a `void*[N]` argv array in
+                    // handler_data, where argv[i] points to argument i. The
+                    // `handler_data#<i>` field marker tells the C backend which
+                    // argument to read; it renders as:
+                    //   msg = *(ParamType*)((void**)__handler_EffectName.handler_data)[i]
                     let handler_data_field = MirRValue::FieldAccess {
                         base: MirValue::Local(handler_local),
-                        field_name: Arc::from("handler_data"),
+                        field_name: Arc::from(format!("handler_data#{}", param_idx)),
                         field_ty: MirType::Ptr(Box::new(MirType::Void)),
                     };
-                    // Store the void* into a temp, then cast and deref.
-                    // Simpler approach: use a special marker that the C backend
-                    // can detect. We'll use FieldAccess with field "handler_data"
-                    // and let the C backend emit the cast+deref.
                     builder.assign(local, handler_data_field);
                 }
             }
@@ -855,15 +853,19 @@ impl<'ctx> MirLowerer<'ctx> {
             h.abs()
         };
 
-        // Lower the first argument (if any) - it becomes the `arg` pointer.
-        let arg_val = if let Some(first) = args.first() {
-            self.lower_expr(first)?
-        } else {
-            MirValue::Const(MirConst::Null(MirType::Void))
-        };
+        // Lower every argument. Each is marshalled into a `void*[N]` argv
+        // array whose i-th slot holds the address of argument i; the handler
+        // reads argument i back via `((void**)handler_data)[i]`. Passing the
+        // whole argv (not just the first arg) is what lets a multi-parameter
+        // operation see all of its arguments. A zero-argument operation passes
+        // a null `arg` pointer, which its handler never dereferences.
+        let arg_vals: Vec<MirValue> = args
+            .iter()
+            .map(|a| self.lower_expr(a))
+            .collect::<CodegenResult<Vec<_>>>()?;
 
-        // Compute the argument type before borrowing current_fn mutably.
-        let arg_ty = self.type_of_value(&arg_val);
+        // Compute each argument's type before borrowing current_fn mutably.
+        let arg_tys: Vec<MirType> = arg_vals.iter().map(|v| self.type_of_value(v)).collect();
 
         let builder = self
             .current_fn
@@ -875,19 +877,34 @@ impl<'ctx> MirLowerer<'ctx> {
         // times with the same effect/operation.
         let result_local = builder.create_local(MirType::i32());
 
-        // Store the argument value into a local so we can take its address.
-        let arg_local = builder.create_local(arg_ty.clone());
-        builder.assign(arg_local, MirRValue::Use(arg_val));
+        // Build the argv array of pointers-to-arguments. Each argument value is
+        // stored into its own local so its address is stable, then written into
+        // `argv[i]`; a `T*` slot value decays to the `void*` element type in C.
+        let n = arg_vals.len();
+        let arg_ptr_value: MirValue = if n == 0 {
+            MirValue::Const(MirConst::Null(MirType::Void))
+        } else {
+            let argv = builder.create_local(MirType::Array(
+                Box::new(MirType::Ptr(Box::new(MirType::Void))),
+                n as u64,
+            ));
+            for (i, (val, ty)) in arg_vals.into_iter().zip(arg_tys.into_iter()).enumerate() {
+                let arg_local = builder.create_local(ty);
+                builder.assign(arg_local, MirRValue::Use(val));
+                builder.push_index_store(
+                    MirValue::Local(argv),
+                    MirValue::Const(MirConst::Int(i as i128, MirType::i32())),
+                    MirType::Ptr(Box::new(MirType::Void)),
+                    MirRValue::AddressOf {
+                        is_mut: false,
+                        place: MirPlace::local(arg_local),
+                    },
+                );
+            }
+            MirValue::Local(argv)
+        };
 
-        // Take address of arg and result for the void* parameters.
-        let arg_ptr = builder.create_local(MirType::Ptr(Box::new(arg_ty)));
-        builder.assign(
-            arg_ptr,
-            MirRValue::AddressOf {
-                is_mut: false,
-                place: MirPlace::local(arg_local),
-            },
-        );
+        // Take the address of the result slot for the void* result parameter.
         let result_ptr = builder.create_local(MirType::Ptr(Box::new(MirType::i32())));
         builder.assign(
             result_ptr,
@@ -897,7 +914,7 @@ impl<'ctx> MirLowerer<'ctx> {
             },
         );
 
-        // build_perform(effect_id, op_id, &arg, &result)
+        // build_perform(effect_id, op_id, argv, &result)
         let perform_fn = MirValue::Function(Arc::from("build_perform"));
         let eid_val = MirValue::Const(MirConst::Int(eid as i128, MirType::i32()));
         let op_val = MirValue::Const(MirConst::Int(op_id as i128, MirType::i32()));
@@ -905,12 +922,7 @@ impl<'ctx> MirLowerer<'ctx> {
         let cont = builder.create_block();
         builder.call(
             perform_fn,
-            vec![
-                eid_val,
-                op_val,
-                MirValue::Local(arg_ptr),
-                MirValue::Local(result_ptr),
-            ],
+            vec![eid_val, op_val, arg_ptr_value, MirValue::Local(result_ptr)],
             None,
             cont,
         );
@@ -935,6 +947,18 @@ impl<'ctx> MirLowerer<'ctx> {
     ///
     /// The element type is inferred from the first argument expression.
     pub(crate) fn lower_vec_macro(&mut self, tokens: &[ast::TokenTree]) -> CodegenResult<MirValue> {
+        // When a `Vec<T>` type is expected (from a let annotation or another
+        // bidirectional hint), lower each element with `T` as its expected type
+        // and build the vec at `T`. Without this an annotated
+        // `let v: Vec<i64> = vec![1, 2, 3]` infers `i32` from the bare literals,
+        // stores 4-byte-strided elements through the i32 push helper, and every
+        // `v[i]` reads at the i64 width the annotation requires -> the read
+        // spans two elements: a silent wrong answer with no diagnostic.
+        let expected_elem: Option<MirType> = match &self.expected_type {
+            Some(MirType::Vec(elem)) => Some((**elem).clone()),
+            _ => None,
+        };
+
         // Check if tokens have valid spans matching our source file.
         // When the macro expander expands nested vec! calls, the inner
         // tokens get synthetic spans that don't match self.source.
@@ -967,9 +991,13 @@ impl<'ctx> MirLowerer<'ctx> {
 
             if !has_valid_spans && !tokens.is_empty() {
                 // Tokens have synthetic spans - this vec! was already expanded
-                // by the macro expander. Create an empty vec as placeholder.
-                let new_fn = MirValue::Function(Arc::from("build_hvec_new_f64"));
-                let vec_ty = MirType::Vec(Box::new(MirType::f64()));
+                // by the macro expander. Create an empty vec as placeholder,
+                // at the expected element type when one is known (else the f64
+                // default this path has always used).
+                let placeholder_elem = expected_elem.clone().unwrap_or_else(MirType::f64);
+                let (new_fn_name, _) = Self::vec_fn_names_for_type(&placeholder_elem)?;
+                let new_fn = MirValue::Function(Arc::from(new_fn_name));
+                let vec_ty = MirType::Vec(Box::new(placeholder_elem));
                 let builder = self
                     .current_fn
                     .as_mut()
@@ -986,9 +1014,12 @@ impl<'ctx> MirLowerer<'ctx> {
         let all_groups = self.split_vec_macro_token_groups(tokens);
 
         if all_groups.is_empty() {
-            // vec![] with no args -- create empty i32 vec
-            let new_fn = MirValue::Function(Arc::from("build_hvec_new_i32"));
-            let vec_ty = MirType::Vec(Box::new(MirType::i32()));
+            // vec![] with no args -- empty vec at the expected element type,
+            // else i32.
+            let empty_elem = expected_elem.clone().unwrap_or_else(MirType::i32);
+            let (new_fn_name, _) = Self::vec_fn_names_for_type(&empty_elem)?;
+            let new_fn = MirValue::Function(Arc::from(new_fn_name));
+            let vec_ty = MirType::Vec(Box::new(empty_elem));
             let builder = self
                 .current_fn
                 .as_mut()
@@ -1008,10 +1039,17 @@ impl<'ctx> MirLowerer<'ctx> {
             let val_tokens = all_groups[0].clone();
             let count_tokens = all_groups[1].clone();
 
-            // Parse and lower the value expression to infer the element type
-            let val = self.parse_and_lower_token_group(val_tokens)?;
-            let elem_ty = self.type_of_value(&val);
-            let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&elem_ty);
+            // Lower the value at the expected element type so a bare literal
+            // adopts the annotated width; fall back to the inferred type.
+            let prev_expected = self.expected_type.take();
+            self.expected_type = expected_elem.clone();
+            let val = self.parse_and_lower_token_group(val_tokens);
+            self.expected_type = prev_expected;
+            let val = val?;
+            let elem_ty = expected_elem
+                .clone()
+                .unwrap_or_else(|| self.type_of_value(&val));
+            let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&elem_ty)?;
             let vec_ty = MirType::Vec(Box::new(elem_ty));
 
             // Create the vec
@@ -1113,11 +1151,18 @@ impl<'ctx> MirLowerer<'ctx> {
             Ok(MirValue::Local(vec_local))
         } else {
             // vec![a, b, c] -- literal form
-            // Parse and lower the first argument to infer the element type
+            // Lower the first argument at the expected element type (so a bare
+            // literal adopts the annotated width), else infer from its value.
             let first_tokens = all_groups[0].clone();
-            let first_val = self.parse_and_lower_token_group(first_tokens)?;
-            let elem_ty = self.type_of_value(&first_val);
-            let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&elem_ty);
+            let prev_expected = self.expected_type.take();
+            self.expected_type = expected_elem.clone();
+            let first_val = self.parse_and_lower_token_group(first_tokens);
+            self.expected_type = prev_expected;
+            let first_val = first_val?;
+            let elem_ty = expected_elem
+                .clone()
+                .unwrap_or_else(|| self.type_of_value(&first_val));
+            let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&elem_ty)?;
             let vec_ty = MirType::Vec(Box::new(elem_ty));
 
             // Create the vec
@@ -1132,7 +1177,7 @@ impl<'ctx> MirLowerer<'ctx> {
             builder.switch_to_block(cont);
 
             // Push the first element
-            let push_fn_val = MirValue::Function(Arc::from(push_fn_name));
+            let push_fn_val = MirValue::Function(Arc::from(push_fn_name.as_str()));
             {
                 let builder = self.current_fn.as_mut().unwrap();
                 let cont2 = builder.create_block();
@@ -1145,10 +1190,14 @@ impl<'ctx> MirLowerer<'ctx> {
                 builder.switch_to_block(cont2);
             }
 
-            // Push remaining elements
+            // Push remaining elements, each lowered at the expected element type.
             for group in &all_groups[1..] {
-                let val = self.parse_and_lower_token_group(group.clone())?;
-                let push_fn_val = MirValue::Function(Arc::from(push_fn_name));
+                let prev_expected = self.expected_type.take();
+                self.expected_type = expected_elem.clone();
+                let val = self.parse_and_lower_token_group(group.clone());
+                self.expected_type = prev_expected;
+                let val = val?;
+                let push_fn_val = MirValue::Function(Arc::from(push_fn_name.as_str()));
                 let builder = self.current_fn.as_mut().unwrap();
                 let cont2 = builder.create_block();
                 builder.call(
@@ -1164,21 +1213,60 @@ impl<'ctx> MirLowerer<'ctx> {
         }
     }
 
-    /// Select the correct C-level vec_new / vec_push function names based on element type.
-    /// Returns the C runtime function names (not the BuildLang builtin names).
-    fn vec_fn_names_for_type(elem_ty: &MirType) -> (&'static str, &'static str) {
-        match elem_ty {
-            MirType::Float(FloatSize::F64) | MirType::Float(FloatSize::F32) => {
-                ("build_hvec_new_f64", "build_hvec_push_f64")
-            }
-            MirType::Int(IntSize::I64, _) | MirType::Int(IntSize::ISize, _) => {
-                ("build_hvec_new_i64", "build_hvec_push_i64")
-            }
+    /// Map a vec element type to its runtime build/push helper pair, or reject
+    /// the element type when the HVec runtime cannot store it.
+    ///
+    /// Two storage strategies back a `Vec<T>`. Scalars and strings ride a
+    /// built-in `build_hvec_*_<suffix>` family: f64 (also f32), i64 (also
+    /// isize), i32 (the narrow integer widths, u32, char, and bool), and str.
+    /// A user struct, a nested vector, or a map rides a monomorphized,
+    /// element-sized wrapper the C backend emits per element type
+    /// (`vec_elem_needs_sized_wrapper` in codegen/backend/c.rs), keyed by the
+    /// struct name or the nested handle's C type. Selecting the wrapper suffix
+    /// here keeps `vec![Point { .. }]` in step with `v.push(Point { .. })`,
+    /// which the vec method accessors already lower through the same wrapper.
+    ///
+    /// A tuple or an array element has no representation in either strategy: no
+    /// scalar family fits it and the backend emits no wrapper for it. Reject it
+    /// rather than fall through to the i32 family, which for an array element
+    /// silently miscompiled (the array decayed to a pointer truncated to
+    /// `int32_t` under `-Wint-conversion`, warn-only) and for a tuple leaked a
+    /// raw C type error. A vector of a tuple or array element is an honest gap;
+    /// it needs a wrapper that stores and projects the aggregate, the same path
+    /// structs and nested vectors already take.
+    ///
+    /// Keep the supported suffixes in sync with `hvec_elem_suffix` and
+    /// `vec_elem_needs_sized_wrapper` in codegen/backend/c.rs and with the vec
+    /// method and free-function accessor tables in codegen/lower/expr.rs, so a
+    /// `vec![...]` builds the same typed handle those accessors later read.
+    fn vec_fn_names_for_type(elem_ty: &MirType) -> CodegenResult<(String, String)> {
+        let suffix: String = match elem_ty {
+            MirType::Float(FloatSize::F64) | MirType::Float(FloatSize::F32) => "f64".to_string(),
+            MirType::Int(IntSize::I64, _) | MirType::Int(IntSize::ISize, _) => "i64".to_string(),
+            MirType::Struct(n) if n.as_ref() == "BuildString" => "str".to_string(),
+            // The narrow integer widths, u32, char (lowered to u32), and bool all
+            // pass to the i32 helper's `int32_t` parameter by value, so their
+            // build and read strides agree.
+            MirType::Int(_, _) | MirType::Bool => "i32".to_string(),
+            // A user struct, a nested vector, or a map rides the element-sized
+            // wrapper the C backend generates; the suffix is the struct name or
+            // the nested handle's C type, matching hvec_elem_suffix.
+            MirType::Struct(n) => n.to_string(),
+            MirType::Vec(_) => "BuildVecHandle".to_string(),
+            MirType::Map(_, _) => "BuildMapHandle".to_string(),
             _ => {
-                // Default to i32 for everything else
-                ("build_hvec_new_i32", "build_hvec_push_i32")
+                return Err(CodegenError::Unsupported(format!(
+                    "a vector of `{elem_ty}` elements is not supported yet: the Vec \
+                     runtime stores scalar (integer, float, bool, char), string, \
+                     struct, nested-vector, and map elements, not a tuple or array \
+                     element"
+                )))
             }
-        }
+        };
+        Ok((
+            format!("build_hvec_new_{suffix}"),
+            format!("build_hvec_push_{suffix}"),
+        ))
     }
 
     /// Extract all argument source texts from vec! macro tokens.
@@ -1288,7 +1376,21 @@ impl<'ctx> MirLowerer<'ctx> {
             Ok(new_tokens) => {
                 let mut parser = Parser::new(&sf, new_tokens);
                 match parser.parse_expr() {
-                    Ok(expr) => self.lower_expr(&expr),
+                    Ok(expr) => {
+                        // The parsed expression's token spans are relative to
+                        // `source_text` (the anonymous re-tokenized string), not
+                        // the original file. Point self.source at it while we
+                        // lower, so a nested macro that re-extracts source by
+                        // span reads the right text. Without this, an inner
+                        // vec! inside a Vec<Vec<_>> literal sliced the original
+                        // file at a stale offset and pushed a garbage element
+                        // (an unrelated identifier, then the 0 parse-failure
+                        // default). Restore the previous source afterward.
+                        let prev_source = self.source.replace(Arc::from(source_text.as_str()));
+                        let result = self.lower_expr(&expr);
+                        self.source = prev_source;
+                        result
+                    }
                     Err(_) => {
                         // Parsing failed - tokens likely have synthetic spans.
                         // Return a sensible default (0 for numerics).
@@ -1500,10 +1602,52 @@ impl<'ctx> MirLowerer<'ctx> {
         let mut arg_values: Vec<MirValue> = Vec::new();
         let mut arg_types: Vec<Option<MirType>> = Vec::new();
 
-        for arg_src in &arg_source_texts {
+        // Pre-scan the format string so we know, per placeholder position,
+        // whether it is a plain `{}` (default Display). A plain float placeholder
+        // is rendered through the shortest-round-trip formatter instead of C's
+        // lossy `%g`, so Display matches Rust. Explicit specs like `{:.3}` keep
+        // their `%.3f` path.
+        let plain_flags = Self::placeholder_is_plain(&format_str);
+
+        for (arg_index, arg_src) in arg_source_texts.iter().enumerate() {
             match self.parse_and_lower_macro_arg(arg_src) {
                 Ok(val) => {
                     let ty = self.type_of_value(&val);
+                    // Plain `{}` on a float: convert to a shortest-round-trip
+                    // string (0.1 + 0.2 -> 0.30000000000000004, 1234567.0 ->
+                    // 1234567) rather than emitting C's 6-significant-digit %g.
+                    if plain_flags.get(arg_index).copied().unwrap_or(false) {
+                        if let MirType::Float(size) = ty {
+                            let conv = match size {
+                                FloatSize::F32 => "build_f32_to_string",
+                                FloatSize::F64 => "build_f64_to_string",
+                            };
+                            let builder = self.current_fn.as_mut().unwrap();
+                            let sdest =
+                                builder.create_local(MirType::Struct(Arc::from("BuildString")));
+                            let cont = builder.create_block();
+                            builder.call(
+                                MirValue::Function(Arc::from(conv)),
+                                vec![val],
+                                Some(sdest),
+                                cont,
+                            );
+                            builder.switch_to_block(cont);
+                            let ptr_local =
+                                builder.create_local(MirType::Ptr(Box::new(MirType::i8())));
+                            builder.assign(
+                                ptr_local,
+                                MirRValue::FieldAccess {
+                                    base: MirValue::Local(sdest),
+                                    field_name: Arc::from("ptr"),
+                                    field_ty: MirType::Ptr(Box::new(MirType::i8())),
+                                },
+                            );
+                            arg_types.push(Some(MirType::Ptr(Box::new(MirType::i8()))));
+                            arg_values.push(MirValue::Local(ptr_local));
+                            continue;
+                        }
+                    }
                     // For BuildString values, extract .ptr for printf
                     if let MirType::Struct(ref name) = ty {
                         if name.as_ref() == "BuildString" {
@@ -1840,6 +1984,43 @@ impl<'ctx> MirLowerer<'ctx> {
         self.lower_expr(&expr)
     }
 
+    /// Walk a Rust-style format string and report, for each placeholder in
+    /// order, whether it is a plain `{}` (default Display). Escaped braces
+    /// (`{{`, `}}`) are skipped and every `{:...}` form reports `false`. The
+    /// brace bookkeeping mirrors the placeholder loop in `prepare_format_call`,
+    /// so index `i` here lines up with placeholder `i` there.
+    fn placeholder_is_plain(format_str: &str) -> Vec<bool> {
+        let mut kinds = Vec::new();
+        let mut chars = format_str.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '{' {
+                match chars.peek() {
+                    Some('{') => {
+                        chars.next();
+                    }
+                    Some('}') => {
+                        chars.next();
+                        kinds.push(true);
+                    }
+                    Some(':') => {
+                        chars.next();
+                        while let Some(&c) = chars.peek() {
+                            chars.next();
+                            if c == '}' {
+                                break;
+                            }
+                        }
+                        kinds.push(false);
+                    }
+                    _ => {}
+                }
+            } else if ch == '}' && chars.peek() == Some(&'}') {
+                chars.next();
+            }
+        }
+        kinds
+    }
+
     /// Pick the correct printf format specifier based on the MIR type.
     fn format_specifier_for_type(&self, ty: Option<&MirType>, precision: Option<&str>) -> String {
         match ty {
@@ -2159,7 +2340,7 @@ impl<'ctx> MirLowerer<'ctx> {
         //    After map closures, the type may change based on the closure's
         //    return type annotation.  For now we infer from the closure.
         let output_elem_ty = self.infer_chain_output_type(&elem_ty, &chain.steps);
-        let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&output_elem_ty);
+        let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&output_elem_ty)?;
 
         // 5. Set up the result value depending on terminal type.
         let (result_local, _is_collect) = match &chain.terminal {

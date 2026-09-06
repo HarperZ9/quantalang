@@ -22,6 +22,40 @@ use super::traits::{BuiltinTraits, TraitEnv, TraitResolver};
 use super::ty::*;
 use super::unify::Unifier;
 
+/// Default binding mode for match ergonomics (RFC 2005). When a structural
+/// pattern is matched against a reference type, the reference is peeled and the
+/// mode weakens from `Move` toward `Ref`/`RefMut`, so identifier leaves bind by
+/// reference instead of by value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatBindMode {
+    Move,
+    Ref,
+    RefMut,
+}
+
+impl PatBindMode {
+    /// Weaken the mode after peeling one reference layer of mutability `m`.
+    /// `Ref` is sticky: once a shared reference is peeled, a later `&mut` layer
+    /// still binds shared. A `&` layer downgrades an existing `RefMut` to `Ref`.
+    fn weaken(self, m: Mutability) -> PatBindMode {
+        match (self, m) {
+            (PatBindMode::Ref, _) => PatBindMode::Ref,
+            (_, Mutability::Immutable) => PatBindMode::Ref,
+            (_, Mutability::Mutable) => PatBindMode::RefMut,
+        }
+    }
+
+    /// Apply the mode to a bound leaf type: `Move` binds by value, `Ref`/`RefMut`
+    /// wrap the type in a shared/mutable reference.
+    fn apply_to(self, ty: &Ty) -> Ty {
+        match self {
+            PatBindMode::Move => ty.clone(),
+            PatBindMode::Ref => Ty::reference(None, Mutability::Immutable, ty.clone()),
+            PatBindMode::RefMut => Ty::reference(None, Mutability::Mutable, ty.clone()),
+        }
+    }
+}
+
 /// Well-known type definition IDs for built-in types.
 #[derive(Debug, Clone, Copy)]
 pub struct WellKnownTypes {
@@ -108,6 +142,11 @@ pub struct TypeInfer<'ctx> {
     /// On scope exit these are restored, so an inner shadow cannot revive or
     /// alter the outer binding's consumed state.
     linear_shadow_stack: Vec<HashMap<String, Option<LinearSlot>>>,
+    /// Loop labels currently in scope, innermost last. One entry per enclosing
+    /// loop; `None` for an unlabeled loop. `break 'x` / `continue 'x` must find
+    /// `'x` here, so an undefined label is rejected at `check` rather than
+    /// slipping through to codegen.
+    loop_label_stack: Vec<Option<String>>,
 }
 
 /// Tracking state for a single `#[linear]`-typed binding.
@@ -270,6 +309,67 @@ fn extract_covered_variants(pattern: &ast::Pattern) -> Vec<String> {
     }
 }
 
+/// A match arm is an unguarded catch-all when it has no guard and its pattern
+/// matches every value of the scrutinee type. Only such an arm makes a scalar
+/// match exhaustive on its own; a guard can always fail, so a guarded arm never
+/// closes the match.
+fn arm_is_unguarded_catch_all(arm: &ast::MatchArm) -> bool {
+    arm.guard.is_none() && pattern_is_irrefutable(&arm.pattern)
+}
+
+/// Whether a pattern matches every value of its type, ignoring any guard. A bare
+/// binding (`x`) and `_` are irrefutable; `x @ inner`, parentheses, and `a | b`
+/// follow their inner patterns.
+fn pattern_is_irrefutable(pat: &ast::Pattern) -> bool {
+    match &pat.kind {
+        ast::PatternKind::Wildcard => true,
+        ast::PatternKind::Ident {
+            subpattern: None, ..
+        } => true,
+        ast::PatternKind::Ident {
+            subpattern: Some(inner),
+            ..
+        }
+        | ast::PatternKind::Paren(inner) => pattern_is_irrefutable(inner),
+        ast::PatternKind::Or(alts) => alts.iter().any(pattern_is_irrefutable),
+        _ => false,
+    }
+}
+
+/// Whether a pattern uses a range anywhere (`0..=9`, including inside `a | b`,
+/// parentheses, or an `x @` binding). Range coverage over an integer or char
+/// type is not computed here, so a match that uses any range is accepted rather
+/// than risk rejecting a program a range makes exhaustive.
+fn pattern_uses_range(pat: &ast::Pattern) -> bool {
+    match &pat.kind {
+        ast::PatternKind::Range { .. } => true,
+        ast::PatternKind::Ident {
+            subpattern: Some(inner),
+            ..
+        }
+        | ast::PatternKind::Paren(inner) => pattern_uses_range(inner),
+        ast::PatternKind::Or(alts) => alts.iter().any(pattern_uses_range),
+        _ => false,
+    }
+}
+
+/// Record which boolean literals a pattern covers, following `a | b` and
+/// parentheses. Used to tell whether the `true` and `false` cases are both
+/// present in a `bool` match.
+fn collect_bool_literals(pat: &ast::Pattern, covers_true: &mut bool, covers_false: &mut bool) {
+    match &pat.kind {
+        ast::PatternKind::Literal(ast::Literal::Bool(true)) => *covers_true = true,
+        ast::PatternKind::Literal(ast::Literal::Bool(false)) => *covers_false = true,
+        ast::PatternKind::Paren(inner) => collect_bool_literals(inner, covers_true, covers_false),
+        ast::PatternKind::Or(alts) => {
+            for alt in alts {
+                collect_bool_literals(alt, covers_true, covers_false);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Whether an array element type may participate in elementwise broadcasting
 /// (`.+ .- .* ./`). Broadcasting is defined only for numeric elements
 /// (integer/float): the C backend lowers each element to a scalar arithmetic op,
@@ -327,6 +427,7 @@ impl<'ctx> TypeInfer<'ctx> {
             loop_depth: 0,
             linear_loop_markers: Vec::new(),
             linear_shadow_stack: Vec::new(),
+            loop_label_stack: Vec::new(),
         }
     }
 
@@ -371,6 +472,7 @@ impl<'ctx> TypeInfer<'ctx> {
             loop_depth: 0,
             linear_loop_markers: Vec::new(),
             linear_shadow_stack: Vec::new(),
+            loop_label_stack: Vec::new(),
         }
     }
 
@@ -2367,6 +2469,37 @@ impl<'ctx> TypeInfer<'ctx> {
                 if Some(*def_id) == self.well_known_types.result && !substs.is_empty() {
                     return Some(substs[0].clone());
                 }
+                // Structural fallback: a user-defined enum shaped like Result or
+                // Option is tryable too. The corpus defines its own non-generic
+                // `enum Result { Ok(i32), Err(i32) }` / `enum Option { Some(i32),
+                // None }`, which are plain ADTs (not the well-known def ids and
+                // carry no substs), yet the rest of the compiler already treats
+                // them as the builtin sum types. Resolve `?`'s Output to the
+                // payload of the success variant (`Ok`/`Some`).
+                if let Some(type_def) = self.ctx.lookup_type(*def_id) {
+                    if let TypeDefKind::Enum(enum_def) = &type_def.kind {
+                        if let Some(success) = enum_def
+                            .variants
+                            .iter()
+                            .find(|v| matches!(v.name.as_ref(), "Ok" | "Some"))
+                        {
+                            if let Some((_, field_ty)) = success.fields.first() {
+                                // A generic payload is filled from the type's own
+                                // substs by the parameter's index; a concrete
+                                // payload (the non-generic corpus enums) is used
+                                // directly.
+                                if let TyKind::Param(_, idx) = &field_ty.kind {
+                                    if let Some(arg) = substs.get(*idx as usize) {
+                                        return Some(arg.clone());
+                                    }
+                                }
+                                return Some(field_ty.clone());
+                            }
+                            // Success variant with no payload → Output is unit.
+                            return Some(Ty::unit());
+                        }
+                    }
+                }
                 None
             }
             TyKind::Var(_) | TyKind::Infer(_) => Some(Ty::fresh_var()),
@@ -2728,16 +2861,18 @@ impl<'ctx> TypeInfer<'ctx> {
                 expr.span,
             ),
             ExprKind::Match { scrutinee, arms } => self.infer_match(scrutinee, arms, expr.span),
-            ExprKind::Loop { body, .. } => self.infer_loop(body),
+            ExprKind::Loop { body, label } => self.infer_loop(body, label.as_ref()),
             ExprKind::While {
-                condition, body, ..
-            } => self.infer_while(condition, body),
+                condition,
+                body,
+                label,
+            } => self.infer_while(condition, body, label.as_ref()),
             ExprKind::For {
                 pattern,
                 iter,
                 body,
-                ..
-            } => self.infer_for(pattern, iter, body, expr.span),
+                label,
+            } => self.infer_for(pattern, iter, body, label.as_ref(), expr.span),
 
             ExprKind::Block(block) => self.infer_block(block),
             ExprKind::Unsafe(block) => self.infer_block(block),
@@ -2769,8 +2904,10 @@ impl<'ctx> TypeInfer<'ctx> {
             }
 
             ExprKind::Return(value) => self.infer_return(value.as_deref(), expr.span),
-            ExprKind::Break { value, .. } => self.infer_break(value.as_deref(), expr.span),
-            ExprKind::Continue { .. } => self.infer_continue(expr.span),
+            ExprKind::Break { value, label } => {
+                self.infer_break(value.as_deref(), label.as_ref(), expr.span)
+            }
+            ExprKind::Continue { label } => self.infer_continue(label.as_ref(), expr.span),
 
             ExprKind::Closure {
                 params,
@@ -2807,8 +2944,8 @@ impl<'ctx> TypeInfer<'ctx> {
                 pattern,
                 expr,
                 body,
-                ..
-            } => self.infer_while_let(pattern, expr, body),
+                label,
+            } => self.infer_while_let(pattern, expr, body, label.as_ref()),
 
             // Type ascription: `expr: Type`
             ExprKind::TypeAscription { expr: inner, ty } => {
@@ -2971,6 +3108,27 @@ impl<'ctx> TypeInfer<'ctx> {
                 return Ty::error();
             }
         }
+        // Prelude value constructors (`Some`, `None`, `Ok`, `Err`) must be
+        // instantiated fresh at every occurrence. The prelude registers each as
+        // a single shared variable (check.rs); returning that binding directly
+        // lets the first use in a body bind the variable and then poison every
+        // later use with a different type argument, so `Some(a_string)` followed
+        // by `Some(a_struct)` in one function wrongly conflicts. Option and
+        // Result are not registered as ADTs (an `Option<T>` annotation itself
+        // lowers to a fresh variable), so the most precise type available is a
+        // fresh functional shape per occurrence: this removes the cross-site
+        // poisoning without adding constraints the rest of the checker cannot
+        // yet honour. `Some`/`Ok`/`Err` take exactly one argument; `None` is a
+        // value.
+        match name {
+            "Some" | "Ok" | "Err" => {
+                return Ty::function(vec![Ty::fresh_var()], Ty::fresh_var());
+            }
+            "None" => {
+                return Ty::fresh_var();
+            }
+            _ => {}
+        }
         if let Some(ty) = self.ctx.lookup_var(name) {
             if self.ctx.is_foreign_static(name) {
                 self.current_effects
@@ -3058,8 +3216,17 @@ impl<'ctx> TypeInfer<'ctx> {
                 "vec_new_i64" | "vec_push_i64" | "vec_get_i64" | "vec_pop_i64" |
                 // Format builtins
                 "to_string_i32" | "to_string_f64" |
-                // HashMap builtins
+                // HashMap builtins (default str->f64)
                 "map_new" | "map_insert" | "map_get" | "map_contains" | "map_len" | "map_remove" |
+                // HashMap builtins (typed i32->i32). Fully wired in codegen
+                // (math_builtin_to_c -> build_map_*, return-type table, runtime
+                // funcs) but were never registered here, so a call resolved to
+                // `undefined variable` before codegen ever ran. See 68_hashmap.
+                "map_new_i32" | "map_insert_i32" | "map_get_i32" | "map_contains_i32" | "map_len_i32" | "map_remove_i32" |
+                // HashMap builtins (typed i64->f64). Same completion as the i32
+                // family: runtime (build_hmap_*_i64_f64), mapping, and return
+                // types all exist; only this allow-list entry was missing.
+                "map_new_i64" | "map_insert_i64" | "map_get_i64" | "map_contains_i64" | "map_len_i64" | "map_remove_i64" |
                 // Vulkan runtime builtins
                 "build_vk_init" | "build_vk_load_shader_file" | "build_vk_run_compute" | "build_vk_shutdown" |
                 // Math constants
@@ -4276,6 +4443,24 @@ impl<'ctx> TypeInfer<'ctx> {
         let func_ty = self.infer_expr(func);
         let func_ty = self.apply(&func_ty);
 
+        // Auto-deref a reference (or chain of references) to a function
+        // pointer: calling `f()` where `f: &fn() -> R` calls the underlying
+        // function. This is how `for f in [a, b] { f() }` type-checks, since
+        // iterating an array binds each element by reference, so the callee
+        // is a `&fn(..)`. Only peel when the target is a concrete function;
+        // `&i32`, `&Param`, `&Var`, and friends keep their own arms below.
+        let func_ty = {
+            let mut target = &func_ty;
+            while let TyKind::Ref(_, _, inner) = &target.kind {
+                target = inner;
+            }
+            if matches!(target.kind, TyKind::Fn(_)) {
+                target.clone()
+            } else {
+                func_ty.clone()
+            }
+        };
+
         match &func_ty.kind {
             TyKind::Fn(fn_ty) => {
                 // A C-style variadic function accepts at least its fixed
@@ -4463,12 +4648,16 @@ impl<'ctx> TypeInfer<'ctx> {
                 }
                 Ty::fresh_var()
             }
-            TyKind::Ref(_, _, ref inner)
-                if matches!(
-                    inner.kind,
-                    TyKind::Param(..) | TyKind::Var(_) | TyKind::Infer(_)
-                ) =>
-            {
+            // A call through `&F` where `F` is a generic type parameter is
+            // lenient: the `Fn` bound is not tracked here, so let
+            // monomorphization supply the concrete callee (mirrors the bare
+            // `TyKind::Param` arm above). This does NOT extend to a reference
+            // whose pointee is an unresolved inference variable: `let x = 5;
+            // let r = &x; r()` has `r: &{integer}`, which is not a function.
+            // Peeling it leniently would accept `(&i32)()` and silently return
+            // a fresh type -- a fail-open hole. Such a reference falls through
+            // to the `NotCallable` arm below and fails closed.
+            TyKind::Ref(_, _, ref inner) if matches!(inner.kind, TyKind::Param(..)) => {
                 let arg_tys: Vec<_> = args.iter().map(|a| self.infer_expr(a)).collect();
                 for (arg, ty) in args.iter().zip(arg_tys.iter()) {
                     self.reject_linear_escape(
@@ -4524,6 +4713,15 @@ impl<'ctx> TypeInfer<'ctx> {
                 .map(|op| op.name.as_ref().to_string())
                 .collect();
 
+            // Snapshot each operation's declared parameter types (owned) so the
+            // `&self.effect_ctx` borrow is released before the loop below, which
+            // calls `&mut self` methods (push_scope, bind_pattern, infer_expr).
+            let op_param_tys: Vec<(String, Vec<Ty>)> = effect_def
+                .operations
+                .iter()
+                .map(|op| (op.name.as_ref().to_string(), op.params.clone()))
+                .collect();
+
             // Collect which operations the handlers cover
             let mut handled_ops: Vec<String> = Vec::new();
 
@@ -4543,8 +4741,31 @@ impl<'ctx> TypeInfer<'ctx> {
                     handled_ops.push(handler_op.to_string());
                 }
 
+                // Bind the arm's parameters -- the operation's arguments -- into a
+                // fresh scope before inferring the body. Each param takes the
+                // declared type of the matching operation parameter, so a param
+                // used in a real expression (a call argument, arithmetic) resolves.
+                // Without this the body sees the arm params as undefined; a bare
+                // println! masked the gap because its args bypass name resolution.
+                let op_params: &[Ty] = op_param_tys
+                    .iter()
+                    .find(|(name, _)| name == handler_op)
+                    .map(|(_, tys)| tys.as_slice())
+                    .unwrap_or(&[]);
+                self.push_scope(ScopeKind::Function);
+                for (i, p) in handler.params.iter().enumerate() {
+                    let ty = if let Some(ty_ast) = &p.ty {
+                        self.lower_type(ty_ast)
+                    } else if let Some(t) = op_params.get(i) {
+                        t.clone()
+                    } else {
+                        Ty::fresh_var()
+                    };
+                    self.bind_pattern(&p.pattern, &ty);
+                }
                 // Infer the handler body type
                 let _ = self.infer_expr(&handler.body);
+                self.pop_scope();
             }
 
             // Check for missing handler clauses: all operations must be handled
@@ -4574,7 +4795,20 @@ impl<'ctx> TypeInfer<'ctx> {
             ));
             self.errors.push(err_with_span);
             for handler in handlers {
+                // Even for an unknown effect, bind the arm params (from their
+                // annotations, else fresh vars) so the body's references resolve
+                // instead of cascading "undefined variable" onto the real error.
+                self.push_scope(ScopeKind::Function);
+                for p in &handler.params {
+                    let ty = if let Some(ty_ast) = &p.ty {
+                        self.lower_type(ty_ast)
+                    } else {
+                        Ty::fresh_var()
+                    };
+                    self.bind_pattern(&p.pattern, &ty);
+                }
                 let _ = self.infer_expr(&handler.body);
+                self.pop_scope();
             }
         }
 
@@ -5262,6 +5496,56 @@ impl<'ctx> TypeInfer<'ctx> {
                     );
                 }
             }
+        } else {
+            // Scalar exhaustiveness. A `bool`, integer, or `char` scrutinee is
+            // not an enum, so the variant check above never covers it. Without
+            // an unguarded catch-all arm the C backend fell through to a
+            // zero/garbage default at runtime (a silent wrong value), so reject
+            // a provably non-exhaustive scalar match the way Rust does. The
+            // check only fires when non-exhaustiveness is certain, so no valid
+            // program is rejected.
+            let resolved = self.apply(&scrutinee_ty);
+            let has_catch_all = arms.iter().any(arm_is_unguarded_catch_all);
+            match &resolved.kind {
+                TyKind::Bool if !has_catch_all => {
+                    let (mut covers_true, mut covers_false) = (false, false);
+                    for arm in arms.iter().filter(|arm| arm.guard.is_none()) {
+                        collect_bool_literals(&arm.pattern, &mut covers_true, &mut covers_false);
+                    }
+                    if !(covers_true && covers_false) {
+                        let mut missing = Vec::new();
+                        if !covers_true {
+                            missing.push("true".to_string());
+                        }
+                        if !covers_false {
+                            missing.push("false".to_string());
+                        }
+                        self.error(
+                            TypeError::NonExhaustiveMatch {
+                                missing_variants: missing,
+                            },
+                            span,
+                        );
+                    }
+                }
+                (TyKind::Int(_)
+                | TyKind::Char
+                | TyKind::Infer(InferTy {
+                    kind: InferKind::Int,
+                    ..
+                })) if !has_catch_all => {
+                    // Finitely many literal arms can never cover a whole integer
+                    // or char type. An integer inference variable (a literal
+                    // scrutinee not yet defaulted to a concrete width) only ever
+                    // resolves to some integer type, so it is discrete too. Skip
+                    // when any arm uses a range, since range coverage is not
+                    // computed here and could be exhaustive.
+                    if !arms.iter().any(|arm| pattern_uses_range(&arm.pattern)) {
+                        self.error(TypeError::NonExhaustivePatterns, span);
+                    }
+                }
+                _ => {}
+            }
         }
 
         result_ty
@@ -5312,14 +5596,16 @@ impl<'ctx> TypeInfer<'ctx> {
         None
     }
 
-    fn infer_loop(&mut self, body: &ast::Block) -> Ty {
+    fn infer_loop(&mut self, body: &ast::Block, label: Option<&ast::Ident>) -> Ty {
         let pre_loop_scope_count = self.source_bindings.len();
         self.loop_break_source_frames
             .push(BreakSourceFrame::new(pre_loop_scope_count));
 
+        self.push_loop_label(label);
         self.push_scope(ScopeKind::Loop);
         let _ = self.infer_block(body);
         self.pop_scope();
+        self.pop_loop_label();
         let body_exit_sources = self.source_bindings.clone();
 
         let break_source_snapshots = self
@@ -5338,7 +5624,12 @@ impl<'ctx> TypeInfer<'ctx> {
         Ty::never()
     }
 
-    fn infer_while(&mut self, condition: &ast::Expr, body: &ast::Block) -> Ty {
+    fn infer_while(
+        &mut self,
+        condition: &ast::Expr,
+        body: &ast::Block,
+        label: Option<&ast::Ident>,
+    ) -> Ty {
         // The condition is re-evaluated every iteration, so consuming an outer
         // linear value there is a potential repeat-consume: treat it as in-loop.
         self.loop_depth += 1;
@@ -5347,9 +5638,11 @@ impl<'ctx> TypeInfer<'ctx> {
         let _ = self.unify(&cond_ty, &Ty::bool(), condition.span);
         let pre_loop_sources = self.source_bindings.clone();
 
+        self.push_loop_label(label);
         self.push_scope(ScopeKind::Loop);
         let _ = self.infer_block(body);
         self.pop_scope();
+        self.pop_loop_label();
         let body_exit_sources = self.source_bindings.clone();
 
         self.source_bindings =
@@ -5363,6 +5656,7 @@ impl<'ctx> TypeInfer<'ctx> {
         pattern: &ast::Pattern,
         iter: &ast::Expr,
         body: &ast::Block,
+        label: Option<&ast::Ident>,
         _span: Span,
     ) -> Ty {
         let iter_ty = self.infer_expr(iter);
@@ -5372,10 +5666,12 @@ impl<'ctx> TypeInfer<'ctx> {
         let item_ty = self.resolve_iterator_item(&iter_ty);
         let pre_loop_sources = self.source_bindings.clone();
 
+        self.push_loop_label(label);
         self.push_scope(ScopeKind::Loop);
         self.check_pattern(pattern, &item_ty);
         let _ = self.infer_block(body);
         self.pop_scope();
+        self.pop_loop_label();
         let body_exit_sources = self.source_bindings.clone();
 
         self.source_bindings =
@@ -5389,6 +5685,7 @@ impl<'ctx> TypeInfer<'ctx> {
         pattern: &ast::Pattern,
         expr: &ast::Expr,
         body: &ast::Block,
+        label: Option<&ast::Ident>,
     ) -> Ty {
         // The scrutinee is re-evaluated every iteration, so consuming an outer
         // linear value there is a potential repeat-consume: treat it as in-loop.
@@ -5397,11 +5694,13 @@ impl<'ctx> TypeInfer<'ctx> {
         self.loop_depth = self.loop_depth.saturating_sub(1);
         let pre_loop_sources = self.source_bindings.clone();
 
+        self.push_loop_label(label);
         self.push_scope(ScopeKind::Loop);
         self.check_pattern(pattern, &expr_ty);
         self.bind_pattern_call_sources(pattern, expr);
         let _ = self.infer_block(body);
         self.pop_scope();
+        self.pop_loop_label();
         let body_exit_sources = self.source_bindings.clone();
 
         self.source_bindings =
@@ -5693,9 +5992,42 @@ impl<'ctx> TypeInfer<'ctx> {
         }
     }
 
-    fn infer_break(&mut self, value: Option<&ast::Expr>, span: Span) -> Ty {
+    /// Enter a loop for label tracking; `None` for an unlabeled loop.
+    fn push_loop_label(&mut self, label: Option<&ast::Ident>) {
+        self.loop_label_stack
+            .push(label.map(|l| l.as_str().to_string()));
+    }
+
+    /// Leave a loop, dropping its label entry.
+    fn pop_loop_label(&mut self) {
+        self.loop_label_stack.pop();
+    }
+
+    /// Whether a loop label is in scope. Used to reject `break 'x` / `continue 'x`
+    /// against a label that names no enclosing loop.
+    fn loop_label_in_scope(&self, name: &str) -> bool {
+        self.loop_label_stack
+            .iter()
+            .any(|lbl| lbl.as_deref() == Some(name))
+    }
+
+    fn infer_break(
+        &mut self,
+        value: Option<&ast::Expr>,
+        label: Option<&ast::Ident>,
+        span: Span,
+    ) -> Ty {
         if !self.ctx.in_loop() {
             self.error(TypeError::BreakOutsideLoop, span);
+        } else if let Some(l) = label {
+            if !self.loop_label_in_scope(l.as_str()) {
+                self.error(
+                    TypeError::UndefinedLoopLabel {
+                        label: l.as_str().to_string(),
+                    },
+                    span,
+                );
+            }
         }
 
         if let Some(expr) = value {
@@ -5709,9 +6041,18 @@ impl<'ctx> TypeInfer<'ctx> {
         Ty::never()
     }
 
-    fn infer_continue(&mut self, span: Span) -> Ty {
+    fn infer_continue(&mut self, label: Option<&ast::Ident>, span: Span) -> Ty {
         if !self.ctx.in_loop() {
             self.error(TypeError::ContinueOutsideLoop, span);
+        } else if let Some(l) = label {
+            if !self.loop_label_in_scope(l.as_str()) {
+                self.error(
+                    TypeError::UndefinedLoopLabel {
+                        label: l.as_str().to_string(),
+                    },
+                    span,
+                );
+            }
         }
         Ty::never()
     }
@@ -6257,26 +6598,55 @@ impl<'ctx> TypeInfer<'ctx> {
     }
 
     fn bind_pattern(&mut self, pattern: &ast::Pattern, ty: &Ty) {
+        self.bind_pattern_mode(pattern, ty, PatBindMode::Move);
+    }
+
+    /// Bind a pattern's variables, threading the default binding mode of match
+    /// ergonomics (RFC 2005). When a non-reference (structural) pattern is
+    /// matched against a reference type `&T`/`&mut T`, the reference is peeled
+    /// and the default binding mode becomes `ref`/`ref mut`, so each identifier
+    /// leaf binds by reference. This makes `match &ev { Ev::Move { x, y } => *x }`
+    /// and `let Point { x, y } = &p;` bind `x`/`y` as references, matching how
+    /// the corpus dereferences them, instead of binding the bare field type and
+    /// rejecting `*x` as "cannot be dereferenced".
+    fn bind_pattern_mode(&mut self, pattern: &ast::Pattern, ty: &Ty, mode: PatBindMode) {
+        // Non-reference patterns auto-deref the scrutinee and weaken the binding
+        // mode; identifier, wildcard, and reference patterns do not.
+        let mut ty = self.apply(ty);
+        let mut mode = mode;
+        if Self::pattern_peels_references(&pattern.kind) {
+            while let TyKind::Ref(_, m, inner) = &ty.kind {
+                mode = mode.weaken(*m);
+                ty = self.apply(inner);
+            }
+        }
+        let ty = &ty;
         match &pattern.kind {
             ast::PatternKind::Wildcard => {}
-            ast::PatternKind::Ident { name, .. } => {
-                self.ctx.define_var(name.name.clone(), ty.clone());
+            ast::PatternKind::Ident {
+                name, subpattern, ..
+            } => {
+                let bound = mode.apply_to(ty);
+                self.ctx.define_var(name.name.clone(), bound.clone());
                 // Track `#[linear]` bindings (lets, params, destructured fields)
                 // for no-cloning enforcement.
-                self.register_linear_local(name.name.as_ref(), ty);
+                self.register_linear_local(name.name.as_ref(), &bound);
+                if let Some(sub) = subpattern {
+                    self.bind_pattern_mode(sub, ty, mode);
+                }
             }
             ast::PatternKind::Tuple(patterns) => {
                 match &ty.kind {
                     TyKind::Tuple(elem_tys) => {
                         for (pat, elem_ty) in patterns.iter().zip(elem_tys.iter()) {
-                            self.bind_pattern(pat, elem_ty);
+                            self.bind_pattern_mode(pat, elem_ty, mode);
                         }
                     }
                     // For inference variables or unknown types, generate fresh
                     // vars for each pattern element so variables get bound.
                     _ => {
                         for pat in patterns {
-                            self.bind_pattern(pat, &Ty::fresh_var());
+                            self.bind_pattern_mode(pat, &Ty::fresh_var(), mode);
                         }
                     }
                 }
@@ -6357,9 +6727,11 @@ impl<'ctx> TypeInfer<'ctx> {
                     })
                     .collect();
 
-                // Now bind patterns with the extracted types
+                // Now bind patterns with the extracted types, threading the
+                // default binding mode so `match &S { S { x } => *x }` binds
+                // `x` by reference.
                 for (field, field_ty) in fields.iter().zip(field_types.iter()) {
-                    self.bind_pattern(&field.pattern, field_ty);
+                    self.bind_pattern_mode(&field.pattern, field_ty, mode);
                 }
             }
             ast::PatternKind::TupleStruct { path, patterns, .. } => {
@@ -6404,9 +6776,10 @@ impl<'ctx> TypeInfer<'ctx> {
                     })
                     .collect();
 
-                // Now bind patterns with the extracted types
+                // Now bind patterns with the extracted types, threading the
+                // default binding mode (see the struct arm above).
                 for (pattern, field_ty) in patterns.iter().zip(field_types.iter()) {
-                    self.bind_pattern(pattern, field_ty);
+                    self.bind_pattern_mode(pattern, field_ty, mode);
                 }
             }
             ast::PatternKind::Slice(patterns) => {
@@ -6416,26 +6789,44 @@ impl<'ctx> TypeInfer<'ctx> {
                     Ty::fresh_var()
                 };
                 for pat in patterns {
-                    self.bind_pattern(pat, &elem_ty);
+                    self.bind_pattern_mode(pat, &elem_ty, mode);
                 }
             }
             ast::PatternKind::Or(patterns) => {
+                // Or patterns do not peel references themselves; each alternative
+                // re-derives the binding mode from the incoming type, so pass the
+                // pre-peel `ty`/`mode` through unchanged.
                 for pat in patterns {
-                    self.bind_pattern(pat, ty);
+                    self.bind_pattern_mode(pat, ty, mode);
                 }
             }
             ast::PatternKind::Ref { pattern, .. } => {
+                // An explicit reference pattern consumes one reference layer and
+                // resets the default binding mode to move for the inner pattern.
                 if let TyKind::Ref(_, _, inner) = &ty.kind {
-                    self.bind_pattern(pattern, inner);
+                    self.bind_pattern_mode(pattern, inner, PatBindMode::Move);
                 } else {
                     // When a `&x` pattern is used but the type isn't Ref
                     // (e.g. iterators yielding owned values), bind the inner
                     // pattern to the type directly - the `&` just dereferences.
-                    self.bind_pattern(pattern, ty);
+                    self.bind_pattern_mode(pattern, ty, PatBindMode::Move);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Whether a pattern auto-dereferences a reference scrutinee and updates the
+    /// default binding mode (RFC 2005). Structural patterns do; identifier,
+    /// wildcard, reference, and the leaf patterns that bind nothing do not.
+    fn pattern_peels_references(kind: &ast::PatternKind) -> bool {
+        matches!(
+            kind,
+            ast::PatternKind::Struct { .. }
+                | ast::PatternKind::TupleStruct { .. }
+                | ast::PatternKind::Tuple(_)
+                | ast::PatternKind::Slice(_)
+        )
     }
 
     // =========================================================================

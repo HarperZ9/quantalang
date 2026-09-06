@@ -152,6 +152,27 @@ impl RustBackend {
         self.indent -= 1;
         self.writeln("}");
         self.writeln("");
+        // Numeric-to-string intrinsics. The C runtime returns a heap
+        // `BuildString`; here each returns a native `String` whose `Display`
+        // form matches the C output: the integer paths print decimal, and the
+        // float paths print Rust's shortest round-trip, which is the same
+        // positional decimal the C `bl_fmt_f64`/`bl_fmt_f32` helpers produce.
+        self.writeln("fn build_i32_to_string(v: i32) -> String { format!(\"{}\", v) }");
+        self.writeln("fn build_i64_to_string(v: i64) -> String { format!(\"{}\", v) }");
+        self.writeln("fn build_f32_to_string(v: f32) -> String { format!(\"{}\", v) }");
+        self.writeln("fn build_f64_to_string(v: f64) -> String { format!(\"{}\", v) }");
+        self.writeln("");
+        // The MIR extracts a `char*` from a runtime string before formatting
+        // it, following the C string model. This backend has no stable raw
+        // pointer to hand back, so it materializes a `'static` slice by leaking
+        // a copy of the bytes. The generated program runs once and exits, so
+        // the bounded, deliberate leak stays local to the projection.
+        self.writeln("fn build_str_ptr(s: &str) -> &'static str {");
+        self.indent += 1;
+        self.writeln("Box::leak(s.to_string().into_boxed_str())");
+        self.indent -= 1;
+        self.writeln("}");
+        self.writeln("");
     }
 
     fn emit_type_definitions(&mut self, types: &[MirTypeDef]) -> CodegenResult<()> {
@@ -528,6 +549,7 @@ impl RustBackend {
                 let v = self.value_to_rust(operand, locals);
                 let op_str = match op {
                     UnaryOp::Not => "!",
+                    UnaryOp::BitNot => "!",
                     UnaryOp::Neg => "-",
                 };
                 format!("({}{})", op_str, v)
@@ -645,16 +667,42 @@ impl RustBackend {
                 field_ty,
             } => {
                 let base_str = self.value_to_rust(base, locals);
-                let field = Self::rust_ident(field_name);
-                let access = if self.value_is_raw_pointer(base, locals) {
-                    format!("unsafe {{ (*{}).{} }}", base_str, field)
+                // The MIR models a runtime string as a C `BuildString` carrying
+                // `ptr`, `len`, and `cap` fields. This backend maps that string
+                // to a native Rust `String`, which has no such fields, so a
+                // projection off a string base is redirected to the matching
+                // `String` operation. `ptr` becomes a `&'static str` over the
+                // bytes (the only consumer formats it), and `len`/`cap` become
+                // the byte length and capacity cast to the projected width.
+                if self.value_is_string_like(base, locals) {
+                    let field: &str = field_name;
+                    match field {
+                        "ptr" => format!("build_str_ptr(&{})", base_str),
+                        "len" => {
+                            format!("(({}).len() as {})", base_str, self.type_to_rust(field_ty))
+                        }
+                        "cap" => format!(
+                            "(({}).capacity() as {})",
+                            base_str,
+                            self.type_to_rust(field_ty)
+                        ),
+                        // No other field exists on the runtime string; fall back
+                        // to a by-name access so an unexpected projection fails
+                        // at rustc rather than miscompiling silently.
+                        _ => format!("{}.{}", base_str, Self::rust_ident(field_name)),
+                    }
                 } else {
-                    format!("{}.{}", base_str, field)
-                };
-                if Self::is_copy_like_type(field_ty) {
-                    access
-                } else {
-                    format!("({}).clone()", access)
+                    let field = Self::rust_ident(field_name);
+                    let access = if self.value_is_raw_pointer(base, locals) {
+                        format!("unsafe {{ (*{}).{} }}", base_str, field)
+                    } else {
+                        format!("{}.{}", base_str, field)
+                    };
+                    if Self::is_copy_like_type(field_ty) {
+                        access
+                    } else {
+                        format!("({}).clone()", access)
+                    }
                 }
             }
             MirRValue::IndexAccess {
@@ -689,7 +737,14 @@ impl RustBackend {
         for projection in &place.projections {
             match projection {
                 PlaceProjection::Deref => out = format!("unsafe {{ *{} }}", out),
-                PlaceProjection::Field(idx, _) => out = format!("{}.field{}", out, idx),
+                PlaceProjection::Field(_, name, _) => {
+                    // Generated Rust structs declare named fields (`x`, or the
+                    // `_0`/`_1` fields of a lowered tuple), so a field place must
+                    // access by name, not by ordinal. Positional `.field{idx}`
+                    // does not compile against a named-field struct. `rust_ident`
+                    // matches the escaping used when the struct is defined.
+                    out = format!("{}.{}", out, Self::rust_ident(name));
+                }
                 PlaceProjection::Index(id) => {
                     out = format!("{}[{} as usize]", out, self.local_name(*id, locals));
                 }

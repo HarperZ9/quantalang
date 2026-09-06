@@ -1276,9 +1276,14 @@ impl Keyword {
             "handle" => Some(Keyword::Handle),
             "resume" => Some(Keyword::Resume),
             "perform" => Some(Keyword::Perform),
-            "ai" => Some(Keyword::AI),
-            "neural" => Some(Keyword::Neural),
-            "infer" => Some(Keyword::Infer),
+            // `ai`, `neural`, `infer`, and `union` are intentionally NOT recognized
+            // as keywords here: they have no grammar production anywhere in the
+            // compiler, so reserving them only stole natural identifiers (a method
+            // named `infer`, an enum variant `Union`, a field `ai`, a module
+            // `neural`). Lexing them as ordinary identifiers is purely additive to
+            // the accepted language. A future AI-native or union-type feature would
+            // reintroduce them contextually (recognized only in its own position),
+            // the way modern languages add keywords without breaking identifiers.
             "macro" => Some(Keyword::Macro),
             "macro_rules" => Some(Keyword::MacroRules),
             "abstract" => Some(Keyword::Abstract),
@@ -1289,7 +1294,9 @@ impl Keyword {
             "priv" => Some(Keyword::Priv),
             "try" => Some(Keyword::Try),
             "yield" => Some(Keyword::Yield),
-            "union" => Some(Keyword::Union),
+            // `union` is demoted to an identifier (see the note above): no grammar
+            // production consumes it, and Rust itself keeps `union` a weak keyword
+            // so it stays usable as an identifier.
             "default" => Some(Keyword::Default),
             "auto" => Some(Keyword::Auto),
             _ => None,

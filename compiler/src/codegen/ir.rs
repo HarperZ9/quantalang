@@ -800,9 +800,12 @@ impl MirPlace {
         }
     }
 
-    /// Add a field projection.
-    pub fn field(mut self, idx: u32, ty: MirType) -> Self {
-        self.projections.push(PlaceProjection::Field(idx, ty));
+    /// Add a field projection. Carries the field NAME as well as the ordinal
+    /// index and type. The C and Rust backends render a place lvalue by name
+    /// (`x.field`), because both emit named-field structs; LLVM GEP uses the
+    /// ordinal index.
+    pub fn field(mut self, idx: u32, name: Arc<str>, ty: MirType) -> Self {
+        self.projections.push(PlaceProjection::Field(idx, name, ty));
         self
     }
 
@@ -824,8 +827,8 @@ impl MirPlace {
 pub enum PlaceProjection {
     /// Dereference.
     Deref,
-    /// Field access.
-    Field(u32, MirType),
+    /// Field access: ordinal index, field name, and field type.
+    Field(u32, Arc<str>, MirType),
     /// Array/slice index.
     Index(LocalId),
     /// Constant index.
@@ -876,8 +879,10 @@ pub enum BinOp {
 /// Unary operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnaryOp {
-    /// Logical/bitwise not.
+    /// Logical not (boolean complement). Lowers to C `!`.
     Not,
+    /// Bitwise not (integer complement). Lowers to C `~`.
+    BitNot,
     /// Arithmetic negation.
     Neg,
 }

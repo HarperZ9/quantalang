@@ -262,7 +262,47 @@ impl<'a> Parser<'a> {
                 | TokenKind::Keyword(Keyword::SelfType)
                 | TokenKind::Keyword(Keyword::Handle)
                 | TokenKind::Keyword(Keyword::Effect)
+                | TokenKind::Keyword(Keyword::Auto)
         )
+    }
+
+    /// Check if the current token is a contextual keyword that can begin an
+    /// expression as a plain value (variable, field access, call, path).
+    ///
+    /// These keywords carry a declaration meaning only in item position
+    /// (`default impl`, `auto trait`, `module m { .. }`, `effect E { .. }`),
+    /// which the item parser consumes before an expression is ever parsed. When
+    /// one of them reaches expression parsing it is being used as an ordinary
+    /// identifier, so it routes to the same path/struct-expression parser as any
+    /// identifier. `handle`, `resume`, and `perform` are deliberately excluded:
+    /// they have their own expression forms.
+    fn is_value_context_keyword(&self) -> bool {
+        matches!(
+            self.current_kind(),
+            TokenKind::Keyword(Keyword::Default)
+                | TokenKind::Keyword(Keyword::Module)
+                | TokenKind::Keyword(Keyword::Effect)
+                | TokenKind::Keyword(Keyword::Auto)
+        )
+    }
+
+    /// If the current token is a path-root keyword (`self`, `Self`, `super`,
+    /// `crate`), consume it and return it as an `Ident` carrying the keyword's
+    /// spelling. These are legal only as the FIRST segment of a path
+    /// (`super::T`, `crate::m::f`, `self::x`, `Self::Assoc`); a later segment
+    /// still routes through `expect_ident`. Returns `None` without advancing
+    /// when the current token is not a path root, so the caller falls back to
+    /// the ordinary identifier rule.
+    fn eat_path_root_keyword(&mut self) -> Option<Ident> {
+        let name = match self.current_kind() {
+            TokenKind::Keyword(Keyword::Self_) => "self",
+            TokenKind::Keyword(Keyword::SelfType) => "Self",
+            TokenKind::Keyword(Keyword::Super) => "super",
+            TokenKind::Keyword(Keyword::Crate) => "crate",
+            _ => return None,
+        };
+        let span = self.advance().span;
+        Some(Ident::new(name, span))
     }
 
     /// Expect a lifetime.
@@ -298,7 +338,10 @@ impl<'a> Parser<'a> {
         let mut items = Vec::new();
 
         while !self.check(&TokenKind::CloseDelim(close)) && !self.is_eof() {
-            items.push(parse_elem(self)?);
+            // A `{` inside a delimited group is an unambiguous struct literal,
+            // never a block, so an enclosing scrutinee/condition restriction
+            // does not apply here.
+            items.push(self.without_struct_restriction(|p| parse_elem(p))?);
 
             if !self.eat(sep) {
                 break;
@@ -309,6 +352,21 @@ impl<'a> Parser<'a> {
         let span = open_span.merge(&close_span);
 
         Ok((items, span))
+    }
+
+    /// Parse with the `no_struct_literal` restriction cleared, then restore the
+    /// prior restrictions. Used at delimited boundaries (`( )`, `[ ]`, call
+    /// arguments) where a `{` cannot be mistaken for a block, so struct literals
+    /// are always allowed regardless of an enclosing scrutinee/condition.
+    fn without_struct_restriction<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> ParseResult<T>,
+    ) -> ParseResult<T> {
+        let saved = self.restrictions;
+        self.restrictions.no_struct_literal = false;
+        let result = f(self);
+        self.restrictions = saved;
+        result
     }
 
     /// Parse a comma-separated list in parentheses.
@@ -586,16 +644,41 @@ impl<'a> Parser<'a> {
         }
 
         loop {
-            let ident = self.expect_ident()?;
-            // In expression context, only parse generic args after turbofish `::<`.
-            // A bare `<` is ambiguous with the comparison operator.
-            let generics = if expr_context {
-                Vec::new() // Turbofish handled elsewhere in the expression parser
-            } else if self.check(&TokenKind::Lt) {
+            // A path-root keyword (`self`, `Self`, `super`, `crate`) is legal
+            // only as the first segment; every later segment is an ordinary
+            // identifier. The expression parser has its own primary-expression
+            // arms for these roots, so this path is reached from type, pattern,
+            // and use-tree contexts, where `super::T` / `crate::m::f` had been
+            // rejected by `expect_ident`.
+            let ident = if segments.is_empty() {
+                match self.eat_path_root_keyword() {
+                    Some(root) => root,
+                    None => self.expect_ident()?,
+                }
+            } else {
+                self.expect_ident()?
+            };
+            // In type context a bare `<` opens a generic argument list. In
+            // expression context a bare `<` is ambiguous with the less-than
+            // operator, so generics there come only from a turbofish `::<...>`
+            // (handled just below).
+            let mut generics = if !expr_context && self.check(&TokenKind::Lt) {
                 self.parse_generic_args()?
             } else {
                 Vec::new()
             };
+
+            // Turbofish `::<...>` binds its generics to the segment just parsed,
+            // e.g. `size_of::<i32>()` or `Vec::<u8>::new()`. Consume the `::<`
+            // here so the path loop does not then demand an identifier after the
+            // `::`, which was the cause of `expected identifier, found `<``.
+            if expr_context
+                && self.check(&TokenKind::ColonColon)
+                && self.peek().kind == TokenKind::Lt
+            {
+                self.advance(); // consume `::`
+                generics = self.parse_generic_args()?;
+            }
 
             segments.push(PathSegment::with_generics(ident, generics));
 
@@ -621,6 +704,20 @@ impl<'a> Parser<'a> {
             if self.check_lifetime() {
                 let lifetime = self.expect_lifetime()?;
                 args.push(GenericArg::Lifetime(lifetime));
+            } else if (self.check_ident() || self.is_contextual_keyword())
+                && matches!(self.peek().kind, TokenKind::Eq)
+            {
+                // Associated type binding: `Item = T` in `Iterator<Item = T>`.
+                // Inside a call-site generic argument list, `IDENT = TYPE` is
+                // only ever a binding -- no other production puts `=` after a
+                // name here -- so this never shadows a real type argument.
+                let name = self.expect_ident()?;
+                self.expect(&TokenKind::Eq)?;
+                let ty = self.parse_type()?;
+                args.push(GenericArg::AssocType {
+                    name,
+                    ty: Box::new(ty),
+                });
             } else {
                 let ty = self.parse_type()?;
                 args.push(GenericArg::Type(Box::new(ty)));

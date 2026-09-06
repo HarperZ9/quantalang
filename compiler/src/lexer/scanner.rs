@@ -1873,6 +1873,20 @@ mod tests {
     }
 
     #[test]
+    fn demoted_words_lex_as_identifiers() {
+        // `ai`, `neural`, `infer`, and `union` have no grammar production, so they
+        // are lexed as ordinary identifiers, not keywords. This keeps natural
+        // identifiers (a method `infer`, a variant `Union`, a field `ai`, a module
+        // `neural`) usable across the corpus.
+        for word in ["ai", "neural", "infer", "union"] {
+            assert!(
+                matches!(lex_one(word), TokenKind::Ident),
+                "`{word}` should lex as an identifier, not a keyword"
+            );
+        }
+    }
+
+    #[test]
     fn test_booleans() {
         assert!(matches!(
             lex_one("true"),

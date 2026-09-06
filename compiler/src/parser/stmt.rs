@@ -127,7 +127,11 @@ impl<'a> Parser<'a> {
 
     /// Parse an expression statement.
     fn parse_expr_stmt(&mut self, _attrs: Vec<Attribute>) -> ParseResult<Stmt> {
-        let expr = self.parse_expr()?;
+        // Statement position: a block-like leading expression (`if`, `match`,
+        // `{...}`, a loop, `unsafe`/`async`/`handle`) terminates at its closing
+        // brace and does not bind a trailing operator, so `if c { .. }` on one
+        // line and `*ptr = v;` on the next parse as two statements.
+        let expr = self.parse_stmt_expr()?;
         let start = expr.span;
 
         // Check if this is a block expression that doesn't need semicolon
@@ -160,6 +164,7 @@ impl<'a> Parser<'a> {
         matches!(
             expr.kind,
             ExprKind::If { .. }
+                | ExprKind::IfLet { .. }
                 | ExprKind::Match { .. }
                 | ExprKind::Loop { .. }
                 | ExprKind::While { .. }
@@ -199,6 +204,13 @@ impl<'a> Parser<'a> {
                             | TokenKind::Keyword(Keyword::Extern)
                     )
                 }
+                // `effect` starts an item only when followed by the effect
+                // name (`effect Foo { .. }`). Used as a value (`effect.run()`,
+                // or a local named `effect`), it is an expression handled by
+                // the value-context-keyword path, not an item declaration.
+                Keyword::Effect => {
+                    matches!(self.peek().kind, TokenKind::Ident | TokenKind::RawIdent)
+                }
                 _ => matches!(
                     kw,
                     Keyword::Fn
@@ -212,7 +224,6 @@ impl<'a> Parser<'a> {
                         | Keyword::Mod
                         | Keyword::Use
                         | Keyword::Extern
-                        | Keyword::Effect
                         | Keyword::Macro
                 ),
             },
@@ -287,5 +298,137 @@ mod tests {
     fn test_expr_stmt() {
         let result = parse_stmt_from_str("x + 1;");
         assert!(result.is_ok());
+    }
+
+    /// Parse a whole function body and return the parser's collected errors.
+    fn parse_fn_body_errors(body: &str) -> Vec<String> {
+        let source = LexerSourceFile::new("test.bld", format!("fn test() {{ {} }}", body));
+        let mut lexer = Lexer::new(&source);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(&source, tokens);
+        let _ = parser.parse();
+        parser.errors().iter().map(|e| e.message()).collect()
+    }
+
+    #[test]
+    fn block_like_statement_does_not_swallow_next_deref_assignment() {
+        // A block-like statement (`if`, `match`, bare block, loop, `unsafe`)
+        // is complete at its closing brace: a following line that begins with
+        // a prefix operator (`*ptr = v`, `*acc += n`, `-x`) is a SEPARATE
+        // statement, not a trailing operand of the block. Before the
+        // ExprWithBlock fix the `*` bound as multiplication continuing the
+        // block, and the later `=`/`+=` made the block the invalid left side
+        // of an assignment ("invalid left-hand side of assignment"). Each case
+        // is the shape found in the corpus (oracle/lib, nexus/diagnostics).
+        let bodies = [
+            "if sum > 0.0 { normalize(); }\n*run_length_probs = new_probs;",
+            "if a > b { record(); }\n*self.usage.entry(k).or_insert(0) += size;",
+            "match tag { A => one(), B => two() }\n*out = done;",
+            "unsafe { touch(); }\n*p = q;",
+            "{ let t = 1; use_it(t); }\n*p = q;",
+        ];
+        for body in bodies {
+            let errors = parse_fn_body_errors(body);
+            assert!(
+                errors.is_empty(),
+                "block-like statement followed by a deref-assignment should parse \
+                 as two statements, got errors for {body:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_with_block_like_right_side_still_binds() {
+        // The fix is scoped to statement position: a block-like expression on
+        // the RIGHT of `=` (value position) is unaffected and still parses as
+        // the assignment's value. This guards against a fix that stopped
+        // operator binding everywhere.
+        let errors = parse_fn_body_errors("let x = if c { 1 } else { 2 };\nuse_it(x);");
+        assert!(
+            errors.is_empty(),
+            "a block-like expression in value position must still parse, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn effect_as_value_is_not_an_item_start() {
+        // `effect` is a value-context keyword. When it names a value -- a local
+        // called `effect`, a method call on one -- a statement that starts with
+        // it must parse as an expression, not an effect declaration. These are
+        // the corpus forms (photon/post_processing, refract/system, refract/lib,
+        // wavelength/video) that reported `expected identifier, found `.`` when
+        // `effect` was treated as an unconditional item start.
+        let bodies = [
+            "effect.execute(ctx, cmd, input, out);",
+            "effect.apply(ctx);",
+            "effect.process(&mut frame);",
+            "let e = effect;",
+        ];
+        for body in bodies {
+            let errors = parse_fn_body_errors(body);
+            assert!(
+                errors.is_empty(),
+                "`effect` as a value should parse as an expression, got errors for {body:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effect_declaration_is_still_an_item_start() {
+        // The value-context change above must not stop `effect <Name> { .. }`
+        // from parsing as an effect declaration: `effect` followed by an
+        // identifier is still an item start.
+        let errors = parse_fn_body_errors("effect Logger {}");
+        assert!(
+            errors.is_empty(),
+            "`effect Name {{}}` should still parse as an effect declaration, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn if_let_block_statement_needs_no_semicolon() {
+        // A non-tail `if let { ... }` is a block-expression statement, so no
+        // trailing `;` is required -- the same as a plain `if { ... }`. A second
+        // statement follows the first, so the first is not in tail position.
+        let errors = parse_fn_body_errors(
+            "if let Some(x) = opt { use_it(x); }\n\
+             if let Some(y) = other { use_it(y); }\n\
+             done();",
+        );
+        assert!(
+            errors.is_empty(),
+            "consecutive `if let` statements should parse without a semicolon, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn plain_if_block_statement_needs_no_semicolon() {
+        // Control: the plain `if` case that already worked, guarding the shared
+        // `expr_is_complete` path against regression.
+        let errors = parse_fn_body_errors(
+            "if a { one(); }\n\
+             if b { two(); }\n\
+             done();",
+        );
+        assert!(
+            errors.is_empty(),
+            "consecutive `if` statements should parse, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn turbofish_on_path_call_parses() {
+        // `path::seg::<T>()` turbofish on a plain `::`-path (not a `.method`
+        // call and not `Self::`) was rejected with `expected identifier, found
+        // `<``, because the path loop ate the `::` and then demanded an ident.
+        let errors = parse_fn_body_errors(
+            "let n = std::mem::size_of::<i32>();\n\
+             let r = rand::random::<f32>();\n\
+             let v = Vec::<u8>::new();",
+        );
+        assert!(
+            errors.is_empty(),
+            "turbofish path calls should parse, got: {errors:?}"
+        );
     }
 }

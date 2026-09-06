@@ -175,6 +175,8 @@ pub enum GenericArg {
     Lifetime(Lifetime),
     /// A const argument.
     Const(Box<Expr>),
+    /// An associated type binding, e.g. `Item = T` in `Iterator<Item = T>`.
+    AssocType { name: Ident, ty: Box<Type> },
 }
 
 /// A lifetime like `'a` or `'static`.

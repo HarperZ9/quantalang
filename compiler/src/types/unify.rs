@@ -48,15 +48,27 @@ impl Unifier {
     }
 
     /// Unify two types, updating the substitution.
+    ///
+    /// Reference and pointer pointees unify invariantly: a concrete integer
+    /// or float width difference behind `&`, `&mut`, or `*` is a type error,
+    /// not a silent coercion. In value position, integer width coercion stays
+    /// permissive so array indexing with an i32 variable still checks.
     pub fn unify(&mut self, t1: &Ty, t2: &Ty) -> TypeResult<()> {
+        self.unify_mode(t1, t2, false)
+    }
+
+    /// Unify with an explicit variance mode. `invariant` is true when the two
+    /// types sit behind a reference or pointer, where a width coercion would
+    /// let a store or load reach the wrong number of bytes.
+    fn unify_mode(&mut self, t1: &Ty, t2: &Ty, invariant: bool) -> TypeResult<()> {
         let t1 = self.apply(t1);
         let t2 = self.apply(t2);
 
-        self.unify_impl(&t1, &t2)
+        self.unify_impl(&t1, &t2, invariant)
     }
 
     /// Internal unification implementation.
-    fn unify_impl(&mut self, t1: &Ty, t2: &Ty) -> TypeResult<()> {
+    fn unify_impl(&mut self, t1: &Ty, t2: &Ty, invariant: bool) -> TypeResult<()> {
         // If types are equal (including annotations), we're done
         if t1 == t2 {
             return Ok(());
@@ -117,24 +129,35 @@ impl Unifier {
 
             // Primitive types must be equal
             (TyKind::Int(i1), TyKind::Int(i2)) if i1 == i2 => Ok(()),
-            // Allow implicit integer width coercion (e.g. i32 <-> usize for
-            // array indexing).  A stricter implementation would only allow
-            // widening; for now we allow all integer-to-integer conversions
-            // so test programs that index arrays with i32 variables compile.
-            (TyKind::Int(_), TyKind::Int(_)) => Ok(()),
+            // Value-position integer width coercion (e.g. i32 <-> usize for
+            // array indexing) stays permissive so common programs check.
+            // Behind a reference or pointer the widths must match exactly: a
+            // differing width falls through to the mismatch error below, since
+            // an 8-byte store through a 4-byte place corrupts adjacent memory.
+            (TyKind::Int(_), TyKind::Int(_)) if !invariant => Ok(()),
             // Float-to-float coercion (f32 <-> f64) stays allowed for
             // ecosystem compatibility, exactly as before. A unit dimension
             // (`f64<m/s>`, experimental) is the one thing that still hard
             // fails here: two DIFFERENT `Some` dimensions never unify.
             // Equal dimensions, or at least one `None` (unconstrained,
             // compatible with any unit), unify same as an unannotated float.
-            (TyKind::Float(_), TyKind::Float(_)) => match (&t1.unit_dim, &t2.unit_dim) {
-                (Some(a), Some(b)) if a != b => Err(TypeError::UnitMismatch {
-                    expected: a.to_canonical_string(),
-                    found: b.to_canonical_string(),
-                }),
-                _ => Ok(()),
-            },
+            (TyKind::Float(f1), TyKind::Float(f2)) => {
+                // Behind a reference or pointer, f32 and f64 are different
+                // widths and must not coerce; fall through to the error.
+                if invariant && f1 != f2 {
+                    return Err(TypeError::TypeMismatch {
+                        expected: t1.clone(),
+                        found: t2.clone(),
+                    });
+                }
+                match (&t1.unit_dim, &t2.unit_dim) {
+                    (Some(a), Some(b)) if a != b => Err(TypeError::UnitMismatch {
+                        expected: a.to_canonical_string(),
+                        found: b.to_canonical_string(),
+                    }),
+                    _ => Ok(()),
+                }
+            }
             (TyKind::Bool, TyKind::Bool) => Ok(()),
             (TyKind::Char, TyKind::Char) => Ok(()),
             (TyKind::Str, TyKind::Str) => Ok(()),
@@ -152,20 +175,22 @@ impl Unifier {
             // Excludes Ref-vs-Ref: when both sides are references, fall through
             // to the Ref/Ref arm which checks lifetime compatibility.
             (TyKind::Ref(_, _, inner), other)
-                if !matches!(
-                    other,
-                    TyKind::Never | TyKind::Error | TyKind::Var(_) | TyKind::Ref(_, _, _)
-                ) =>
+                if !invariant
+                    && !matches!(
+                        other,
+                        TyKind::Never | TyKind::Error | TyKind::Var(_) | TyKind::Ref(_, _, _)
+                    ) =>
             {
-                self.unify_impl(inner, t2)
+                self.unify_impl(inner, t2, invariant)
             }
             (other, TyKind::Ref(_, _, inner))
-                if !matches!(
-                    other,
-                    TyKind::Never | TyKind::Error | TyKind::Var(_) | TyKind::Ref(_, _, _)
-                ) =>
+                if !invariant
+                    && !matches!(
+                        other,
+                        TyKind::Never | TyKind::Error | TyKind::Var(_) | TyKind::Ref(_, _, _)
+                    ) =>
             {
-                self.unify_impl(t1, inner)
+                self.unify_impl(t1, inner, invariant)
             }
 
             // Tuples: must have same length and unify element-wise
@@ -177,7 +202,7 @@ impl Unifier {
                     });
                 }
                 for (e1, e2) in elems1.iter().zip(elems2.iter()) {
-                    self.unify(e1, e2)?;
+                    self.unify_mode(e1, e2, invariant)?;
                 }
                 Ok(())
             }
@@ -190,16 +215,22 @@ impl Unifier {
                         found: *len2,
                     });
                 }
-                self.unify(elem1, elem2)
+                self.unify_mode(elem1, elem2, invariant)
             }
 
             // Slices: same element type
-            (TyKind::Slice(elem1), TyKind::Slice(elem2)) => self.unify(elem1, elem2),
+            (TyKind::Slice(elem1), TyKind::Slice(elem2)) => {
+                self.unify_mode(elem1, elem2, invariant)
+            }
 
             // Array-to-slice coercion: [T; N] unifies with [T]
             // This allows passing fixed-size arrays where slices are expected.
-            (TyKind::Array(elem1, _), TyKind::Slice(elem2)) => self.unify(elem1, elem2),
-            (TyKind::Slice(elem1), TyKind::Array(elem2, _)) => self.unify(elem1, elem2),
+            (TyKind::Array(elem1, _), TyKind::Slice(elem2)) => {
+                self.unify_mode(elem1, elem2, invariant)
+            }
+            (TyKind::Slice(elem1), TyKind::Array(elem2, _)) => {
+                self.unify_mode(elem1, elem2, invariant)
+            }
 
             // References: same mutability and unified pointee
             (TyKind::Ref(lt1, mut1, ty1), TyKind::Ref(lt2, mut2, ty2)) => {
@@ -221,7 +252,10 @@ impl Unifier {
                     // Elided lifetimes or matching lifetimes are acceptable
                     _ => {}
                 }
-                self.unify(ty1, ty2)
+                // A mutable or shared reference pins its pointee width: reading
+                // or writing through it moves a fixed number of bytes, so the
+                // pointee unifies invariantly.
+                self.unify_mode(ty1, ty2, true)
             }
 
             // Pointers: same mutability and unified pointee
@@ -232,7 +266,8 @@ impl Unifier {
                         found: *mut2,
                     });
                 }
-                self.unify(ty1, ty2)
+                // Same reasoning as references: the pointee width is fixed.
+                self.unify_mode(ty1, ty2, true)
             }
 
             // Functions: unify parameters and return type
@@ -262,9 +297,9 @@ impl Unifier {
                     _ => {}
                 }
                 for (p1, p2) in fn1.params.iter().zip(fn2.params.iter()) {
-                    self.unify(p1, p2)?;
+                    self.unify_mode(p1, p2, invariant)?;
                 }
-                self.unify(&fn1.ret, &fn2.ret)?;
+                self.unify_mode(&fn1.ret, &fn2.ret, invariant)?;
                 // Effect rows are part of the callable contract. Allowing an
                 // effectful function to unify with a pure function type erases
                 // the capability gate at callback and assignment boundaries.
@@ -292,7 +327,7 @@ impl Unifier {
                     });
                 }
                 for (a1, a2) in args1.iter().zip(args2.iter()) {
-                    self.unify(a1, a2)?;
+                    self.unify_mode(a1, a2, invariant)?;
                 }
                 Ok(())
             }
@@ -330,9 +365,9 @@ impl Unifier {
                         found: t2.clone(),
                     });
                 }
-                self.unify(self_ty1, self_ty2)?;
+                self.unify_mode(self_ty1, self_ty2, invariant)?;
                 for (subst1, subst2) in substs1.iter().zip(substs2.iter()) {
-                    self.unify(subst1, subst2)?;
+                    self.unify_mode(subst1, subst2, invariant)?;
                 }
                 Ok(())
             }

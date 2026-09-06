@@ -18,6 +18,13 @@ use crate::codegen::runtime;
 
 use super::{MirLowerer, OverloadTarget};
 
+/// Owned copy of a loop label for storage in `loop_stack`, or `None` for an
+/// unlabeled loop. Kept as a free helper so every loop-lowering path records the
+/// label the same way.
+fn label_name(label: Option<&ast::Ident>) -> Option<String> {
+    label.map(|l| l.as_str().to_string())
+}
+
 impl<'ctx> MirLowerer<'ctx> {
     // =========================================================================
     // BLOCK AND STATEMENT LOWERING
@@ -25,6 +32,16 @@ impl<'ctx> MirLowerer<'ctx> {
 
     pub(crate) fn lower_block(&mut self, block: &ast::Block) -> CodegenResult<Option<MirValue>> {
         let mut result = None;
+
+        // A block's value comes only from its tail statement, so only the tail
+        // should see the block's expected type. Non-tail statements are lowered
+        // with no expected-type hint, which keeps a block's declared type from
+        // leaking into an intermediate statement's literals: a function whose
+        // body is `{ let mut s = 0; for i in 0..3 { s += i } s }` must not let
+        // the `-> i64` return type widen the `0..3` loop counter. The tail hint
+        // is what threads a `-> (i64, i64)` return type into a returned tuple
+        // literal so it is built at the width its caller reads.
+        let block_expected = self.expected_type.clone();
 
         for (i, stmt) in block.stmts.iter().enumerate() {
             let is_last = i == block.stmts.len() - 1;
@@ -39,10 +56,33 @@ impl<'ctx> MirLowerer<'ctx> {
             if let Some(builder) = self.current_fn.as_mut() {
                 builder.set_current_span(stmt.span);
             }
+            self.expected_type = if is_last {
+                block_expected.clone()
+            } else {
+                None
+            };
             result = self.lower_stmt(stmt, is_last)?;
         }
 
+        // Restore the incoming hint for the caller (an empty block never
+        // touched it, but the loop above leaves it cleared otherwise).
+        self.expected_type = block_expected;
+
         Ok(result)
+    }
+
+    /// Lower a function body with the function's declared return type as the
+    /// tail expected type. This threads the return type into an implicitly
+    /// returned aggregate literal (`fn f() -> (i64, i64) { (a, b) }`) so it is
+    /// built at the width its callers read, the same way `lower_return` handles
+    /// an explicit `return`. Must be called with `self.current_fn` already set.
+    pub(crate) fn lower_fn_body(&mut self, body: &ast::Block) -> CodegenResult<Option<MirValue>> {
+        let body_expected = self.current_fn.as_ref().map(|b| b.return_type().clone());
+        let prev_expected = self.expected_type.take();
+        self.expected_type = body_expected;
+        let result = self.lower_block(body);
+        self.expected_type = prev_expected;
+        result
     }
 
     fn lower_stmt(&mut self, stmt: &ast::Stmt, is_tail: bool) -> CodegenResult<Option<MirValue>> {
@@ -490,7 +530,22 @@ impl<'ctx> MirLowerer<'ctx> {
                         ast::IntSuffix::Usize => (MirType::usize(), false),
                     })
                     .unwrap_or_else(|| {
-                        // Unsuffixed: default to i32, but widen for values that
+                        // Unsuffixed literal. Honor a scalar integer type hint
+                        // (the element type of an annotated array, or a
+                        // `let x: T = ...` annotation) when the value fits in
+                        // that width without truncation, so the literal is laid
+                        // out at the intended width. Without this, an annotated
+                        // `let a: [i64; 3] = [1, 2, 3]` lays the array out as
+                        // [i32; 3] and a later `&mut a[i]` typed `&mut i64`
+                        // stores 8 bytes into a 4-byte slot -> silent wrong
+                        // answer. The hint only fires for a scalar Int type, so
+                        // a struct or generic annotation cannot capture it.
+                        if let Some(MirType::Int(size, esigned)) = &self.expected_type {
+                            if int_literal_fits(*value, *size, *esigned) {
+                                return (MirType::Int(*size, *esigned), *esigned);
+                            }
+                        }
+                        // Otherwise default to i32, widening for values that
                         // exceed it so the literal is not silently truncated
                         // (mirrors the type checker's literal widening).
                         if *value > i64::MAX as u128 {
@@ -515,7 +570,17 @@ impl<'ctx> MirLowerer<'ctx> {
                         ast::FloatSuffix::F16 | ast::FloatSuffix::F32 => MirType::f32(),
                         ast::FloatSuffix::F64 => MirType::f64(),
                     })
-                    .unwrap_or(MirType::f64());
+                    .unwrap_or_else(|| {
+                        // Unsuffixed float: honor a scalar float type hint (an
+                        // annotated `[f32; N]` element, or `let x: f32 = ...`)
+                        // so an annotated f32 array is laid out four bytes wide
+                        // rather than defaulting to f64 and mismatching a later
+                        // `&f32` borrow. Falls back to f64.
+                        if let Some(MirType::Float(fsize)) = &self.expected_type {
+                            return MirType::Float(*fsize);
+                        }
+                        MirType::f64()
+                    });
                 Ok(MirValue::Const(MirConst::Float(*value, ty)))
             }
             Literal::Bool(b) => Ok(values::bool(*b)),
@@ -1141,7 +1206,19 @@ impl<'ctx> MirLowerer<'ctx> {
 
         let mir_op = match op {
             AstUnaryOp::Neg => UnaryOp::Neg,
-            AstUnaryOp::Not | AstUnaryOp::BitNot => UnaryOp::Not,
+            // `~` is always bitwise complement.
+            AstUnaryOp::BitNot => UnaryOp::BitNot,
+            // `!` is logical complement on bool and bitwise complement on
+            // integers (Rust semantics), so the correct C operator depends on
+            // the operand type: `!` for bool, `~` for everything else (which
+            // the type checker guarantees is an integer here).
+            AstUnaryOp::Not => {
+                if matches!(self.type_of_value(&inner_val), MirType::Bool) {
+                    UnaryOp::Not
+                } else {
+                    UnaryOp::BitNot
+                }
+            }
             AstUnaryOp::Deref => {
                 // Dereference: emit a proper deref rvalue
                 let pointee_ty = match self.type_of_value(&inner_val) {
@@ -1200,6 +1277,176 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(values::local(result))
     }
 
+    /// Build a MIR place (lvalue) for an assignable expression WITHOUT copying
+    /// the referent, returning the place and its type. Returns `None` for any
+    /// shape this does not model as an in-place location (a module global, a Vec
+    /// element, a vector swizzle, a call result), so the caller keeps its
+    /// existing value-based path. This is what lets `arr[0].x = v`, `a.b.c = v`,
+    /// and `&mut arr[i]` address the real location instead of a discarded copy.
+    fn lower_place(&mut self, expr: &ast::Expr) -> CodegenResult<Option<(MirPlace, MirType)>> {
+        match &expr.kind {
+            ExprKind::Ident(ident) => match self.var_map.get(&ident.name).copied() {
+                Some(local) => {
+                    let ty = self
+                        .current_fn
+                        .as_ref()
+                        .and_then(|b| b.local_type(local))
+                        .unwrap_or_else(MirType::i32);
+                    Ok(Some((MirPlace::local(local), ty)))
+                }
+                // A bare name with no local is a global; not an in-place location.
+                None => Ok(None),
+            },
+            ExprKind::Field { expr: base, field } => {
+                let (mut place, base_ty) = match self.lower_place(base)? {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                // Auto-deref a pointer base (`(*p).field`) to reach the struct.
+                let (struct_ty, via_ptr) = match &base_ty {
+                    MirType::Ptr(inner) => ((**inner).clone(), true),
+                    other => (other.clone(), false),
+                };
+                let MirType::Struct(name) = &struct_ty else {
+                    return Ok(None);
+                };
+                // A vector swizzle (`v.xy`) is a constructor call, not one field.
+                if let Some(max) = Self::vec_component_count(name) {
+                    if Self::is_swizzle_pattern(&field.name, max) {
+                        return Ok(None);
+                    }
+                }
+                let idx = match self.lookup_struct_field_index(name, &field.name) {
+                    Some(i) => i,
+                    None => return Ok(None),
+                };
+                let fty = self
+                    .lookup_struct_field_type(name, &field.name)
+                    .unwrap_or_else(MirType::i32);
+                if via_ptr {
+                    place = place.deref();
+                }
+                Ok(Some((
+                    place.field(idx, field.name.clone(), fty.clone()),
+                    fty,
+                )))
+            }
+            ExprKind::TupleField {
+                expr: base, index, ..
+            } => {
+                let (place, base_ty) = match self.lower_place(base)? {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                let MirType::Tuple(elems) = &base_ty else {
+                    return Ok(None);
+                };
+                let ety = elems
+                    .get(*index as usize)
+                    .cloned()
+                    .unwrap_or_else(MirType::i32);
+                let name: Arc<str> = Arc::from(format!("_{}", index));
+                Ok(Some((place.field(*index, name, ety.clone()), ety)))
+            }
+            ExprKind::Index { expr: base, index } => {
+                let (place, base_ty) = match self.lower_place(base)? {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                // Only a fixed-layout array or slice held BY VALUE indexes in
+                // place here. A Vec routes through its runtime setter, and a
+                // slice/array behind a pointer keeps the tested IndexStore ABI;
+                // both return None so the caller's existing path handles them.
+                let elem_ty = match &base_ty {
+                    MirType::Array(elem, _) | MirType::Slice(elem) => (**elem).clone(),
+                    _ => return Ok(None),
+                };
+                let idx_val = self.lower_expr(index)?;
+                let idx_local = match idx_val {
+                    MirValue::Local(id) => id,
+                    other => {
+                        let builder = self.current_fn.as_mut().unwrap();
+                        let t = builder.create_local(MirType::i32());
+                        builder.assign(t, MirRValue::Use(other));
+                        t
+                    }
+                };
+                Ok(Some((place.index(idx_local), elem_ty)))
+            }
+            ExprKind::Deref(inner) => {
+                let (place, base_ty) = match self.lower_place(inner)? {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                let MirType::Ptr(pointee) = &base_ty else {
+                    return Ok(None);
+                };
+                let pointee = (**pointee).clone();
+                Ok(Some((place.deref(), pointee)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Fold a compound-assignment operator into the value to store: `=` stores
+    /// `val` unchanged; `+=` and the rest read the current value of `target`,
+    /// apply the operator, and return the combined value. The read happens after
+    /// `val` is already lowered, matching the evaluation order every other
+    /// assignment arm uses.
+    fn compound_store_value(
+        &mut self,
+        op: ast::AssignOp,
+        target: &ast::Expr,
+        val: MirValue,
+        ty: &MirType,
+    ) -> CodegenResult<MirValue> {
+        if op == ast::AssignOp::Assign {
+            return Ok(val);
+        }
+        let bin_op = match op {
+            ast::AssignOp::AddAssign => BinOp::Add,
+            ast::AssignOp::SubAssign => BinOp::Sub,
+            ast::AssignOp::MulAssign => BinOp::Mul,
+            ast::AssignOp::DivAssign => BinOp::Div,
+            ast::AssignOp::RemAssign => BinOp::Rem,
+            ast::AssignOp::BitAndAssign => BinOp::BitAnd,
+            ast::AssignOp::BitOrAssign => BinOp::BitOr,
+            ast::AssignOp::BitXorAssign => BinOp::BitXor,
+            ast::AssignOp::ShlAssign => BinOp::Shl,
+            ast::AssignOp::ShrAssign => BinOp::Shr,
+            _ => BinOp::Add,
+        };
+        let cur = self.lower_expr(target)?;
+        let builder = self.current_fn.as_mut().unwrap();
+        let combined = builder.create_local(ty.clone());
+        builder.binary_op(combined, bin_op, cur, val);
+        Ok(values::local(combined))
+    }
+
+    /// Store a value into a projected place by taking the address of the REAL
+    /// location and writing through it: `tmp = &place; *tmp = value`. The
+    /// identity `*(&place) = v` is exactly `place = v`, and it reuses the
+    /// AddressOf + DerefAssign machinery every backend already lowers, so no new
+    /// statement kind is needed for projected stores.
+    fn store_through_place(
+        &mut self,
+        place: MirPlace,
+        place_ty: MirType,
+        value: MirRValue,
+    ) -> CodegenResult<()> {
+        let builder = self.current_fn.as_mut().unwrap();
+        let ptr = builder.create_local(MirType::Ptr(Box::new(place_ty)));
+        builder.assign(
+            ptr,
+            MirRValue::AddressOf {
+                is_mut: true,
+                place,
+            },
+        );
+        builder.push_deref_assign(ptr, value);
+        Ok(())
+    }
+
     fn lower_assign(
         &mut self,
         op: ast::AssignOp,
@@ -1208,30 +1455,126 @@ impl<'ctx> MirLowerer<'ctx> {
     ) -> CodegenResult<MirValue> {
         let val = self.lower_expr(value)?;
 
-        // Handle dereference assignment: `*ptr = value`
+        // Handle dereference assignment: `*ptr = value` and `*ptr OP= value`.
         if let ExprKind::Deref(inner) = &target.kind {
             let ptr_val = self.lower_expr(inner)?;
+            let ptr_ty = self.type_of_value(&ptr_val);
             let ptr_local = match &ptr_val {
                 MirValue::Local(id) => *id,
                 _ => {
-                    let ptr_ty = self.type_of_value(&ptr_val);
                     let builder = self.current_fn.as_mut().unwrap();
-                    let temp = builder.create_local(ptr_ty);
+                    let temp = builder.create_local(ptr_ty.clone());
                     builder.assign(temp, MirRValue::Use(ptr_val));
                     temp
                 }
             };
 
+            // A compound assignment (`*p += v`) reads the current pointee,
+            // applies the operator, then stores. Without the read-modify-write
+            // the operator and the load were both dropped and `*p += v` stored
+            // the bare `v`, a silent wrong answer with no diagnostic. The place
+            // `p` is evaluated once (above), so reading it back here does not
+            // re-run a side effect in the pointer expression.
+            let store_val = if op == ast::AssignOp::Assign {
+                MirRValue::Use(val)
+            } else {
+                let pointee_ty = match &ptr_ty {
+                    MirType::Ptr(pointee) => (**pointee).clone(),
+                    other => other.clone(),
+                };
+                let bin_op = match op {
+                    ast::AssignOp::AddAssign => BinOp::Add,
+                    ast::AssignOp::SubAssign => BinOp::Sub,
+                    ast::AssignOp::MulAssign => BinOp::Mul,
+                    ast::AssignOp::DivAssign => BinOp::Div,
+                    ast::AssignOp::RemAssign => BinOp::Rem,
+                    ast::AssignOp::BitAndAssign => BinOp::BitAnd,
+                    ast::AssignOp::BitOrAssign => BinOp::BitOr,
+                    ast::AssignOp::BitXorAssign => BinOp::BitXor,
+                    ast::AssignOp::ShlAssign => BinOp::Shl,
+                    ast::AssignOp::ShrAssign => BinOp::Shr,
+                    _ => BinOp::Add,
+                };
+                let builder = self.current_fn.as_mut().unwrap();
+                let cur = builder.create_local(pointee_ty.clone());
+                builder.assign(
+                    cur,
+                    MirRValue::Deref {
+                        ptr: values::local(ptr_local),
+                        pointee_ty: pointee_ty.clone(),
+                    },
+                );
+                let combined = builder.create_local(pointee_ty);
+                builder.binary_op(combined, bin_op, values::local(cur), val);
+                MirRValue::Use(values::local(combined))
+            };
             let builder = self.current_fn.as_mut().unwrap();
-            builder.push_deref_assign(ptr_local, MirRValue::Use(val));
+            builder.push_deref_assign(ptr_local, store_val);
             return Ok(values::unit());
         }
 
         // Handle field assignment: `obj.field = value`
         if let ExprKind::Field { expr: obj, field } = &target.kind {
+            // Fast path: the base is a plain, in-scope local (`p.x = v` /
+            // `p.x += v`). The base is already an addressable local, so
+            // FieldAssign / FieldDerefAssign writes in place. This also covers a
+            // pointer local (`p: &mut S`) through the `->` store.
+            let base_is_plain_local = matches!(
+                &obj.kind,
+                ExprKind::Ident(id) if self.var_map.contains_key(&id.name)
+            );
+            if base_is_plain_local {
+                let obj_val = self.lower_expr(obj)?;
+                let obj_ty = self.type_of_value(&obj_val);
+                let obj_local = match &obj_val {
+                    MirValue::Local(id) => *id,
+                    _ => {
+                        let builder = self.current_fn.as_mut().unwrap();
+                        let temp = builder.create_local(obj_ty.clone());
+                        builder.assign(temp, MirRValue::Use(obj_val));
+                        temp
+                    }
+                };
+                // The field type (a pointer base unwraps to its pointee) drives
+                // the type of a compound op's intermediate value.
+                let struct_ty = match &obj_ty {
+                    MirType::Ptr(inner) => (**inner).clone(),
+                    other => other.clone(),
+                };
+                let field_ty = match &struct_ty {
+                    MirType::Struct(name) => self
+                        .lookup_struct_field_type(name, &field.name)
+                        .unwrap_or_else(MirType::i32),
+                    _ => MirType::i32(),
+                };
+                let store = self.compound_store_value(op, target, val, &field_ty)?;
+                let builder = self.current_fn.as_mut().unwrap();
+                if obj_ty.is_pointer() {
+                    builder.push_field_deref_assign(
+                        obj_local,
+                        field.name.clone(),
+                        MirRValue::Use(store),
+                    );
+                } else {
+                    builder.push_field_assign(obj_local, field.name.clone(), MirRValue::Use(store));
+                }
+                return Ok(values::unit());
+            }
+
+            // General path: the base is itself a projection (`arr[0].x`,
+            // `a.b.c`). Build the real place and store through its address so the
+            // write lands in the true location instead of a discarded copy.
+            if let Some((place, place_ty)) = self.lower_place(target)? {
+                let store = self.compound_store_value(op, target, val, &place_ty)?;
+                self.store_through_place(place, place_ty, MirRValue::Use(store))?;
+                return Ok(values::unit());
+            }
+
+            // Fallback: any shape `lower_place` does not model (kept so no target
+            // silently changes behavior). This copies the base, so it cannot
+            // write through a projection; it preserves the prior semantics only.
             let obj_val = self.lower_expr(obj)?;
             let obj_ty = self.type_of_value(&obj_val);
-
             let obj_local = match &obj_val {
                 MirValue::Local(id) => *id,
                 _ => {
@@ -1241,16 +1584,74 @@ impl<'ctx> MirLowerer<'ctx> {
                     temp
                 }
             };
-
+            let builder = self.current_fn.as_mut().unwrap();
             if obj_ty.is_pointer() {
-                // Pointer-to-struct field assignment: emit ptr->field = value
-                let builder = self.current_fn.as_mut().unwrap();
                 builder.push_field_deref_assign(obj_local, field.name.clone(), MirRValue::Use(val));
             } else {
-                // Local struct field assignment: emit base.field = value
-                let builder = self.current_fn.as_mut().unwrap();
                 builder.push_field_assign(obj_local, field.name.clone(), MirRValue::Use(val));
             }
+            return Ok(values::unit());
+        }
+
+        // Handle tuple-field assignment: `t.0 = value`. Without this arm the
+        // write matched no target case and was silently dropped.
+        if let ExprKind::TupleField {
+            expr: obj, index, ..
+        } = &target.kind
+        {
+            let field_name: Arc<str> = Arc::from(format!("_{}", index));
+            // Fast path: the base is a plain local tuple (`t.0 = v` / `t.0 += v`).
+            let base_is_plain_local = matches!(
+                &obj.kind,
+                ExprKind::Ident(id) if self.var_map.contains_key(&id.name)
+            );
+            if base_is_plain_local {
+                let obj_val = self.lower_expr(obj)?;
+                let obj_ty = self.type_of_value(&obj_val);
+                let obj_local = match &obj_val {
+                    MirValue::Local(id) => *id,
+                    _ => {
+                        let builder = self.current_fn.as_mut().unwrap();
+                        let temp = builder.create_local(obj_ty.clone());
+                        builder.assign(temp, MirRValue::Use(obj_val));
+                        temp
+                    }
+                };
+                let field_ty = match &obj_ty {
+                    MirType::Tuple(elems) => elems
+                        .get(*index as usize)
+                        .cloned()
+                        .unwrap_or_else(MirType::i32),
+                    _ => MirType::i32(),
+                };
+                let store = self.compound_store_value(op, target, val, &field_ty)?;
+                let builder = self.current_fn.as_mut().unwrap();
+                builder.push_field_assign(obj_local, field_name, MirRValue::Use(store));
+                return Ok(values::unit());
+            }
+
+            // General path: the tuple is reached through a projection.
+            if let Some((place, place_ty)) = self.lower_place(target)? {
+                let store = self.compound_store_value(op, target, val, &place_ty)?;
+                self.store_through_place(place, place_ty, MirRValue::Use(store))?;
+                return Ok(values::unit());
+            }
+
+            // Fallback: materialize the base and store positionally (prior
+            // semantics; cannot write through a projection).
+            let obj_val = self.lower_expr(obj)?;
+            let obj_ty = self.type_of_value(&obj_val);
+            let obj_local = match &obj_val {
+                MirValue::Local(id) => *id,
+                _ => {
+                    let builder = self.current_fn.as_mut().unwrap();
+                    let temp = builder.create_local(obj_ty.clone());
+                    builder.assign(temp, MirRValue::Use(obj_val));
+                    temp
+                }
+            };
+            let builder = self.current_fn.as_mut().unwrap();
+            builder.push_field_assign(obj_local, field_name, MirRValue::Use(val));
             return Ok(values::unit());
         }
 
@@ -1428,6 +1829,39 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(values::unit())
     }
 
+    /// Lower call arguments, threading each declared parameter type into the
+    /// matching argument as its expected type. An aggregate literal argument (a
+    /// tuple, vec, or array literal) then adopts the parameter's element widths
+    /// instead of the i32/f64 default, the same bidirectional hint a `let`
+    /// annotation or a return type supplies. Without it, `take((7, 8))` into a
+    /// `(i64, i64)` parameter builds a `Tuple_i32_i32` the callee reads as
+    /// `Tuple_i64_i64`: a hard C type error for a tuple argument and a silent
+    /// wrong answer for a vec or array argument, whose narrow storage the callee
+    /// indexes at the wider declared width. An argument past the end of the known
+    /// parameter list, or a call whose callee is not a resolvable direct function
+    /// (`params` is `None`: a builtin, a function value, an overload the resolver
+    /// rejected), lowers with no hint.
+    fn lower_args_with_param_hints(
+        &mut self,
+        params: Option<&[MirType]>,
+        args: &[ast::Expr],
+    ) -> CodegenResult<Vec<MirValue>> {
+        let prev_expected = self.expected_type.take();
+        let mut vals = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            self.expected_type = params.and_then(|p| p.get(i)).cloned();
+            match self.lower_expr(a) {
+                Ok(v) => vals.push(v),
+                Err(e) => {
+                    self.expected_type = prev_expected;
+                    return Err(e);
+                }
+            }
+        }
+        self.expected_type = prev_expected;
+        Ok(vals)
+    }
+
     fn lower_call(&mut self, func: &ast::Expr, args: &[ast::Expr]) -> CodegenResult<MirValue> {
         // Check for enum variant construction: Shape::Circle(5.0)
         if let Some((enum_name, variant_name)) = self.try_resolve_enum_variant_path(func) {
@@ -1508,15 +1942,12 @@ impl<'ctx> MirLowerer<'ctx> {
                     args.iter().map(|a| self.infer_single_arg_type(a)).collect();
                 match self.resolve_overloaded_call_name(resolved.as_ref(), &arg_tys) {
                     Some(OverloadTarget::Concrete(mangled)) => {
-                        let ret_ty = self
-                            .module
-                            .find_function(mangled.as_ref())
-                            .map(|f| f.sig.ret.clone())
-                            .unwrap_or(MirType::i32());
-                        let arg_vals: Vec<_> = args
-                            .iter()
-                            .map(|a| self.lower_expr(a))
-                            .collect::<CodegenResult<_>>()?;
+                        let target = self.module.find_function(mangled.as_ref());
+                        let ret_ty = target.map(|f| f.sig.ret.clone()).unwrap_or(MirType::i32());
+                        let param_types: Option<Vec<MirType>> =
+                            target.map(|f| f.sig.params.clone());
+                        let arg_vals: Vec<_> =
+                            self.lower_args_with_param_hints(param_types.as_deref(), args)?;
                         let builder = self.current_fn.as_mut().ok_or_else(|| {
                             CodegenError::Internal("No current function".to_string())
                         })?;
@@ -1566,19 +1997,27 @@ impl<'ctx> MirLowerer<'ctx> {
             }
         }
 
+        // Element-generic Vec builtins (vec_push/vec_get/vec_pop) dispatch to
+        // the correctly-typed runtime helper based on the receiver vec's
+        // element type, instead of the i32 default baked into math_builtin_to_c.
+        if let Some(callee_name) = self.extract_call_name(func) {
+            if let Some(dispatched) = self.try_dispatch_vec_builtin(callee_name, args) {
+                return dispatched;
+            }
+        }
+
         // Check for math built-in functions and rewrite the call target to the
         // corresponding C / runtime function name - but only if there is no
         // user-defined function with the same name in the module.
         let func_val = if let Some(builtin_name) = self.try_resolve_math_builtin(func) {
             // Don't shadow a user-defined function with the same name.
-            // Inside inline modules, also check the prefixed name.
-            let fn_name = self.extract_call_name(func);
-            let user_defined = fn_name
-                .map(|n| {
-                    let resolved = self.resolve_fn_name(n);
-                    self.module.find_function(resolved.as_ref()).is_some()
-                })
-                .unwrap_or(false);
+            // Inside inline modules, also check the prefixed name, and resolve
+            // qualified module paths (`math_utils::dot`) to their mangled
+            // function name. Without the qualified-path case a user module
+            // function whose last segment matches a math builtin (dot, length,
+            // ...) is hijacked to the runtime builtin, which takes the wrong
+            // argument type.
+            let user_defined = self.call_resolves_to_user_fn(func);
             if user_defined {
                 self.lower_expr(func)?
             } else {
@@ -1591,10 +2030,67 @@ impl<'ctx> MirLowerer<'ctx> {
         // Try to resolve the function's return type from declared signatures
         let ret_ty = self.resolve_call_return_type(func);
 
-        let mut arg_vals: Vec<_> = args
-            .iter()
-            .map(|a| self.lower_expr(a))
-            .collect::<CodegenResult<_>>()?;
+        // Resolve the callee's declared parameter types (direct user functions
+        // only) so each argument is lowered with its parameter type as the
+        // expected type. This threads a parameter's element width into an
+        // aggregate literal argument the same way a let annotation or a return
+        // type does.
+        let param_types: Option<Vec<MirType>> = self
+            .extract_call_name(func)
+            .and_then(|name| self.module.find_function(name))
+            .map(|f| f.sig.params.clone());
+        let mut arg_vals: Vec<_> =
+            self.lower_args_with_param_hints(param_types.as_deref(), args)?;
+
+        // ---- Guard: a reference argument's pointee width must match the
+        // callee's declared parameter pointee. ----
+        // The checker unifies reference pointees invariantly (types/unify.rs),
+        // but codegen defaults an unannotated integer array or local to i32
+        // while the checker may have inferred a wider element through a later
+        // borrow. Passing such a `&mut arr[i]` (a `Ptr(i32)` here) to a
+        // parameter declared `&mut i64` (a `Ptr(i64)` in the callee) lets the
+        // callee store 8 bytes through a 4-byte slot -> silent memory
+        // corruption; a `&arr[i]` read path reads past the element. buildc
+        // cannot yet lay the storage out at the inferred width without an
+        // annotation, so it fails closed here rather than miscompiling.
+        // Annotating the element type (`let arr: [i64; N] = ...`) makes it
+        // compile through the array-literal element-type path. Only scalar
+        // int/float pointees are checked, and equal widths (the correct-width
+        // borrow) pass, so a well-typed program is never rejected.
+        if let Some(fn_name) = self.extract_call_name(func) {
+            if let Some(target_fn) = self.module.find_function(fn_name) {
+                let params = target_fn.sig.params.clone();
+                let callee = fn_name.to_string();
+                for (i, arg_val) in arg_vals.iter().enumerate() {
+                    if let Some(MirType::Ptr(param_pointee)) = params.get(i) {
+                        let arg_ty = self.type_of_value(arg_val);
+                        if let MirType::Ptr(arg_pointee) = &arg_ty {
+                            if let (Some((pw, pc)), Some((aw, ac))) = (
+                                scalar_pointee_shape(param_pointee),
+                                scalar_pointee_shape(arg_pointee),
+                            ) {
+                                if pw != aw || pc != ac {
+                                    return Err(CodegenError::TypeError(format!(
+                                        "argument {n} to `{callee}` is a {aw}-byte {ac} \
+                                         reference but the parameter is declared as a {pw}-byte \
+                                         {pc} reference. This happens when an array or variable's \
+                                         element type is inferred through a later borrow while its \
+                                         storage width is left unannotated. Add a type annotation \
+                                         (for example `let x: [i64; N] = ...`) so the storage \
+                                         matches the borrow.",
+                                        n = i + 1,
+                                        aw = aw,
+                                        ac = ac.name(),
+                                        pw = pw,
+                                        pc = pc.name(),
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // ---- Coerce BuildString args to raw char* for FFI calls ----
         // When calling an extern "C" function that expects `const char*`
@@ -1721,6 +2217,43 @@ impl<'ctx> MirLowerer<'ctx> {
         }
     }
 
+    /// True when this call target resolves to a user-defined function in the
+    /// current module, so a same-named math builtin must not shadow it. Handles
+    /// bare names (via the module-prefix-aware `resolve_fn_name`) and qualified
+    /// module paths like `math_utils::dot`, which the module loader mangles to
+    /// `math_utils_dot`. `extract_call_name` returns `None` for a multi-segment
+    /// path, so the joined name is resolved here directly.
+    fn call_resolves_to_user_fn(&self, func: &ast::Expr) -> bool {
+        // Bare name or single-segment path.
+        if let Some(name) = self.extract_call_name(func) {
+            let resolved = self.resolve_fn_name(name);
+            return self.module.find_function(resolved.as_ref()).is_some();
+        }
+        // Qualified path: join segments with `_` to match the module loader's
+        // mangling, and also try the module-prefixed form for calls made from
+        // inside another inline module.
+        if let ExprKind::Path(path) = &func.kind {
+            if path.segments.len() > 1 {
+                let joined: String = path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.name.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("_");
+                if self.module.find_function(joined.as_str()).is_some() {
+                    return true;
+                }
+                if !self.module_prefix.is_empty() {
+                    let prefixed = self.prefixed_name(&Arc::from(joined.as_str()));
+                    if self.module.find_function(prefixed.as_ref()).is_some() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// If `func` resolves to a recognised math built-in (abs, sqrt, pow, ...),
     /// return the C function name to call instead.
     fn try_resolve_math_builtin(&self, func: &ast::Expr) -> Option<&'static str> {
@@ -1774,6 +2307,110 @@ impl<'ctx> MirLowerer<'ctx> {
             "build_vec3" => Some(3),
             "build_vec4" => Some(4),
             _ => None,
+        }
+    }
+
+    /// Dispatch the element-generic Vec builtins (`vec_push`, `vec_get`,
+    /// `vec_pop`) to the correctly-typed runtime helper, keyed by the receiver
+    /// vec's element type. Without this the generic names always resolved to the
+    /// i32 helpers (`build_hvec_push_i32`, ...) via `math_builtin_to_c`, which
+    /// truncated i64 elements to 32 bits, read f64/str vecs through the wrong
+    /// accessor, and emitted a C type error for string elements. This mirrors
+    /// the element-typed dispatch already used for the `v.push()`/`v.get()`
+    /// method forms. The explicitly-typed names (`vec_push_i64`, `vec_get_str`,
+    /// ...) are untouched; they still resolve through `math_builtin_to_c`.
+    ///
+    /// Returns `None` (deferring to normal handling) when the callee is not one
+    /// of these builtins, when a user-defined function shadows the name, or when
+    /// the first argument is not a `Vec` (which the type checker rejects for a
+    /// real call, so that path is effectively unreachable for valid programs).
+    fn try_dispatch_vec_builtin(
+        &mut self,
+        name: &str,
+        args: &[ast::Expr],
+    ) -> Option<CodegenResult<MirValue>> {
+        let op = match name {
+            "vec_push" | "vec_get" | "vec_pop" => name,
+            _ => return None,
+        };
+        if args.is_empty() {
+            return None;
+        }
+        // Don't shadow a user-defined function of the same name.
+        let resolved = self.resolve_fn_name(name);
+        if self.module.find_function(resolved.as_ref()).is_some() {
+            return None;
+        }
+
+        // Lower the receiver (first arg) and read its element type.
+        let recv_val = match self.lower_expr(&args[0]) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        let recv_ty = self.type_of_value(&recv_val);
+        let elem_ty = match &recv_ty {
+            MirType::Vec(elem) => (**elem).clone(),
+            _ => return None,
+        };
+        // Same element -> suffix mapping the method-call path uses, so the two
+        // call forms stay in lockstep for every element type.
+        let suffix: String = match &elem_ty {
+            MirType::Float(_) => "f64".to_string(),
+            MirType::Int(IntSize::I64, _) => "i64".to_string(),
+            MirType::Struct(n) if n.as_ref() == "BuildString" => "str".to_string(),
+            MirType::Struct(n) => n.to_string(),
+            MirType::Vec(_) => "BuildVecHandle".to_string(),
+            MirType::Map(_, _) => "BuildMapHandle".to_string(),
+            MirType::Int(_, _) | MirType::Bool => "i32".to_string(),
+            // A tuple or array element has no handle representation and no
+            // backend wrapper; fail closed rather than route it to the i32
+            // helper, whose `int32_t` parameter cannot store it (an array would
+            // decay to a truncated pointer, a tuple leak a raw C type error).
+            _ => {
+                return Some(Err(CodegenError::Unsupported(format!(
+                    "a vector of `{elem_ty}` elements is not supported yet: the Vec \
+                     runtime stores scalar (integer, float, bool, char), string, \
+                     struct, nested-vector, and map elements, not a tuple or array \
+                     element"
+                ))))
+            }
+        };
+
+        // Lower the remaining args (push value / get index).
+        let mut arg_vals = vec![recv_val];
+        for a in &args[1..] {
+            match self.lower_expr(a) {
+                Ok(v) => arg_vals.push(v),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        let (c_fn, ret_ty): (String, MirType) = match op {
+            "vec_push" => (format!("build_hvec_push_{}", suffix), MirType::Void),
+            "vec_get" => (format!("build_hvec_get_{}", suffix), elem_ty.clone()),
+            "vec_pop" => (format!("build_hvec_pop_{}", suffix), elem_ty.clone()),
+            _ => unreachable!(),
+        };
+
+        let builder = match self.current_fn.as_mut() {
+            Some(b) => b,
+            None => {
+                return Some(Err(CodegenError::Internal(
+                    "No current function".to_string(),
+                )))
+            }
+        };
+        let cont = builder.create_block();
+        let func_val = MirValue::Function(Arc::from(c_fn.as_str()));
+        if matches!(ret_ty, MirType::Void) {
+            builder.call(func_val, arg_vals, None, cont);
+            builder.switch_to_block(cont);
+            Some(Ok(values::unit()))
+        } else {
+            let result = builder.create_local(ret_ty);
+            builder.call(func_val, arg_vals, Some(result), cont);
+            builder.switch_to_block(cont);
+            Some(Ok(values::local(result)))
         }
     }
 
@@ -3280,7 +3917,19 @@ impl<'ctx> MirLowerer<'ctx> {
                 // element is a handle struct; key the sized wrapper by its C type.
                 MirType::Vec(_) => "BuildVecHandle".to_string(),
                 MirType::Map(_, _) => "BuildMapHandle".to_string(),
-                _ => "i32".to_string(),
+                MirType::Int(_, _) | MirType::Bool => "i32".to_string(),
+                // A tuple or array element has no handle representation and no
+                // backend wrapper; every vec method on it fails closed with one
+                // diagnostic rather than routing element access to the i32
+                // helper, whose `int32_t` parameter cannot store it.
+                _ => {
+                    return Err(CodegenError::Unsupported(format!(
+                        "a vector of `{elem_ty}` elements is not supported yet: the Vec \
+                         runtime stores scalar (integer, float, bool, char), string, \
+                         struct, nested-vector, and map elements, not a tuple or array \
+                         element"
+                    )))
+                }
             };
 
             let (runtime_fn, ret_ty): (Option<String>, MirType) = match method_name {
@@ -4098,6 +4747,14 @@ impl<'ctx> MirLowerer<'ctx> {
                 return ty.clone();
             }
         }
+        // A user-defined `enum Result { Ok(T), Err(E) }` carries the real payload
+        // types; read Ok's field directly so a matched local whose annotation and
+        // callee are both unavailable is not silently defaulted to the wrong slot.
+        if let Some((_, fields)) = self.lookup_enum_variant("Result", "Ok") {
+            if let Some((_, ty)) = fields.first() {
+                return ty.clone();
+            }
+        }
         MirType::i32()
     }
 
@@ -4147,6 +4804,14 @@ impl<'ctx> MirLowerer<'ctx> {
                 return ty.clone();
             }
         }
+        // A user-defined `enum Result { Ok(T), Err(E) }` carries the real Err
+        // payload type; read it directly so a scalar-error match (e.g. `Err(i32)`)
+        // reads the `err_i` slot instead of dereferencing it as a boxed String.
+        if let Some((_, fields)) = self.lookup_enum_variant("Result", "Err") {
+            if let Some((_, ty)) = fields.first() {
+                return ty.clone();
+            }
+        }
         MirType::Struct(Arc::from("BuildString"))
     }
 
@@ -4172,6 +4837,30 @@ impl<'ctx> MirLowerer<'ctx> {
             }
         }
         None
+    }
+
+    /// True when an arm has no guard and its pattern matches every value, so
+    /// the match is exhaustive by that arm alone.  Mirrors the type checker's
+    /// `pattern_is_irrefutable`; used to decide whether a scalar match needs a
+    /// fail-closed no-match backstop in codegen.
+    fn arm_is_unguarded_catch_all(arm: &ast::MatchArm) -> bool {
+        arm.guard.is_none() && Self::pattern_is_irrefutable(&arm.pattern)
+    }
+
+    fn pattern_is_irrefutable(pat: &ast::Pattern) -> bool {
+        match &pat.kind {
+            ast::PatternKind::Wildcard => true,
+            ast::PatternKind::Ident {
+                subpattern: None, ..
+            } => true,
+            ast::PatternKind::Ident {
+                subpattern: Some(inner),
+                ..
+            }
+            | ast::PatternKind::Paren(inner) => Self::pattern_is_irrefutable(inner),
+            ast::PatternKind::Or(alts) => alts.iter().any(Self::pattern_is_irrefutable),
+            _ => false,
+        }
     }
 
     fn lower_match(
@@ -4276,6 +4965,30 @@ impl<'ctx> MirLowerer<'ctx> {
 
         let merge_block = builder.create_block();
 
+        // Fail-closed backstop for scalar (non-enum) matches that have no
+        // irrefutable catch-all arm.  The type checker rejects provably
+        // non-exhaustive scalar matches at compile time, but a scrutinee whose
+        // concrete integer type is pinned only by later global constraint
+        // solving (`let n = v[i]; match n { 0 => .. }`), or an int match made
+        // exhaustive only by a range the checker does not range-analyse, can
+        // reach codegen without full coverage.  Without a backstop the no-match
+        // path falls through to `merge_block` and reads an uninitialised result
+        // -- a silent wrong answer.  Route that path to a block that calls
+        // `bl_match_fail` (stderr + exit 101) instead.  Enum matches keep their
+        // existing behaviour: the checker catches them reliably via pattern-path
+        // variant recovery.  When the match is in fact exhaustive (a bool over
+        // both literals, an int with a wildcard) the backstop block is emitted
+        // but never reached; that dead block is the cost of a uniform, provably
+        // fail-closed no-match path.
+        let has_unguarded_catch_all = arms.iter().any(Self::arm_is_unguarded_catch_all);
+        let needs_match_backstop = !is_enum_match && !has_unguarded_catch_all;
+        let no_match_block = if needs_match_backstop {
+            Some(builder.create_block())
+        } else {
+            None
+        };
+        let final_fallthrough = no_match_block.unwrap_or(merge_block);
+
         // Pre-create one body block per arm, plus test blocks and optional
         // guard blocks.
         let mut arm_body_blocks: Vec<BlockId> = Vec::with_capacity(arms.len());
@@ -4292,7 +5005,11 @@ impl<'ctx> MirLowerer<'ctx> {
 
             let is_wildcard_or_binding = matches!(
                 arm.pattern.kind,
-                ast::PatternKind::Wildcard | ast::PatternKind::Ident { .. }
+                ast::PatternKind::Wildcard
+                    | ast::PatternKind::Ident {
+                        subpattern: None,
+                        ..
+                    }
             );
             // A wildcard/binding arm still needs a test block if it has a
             // guard clause, because the guard may fail.
@@ -4338,8 +5055,21 @@ impl<'ctx> MirLowerer<'ctx> {
             } else {
                 ret
             }
-        } else {
+        } else if matches!(scrutinee_ty, MirType::Int(..)) {
+            // Integer scrutinee with scalar (i32-inferred) arms: the arms
+            // share the scrutinee's integer domain, so keep the scrutinee
+            // width (`match x: i64 { _ => 0 }` yields i64, not i32).
             scrutinee_ty.clone()
+        } else {
+            // Non-integer scrutinee (bool, float, tuple, struct, array) with
+            // scalar arms: the result is the scalar, not the scrutinee.  A
+            // bool scrutinee here previously typed the result `bool`, so
+            // `match b { true => 42, false => 7 }` stored 42 into a `_Bool`
+            // and printed `true` -- a silent wrong answer.  Taking an
+            // aggregate type here emits C that assigns an int to an aggregate
+            // local.  Genuine bool/aggregate arms infer their own type above
+            // and never reach this branch.
+            MirType::i32()
         };
 
         let result = {
@@ -4355,7 +5085,9 @@ impl<'ctx> MirLowerer<'ctx> {
             } else if let Some(&body_blk) = arm_body_blocks.first() {
                 builder.goto(body_blk);
             } else {
-                builder.goto(merge_block);
+                // No arms at all: route the unmatched entry to the backstop
+                // (or merge_block when no backstop was created).
+                builder.goto(final_fallthrough);
             }
         }
 
@@ -4363,11 +5095,13 @@ impl<'ctx> MirLowerer<'ctx> {
         for (i, arm) in arms.iter().enumerate() {
             let body_block = arm_body_blocks[i];
 
-            // Compute the fall-through target (next arm's test, body, or merge).
+            // Compute the fall-through target (next arm's test, body, or the
+            // final fall-through -- merge_block, or the no-match backstop when
+            // this scalar match has no irrefutable catch-all arm).
             let next_target = if i + 1 < arms.len() {
                 arm_test_blocks[i + 1].unwrap_or(arm_body_blocks[i + 1])
             } else {
-                merge_block
+                final_fallthrough
             };
 
             // --- Test block (if there is one) ---
@@ -4380,7 +5114,11 @@ impl<'ctx> MirLowerer<'ctx> {
                 // Generate the comparison based on pattern kind.
                 let is_wildcard_or_binding = matches!(
                     arm.pattern.kind,
-                    ast::PatternKind::Wildcard | ast::PatternKind::Ident { .. }
+                    ast::PatternKind::Wildcard
+                        | ast::PatternKind::Ident {
+                            subpattern: None,
+                            ..
+                        }
                 );
 
                 let cond_val = if is_wildcard_or_binding {
@@ -4421,6 +5159,14 @@ impl<'ctx> MirLowerer<'ctx> {
                     // Bind record-pattern fields before the guard so a guard
                     // expression can reference them (`Point { x } if x < 0`).
                     self.bind_struct_pattern_vars(&arm.pattern, scrutinee_local, &scrutinee_ty)?;
+                } else if matches!(&arm.pattern.kind, ast::PatternKind::Tuple(_)) {
+                    // Bind tuple-pattern elements before the guard so a guard
+                    // expression can reference them (`(a, b) if a < b`).
+                    self.bind_tuple_pattern_vars(
+                        &arm.pattern,
+                        values::local(scrutinee_local),
+                        &scrutinee_ty,
+                    )?;
                 }
 
                 let guard_expr = arm.guard.as_ref().unwrap();
@@ -4480,6 +5226,17 @@ impl<'ctx> MirLowerer<'ctx> {
                     // (Non-enum struct match; enum struct-variants go through
                     // `bind_enum_pattern_vars` above.)
                     self.bind_struct_pattern_vars(&arm.pattern, scrutinee_local, &scrutinee_ty)?;
+                } else if matches!(&arm.pattern.kind, ast::PatternKind::Tuple(_)) {
+                    // Tuple pattern `(a, b)` / `((a, b), c)`: bind each element
+                    // by projecting `_i` from the scrutinee tuple.  A refutable
+                    // element (a literal) has already been tested by
+                    // `lower_pattern_test`; binding only walks the irrefutable
+                    // sub-patterns.
+                    self.bind_tuple_pattern_vars(
+                        &arm.pattern,
+                        values::local(scrutinee_local),
+                        &scrutinee_ty,
+                    )?;
                 }
             }
 
@@ -4492,6 +5249,19 @@ impl<'ctx> MirLowerer<'ctx> {
                 builder.assign(result, MirRValue::Use(body_val));
             }
             builder.goto(merge_block);
+        }
+
+        // Emit the no-match backstop: call `bl_match_fail` (which exits 101)
+        // then nominally continue to merge_block so the terminator has a
+        // successor.  The call never returns, so the merge edge is dead.
+        if let Some(nm) = no_match_block {
+            let builder = self.current_fn.as_mut().unwrap();
+            builder.switch_to_block(nm);
+            builder.call_void(
+                MirValue::Function(Arc::from("bl_match_fail")),
+                vec![],
+                merge_block,
+            );
         }
 
         let builder = self.current_fn.as_mut().unwrap();
@@ -4597,9 +5367,45 @@ impl<'ctx> MirLowerer<'ctx> {
             }
 
             ast::PatternKind::Wildcard => Ok(values::bool(true)),
-            ast::PatternKind::Ident { .. } => Ok(values::bool(true)),
 
-            _ => Ok(values::bool(true)),
+            // A bare binding always matches; an `x @ subpat` binding matches
+            // only when the subpattern matches, so test the subpattern.
+            ast::PatternKind::Ident { subpattern, .. } => match subpattern {
+                None => Ok(values::bool(true)),
+                Some(sub) => self.lower_enum_pattern_test(sub, scrutinee_local, scrutinee_ty),
+            },
+
+            // Or-pattern over enum variants (`A | B`): match when any
+            // alternative matches. Without this arm the pattern fell through
+            // the old catch-all to an unconditional match, so the first arm
+            // shadowed every later arm (a silent wrong answer).
+            ast::PatternKind::Or(pats) if !pats.is_empty() => {
+                let mut current =
+                    self.lower_enum_pattern_test(&pats[0], scrutinee_local, scrutinee_ty)?;
+                for pat in &pats[1..] {
+                    let rhs = self.lower_enum_pattern_test(pat, scrutinee_local, scrutinee_ty)?;
+                    let builder = self.current_fn.as_mut().unwrap();
+                    let combined = builder.create_local(MirType::Bool);
+                    builder.binary_op(combined, BinOp::BitOr, current, rhs);
+                    current = values::local(combined);
+                }
+                Ok(current)
+            }
+
+            // Parenthesized pattern is transparent.
+            ast::PatternKind::Paren(inner) => {
+                self.lower_enum_pattern_test(inner, scrutinee_local, scrutinee_ty)
+            }
+
+            // Any other pattern kind against an enum scrutinee cannot be tested
+            // here. Fail closed rather than matching unconditionally, which
+            // would let this arm shadow every later arm.
+            _ => Err(CodegenError::Unsupported(format!(
+                "unsupported pattern in a match on enum `{}`; only variant \
+                 patterns, `_`, bindings, `|`-alternatives, and parentheses \
+                 are supported",
+                enum_name
+            ))),
         }
     }
 
@@ -4759,6 +5565,83 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(())
     }
 
+    /// Bind the variables of a tuple pattern by projecting each element `_i`
+    /// of the scrutinee tuple and binding the matching sub-pattern.  Recurses
+    /// into nested tuples so `((a, b), c)` binds `a`, `b`, and `c`.  Literal
+    /// and wildcard elements bind nothing.  A non-tuple scrutinee type or an
+    /// arity mismatch binds nothing (the refutability test has already gated
+    /// those before control reaches a body block).
+    fn bind_tuple_pattern_vars(
+        &mut self,
+        pattern: &ast::Pattern,
+        scrutinee_val: MirValue,
+        scrutinee_ty: &MirType,
+    ) -> CodegenResult<()> {
+        let ast::PatternKind::Tuple(patterns) = &pattern.kind else {
+            return Ok(());
+        };
+        let elem_tys: Vec<MirType> = match scrutinee_ty {
+            MirType::Tuple(tys) => tys.clone(),
+            _ => return Ok(()),
+        };
+        if patterns.len() != elem_tys.len() {
+            return Ok(());
+        }
+        for (i, pat) in patterns.iter().enumerate() {
+            let elem_ty = elem_tys[i].clone();
+            let field_name: Arc<str> = Arc::from(format!("_{}", i));
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+            let elem_local = builder.create_local(elem_ty.clone());
+            builder.assign(
+                elem_local,
+                MirRValue::FieldAccess {
+                    base: scrutinee_val.clone(),
+                    field_name,
+                    field_ty: elem_ty.clone(),
+                },
+            );
+            self.bind_subpattern_vars(pat, values::local(elem_local), &elem_ty)?;
+        }
+        Ok(())
+    }
+
+    /// Bind the variables of one sub-pattern against an already-projected
+    /// value.  Handles identifier bindings (including `x @ pat` and skipping
+    /// `_`), nested tuples, and transparent parentheses; other kinds bind
+    /// nothing.
+    fn bind_subpattern_vars(
+        &mut self,
+        pattern: &ast::Pattern,
+        value: MirValue,
+        value_ty: &MirType,
+    ) -> CodegenResult<()> {
+        match &pattern.kind {
+            ast::PatternKind::Ident {
+                name, subpattern, ..
+            } => {
+                if name.name.as_ref() != "_" {
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                    let local = builder.create_named_local(name.name.clone(), value_ty.clone());
+                    builder.assign(local, MirRValue::Use(value.clone()));
+                    self.var_map.insert(name.name.clone(), local);
+                }
+                if let Some(sub) = subpattern {
+                    self.bind_subpattern_vars(sub, value, value_ty)?;
+                }
+                Ok(())
+            }
+            ast::PatternKind::Tuple(_) => self.bind_tuple_pattern_vars(pattern, value, value_ty),
+            ast::PatternKind::Paren(inner) => self.bind_subpattern_vars(inner, value, value_ty),
+            _ => Ok(()),
+        }
+    }
+
     /// Generate a boolean MIR value that is true when `scrutinee_val` matches
     /// `pattern`.  Supports literal, wildcard, and simple variable patterns.
     fn lower_pattern_test(
@@ -4770,8 +5653,14 @@ impl<'ctx> MirLowerer<'ctx> {
             // Wildcard always matches.
             ast::PatternKind::Wildcard => Ok(values::bool(true)),
 
-            // Variable binding always matches (binding happens in the caller).
-            ast::PatternKind::Ident { .. } => Ok(values::bool(true)),
+            // A bare binding always matches; an `x @ subpat` binding matches
+            // only when the subpattern matches. Testing the subpattern is
+            // required, since an `@`-binding is otherwise refutable
+            // (`n @ 1..=5` must reject 100). Binding happens in the caller.
+            ast::PatternKind::Ident { subpattern, .. } => match subpattern {
+                None => Ok(values::bool(true)),
+                Some(sub) => self.lower_pattern_test(sub, scrutinee_val),
+            },
 
             // Literal patterns: emit scrutinee == literal.
             ast::PatternKind::Literal(lit) => {
@@ -4812,52 +5701,199 @@ impl<'ctx> MirLowerer<'ctx> {
                 Ok(values::local(cmp))
             }
 
-            // Unsupported pattern kinds fall through to "always matches" to
-            // avoid panicking.  A real implementation would need full pattern
-            // compilation here.
-            // Range pattern: lo..=hi → scrutinee >= lo && scrutinee <= hi
+            // Range pattern: `lo..=hi` → scrutinee >= lo && scrutinee <= hi.
+            // An open end has no bound on that side, so its comparison is
+            // omitted rather than synthesized from an `i32` sentinel: an
+            // `i32::MAX` upper bound wrongly rejects an `i64` scrutinee above
+            // 2^31, and an `i32::MIN` lower bound wrongly rejects one below
+            // -2^31. `lo..` tests only the lower bound, `..hi` only the upper,
+            // and a fully open `..` matches anything.
             ast::PatternKind::Range {
                 start,
                 end,
                 inclusive,
             } => {
-                let lo_val = if let Some(lo_expr) = start {
-                    self.lower_expr(lo_expr)?
-                } else {
-                    values::i32(i32::MIN)
+                let lo_val = match start {
+                    Some(lo_expr) => Some(self.lower_expr(lo_expr)?),
+                    None => None,
                 };
-                let hi_val = if let Some(hi_expr) = end {
-                    self.lower_expr(hi_expr)?
-                } else {
-                    values::i32(i32::MAX)
+                let hi_val = match end {
+                    Some(hi_expr) => Some(self.lower_expr(hi_expr)?),
+                    None => None,
                 };
 
-                let builder = self
-                    .current_fn
-                    .as_mut()
-                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                let ge = match lo_val {
+                    Some(lo) => {
+                        let builder = self.current_fn.as_mut().ok_or_else(|| {
+                            CodegenError::Internal("No current function".to_string())
+                        })?;
+                        let ge = builder.create_local(MirType::Bool);
+                        builder.binary_op(ge, BinOp::Ge, scrutinee_val.clone(), lo);
+                        Some(values::local(ge))
+                    }
+                    None => None,
+                };
 
-                let ge = builder.create_local(MirType::Bool);
-                builder.binary_op(ge, BinOp::Ge, scrutinee_val.clone(), lo_val);
+                let le = match hi_val {
+                    Some(hi) => {
+                        let le_op = if *inclusive { BinOp::Le } else { BinOp::Lt };
+                        let builder = self.current_fn.as_mut().ok_or_else(|| {
+                            CodegenError::Internal("No current function".to_string())
+                        })?;
+                        let le = builder.create_local(MirType::Bool);
+                        builder.binary_op(le, le_op, scrutinee_val, hi);
+                        Some(values::local(le))
+                    }
+                    None => None,
+                };
 
-                let le_op = if *inclusive { BinOp::Le } else { BinOp::Lt };
-                let le = builder.create_local(MirType::Bool);
-                builder.binary_op(le, le_op, scrutinee_val, hi_val);
-
-                let result = builder.create_local(MirType::Bool);
-                builder.binary_op(result, BinOp::BitAnd, values::local(ge), values::local(le));
-
-                Ok(values::local(result))
+                match (ge, le) {
+                    (Some(ge), Some(le)) => {
+                        let builder = self.current_fn.as_mut().unwrap();
+                        let result = builder.create_local(MirType::Bool);
+                        builder.binary_op(result, BinOp::BitAnd, ge, le);
+                        Ok(values::local(result))
+                    }
+                    (Some(only), None) | (None, Some(only)) => Ok(only),
+                    (None, None) => Ok(values::bool(true)),
+                }
             }
 
-            _ => Ok(values::bool(true)),
+            // Tuple pattern: project each element `_i` of the scrutinee and
+            // recursively test the matching sub-pattern, ANDing the results.
+            // A tuple of only bindings/wildcards is irrefutable, so this
+            // naturally yields `true`.  A shape it cannot project (a rest
+            // element, an arity mismatch, or a non-tuple scrutinee) fails
+            // closed rather than silently matching.
+            ast::PatternKind::Tuple(patterns) => {
+                let scrut_ty = self.type_of_value(&scrutinee_val);
+                let elem_tys: Vec<MirType> = match &scrut_ty {
+                    MirType::Tuple(tys) => tys.clone(),
+                    _ => {
+                        return Err(CodegenError::Unsupported(format!(
+                            "tuple pattern tested against non-tuple scrutinee of type {:?}",
+                            scrut_ty
+                        )));
+                    }
+                };
+                if patterns.len() != elem_tys.len() {
+                    return Err(CodegenError::Unsupported(format!(
+                        "tuple pattern with {} elements cannot match a {}-tuple scrutinee",
+                        patterns.len(),
+                        elem_tys.len()
+                    )));
+                }
+                let mut acc: Option<MirValue> = None;
+                for (i, pat) in patterns.iter().enumerate() {
+                    let elem_ty = elem_tys[i].clone();
+                    let field_name: Arc<str> = Arc::from(format!("_{}", i));
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                    let elem_local = builder.create_local(elem_ty.clone());
+                    builder.assign(
+                        elem_local,
+                        MirRValue::FieldAccess {
+                            base: scrutinee_val.clone(),
+                            field_name,
+                            field_ty: elem_ty,
+                        },
+                    );
+                    let sub = self.lower_pattern_test(pat, values::local(elem_local))?;
+                    acc = Some(match acc {
+                        None => sub,
+                        Some(prev) => {
+                            let builder = self.current_fn.as_mut().unwrap();
+                            let combined = builder.create_local(MirType::Bool);
+                            builder.binary_op(combined, BinOp::BitAnd, prev, sub);
+                            values::local(combined)
+                        }
+                    });
+                }
+                Ok(acc.unwrap_or_else(|| values::bool(true)))
+            }
+
+            // Parenthesized pattern: transparent — test the inner pattern.
+            ast::PatternKind::Paren(inner) => self.lower_pattern_test(inner, scrutinee_val),
+
+            // Struct (record) pattern in a non-enum match.  When every field
+            // sub-pattern is irrefutable (a binding or wildcard) the pattern
+            // always matches structurally, so the test is `true` and the field
+            // binding happens in the caller.  A refutable field sub-pattern
+            // (`Point { x: 0 }`) is not yet compiled here, so it fails closed
+            // rather than silently matching.
+            ast::PatternKind::Struct { fields, .. } => {
+                if fields.iter().all(|f| f.pattern.is_irrefutable()) {
+                    Ok(values::bool(true))
+                } else {
+                    Err(CodegenError::Unsupported(
+                        "struct pattern with a refutable field sub-pattern is not yet \
+                         supported in match; use a guard clause instead"
+                            .to_string(),
+                    ))
+                }
+            }
+
+            // Tuple-struct/newtype pattern in a non-enum match.  Irrefutable
+            // when every inner pattern is a binding or wildcard; a refutable
+            // inner pattern fails closed.
+            ast::PatternKind::TupleStruct { patterns, .. } => {
+                if patterns.iter().all(|p| p.is_irrefutable()) {
+                    Ok(values::bool(true))
+                } else {
+                    Err(CodegenError::Unsupported(
+                        "tuple-struct pattern with a refutable field is not yet supported \
+                         in match; use a guard clause instead"
+                            .to_string(),
+                    ))
+                }
+            }
+
+            // Reference/box patterns are transparent only when the inner
+            // pattern is irrefutable.  Testing a refutable inner pattern needs
+            // a deref that is not emitted here, so it fails closed.
+            ast::PatternKind::Ref { pattern: inner, .. } | ast::PatternKind::Box(inner) => {
+                if inner.is_irrefutable() {
+                    Ok(values::bool(true))
+                } else {
+                    Err(CodegenError::Unsupported(
+                        "reference/box pattern with a refutable inner pattern is not yet \
+                         supported in match"
+                            .to_string(),
+                    ))
+                }
+            }
+
+            // Slice patterns need length and element tests that are not yet
+            // compiled here; fail closed rather than silently always match.
+            ast::PatternKind::Slice(_) => Err(CodegenError::Unsupported(
+                "slice pattern is not yet supported in match; it would otherwise \
+                 silently always match"
+                    .to_string(),
+            )),
+
+            // Any remaining pattern kind: an irrefutable one always matches; a
+            // refutable one fails closed so the compiler never silently treats
+            // a non-match as a match.
+            _ => {
+                if pattern.is_irrefutable() {
+                    Ok(values::bool(true))
+                } else {
+                    Err(CodegenError::Unsupported(
+                        "this refutable pattern kind is not yet supported in match; it \
+                         would otherwise silently always match"
+                            .to_string(),
+                    ))
+                }
+            }
         }
     }
 
     fn lower_loop(
         &mut self,
         body: &ast::Block,
-        _label: Option<&ast::Ident>,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         let builder = self
             .current_fn
@@ -4867,7 +5903,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let loop_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((loop_block, exit_block));
+        self.loop_stack
+            .push((loop_block, exit_block, label_name(label)));
 
         builder.goto(loop_block);
         builder.switch_to_block(loop_block);
@@ -4892,7 +5929,7 @@ impl<'ctx> MirLowerer<'ctx> {
         &mut self,
         condition: &ast::Expr,
         body: &ast::Block,
-        _label: Option<&ast::Ident>,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         let builder = self
             .current_fn
@@ -4903,7 +5940,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let body_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((cond_block, exit_block));
+        self.loop_stack
+            .push((cond_block, exit_block, label_name(label)));
 
         builder.goto(cond_block);
         builder.switch_to_block(cond_block);
@@ -4936,7 +5974,7 @@ impl<'ctx> MirLowerer<'ctx> {
         pattern: &ast::Pattern,
         scrutinee: &ast::Expr,
         body: &ast::Block,
-        _label: Option<&ast::Ident>,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         let builder = self
             .current_fn
@@ -4947,7 +5985,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let body_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((cond_block, exit_block));
+        self.loop_stack
+            .push((cond_block, exit_block, label_name(label)));
 
         builder.goto(cond_block);
         builder.switch_to_block(cond_block);
@@ -5039,7 +6078,7 @@ impl<'ctx> MirLowerer<'ctx> {
         pattern: &ast::Pattern,
         iter: &ast::Expr,
         body: &ast::Block,
-        _label: Option<&ast::Ident>,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         // Detect `.step_by(n)` on a range: `(start..end).step_by(n)` or `(start..=end).step_by(n)`
         if let ExprKind::MethodCall {
@@ -5058,6 +6097,7 @@ impl<'ctx> MirLowerer<'ctx> {
                         inclusive,
                         body,
                         Some(&args[0]),
+                        label,
                     );
                 }
             }
@@ -5078,6 +6118,7 @@ impl<'ctx> MirLowerer<'ctx> {
                 *inclusive,
                 body,
                 None,
+                label,
             );
         }
 
@@ -5085,10 +6126,26 @@ impl<'ctx> MirLowerer<'ctx> {
         // parser for `0..10` style expressions.
         if let ExprKind::Binary { op, left, right } = &iter.kind {
             if *op == AstBinOp::Range {
-                return self.lower_for_range(pattern, Some(left), Some(right), false, body, None);
+                return self.lower_for_range(
+                    pattern,
+                    Some(left),
+                    Some(right),
+                    false,
+                    body,
+                    None,
+                    label,
+                );
             }
             if *op == AstBinOp::RangeInclusive {
-                return self.lower_for_range(pattern, Some(left), Some(right), true, body, None);
+                return self.lower_for_range(
+                    pattern,
+                    Some(left),
+                    Some(right),
+                    true,
+                    body,
+                    None,
+                    label,
+                );
             }
         }
 
@@ -5114,13 +6171,13 @@ impl<'ctx> MirLowerer<'ctx> {
             // iteration (the body never ran).
             MirType::Vec(elem) => {
                 let elem_ty = elem.as_ref().clone();
-                return self.lower_for_vec(pattern, iter_val, elem_ty, body);
+                return self.lower_for_vec(pattern, iter_val, elem_ty, body, label);
             }
             // `for c in s.chars()` / `for c in s`: iterate the string's bytes.
             // chars()/bytes() are identity ops, so the iterable is a BuildString.
             // Previously this fell to the no-op loop (zero iterations).
             MirType::Struct(n) if n.as_ref() == "BuildString" => {
-                return self.lower_for_string(pattern, iter_val, body);
+                return self.lower_for_string(pattern, iter_val, body, label);
             }
             _ => {
                 // Not an array - try iterator protocol: call .next() in a loop.
@@ -5131,7 +6188,7 @@ impl<'ctx> MirLowerer<'ctx> {
                         .impl_methods
                         .contains_key(&(type_name.clone(), Arc::from("next")))
                     {
-                        return self.lower_for_iterator(pattern, iter_val, &iter_ty, body);
+                        return self.lower_for_iterator(pattern, iter_val, &iter_ty, body, label);
                     }
                 }
                 // No iterator protocol - emit a no-op loop
@@ -5167,7 +6224,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let incr_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((incr_block, exit_block));
+        self.loop_stack
+            .push((incr_block, exit_block, label_name(label)));
 
         builder.goto(cond_block);
         builder.switch_to_block(cond_block);
@@ -5229,6 +6287,7 @@ impl<'ctx> MirLowerer<'ctx> {
         iter_val: MirValue,
         elem_ty: MirType,
         body: &ast::Block,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         let builder = self
             .current_fn
@@ -5263,7 +6322,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let incr_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((incr_block, exit_block));
+        self.loop_stack
+            .push((incr_block, exit_block, label_name(label)));
 
         let builder = self.current_fn.as_mut().unwrap();
         builder.goto(cond_block);
@@ -5322,6 +6382,7 @@ impl<'ctx> MirLowerer<'ctx> {
         pattern: &ast::Pattern,
         iter_val: MirValue,
         body: &ast::Block,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         let byte_ty = MirType::i32();
         let builder = self
@@ -5353,7 +6414,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let body_block = builder.create_block();
         let incr_block = builder.create_block();
         let exit_block = builder.create_block();
-        self.loop_stack.push((incr_block, exit_block));
+        self.loop_stack
+            .push((incr_block, exit_block, label_name(label)));
 
         let builder = self.current_fn.as_mut().unwrap();
         builder.goto(cond_block);
@@ -5441,6 +6503,7 @@ impl<'ctx> MirLowerer<'ctx> {
         inclusive: bool,
         body: &ast::Block,
         step: Option<&ast::Expr>,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         // Lower start value (default to 0)
         let start_val = if let Some(s) = start {
@@ -5471,7 +6534,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let incr_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((incr_block, exit_block));
+        self.loop_stack
+            .push((incr_block, exit_block, label_name(label)));
 
         builder.goto(cond_block);
         builder.switch_to_block(cond_block);
@@ -5543,6 +6607,7 @@ impl<'ctx> MirLowerer<'ctx> {
         iter_val: MirValue,
         iter_ty: &MirType,
         body: &ast::Block,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         let type_name = if let MirType::Struct(ref name) = iter_ty {
             name.clone()
@@ -5599,7 +6664,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let body_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((cond_block, exit_block));
+        self.loop_stack
+            .push((cond_block, exit_block, label_name(label)));
 
         builder.goto(cond_block);
         builder.switch_to_block(cond_block);
@@ -5744,9 +6810,18 @@ impl<'ctx> MirLowerer<'ctx> {
     }
 
     fn lower_return(&mut self, value: Option<&ast::Expr>) -> CodegenResult<MirValue> {
-        // Lower value expression FIRST if present
+        // Lower value expression FIRST if present, threading the function's
+        // declared return type as the expected type so a returned aggregate
+        // literal (`return (a, b);`, `return vec![..];`, `return [..];`) is
+        // built at the width its caller reads. Without this the elements
+        // default to i32 and an i64 caller reads a corrupt, wider value.
+        let ret_expected = self.current_fn.as_ref().map(|b| b.return_type().clone());
         let ret_val = if let Some(expr) = value {
-            Some(self.lower_expr(expr)?)
+            let prev_expected = self.expected_type.take();
+            self.expected_type = ret_expected;
+            let lowered = self.lower_expr(expr);
+            self.expected_type = prev_expected;
+            Some(lowered?)
         } else {
             None
         };
@@ -6016,12 +7091,19 @@ impl<'ctx> MirLowerer<'ctx> {
     fn lower_break(
         &mut self,
         value: Option<&ast::Expr>,
-        _label: Option<&ast::Ident>,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         // Break value (e.g. `break 42`) is evaluated but currently not
         // assigned to a loop result local because loops do not yet propagate
         // a result variable.  The value is lowered for side-effect correctness.
-        if let Some((_, exit_block)) = self.loop_stack.last().copied() {
+        //
+        // `break 'name` targets the nearest enclosing loop whose label matches;
+        // a bare `break` targets the innermost loop. An unresolved label is a
+        // fail-closed error rather than a silent fall-through to the innermost
+        // loop, which would compile the wrong control flow.
+        let target = self.resolve_loop_target(label, "break")?;
+
+        if let Some((_, exit_block)) = target {
             if let Some(expr) = value {
                 let _val = self.lower_expr(expr)?;
             }
@@ -6039,13 +7121,18 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(values::unit())
     }
 
-    fn lower_continue(&mut self, _label: Option<&ast::Ident>) -> CodegenResult<MirValue> {
+    fn lower_continue(&mut self, label: Option<&ast::Ident>) -> CodegenResult<MirValue> {
+        // `continue 'name` re-enters the nearest enclosing loop whose label
+        // matches; a bare `continue` re-enters the innermost loop. An unresolved
+        // label fails closed (see `lower_break`).
+        let target = self.resolve_loop_target(label, "continue")?;
+
         let builder = self
             .current_fn
             .as_mut()
             .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
-        if let Some((continue_block, _)) = self.loop_stack.last().copied() {
+        if let Some((continue_block, _)) = target {
             builder.goto(continue_block);
         }
 
@@ -6055,11 +7142,64 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(values::unit())
     }
 
+    /// Resolve the `(continue_block, exit_block)` target of a `break`/`continue`.
+    ///
+    /// With a label, the nearest enclosing loop carrying that label wins, and an
+    /// unresolved label is an error (fail closed) rather than a silent fall
+    /// through to the innermost loop. Without a label, the innermost loop wins;
+    /// `None` means the statement is outside any loop, which the earlier
+    /// type-check pass already reports, so lowering leaves it as a no-op here.
+    fn resolve_loop_target(
+        &self,
+        label: Option<&ast::Ident>,
+        kw: &str,
+    ) -> CodegenResult<Option<(BlockId, BlockId)>> {
+        match label {
+            Some(l) => {
+                let name = l.as_str();
+                match self
+                    .loop_stack
+                    .iter()
+                    .rev()
+                    .find(|(_, _, lbl)| lbl.as_deref() == Some(name))
+                {
+                    Some((cont, exit, _)) => Ok(Some((*cont, *exit))),
+                    None => Err(CodegenError::Internal(format!(
+                        "{kw} to undefined loop label '{name}'"
+                    ))),
+                }
+            }
+            None => Ok(self.loop_stack.last().map(|(cont, exit, _)| (*cont, *exit))),
+        }
+    }
+
     fn lower_tuple(&mut self, elems: &[ast::Expr]) -> CodegenResult<MirValue> {
-        let elem_vals: Vec<_> = elems
-            .iter()
-            .map(|e| self.lower_expr(e))
-            .collect::<CodegenResult<_>>()?;
+        // When a tuple type is expected (from a let annotation or another
+        // bidirectional hint), lower each element with its expected component
+        // type so integer and float literals adopt the annotated width instead
+        // of the i32/f64 default. Without this an annotated
+        // `let a: (i64, i64) = (7, 8)` builds a `Tuple_i32_i32` value with two
+        // 4-byte fields while every `a.0` field access reads at the annotated
+        // i64 width (8 bytes), so a plain read spans both fields and a store
+        // corrupts its neighbour -> a silent wrong answer with no diagnostic.
+        let expected_elems: Option<Vec<MirType>> = match &self.expected_type {
+            Some(MirType::Tuple(tys)) if tys.len() == elems.len() => Some(tys.clone()),
+            _ => None,
+        };
+
+        let prev_expected = self.expected_type.take();
+        let mut elem_vals = Vec::with_capacity(elems.len());
+        for (i, e) in elems.iter().enumerate() {
+            self.expected_type = expected_elems.as_ref().map(|tys| tys[i].clone());
+            match self.lower_expr(e) {
+                Ok(val) => elem_vals.push(val),
+                Err(err) => {
+                    self.expected_type = prev_expected;
+                    return Err(err);
+                }
+            }
+        }
+        self.expected_type = prev_expected;
 
         if elem_vals.is_empty() {
             let builder = self
@@ -6071,8 +7211,13 @@ impl<'ctx> MirLowerer<'ctx> {
             return Ok(values::local(result));
         }
 
-        // Build the proper MirType::Tuple from element types.
-        let elem_tys: Vec<MirType> = elem_vals.iter().map(|v| self.type_of_value(v)).collect();
+        // Element types: the annotated component types when present, else each
+        // element's inferred type. Using the annotated types keeps the tuple's
+        // struct typedef the same width the field-access side reads at.
+        let elem_tys: Vec<MirType> = match &expected_elems {
+            Some(tys) => tys.clone(),
+            None => elem_vals.iter().map(|v| self.type_of_value(v)).collect(),
+        };
         let tuple_ty = MirType::Tuple(elem_tys.clone());
 
         // Register the tuple type definition (struct typedef) if not already done.
@@ -6124,16 +7269,40 @@ impl<'ctx> MirLowerer<'ctx> {
             })
             .unwrap_or(4); // Default to 4 if we can't evaluate
 
+        // Honor an expected `[T; N]` element type so `let a: [i64; 4] = [0; 4]`
+        // is laid out at the annotated width rather than the i32 default (see
+        // lower_array for why the width must match later borrows).
+        let expected_elem = match &self.expected_type {
+            Some(MirType::Array(elem, _)) => Some((**elem).clone()),
+            _ => None,
+        };
+        let prev_expected = self.expected_type.take();
+
         // Lower the element expression once to get its type
-        let elem_val = self.lower_expr(element)?;
-        let elem_ty = self.type_of_value(&elem_val);
+        self.expected_type = expected_elem.clone();
+        let elem_val = match self.lower_expr(element) {
+            Ok(v) => v,
+            Err(err) => {
+                self.expected_type = prev_expected;
+                return Err(err);
+            }
+        };
+        let elem_ty = expected_elem.unwrap_or_else(|| self.type_of_value(&elem_val));
 
         // Create N copies of the element
         let mut elem_vals = Vec::with_capacity(count_val as usize);
         elem_vals.push(elem_val);
         for _ in 1..count_val {
-            elem_vals.push(self.lower_expr(element)?);
+            self.expected_type = Some(elem_ty.clone());
+            match self.lower_expr(element) {
+                Ok(v) => elem_vals.push(v),
+                Err(err) => {
+                    self.expected_type = prev_expected;
+                    return Err(err);
+                }
+            }
         }
+        self.expected_type = prev_expected;
 
         let builder = self
             .current_fn
@@ -6146,16 +7315,37 @@ impl<'ctx> MirLowerer<'ctx> {
     }
 
     fn lower_array(&mut self, elems: &[ast::Expr]) -> CodegenResult<MirValue> {
-        let elem_vals: Vec<_> = elems
-            .iter()
-            .map(|e| self.lower_expr(e))
-            .collect::<CodegenResult<_>>()?;
+        // When a `[T; N]` type is expected (from a let annotation or another
+        // bidirectional hint), lower each element with T as its expected type
+        // so integer and float literals adopt the annotated width instead of
+        // the i32/f64 default, and use T as the array's element type. Without
+        // this an annotated `let a: [i64; 3] = [1, 2, 3]` is laid out [i32; 3]
+        // and a later `&a[i]` typed `&i64` reads or writes past the element ->
+        // silent wrong answer.
+        let expected_elem = match &self.expected_type {
+            Some(MirType::Array(elem, _)) => Some((**elem).clone()),
+            _ => None,
+        };
 
-        // Infer element type from the first element; fall back to i32 for
-        // empty array literals.
-        let elem_ty = elem_vals
-            .first()
-            .map(|v| self.type_of_value(v))
+        let prev_expected = self.expected_type.take();
+        let mut elem_vals = Vec::with_capacity(elems.len());
+        for e in elems {
+            self.expected_type = expected_elem.clone();
+            let v = self.lower_expr(e);
+            match v {
+                Ok(val) => elem_vals.push(val),
+                Err(err) => {
+                    self.expected_type = prev_expected;
+                    return Err(err);
+                }
+            }
+        }
+        self.expected_type = prev_expected;
+
+        // Element type: the annotated element type when present, else inferred
+        // from the first element, falling back to i32 for an empty literal.
+        let elem_ty = expected_elem
+            .or_else(|| elem_vals.first().map(|v| self.type_of_value(v)))
             .unwrap_or(MirType::i32());
 
         let builder = self
@@ -6450,6 +7640,20 @@ impl<'ctx> MirLowerer<'ctx> {
         mutability: ast::Mutability,
         inner: &ast::Expr,
     ) -> CodegenResult<MirValue> {
+        // Address-of a real place (`&arr[i].field`, `&t.0`, `&s.field`, `&x`).
+        // Reference the location itself so the pointer aliases storage the caller
+        // can mutate. Without this the operand was copied to a temp first, so the
+        // reference pointed at the copy and a `*p = v` never reached the source.
+        if let Some((place, place_ty)) = self.lower_place(inner)? {
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+            let result = builder.create_local(MirType::Ptr(Box::new(place_ty)));
+            builder.make_ref(result, mutability.is_mut(), place);
+            return Ok(values::local(result));
+        }
+
         let inner_val = self.lower_expr(inner)?;
         let inner_ty = self.type_of_value(&inner_val);
 
@@ -6458,11 +7662,12 @@ impl<'ctx> MirLowerer<'ctx> {
             .as_mut()
             .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
-        // Get the local from inner value
+        // Operand is not an addressable place (a call result, an arithmetic
+        // expression, a global). Materialize it into a temporary and reference
+        // that; this matches the prior behavior for those non-place operands.
         let local = match &inner_val {
             MirValue::Local(id) => *id,
             _ => {
-                // Create a temporary with the correct type
                 let temp = builder.create_local(inner_ty.clone());
                 builder.assign(temp, MirRValue::Use(inner_val));
                 temp
@@ -6587,5 +7792,57 @@ impl<'ctx> MirLowerer<'ctx> {
         builder.cast(result, cast_kind, inner_val, target_ty);
 
         Ok(values::local(result))
+    }
+}
+
+/// Scalar class of a reference pointee, distinguishing an integer store/load
+/// from a float one. Used by the call-site reference-width guard so a pointee
+/// mismatch that shares a byte width but not a class (an `&i32` where an `&f32`
+/// is declared) is still rejected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalarPointeeClass {
+    Int,
+    Float,
+}
+
+impl ScalarPointeeClass {
+    fn name(self) -> &'static str {
+        match self {
+            ScalarPointeeClass::Int => "integer",
+            ScalarPointeeClass::Float => "float",
+        }
+    }
+}
+
+/// Byte width and scalar class of a pointee type, if it is a scalar integer or
+/// float. Returns None for a non-scalar pointee (struct, array, nested
+/// pointer), which is out of scope for the reference-width guard and left to
+/// the backend's existing shape matching. The C target is 64-bit, so `ISize`
+/// and `USize` measure eight bytes.
+fn scalar_pointee_shape(ty: &MirType) -> Option<(u32, ScalarPointeeClass)> {
+    match ty {
+        MirType::Int(size, _) => Some((size.bits(64) / 8, ScalarPointeeClass::Int)),
+        MirType::Float(f) => Some((f.bits() / 8, ScalarPointeeClass::Float)),
+        _ => None,
+    }
+}
+
+/// Whether an unsuffixed integer literal of magnitude `value` fits in a target
+/// integer type of the given size and signedness without truncation. `value`
+/// is the literal's non-negative magnitude (negation is a separate unary op),
+/// so only the upper bound is checked. The C target is 64-bit, so `ISize` and
+/// `USize` are treated as 64-bit here.
+fn int_literal_fits(value: u128, size: IntSize, signed: bool) -> bool {
+    let bits = size.bits(64);
+    if signed {
+        if bits >= 128 {
+            value <= i128::MAX as u128
+        } else {
+            value <= (1u128 << (bits - 1)) - 1
+        }
+    } else if bits >= 128 {
+        true
+    } else {
+        value <= (1u128 << bits) - 1
     }
 }

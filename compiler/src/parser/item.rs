@@ -481,31 +481,54 @@ impl<'a> Parser<'a> {
     ) -> ParseResult<Option<Param>> {
         use crate::ast::{Mutability, Path, PathSegment, Pattern, PatternKind, Type, TypeKind};
 
-        // Check for &self or &mut self
+        // Check for a reference self receiver: `&self`, `&'a self`,
+        // `&mut self`, or `&'a mut self`. Look past the `&`, an optional
+        // lifetime, and an optional `mut` to confirm `self` before consuming
+        // anything; otherwise this is an ordinary reference-typed parameter
+        // (`&Frustum`, `&'a T`) and we fall through to the pattern parser.
         if self.check(&TokenKind::And) {
-            // Look ahead to see if this is &self or &mut self
-            let is_ref_self = self.peek().kind == TokenKind::Keyword(Keyword::Self_);
-            let is_ref_mut_self = self.peek().kind == TokenKind::Keyword(Keyword::Mut)
-                && self.pos + 2 < self.tokens.len()
-                && self.tokens[self.pos + 2].kind == TokenKind::Keyword(Keyword::Self_);
+            let mut offset = 1;
+            let has_lifetime = self.peek_n(offset).kind == TokenKind::Lifetime;
+            if has_lifetime {
+                offset += 1;
+            }
+            let has_mut = self.peek_n(offset).kind == TokenKind::Keyword(Keyword::Mut);
+            if has_mut {
+                offset += 1;
+            }
 
-            if is_ref_self {
-                // &self
+            if self.peek_n(offset).kind == TokenKind::Keyword(Keyword::Self_) {
                 self.advance(); // consume &
+
+                // An explicit receiver lifetime (`&'a self`); the corpus pairs
+                // it with a `<'a>` generic on the method.
+                let lifetime = if has_lifetime {
+                    Some(self.expect_lifetime()?)
+                } else {
+                    None
+                };
+
+                let mutability = if has_mut {
+                    self.advance(); // consume mut
+                    Mutability::Mutable
+                } else {
+                    Mutability::Immutable
+                };
+
                 let self_span = self.current_span();
                 self.advance(); // consume self
 
                 let self_ident = Ident::new("self", self_span);
                 let pattern = Pattern::new(
                     PatternKind::Ident {
-                        mutability: Mutability::Immutable,
+                        mutability,
                         name: self_ident,
                         subpattern: None,
                     },
                     self_span,
                 );
 
-                // Type is &Self
+                // Type is `&Self` / `&'a Self` / `&mut Self` / `&'a mut Self`.
                 let self_type_path = Path {
                     segments: vec![PathSegment {
                         ident: Ident::new("Self", self_span),
@@ -520,55 +543,8 @@ impl<'a> Parser<'a> {
                 };
                 let ty = Type {
                     kind: TypeKind::Ref {
-                        lifetime: None,
-                        mutability: Mutability::Immutable,
-                        ty: Box::new(inner_ty),
-                    },
-                    span: start.merge(&self_span),
-                    id: NodeId::DUMMY,
-                };
-
-                return Ok(Some(Param {
-                    attrs: attrs.to_vec(),
-                    pattern,
-                    ty: Box::new(ty),
-                    default: None,
-                    span: start.merge(&self_span),
-                }));
-            } else if is_ref_mut_self {
-                // &mut self
-                self.advance(); // consume &
-                self.advance(); // consume mut
-                let self_span = self.current_span();
-                self.advance(); // consume self
-
-                let self_ident = Ident::new("self", self_span);
-                let pattern = Pattern::new(
-                    PatternKind::Ident {
-                        mutability: Mutability::Mutable,
-                        name: self_ident,
-                        subpattern: None,
-                    },
-                    self_span,
-                );
-
-                // Type is &mut Self
-                let self_type_path = Path {
-                    segments: vec![PathSegment {
-                        ident: Ident::new("Self", self_span),
-                        generics: vec![],
-                    }],
-                    span: self_span,
-                };
-                let inner_ty = Type {
-                    kind: TypeKind::Path(self_type_path),
-                    span: self_span,
-                    id: NodeId::DUMMY,
-                };
-                let ty = Type {
-                    kind: TypeKind::Ref {
-                        lifetime: None,
-                        mutability: Mutability::Mutable,
+                        lifetime,
+                        mutability,
                         ty: Box::new(inner_ty),
                     },
                     span: start.merge(&self_span),
@@ -867,7 +843,21 @@ impl<'a> Parser<'a> {
         let attrs = self.parse_outer_attrs()?;
         let start = self.current_span();
 
-        let is_const = self.eat_keyword(Keyword::Const);
+        // Only consume `const` as a modifier when it is followed by `fn`
+        // (`const fn foo();`). A bare `const NAME: TYPE;` begins an associated
+        // const declaration and must be left for the `Const` arm below; eating
+        // it here unconditionally left that arm unreachable, so every associated
+        // const in a trait failed with "expected trait item". Mirrors the impl
+        // item parser.
+        let is_const = if self.check_keyword(Keyword::Const) {
+            if matches!(&self.peek().kind, TokenKind::Keyword(Keyword::Fn)) {
+                self.eat_keyword(Keyword::Const)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let is_async = self.eat_keyword(Keyword::Async);
         let is_unsafe = self.eat_keyword(Keyword::Unsafe);
 
@@ -1036,9 +1026,31 @@ impl<'a> Parser<'a> {
         let is_async = self.eat_keyword(Keyword::Async);
         let is_unsafe = self.eat_keyword(Keyword::Unsafe);
 
+        // `extern "ABI"` on a method mirrors the free-item form (see the
+        // `Keyword::Extern` arm in `parse_item`): consume the keyword and the
+        // optional ABI string so `extern "stdcall" fn ...` inside an impl body
+        // parses the same as at the top level. Only a function may follow;
+        // `extern crate` / `extern { ... }` are free-item forms, not impl items.
+        let abi = if self.check_keyword(Keyword::Extern) {
+            self.advance();
+            let abi = if let TokenKind::Literal { .. } = self.current_kind() {
+                let token_span = self.advance().span;
+                Some(self.source.slice(token_span).trim_matches('"').to_string())
+            } else {
+                None
+            };
+            if !self.check_keyword(Keyword::Fn) {
+                return Err(self.error_expected("`fn` after `extern` in impl item"));
+            }
+            abi
+        } else {
+            None
+        };
+
         let kind = match self.current_kind().clone() {
             TokenKind::Keyword(Keyword::Fn) => {
-                let fn_def = self.parse_fn(is_unsafe, is_async, is_const)?;
+                let mut fn_def = self.parse_fn(is_unsafe, is_async, is_const)?;
+                fn_def.sig.abi = abi;
                 ImplItemKind::Function(Box::new(fn_def))
             }
 
@@ -1221,6 +1233,7 @@ impl<'a> Parser<'a> {
             name,
             content,
             is_unsafe,
+            is_file_module: false,
         })
     }
 
@@ -1272,6 +1285,7 @@ impl<'a> Parser<'a> {
             name,
             content,
             is_unsafe,
+            is_file_module: true,
         })
     }
 
@@ -1696,6 +1710,51 @@ mod tests {
     }
 
     #[test]
+    fn reference_self_receiver_with_lifetime_parses() {
+        // `&'a self` and `&'a mut self` are reference receivers carrying an
+        // explicit lifetime; the corpus pairs them with a `<'a>` method
+        // generic on iterator-returning methods. Confirm all four reference
+        // receiver shapes parse and that the lifetime and mutability land on
+        // the receiver's `&Self` type. `&self`/`&mut self` are checked here
+        // too so the refactor that added the lifetime forms is pinned as
+        // behaviour-preserving.
+        let cases = [
+            ("fn f<'a>(&'a self) {}", true, Mutability::Immutable),
+            ("fn f<'a>(&'a mut self) {}", true, Mutability::Mutable),
+            ("fn f(&self) {}", false, Mutability::Immutable),
+            ("fn f(&mut self) {}", false, Mutability::Mutable),
+        ];
+        for (src, has_lifetime, mutability) in cases {
+            let item =
+                parse_item_str(src).unwrap_or_else(|e| panic!("`{src}` should parse: {e:?}"));
+            let f = match &item.kind {
+                ItemKind::Function(f) => f,
+                other => panic!("`{src}` parsed as {other:?}, expected Function"),
+            };
+            assert_eq!(
+                f.sig.params.len(),
+                1,
+                "`{src}` should have one (self) param"
+            );
+            match &f.sig.params[0].ty.kind {
+                TypeKind::Ref {
+                    lifetime,
+                    mutability: m,
+                    ..
+                } => {
+                    assert_eq!(
+                        lifetime.is_some(),
+                        has_lifetime,
+                        "`{src}` receiver lifetime presence"
+                    );
+                    assert_eq!(*m, mutability, "`{src}` receiver mutability");
+                }
+                other => panic!("`{src}` receiver type was {other:?}, expected Ref"),
+            }
+        }
+    }
+
+    #[test]
     fn struct_with_fields() {
         let item = parse_item_str("struct Point { x: f64, y: f64 }").unwrap();
         match &item.kind {
@@ -1866,6 +1925,47 @@ mod tests {
     }
 
     #[test]
+    fn extern_abi_method_in_impl_parses() {
+        // `extern "ABI" fn` is accepted as an impl method, mirroring the
+        // free-item form; the ABI is recorded on the method signature.
+        let item = parse_item_str(
+            "impl HookManager { extern \"stdcall\" fn present(&self, flags: u32) -> u32 { flags } }",
+        )
+        .unwrap();
+        match &item.kind {
+            ItemKind::Impl(imp) => {
+                assert_eq!(imp.items.len(), 1);
+                match &imp.items[0].kind {
+                    ImplItemKind::Function(f) => {
+                        assert_eq!(f.name.as_str(), "present");
+                        assert_eq!(f.sig.abi.as_deref(), Some("stdcall"));
+                        assert!(f.body.is_some());
+                    }
+                    other => panic!("expected impl Function, got {:?}", other),
+                }
+            }
+            other => panic!("expected Impl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plain_method_in_impl_has_no_abi() {
+        // Regression: an ordinary method must still parse and carry no ABI, so
+        // the new `extern` branch does not clobber the common case.
+        let item = parse_item_str("impl Foo { fn bar(&self) -> u32 { 0 } }").unwrap();
+        match &item.kind {
+            ItemKind::Impl(imp) => match &imp.items[0].kind {
+                ImplItemKind::Function(f) => {
+                    assert_eq!(f.name.as_str(), "bar");
+                    assert_eq!(f.sig.abi, None);
+                }
+                other => panic!("expected impl Function, got {:?}", other),
+            },
+            other => panic!("expected Impl, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn enum_with_variants() {
         let item = parse_item_str("enum Option<T> { Some(T), None }").unwrap();
         match &item.kind {
@@ -1893,6 +1993,40 @@ mod tests {
                         assert!(f.body.is_none(), "trait method should be bodyless");
                     }
                     other => panic!("expected trait Function item, got {:?}", other),
+                }
+            }
+            other => panic!("expected Trait, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn trait_associated_const() {
+        // A bare `const NAME: TYPE;` and a defaulted `const NAME: TYPE = val;`
+        // are both associated const declarations; `const fn` stays a function.
+        let item = parse_item_str(
+            "trait Hash { const OUTPUT_SIZE: usize; const SEED: u64 = 0; const fn reset(); }",
+        )
+        .unwrap();
+        match &item.kind {
+            ItemKind::Trait(t) => {
+                assert_eq!(t.items.len(), 3, "three trait items");
+                match &t.items[0].kind {
+                    TraitItemKind::Const { name, default, .. } => {
+                        assert_eq!(name.as_str(), "OUTPUT_SIZE");
+                        assert!(default.is_none(), "no default on the first const");
+                    }
+                    other => panic!("expected associated Const, got {:?}", other),
+                }
+                match &t.items[1].kind {
+                    TraitItemKind::Const { name, default, .. } => {
+                        assert_eq!(name.as_str(), "SEED");
+                        assert!(default.is_some(), "second const carries a default");
+                    }
+                    other => panic!("expected defaulted Const, got {:?}", other),
+                }
+                match &t.items[2].kind {
+                    TraitItemKind::Function(f) => assert_eq!(f.name.as_str(), "reset"),
+                    other => panic!("`const fn` should stay a Function, got {:?}", other),
                 }
             }
             other => panic!("expected Trait, got {:?}", other),
@@ -1932,6 +2066,116 @@ mod tests {
                 assert!(f.sig.return_ty.is_some());
             }
             other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    // Extract the generic arguments on the last path segment of a function's
+    // return type, so an associated-type-binding assertion can read them.
+    fn return_type_generics(item: &Item) -> Vec<crate::ast::GenericArg> {
+        let ret = match &item.kind {
+            ItemKind::Function(f) => f.sig.return_ty.as_ref().expect("return type"),
+            other => panic!("expected Function, got {:?}", other),
+        };
+        match &ret.kind {
+            crate::ast::TypeKind::Path(p) => p.segments.last().unwrap().generics.clone(),
+            other => panic!("expected Path type, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn associated_type_binding_parses_as_assoc_type() {
+        // `Item = i32` in `Iterator<Item = i32>` is an associated-type
+        // binding, not a positional type argument. It must parse as
+        // `GenericArg::AssocType` carrying the bound name and type.
+        let item = parse_item_str("fn f() -> Iterator<Item = i32> { 0 }").unwrap();
+        let generics = return_type_generics(&item);
+        assert_eq!(generics.len(), 1, "one binding, no positional args");
+        match &generics[0] {
+            crate::ast::GenericArg::AssocType { name, ty } => {
+                assert_eq!(name.as_str(), "Item");
+                assert!(matches!(&ty.kind, crate::ast::TypeKind::Path(_)));
+            }
+            other => panic!("expected AssocType binding, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn binding_and_positional_args_coexist() {
+        // A positional type argument and a binding parse side by side, each
+        // into its own `GenericArg` kind. This guards the disambiguation: a
+        // bare `i32` stays a `Type`, only `Output = bool` becomes a binding.
+        let item = parse_item_str("fn f() -> Op<i32, Output = bool> { 0 }").unwrap();
+        let generics = return_type_generics(&item);
+        assert_eq!(generics.len(), 2);
+        assert!(
+            matches!(&generics[0], crate::ast::GenericArg::Type(_)),
+            "leading `i32` must stay a positional type argument"
+        );
+        match &generics[1] {
+            crate::ast::GenericArg::AssocType { name, .. } => assert_eq!(name.as_str(), "Output"),
+            other => panic!("expected AssocType binding, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multiple_associated_type_bindings_parse() {
+        // Two comma-separated bindings, the shape corpus trait bounds use
+        // (`SerializeSeq<Ok = ..., Error = ...>`). Each binding parses
+        // independently into its own kind, and the right-hand side accepts a
+        // multi-segment path (`io::Error`) as well as a plain name. (A
+        // `Self::`-qualified right-hand side is a separate, pre-existing gap
+        // in type-position `Self` projection, not exercised here.)
+        let item = parse_item_str("fn f() -> Seq<Ok = String, Error = io::Error> { 0 }").unwrap();
+        let generics = return_type_generics(&item);
+        assert_eq!(generics.len(), 2, "two bindings, no positional args");
+        for (arg, expected) in generics.iter().zip(["Ok", "Error"]) {
+            match arg {
+                crate::ast::GenericArg::AssocType { name, ty } => {
+                    assert_eq!(name.as_str(), expected);
+                    assert!(matches!(&ty.kind, crate::ast::TypeKind::Path(_)));
+                }
+                other => panic!("expected AssocType binding, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn self_projection_parses_in_type_position() {
+        // `Self::Output` in type position is a two-segment path (`Self`, then
+        // `Output`). The `Self` type arm used to consume only `Self` and leave
+        // the `::` dangling, so `Poll<Self::Output>` and `Option<Self::Item>`
+        // failed to parse. The projection must now parse to the full path.
+        let item = parse_item_str("fn f() -> Self::Output { 0 }").unwrap();
+        let ret = match &item.kind {
+            ItemKind::Function(f) => f.sig.return_ty.as_ref().expect("return type"),
+            other => panic!("expected Function, got {:?}", other),
+        };
+        match &ret.kind {
+            crate::ast::TypeKind::Path(p) => {
+                let names: Vec<_> = p.segments.iter().map(|s| s.ident.as_str()).collect();
+                assert_eq!(names, ["Self", "Output"]);
+            }
+            other => panic!("expected Path type, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn self_projection_carries_generics_on_the_head() {
+        // A projection nested inside a generic argument list, the corpus shape
+        // (`Poll<Self::Output>`). The outer `Poll` gets one type argument, and
+        // that argument is the two-segment `Self::Output` path.
+        let item = parse_item_str("fn f() -> Poll<Self::Output> { 0 }").unwrap();
+        let generics = return_type_generics(&item);
+        assert_eq!(generics.len(), 1);
+        match &generics[0] {
+            crate::ast::GenericArg::Type(ty) => match &ty.kind {
+                crate::ast::TypeKind::Path(p) => {
+                    let names: Vec<_> = p.segments.iter().map(|s| s.ident.as_str()).collect();
+                    assert_eq!(names, ["Self", "Output"]);
+                }
+                other => panic!("expected Path argument, got {:?}", other),
+            },
+            other => panic!("expected Type argument, got {:?}", other),
         }
     }
 

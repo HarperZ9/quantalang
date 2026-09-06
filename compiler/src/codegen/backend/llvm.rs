@@ -1399,6 +1399,14 @@ impl LlvmBackend {
                             .unwrap();
                         }
                     }
+                    UnaryOp::BitNot => {
+                        writeln!(
+                            &mut self.output,
+                            "  {} = xor {} {}, -1",
+                            result, llvm_ty, operand_val
+                        )
+                        .unwrap();
+                    }
                 }
 
                 writeln!(
@@ -2137,7 +2145,7 @@ impl LlvmBackend {
                         current_ty = *inner;
                     }
                 }
-                PlaceProjection::Field(idx, field_ty) => {
+                PlaceProjection::Field(idx, _name, field_ty) => {
                     let gep = self.fresh_value();
                     let struct_ty = self.llvm_type(&current_ty)?;
 

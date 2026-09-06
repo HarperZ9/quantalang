@@ -15,7 +15,7 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use super::{Backend, CodegenResult, Target};
+use super::{Backend, CodegenError, CodegenResult, Target};
 use crate::codegen::ir::*;
 use crate::codegen::runtime;
 use crate::codegen::{GeneratedCode, OutputFormat};
@@ -1650,6 +1650,26 @@ impl CBackend {
             return Ok(());
         }
 
+        // The vtable method sigs carry `void*` as the self param (that is the
+        // C-level type stored in the function-pointer table), so they cannot say
+        // whether the concrete method takes `self` by value or `&self` by
+        // reference. Read that from the concrete function's real first parameter
+        // instead, keyed by its mangled name.
+        let concrete_self_by_ref: std::collections::HashMap<&str, bool> = module
+            .functions
+            .iter()
+            .map(|f| {
+                (
+                    f.name.as_ref(),
+                    f.sig
+                        .params
+                        .first()
+                        .map(|p| p.is_pointer())
+                        .unwrap_or(false),
+                )
+            })
+            .collect();
+
         // Generate wrapper functions that dereference void* to concrete type
         for vtable in &module.vtables {
             for (method_name, mangled_fn, sig) in &vtable.methods {
@@ -1662,10 +1682,13 @@ impl CBackend {
                 // Generate: ret wrapper(void* self, ...) { return concrete(<self>, ...); }
                 // The receiver is passed as a pointer when the method takes
                 // `&self`/`&mut self` (a pointer self param), or dereferenced to a
-                // value when it takes `self` by value. Always dereferencing broke
-                // `&self` trait methods (passing a value where a pointer was
-                // expected).
-                let self_is_ref = sig.params.first().map(|p| p.is_pointer()).unwrap_or(false);
+                // value when it takes `self` by value. The vtable sig always
+                // reports the self param as `void*`, so consult the concrete
+                // function's real first parameter to decide.
+                let self_is_ref = concrete_self_by_ref
+                    .get(mangled_fn.as_ref())
+                    .copied()
+                    .unwrap_or_else(|| sig.params.first().map(|p| p.is_pointer()).unwrap_or(false));
                 let self_arg = if self_is_ref {
                     format!("({}*)__self", vtable.type_name)
                 } else {
@@ -1773,7 +1796,7 @@ impl CBackend {
 
             if let Some(init) = &global.init {
                 decl.push_str(" = ");
-                decl.push_str(&self.const_to_c(init));
+                decl.push_str(&self.const_to_c_static(init));
             }
 
             decl.push_str(";\n");
@@ -2635,9 +2658,19 @@ impl CBackend {
                     base, field_name, ..
                 } = value
                 {
-                    // Special case: loading from handler_data needs cast+deref
-                    // handler_data is a void* that holds a pointer to the perform argument
-                    if field_name.as_ref() == "handler_data" {
+                    // Special case: loading from handler_data needs cast+deref.
+                    // handler_data holds a `void*[N]` argv array; slot `i` points
+                    // to the perform argument for parameter `i`. The field marker
+                    // is `handler_data#<i>` (plain `handler_data` means index 0).
+                    let hd_index = if field_name.as_ref() == "handler_data" {
+                        Some(0usize)
+                    } else {
+                        field_name
+                            .as_ref()
+                            .strip_prefix("handler_data#")
+                            .and_then(|s| s.parse::<usize>().ok())
+                    };
+                    if let Some(idx) = hd_index {
                         let base_str = self.value_to_c(base, locals);
                         let dest_type = locals
                             .get(dest.0 as usize)
@@ -2646,8 +2679,8 @@ impl CBackend {
                         self.write_indent();
                         write!(
                             self.output,
-                            "{} = *({}*){}.handler_data;\n",
-                            dest_name, dest_type, base_str
+                            "{} = *({}*)((void**){}.handler_data)[{}];\n",
+                            dest_name, dest_type, base_str, idx
                         )
                         .unwrap();
                     } else {
@@ -2757,7 +2790,8 @@ impl CBackend {
                 let ptr_name = self.local_name(*ptr, locals);
                 self.write_indent();
                 let rvalue = self.rvalue_to_c(value, locals)?;
-                write!(self.output, "{}->{} = {};\n", ptr_name, field_name, rvalue).unwrap();
+                let field = Self::escape_c_keyword(field_name);
+                write!(self.output, "{}->{} = {};\n", ptr_name, field, rvalue).unwrap();
             }
             MirStmtKind::FieldAssign {
                 base,
@@ -2767,7 +2801,8 @@ impl CBackend {
                 let base_name = self.local_name(*base, locals);
                 self.write_indent();
                 let rvalue = self.rvalue_to_c(value, locals)?;
-                write!(self.output, "{}.{} = {};\n", base_name, field_name, rvalue).unwrap();
+                let field = Self::escape_c_keyword(field_name);
+                write!(self.output, "{}.{} = {};\n", base_name, field, rvalue).unwrap();
             }
             MirStmtKind::GlobalStore { name, value } => {
                 // `GLOBAL = value;` - the C global identifier matches the
@@ -2811,7 +2846,13 @@ impl CBackend {
                 } else if let Some(target) =
                     Self::slice_element_access(base, &base_str, &index_str, locals)
                 {
-                    // Slice / pointer-to-slice store: `base->ptr[i] = value`.
+                    // Slice / pointer-to-slice store: `base->ptr[i] = value`,
+                    // bounds-checked against the slice length.
+                    write!(self.output, "{} = {};\n", target, rvalue).unwrap();
+                } else if let Some(target) =
+                    Self::array_element_access(base, &base_str, &index_str, locals)
+                {
+                    // Fixed-array store: `base[bl_idx_chk(i, N)] = value`.
                     write!(self.output, "{} = {};\n", target, rvalue).unwrap();
                 } else {
                     write!(self.output, "{}[{}] = {};\n", base_str, index_str, rvalue).unwrap();
@@ -3686,7 +3727,19 @@ impl CBackend {
             MirType::SampledImage(_) => "void*".to_string(), // Opaque GPU handle
             MirType::TraitObject(name) => format!("dyn_{}", name), // vtable struct
             MirType::Vec(_) => "BuildVecHandle".to_string(),
-            MirType::Map(_, _) => "BuildStrF64MapHandle".to_string(),
+            // The handle-struct name depends on key/value types. Default map is
+            // str->f64 (BuildStrF64MapHandle), which also backs the value-typed
+            // str-key families (build_hmap_*_val_*). The i64->f64 family has its
+            // own handle. The i32->i32 family never flows through here: map_new_i32
+            // returns Struct("BuildMapHandle") directly. Without this split, a
+            // `map_new_i64()` local was declared BuildStrF64MapHandle while the
+            // runtime returned BuildI64F64MapHandle, a real C2440.
+            MirType::Map(ref k, ref v) => match (k.as_ref(), v.as_ref()) {
+                (MirType::Int(IntSize::I64, _), MirType::Float(..)) => {
+                    "BuildI64F64MapHandle".to_string()
+                }
+                _ => "BuildStrF64MapHandle".to_string(),
+            },
             MirType::Tuple(ref elems) => {
                 if elems.is_empty() {
                     "void".to_string()
@@ -3845,6 +3898,25 @@ impl CBackend {
         }
     }
 
+    /// Emit a constant as a C static initializer (file-scope `const`/global).
+    /// Aggregate constants become plain brace-init lists `{ ... }` rather than
+    /// compound literals `(T){ ... }`: C requires the initializer of an object
+    /// with static storage duration to be a constant expression, and a compound
+    /// literal is not one, so MSVC rejects `const Color W = (Color){...};` with
+    /// C2099. Nested structs recurse the same way; scalars and strings are
+    /// already constant expressions and defer to `const_to_c`.
+    fn const_to_c_static(&self, c: &MirConst) -> String {
+        match c {
+            MirConst::Struct(_, fields) => {
+                let field_strs: Vec<String> =
+                    fields.iter().map(|f| self.const_to_c_static(f)).collect();
+                format!("{{ {} }}", field_strs.join(", "))
+            }
+            MirConst::Zeroed(_) => "{0}".to_string(),
+            _ => self.const_to_c(c),
+        }
+    }
+
     /// If `base` indexes a slice (fat pointer `{ptr, len}`) or a pointer-to-slice
     /// (`&[T]` -> `Ptr(Slice)`), return the correct element access. A slice value
     /// is `base.ptr[index]`; a pointer-to-slice (a slice/array *parameter*) is
@@ -3863,11 +3935,38 @@ impl CBackend {
             MirValue::Local(id) => &locals.get(id.0 as usize)?.ty,
             _ => return None,
         };
+        // A slice carries its length, so the index is bounds-checked against it
+        // (fail closed, Rust semantics) before the subscript on read and write.
         match ty {
-            MirType::Slice(_) => Some(format!("{}.ptr[{}]", base_str, index_str)),
-            MirType::Ptr(inner) if matches!(inner.as_ref(), MirType::Slice(_)) => {
-                Some(format!("{}->ptr[{}]", base_str, index_str))
-            }
+            MirType::Slice(_) => Some(format!(
+                "{base_str}.ptr[bl_idx_chk((long long)({index_str}), {base_str}.len)]"
+            )),
+            MirType::Ptr(inner) if matches!(inner.as_ref(), MirType::Slice(_)) => Some(format!(
+                "{base_str}->ptr[bl_idx_chk((long long)({index_str}), {base_str}->len)]"
+            )),
+            _ => None,
+        }
+    }
+
+    /// If `base` indexes a fixed array `[T; N]`, return the bounds-checked
+    /// element access `base[bl_idx_chk(index, N)]`. The length N is a compile-time
+    /// constant carried by the array type, so the check is a static bound. Returns
+    /// `None` for non-array bases (a raw pointer has no length and stays an
+    /// unchecked subscript, matching an `unsafe` pointer deref).
+    fn array_element_access(
+        base: &MirValue,
+        base_str: &str,
+        index_str: &str,
+        locals: &[MirLocal],
+    ) -> Option<String> {
+        let ty = match base {
+            MirValue::Local(id) => &locals.get(id.0 as usize)?.ty,
+            _ => return None,
+        };
+        match ty {
+            MirType::Array(_, len) => Some(format!(
+                "{base_str}[bl_idx_chk((long long)({index_str}), {len}ULL)]"
+            )),
             _ => None,
         }
     }
@@ -3880,6 +3979,96 @@ impl CBackend {
                 let r = self.value_to_c(right, locals);
                 if *op == BinOp::Pow {
                     return Ok(format!("pow({}, {})", l, r));
+                }
+                // C's `%` is integer-only. A float remainder must lower to the
+                // C library `fmod`/`fmodf`, which matches Rust's `%` on floats
+                // (5.5 % 2.0 == 1.5). Without this the backend emitted `(a % b)`
+                // on doubles, which gcc rejects outright.
+                if *op == BinOp::Rem {
+                    let float_size = |v: &MirValue| -> Option<FloatSize> {
+                        match v {
+                            MirValue::Const(MirConst::Float(_, MirType::Float(sz))) => Some(*sz),
+                            MirValue::Local(id) => {
+                                match locals.get(id.0 as usize).map(|loc| &loc.ty) {
+                                    Some(MirType::Float(sz)) => Some(*sz),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(sz) = float_size(left).or_else(|| float_size(right)) {
+                        let f = match sz {
+                            FloatSize::F32 => "fmodf",
+                            FloatSize::F64 => "fmod",
+                        };
+                        return Ok(format!("{}({}, {})", f, l, r));
+                    }
+                }
+                // Integer division and remainder trap. Rust's `/` and `%` panic
+                // on a zero divisor and on the one signed overflow `MIN / -1`, in
+                // release as well as debug. Raw C `/`/`%` instead crash on a zero
+                // divisor, hang on i32/i64 `MIN / -1` under this toolchain, and,
+                // because a narrow operand promotes to `int`, silently return the
+                // wrong value for a narrow signed overflow ((int8_t)-128 / -1
+                // evaluates to -128 by wrap). Route every integer `/`/`%` through
+                // the runtime helper for the operand width and signedness so the
+                // result is a clean abort matching a Rust panic (exit 101). A
+                // float `/` stays IEEE (falls through to `/`) and a float `%` is
+                // handled by the fmod block above, so neither reaches here.
+                if *op == BinOp::Div || *op == BinOp::Rem {
+                    let int_type = |v: &MirValue| -> Option<(IntSize, bool)> {
+                        let ty = match v {
+                            MirValue::Const(MirConst::Int(_, t))
+                            | MirValue::Const(MirConst::Uint(_, t)) => t,
+                            MirValue::Local(id) => &locals.get(id.0 as usize)?.ty,
+                            _ => return None,
+                        };
+                        match ty {
+                            MirType::Int(size, signed) => Some((*size, *signed)),
+                            _ => None,
+                        }
+                    };
+                    // Prefer a Local operand's declared type over a literal's; the
+                    // two agree after type-checking, but a literal is the weaker
+                    // source of truth.
+                    let local_ty = match left {
+                        MirValue::Local(_) => int_type(left),
+                        _ => None,
+                    }
+                    .or_else(|| match right {
+                        MirValue::Local(_) => int_type(right),
+                        _ => None,
+                    });
+                    if let Some((size, signed)) = local_ty
+                        .or_else(|| int_type(left))
+                        .or_else(|| int_type(right))
+                    {
+                        let suffix = match (size, signed) {
+                            (IntSize::I8, true) => "i8",
+                            (IntSize::I16, true) => "i16",
+                            (IntSize::I32, true) => "i32",
+                            (IntSize::I64, true) | (IntSize::ISize, true) => "i64",
+                            (IntSize::I128, true) => "i128",
+                            (IntSize::I8, false) => "u8",
+                            (IntSize::I16, false) => "u16",
+                            (IntSize::I32, false) => "u32",
+                            (IntSize::I64, false) | (IntSize::ISize, false) => "u64",
+                            (IntSize::I128, false) => "u128",
+                        };
+                        let stem = if signed {
+                            if *op == BinOp::Div {
+                                "bl_idiv_"
+                            } else {
+                                "bl_irem_"
+                            }
+                        } else if *op == BinOp::Div {
+                            "bl_udiv_"
+                        } else {
+                            "bl_urem_"
+                        };
+                        return Ok(format!("{}{}({}, {})", stem, suffix, l, r));
+                    }
                 }
                 // String comparison: use strcmp when either operand is BuildString
                 if *op == BinOp::Eq || *op == BinOp::Ne {
@@ -3901,6 +4090,42 @@ impl CBackend {
                         });
                     }
                 }
+                // Shift-count masking. Rust wraps a shift count to the left
+                // operand's bit width (release semantics): `a << b` shifts by
+                // `b % bits`. C promotes a sub-`int` operand to 32-bit `int`
+                // before shifting, so a narrow type (i8/i16/u8/u16) shifted by
+                // a count at or past its width used the un-masked 32-bit count
+                // and printed a wrong value (255u8 >> 9 gave 0 instead of 127,
+                // 1u8 << 8 gave 0 instead of 1). Mask the count to the operand
+                // width for every integer width: for i32/i64 this equals the
+                // count-masking x86 already performs, so those stay correct
+                // while the narrow widths are fixed and the emitted C no longer
+                // depends on a target-specific shift rule. `<<`/`>>` bind
+                // tighter than `&`, so the masked count is fully parenthesized.
+                if *op == BinOp::Shl || *op == BinOp::Shr {
+                    let int_bits = |v: &MirValue| -> Option<u32> {
+                        let ty = match v {
+                            MirValue::Const(MirConst::Int(_, t))
+                            | MirValue::Const(MirConst::Uint(_, t)) => t,
+                            MirValue::Local(id) => &locals.get(id.0 as usize)?.ty,
+                            _ => return None,
+                        };
+                        match ty {
+                            MirType::Int(size, _) => Some(match size {
+                                IntSize::I8 => 8,
+                                IntSize::I16 => 16,
+                                IntSize::I32 => 32,
+                                IntSize::I64 | IntSize::ISize => 64,
+                                IntSize::I128 => 128,
+                            }),
+                            _ => None,
+                        }
+                    };
+                    if let Some(bits) = int_bits(left) {
+                        let op_str = self.binop_to_c(*op);
+                        return Ok(format!("({} {} (({}) & {}))", l, op_str, r, bits - 1));
+                    }
+                }
                 let op_str = self.binop_to_c(*op);
                 format!("({} {} {})", l, op_str, r)
             }
@@ -3908,17 +4133,52 @@ impl CBackend {
                 let v = self.value_to_c(operand, locals);
                 let op_str = match op {
                     UnaryOp::Not => "!",
+                    UnaryOp::BitNot => "~",
                     UnaryOp::Neg => "-",
                 };
                 format!("({}{})", op_str, v)
             }
-            MirRValue::Ref { is_mut: _, place } => {
-                let local_name = self.local_name(place.local, locals);
-                format!("&{}", local_name)
+            MirRValue::Ref { is_mut: _, place } | MirRValue::AddressOf { is_mut: _, place } => {
+                // Address of the REAL location. A bare local keeps `&x`; a place
+                // with projections composes the lvalue (`&(arr[i].field)`) so a
+                // reference or a projected store writes through, never into a copy.
+                if place.projections.is_empty() {
+                    format!("&{}", self.local_name(place.local, locals))
+                } else {
+                    format!("&({})", self.place_to_c(place, locals)?)
+                }
             }
-            MirRValue::AddressOf { is_mut: _, place } => {
-                let local_name = self.local_name(place.local, locals);
-                format!("&{}", local_name)
+            MirRValue::Cast {
+                kind: CastKind::FloatToInt,
+                value,
+                ty,
+            } => {
+                // A raw C cast of a float outside the target integer's range,
+                // or of NaN, is undefined behavior. Route through a saturating
+                // helper so the result matches Rust's `as` (clamp to min/max,
+                // NaN -> 0). The outer cast pins the exact target C type, which
+                // covers isize/usize/i128 whose helper returns a wider integer.
+                let v = self.value_to_c(value, locals);
+                let t = self.type_to_c(ty);
+                let helper = match ty {
+                    MirType::Int(size, signed) => match (size, signed) {
+                        (IntSize::I8, true) => "bl_f2i_i8",
+                        (IntSize::I8, false) => "bl_f2i_u8",
+                        (IntSize::I16, true) => "bl_f2i_i16",
+                        (IntSize::I16, false) => "bl_f2i_u16",
+                        (IntSize::I32, true) => "bl_f2i_i32",
+                        (IntSize::I32, false) => "bl_f2i_u32",
+                        (IntSize::I64, true) | (IntSize::ISize, true) => "bl_f2i_i64",
+                        (IntSize::I64, false) | (IntSize::ISize, false) => "bl_f2i_u64",
+                        (IntSize::I128, _) => "bl_f2i_i128",
+                    },
+                    _ => "",
+                };
+                if helper.is_empty() {
+                    format!("(({}){})", t, v)
+                } else {
+                    format!("(({}){}({}))", t, helper, v)
+                }
             }
             MirRValue::Cast { kind: _, value, ty } => {
                 let v = self.value_to_c(value, locals);
@@ -3976,7 +4236,53 @@ impl CBackend {
                         }
                     }
                     AggregateKind::Variant(name, disc, variant_name) => {
-                        if vals.is_empty() {
+                        // Option/Result are prelude builtins with a fixed field
+                        // layout (`.has_value`/`.value`, `.is_ok`/`.ok`/`.err`)
+                        // that the runtime methods and match-lowering read. A
+                        // path-qualified construction (`Option::Some(x)`) reaches
+                        // this generic aggregate path when the program also
+                        // declares `enum Option`; emit the builtin shape so it
+                        // agrees with those readers instead of the generic
+                        // `.tag`/`.data` shape (which the Option typedef lacks).
+                        let is_builtin_sum = matches!(name.as_ref(), "Option" | "Result");
+                        if is_builtin_sum {
+                            // Pick the 8-byte union slot from the payload type.
+                            let slot = match operands.first() {
+                                Some(MirValue::Local(id)) => {
+                                    match locals.get(id.0 as usize).map(|l| &l.ty) {
+                                        Some(MirType::Float(_)) => "f",
+                                        Some(MirType::Ptr(_)) => "p",
+                                        _ => "i",
+                                    }
+                                }
+                                Some(MirValue::Const(MirConst::Float(..))) => "f",
+                                _ => "i",
+                            };
+                            let cast = match slot {
+                                "f" => "(double)",
+                                "p" => "(void*)",
+                                _ => "(int64_t)",
+                            };
+                            match (name.as_ref(), variant_name.as_ref()) {
+                                ("Option", "Some") if !vals.is_empty() => format!(
+                                    "((Option){{ .has_value = true, .value = {{ .{} = {}{} }} }})",
+                                    slot, cast, vals[0]
+                                ),
+                                ("Option", "Some") => "((Option){ .has_value = true })".to_string(),
+                                ("Option", _) => "((Option){ .has_value = false })".to_string(),
+                                ("Result", "Ok") if !vals.is_empty() => format!(
+                                    "((Result){{ .is_ok = true, .ok = {{ .ok_{} = {}{} }} }})",
+                                    slot, cast, vals[0]
+                                ),
+                                ("Result", "Ok") => "((Result){ .is_ok = true })".to_string(),
+                                ("Result", _) if !vals.is_empty() => format!(
+                                    "((Result){{ .is_ok = false, .err = {{ .err_{} = {}{} }} }})",
+                                    slot, cast, vals[0]
+                                ),
+                                ("Result", _) => "((Result){ .is_ok = false })".to_string(),
+                                _ => unreachable!(),
+                            }
+                        } else if vals.is_empty() {
                             // Unit variant - no data fields
                             format!("({}){{ .tag = {} }}", name, disc)
                         } else {
@@ -4124,10 +4430,11 @@ impl CBackend {
                         .unwrap_or(false),
                     _ => false,
                 };
+                let field = Self::escape_c_keyword(field_name);
                 if is_ptr {
-                    format!("{}->{}", base_str, field_name)
+                    format!("{}->{}", base_str, field)
                 } else {
-                    format!("{}.{}", base_str, field_name)
+                    format!("{}.{}", base_str, field)
                 }
             }
             MirRValue::VariantField {
@@ -4189,9 +4496,15 @@ impl CBackend {
                         _ => false,
                     };
                     if base_is_string {
-                        format!("((uint8_t*){}.ptr)[{}]", base_str, index_str)
+                        format!(
+                            "((uint8_t*){base_str}.ptr)[bl_idx_chk((long long)({index_str}), {base_str}.len)]"
+                        )
                     } else if let Some(access) =
                         Self::slice_element_access(base, &base_str, &index_str, locals)
+                    {
+                        access
+                    } else if let Some(access) =
+                        Self::array_element_access(base, &base_str, &index_str, locals)
                     {
                         access
                     } else {
@@ -4274,7 +4587,9 @@ impl CBackend {
             Some(MirType::Int(IntSize::I64 | IntSize::I128 | IntSize::ISize, false)) => "%llu",
             Some(MirType::Int(_, true)) => "%d",
             Some(MirType::Int(_, false)) => "%u",
-            Some(MirType::Float(_)) => "%g",
+            // Floats print via a runtime formatter that renders Rust's Display
+            // (shortest round-tripping decimal), passed through printf as "%s".
+            Some(MirType::Float(_)) => "%s",
             Some(MirType::Bool) => "%s",
             Some(MirType::Ptr(_)) => "%p",
             Some(MirType::Struct(name)) if name.as_ref() == "BuildString" => "%s",
@@ -4292,6 +4607,13 @@ impl CBackend {
             match value {
                 MirValue::Const(MirConst::Str(idx)) => format!("__str{}", idx),
                 _ => format!("{}.ptr", rendered),
+            }
+        } else if let Some(MirType::Float(size)) = self.value_mir_type(value, locals) {
+            // Render floats with the runtime shortest-round-trip formatter so
+            // printed output matches Rust's Display instead of %g's 6 digits.
+            match size {
+                FloatSize::F32 => format!("bl_fmt_f32({})", rendered),
+                FloatSize::F64 => format!("bl_fmt_f64({})", rendered),
             }
         } else {
             rendered
@@ -4511,6 +4833,69 @@ impl CBackend {
             .unwrap_or_else(|| format!("_{}", id.0))
     }
 
+    /// Render a place (lvalue) as a C expression: the base local followed by
+    /// each projection. `&(place_to_c(p))` is the address of the REAL location,
+    /// which is what makes `&mut p.x`, `&mut arr[i]`, `arr[0].x = v`, and
+    /// `a.b.c = v` write through instead of into a copied temporary. Deref and
+    /// Field track the running type so a field through a pointer renders `->`.
+    fn place_to_c(&self, place: &MirPlace, locals: &[MirLocal]) -> CodegenResult<String> {
+        let mut expr = self.local_name(place.local, locals);
+        let mut cur_ty = locals.get(place.local.0 as usize).map(|l| l.ty.clone());
+        // Unwrap one collection layer to the element type (for an Index step).
+        let elem_of = |ty: &Option<MirType>| -> Option<MirType> {
+            match ty {
+                Some(MirType::Array(elem, _))
+                | Some(MirType::Slice(elem))
+                | Some(MirType::Vec(elem)) => Some((**elem).clone()),
+                Some(MirType::Ptr(inner)) => match inner.as_ref() {
+                    MirType::Array(elem, _) | MirType::Slice(elem) => Some((**elem).clone()),
+                    other => Some(other.clone()),
+                },
+                _ => None,
+            }
+        };
+        for proj in &place.projections {
+            match proj {
+                PlaceProjection::Deref => {
+                    expr = format!("(*{})", expr);
+                    cur_ty = match cur_ty {
+                        Some(MirType::Ptr(inner)) => Some(*inner),
+                        _ => None,
+                    };
+                }
+                PlaceProjection::Field(_idx, name, fty) => {
+                    let field = Self::escape_c_keyword(name);
+                    if matches!(cur_ty, Some(MirType::Ptr(_))) {
+                        expr = format!("{}->{}", expr, field);
+                    } else {
+                        expr = format!("({}).{}", expr, field);
+                    }
+                    cur_ty = Some(fty.clone());
+                }
+                PlaceProjection::Index(idx_local) => {
+                    let idx = self.local_name(*idx_local, locals);
+                    expr = format!("({})[{}]", expr, idx);
+                    cur_ty = elem_of(&cur_ty);
+                }
+                PlaceProjection::ConstantIndex { offset, from_end } => {
+                    if *from_end {
+                        return Err(CodegenError::Internal(
+                            "from-end constant index is not supported as a C place".to_string(),
+                        ));
+                    }
+                    expr = format!("({})[{}]", expr, offset);
+                    cur_ty = elem_of(&cur_ty);
+                }
+                PlaceProjection::Subslice { .. } | PlaceProjection::Downcast(_) => {
+                    return Err(CodegenError::Internal(
+                        "subslice/downcast is not supported as a C place".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(expr)
+    }
+
     /// Increment 5: emit a guarded free for a flag-managed owner:
     /// `if (__bl_live_N) { build_string_free(<name>); __bl_live_N = 0; }`.
     /// Soundness invariant (verbatim, also in `analysis::flags` and the flag
@@ -4564,21 +4949,19 @@ impl CBackend {
         )
     }
 
-    /// Check if a function name is a BuildLang runtime helper or a standard
-    /// C math/stdlib function that must NOT be escaped.  These names are
-    /// Escape C reserved keywords used as identifiers by appending an underscore.
+    /// Escape a struct/field identifier that collides with a reserved C word by
+    /// appending an underscore. Delegates to `is_c_reserved` so the definition
+    /// site and every access site share one list; a narrower hand-maintained set
+    /// here let MSVC-reserved names such as `near`/`far` (Win16 legacy keywords)
+    /// leak through as `double near;`, which MSVC rejects with C2208.
     fn escape_c_keyword(name: &str) -> String {
-        match name {
-            "default" | "register" | "volatile" | "signed" | "unsigned" | "auto" | "extern"
-            | "static" | "typedef" | "union" | "enum" | "struct" | "switch" | "case" | "break"
-            | "continue" | "goto" | "return" | "if" | "else" | "while" | "do" | "for"
-            | "inline" | "restrict" | "const" => format!("{}_", name),
-            _ => name.to_string(),
+        if Self::is_c_reserved(name) {
+            format!("{}_", name)
+        } else {
+            name.to_string()
         }
     }
 
-    /// produced by the lowerer for builtin operations and should pass through
-    /// to C unchanged.
     /// Collect block IDs that need labels (targeted by non-sequential jumps).
     /// A block needs a label if ANY block other than its immediate predecessor
     /// has a jump (goto/if/switch/call) targeting it.
@@ -4651,6 +5034,13 @@ impl CBackend {
         }
         fn collect_place(place: &MirPlace, used: &mut std::collections::HashSet<LocalId>) {
             used.insert(place.local);
+            // A place can index by a local (`base[i]`); that index local is used
+            // by the emitted lvalue even though it never appears as a value here.
+            for proj in &place.projections {
+                if let PlaceProjection::Index(idx) = proj {
+                    used.insert(*idx);
+                }
+            }
         }
 
         for block in blocks {
@@ -6911,14 +7301,18 @@ fn main() {
             .expect("Failed to generate C code");
         let code = output.as_string().unwrap();
 
-        // Verify struct constant globals are emitted with initializers
+        // Verify struct constant globals are emitted with initializers.
+        // Static-storage globals use a brace-init list `{ ... }`, NOT a compound
+        // literal `(Color){ ... }`: a compound literal is not a constant
+        // expression, so MSVC rejects it as a file-scope initializer with C2099.
+        // See `const_to_c_static`. Do not reintroduce the `(Color)` cast here.
         assert!(
-            code.contains("const Color WHITE = (Color)"),
+            code.contains("const Color WHITE = {"),
             "Expected const Color WHITE global in:\n{}",
             code
         );
         assert!(
-            code.contains("const Color BLACK = (Color)"),
+            code.contains("const Color BLACK = {"),
             "Expected const Color BLACK global in:\n{}",
             code
         );

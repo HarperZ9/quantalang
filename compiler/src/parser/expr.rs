@@ -62,10 +62,33 @@ impl<'a> Parser<'a> {
         self.parse_expr_with_bp(0)
     }
 
+    /// Parse an expression in statement position under Rust's ExprWithBlock
+    /// rule. A block-like leading atom (`if`, `match`, a bare `{...}` block,
+    /// `loop`/`while`/`for`, `unsafe`/`async`/`handle`) is a complete statement
+    /// on its own: it does not bind a trailing infix or postfix operator, so a
+    /// following `*x` / `-x` / `&x` / `.foo()` begins a NEW statement instead of
+    /// being read as `block * x`, `block - x`, and so on. Without this a body
+    /// like `if c { .. } \n *ptr = v;` parses the `*` as multiplication
+    /// continuing the `if`, then the later `=` makes the whole `if * ptr` an
+    /// invalid assignment target.
+    ///
+    /// Any other leading atom resumes the ordinary Pratt loop, so
+    /// value-position parsing (the right side of `=`, call arguments, operands)
+    /// is untouched: only a statement that STARTS with a block-like expression
+    /// is affected. This mirrors the match-arm body rule; `continue_expr_with_bp`
+    /// is the shared tail.
+    pub fn parse_stmt_expr(&mut self) -> ParseResult<Expr> {
+        let lhs = self.parse_prefix_expr()?;
+        if Self::is_block_like_expr(&lhs) {
+            return Ok(lhs);
+        }
+        self.continue_expr_with_bp(lhs, 0)
+    }
+
     /// Parse an expression with minimum binding power.
     fn parse_expr_with_bp(&mut self, min_bp: u8) -> ParseResult<Expr> {
         // Parse prefix (atoms and unary operators)
-        let mut lhs = self.parse_prefix_expr()?;
+        let lhs = self.parse_prefix_expr()?;
 
         // Control flow expressions (while, for, loop, if-without-value) are
         // statement-level constructs that cannot be the left operand of a
@@ -77,9 +100,16 @@ impl<'a> Parser<'a> {
             return Ok(lhs);
         }
 
-        loop {
-            // Type cast handled outside the loop (see above)
+        self.continue_expr_with_bp(lhs, min_bp)
+    }
 
+    /// Continue an expression from an already-parsed prefix atom, binding
+    /// postfix and infix operators at or above `min_bp`. Split out of
+    /// `parse_expr_with_bp` so a caller that has parsed the atom itself -- a
+    /// match-arm body, which must classify the atom as block-like or value
+    /// before any operator binds -- can resume the ordinary Pratt loop.
+    fn continue_expr_with_bp(&mut self, mut lhs: Expr, min_bp: u8) -> ParseResult<Expr> {
+        loop {
             // Try postfix operators first (highest precedence)
             if let Some(postfix_bp) = self.postfix_binding_power() {
                 if postfix_bp >= min_bp {
@@ -113,6 +143,27 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// Check whether an expression is "block-like" (Rust's ExprWithBlock): a
+    /// construct that closes on a brace and is complete on its own. As a
+    /// match-arm body such an expression does not continue into trailing
+    /// postfix/infix operators, so it cannot swallow the following arm's
+    /// pattern, and its trailing comma is optional. A value body (anything
+    /// else) binds operators normally and must be terminated by `,` or `}`.
+    fn is_block_like_expr(expr: &Expr) -> bool {
+        matches!(
+            &expr.kind,
+            ExprKind::Block(_)
+                | ExprKind::If { .. }
+                | ExprKind::Match { .. }
+                | ExprKind::Loop { .. }
+                | ExprKind::While { .. }
+                | ExprKind::For { .. }
+                | ExprKind::Unsafe(_)
+                | ExprKind::Async { .. }
+                | ExprKind::Handle { .. }
+        )
+    }
+
     /// Parse a prefix expression (atoms and unary operators).
     fn parse_prefix_expr(&mut self) -> ParseResult<Expr> {
         let start = self.current_span();
@@ -131,6 +182,14 @@ impl<'a> Parser<'a> {
             // IDENTIFIERS AND PATHS
             // =====================================================================
             TokenKind::Ident | TokenKind::RawIdent => self.parse_path_or_struct_expr(),
+
+            // Contextual keywords used as a plain value (a variable, field, call,
+            // or path named `default`/`module`/`effect`/`auto`). Their declaration
+            // forms are consumed by the item parser before expression parsing, so
+            // here they are ordinary identifiers and parse as such.
+            TokenKind::Keyword(_) if self.is_value_context_keyword() => {
+                self.parse_path_or_struct_expr()
+            }
 
             TokenKind::Keyword(Keyword::Self_) => {
                 self.advance();
@@ -376,9 +435,24 @@ impl<'a> Parser<'a> {
             // =====================================================================
             TokenKind::Keyword(Keyword::If) => self.parse_if_expr(),
             TokenKind::Keyword(Keyword::Match) => self.parse_match_expr(),
-            TokenKind::Keyword(Keyword::Loop) => self.parse_loop_expr(),
-            TokenKind::Keyword(Keyword::While) => self.parse_while_expr(),
-            TokenKind::Keyword(Keyword::For) => self.parse_for_expr(),
+            TokenKind::Keyword(Keyword::Loop) => self.parse_loop_expr(None),
+            TokenKind::Keyword(Keyword::While) => self.parse_while_expr(None),
+            TokenKind::Keyword(Keyword::For) => self.parse_for_expr(None),
+
+            // A loop label: `'name: loop`, `'name: while`, `'name: for`. Only a
+            // loop may be labelled, so require a loop keyword after the `:`. The
+            // matching `break 'name` / `continue 'name` forms are parsed by
+            // `parse_break_expr` / `parse_continue_expr`.
+            TokenKind::Lifetime if matches!(self.peek().kind, TokenKind::Colon) => {
+                let label = self.expect_lifetime()?.name;
+                self.expect(&TokenKind::Colon)?;
+                match self.current_kind() {
+                    TokenKind::Keyword(Keyword::Loop) => self.parse_loop_expr(Some(label)),
+                    TokenKind::Keyword(Keyword::While) => self.parse_while_expr(Some(label)),
+                    TokenKind::Keyword(Keyword::For) => self.parse_for_expr(Some(label)),
+                    _ => Err(self.error_expected("`loop`, `while`, or `for` after loop label")),
+                }
+            }
 
             // =====================================================================
             // EFFECT SYSTEM
@@ -411,12 +485,9 @@ impl<'a> Parser<'a> {
             // =====================================================================
             // CLOSURES
             // =====================================================================
-            TokenKind::Or => self.parse_closure_expr(false, false),
-            TokenKind::OrOr => {
-                // || - closure with no params
-                self.advance();
-                self.parse_closure_body(Vec::new(), None, start, false, false)
-            }
+            // `|params|` and `||` (zero params) both route through the closure
+            // parser, which handles the `OrOr` empty-list case itself.
+            TokenKind::Or | TokenKind::OrOr => self.parse_closure_expr(false, false),
 
             TokenKind::Keyword(Keyword::Move) => {
                 self.advance();
@@ -425,9 +496,16 @@ impl<'a> Parser<'a> {
 
             TokenKind::Keyword(Keyword::Async) => {
                 self.advance();
+                // Eat an optional `move` first: it captures for both the async
+                // block (`async move { .. }`) and the async closure
+                // (`async move || ..`). The block-vs-closure decision is made on
+                // the token that follows it, so `move` must be consumed before
+                // the `{` check rather than inside the block branch (where it
+                // was unreachable and left `async move { .. }` to fall through to
+                // the closure parser and fail with `expected |, found {`).
+                let is_move = self.eat_keyword(Keyword::Move);
                 if self.check(&TokenKind::OpenDelim(Delimiter::Brace)) {
-                    // async { ... }
-                    let is_move = self.eat_keyword(Keyword::Move);
+                    // async { ... } or async move { ... }
                     let block = self.parse_block()?;
                     let span = start.merge(&block.span);
                     Ok(Expr::new(
@@ -438,8 +516,7 @@ impl<'a> Parser<'a> {
                         span,
                     ))
                 } else {
-                    // async || or async move ||
-                    let is_move = self.eat_keyword(Keyword::Move);
+                    // async || ... or async move || ...
                     self.parse_closure_expr(is_move, true)
                 }
             }
@@ -539,7 +616,7 @@ impl<'a> Parser<'a> {
             // Index: expr[index]
             TokenKind::OpenDelim(Delimiter::Bracket) => {
                 self.advance();
-                let index = self.parse_expr()?;
+                let index = self.without_struct_restriction(|p| p.parse_expr())?;
                 let end = self
                     .expect(&TokenKind::CloseDelim(Delimiter::Bracket))?
                     .span;
@@ -903,6 +980,14 @@ impl<'a> Parser<'a> {
                         | Keyword::SelfType
                         | Keyword::Crate
                         | Keyword::Super
+                        // Value-position contextual keywords parse as ordinary
+                        // identifiers here (see `is_value_context_keyword` and the
+                        // `parse_prefix_expr` value-keyword arm); a gated operand
+                        // such as `return default;` must treat them as expr-start.
+                        | Keyword::Default
+                        | Keyword::Module
+                        | Keyword::Effect
+                        | Keyword::Auto
                 )
                 | TokenKind::DslBlock { .. }
         )
@@ -1127,6 +1212,11 @@ impl<'a> Parser<'a> {
         let mut rest = None;
 
         while !self.check(&TokenKind::CloseDelim(Delimiter::Brace)) && !self.is_eof() {
+            // A field may carry outer attributes, e.g. `#[cfg(unix)] ino`.
+            // Parse them before the `..rest` check so a bare `..` is still
+            // recognized after any leading attributes.
+            let attrs = self.parse_outer_attrs()?;
+
             // Check for ..rest
             if self.check(&TokenKind::DotDot) {
                 self.advance();
@@ -1152,7 +1242,7 @@ impl<'a> Parser<'a> {
             fields.push(FieldExpr {
                 name,
                 value,
-                attrs: Vec::new(),
+                attrs,
                 span: field_span,
             });
 
@@ -1209,7 +1299,7 @@ impl<'a> Parser<'a> {
             return Ok(Expr::new(ExprKind::Tuple(Vec::new()), start.merge(&end)));
         }
 
-        let first = self.parse_expr()?;
+        let first = self.without_struct_restriction(|p| p.parse_expr())?;
 
         // Check for tuple
         if self.check(&TokenKind::Comma) {
@@ -1217,7 +1307,7 @@ impl<'a> Parser<'a> {
             let mut elements = vec![first];
 
             while !self.check(&TokenKind::CloseDelim(Delimiter::Paren)) && !self.is_eof() {
-                elements.push(self.parse_expr()?);
+                elements.push(self.without_struct_restriction(|p| p.parse_expr())?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -1244,12 +1334,16 @@ impl<'a> Parser<'a> {
             return Ok(Expr::new(ExprKind::Array(Vec::new()), start.merge(&end)));
         }
 
-        let first = self.parse_expr()?;
+        // An element may carry outer attributes, e.g. `#[cfg(windows)] path`.
+        // `ExprKind::Array` holds bare expressions, so the attributes are
+        // parsed and dropped rather than attached.
+        let _ = self.parse_outer_attrs()?;
+        let first = self.without_struct_restriction(|p| p.parse_expr())?;
 
         // Repeat: [expr; count]
         if self.check(&TokenKind::Semi) {
             self.advance();
-            let count = self.parse_expr()?;
+            let count = self.without_struct_restriction(|p| p.parse_expr())?;
             let end = self
                 .expect(&TokenKind::CloseDelim(Delimiter::Bracket))?
                 .span;
@@ -1268,7 +1362,8 @@ impl<'a> Parser<'a> {
 
         if self.eat(&TokenKind::Comma) {
             while !self.check(&TokenKind::CloseDelim(Delimiter::Bracket)) && !self.is_eof() {
-                elements.push(self.parse_expr()?);
+                let _ = self.parse_outer_attrs()?;
+                elements.push(self.without_struct_restriction(|p| p.parse_expr())?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -1399,7 +1494,35 @@ impl<'a> Parser<'a> {
             };
 
             self.expect(&TokenKind::FatArrow)?;
-            let body = self.parse_expr()?;
+
+            // Parse the arm body under Rust's ExprWithBlock / ExprWithoutBlock
+            // rule. Parse the prefix atom first, then classify it: a block-like
+            // body (block, if, match, loop/while/for, unsafe/async/handle
+            // block) ends at its closing brace and does NOT bind trailing
+            // postfix/infix operators, so it cannot consume the following arm's
+            // pattern -- its trailing comma is optional. A value body resumes
+            // the ordinary Pratt loop so operators bind (`x + 1`, `f()?`, `a.b`)
+            // and must be terminated by `,` or the closing `}`.
+            //
+            // Exception: a trailing `.` or `?` immediately after a block-like
+            // head reopens the expression, so `X => if c {a} else {b}.to_string(),`
+            // binds the method call, matching Rust. This is unambiguous because
+            // no arm pattern can begin with `.` or `?` (range patterns use the
+            // distinct `..`/`..=` tokens), so the continuation cannot swallow the
+            // following arm. `(` and `[` are deliberately NOT reopened: a bare
+            // `(pat)`/`[slice]` arm after a block body must stay a separate arm,
+            // and infix stays terminal for the same reason. A reopened body is a
+            // value expression, so its comma is then required.
+            let atom = self.parse_prefix_expr()?;
+            let head_is_block = Self::is_block_like_expr(&atom);
+            let reopen_postfix = head_is_block
+                && matches!(self.current_kind(), TokenKind::Dot | TokenKind::Question);
+            let body_is_block = head_is_block && !reopen_postfix;
+            let body = if body_is_block {
+                atom
+            } else {
+                self.continue_expr_with_bp(atom, 0)?
+            };
 
             let arm_span = arm_start.merge(&body.span);
 
@@ -1411,21 +1534,13 @@ impl<'a> Parser<'a> {
                 span: arm_span,
             });
 
-            // Comma is optional after block expression bodies (Rust convention)
-            if !self.eat(&TokenKind::Comma) {
-                if !self.check(&TokenKind::CloseDelim(Delimiter::Brace)) {
-                    // Check if this looks like the start of another arm - if so, allow missing comma
-                    let looks_like_next_arm = self.check_ident()
-                        || self.check(&TokenKind::Underscore)
-                        || self.check(&TokenKind::Pound)
-                        || self.check(&TokenKind::At)
-                        || self.check_keyword(Keyword::Self_)
-                        || self.check_keyword(Keyword::SelfType)
-                        || self.check(&TokenKind::Or);
-                    if !looks_like_next_arm {
-                        return Err(self.error_expected("`,` or `}`"));
-                    }
-                }
+            // Comma is required after a value body and optional after a
+            // block-like body; a closing `}` ends the arm list in either case.
+            if !self.eat(&TokenKind::Comma)
+                && !self.check(&TokenKind::CloseDelim(Delimiter::Brace))
+                && !body_is_block
+            {
+                return Err(self.error_expected("`,` or `}`"));
             }
         }
 
@@ -1441,8 +1556,10 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    /// Parse loop expression.
-    fn parse_loop_expr(&mut self) -> ParseResult<Expr> {
+    /// Parse loop expression. An optional loop label (`'name:`) is parsed by the
+    /// caller and threaded in; `break`/`continue` already accept the matching
+    /// `'name` form.
+    fn parse_loop_expr(&mut self, label: Option<Ident>) -> ParseResult<Expr> {
         let start = self.expect_keyword(Keyword::Loop)?;
         let body = self.parse_block()?;
         let span = start.merge(&body.span);
@@ -1450,19 +1567,19 @@ impl<'a> Parser<'a> {
         Ok(Expr::new(
             ExprKind::Loop {
                 body: Box::new(body),
-                label: None,
+                label,
             },
             span,
         ))
     }
 
     /// Parse while expression.
-    fn parse_while_expr(&mut self) -> ParseResult<Expr> {
+    fn parse_while_expr(&mut self, label: Option<Ident>) -> ParseResult<Expr> {
         let start = self.expect_keyword(Keyword::While)?;
 
         // Check for while let
         if self.check_keyword(Keyword::Let) {
-            return self.parse_while_let_expr(start);
+            return self.parse_while_let_expr(start, label);
         }
 
         let old_restrictions = self.restrictions;
@@ -1477,14 +1594,18 @@ impl<'a> Parser<'a> {
             ExprKind::While {
                 condition: Box::new(condition),
                 body: Box::new(body),
-                label: None,
+                label,
             },
             span,
         ))
     }
 
     /// Parse while let expression.
-    fn parse_while_let_expr(&mut self, start: crate::lexer::Span) -> ParseResult<Expr> {
+    fn parse_while_let_expr(
+        &mut self,
+        start: crate::lexer::Span,
+        label: Option<Ident>,
+    ) -> ParseResult<Expr> {
         self.expect_keyword(Keyword::Let)?;
         let pattern = self.parse_pattern()?;
         self.expect(&TokenKind::Eq)?;
@@ -1502,14 +1623,14 @@ impl<'a> Parser<'a> {
                 pattern: Box::new(pattern),
                 expr: Box::new(expr),
                 body: Box::new(body),
-                label: None,
+                label,
             },
             span,
         ))
     }
 
     /// Parse for expression.
-    fn parse_for_expr(&mut self) -> ParseResult<Expr> {
+    fn parse_for_expr(&mut self, label: Option<Ident>) -> ParseResult<Expr> {
         let start = self.expect_keyword(Keyword::For)?;
         let pattern = self.parse_pattern()?;
         self.expect_keyword(Keyword::In)?;
@@ -1527,7 +1648,7 @@ impl<'a> Parser<'a> {
                 pattern: Box::new(pattern),
                 iter: Box::new(iter),
                 body: Box::new(body),
-                label: None,
+                label,
             },
             span,
         ))
@@ -1603,6 +1724,19 @@ impl<'a> Parser<'a> {
     /// Parse closure expression.
     fn parse_closure_expr(&mut self, is_move: bool, is_async: bool) -> ParseResult<Expr> {
         let start = self.current_span();
+
+        // `||` lexes as a single `OrOr` token, so a zero-parameter closure never
+        // presents two separate `|`s. Consume it as an empty parameter list. This
+        // covers bare `|| body`, `move || body`, and `async || body` uniformly,
+        // including an explicit `-> T` return type.
+        if self.eat(&TokenKind::OrOr) {
+            let return_type = if self.eat(&TokenKind::Arrow) {
+                Some(Box::new(self.parse_type()?))
+            } else {
+                None
+            };
+            return self.parse_closure_body(Vec::new(), return_type, start, is_move, is_async);
+        }
 
         self.expect(&TokenKind::Or)?;
 
@@ -1883,6 +2017,303 @@ mod tests {
         parser.parse_expr()
     }
 
+    /// Parse a standalone type from its source text.
+    fn parse_type_str(s: &str) -> ParseResult<Type> {
+        let source = LexerSourceFile::new("test.bld", s.to_string());
+        let mut lexer = Lexer::new(&source);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(&source, tokens);
+        parser.parse_type()
+    }
+
+    // =========================================================================
+    // CONTEXTUAL KEYWORDS IN VALUE POSITION
+    // =========================================================================
+
+    #[test]
+    fn value_context_keywords_parse_as_identifiers() {
+        // `default`/`module`/`effect`/`auto` are keywords only in item
+        // position; used as a plain value each is an ordinary identifier.
+        // Their declaration forms are consumed by the item parser before an
+        // expression is ever parsed, so here they must route through the same
+        // path/identifier parser as any other name.
+        for word in ["default", "module", "effect", "auto"] {
+            let expr = parse_expr_str(word)
+                .unwrap_or_else(|e| panic!("`{word}` should parse as a value expression: {e:?}"));
+            match &expr.kind {
+                ExprKind::Ident(id) => {
+                    assert_eq!(id.as_str(), word, "identifier name should be preserved")
+                }
+                other => panic!("`{word}` parsed as {other:?}, expected ExprKind::Ident"),
+            }
+        }
+    }
+
+    #[test]
+    fn value_context_keywords_parse_as_return_operand() {
+        // `can_begin_expr` gates the optional operand of `return`. The
+        // value-position contextual keywords parse as ordinary identifiers,
+        // so `return default` must read `default` as the returned value, not
+        // as a bare `return` followed by a stray token.
+        for word in ["default", "module", "effect", "auto"] {
+            let src = format!("return {word}");
+            let expr = parse_expr_str(&src)
+                .unwrap_or_else(|e| panic!("`{src}` should parse as a value expression: {e:?}"));
+            match &expr.kind {
+                ExprKind::Return(Some(inner)) => match &inner.kind {
+                    ExprKind::Ident(id) => assert_eq!(
+                        id.as_str(),
+                        word,
+                        "returned identifier name should be preserved"
+                    ),
+                    other => panic!("`{src}` operand parsed as {other:?}, expected Ident"),
+                },
+                other => panic!("`{src}` parsed as {other:?}, expected Return(Some(_))"),
+            }
+        }
+    }
+
+    #[test]
+    fn path_root_keywords_parse_in_type_position() {
+        // `super`/`crate`/`self`/`Self` are legal as the FIRST segment of a
+        // qualified TYPE path (`super::T`, `crate::m::Foo`, `self::Bar`,
+        // `Self::Assoc`). The expression parser has its own primary arms for
+        // these roots, but the shared path parser rejected them, so a
+        // `super::`-qualified return type, field type, or bound failed to
+        // parse while its expression-position twin (`super::CONST`) did not.
+        for (src, root) in [
+            ("super::DecodeError", "super"),
+            ("crate::codec::Frame", "crate"),
+            ("self::Bar", "self"),
+            ("Self::Assoc", "Self"),
+        ] {
+            let ty = parse_type_str(src)
+                .unwrap_or_else(|e| panic!("`{src}` should parse as a type path: {e:?}"));
+            match &ty.kind {
+                TypeKind::Path(path) => assert_eq!(
+                    path.segments.first().unwrap().ident.as_str(),
+                    root,
+                    "`{src}` first path segment should be `{root}`"
+                ),
+                other => panic!("`{src}` parsed as {other:?}, expected TypeKind::Path"),
+            }
+        }
+    }
+
+    // =========================================================================
+    // ZERO-PARAMETER CLOSURES
+    // =========================================================================
+
+    #[test]
+    fn zero_param_closures_parse_in_every_flavor() {
+        // `||` is a single `OrOr` token, so the empty parameter list must be
+        // accepted by the closure parser directly -- not only by the bare
+        // prefix path. `move ||` and `async ||` route through
+        // `parse_closure_expr`, and an explicit `-> T` must still parse.
+        for src in [
+            "|| 1",
+            "move || 1",
+            "async || 1",
+            "|| -> i32 { 1 }",
+            "move || -> i32 { 1 }",
+        ] {
+            let expr = parse_expr_str(src)
+                .unwrap_or_else(|e| panic!("`{src}` should parse as a closure: {e:?}"));
+            match &expr.kind {
+                ExprKind::Closure { params, .. } => {
+                    assert!(params.is_empty(), "`{src}` should have zero params")
+                }
+                other => panic!("`{src}` parsed as {other:?}, expected ExprKind::Closure"),
+            }
+        }
+    }
+
+    #[test]
+    fn async_move_block_parses_as_an_async_block_not_a_closure() {
+        // `async move { .. }` is an async block that captures by move, distinct
+        // from a move closure. The block-vs-closure decision is made on the
+        // token after an optional `move`, so `move` must be consumed before the
+        // `{` check. Before the fix the async arm tested for `{` first and let
+        // `async move { .. }` fall through to the closure parser, which failed
+        // with `expected |, found {`.
+        let block_cases = [("async { 1 }", false), ("async move { 1 }", true)];
+        for (src, want_move) in block_cases {
+            let expr = parse_expr_str(src)
+                .unwrap_or_else(|e| panic!("`{src}` should parse as an async block: {e:?}"));
+            match &expr.kind {
+                ExprKind::Async { is_move, .. } => assert_eq!(
+                    *is_move, want_move,
+                    "`{src}` should have is_move={want_move}"
+                ),
+                other => panic!("`{src}` parsed as {other:?}, expected ExprKind::Async"),
+            }
+        }
+
+        // The closure forms are unaffected: `async ||` and `async move ||` stay
+        // async closures, with the move flag tracking the keyword.
+        let closure_cases = [("async || 1", false), ("async move || 1", true)];
+        for (src, want_move) in closure_cases {
+            let expr = parse_expr_str(src)
+                .unwrap_or_else(|e| panic!("`{src}` should parse as an async closure: {e:?}"));
+            match &expr.kind {
+                ExprKind::Closure {
+                    is_async, is_move, ..
+                } => {
+                    assert!(*is_async, "`{src}` should be an async closure");
+                    assert_eq!(
+                        *is_move, want_move,
+                        "`{src}` should have is_move={want_move}"
+                    );
+                }
+                other => panic!("`{src}` parsed as {other:?}, expected ExprKind::Closure"),
+            }
+        }
+    }
+
+    #[test]
+    fn outer_attributes_are_accepted_on_struct_fields_and_array_elements() {
+        // `#[cfg(..)]` and friends may prefix a struct-literal field or an
+        // array element. The struct field keeps its attributes; the array
+        // element's are parsed and dropped (the AST holds bare expressions).
+        let s = parse_expr_str("Foo { #[cfg(unix)] ino, path: p }")
+            .unwrap_or_else(|e| panic!("attributed struct field should parse: {e:?}"));
+        match &s.kind {
+            ExprKind::Struct { fields, .. } => {
+                assert_eq!(fields.len(), 2, "both fields present");
+                assert_eq!(fields[0].attrs.len(), 1, "first field keeps its attribute");
+                assert!(fields[1].attrs.is_empty(), "second field has no attribute");
+            }
+            other => panic!("parsed as {other:?}, expected ExprKind::Struct"),
+        }
+
+        let a = parse_expr_str("[#[cfg(windows)] a, b, #[cfg(unix)] c]")
+            .unwrap_or_else(|e| panic!("attributed array element should parse: {e:?}"));
+        match &a.kind {
+            ExprKind::Array(elems) => assert_eq!(elems.len(), 3, "all three elements present"),
+            other => panic!("parsed as {other:?}, expected ExprKind::Array"),
+        }
+    }
+
+    // =========================================================================
+    // MATCH-ARM BODIES: ExprWithBlock / ExprWithoutBlock comma rule
+    // =========================================================================
+
+    fn match_arms(expr: &Expr) -> &[MatchArm] {
+        match &expr.kind {
+            ExprKind::Match { arms, .. } => arms,
+            other => panic!("expected a match expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_bodied_arm_does_not_swallow_next_tuple_pattern() {
+        // A block-like body ends at its `}`; the arm that follows may begin
+        // with `(` (a tuple/or pattern) and must NOT be consumed as a call on
+        // the block. Before the ExprWithBlock rule the block body greedily
+        // parsed `(a, _) | (_, a)` as `block(a, _) | (_, a)` and then failed at
+        // the `=>` of that next arm. Reaching two arms proves they stayed
+        // separate -- a merge would have been a parse error, not two arms.
+        let src = "match (x, x) { \
+            (a, b) if a != b => { a + b } \
+            (a, _) | (_, a) => a \
+        }";
+        let expr = parse_expr_str(src)
+            .unwrap_or_else(|e| panic!("comma-optional block arm should parse: {e:?}"));
+        let arms = match_arms(&expr);
+        assert_eq!(arms.len(), 2, "both arms must survive as separate arms");
+        assert!(
+            matches!(&arms[0].body.kind, ExprKind::Block(_)),
+            "first arm body stays a block, not an over-consumed call expression"
+        );
+    }
+
+    #[test]
+    fn block_bodied_arm_allows_comma_less_literal_next_arm() {
+        // The following arm may also start with a literal. The block body does
+        // not bind it and no trailing comma is required after the block.
+        let src = "match x { 0 => { 1 } 1 => 2, _ => 3 }";
+        let expr = parse_expr_str(src)
+            .unwrap_or_else(|e| panic!("comma-optional block arm should parse: {e:?}"));
+        let arms = match_arms(&expr);
+        assert_eq!(arms.len(), 3, "three arms, none merged");
+    }
+
+    #[test]
+    fn value_bodied_arm_requires_a_trailing_comma() {
+        // A value (ExprWithoutBlock) body must be terminated by `,` or `}`.
+        // Omitting the comma between two value arms is a hard error; the parser
+        // fails closed rather than silently accepting it, matching Rust.
+        let src = "match x { 0 => 1 _ => 2 }";
+        assert!(
+            parse_expr_str(src).is_err(),
+            "comma-less value arms must be rejected"
+        );
+    }
+
+    #[test]
+    fn block_like_arm_body_does_not_bind_a_trailing_operator() {
+        // An `if/else` arm body is block-like: it terminates at the final `}`
+        // and does not absorb a trailing `+ 1`. The leftover `+` then fails to
+        // parse as the next arm's pattern, so the match is rejected rather than
+        // silently re-associating the operator onto the if-expression.
+        let src = "match x { _ => if x > 0 { 1 } else { 2 } + 1 }";
+        assert!(
+            parse_expr_str(src).is_err(),
+            "a block-like body must not bind a trailing operator"
+        );
+    }
+
+    #[test]
+    fn block_like_arm_body_binds_trailing_dot_method() {
+        // A `.method()` (or `?`) immediately after a block-like arm body reopens
+        // the expression and binds, matching Rust: `X => if c {a} else {b}.f(),`
+        // parses as `(if c {a} else {b}).f()`. `.`/`?` cannot begin an arm
+        // pattern (range patterns use the distinct `..`/`..=` tokens), so the
+        // continuation is unambiguous and cannot swallow the following arm.
+        for src in [
+            "match b { true => if b { \"a\" } else { \"c\" }.to_string(), _ => \"d\".to_string() }",
+            "match n { 0 => match n { _ => 1 }.clone(), _ => 2 }",
+            "match n { _ => { 5 }.clone() }",
+        ] {
+            parse_expr_str(src).unwrap_or_else(|e| {
+                panic!("block-like body followed by `.method()` must parse: {src:?}: {e:?}")
+            });
+        }
+        // The reopened body is a method call whose receiver is the block-like head.
+        let expr = parse_expr_str("match b { true => if b { 1 } else { 2 }.min(3), _ => 0 }")
+            .expect("reopened arm body should parse");
+        let arms = match_arms(&expr);
+        match &arms[0].body.kind {
+            ExprKind::MethodCall {
+                receiver, method, ..
+            } => {
+                assert_eq!(&*method.name, "min", "method name should be `min`");
+                assert!(
+                    matches!(&receiver.kind, ExprKind::If { .. }),
+                    "method receiver should be the if-expression, got {:?}",
+                    receiver.kind
+                );
+            }
+            other => panic!("expected a method-call arm body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_like_arm_body_does_not_reopen_on_call_or_index() {
+        // `(` and `[` after a block-like body are NOT reopened: a following
+        // `(pat)` / `[slice]` arm must stay a separate arm, preserving the
+        // no-swallow guarantee while `.`/`?` are allowed to continue.
+        let src = "match x { _ => { f() } (a, b) => a + b }";
+        let expr = parse_expr_str(src)
+            .unwrap_or_else(|e| panic!("a block body before a `(` arm must stay separate: {e:?}"));
+        let arms = match_arms(&expr);
+        assert_eq!(
+            arms.len(),
+            2,
+            "the `(a, b)` arm must not be consumed as a call on the block body"
+        );
+    }
+
     // =========================================================================
     // OPERATOR PRECEDENCE (core Pratt parser correctness)
     // =========================================================================
@@ -2132,6 +2563,54 @@ mod tests {
     // =========================================================================
 
     #[test]
+    fn labelled_loops_record_the_label() {
+        // A loop label (`'name:`) before `loop`/`while`/`for` is parsed and
+        // stored on the loop expression. The matching `break 'name` /
+        // `continue 'name` forms were already supported.
+        let for_expr = parse_expr_str("'outer: for i in xs { }").unwrap();
+        match &for_expr.kind {
+            ExprKind::For { label, .. } => {
+                assert_eq!(label.as_ref().map(|l| l.as_str()), Some("outer"));
+            }
+            other => panic!("expected labelled For, got {:?}", other),
+        }
+
+        let while_expr = parse_expr_str("'w: while c { }").unwrap();
+        match &while_expr.kind {
+            ExprKind::While { label, .. } => {
+                assert_eq!(label.as_ref().map(|l| l.as_str()), Some("w"));
+            }
+            other => panic!("expected labelled While, got {:?}", other),
+        }
+
+        let loop_expr = parse_expr_str("'l: loop { }").unwrap();
+        match &loop_expr.kind {
+            ExprKind::Loop { label, .. } => {
+                assert_eq!(label.as_ref().map(|l| l.as_str()), Some("l"));
+            }
+            other => panic!("expected labelled Loop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unlabelled_loop_has_no_label() {
+        // Regression: the common unlabelled form must still parse with no label,
+        // so the new lifetime branch does not perturb it.
+        let expr = parse_expr_str("for i in xs { }").unwrap();
+        match &expr.kind {
+            ExprKind::For { label, .. } => assert_eq!(*label, None),
+            other => panic!("expected For, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn label_not_followed_by_loop_is_an_error() {
+        // Only a loop may carry a label; `'x: 5` must fail closed with a
+        // diagnostic rather than mis-parse or panic.
+        assert!(parse_expr_str("'x: 5").is_err());
+    }
+
+    #[test]
     fn if_else_parses() {
         let expr = parse_expr_str("if x { 1 } else { 2 }").unwrap();
         match &expr.kind {
@@ -2257,5 +2736,35 @@ mod tests {
             }
             other => panic!("expected Mul(Add(1,2), 3), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn struct_literal_allowed_in_scrutinee_call_argument() {
+        // A `match`/`if` scrutinee forbids a bare struct literal (so `match S {`
+        // is not read as a struct), but that restriction must not leak into a
+        // call argument: `f(S { x: 1 })` inside the scrutinee is unambiguous.
+        let expr = parse_expr_str("match f(S { x: 1 }) { _ => 0 }")
+            .expect("struct literal inside a scrutinee call argument should parse");
+        let scrutinee = match &expr.kind {
+            ExprKind::Match { scrutinee, .. } => scrutinee,
+            other => panic!("expected Match, got {:?}", other),
+        };
+        let args = match &scrutinee.kind {
+            ExprKind::Call { args, .. } => args,
+            other => panic!("expected Call scrutinee, got {:?}", other),
+        };
+        assert!(
+            matches!(&args[0].kind, ExprKind::Struct { .. }),
+            "call argument should be a struct literal, got {:?}",
+            args[0].kind
+        );
+
+        // The same holds for an `if` condition and for bracket/paren nesting.
+        parse_expr_str("if f(S { x: 1 }) { 1 } else { 0 }")
+            .expect("struct literal inside an if-condition call argument should parse");
+        parse_expr_str("match arr[S { x: 1 }] { _ => 0 }")
+            .expect("struct literal inside a scrutinee index should parse");
+        parse_expr_str("match (S { x: 1 }) { _ => 0 }")
+            .expect("parenthesized struct literal in a scrutinee should parse");
     }
 }

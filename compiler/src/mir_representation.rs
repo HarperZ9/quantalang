@@ -434,7 +434,7 @@ fn collect_place(
             .insert(projection_name(projection).to_string());
         match projection {
             PlaceProjection::Deref => memory.deref_reads = true,
-            PlaceProjection::Field(_, _) => memory.field_reads = true,
+            PlaceProjection::Field(..) => memory.field_reads = true,
             PlaceProjection::Index(_)
             | PlaceProjection::ConstantIndex { .. }
             | PlaceProjection::Subslice { .. } => memory.index_reads = true,
@@ -611,6 +611,7 @@ fn bin_op_name(op: BinOp) -> &'static str {
 fn unary_op_name(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Not => "Not",
+        UnaryOp::BitNot => "BitNot",
         UnaryOp::Neg => "Neg",
     }
 }
@@ -642,7 +643,7 @@ fn aggregate_kind_name(kind: &AggregateKind) -> &'static str {
 fn projection_name(projection: &PlaceProjection) -> &'static str {
     match projection {
         PlaceProjection::Deref => "Deref",
-        PlaceProjection::Field(_, _) => "Field",
+        PlaceProjection::Field(..) => "Field",
         PlaceProjection::Index(_) => "Index",
         PlaceProjection::ConstantIndex { .. } => "ConstantIndex",
         PlaceProjection::Subslice { .. } => "Subslice",
@@ -927,8 +928,8 @@ fn write_mir_place(output: &mut String, label: &str, place: &MirPlace) {
 fn write_mir_projection(output: &mut String, label: &str, projection: &PlaceProjection) {
     match projection {
         PlaceProjection::Deref => push_line(output, format!("{label} Deref")),
-        PlaceProjection::Field(index, ty) => {
-            push_line(output, format!("{label} Field index={index}"));
+        PlaceProjection::Field(index, name, ty) => {
+            push_line(output, format!("{label} Field index={index} name={name}"));
             write_mir_type(output, &format!("{label}.type"), ty);
         }
         PlaceProjection::Index(local) => push_line(output, format!("{label} Index {}", local.0)),

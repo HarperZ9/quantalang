@@ -195,8 +195,24 @@ impl<'a> Parser<'a> {
             // =================================================================
             TokenKind::Keyword(Keyword::SelfType) => {
                 self.advance();
-                let path = Path::from_ident(Ident::new("Self", start));
-                Ok(Type::new(TypeKind::Path(path), start))
+                // `Self` can head a type-position projection such as
+                // `Self::Output` or `Poll<Self::Item>`. Continue consuming
+                // `::segment` (each with optional generics) the same way
+                // `parse_path_inner` does, so a projection parses instead of
+                // stopping at `::`. A bare `Self` with no `::` still yields the
+                // single-segment path it did before.
+                let mut segments = vec![PathSegment::from_ident(Ident::new("Self", start))];
+                while self.eat(&TokenKind::ColonColon) {
+                    let ident = self.expect_ident()?;
+                    let generics = if self.check(&TokenKind::Lt) {
+                        self.parse_generic_args()?
+                    } else {
+                        Vec::new()
+                    };
+                    segments.push(PathSegment::with_generics(ident, generics));
+                }
+                let span = start.merge(&self.tokens[self.pos.saturating_sub(1)].span);
+                Ok(Type::new(TypeKind::Path(Path::new(segments, span)), span))
             }
 
             // =================================================================
