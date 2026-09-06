@@ -13920,6 +13920,262 @@ fn in_bounds_index_reads_and_writes_correctly() {
     }
 }
 
+/// Integer division and remainder must trap the two cases Rust panics on: a zero
+/// divisor and the single signed overflow `MIN / -1`, in release as well as
+/// debug. The pre-fix backend emitted raw C `/` and `%`, which deviate from that
+/// contract three different ways, none of them a clean panic:
+///   - divide or remainder by zero: a hardware divide error. Under the active
+///     toolchain the process died with exit 148, no diagnostic.
+///   - `i32::MIN / -1` and `i64::MIN / -1`: the same fault, except MinGW gcc
+///     turned it into an infinite loop; the process HUNG (only a timeout killed
+///     it). Worse than a crash.
+///   - `i8::MIN / -1` (and `i16`): a SILENT WRONG ANSWER. A sub-`int` operand
+///     promotes to 32-bit `int`, so `(int8_t)-128 / -1` computes 128 and
+///     truncates back to -128, printed with exit 0.
+/// Every case now routes through a per-width runtime helper that aborts with exit
+/// 101 and the exact Rust panic text. Each assertion below therefore fails on the
+/// pre-fix binary: the zero cases exited 148 not 101, the wide-overflow cases
+/// hung, and the narrow-overflow case exited 0 with a value. The divisor (or the
+/// `-1`) is read from a heap `Vec` so the checker cannot fold the operation at
+/// compile time and the runtime helper is the path under test. The overflow
+/// dividends are built as `0 - MAX - 1` to reach `MIN` without an out-of-range
+/// literal.
+#[test]
+fn integer_divide_by_zero_and_overflow_abort_fail_closed() {
+    if !c_backend_ready() {
+        eprintln!("skipping integer div/rem fail-closed e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    // (name, source, required stderr substring) -- each must abort with exit 101.
+    let cases: [(&str, &str, &str); 7] = [
+        (
+            "div_zero_i32",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![0, 1];
+    let b = v[0];
+    let a = 7;
+    println!("{}", a / b);
+}
+"#,
+            "attempt to divide by zero",
+        ),
+        (
+            "rem_zero_i32",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![0, 1];
+    let b = v[0];
+    let a = 7;
+    println!("{}", a % b);
+}
+"#,
+            "attempt to calculate the remainder with a divisor of zero",
+        ),
+        (
+            "div_zero_u32",
+            r#"fn main() ~ Console {
+    let v: Vec<u32> = vec![0u32, 1u32];
+    let b = v[0];
+    let a: u32 = 7u32;
+    println!("{}", a / b);
+}
+"#,
+            "attempt to divide by zero",
+        ),
+        (
+            "div_overflow_i32",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![0];
+    let nb = v[0] - 1;
+    let a: i32 = 0 - 2147483647 - 1;
+    println!("{}", a / nb);
+}
+"#,
+            "attempt to divide with overflow",
+        ),
+        (
+            "rem_overflow_i32",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![0];
+    let nb = v[0] - 1;
+    let a: i32 = 0 - 2147483647 - 1;
+    println!("{}", a % nb);
+}
+"#,
+            "attempt to calculate the remainder with overflow",
+        ),
+        (
+            "div_overflow_i8",
+            r#"fn main() ~ Console {
+    let v: Vec<i8> = vec![0i8];
+    let nb = v[0] - 1i8;
+    let a: i8 = 0i8 - 127i8 - 1i8;
+    println!("{}", a / nb);
+}
+"#,
+            "attempt to divide with overflow",
+        ),
+        (
+            "div_overflow_i64",
+            r#"fn main() ~ Console {
+    let v: Vec<i64> = vec![0i64];
+    let nb = v[0] - 1i64;
+    let a: i64 = 0i64 - 9223372036854775807i64 - 1i64;
+    println!("{}", a / nb);
+}
+"#,
+            "attempt to divide with overflow",
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_div_fail_closed");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src, needle) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write div/rem fail-closed case");
+        let (stdout, stderr, exit_code) = c_backend_run_capture(&path);
+        assert_eq!(
+            exit_code,
+            Some(101),
+            "div/rem case `{name}` must abort with exit 101 (Rust panic)\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(needle),
+            "div/rem case `{name}` must print `{needle}`; got exit {exit_code:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// Positive companion to `integer_divide_by_zero_and_overflow_abort_fail_closed`:
+/// the trap must not disturb a valid division or remainder. Every operand is read
+/// from a heap `Vec`, so the runtime helper actually runs (the emitted C is
+/// `bl_idiv_i32(a, b)`, not a folded constant) and this pins the helper's normal
+/// return, not a compile-time fold. Coverage: truncation toward zero for negative
+/// operands (`-7 / 2 == -3`, `-7 % 2 == -1`, matching Rust and C99), an unsigned
+/// width, a narrow `i8` width, and the three boundary cases around the overflow
+/// guard -- `MIN / 1 == MIN` and `MIN % 1 == 0` (dividend is `MIN` but the divisor
+/// is not `-1`) and `MIN / -2 == 1073741824` (a negative divisor of `MIN` that is
+/// not `-1`). Those prove the guard fires on exactly `b == -1`, never on `MIN`
+/// alone or on any negative divisor. This passes on the pre-fix binary too.
+#[test]
+fn integer_divide_and_remainder_compute_correctly() {
+    if !c_backend_ready() {
+        eprintln!("skipping integer div/rem positive e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    // (name, source, expected stdout)
+    let cases: [(&str, &str, &str); 9] = [
+        (
+            "div_7_2",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![7, 2];
+    let a = v[0];
+    let b = v[1];
+    println!("{}", a / b);
+}
+"#,
+            "3\n",
+        ),
+        (
+            "rem_7_2",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![7, 2];
+    let a = v[0];
+    let b = v[1];
+    println!("{}", a % b);
+}
+"#,
+            "1\n",
+        ),
+        (
+            "div_neg7_2",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![-7, 2];
+    let a = v[0];
+    let b = v[1];
+    println!("{}", a / b);
+}
+"#,
+            "-3\n",
+        ),
+        (
+            "rem_neg7_2",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![-7, 2];
+    let a = v[0];
+    let b = v[1];
+    println!("{}", a % b);
+}
+"#,
+            "-1\n",
+        ),
+        (
+            "div_u32_7_2",
+            r#"fn main() ~ Console {
+    let v: Vec<u32> = vec![7u32, 2u32];
+    let a = v[0];
+    let b = v[1];
+    println!("{}", a / b);
+}
+"#,
+            "3\n",
+        ),
+        (
+            "div_i8_100_3",
+            r#"fn main() ~ Console {
+    let v: Vec<i8> = vec![100i8, 3i8];
+    let a = v[0];
+    let b = v[1];
+    println!("{}", a / b);
+}
+"#,
+            "33\n",
+        ),
+        (
+            "div_min_1",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![1];
+    let b = v[0];
+    let a: i32 = 0 - 2147483647 - 1;
+    println!("{}", a / b);
+}
+"#,
+            "-2147483648\n",
+        ),
+        (
+            "rem_min_1",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![1];
+    let b = v[0];
+    let a: i32 = 0 - 2147483647 - 1;
+    println!("{}", a % b);
+}
+"#,
+            "0\n",
+        ),
+        (
+            "div_min_neg2",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![1];
+    let b = v[0] - 3;
+    let a: i32 = 0 - 2147483647 - 1;
+    println!("{}", a / b);
+}
+"#,
+            "1073741824\n",
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_div_positive");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src, expected) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write div/rem positive case");
+        let result = c_backend_run(&path);
+        assert_eq!(
+            result.stdout, expected,
+            "div/rem case `{name}` must compute the correct value"
+        );
+    }
+}
+
 /// Regression: unary complement must pick the C operator from the operand type.
 /// BuildLang follows Rust: `!` is logical complement on `bool` and bitwise
 /// complement on integers, and `~` is always bitwise complement. MIR lowering

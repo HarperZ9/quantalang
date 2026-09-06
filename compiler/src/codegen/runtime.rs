@@ -56,6 +56,42 @@ static __int128 bl_f2i_i128(double v){
     return (__int128)v;
 }
 
+// --- Integer division and remainder traps ---
+// Rust's `/` and `%` panic on a zero divisor and on the one signed overflow
+// `MIN / -1`, in release as well as debug. C's raw `/` and `%` instead raise a
+// hardware divide error for i32/i64 (a crash, or a hang under this toolchain for
+// the MIN/-1 case), and, because a narrow operand promotes to `int`, silently
+// return the wrong value for the narrow signed overflow ((int8_t)-128 / -1
+// evaluates to 128 and truncates back to -128). Every integer `/` and `%` routes
+// through these helpers so the result is a clean abort matching a Rust panic
+// (exit 101). A float `/` stays IEEE (1.0/0.0 == inf) and a float `%` lowers to
+// fmod, so neither reaches here. Unsigned division cannot overflow, so those
+// helpers check only the zero divisor.
+static void bl_arith_panic(const char* what) {
+    fprintf(stderr, "%s\n", what);
+    exit(101);
+}
+static int8_t   bl_idiv_i8  (int8_t   a, int8_t   b){ if(b==0) bl_arith_panic("attempt to divide by zero"); if(a==INT8_MIN  && b==-1) bl_arith_panic("attempt to divide with overflow"); return a/b; }
+static int16_t  bl_idiv_i16 (int16_t  a, int16_t  b){ if(b==0) bl_arith_panic("attempt to divide by zero"); if(a==INT16_MIN && b==-1) bl_arith_panic("attempt to divide with overflow"); return a/b; }
+static int32_t  bl_idiv_i32 (int32_t  a, int32_t  b){ if(b==0) bl_arith_panic("attempt to divide by zero"); if(a==INT32_MIN && b==-1) bl_arith_panic("attempt to divide with overflow"); return a/b; }
+static int64_t  bl_idiv_i64 (int64_t  a, int64_t  b){ if(b==0) bl_arith_panic("attempt to divide by zero"); if(a==INT64_MIN && b==-1) bl_arith_panic("attempt to divide with overflow"); return a/b; }
+static __int128 bl_idiv_i128(__int128 a, __int128 b){ if(b==0) bl_arith_panic("attempt to divide by zero"); __int128 imin = -(__int128)(((unsigned __int128)1<<127)-1)-1; if(a==imin && b==-1) bl_arith_panic("attempt to divide with overflow"); return a/b; }
+static int8_t   bl_irem_i8  (int8_t   a, int8_t   b){ if(b==0) bl_arith_panic("attempt to calculate the remainder with a divisor of zero"); if(a==INT8_MIN  && b==-1) bl_arith_panic("attempt to calculate the remainder with overflow"); return a%b; }
+static int16_t  bl_irem_i16 (int16_t  a, int16_t  b){ if(b==0) bl_arith_panic("attempt to calculate the remainder with a divisor of zero"); if(a==INT16_MIN && b==-1) bl_arith_panic("attempt to calculate the remainder with overflow"); return a%b; }
+static int32_t  bl_irem_i32 (int32_t  a, int32_t  b){ if(b==0) bl_arith_panic("attempt to calculate the remainder with a divisor of zero"); if(a==INT32_MIN && b==-1) bl_arith_panic("attempt to calculate the remainder with overflow"); return a%b; }
+static int64_t  bl_irem_i64 (int64_t  a, int64_t  b){ if(b==0) bl_arith_panic("attempt to calculate the remainder with a divisor of zero"); if(a==INT64_MIN && b==-1) bl_arith_panic("attempt to calculate the remainder with overflow"); return a%b; }
+static __int128 bl_irem_i128(__int128 a, __int128 b){ if(b==0) bl_arith_panic("attempt to calculate the remainder with a divisor of zero"); __int128 imin = -(__int128)(((unsigned __int128)1<<127)-1)-1; if(a==imin && b==-1) bl_arith_panic("attempt to calculate the remainder with overflow"); return a%b; }
+static uint8_t          bl_udiv_u8  (uint8_t          a, uint8_t          b){ if(b==0) bl_arith_panic("attempt to divide by zero"); return a/b; }
+static uint16_t         bl_udiv_u16 (uint16_t         a, uint16_t         b){ if(b==0) bl_arith_panic("attempt to divide by zero"); return a/b; }
+static uint32_t         bl_udiv_u32 (uint32_t         a, uint32_t         b){ if(b==0) bl_arith_panic("attempt to divide by zero"); return a/b; }
+static uint64_t         bl_udiv_u64 (uint64_t         a, uint64_t         b){ if(b==0) bl_arith_panic("attempt to divide by zero"); return a/b; }
+static unsigned __int128 bl_udiv_u128(unsigned __int128 a, unsigned __int128 b){ if(b==0) bl_arith_panic("attempt to divide by zero"); return a/b; }
+static uint8_t          bl_urem_u8  (uint8_t          a, uint8_t          b){ if(b==0) bl_arith_panic("attempt to calculate the remainder with a divisor of zero"); return a%b; }
+static uint16_t         bl_urem_u16 (uint16_t         a, uint16_t         b){ if(b==0) bl_arith_panic("attempt to calculate the remainder with a divisor of zero"); return a%b; }
+static uint32_t         bl_urem_u32 (uint32_t         a, uint32_t         b){ if(b==0) bl_arith_panic("attempt to calculate the remainder with a divisor of zero"); return a%b; }
+static uint64_t         bl_urem_u64 (uint64_t         a, uint64_t         b){ if(b==0) bl_arith_panic("attempt to calculate the remainder with a divisor of zero"); return a%b; }
+static unsigned __int128 bl_urem_u128(unsigned __int128 a, unsigned __int128 b){ if(b==0) bl_arith_panic("attempt to calculate the remainder with a divisor of zero"); return a%b; }
+
 // Place a %e-formatted number ("[-]D[.DDD]e[+-]EE") as plain positional decimal
 // with no exponent, the way Rust's float Display renders. Writes into `out`.
 static void bl_sci_to_plain(const char* sci, char* out) {

@@ -4001,6 +4001,66 @@ impl CBackend {
                         return Ok(format!("{}({}, {})", f, l, r));
                     }
                 }
+                // Integer division and remainder trap. Rust's `/` and `%` panic
+                // on a zero divisor and on the one signed overflow `MIN / -1`, in
+                // release as well as debug. Raw C `/`/`%` instead crash on a zero
+                // divisor, hang on i32/i64 `MIN / -1` under this toolchain, and,
+                // because a narrow operand promotes to `int`, silently return the
+                // wrong value for a narrow signed overflow ((int8_t)-128 / -1
+                // evaluates to -128 by wrap). Route every integer `/`/`%` through
+                // the runtime helper for the operand width and signedness so the
+                // result is a clean abort matching a Rust panic (exit 101). A
+                // float `/` stays IEEE (falls through to `/`) and a float `%` is
+                // handled by the fmod block above, so neither reaches here.
+                if *op == BinOp::Div || *op == BinOp::Rem {
+                    let int_type = |v: &MirValue| -> Option<(IntSize, bool)> {
+                        let ty = match v {
+                            MirValue::Const(MirConst::Int(_, t))
+                            | MirValue::Const(MirConst::Uint(_, t)) => t,
+                            MirValue::Local(id) => &locals.get(id.0 as usize)?.ty,
+                            _ => return None,
+                        };
+                        match ty {
+                            MirType::Int(size, signed) => Some((*size, *signed)),
+                            _ => None,
+                        }
+                    };
+                    // Prefer a Local operand's declared type over a literal's; the
+                    // two agree after type-checking, but a literal is the weaker
+                    // source of truth.
+                    let local_ty = match left {
+                        MirValue::Local(_) => int_type(left),
+                        _ => None,
+                    }
+                    .or_else(|| match right {
+                        MirValue::Local(_) => int_type(right),
+                        _ => None,
+                    });
+                    if let Some((size, signed)) =
+                        local_ty.or_else(|| int_type(left)).or_else(|| int_type(right))
+                    {
+                        let suffix = match (size, signed) {
+                            (IntSize::I8, true) => "i8",
+                            (IntSize::I16, true) => "i16",
+                            (IntSize::I32, true) => "i32",
+                            (IntSize::I64, true) | (IntSize::ISize, true) => "i64",
+                            (IntSize::I128, true) => "i128",
+                            (IntSize::I8, false) => "u8",
+                            (IntSize::I16, false) => "u16",
+                            (IntSize::I32, false) => "u32",
+                            (IntSize::I64, false) | (IntSize::ISize, false) => "u64",
+                            (IntSize::I128, false) => "u128",
+                        };
+                        let stem = if signed {
+                            if *op == BinOp::Div { "bl_idiv_" } else { "bl_irem_" }
+                        } else if *op == BinOp::Div {
+                            "bl_udiv_"
+                        } else {
+                            "bl_urem_"
+                        };
+                        return Ok(format!("{}{}({}, {})", stem, suffix, l, r));
+                    }
+                }
                 // String comparison: use strcmp when either operand is BuildString
                 if *op == BinOp::Eq || *op == BinOp::Ne {
                     let is_string = |v: &MirValue| -> bool {

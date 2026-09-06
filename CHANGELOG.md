@@ -10,6 +10,36 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+- **Integer divide-by-zero and `MIN / -1` abort with a clean panic instead of
+  crashing, hanging, or returning a wrong value**: the backend emitted integer
+  `/` and `%` as raw C `/` and `%`, which deviate from Rust's contract three ways.
+  Rust panics on a zero divisor and on the single signed overflow `MIN / -1`, in
+  release as well as debug. Raw C instead raised a hardware divide error on a zero
+  divisor, so the process died with exit 148 and no diagnostic; on `i32::MIN / -1`
+  and `i64::MIN / -1` the active toolchain turned that fault into an infinite loop,
+  so the process hung until a timeout killed it; and on the narrow widths
+  `i8::MIN / -1` and `i16::MIN / -1` it was a silent wrong answer, because a
+  sub-`int` operand promotes to 32-bit `int`, so `(int8_t)-128 / -1` computes 128
+  and truncates back to -128 and the program printed it with exit 0. Every integer
+  `/` and `%` now routes through a per-width, signedness-aware runtime helper
+  (`bl_idiv_*`/`bl_irem_*` for signed, `bl_udiv_*`/`bl_urem_*` for unsigned) that
+  checks the divisor and, for signed types, the `MIN / -1` overflow, then aborts
+  with exit 101 and the exact Rust panic text (`attempt to divide by zero`,
+  `attempt to calculate the remainder with a divisor of zero`, `attempt to divide
+  with overflow`, `attempt to calculate the remainder with overflow`). The
+  overflow check keys on exactly `b == -1`, so `MIN / 1`, `MIN % 1`, and `MIN / -2`
+  compute normally. Unsigned division cannot overflow, so those helpers check only
+  the zero divisor. A float `/` is untouched and stays IEEE (`1.0 / 0.0` is `inf`,
+  matching Rust), and a float `%` still lowers to `fmod`/`fmodf`. Covered by
+  `integer_divide_by_zero_and_overflow_abort_fail_closed` (zero and overflow across
+  i32, u32, i8, i64, and both `/` and `%`, each of which crashed, hung, or ran
+  silently wrong on the pre-fix binary) and by
+  `integer_divide_and_remainder_compute_correctly` (truncation toward zero for
+  negative operands, an unsigned and a narrow width, and the three boundary cases
+  that prove the overflow guard fires on `b == -1` alone). Honest null: integer
+  add, subtract, and multiply still wrap on overflow, matching Rust's release
+  semantics; only division and remainder trap.
+
 - **An out-of-bounds index aborts instead of reading or writing past the
   allocation**: indexing was unchecked on every path. A fixed-array read past the
   end returned an adjacent stack value, a fixed-array write past the end corrupted
@@ -34,9 +64,9 @@ tracked in `STATUS.md`, `README.md`, and
   the pre-fix binary) and by `in_bounds_index_reads_and_writes_correctly` (the
   same paths at an in-bounds index including the last valid element, so the check
   does not reject a valid access). Honest null: integer add and multiply still
-  wrap on overflow, matching Rust's release semantics, and division or remainder
-  by zero and `INT_MIN / -1` are not yet turned into a clean panic; those are
-  separate arithmetic-trap fixes.
+  wrap on overflow, matching Rust's release semantics; division and remainder by
+  zero and `MIN / -1` are handled separately (see the arithmetic-trap entry
+  above).
 
 - **An aggregate literal is built at its expected element width, not the i32/f64
   default**: a tuple or vector literal lowered its bare integer and float elements
