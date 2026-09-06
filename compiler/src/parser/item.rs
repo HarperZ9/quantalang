@@ -1026,9 +1026,31 @@ impl<'a> Parser<'a> {
         let is_async = self.eat_keyword(Keyword::Async);
         let is_unsafe = self.eat_keyword(Keyword::Unsafe);
 
+        // `extern "ABI"` on a method mirrors the free-item form (see the
+        // `Keyword::Extern` arm in `parse_item`): consume the keyword and the
+        // optional ABI string so `extern "stdcall" fn ...` inside an impl body
+        // parses the same as at the top level. Only a function may follow;
+        // `extern crate` / `extern { ... }` are free-item forms, not impl items.
+        let abi = if self.check_keyword(Keyword::Extern) {
+            self.advance();
+            let abi = if let TokenKind::Literal { .. } = self.current_kind() {
+                let token_span = self.advance().span;
+                Some(self.source.slice(token_span).trim_matches('"').to_string())
+            } else {
+                None
+            };
+            if !self.check_keyword(Keyword::Fn) {
+                return Err(self.error_expected("`fn` after `extern` in impl item"));
+            }
+            abi
+        } else {
+            None
+        };
+
         let kind = match self.current_kind().clone() {
             TokenKind::Keyword(Keyword::Fn) => {
-                let fn_def = self.parse_fn(is_unsafe, is_async, is_const)?;
+                let mut fn_def = self.parse_fn(is_unsafe, is_async, is_const)?;
+                fn_def.sig.abi = abi;
                 ImplItemKind::Function(Box::new(fn_def))
             }
 
@@ -1895,6 +1917,47 @@ mod tests {
                 assert_eq!(eb.items.len(), 1);
             }
             other => panic!("expected ExternBlock, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_abi_method_in_impl_parses() {
+        // `extern "ABI" fn` is accepted as an impl method, mirroring the
+        // free-item form; the ABI is recorded on the method signature.
+        let item = parse_item_str(
+            "impl HookManager { extern \"stdcall\" fn present(&self, flags: u32) -> u32 { flags } }",
+        )
+        .unwrap();
+        match &item.kind {
+            ItemKind::Impl(imp) => {
+                assert_eq!(imp.items.len(), 1);
+                match &imp.items[0].kind {
+                    ImplItemKind::Function(f) => {
+                        assert_eq!(f.name.as_str(), "present");
+                        assert_eq!(f.sig.abi.as_deref(), Some("stdcall"));
+                        assert!(f.body.is_some());
+                    }
+                    other => panic!("expected impl Function, got {:?}", other),
+                }
+            }
+            other => panic!("expected Impl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plain_method_in_impl_has_no_abi() {
+        // Regression: an ordinary method must still parse and carry no ABI, so
+        // the new `extern` branch does not clobber the common case.
+        let item = parse_item_str("impl Foo { fn bar(&self) -> u32 { 0 } }").unwrap();
+        match &item.kind {
+            ItemKind::Impl(imp) => match &imp.items[0].kind {
+                ImplItemKind::Function(f) => {
+                    assert_eq!(f.name.as_str(), "bar");
+                    assert_eq!(f.sig.abi, None);
+                }
+                other => panic!("expected impl Function, got {:?}", other),
+            },
+            other => panic!("expected Impl, got {:?}", other),
         }
     }
 
