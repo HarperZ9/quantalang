@@ -690,7 +690,7 @@ impl RustBackend {
         for projection in &place.projections {
             match projection {
                 PlaceProjection::Deref => out = format!("unsafe {{ *{} }}", out),
-                PlaceProjection::Field(idx, _) => out = format!("{}.field{}", out, idx),
+                PlaceProjection::Field(idx, _, _) => out = format!("{}.field{}", out, idx),
                 PlaceProjection::Index(id) => {
                     out = format!("{}[{} as usize]", out, self.local_name(*id, locals));
                 }

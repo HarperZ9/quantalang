@@ -1230,7 +1230,7 @@ impl WasmBackend {
                 PlaceProjection::Deref => {
                     self.emit_line("i32.load");
                 }
-                PlaceProjection::Field(idx, _ty) => {
+                PlaceProjection::Field(idx, _name, _ty) => {
                     self.emit_line(&format!("i32.const {}", idx * 4));
                     self.emit_line("i32.add");
                 }

@@ -13003,6 +13003,123 @@ fn large_unsuffixed_int_literal_not_truncated_end_to_end() {
     );
 }
 
+/// Regression (Cluster P: place projections as store targets and `&mut` operands).
+/// A store into a projected lvalue, and a mutable borrow of one, must reach the
+/// real storage instead of a detached copy. Before this fix the frontend copied a
+/// projected base to a temp and stored into the copy, which silently dropped the
+/// write; no tuple-field target arm existed, so `t.0 = v` was dropped outright; and
+/// `lower_ref` borrowed a value copy, so `&mut place` aliased the copy rather than
+/// the place. Each row pins one path and the whole program prints one value per
+/// line:
+///   p1  compound-assign to a struct field   `p.x += k`            -> 17
+///   p2  field of an array element            `arr[0].x = 100`      -> 100/2/3
+///   p3  nested struct field                  `a.b.c = 42`          -> 42/9
+///   p4  tuple field                          `t.0 = 50`            -> 50/20
+///   p5  `&mut` of a struct field             `set77(&mut p.x)`     -> 77
+///   p6  `&mut` of an array element           `set88(&mut arr[1])`  -> 10/88/30
+/// p6 keeps the borrow element type equal to the array element type (i32) so it
+/// tests projection-ref aliasing alone. A borrow of a wider element type than the
+/// literal defaults to is a separate array-literal element-type gap, disclosed in
+/// the changelog, not exercised here.
+#[test]
+fn place_projection_stores_and_borrows_reach_real_storage_end_to_end() {
+    if !c_backend_ready() {
+        eprintln!("skipping place-projection e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let cases: [(&str, &str, &str); 6] = [
+        (
+            "cluster_p_struct_field_compound",
+            r#"struct Point { x: i64, y: i64 }
+fn main() ~ Console {
+    let mut p = Point { x: 10, y: 5 };
+    let k = 7;
+    p.x += k;
+    println!("{}", p.x);
+}
+"#,
+            "17\n",
+        ),
+        (
+            "cluster_p_array_element_field",
+            r#"struct Point { x: i64, y: i64 }
+fn main() ~ Console {
+    let mut arr = [Point{x:1,y:1}, Point{x:2,y:2}, Point{x:3,y:3}];
+    arr[0].x = 100;
+    println!("{}", arr[0].x);
+    println!("{}", arr[1].x);
+    println!("{}", arr[2].x);
+}
+"#,
+            "100\n2\n3\n",
+        ),
+        (
+            "cluster_p_nested_struct_field",
+            r#"struct Inner { c: i64 }
+struct Outer { b: Inner, tag: i64 }
+fn main() ~ Console {
+    let mut a = Outer { b: Inner { c: 9 }, tag: 9 };
+    a.b.c = 42;
+    println!("{}", a.b.c);
+    println!("{}", a.tag);
+}
+"#,
+            "42\n9\n",
+        ),
+        (
+            "cluster_p_tuple_field",
+            r#"fn main() ~ Console {
+    let mut t = (10, 20);
+    t.0 = 50;
+    println!("{}", t.0);
+    println!("{}", t.1);
+}
+"#,
+            "50\n20\n",
+        ),
+        (
+            "cluster_p_borrow_struct_field",
+            r#"struct Point { x: i64, y: i64 }
+fn set77(r: &mut i64) {
+    *r = 77;
+}
+fn main() ~ Console {
+    let mut p = Point { x: 1, y: 2 };
+    set77(&mut p.x);
+    println!("{}", p.x);
+}
+"#,
+            "77\n",
+        ),
+        (
+            "cluster_p_borrow_array_element",
+            r#"fn set88(r: &mut i32) {
+    *r = 88;
+}
+fn main() ~ Console {
+    let mut arr = [10, 20, 30];
+    set88(&mut arr[1]);
+    println!("{}", arr[0]);
+    println!("{}", arr[1]);
+    println!("{}", arr[2]);
+}
+"#,
+            "10\n88\n30\n",
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_cluster_p_projection");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src, expected) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write cluster-p case");
+        let result = c_backend_run(&path);
+        assert_eq!(
+            result.stdout, expected,
+            "cluster-p case `{name}` must store or borrow through the real place"
+        );
+    }
+}
+
 /// Regression: unary complement must pick the C operator from the operand type.
 /// BuildLang follows Rust: `!` is logical complement on `bool` and bitwise
 /// complement on integers, and `~` is always bitwise complement. MIR lowering

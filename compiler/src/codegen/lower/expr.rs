@@ -1219,6 +1219,167 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(values::local(result))
     }
 
+    /// Build a MIR place (lvalue) for an assignable expression WITHOUT copying
+    /// the referent, returning the place and its type. Returns `None` for any
+    /// shape this does not model as an in-place location (a module global, a Vec
+    /// element, a vector swizzle, a call result), so the caller keeps its
+    /// existing value-based path. This is what lets `arr[0].x = v`, `a.b.c = v`,
+    /// and `&mut arr[i]` address the real location instead of a discarded copy.
+    fn lower_place(&mut self, expr: &ast::Expr) -> CodegenResult<Option<(MirPlace, MirType)>> {
+        match &expr.kind {
+            ExprKind::Ident(ident) => match self.var_map.get(&ident.name).copied() {
+                Some(local) => {
+                    let ty = self
+                        .current_fn
+                        .as_ref()
+                        .and_then(|b| b.local_type(local))
+                        .unwrap_or_else(MirType::i32);
+                    Ok(Some((MirPlace::local(local), ty)))
+                }
+                // A bare name with no local is a global; not an in-place location.
+                None => Ok(None),
+            },
+            ExprKind::Field { expr: base, field } => {
+                let (mut place, base_ty) = match self.lower_place(base)? {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                // Auto-deref a pointer base (`(*p).field`) to reach the struct.
+                let (struct_ty, via_ptr) = match &base_ty {
+                    MirType::Ptr(inner) => ((**inner).clone(), true),
+                    other => (other.clone(), false),
+                };
+                let MirType::Struct(name) = &struct_ty else {
+                    return Ok(None);
+                };
+                // A vector swizzle (`v.xy`) is a constructor call, not one field.
+                if let Some(max) = Self::vec_component_count(name) {
+                    if Self::is_swizzle_pattern(&field.name, max) {
+                        return Ok(None);
+                    }
+                }
+                let idx = match self.lookup_struct_field_index(name, &field.name) {
+                    Some(i) => i,
+                    None => return Ok(None),
+                };
+                let fty = self
+                    .lookup_struct_field_type(name, &field.name)
+                    .unwrap_or_else(MirType::i32);
+                if via_ptr {
+                    place = place.deref();
+                }
+                Ok(Some((place.field(idx, field.name.clone(), fty.clone()), fty)))
+            }
+            ExprKind::TupleField {
+                expr: base, index, ..
+            } => {
+                let (place, base_ty) = match self.lower_place(base)? {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                let MirType::Tuple(elems) = &base_ty else {
+                    return Ok(None);
+                };
+                let ety = elems
+                    .get(*index as usize)
+                    .cloned()
+                    .unwrap_or_else(MirType::i32);
+                let name: Arc<str> = Arc::from(format!("_{}", index));
+                Ok(Some((place.field(*index, name, ety.clone()), ety)))
+            }
+            ExprKind::Index { expr: base, index } => {
+                let (place, base_ty) = match self.lower_place(base)? {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                // Only a fixed-layout array or slice held BY VALUE indexes in
+                // place here. A Vec routes through its runtime setter, and a
+                // slice/array behind a pointer keeps the tested IndexStore ABI;
+                // both return None so the caller's existing path handles them.
+                let elem_ty = match &base_ty {
+                    MirType::Array(elem, _) | MirType::Slice(elem) => (**elem).clone(),
+                    _ => return Ok(None),
+                };
+                let idx_val = self.lower_expr(index)?;
+                let idx_local = match idx_val {
+                    MirValue::Local(id) => id,
+                    other => {
+                        let builder = self.current_fn.as_mut().unwrap();
+                        let t = builder.create_local(MirType::i32());
+                        builder.assign(t, MirRValue::Use(other));
+                        t
+                    }
+                };
+                Ok(Some((place.index(idx_local), elem_ty)))
+            }
+            ExprKind::Deref(inner) => {
+                let (place, base_ty) = match self.lower_place(inner)? {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                let MirType::Ptr(pointee) = &base_ty else {
+                    return Ok(None);
+                };
+                let pointee = (**pointee).clone();
+                Ok(Some((place.deref(), pointee)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Fold a compound-assignment operator into the value to store: `=` stores
+    /// `val` unchanged; `+=` and the rest read the current value of `target`,
+    /// apply the operator, and return the combined value. The read happens after
+    /// `val` is already lowered, matching the evaluation order every other
+    /// assignment arm uses.
+    fn compound_store_value(
+        &mut self,
+        op: ast::AssignOp,
+        target: &ast::Expr,
+        val: MirValue,
+        ty: &MirType,
+    ) -> CodegenResult<MirValue> {
+        if op == ast::AssignOp::Assign {
+            return Ok(val);
+        }
+        let bin_op = match op {
+            ast::AssignOp::AddAssign => BinOp::Add,
+            ast::AssignOp::SubAssign => BinOp::Sub,
+            ast::AssignOp::MulAssign => BinOp::Mul,
+            ast::AssignOp::DivAssign => BinOp::Div,
+            ast::AssignOp::RemAssign => BinOp::Rem,
+            ast::AssignOp::BitAndAssign => BinOp::BitAnd,
+            ast::AssignOp::BitOrAssign => BinOp::BitOr,
+            ast::AssignOp::BitXorAssign => BinOp::BitXor,
+            ast::AssignOp::ShlAssign => BinOp::Shl,
+            ast::AssignOp::ShrAssign => BinOp::Shr,
+            _ => BinOp::Add,
+        };
+        let cur = self.lower_expr(target)?;
+        let builder = self.current_fn.as_mut().unwrap();
+        let combined = builder.create_local(ty.clone());
+        builder.binary_op(combined, bin_op, cur, val);
+        Ok(values::local(combined))
+    }
+
+    /// Store a value into a projected place by taking the address of the REAL
+    /// location and writing through it: `tmp = &place; *tmp = value`. The
+    /// identity `*(&place) = v` is exactly `place = v`, and it reuses the
+    /// AddressOf + DerefAssign machinery every backend already lowers, so no new
+    /// statement kind is needed for projected stores.
+    fn store_through_place(
+        &mut self,
+        place: MirPlace,
+        place_ty: MirType,
+        value: MirRValue,
+    ) -> CodegenResult<()> {
+        let builder = self.current_fn.as_mut().unwrap();
+        let ptr = builder.create_local(MirType::Ptr(Box::new(place_ty)));
+        builder.assign(ptr, MirRValue::AddressOf { is_mut: true, place });
+        builder.push_deref_assign(ptr, value);
+        Ok(())
+    }
+
     fn lower_assign(
         &mut self,
         op: ast::AssignOp,
@@ -1248,9 +1409,66 @@ impl<'ctx> MirLowerer<'ctx> {
 
         // Handle field assignment: `obj.field = value`
         if let ExprKind::Field { expr: obj, field } = &target.kind {
+            // Fast path: the base is a plain, in-scope local (`p.x = v` /
+            // `p.x += v`). The base is already an addressable local, so
+            // FieldAssign / FieldDerefAssign writes in place. This also covers a
+            // pointer local (`p: &mut S`) through the `->` store.
+            let base_is_plain_local = matches!(
+                &obj.kind,
+                ExprKind::Ident(id) if self.var_map.contains_key(&id.name)
+            );
+            if base_is_plain_local {
+                let obj_val = self.lower_expr(obj)?;
+                let obj_ty = self.type_of_value(&obj_val);
+                let obj_local = match &obj_val {
+                    MirValue::Local(id) => *id,
+                    _ => {
+                        let builder = self.current_fn.as_mut().unwrap();
+                        let temp = builder.create_local(obj_ty.clone());
+                        builder.assign(temp, MirRValue::Use(obj_val));
+                        temp
+                    }
+                };
+                // The field type (a pointer base unwraps to its pointee) drives
+                // the type of a compound op's intermediate value.
+                let struct_ty = match &obj_ty {
+                    MirType::Ptr(inner) => (**inner).clone(),
+                    other => other.clone(),
+                };
+                let field_ty = match &struct_ty {
+                    MirType::Struct(name) => self
+                        .lookup_struct_field_type(name, &field.name)
+                        .unwrap_or_else(MirType::i32),
+                    _ => MirType::i32(),
+                };
+                let store = self.compound_store_value(op, target, val, &field_ty)?;
+                let builder = self.current_fn.as_mut().unwrap();
+                if obj_ty.is_pointer() {
+                    builder.push_field_deref_assign(
+                        obj_local,
+                        field.name.clone(),
+                        MirRValue::Use(store),
+                    );
+                } else {
+                    builder.push_field_assign(obj_local, field.name.clone(), MirRValue::Use(store));
+                }
+                return Ok(values::unit());
+            }
+
+            // General path: the base is itself a projection (`arr[0].x`,
+            // `a.b.c`). Build the real place and store through its address so the
+            // write lands in the true location instead of a discarded copy.
+            if let Some((place, place_ty)) = self.lower_place(target)? {
+                let store = self.compound_store_value(op, target, val, &place_ty)?;
+                self.store_through_place(place, place_ty, MirRValue::Use(store))?;
+                return Ok(values::unit());
+            }
+
+            // Fallback: any shape `lower_place` does not model (kept so no target
+            // silently changes behavior). This copies the base, so it cannot
+            // write through a projection; it preserves the prior semantics only.
             let obj_val = self.lower_expr(obj)?;
             let obj_ty = self.type_of_value(&obj_val);
-
             let obj_local = match &obj_val {
                 MirValue::Local(id) => *id,
                 _ => {
@@ -1260,16 +1478,74 @@ impl<'ctx> MirLowerer<'ctx> {
                     temp
                 }
             };
-
+            let builder = self.current_fn.as_mut().unwrap();
             if obj_ty.is_pointer() {
-                // Pointer-to-struct field assignment: emit ptr->field = value
-                let builder = self.current_fn.as_mut().unwrap();
                 builder.push_field_deref_assign(obj_local, field.name.clone(), MirRValue::Use(val));
             } else {
-                // Local struct field assignment: emit base.field = value
-                let builder = self.current_fn.as_mut().unwrap();
                 builder.push_field_assign(obj_local, field.name.clone(), MirRValue::Use(val));
             }
+            return Ok(values::unit());
+        }
+
+        // Handle tuple-field assignment: `t.0 = value`. Without this arm the
+        // write matched no target case and was silently dropped.
+        if let ExprKind::TupleField {
+            expr: obj, index, ..
+        } = &target.kind
+        {
+            let field_name: Arc<str> = Arc::from(format!("_{}", index));
+            // Fast path: the base is a plain local tuple (`t.0 = v` / `t.0 += v`).
+            let base_is_plain_local = matches!(
+                &obj.kind,
+                ExprKind::Ident(id) if self.var_map.contains_key(&id.name)
+            );
+            if base_is_plain_local {
+                let obj_val = self.lower_expr(obj)?;
+                let obj_ty = self.type_of_value(&obj_val);
+                let obj_local = match &obj_val {
+                    MirValue::Local(id) => *id,
+                    _ => {
+                        let builder = self.current_fn.as_mut().unwrap();
+                        let temp = builder.create_local(obj_ty.clone());
+                        builder.assign(temp, MirRValue::Use(obj_val));
+                        temp
+                    }
+                };
+                let field_ty = match &obj_ty {
+                    MirType::Tuple(elems) => elems
+                        .get(*index as usize)
+                        .cloned()
+                        .unwrap_or_else(MirType::i32),
+                    _ => MirType::i32(),
+                };
+                let store = self.compound_store_value(op, target, val, &field_ty)?;
+                let builder = self.current_fn.as_mut().unwrap();
+                builder.push_field_assign(obj_local, field_name, MirRValue::Use(store));
+                return Ok(values::unit());
+            }
+
+            // General path: the tuple is reached through a projection.
+            if let Some((place, place_ty)) = self.lower_place(target)? {
+                let store = self.compound_store_value(op, target, val, &place_ty)?;
+                self.store_through_place(place, place_ty, MirRValue::Use(store))?;
+                return Ok(values::unit());
+            }
+
+            // Fallback: materialize the base and store positionally (prior
+            // semantics; cannot write through a projection).
+            let obj_val = self.lower_expr(obj)?;
+            let obj_ty = self.type_of_value(&obj_val);
+            let obj_local = match &obj_val {
+                MirValue::Local(id) => *id,
+                _ => {
+                    let builder = self.current_fn.as_mut().unwrap();
+                    let temp = builder.create_local(obj_ty.clone());
+                    builder.assign(temp, MirRValue::Use(obj_val));
+                    temp
+                }
+            };
+            let builder = self.current_fn.as_mut().unwrap();
+            builder.push_field_assign(obj_local, field_name, MirRValue::Use(val));
             return Ok(values::unit());
         }
 
@@ -6987,6 +7263,20 @@ impl<'ctx> MirLowerer<'ctx> {
         mutability: ast::Mutability,
         inner: &ast::Expr,
     ) -> CodegenResult<MirValue> {
+        // Address-of a real place (`&arr[i].field`, `&t.0`, `&s.field`, `&x`).
+        // Reference the location itself so the pointer aliases storage the caller
+        // can mutate. Without this the operand was copied to a temp first, so the
+        // reference pointed at the copy and a `*p = v` never reached the source.
+        if let Some((place, place_ty)) = self.lower_place(inner)? {
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+            let result = builder.create_local(MirType::Ptr(Box::new(place_ty)));
+            builder.make_ref(result, mutability.is_mut(), place);
+            return Ok(values::local(result));
+        }
+
         let inner_val = self.lower_expr(inner)?;
         let inner_ty = self.type_of_value(&inner_val);
 
@@ -6995,11 +7285,12 @@ impl<'ctx> MirLowerer<'ctx> {
             .as_mut()
             .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
-        // Get the local from inner value
+        // Operand is not an addressable place (a call result, an arithmetic
+        // expression, a global). Materialize it into a temporary and reference
+        // that; this matches the prior behavior for those non-place operands.
         let local = match &inner_val {
             MirValue::Local(id) => *id,
             _ => {
-                // Create a temporary with the correct type
                 let temp = builder.create_local(inner_ty.clone());
                 builder.assign(temp, MirRValue::Use(inner_val));
                 temp

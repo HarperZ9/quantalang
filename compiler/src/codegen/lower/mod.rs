@@ -2537,6 +2537,24 @@ impl<'ctx> MirLowerer<'ctx> {
         self.module.find_variant_field_type(struct_name, field_name)
     }
 
+    /// Look up a struct field's ordinal index (0-based declaration order) by
+    /// name. Index-based backends (LLVM GEP, Rust positional) use this in a
+    /// place projection; the C backend renders by name.
+    fn lookup_struct_field_index(&self, struct_name: &str, field_name: &str) -> Option<u32> {
+        if let Some(type_def) = self.module.find_type(struct_name) {
+            if let TypeDefKind::Struct { fields, .. } = &type_def.kind {
+                for (i, (fname, _)) in fields.iter().enumerate() {
+                    if let Some(name) = fname {
+                        if name.as_ref() == field_name {
+                            return Some(i as u32);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Look up an enum variant by enum name and variant name.
     /// Returns (discriminant, variant_fields) if found.
     fn lookup_enum_variant(

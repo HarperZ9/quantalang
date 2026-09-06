@@ -15,7 +15,7 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use super::{Backend, CodegenResult, Target};
+use super::{Backend, CodegenError, CodegenResult, Target};
 use crate::codegen::ir::*;
 use crate::codegen::runtime;
 use crate::codegen::{GeneratedCode, OutputFormat};
@@ -4036,13 +4036,15 @@ impl CBackend {
                 };
                 format!("({}{})", op_str, v)
             }
-            MirRValue::Ref { is_mut: _, place } => {
-                let local_name = self.local_name(place.local, locals);
-                format!("&{}", local_name)
-            }
-            MirRValue::AddressOf { is_mut: _, place } => {
-                let local_name = self.local_name(place.local, locals);
-                format!("&{}", local_name)
+            MirRValue::Ref { is_mut: _, place } | MirRValue::AddressOf { is_mut: _, place } => {
+                // Address of the REAL location. A bare local keeps `&x`; a place
+                // with projections composes the lvalue (`&(arr[i].field)`) so a
+                // reference or a projected store writes through, never into a copy.
+                if place.projections.is_empty() {
+                    format!("&{}", self.local_name(place.local, locals))
+                } else {
+                    format!("&({})", self.place_to_c(place, locals)?)
+                }
             }
             MirRValue::Cast {
                 kind: CastKind::FloatToInt,
@@ -4725,6 +4727,69 @@ impl CBackend {
             .unwrap_or_else(|| format!("_{}", id.0))
     }
 
+    /// Render a place (lvalue) as a C expression: the base local followed by
+    /// each projection. `&(place_to_c(p))` is the address of the REAL location,
+    /// which is what makes `&mut p.x`, `&mut arr[i]`, `arr[0].x = v`, and
+    /// `a.b.c = v` write through instead of into a copied temporary. Deref and
+    /// Field track the running type so a field through a pointer renders `->`.
+    fn place_to_c(&self, place: &MirPlace, locals: &[MirLocal]) -> CodegenResult<String> {
+        let mut expr = self.local_name(place.local, locals);
+        let mut cur_ty = locals.get(place.local.0 as usize).map(|l| l.ty.clone());
+        // Unwrap one collection layer to the element type (for an Index step).
+        let elem_of = |ty: &Option<MirType>| -> Option<MirType> {
+            match ty {
+                Some(MirType::Array(elem, _))
+                | Some(MirType::Slice(elem))
+                | Some(MirType::Vec(elem)) => Some((**elem).clone()),
+                Some(MirType::Ptr(inner)) => match inner.as_ref() {
+                    MirType::Array(elem, _) | MirType::Slice(elem) => Some((**elem).clone()),
+                    other => Some(other.clone()),
+                },
+                _ => None,
+            }
+        };
+        for proj in &place.projections {
+            match proj {
+                PlaceProjection::Deref => {
+                    expr = format!("(*{})", expr);
+                    cur_ty = match cur_ty {
+                        Some(MirType::Ptr(inner)) => Some(*inner),
+                        _ => None,
+                    };
+                }
+                PlaceProjection::Field(_idx, name, fty) => {
+                    let field = Self::escape_c_keyword(name);
+                    if matches!(cur_ty, Some(MirType::Ptr(_))) {
+                        expr = format!("{}->{}", expr, field);
+                    } else {
+                        expr = format!("({}).{}", expr, field);
+                    }
+                    cur_ty = Some(fty.clone());
+                }
+                PlaceProjection::Index(idx_local) => {
+                    let idx = self.local_name(*idx_local, locals);
+                    expr = format!("({})[{}]", expr, idx);
+                    cur_ty = elem_of(&cur_ty);
+                }
+                PlaceProjection::ConstantIndex { offset, from_end } => {
+                    if *from_end {
+                        return Err(CodegenError::Internal(
+                            "from-end constant index is not supported as a C place".to_string(),
+                        ));
+                    }
+                    expr = format!("({})[{}]", expr, offset);
+                    cur_ty = elem_of(&cur_ty);
+                }
+                PlaceProjection::Subslice { .. } | PlaceProjection::Downcast(_) => {
+                    return Err(CodegenError::Internal(
+                        "subslice/downcast is not supported as a C place".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(expr)
+    }
+
     /// Increment 5: emit a guarded free for a flag-managed owner:
     /// `if (__bl_live_N) { build_string_free(<name>); __bl_live_N = 0; }`.
     /// Soundness invariant (verbatim, also in `analysis::flags` and the flag
@@ -4863,6 +4928,13 @@ impl CBackend {
         }
         fn collect_place(place: &MirPlace, used: &mut std::collections::HashSet<LocalId>) {
             used.insert(place.local);
+            // A place can index by a local (`base[i]`); that index local is used
+            // by the emitted lvalue even though it never appears as a value here.
+            for proj in &place.projections {
+                if let PlaceProjection::Index(idx) = proj {
+                    used.insert(*idx);
+                }
+            }
         }
 
         for block in blocks {

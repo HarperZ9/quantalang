@@ -10,6 +10,36 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+- **Projected assignment targets and `&mut` of a place reach real storage**: four
+  codegen defects let a store or a mutable borrow of a projected lvalue miss its
+  target, each a silent wrong answer because the write vanished with no diagnostic.
+  The `lower_assign` field arm copied a non-local base into a temp and stored into
+  the copy, so `arr[0].x = v` and `a.b.c = v` updated a value that was then
+  discarded. On that same path a compound form such as `p.x += k` also dropped the
+  compound operator. No tuple-field target arm existed, so `t.0 = v` was lowered as
+  nothing at all. And `lower_ref` borrowed a materialized copy of its operand, so
+  `set(&mut p.x)` and `set(&mut arr[i])` handed the callee a pointer to a
+  throwaway temp and the store never reached `p.x` or `arr[i]`. The fix threads a
+  syntactic place through lowering instead of copying: `PlaceProjection::Field`
+  now carries the field name and MIR type, a new `lower_place` builds a `MirPlace`
+  for an ident, field, tuple field, by-value index, or deref base without
+  materializing a copy, a projected store lowers as `AddressOf(place)` into a fresh
+  pointer temp followed by the existing `DerefAssign` (the identity
+  `*(&place) = v` equals `place = v`, so no new statement kind is added), and the C
+  backend composes the projected lvalue for both the store and the `&place`
+  operand. Six end-to-end controls in `compiler/tests/cli.rs` pin the struct-field
+  compound-assign, array-element field, nested struct field, tuple field,
+  struct-field borrow, and array-element borrow paths; all six print the dropped or
+  misdirected pre-fix values on the pre-fix binary. Scoped out and left as honest
+  nulls: a store whose base is a slice or array behind a pointer still routes
+  through the prior index-store path, so its ABI is unchanged and
+  `slice_param[i].field = v` is untouched; a compound-assign through a plain deref
+  (`*p += v`) still ignores the operator and remains a separate gap; and an integer
+  array literal whose element is borrowed as a wider type than the literal defaults
+  to (`&mut i64` against `[10, 20, 30]`, whose elements default to i32) is a
+  separate array-literal element-type defect that neither unifies to the wider type
+  nor rejects the mismatch, so the array-element borrow control fixes both sides at
+  i32 to test the borrow aliasing alone.
 - **Float `{}` Display matches Rust's shortest round-trip**: the
   `println!`/`format!` lowering baked C's `%g` specifier into the format string
   for a default `{}` float placeholder. `%g` caps output at six significant
