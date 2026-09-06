@@ -965,6 +965,14 @@ impl<'a> Parser<'a> {
                         | Keyword::SelfType
                         | Keyword::Crate
                         | Keyword::Super
+                        // Value-position contextual keywords parse as ordinary
+                        // identifiers here (see `is_value_context_keyword` and the
+                        // `parse_prefix_expr` value-keyword arm); a gated operand
+                        // such as `return default;` must treat them as expr-start.
+                        | Keyword::Default
+                        | Keyword::Module
+                        | Keyword::Effect
+                        | Keyword::Auto
                 )
                 | TokenKind::DslBlock { .. }
         )
@@ -2019,6 +2027,30 @@ mod tests {
                     assert_eq!(id.as_str(), word, "identifier name should be preserved")
                 }
                 other => panic!("`{word}` parsed as {other:?}, expected ExprKind::Ident"),
+            }
+        }
+    }
+
+    #[test]
+    fn value_context_keywords_parse_as_return_operand() {
+        // `can_begin_expr` gates the optional operand of `return`. The
+        // value-position contextual keywords parse as ordinary identifiers,
+        // so `return default` must read `default` as the returned value, not
+        // as a bare `return` followed by a stray token.
+        for word in ["default", "module", "effect", "auto"] {
+            let src = format!("return {word}");
+            let expr = parse_expr_str(&src)
+                .unwrap_or_else(|e| panic!("`{src}` should parse as a value expression: {e:?}"));
+            match &expr.kind {
+                ExprKind::Return(Some(inner)) => match &inner.kind {
+                    ExprKind::Ident(id) => assert_eq!(
+                        id.as_str(),
+                        word,
+                        "returned identifier name should be preserved"
+                    ),
+                    other => panic!("`{src}` operand parsed as {other:?}, expected Ident"),
+                },
+                other => panic!("`{src}` parsed as {other:?}, expected Return(Some(_))"),
             }
         }
     }
