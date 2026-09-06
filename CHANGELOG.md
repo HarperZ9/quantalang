@@ -10,6 +10,23 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+- **Tuple patterns in `match`: correct selection, scalar results, and
+  bindings**: `match` over a tuple scrutinee had three codegen defects, now
+  fixed. A literal tuple pattern fell through `lower_pattern_test`'s
+  always-true catch-all, so `(1, 2)` matched any pair and the first arm won
+  regardless of the value; it now tests every element and recurses into nested
+  tuples. Scalar arms over a tuple scrutinee took the tuple as the result type
+  and emitted C that assigned an int to a tuple struct; the result type is now
+  the scalar. Tuple elements bound no variables, since the binding section had
+  no tuple arm, so `(a, b) => a + b` emitted undeclared C names; a recursive
+  binder now binds elements in both the body and guard blocks, covering nested
+  `((a, b), c)` and mixed literal/binding `(1, x)`. Pattern kinds the backend
+  cannot yet lower (slice, struct with a refutable field, refutable
+  tuple-struct/ref/box) now fail closed with an `unsupported feature`
+  diagnostic instead of silently always matching. Six end-to-end controls in
+  `compiler/tests/cli.rs` each fail on the pre-fix binary (wrong arm, invalid
+  C, or a false always-match); cli suite 359 pass, lib suite 1037 pass, no
+  regression.
 - **Tool-call receipt verify arm**: `buildc receipt verify` gains a third
   schema dispatch for `flywheel.tool-call-receipt/v1`, the sealed per-tool-call
   receipt emitted by Flywheel's agent loop. Mirrors `model_receipt.rs` in

@@ -13166,6 +13166,205 @@ fn option_i64_return_and_match_runs_end_to_end() {
     );
 }
 
+/// Regression (silent-wrong-answer): a tuple pattern with literal elements must
+/// select the arm whose elements ALL equal the scrutinee. Before the fix,
+/// `lower_pattern_test` fell through to a `_ => Ok(bool(true))` catch-all for
+/// tuple patterns, so `(1, 2)` "matched" the scrutinee `(3, 4)`, the first arm
+/// was taken unconditionally, and this printed "a". A compiler that silently
+/// selects the wrong arm is the exact failure the fail-closed rule forbids.
+#[test]
+fn match_tuple_literal_pattern_selects_equal_arm() {
+    if !c_backend_ready() {
+        eprintln!("skipping tuple-literal-arm e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let src = "fn main() ~ Console {\n\
+               let pair = (3, 4);\n\
+               let r = match pair {\n\
+               (1, 2) => \"a\",\n\
+               (3, 4) => \"b\",\n\
+               _ => \"other\",\n\
+               };\n\
+               println(\"{}\", r);\n\
+               }\n";
+    let dir = std::env::temp_dir().join("buildlang_match_tuple_literal");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("tuple_literal.bld");
+    std::fs::write(&path, src).expect("write tuple_literal.bld");
+    let result = c_backend_run(&path);
+    assert_eq!(
+        result.stdout, "b\n",
+        "a tuple pattern must test every element for equality, not silently always match"
+    );
+}
+
+/// Regression (invalid C): scalar-bodied arms over a tuple scrutinee must yield
+/// a scalar result local. Before the fix, `lower_match` fell back to the
+/// scrutinee type (a tuple) for the result, emitting C that assigned an int
+/// (`100`/`200`) to a `Tuple_i32_i32` local, which gcc rejects as incompatible
+/// types. The program must compile and print the selected scalar.
+#[test]
+fn match_tuple_scalar_result_over_tuple_scrutinee() {
+    if !c_backend_ready() {
+        eprintln!("skipping tuple-scalar-result e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let src = "fn main() ~ Console {\n\
+               let pair = (3, 4);\n\
+               let r = match pair {\n\
+               (1, 2) => 100,\n\
+               (3, 4) => 200,\n\
+               _ => 999,\n\
+               };\n\
+               println(\"{}\", r);\n\
+               }\n";
+    let dir = std::env::temp_dir().join("buildlang_match_tuple_scalar");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("tuple_scalar.bld");
+    std::fs::write(&path, src).expect("write tuple_scalar.bld");
+    let result = c_backend_run(&path);
+    assert_eq!(
+        result.stdout, "200\n",
+        "scalar match arms over a tuple scrutinee must produce a scalar result, not an aggregate"
+    );
+}
+
+/// Regression: a nested tuple pattern tests every leaf. `((1, 2), 9)` must not
+/// match `((1, 3), 9)` (the inner `2 != 3` fails that arm). Before the fix the
+/// tuple arm always matched, so the first (wrong) arm was taken.
+#[test]
+fn match_nested_tuple_pattern_tests_inner_elements() {
+    if !c_backend_ready() {
+        eprintln!("skipping nested-tuple e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let src = "fn main() ~ Console {\n\
+               let p = ((1, 2), 9);\n\
+               let r = match p {\n\
+               ((1, 3), 9) => \"wrongA\",\n\
+               ((1, 2), 9) => \"right\",\n\
+               _ => \"other\",\n\
+               };\n\
+               println(\"{}\", r);\n\
+               }\n";
+    let dir = std::env::temp_dir().join("buildlang_match_nested_tuple");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("nested_tuple.bld");
+    std::fs::write(&path, src).expect("write nested_tuple.bld");
+    let result = c_backend_run(&path);
+    assert_eq!(
+        result.stdout, "right\n",
+        "a nested tuple pattern must test inner elements, not silently always match"
+    );
+}
+
+/// Regression (undeclared C variables): tuple-pattern element bindings must be
+/// emitted. `(a, b) => a + b` prints 15; the nested `((a, b), c)` binds all
+/// three (prints 12); the mixed `(1, x)` tests the literal `1` and binds `x`
+/// (prints 20). Before the binder existed, `lower_match` had no tuple arm in
+/// its binding section, so the emitted C referenced undeclared `a`/`b`.
+#[test]
+fn match_tuple_pattern_binds_elements() {
+    if !c_backend_ready() {
+        eprintln!("skipping tuple-binding e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let src = "fn main() ~ Console {\n\
+               let p = (7, 8);\n\
+               match p { (a, b) => println(\"{}\", a + b), }\n\
+               let q = ((3, 4), 5);\n\
+               match q { ((a, b), c) => println(\"{}\", a + b + c), }\n\
+               let m = (1, 20);\n\
+               match m { (1, x) => println(\"{}\", x), _ => println(\"{}\", 0), }\n\
+               }\n";
+    let dir = std::env::temp_dir().join("buildlang_match_tuple_binds");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("tuple_binds.bld");
+    std::fs::write(&path, src).expect("write tuple_binds.bld");
+    let result = c_backend_run(&path);
+    assert_eq!(
+        result.stdout, "15\n12\n20\n",
+        "tuple, nested-tuple, and mixed literal/binding patterns must bind their element variables"
+    );
+}
+
+/// Regression: a match guard can reference tuple-pattern bindings. The binder
+/// runs in the guard block before the guard expression, so `(a, b) if a < b`
+/// evaluates `a < b` with `a`/`b` in scope. `(3, 4)` takes the guarded arm and
+/// prints 34 (`a * 10 + b`); if the binder did not run before the guard the
+/// guard would reference undeclared variables.
+#[test]
+fn match_tuple_guard_references_bindings() {
+    if !c_backend_ready() {
+        eprintln!("skipping tuple-guard e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let src = "fn main() ~ Console {\n\
+               let p = (3, 4);\n\
+               let r = match p {\n\
+               (a, b) if a < b => a * 10 + b,\n\
+               (a, b) => a + b,\n\
+               };\n\
+               println(\"{}\", r);\n\
+               }\n";
+    let dir = std::env::temp_dir().join("buildlang_match_tuple_guard");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("tuple_guard.bld");
+    std::fs::write(&path, src).expect("write tuple_guard.bld");
+    let result = c_backend_run(&path);
+    assert_eq!(
+        result.stdout, "34\n",
+        "a guard clause must see the tuple pattern's bound elements"
+    );
+}
+
+/// Regression (fail-closed): a slice pattern in `match` is not yet supported in
+/// codegen. It must be REJECTED with a diagnostic, never compiled as an
+/// always-true test. Before the fix the `_ => Ok(bool(true))` catch-all made
+/// `[1, 2, 3]` silently always match, so a non-matching array would take the
+/// wrong arm. The `--target c` codegen path needs no C compiler, so this proves
+/// the fail-closed diagnostic directly.
+#[test]
+fn match_slice_pattern_fails_closed() {
+    let dir = std::env::temp_dir().join(format!(
+        "buildlang_match_slice_closed_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let fixture = dir.join("slice_pattern.bld");
+    fs::write(
+        &fixture,
+        "fn main() ~ Console {\n\
+         let a = [1, 2, 3];\n\
+         let r = match a {\n\
+         [1, 2, 3] => \"a\",\n\
+         _ => \"other\",\n\
+         };\n\
+         println(\"{}\", r);\n\
+         }\n",
+    )
+    .expect("write slice-pattern fixture");
+    let out_c = dir.join("slice_pattern.c");
+    let output = buildc()
+        .arg(&fixture)
+        .args(["--target", "c", "-o"])
+        .arg(&out_c)
+        .output()
+        .expect("run buildc --target c");
+    let _ = fs::remove_file(&fixture);
+    assert!(
+        !output.status.success(),
+        "a slice pattern in match must fail closed, not compile as always-true\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.to_lowercase().contains("slice pattern"),
+        "diagnostic should name the unsupported slice pattern:\n{}",
+        stderr
+    );
+}
+
 /// I1: Unicode arithmetic-operator aliases lex to their ASCII counterparts and
 /// run end-to-end. `×` (U+00D7), `·` (U+00B7), `∙` (U+2219) alias `*`; `÷`
 /// (U+00F7) aliases `/`; `−` (U+2212, the minus sign, NOT ASCII hyphen) aliases

@@ -4498,6 +4498,12 @@ impl<'ctx> MirLowerer<'ctx> {
             } else {
                 ret
             }
+        } else if Self::is_aggregate_mir_ty(&scrutinee_ty) {
+            // Arm bodies inferred as i32/void over an aggregate scrutinee
+            // (a tuple/struct/array match that yields a scalar): the result
+            // is the scalar, not the aggregate.  Taking the aggregate type
+            // here emits C that assigns an int to an aggregate local.
+            MirType::i32()
         } else {
             scrutinee_ty.clone()
         };
@@ -4581,6 +4587,14 @@ impl<'ctx> MirLowerer<'ctx> {
                     // Bind record-pattern fields before the guard so a guard
                     // expression can reference them (`Point { x } if x < 0`).
                     self.bind_struct_pattern_vars(&arm.pattern, scrutinee_local, &scrutinee_ty)?;
+                } else if matches!(&arm.pattern.kind, ast::PatternKind::Tuple(_)) {
+                    // Bind tuple-pattern elements before the guard so a guard
+                    // expression can reference them (`(a, b) if a < b`).
+                    self.bind_tuple_pattern_vars(
+                        &arm.pattern,
+                        values::local(scrutinee_local),
+                        &scrutinee_ty,
+                    )?;
                 }
 
                 let guard_expr = arm.guard.as_ref().unwrap();
@@ -4640,6 +4654,17 @@ impl<'ctx> MirLowerer<'ctx> {
                     // (Non-enum struct match; enum struct-variants go through
                     // `bind_enum_pattern_vars` above.)
                     self.bind_struct_pattern_vars(&arm.pattern, scrutinee_local, &scrutinee_ty)?;
+                } else if matches!(&arm.pattern.kind, ast::PatternKind::Tuple(_)) {
+                    // Tuple pattern `(a, b)` / `((a, b), c)`: bind each element
+                    // by projecting `_i` from the scrutinee tuple.  A refutable
+                    // element (a literal) has already been tested by
+                    // `lower_pattern_test`; binding only walks the irrefutable
+                    // sub-patterns.
+                    self.bind_tuple_pattern_vars(
+                        &arm.pattern,
+                        values::local(scrutinee_local),
+                        &scrutinee_ty,
+                    )?;
                 }
             }
 
@@ -4919,6 +4944,83 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(())
     }
 
+    /// Bind the variables of a tuple pattern by projecting each element `_i`
+    /// of the scrutinee tuple and binding the matching sub-pattern.  Recurses
+    /// into nested tuples so `((a, b), c)` binds `a`, `b`, and `c`.  Literal
+    /// and wildcard elements bind nothing.  A non-tuple scrutinee type or an
+    /// arity mismatch binds nothing (the refutability test has already gated
+    /// those before control reaches a body block).
+    fn bind_tuple_pattern_vars(
+        &mut self,
+        pattern: &ast::Pattern,
+        scrutinee_val: MirValue,
+        scrutinee_ty: &MirType,
+    ) -> CodegenResult<()> {
+        let ast::PatternKind::Tuple(patterns) = &pattern.kind else {
+            return Ok(());
+        };
+        let elem_tys: Vec<MirType> = match scrutinee_ty {
+            MirType::Tuple(tys) => tys.clone(),
+            _ => return Ok(()),
+        };
+        if patterns.len() != elem_tys.len() {
+            return Ok(());
+        }
+        for (i, pat) in patterns.iter().enumerate() {
+            let elem_ty = elem_tys[i].clone();
+            let field_name: Arc<str> = Arc::from(format!("_{}", i));
+            let builder = self
+                .current_fn
+                .as_mut()
+                .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+            let elem_local = builder.create_local(elem_ty.clone());
+            builder.assign(
+                elem_local,
+                MirRValue::FieldAccess {
+                    base: scrutinee_val.clone(),
+                    field_name,
+                    field_ty: elem_ty.clone(),
+                },
+            );
+            self.bind_subpattern_vars(pat, values::local(elem_local), &elem_ty)?;
+        }
+        Ok(())
+    }
+
+    /// Bind the variables of one sub-pattern against an already-projected
+    /// value.  Handles identifier bindings (including `x @ pat` and skipping
+    /// `_`), nested tuples, and transparent parentheses; other kinds bind
+    /// nothing.
+    fn bind_subpattern_vars(
+        &mut self,
+        pattern: &ast::Pattern,
+        value: MirValue,
+        value_ty: &MirType,
+    ) -> CodegenResult<()> {
+        match &pattern.kind {
+            ast::PatternKind::Ident {
+                name, subpattern, ..
+            } => {
+                if name.name.as_ref() != "_" {
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                    let local = builder.create_named_local(name.name.clone(), value_ty.clone());
+                    builder.assign(local, MirRValue::Use(value.clone()));
+                    self.var_map.insert(name.name.clone(), local);
+                }
+                if let Some(sub) = subpattern {
+                    self.bind_subpattern_vars(sub, value, value_ty)?;
+                }
+                Ok(())
+            }
+            ast::PatternKind::Tuple(_) => self.bind_tuple_pattern_vars(pattern, value, value_ty),
+            ast::PatternKind::Paren(inner) => self.bind_subpattern_vars(inner, value, value_ty),
+            _ => Ok(()),
+        }
+    }
+
     /// Generate a boolean MIR value that is true when `scrutinee_val` matches
     /// `pattern`.  Supports literal, wildcard, and simple variable patterns.
     fn lower_pattern_test(
@@ -4972,9 +5074,6 @@ impl<'ctx> MirLowerer<'ctx> {
                 Ok(values::local(cmp))
             }
 
-            // Unsupported pattern kinds fall through to "always matches" to
-            // avoid panicking.  A real implementation would need full pattern
-            // compilation here.
             // Range pattern: lo..=hi → scrutinee >= lo && scrutinee <= hi
             ast::PatternKind::Range {
                 start,
@@ -5010,7 +5109,134 @@ impl<'ctx> MirLowerer<'ctx> {
                 Ok(values::local(result))
             }
 
-            _ => Ok(values::bool(true)),
+            // Tuple pattern: project each element `_i` of the scrutinee and
+            // recursively test the matching sub-pattern, ANDing the results.
+            // A tuple of only bindings/wildcards is irrefutable, so this
+            // naturally yields `true`.  A shape it cannot project (a rest
+            // element, an arity mismatch, or a non-tuple scrutinee) fails
+            // closed rather than silently matching.
+            ast::PatternKind::Tuple(patterns) => {
+                let scrut_ty = self.type_of_value(&scrutinee_val);
+                let elem_tys: Vec<MirType> = match &scrut_ty {
+                    MirType::Tuple(tys) => tys.clone(),
+                    _ => {
+                        return Err(CodegenError::Unsupported(format!(
+                            "tuple pattern tested against non-tuple scrutinee of type {:?}",
+                            scrut_ty
+                        )));
+                    }
+                };
+                if patterns.len() != elem_tys.len() {
+                    return Err(CodegenError::Unsupported(format!(
+                        "tuple pattern with {} elements cannot match a {}-tuple scrutinee",
+                        patterns.len(),
+                        elem_tys.len()
+                    )));
+                }
+                let mut acc: Option<MirValue> = None;
+                for (i, pat) in patterns.iter().enumerate() {
+                    let elem_ty = elem_tys[i].clone();
+                    let field_name: Arc<str> = Arc::from(format!("_{}", i));
+                    let builder = self
+                        .current_fn
+                        .as_mut()
+                        .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                    let elem_local = builder.create_local(elem_ty.clone());
+                    builder.assign(
+                        elem_local,
+                        MirRValue::FieldAccess {
+                            base: scrutinee_val.clone(),
+                            field_name,
+                            field_ty: elem_ty,
+                        },
+                    );
+                    let sub = self.lower_pattern_test(pat, values::local(elem_local))?;
+                    acc = Some(match acc {
+                        None => sub,
+                        Some(prev) => {
+                            let builder = self.current_fn.as_mut().unwrap();
+                            let combined = builder.create_local(MirType::Bool);
+                            builder.binary_op(combined, BinOp::BitAnd, prev, sub);
+                            values::local(combined)
+                        }
+                    });
+                }
+                Ok(acc.unwrap_or_else(|| values::bool(true)))
+            }
+
+            // Parenthesized pattern: transparent — test the inner pattern.
+            ast::PatternKind::Paren(inner) => self.lower_pattern_test(inner, scrutinee_val),
+
+            // Struct (record) pattern in a non-enum match.  When every field
+            // sub-pattern is irrefutable (a binding or wildcard) the pattern
+            // always matches structurally, so the test is `true` and the field
+            // binding happens in the caller.  A refutable field sub-pattern
+            // (`Point { x: 0 }`) is not yet compiled here, so it fails closed
+            // rather than silently matching.
+            ast::PatternKind::Struct { fields, .. } => {
+                if fields.iter().all(|f| f.pattern.is_irrefutable()) {
+                    Ok(values::bool(true))
+                } else {
+                    Err(CodegenError::Unsupported(
+                        "struct pattern with a refutable field sub-pattern is not yet \
+                         supported in match; use a guard clause instead"
+                            .to_string(),
+                    ))
+                }
+            }
+
+            // Tuple-struct/newtype pattern in a non-enum match.  Irrefutable
+            // when every inner pattern is a binding or wildcard; a refutable
+            // inner pattern fails closed.
+            ast::PatternKind::TupleStruct { patterns, .. } => {
+                if patterns.iter().all(|p| p.is_irrefutable()) {
+                    Ok(values::bool(true))
+                } else {
+                    Err(CodegenError::Unsupported(
+                        "tuple-struct pattern with a refutable field is not yet supported \
+                         in match; use a guard clause instead"
+                            .to_string(),
+                    ))
+                }
+            }
+
+            // Reference/box patterns are transparent only when the inner
+            // pattern is irrefutable.  Testing a refutable inner pattern needs
+            // a deref that is not emitted here, so it fails closed.
+            ast::PatternKind::Ref { pattern: inner, .. } | ast::PatternKind::Box(inner) => {
+                if inner.is_irrefutable() {
+                    Ok(values::bool(true))
+                } else {
+                    Err(CodegenError::Unsupported(
+                        "reference/box pattern with a refutable inner pattern is not yet \
+                         supported in match"
+                            .to_string(),
+                    ))
+                }
+            }
+
+            // Slice patterns need length and element tests that are not yet
+            // compiled here; fail closed rather than silently always match.
+            ast::PatternKind::Slice(_) => Err(CodegenError::Unsupported(
+                "slice pattern is not yet supported in match; it would otherwise \
+                 silently always match"
+                    .to_string(),
+            )),
+
+            // Any remaining pattern kind: an irrefutable one always matches; a
+            // refutable one fails closed so the compiler never silently treats
+            // a non-match as a match.
+            _ => {
+                if pattern.is_irrefutable() {
+                    Ok(values::bool(true))
+                } else {
+                    Err(CodegenError::Unsupported(
+                        "this refutable pattern kind is not yet supported in match; it \
+                         would otherwise silently always match"
+                            .to_string(),
+                    ))
+                }
+            }
         }
     }
 
