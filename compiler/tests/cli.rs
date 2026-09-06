@@ -13536,6 +13536,165 @@ fn main() ~ Console {
     }
 }
 
+/// Regression (vec-of-aggregate element, must-reject control). The HVec runtime
+/// stores scalar and string elements only: a `build_hvec_*_<suffix>` helper pair
+/// exists for f64, i64, i32, and str. `vec_fn_names_for_type` used to default
+/// every unrecognised element type to the i32 helper, so a vector whose element
+/// is a tuple, an array, a nested vector, or a user struct was handed to a helper
+/// whose parameter is `int32_t`. For a tuple, struct, or nested vector that leaked
+/// a raw C type error to the user. For an ARRAY element it was a silent wrong
+/// answer: the array decayed to a pointer that `int32_t` truncated to 32 bits
+/// under `-Wint-conversion`, which only warns, so the program compiled and read
+/// the element back as a bogus value. `vec_fn_names_for_type` now fails closed on
+/// any aggregate element with one honest diagnostic. Each case below must be
+/// rejected, and the assertion checks the rejection reason, not merely that the
+/// run failed, so an unrelated earlier error (a parser or checker rejection)
+/// cannot make the control pass silently. The array case is the one that ran and
+/// miscompiled on the pre-fix binary; the other three leaked C errors.
+#[test]
+fn vec_of_aggregate_element_is_rejected() {
+    if !c_backend_ready() {
+        eprintln!("skipping vec-of-aggregate reject e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    // (name, source, behaviour on the pre-fix binary)
+    let cases: [(&str, &str, &str); 4] = [
+        (
+            "vec_of_array_swa",
+            r#"fn main() ~ Console {
+    let v: Vec<[i64; 2]> = vec![[1, 2], [3, 4]];
+    println!("{}", v[0][0]);
+}
+"#,
+            "silent wrong answer: the array decayed to a pointer truncated to int32_t",
+        ),
+        (
+            "vec_of_tuple",
+            r#"fn main() ~ Console {
+    let v: Vec<(i64, i64)> = vec![(1, 2), (3, 4)];
+    println!("{}", v[0].0);
+}
+"#,
+            "leaked C type error: int32_t parameter for a Tuple_i64_i64 element",
+        ),
+        (
+            "vec_of_nested_vec",
+            r#"fn main() ~ Console {
+    let v: Vec<Vec<i64>> = vec![vec![1], vec![2]];
+    println!("{}", v[0][0]);
+}
+"#,
+            "leaked C type error: int32_t parameter for a vec-handle element",
+        ),
+        (
+            "vec_of_struct",
+            r#"struct Point { x: i64, y: i64 }
+fn main() ~ Console {
+    let v: Vec<Point> = vec![Point { x: 1, y: 2 }];
+    println!("{}", v[0].x);
+}
+"#,
+            "leaked C type error: int32_t parameter for a struct element",
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_vec_aggregate_reject");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src, prefix_behaviour) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write vec-aggregate reject case");
+        let output = buildc()
+            .arg("run")
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|err| panic!("run buildc for {name}: {err}"));
+        assert!(
+            !output.status.success(),
+            "vec-aggregate reject case `{name}` must fail to compile, not build a scalar-strided vec (pre-fix: {prefix_behaviour})\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("the Vec runtime stores scalar"),
+            "vec-aggregate reject case `{name}` must fail for the unsupported-element reason, not an unrelated error:\n{stderr}"
+        );
+    }
+}
+
+/// Regression (vec-of-aggregate rejection, no-over-rejection companion). The
+/// rejection above must not swallow the element types the HVec runtime does
+/// support. Each supported arm is pinned: i64 (the i64 helper), f32 (mapped to
+/// the f64 helper), i32 (the i32 helper), bool (also the i32 helper, read through
+/// a branch so the assertion does not depend on bool Display formatting), and a
+/// string element (the str helper). Each must still build and read the element it
+/// stored.
+#[test]
+fn vec_of_scalar_element_still_builds_and_reads() {
+    if !c_backend_ready() {
+        eprintln!("skipping vec-scalar positive e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    // (name, source, expected stdout)
+    let cases: [(&str, &str, &str); 5] = [
+        (
+            "vec_i64",
+            r#"fn main() ~ Console {
+    let v: Vec<i64> = vec![10, 20, 30];
+    println!("{}", v[1]);
+}
+"#,
+            "20\n",
+        ),
+        (
+            "vec_f32",
+            r#"fn main() ~ Console {
+    let v: Vec<f32> = vec![1.5, 2.5, 3.5];
+    println!("{}", v[1]);
+}
+"#,
+            "2.5\n",
+        ),
+        (
+            "vec_i32",
+            r#"fn main() ~ Console {
+    let v: Vec<i32> = vec![10, 20, 30];
+    println!("{}", v[1]);
+}
+"#,
+            "20\n",
+        ),
+        (
+            "vec_bool",
+            r#"fn main() ~ Console {
+    let v: Vec<bool> = vec![true, false, true];
+    if v[1] { println!("A"); } else { println!("B"); }
+}
+"#,
+            "B\n",
+        ),
+        (
+            "vec_string",
+            r#"fn main() ~ Console {
+    let v: Vec<String> = vec!["a", "b", "c"];
+    println!("{}", v[1]);
+}
+"#,
+            "b\n",
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_vec_scalar_positive");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src, expected) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write vec-scalar positive case");
+        let result = c_backend_run(&path);
+        assert_eq!(
+            result.stdout, expected,
+            "vec-scalar case `{name}` must still build and read its supported element type"
+        );
+    }
+}
+
 /// Regression: unary complement must pick the C operator from the operand type.
 /// BuildLang follows Rust: `!` is logical complement on `bool` and bitwise
 /// complement on integers, and `~` is always bitwise complement. MIR lowering

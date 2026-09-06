@@ -1000,7 +1000,7 @@ impl<'ctx> MirLowerer<'ctx> {
                 // at the expected element type when one is known (else the f64
                 // default this path has always used).
                 let placeholder_elem = expected_elem.clone().unwrap_or_else(MirType::f64);
-                let (new_fn_name, _) = Self::vec_fn_names_for_type(&placeholder_elem);
+                let (new_fn_name, _) = Self::vec_fn_names_for_type(&placeholder_elem)?;
                 let new_fn = MirValue::Function(Arc::from(new_fn_name));
                 let vec_ty = MirType::Vec(Box::new(placeholder_elem));
                 let builder = self
@@ -1022,7 +1022,7 @@ impl<'ctx> MirLowerer<'ctx> {
             // vec![] with no args -- empty vec at the expected element type,
             // else i32.
             let empty_elem = expected_elem.clone().unwrap_or_else(MirType::i32);
-            let (new_fn_name, _) = Self::vec_fn_names_for_type(&empty_elem);
+            let (new_fn_name, _) = Self::vec_fn_names_for_type(&empty_elem)?;
             let new_fn = MirValue::Function(Arc::from(new_fn_name));
             let vec_ty = MirType::Vec(Box::new(empty_elem));
             let builder = self
@@ -1054,7 +1054,7 @@ impl<'ctx> MirLowerer<'ctx> {
             let elem_ty = expected_elem
                 .clone()
                 .unwrap_or_else(|| self.type_of_value(&val));
-            let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&elem_ty);
+            let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&elem_ty)?;
             let vec_ty = MirType::Vec(Box::new(elem_ty));
 
             // Create the vec
@@ -1167,7 +1167,7 @@ impl<'ctx> MirLowerer<'ctx> {
             let elem_ty = expected_elem
                 .clone()
                 .unwrap_or_else(|| self.type_of_value(&first_val));
-            let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&elem_ty);
+            let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&elem_ty)?;
             let vec_ty = MirType::Vec(Box::new(elem_ty));
 
             // Create the vec
@@ -1220,27 +1220,51 @@ impl<'ctx> MirLowerer<'ctx> {
 
     /// Select the correct C-level vec_new / vec_push function names based on element type.
     /// Returns the C runtime function names (not the BuildLang builtin names).
-    fn vec_fn_names_for_type(elem_ty: &MirType) -> (&'static str, &'static str) {
+    /// Map a vec element type to its runtime build/push helper pair, or reject
+    /// the element type when no helper can store it.
+    ///
+    /// The HVec runtime is scalar-plus-string only: a `build_hvec_*_<suffix>`
+    /// pair exists for f64 (also used for f32), i64 (also used for isize/u64),
+    /// i32 (used for the narrow integer widths, u32, char, and bool), and str.
+    /// An aggregate element (a tuple, an array, a nested vector, a user struct)
+    /// has no helper, so the i32 default used to be handed a value it cannot
+    /// take by an `int32_t` parameter. For a tuple, struct, or nested vector
+    /// that was a hard C type error leaking to the user; for an array element it
+    /// was worse, a silent miscompile, because the array decayed to a pointer
+    /// that `int32_t` truncated to 32 bits under `-Wint-conversion` and read
+    /// back as a bogus value. Fail closed here with a clear diagnostic instead.
+    /// A vector of an aggregate element is an honest gap: it needs an
+    /// element-size-generic HVec path (byte-width storage plus an accessor that
+    /// projects the aggregate back out), not the scalar helper family.
+    ///
+    /// Keep the supported suffixes in sync with the canonical element -> suffix
+    /// table the vec method and free-function accessors use in
+    /// codegen/lower/expr.rs, so `vec![...]` builds the same typed handle those
+    /// accessors later read.
+    fn vec_fn_names_for_type(
+        elem_ty: &MirType,
+    ) -> CodegenResult<(&'static str, &'static str)> {
         match elem_ty {
             MirType::Float(FloatSize::F64) | MirType::Float(FloatSize::F32) => {
-                ("build_hvec_new_f64", "build_hvec_push_f64")
+                Ok(("build_hvec_new_f64", "build_hvec_push_f64"))
             }
             MirType::Int(IntSize::I64, _) | MirType::Int(IntSize::ISize, _) => {
-                ("build_hvec_new_i64", "build_hvec_push_i64")
+                Ok(("build_hvec_new_i64", "build_hvec_push_i64"))
             }
-            // String elements need the str-typed handle; the i32 helpers take an
-            // int32_t and passing a BuildString to them fails to compile. Keep the
-            // BuildString -> "str" mapping in sync with the canonical element ->
-            // suffix table the vec method/free-function paths use in
-            // codegen/lower/expr.rs, so `vec!["a", "b"]` builds the same typed
-            // handle those accessors later read.
             MirType::Struct(n) if n.as_ref() == "BuildString" => {
-                ("build_hvec_new_str", "build_hvec_push_str")
+                Ok(("build_hvec_new_str", "build_hvec_push_str"))
             }
-            _ => {
-                // Default to i32 for everything else (bool, i32, u32, char).
-                ("build_hvec_new_i32", "build_hvec_push_i32")
+            // The narrow integer widths, u32, char (lowered to u32), and bool all
+            // pass to the i32 helper's `int32_t` parameter by value, so their
+            // build and read strides agree.
+            MirType::Int(_, _) | MirType::Bool => {
+                Ok(("build_hvec_new_i32", "build_hvec_push_i32"))
             }
+            _ => Err(CodegenError::Unsupported(format!(
+                "a vector of `{elem_ty}` elements is not supported yet: the Vec \
+                 runtime stores scalar (integer, float, bool, char) and string \
+                 elements, not a tuple, array, struct, or nested vector element"
+            ))),
         }
     }
 
@@ -2301,7 +2325,7 @@ impl<'ctx> MirLowerer<'ctx> {
         //    After map closures, the type may change based on the closure's
         //    return type annotation.  For now we infer from the closure.
         let output_elem_ty = self.infer_chain_output_type(&elem_ty, &chain.steps);
-        let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&output_elem_ty);
+        let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&output_elem_ty)?;
 
         // 5. Set up the result value depending on terminal type.
         let (result_local, _is_collect) = match &chain.terminal {

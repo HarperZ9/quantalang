@@ -55,6 +55,25 @@ tracked in `STATUS.md`, `README.md`, and
   (which routes to the monomorphizer before this path) passes no hint and lowers the
   argument at the default width.
 
+- **A vector of an aggregate element is rejected instead of miscompiled**: the HVec
+  runtime stores scalar and string elements only, with a build/push helper pair for
+  `f64`, `i64`, `i32`, and `str`. The element-to-helper selector defaulted every
+  unrecognised element type to the `i32` helper, whose parameter is `int32_t`, so a
+  vector whose element is a tuple, an array, a nested vector, or a user struct was
+  handed to a helper that could not store it. For an array element that was a silent
+  wrong answer: the array decayed to a pointer that `int32_t` truncated to 32 bits
+  under `-Wint-conversion`, which only warns, so `let v: Vec<[i64; 2]> = vec![[1, 2],
+  [3, 4]]` compiled and read `v[0][0]` back as a bogus value. For a tuple, struct, or
+  nested-vector element it leaked a raw C type error to the user. The selector now
+  fails closed on any aggregate element with one diagnostic naming the supported
+  element kinds. Covered by `vec_of_aggregate_element_is_rejected` (vector of array,
+  tuple, nested vector, and struct, each rejected for the unsupported-element reason)
+  and by `vec_of_scalar_element_still_builds_and_reads`, which confirms the supported
+  `i64`, `f32`, `i32`, `bool`, and string element vectors still build and read. Honest
+  null: a vector of an aggregate element is not supported at all yet. Supporting it
+  needs a byte-width HVec path plus an accessor that projects the aggregate back out,
+  not the scalar helper family.
+
 - **Compound assignment through a plain dereference reads before it stores**:
   `*p += v` and its nine siblings (`-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`,
   `>>=`) lowered as `*p = v`. The dereference-assignment path never inspected the
