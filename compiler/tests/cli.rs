@@ -13159,6 +13159,59 @@ fn float_to_int_cast_saturates_like_rust_end_to_end() {
     );
 }
 
+/// Regression: a shift count is masked to the left operand's bit width, matching
+/// Rust's release-wrapping shift (`a << b` shifts by `b % bits`). The C backend
+/// promotes a sub-`int` operand to 32-bit `int` before shifting, so a narrow
+/// type shifted by a count at or past its own width used the un-masked 32-bit
+/// count and printed a silent wrong answer: 255u8 >> 9 gave 0 (want 127), 1u8
+/// << 8 gave 0 (want 1), -128i8 >> 9 gave -1 (want -64), 1u16 << 16 gave 0
+/// (want 1). The shift amounts are read from mutable locals so the value flows
+/// through codegen rather than being const-folded. The last two lines are wide
+/// types (i32/u64) that were already correct; they pin that masking every width
+/// does not regress them (x86 already masks the count mod width there).
+#[test]
+fn narrow_shift_masks_count_to_width_like_rust_end_to_end() {
+    if !c_backend_ready() {
+        eprintln!("skipping narrow-shift e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let src = r#"fn main() ~ Console {
+    let mut s9: u32 = 9;
+    let mut s8: u32 = 8;
+    let mut s16: u32 = 16;
+    let mut s17: u32 = 17;
+    let a: u8 = 255u8;
+    let b: u8 = 1u8;
+    let c: i8 = -128i8;
+    let d: u16 = 1u16;
+    let e: u16 = 65535u16;
+    let f: i16 = 1i16;
+    println!("{}", a >> s9);
+    println!("{}", b << s8);
+    println!("{}", c >> s9);
+    println!("{}", d << s16);
+    println!("{}", e >> s17);
+    println!("{}", f << s16);
+    let mut s32: u32 = 32;
+    let g: i32 = 1i32;
+    println!("{}", g << s32);
+    let h: u64 = 255u64;
+    let mut s65: u32 = 65;
+    println!("{}", h >> s65);
+}
+"#;
+    let dir = std::env::temp_dir().join("buildlang_narrow_shift_regress");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("narrow_shift.bld");
+    std::fs::write(&path, src).expect("write narrow_shift.bld");
+    let result = c_backend_run(&path);
+    assert_eq!(
+        result.stdout,
+        "127\n1\n-64\n1\n32767\n1\n1\n127\n",
+        "narrow-width over-shift must mask the count to the operand width like Rust release"
+    );
+}
+
 /// Regression: `break 'label` / `continue 'label` must target the named
 /// enclosing loop, not the innermost one. Labeled loops parse (parser support),
 /// but MIR lowering previously stored only the innermost loop's blocks and

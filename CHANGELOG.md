@@ -38,6 +38,21 @@ tracked in `STATUS.md`, `README.md`, and
   control in `compiler/tests/cli.rs` pins the positive-overflow,
   negative-overflow, NaN, unsigned, and 64-bit paths and prints the wrapped UB
   values on the pre-fix binary.
+- **Shifts mask the count to the operand width like Rust's release shift**: the
+  C backend emitted a bare `a << b` / `a >> b`. C promotes a sub-`int` operand to
+  a 32-bit `int` before shifting, so a narrow type shifted by a count at or past
+  its own width used the full 32-bit count instead of Rust's wrapped count
+  (`b % bits`). `255u8 >> 9` printed 0 instead of 127, `1u8 << 8` printed 0
+  instead of 1, `-128i8 >> 9` printed -1 instead of -64, and `1u16 << 16` printed
+  0 instead of 1. Each was a silent wrong answer. The backend now masks the shift
+  count to the left operand's bit width for every integer width, emitting
+  `(a << ((b) & (bits - 1)))`. At i32 and i64 this equals the count masking x86
+  already performs, so those widths stay correct and the emitted C no longer
+  relies on a target-specific shift rule. One end-to-end control in
+  `compiler/tests/cli.rs` reads the shift amounts from mutable locals so the value
+  flows through codegen, pins the six narrow-width cases plus two already-correct
+  wide controls, and prints the un-masked `0 0 -1 0 0 0` values on the pre-fix
+  binary.
 - **`match` pattern tests and result type**: five codegen defects in match
   lowering are fixed, four of which produced a silent wrong answer. An
   open-ended range pattern (`100..`) compared the scrutinee against an

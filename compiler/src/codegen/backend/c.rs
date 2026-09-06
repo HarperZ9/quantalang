@@ -3988,6 +3988,42 @@ impl CBackend {
                         });
                     }
                 }
+                // Shift-count masking. Rust wraps a shift count to the left
+                // operand's bit width (release semantics): `a << b` shifts by
+                // `b % bits`. C promotes a sub-`int` operand to 32-bit `int`
+                // before shifting, so a narrow type (i8/i16/u8/u16) shifted by
+                // a count at or past its width used the un-masked 32-bit count
+                // and printed a wrong value (255u8 >> 9 gave 0 instead of 127,
+                // 1u8 << 8 gave 0 instead of 1). Mask the count to the operand
+                // width for every integer width: for i32/i64 this equals the
+                // count-masking x86 already performs, so those stay correct
+                // while the narrow widths are fixed and the emitted C no longer
+                // depends on a target-specific shift rule. `<<`/`>>` bind
+                // tighter than `&`, so the masked count is fully parenthesized.
+                if *op == BinOp::Shl || *op == BinOp::Shr {
+                    let int_bits = |v: &MirValue| -> Option<u32> {
+                        let ty = match v {
+                            MirValue::Const(MirConst::Int(_, t))
+                            | MirValue::Const(MirConst::Uint(_, t)) => t,
+                            MirValue::Local(id) => &locals.get(id.0 as usize)?.ty,
+                            _ => return None,
+                        };
+                        match ty {
+                            MirType::Int(size, _) => Some(match size {
+                                IntSize::I8 => 8,
+                                IntSize::I16 => 16,
+                                IntSize::I32 => 32,
+                                IntSize::I64 | IntSize::ISize => 64,
+                                IntSize::I128 => 128,
+                            }),
+                            _ => None,
+                        }
+                    };
+                    if let Some(bits) = int_bits(left) {
+                        let op_str = self.binop_to_c(*op);
+                        return Ok(format!("({} {} (({}) & {}))", l, op_str, r, bits - 1));
+                    }
+                }
                 let op_str = self.binop_to_c(*op);
                 format!("({} {} {})", l, op_str, r)
             }
