@@ -2022,8 +2022,8 @@ impl<'ctx> MirLowerer<'ctx> {
 
             self.current_fn = Some(builder);
 
-            // Lower function body
-            let result = self.lower_block(body)?;
+            // Lower function body (tail expression sees the declared return type)
+            let result = self.lower_fn_body(body)?;
 
             // Add return if needed
             let mut builder = self.current_fn.take().unwrap();
@@ -2278,7 +2278,7 @@ impl<'ctx> MirLowerer<'ctx> {
 
             self.current_fn = Some(builder);
 
-            let result = self.lower_block(body)?;
+            let result = self.lower_fn_body(body)?;
 
             let mut builder = self.current_fn.take().unwrap();
             if f.sig.return_ty.is_some() {
@@ -2357,7 +2357,7 @@ impl<'ctx> MirLowerer<'ctx> {
             }
 
             self.current_fn = Some(builder);
-            let result = self.lower_block(body)?;
+            let result = self.lower_fn_body(body)?;
 
             let mut builder = self.current_fn.take().unwrap();
             if f.sig.return_ty.is_some() {

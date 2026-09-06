@@ -33,6 +33,16 @@ impl<'ctx> MirLowerer<'ctx> {
     pub(crate) fn lower_block(&mut self, block: &ast::Block) -> CodegenResult<Option<MirValue>> {
         let mut result = None;
 
+        // A block's value comes only from its tail statement, so only the tail
+        // should see the block's expected type. Non-tail statements are lowered
+        // with no expected-type hint, which keeps a block's declared type from
+        // leaking into an intermediate statement's literals: a function whose
+        // body is `{ let mut s = 0; for i in 0..3 { s += i } s }` must not let
+        // the `-> i64` return type widen the `0..3` loop counter. The tail hint
+        // is what threads a `-> (i64, i64)` return type into a returned tuple
+        // literal so it is built at the width its caller reads.
+        let block_expected = self.expected_type.clone();
+
         for (i, stmt) in block.stmts.iter().enumerate() {
             let is_last = i == block.stmts.len() - 1;
             // Set the span cursor so every MIR statement/terminator this
@@ -46,10 +56,29 @@ impl<'ctx> MirLowerer<'ctx> {
             if let Some(builder) = self.current_fn.as_mut() {
                 builder.set_current_span(stmt.span);
             }
+            self.expected_type = if is_last { block_expected.clone() } else { None };
             result = self.lower_stmt(stmt, is_last)?;
         }
 
+        // Restore the incoming hint for the caller (an empty block never
+        // touched it, but the loop above leaves it cleared otherwise).
+        self.expected_type = block_expected;
+
         Ok(result)
+    }
+
+    /// Lower a function body with the function's declared return type as the
+    /// tail expected type. This threads the return type into an implicitly
+    /// returned aggregate literal (`fn f() -> (i64, i64) { (a, b) }`) so it is
+    /// built at the width its callers read, the same way `lower_return` handles
+    /// an explicit `return`. Must be called with `self.current_fn` already set.
+    pub(crate) fn lower_fn_body(&mut self, body: &ast::Block) -> CodegenResult<Option<MirValue>> {
+        let body_expected = self.current_fn.as_ref().map(|b| b.return_type().clone());
+        let prev_expected = self.expected_type.take();
+        self.expected_type = body_expected;
+        let result = self.lower_block(body);
+        self.expected_type = prev_expected;
+        result
     }
 
     fn lower_stmt(&mut self, stmt: &ast::Stmt, is_tail: bool) -> CodegenResult<Option<MirValue>> {
@@ -6628,9 +6657,21 @@ impl<'ctx> MirLowerer<'ctx> {
     }
 
     fn lower_return(&mut self, value: Option<&ast::Expr>) -> CodegenResult<MirValue> {
-        // Lower value expression FIRST if present
+        // Lower value expression FIRST if present, threading the function's
+        // declared return type as the expected type so a returned aggregate
+        // literal (`return (a, b);`, `return vec![..];`, `return [..];`) is
+        // built at the width its caller reads. Without this the elements
+        // default to i32 and an i64 caller reads a corrupt, wider value.
+        let ret_expected = self
+            .current_fn
+            .as_ref()
+            .map(|b| b.return_type().clone());
         let ret_val = if let Some(expr) = value {
-            Some(self.lower_expr(expr)?)
+            let prev_expected = self.expected_type.take();
+            self.expected_type = ret_expected;
+            let lowered = self.lower_expr(expr);
+            self.expected_type = prev_expected;
+            Some(lowered?)
         } else {
             None
         };
@@ -6983,10 +7024,32 @@ impl<'ctx> MirLowerer<'ctx> {
     }
 
     fn lower_tuple(&mut self, elems: &[ast::Expr]) -> CodegenResult<MirValue> {
-        let elem_vals: Vec<_> = elems
-            .iter()
-            .map(|e| self.lower_expr(e))
-            .collect::<CodegenResult<_>>()?;
+        // When a tuple type is expected (from a let annotation or another
+        // bidirectional hint), lower each element with its expected component
+        // type so integer and float literals adopt the annotated width instead
+        // of the i32/f64 default. Without this an annotated
+        // `let a: (i64, i64) = (7, 8)` builds a `Tuple_i32_i32` value with two
+        // 4-byte fields while every `a.0` field access reads at the annotated
+        // i64 width (8 bytes), so a plain read spans both fields and a store
+        // corrupts its neighbour -> a silent wrong answer with no diagnostic.
+        let expected_elems: Option<Vec<MirType>> = match &self.expected_type {
+            Some(MirType::Tuple(tys)) if tys.len() == elems.len() => Some(tys.clone()),
+            _ => None,
+        };
+
+        let prev_expected = self.expected_type.take();
+        let mut elem_vals = Vec::with_capacity(elems.len());
+        for (i, e) in elems.iter().enumerate() {
+            self.expected_type = expected_elems.as_ref().map(|tys| tys[i].clone());
+            match self.lower_expr(e) {
+                Ok(val) => elem_vals.push(val),
+                Err(err) => {
+                    self.expected_type = prev_expected;
+                    return Err(err);
+                }
+            }
+        }
+        self.expected_type = prev_expected;
 
         if elem_vals.is_empty() {
             let builder = self
@@ -6998,8 +7061,13 @@ impl<'ctx> MirLowerer<'ctx> {
             return Ok(values::local(result));
         }
 
-        // Build the proper MirType::Tuple from element types.
-        let elem_tys: Vec<MirType> = elem_vals.iter().map(|v| self.type_of_value(v)).collect();
+        // Element types: the annotated component types when present, else each
+        // element's inferred type. Using the annotated types keeps the tuple's
+        // struct typedef the same width the field-access side reads at.
+        let elem_tys: Vec<MirType> = match &expected_elems {
+            Some(tys) => tys.clone(),
+            None => elem_vals.iter().map(|v| self.type_of_value(v)).collect(),
+        };
         let tuple_ty = MirType::Tuple(elem_tys.clone());
 
         // Register the tuple type definition (struct typedef) if not already done.

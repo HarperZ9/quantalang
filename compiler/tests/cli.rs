@@ -13294,6 +13294,84 @@ fn main() ~ Console {
     }
 }
 
+/// Regression (return-position aggregate element width, false-success control).
+/// An aggregate literal in return position defaulted its element literals to
+/// i32 because the function's declared return type was never threaded in as the
+/// expected type. A `fn f() -> (i64, i64) { (a, b) }` therefore built a tuple at
+/// a 4-byte stride while every caller read it at the declared 8-byte width, so
+/// an 8-byte field read spanned two 4-byte-strided elements: a silent wrong
+/// answer with no diagnostic. Covers the tail-expression and explicit-`return`
+/// forms of a tuple, plus a returned `Vec<i64>` and a returned `[i64; 3]`. Each
+/// case ran on the pre-fix binary and produced the corrupt value in its comment;
+/// the assertions pin the corrected value, so the pre-fix binary fails each one.
+#[test]
+fn return_position_aggregate_is_built_at_declared_width() {
+    if !c_backend_ready() {
+        eprintln!("skipping return-width e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    // (name, source, expected stdout, value the pre-fix binary printed)
+    let cases: [(&str, &str, &str, &str); 4] = [
+        (
+            "return_tuple_tail",
+            r#"fn ret_t() -> (i64, i64) { (11, 22) }
+fn main() ~ Console {
+    let r = ret_t();
+    println!("{}", r.0);
+    println!("{}", r.1);
+}
+"#,
+            "11\n22\n",
+            "94489280523 then 0 = (22<<32)|11 read at i64 over an i32-strided tuple",
+        ),
+        (
+            "return_tuple_explicit",
+            r#"fn ret_t() -> (i64, i64) { return (33, 44); }
+fn main() ~ Console {
+    let r = ret_t();
+    println!("{}", r.0);
+    println!("{}", r.1);
+}
+"#,
+            "33\n44\n",
+            "188978561057 then 0 = (44<<32)|33",
+        ),
+        (
+            "return_vec_i64",
+            r#"fn ret_v() -> Vec<i64> { vec![1, 2, 3] }
+fn main() ~ Console {
+    let v = ret_v();
+    println!("{}", v[1]);
+}
+"#,
+            "2\n",
+            "12884901890 = (3<<32)|2",
+        ),
+        (
+            "return_array_i64",
+            r#"fn ret_a() -> [i64; 3] { [5, 6, 7] }
+fn main() ~ Console {
+    let a = ret_a();
+    println!("{}", a[2]);
+}
+"#,
+            "7\n",
+            "garbage from an out-of-stride 8-byte read",
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_return_width");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src, expected, prefix_value) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write return-width case");
+        let result = c_backend_run(&path);
+        assert_eq!(
+            result.stdout, expected,
+            "return-width case `{name}` must build the aggregate at the declared width; pre-fix printed `{prefix_value}`"
+        );
+    }
+}
+
 /// Regression (reference-pointee width, must-reject controls). A borrow whose
 /// pointee width disagrees with the callee parameter is a silent wrong answer:
 /// the callee stores or loads at its own width through storage laid out at a

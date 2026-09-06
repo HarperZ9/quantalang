@@ -952,6 +952,18 @@ impl<'ctx> MirLowerer<'ctx> {
     ///
     /// The element type is inferred from the first argument expression.
     pub(crate) fn lower_vec_macro(&mut self, tokens: &[ast::TokenTree]) -> CodegenResult<MirValue> {
+        // When a `Vec<T>` type is expected (from a let annotation or another
+        // bidirectional hint), lower each element with `T` as its expected type
+        // and build the vec at `T`. Without this an annotated
+        // `let v: Vec<i64> = vec![1, 2, 3]` infers `i32` from the bare literals,
+        // stores 4-byte-strided elements through the i32 push helper, and every
+        // `v[i]` reads at the i64 width the annotation requires -> the read
+        // spans two elements: a silent wrong answer with no diagnostic.
+        let expected_elem: Option<MirType> = match &self.expected_type {
+            Some(MirType::Vec(elem)) => Some((**elem).clone()),
+            _ => None,
+        };
+
         // Check if tokens have valid spans matching our source file.
         // When the macro expander expands nested vec! calls, the inner
         // tokens get synthetic spans that don't match self.source.
@@ -984,9 +996,13 @@ impl<'ctx> MirLowerer<'ctx> {
 
             if !has_valid_spans && !tokens.is_empty() {
                 // Tokens have synthetic spans - this vec! was already expanded
-                // by the macro expander. Create an empty vec as placeholder.
-                let new_fn = MirValue::Function(Arc::from("build_hvec_new_f64"));
-                let vec_ty = MirType::Vec(Box::new(MirType::f64()));
+                // by the macro expander. Create an empty vec as placeholder,
+                // at the expected element type when one is known (else the f64
+                // default this path has always used).
+                let placeholder_elem = expected_elem.clone().unwrap_or_else(MirType::f64);
+                let (new_fn_name, _) = Self::vec_fn_names_for_type(&placeholder_elem);
+                let new_fn = MirValue::Function(Arc::from(new_fn_name));
+                let vec_ty = MirType::Vec(Box::new(placeholder_elem));
                 let builder = self
                     .current_fn
                     .as_mut()
@@ -1003,9 +1019,12 @@ impl<'ctx> MirLowerer<'ctx> {
         let all_groups = self.split_vec_macro_token_groups(tokens);
 
         if all_groups.is_empty() {
-            // vec![] with no args -- create empty i32 vec
-            let new_fn = MirValue::Function(Arc::from("build_hvec_new_i32"));
-            let vec_ty = MirType::Vec(Box::new(MirType::i32()));
+            // vec![] with no args -- empty vec at the expected element type,
+            // else i32.
+            let empty_elem = expected_elem.clone().unwrap_or_else(MirType::i32);
+            let (new_fn_name, _) = Self::vec_fn_names_for_type(&empty_elem);
+            let new_fn = MirValue::Function(Arc::from(new_fn_name));
+            let vec_ty = MirType::Vec(Box::new(empty_elem));
             let builder = self
                 .current_fn
                 .as_mut()
@@ -1025,9 +1044,16 @@ impl<'ctx> MirLowerer<'ctx> {
             let val_tokens = all_groups[0].clone();
             let count_tokens = all_groups[1].clone();
 
-            // Parse and lower the value expression to infer the element type
-            let val = self.parse_and_lower_token_group(val_tokens)?;
-            let elem_ty = self.type_of_value(&val);
+            // Lower the value at the expected element type so a bare literal
+            // adopts the annotated width; fall back to the inferred type.
+            let prev_expected = self.expected_type.take();
+            self.expected_type = expected_elem.clone();
+            let val = self.parse_and_lower_token_group(val_tokens);
+            self.expected_type = prev_expected;
+            let val = val?;
+            let elem_ty = expected_elem
+                .clone()
+                .unwrap_or_else(|| self.type_of_value(&val));
             let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&elem_ty);
             let vec_ty = MirType::Vec(Box::new(elem_ty));
 
@@ -1130,10 +1156,17 @@ impl<'ctx> MirLowerer<'ctx> {
             Ok(MirValue::Local(vec_local))
         } else {
             // vec![a, b, c] -- literal form
-            // Parse and lower the first argument to infer the element type
+            // Lower the first argument at the expected element type (so a bare
+            // literal adopts the annotated width), else infer from its value.
             let first_tokens = all_groups[0].clone();
-            let first_val = self.parse_and_lower_token_group(first_tokens)?;
-            let elem_ty = self.type_of_value(&first_val);
+            let prev_expected = self.expected_type.take();
+            self.expected_type = expected_elem.clone();
+            let first_val = self.parse_and_lower_token_group(first_tokens);
+            self.expected_type = prev_expected;
+            let first_val = first_val?;
+            let elem_ty = expected_elem
+                .clone()
+                .unwrap_or_else(|| self.type_of_value(&first_val));
             let (new_fn_name, push_fn_name) = Self::vec_fn_names_for_type(&elem_ty);
             let vec_ty = MirType::Vec(Box::new(elem_ty));
 
@@ -1162,9 +1195,13 @@ impl<'ctx> MirLowerer<'ctx> {
                 builder.switch_to_block(cont2);
             }
 
-            // Push remaining elements
+            // Push remaining elements, each lowered at the expected element type.
             for group in &all_groups[1..] {
-                let val = self.parse_and_lower_token_group(group.clone())?;
+                let prev_expected = self.expected_type.take();
+                self.expected_type = expected_elem.clone();
+                let val = self.parse_and_lower_token_group(group.clone());
+                self.expected_type = prev_expected;
+                let val = val?;
                 let push_fn_val = MirValue::Function(Arc::from(push_fn_name));
                 let builder = self.current_fn.as_mut().unwrap();
                 let cont2 = builder.create_block();

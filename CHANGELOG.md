@@ -10,6 +10,28 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+- **An aggregate literal is built at its expected element width, not the i32/f64
+  default**: a tuple or vector literal lowered its bare integer and float elements
+  at the `i32`/`f64` default even when the surrounding type said otherwise, then the
+  access side read each element at the wider annotated width. The construction
+  stride and the read stride disagreed, so an 8-byte read spanned two 4-byte slots.
+  It was a silent wrong answer with no diagnostic. The fix threads the expected
+  component type into each element at every position where a wider type is already
+  known: a `let` annotation (`let a: (i64, i64) = (7, 8)`, `let v: Vec<i64> =
+  vec![1, 2, 3]`), a function's tail expression (`fn f() -> (i64, i64) { (11, 22) }`),
+  and an explicit `return` (`return (33, 44);`, `return vec![1, 2, 3];`,
+  `return [5, 6, 7];`). A block only applies its expected type to its own tail
+  statement, so a `-> i64` return type can no longer widen a `0..3` loop counter in
+  an intermediate statement. On the pre-fix binary a returned `(11, 22)` printed
+  `94489280523` then `0`, a returned `vec![1, 2, 3]` read `v[1]` as `12884901890`,
+  and a returned `[5, 6, 7]` read `a[2]` as garbage. Covered by
+  `return_position_aggregate_is_built_at_declared_width` over returned tuples, a
+  returned vector, and a returned array; each case runs silently wrong on the
+  pre-fix binary. Two honest nulls remain: an aggregate stored in an unannotated
+  local and then returned (`{ let t = (1, 2); t }`) is still built at the default
+  width because the `let` had no annotation to thread, and a closure body is not
+  yet threaded with its declared return type.
+
 - **Compound assignment through a plain dereference reads before it stores**:
   `*p += v` and its nine siblings (`-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`,
   `>>=`) lowered as `*p = v`. The dereference-assignment path never inspected the
