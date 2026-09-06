@@ -1148,7 +1148,19 @@ impl<'ctx> MirLowerer<'ctx> {
 
         let mir_op = match op {
             AstUnaryOp::Neg => UnaryOp::Neg,
-            AstUnaryOp::Not | AstUnaryOp::BitNot => UnaryOp::Not,
+            // `~` is always bitwise complement.
+            AstUnaryOp::BitNot => UnaryOp::BitNot,
+            // `!` is logical complement on bool and bitwise complement on
+            // integers (Rust semantics), so the correct C operator depends on
+            // the operand type: `!` for bool, `~` for everything else (which
+            // the type checker guarantees is an integer here).
+            AstUnaryOp::Not => {
+                if matches!(self.type_of_value(&inner_val), MirType::Bool) {
+                    UnaryOp::Not
+                } else {
+                    UnaryOp::BitNot
+                }
+            }
             AstUnaryOp::Deref => {
                 // Dereference: emit a proper deref rvalue
                 let pointee_ty = match self.type_of_value(&inner_val) {

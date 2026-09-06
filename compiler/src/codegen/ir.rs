@@ -876,8 +876,10 @@ pub enum BinOp {
 /// Unary operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnaryOp {
-    /// Logical/bitwise not.
+    /// Logical not (boolean complement). Lowers to C `!`.
     Not,
+    /// Bitwise not (integer complement). Lowers to C `~`.
+    BitNot,
     /// Arithmetic negation.
     Neg,
 }

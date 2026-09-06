@@ -974,6 +974,7 @@ impl HlslBackend {
                 match op {
                     UnaryOp::Neg => format!("(-{})", v),
                     UnaryOp::Not => format!("(!{})", v),
+                    UnaryOp::BitNot => format!("(~{})", v),
                 }
             }
             MirRValue::Aggregate { kind, operands } => {

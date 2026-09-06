@@ -611,6 +611,7 @@ fn bin_op_name(op: BinOp) -> &'static str {
 fn unary_op_name(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Not => "Not",
+        UnaryOp::BitNot => "BitNot",
         UnaryOp::Neg => "Neg",
     }
 }

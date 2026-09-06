@@ -968,6 +968,13 @@ impl WasmBackend {
                             self.emit_line(&format!("{}.xor", wasm_ty));
                         }
                     }
+                    UnaryOp::BitNot => {
+                        // Bitwise not: xor with -1
+                        self.gen_value(operand, func)?;
+                        let wasm_ty = self.emit_type(&ty);
+                        self.emit_line(&format!("{}.const -1", wasm_ty));
+                        self.emit_line(&format!("{}.xor", wasm_ty));
+                    }
                 }
             }
             MirRValue::Ref { place, .. } | MirRValue::AddressOf { place, .. } => {

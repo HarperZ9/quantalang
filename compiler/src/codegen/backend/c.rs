@@ -3945,6 +3945,29 @@ impl CBackend {
                 if *op == BinOp::Pow {
                     return Ok(format!("pow({}, {})", l, r));
                 }
+                // C's `%` is integer-only. A float remainder must lower to the
+                // C library `fmod`/`fmodf`, which matches Rust's `%` on floats
+                // (5.5 % 2.0 == 1.5). Without this the backend emitted `(a % b)`
+                // on doubles, which gcc rejects outright.
+                if *op == BinOp::Rem {
+                    let float_size = |v: &MirValue| -> Option<FloatSize> {
+                        match v {
+                            MirValue::Const(MirConst::Float(_, MirType::Float(sz))) => Some(*sz),
+                            MirValue::Local(id) => match locals.get(id.0 as usize).map(|loc| &loc.ty) {
+                                Some(MirType::Float(sz)) => Some(*sz),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    };
+                    if let Some(sz) = float_size(left).or_else(|| float_size(right)) {
+                        let f = match sz {
+                            FloatSize::F32 => "fmodf",
+                            FloatSize::F64 => "fmod",
+                        };
+                        return Ok(format!("{}({}, {})", f, l, r));
+                    }
+                }
                 // String comparison: use strcmp when either operand is BuildString
                 if *op == BinOp::Eq || *op == BinOp::Ne {
                     let is_string = |v: &MirValue| -> bool {
@@ -3972,6 +3995,7 @@ impl CBackend {
                 let v = self.value_to_c(operand, locals);
                 let op_str = match op {
                     UnaryOp::Not => "!",
+                    UnaryOp::BitNot => "~",
                     UnaryOp::Neg => "-",
                 };
                 format!("({}{})", op_str, v)

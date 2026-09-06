@@ -13003,6 +13003,74 @@ fn large_unsuffixed_int_literal_not_truncated_end_to_end() {
     );
 }
 
+/// Regression: unary complement must pick the C operator from the operand type.
+/// BuildLang follows Rust: `!` is logical complement on `bool` and bitwise
+/// complement on integers, and `~` is always bitwise complement. MIR lowering
+/// previously collapsed both `~` and integer `!` onto a single logical-not node,
+/// so the C backend emitted `!` for every case. That is a silent wrong answer:
+/// `~5` and `!5` printed `0` instead of `-6`, and a `u8` complement lost its
+/// width. Each line below pins one path; `!bool` must stay logical.
+///   `~x`  (i32 5)  -> bitwise complement -> -6
+///   `!x`  (i32 5)  -> bitwise complement -> -6
+///   `~y`  (u8 5)   -> width-correct complement -> 250
+///   `!b`  (bool)   -> logical complement, else branch -> f
+#[test]
+fn unary_complement_uses_type_directed_c_operator_end_to_end() {
+    if !c_backend_ready() {
+        eprintln!("skipping unary-complement e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let src = "fn main() ~ Console {\n\
+               let x: i32 = 5;\n\
+               println!(\"{}\", ~x);\n\
+               println!(\"{}\", !x);\n\
+               let y: u8 = 5;\n\
+               println!(\"{}\", ~y);\n\
+               let b: bool = true;\n\
+               if !b { println!(\"t\"); } else { println!(\"f\"); }\n\
+               }\n";
+    let dir = std::env::temp_dir().join("buildlang_unary_complement_regress");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("unary_complement.bld");
+    std::fs::write(&path, src).expect("write unary_complement.bld");
+    let result = c_backend_run(&path);
+    assert_eq!(
+        result.stdout, "-6\n-6\n250\nf\n",
+        "`~` and integer `!` must lower to bitwise complement, `!bool` to logical not"
+    );
+}
+
+/// Regression: the remainder operator on floats must lower to `fmod`/`fmodf`,
+/// not to C's `%`. C's `%` rejects floating-point operands, so the previous
+/// lowering emitted `(a % b)` and gcc failed to compile the program. That is a
+/// fail-closed crash rather than a wrong answer, but a supported operation on a
+/// supported type must simply work. Both an f64 and an f32 remainder are pinned
+/// so the f32 path (`fmodf`) is covered too; each yields 1.5.
+#[test]
+fn float_remainder_uses_fmod_end_to_end() {
+    if !c_backend_ready() {
+        eprintln!("skipping float-remainder e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let src = "fn main() ~ Console {\n\
+               let a: f64 = 5.5;\n\
+               let b: f64 = 2.0;\n\
+               println!(\"{}\", a % b);\n\
+               let c: f32 = 7.5;\n\
+               let d: f32 = 2.0;\n\
+               println!(\"{}\", c % d);\n\
+               }\n";
+    let dir = std::env::temp_dir().join("buildlang_float_remainder_regress");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("float_remainder.bld");
+    std::fs::write(&path, src).expect("write float_remainder.bld");
+    let result = c_backend_run(&path);
+    assert_eq!(
+        result.stdout, "1.5\n1.5\n",
+        "float remainder must lower to fmod/fmodf and compute correctly"
+    );
+}
+
 /// Regression: `break 'label` / `continue 'label` must target the named
 /// enclosing loop, not the innermost one. Labeled loops parse (parser support),
 /// but MIR lowering previously stored only the innermost loop's blocks and

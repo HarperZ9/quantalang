@@ -10,6 +10,20 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+- **Unary complement and float remainder in the C backend**: two codegen
+  defects that produced silent wrong answers or a failed compile are fixed.
+  Unary complement lowered `~` and integer `!` onto a single logical-not node,
+  so the C backend emitted `!` for both; BuildLang follows Rust, where `!` is
+  logical complement on `bool` and bitwise complement on integers and `~` is
+  always bitwise complement. MIR gains a `BitNot` unary op, and lowering now
+  chooses the operator from the operand type, so `~5` and `!5` produce `-6` and
+  a `u8` complement keeps its width (`~5u8` is `250`), while `!bool` stays
+  logical. The remainder operator on floats emitted C's `%`, which rejects
+  floating-point operands, so `5.5 % 2.0` failed to compile; float remainder
+  now lowers to `fmod`/`fmodf` and computes `1.5`. Every non-C backend's unary
+  match gains the `BitNot` arm so the enum stays exhaustive. Two end-to-end
+  controls in `compiler/tests/cli.rs` each fail on the pre-fix binary (wrong
+  value, or gcc rejecting the emitted `%`).
 - **Tuple patterns in `match`: correct selection, scalar results, and
   bindings**: `match` over a tuple scrutinee had three codegen defects, now
   fixed. A literal tuple pattern fell through `lower_pattern_test`'s

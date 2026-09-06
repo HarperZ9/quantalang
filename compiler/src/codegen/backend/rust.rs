@@ -528,6 +528,7 @@ impl RustBackend {
                 let v = self.value_to_rust(operand, locals);
                 let op_str = match op {
                     UnaryOp::Not => "!",
+                    UnaryOp::BitNot => "!",
                     UnaryOp::Neg => "-",
                 };
                 format!("({}{})", op_str, v)

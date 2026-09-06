@@ -346,6 +346,7 @@ impl Arm64Backend {
                 match op {
                     UnaryOp::Neg => self.output.push_str("    neg x0, x0\n"),
                     UnaryOp::Not => self.output.push_str("    mvn x0, x0\n"),
+                    UnaryOp::BitNot => self.output.push_str("    mvn x0, x0\n"),
                 }
                 self.store_x0_to_local(dest, func)?;
             }
@@ -908,6 +909,7 @@ impl Arm64Backend {
                 match op {
                     UnaryOp::Neg => self.enc().neg(Reg64::X0, Reg64::X0),
                     UnaryOp::Not => self.enc().mvn(Reg64::X0, Reg64::X0),
+                    UnaryOp::BitNot => self.enc().mvn(Reg64::X0, Reg64::X0),
                 }
                 self.store_reg_to_local(Reg64::X0, dest)?;
             }

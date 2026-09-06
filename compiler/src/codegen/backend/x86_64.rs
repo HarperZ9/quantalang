@@ -318,6 +318,7 @@ impl X86_64Backend {
                 match op {
                     UnaryOp::Neg => self.output.push_str("    neg rax\n"),
                     UnaryOp::Not => self.output.push_str("    not rax\n"),
+                    UnaryOp::BitNot => self.output.push_str("    not rax\n"),
                 }
                 self.store_rax_to_local(dest, func)?;
             }
@@ -866,6 +867,7 @@ impl X86_64Backend {
                 match op {
                     UnaryOp::Neg => self.enc().neg(Reg64::RAX),
                     UnaryOp::Not => self.enc().not(Reg64::RAX),
+                    UnaryOp::BitNot => self.enc().not(Reg64::RAX),
                 }
                 self.store_reg_to_local(Reg64::RAX, dest)?;
             }

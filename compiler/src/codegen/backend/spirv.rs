@@ -2733,6 +2733,7 @@ impl SpirvBackend {
                         }
                     }
                     UnaryOp::Not => SpvOp::OpNot,
+                    UnaryOp::BitNot => SpvOp::OpNot,
                 };
                 self.emit(opcode, &[ty_id, result_id, operand_id]);
                 Ok(result_id)

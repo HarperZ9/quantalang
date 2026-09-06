@@ -1399,6 +1399,14 @@ impl LlvmBackend {
                             .unwrap();
                         }
                     }
+                    UnaryOp::BitNot => {
+                        writeln!(
+                            &mut self.output,
+                            "  {} = xor {} {}, -1",
+                            result, llvm_ty, operand_val
+                        )
+                        .unwrap();
+                    }
                 }
 
                 writeln!(
