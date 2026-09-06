@@ -1661,7 +1661,11 @@ impl CBackend {
             .map(|f| {
                 (
                     f.name.as_ref(),
-                    f.sig.params.first().map(|p| p.is_pointer()).unwrap_or(false),
+                    f.sig
+                        .params
+                        .first()
+                        .map(|p| p.is_pointer())
+                        .unwrap_or(false),
                 )
             })
             .collect();
@@ -1684,9 +1688,7 @@ impl CBackend {
                 let self_is_ref = concrete_self_by_ref
                     .get(mangled_fn.as_ref())
                     .copied()
-                    .unwrap_or_else(|| {
-                        sig.params.first().map(|p| p.is_pointer()).unwrap_or(false)
-                    });
+                    .unwrap_or_else(|| sig.params.first().map(|p| p.is_pointer()).unwrap_or(false));
                 let self_arg = if self_is_ref {
                     format!("({}*)__self", vtable.type_name)
                 } else {
@@ -3986,10 +3988,12 @@ impl CBackend {
                     let float_size = |v: &MirValue| -> Option<FloatSize> {
                         match v {
                             MirValue::Const(MirConst::Float(_, MirType::Float(sz))) => Some(*sz),
-                            MirValue::Local(id) => match locals.get(id.0 as usize).map(|loc| &loc.ty) {
-                                Some(MirType::Float(sz)) => Some(*sz),
-                                _ => None,
-                            },
+                            MirValue::Local(id) => {
+                                match locals.get(id.0 as usize).map(|loc| &loc.ty) {
+                                    Some(MirType::Float(sz)) => Some(*sz),
+                                    _ => None,
+                                }
+                            }
                             _ => None,
                         }
                     };
@@ -4036,8 +4040,9 @@ impl CBackend {
                         MirValue::Local(_) => int_type(right),
                         _ => None,
                     });
-                    if let Some((size, signed)) =
-                        local_ty.or_else(|| int_type(left)).or_else(|| int_type(right))
+                    if let Some((size, signed)) = local_ty
+                        .or_else(|| int_type(left))
+                        .or_else(|| int_type(right))
                     {
                         let suffix = match (size, signed) {
                             (IntSize::I8, true) => "i8",
@@ -4052,7 +4057,11 @@ impl CBackend {
                             (IntSize::I128, false) => "u128",
                         };
                         let stem = if signed {
-                            if *op == BinOp::Div { "bl_idiv_" } else { "bl_irem_" }
+                            if *op == BinOp::Div {
+                                "bl_idiv_"
+                            } else {
+                                "bl_irem_"
+                            }
                         } else if *op == BinOp::Div {
                             "bl_udiv_"
                         } else {
@@ -4259,9 +4268,7 @@ impl CBackend {
                                     "((Option){{ .has_value = true, .value = {{ .{} = {}{} }} }})",
                                     slot, cast, vals[0]
                                 ),
-                                ("Option", "Some") => {
-                                    "((Option){ .has_value = true })".to_string()
-                                }
+                                ("Option", "Some") => "((Option){ .has_value = true })".to_string(),
                                 ("Option", _) => "((Option){ .has_value = false })".to_string(),
                                 ("Result", "Ok") if !vals.is_empty() => format!(
                                     "((Result){{ .is_ok = true, .ok = {{ .ok_{} = {}{} }} }})",

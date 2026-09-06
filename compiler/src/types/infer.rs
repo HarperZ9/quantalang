@@ -5533,9 +5533,7 @@ impl<'ctx> TypeInfer<'ctx> {
                 | TyKind::Infer(InferTy {
                     kind: InferKind::Int,
                     ..
-                }))
-                    if !has_catch_all =>
-                {
+                })) if !has_catch_all => {
                     // Finitely many literal arms can never cover a whole integer
                     // or char type. An integer inference variable (a literal
                     // scrutinee not yet defaulted to a concrete width) only ever
@@ -6625,7 +6623,9 @@ impl<'ctx> TypeInfer<'ctx> {
         let ty = &ty;
         match &pattern.kind {
             ast::PatternKind::Wildcard => {}
-            ast::PatternKind::Ident { name, subpattern, .. } => {
+            ast::PatternKind::Ident {
+                name, subpattern, ..
+            } => {
                 let bound = mode.apply_to(ty);
                 self.ctx.define_var(name.name.clone(), bound.clone());
                 // Track `#[linear]` bindings (lets, params, destructured fields)

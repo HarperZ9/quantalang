@@ -922,12 +922,7 @@ impl<'ctx> MirLowerer<'ctx> {
         let cont = builder.create_block();
         builder.call(
             perform_fn,
-            vec![
-                eid_val,
-                op_val,
-                arg_ptr_value,
-                MirValue::Local(result_ptr),
-            ],
+            vec![eid_val, op_val, arg_ptr_value, MirValue::Local(result_ptr)],
             None,
             cont,
         );

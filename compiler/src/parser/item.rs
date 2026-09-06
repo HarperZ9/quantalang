@@ -1731,7 +1731,11 @@ mod tests {
                 ItemKind::Function(f) => f,
                 other => panic!("`{src}` parsed as {other:?}, expected Function"),
             };
-            assert_eq!(f.sig.params.len(), 1, "`{src}` should have one (self) param");
+            assert_eq!(
+                f.sig.params.len(),
+                1,
+                "`{src}` should have one (self) param"
+            );
             match &f.sig.params[0].ty.kind {
                 TypeKind::Ref {
                     lifetime,
@@ -2121,8 +2125,7 @@ mod tests {
         // multi-segment path (`io::Error`) as well as a plain name. (A
         // `Self::`-qualified right-hand side is a separate, pre-existing gap
         // in type-position `Self` projection, not exercised here.)
-        let item =
-            parse_item_str("fn f() -> Seq<Ok = String, Error = io::Error> { 0 }").unwrap();
+        let item = parse_item_str("fn f() -> Seq<Ok = String, Error = io::Error> { 0 }").unwrap();
         let generics = return_type_generics(&item);
         assert_eq!(generics.len(), 2, "two bindings, no positional args");
         for (arg, expected) in generics.iter().zip(["Ok", "Error"]) {

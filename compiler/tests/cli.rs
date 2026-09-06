@@ -13665,7 +13665,9 @@ fn vec_of_tuple_or_array_element_is_rejected() {
 #[test]
 fn vec_of_supported_element_builds_and_reads() {
     if !c_backend_ready() {
-        eprintln!("skipping vec supported-element positive e2e: no C backend available (buildc doctor)");
+        eprintln!(
+            "skipping vec supported-element positive e2e: no C backend available (buildc doctor)"
+        );
         return;
     }
     // (name, source, expected stdout)
@@ -13950,7 +13952,9 @@ fn in_bounds_index_reads_and_writes_correctly() {
 #[test]
 fn integer_divide_by_zero_and_overflow_abort_fail_closed() {
     if !c_backend_ready() {
-        eprintln!("skipping integer div/rem fail-closed e2e: no C backend available (buildc doctor)");
+        eprintln!(
+            "skipping integer div/rem fail-closed e2e: no C backend available (buildc doctor)"
+        );
         return;
     }
     // (name, source, required stderr substring) -- each must abort with exit 101.
@@ -14521,8 +14525,7 @@ fn float_display_matches_rust_shortest_roundtrip_end_to_end() {
     std::fs::write(&path, src).expect("write float_display.bld");
     let result = c_backend_run(&path);
     assert_eq!(
-        result.stdout,
-        "0.30000000000000004\n1234567\n2\n3.14159265358979\n1234567\n0.1\n",
+        result.stdout, "0.30000000000000004\n1234567\n2\n3.14159265358979\n1234567\n0.1\n",
         "float Display must match Rust's shortest round-trip, not C's %g"
     );
 }
@@ -14618,8 +14621,7 @@ fn narrow_shift_masks_count_to_width_like_rust_end_to_end() {
     std::fs::write(&path, src).expect("write narrow_shift.bld");
     let result = c_backend_run(&path);
     assert_eq!(
-        result.stdout,
-        "127\n1\n-64\n1\n32767\n1\n1\n127\n",
+        result.stdout, "127\n1\n-64\n1\n32767\n1\n1\n127\n",
         "narrow-width over-shift must mask the count to the operand width like Rust release"
     );
 }
@@ -14683,8 +14685,11 @@ fn check_rejects_undefined_loop_label() {
 
     // Undefined break label: `'nope` is never declared.
     let bad = std::env::temp_dir().join(format!("buildlang_undef_break_label_{id}.bld"));
-    fs::write(&bad, "fn main() {\n    loop {\n        break 'nope;\n    }\n}\n")
-        .expect("write undefined-label fixture");
+    fs::write(
+        &bad,
+        "fn main() {\n    loop {\n        break 'nope;\n    }\n}\n",
+    )
+    .expect("write undefined-label fixture");
     let output = buildc()
         .arg("check")
         .arg(&bad)
@@ -14710,10 +14715,7 @@ fn check_rejects_undefined_loop_label() {
         diagnostics.iter().any(|diag| {
             diag["stage"] == "type"
                 && diag["kind"] == "UndefinedLoopLabel"
-                && diag["message"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("'nope")
+                && diag["message"].as_str().unwrap_or("").contains("'nope")
         }),
         "expected an UndefinedLoopLabel type diagnostic naming 'nope in {diagnostics:#?}"
     );

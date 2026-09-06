@@ -1516,10 +1516,7 @@ impl<'a> Parser<'a> {
             let atom = self.parse_prefix_expr()?;
             let head_is_block = Self::is_block_like_expr(&atom);
             let reopen_postfix = head_is_block
-                && matches!(
-                    self.current_kind(),
-                    TokenKind::Dot | TokenKind::Question
-                );
+                && matches!(self.current_kind(), TokenKind::Dot | TokenKind::Question);
             let body_is_block = head_is_block && !reopen_postfix;
             let body = if body_is_block {
                 atom
@@ -2163,7 +2160,10 @@ mod tests {
                     is_async, is_move, ..
                 } => {
                     assert!(*is_async, "`{src}` should be an async closure");
-                    assert_eq!(*is_move, want_move, "`{src}` should have is_move={want_move}");
+                    assert_eq!(
+                        *is_move, want_move,
+                        "`{src}` should have is_move={want_move}"
+                    );
                 }
                 other => panic!("`{src}` parsed as {other:?}, expected ExprKind::Closure"),
             }
@@ -2284,7 +2284,9 @@ mod tests {
             .expect("reopened arm body should parse");
         let arms = match_arms(&expr);
         match &arms[0].body.kind {
-            ExprKind::MethodCall { receiver, method, .. } => {
+            ExprKind::MethodCall {
+                receiver, method, ..
+            } => {
                 assert_eq!(&*method.name, "min", "method name should be `min`");
                 assert!(
                     matches!(&receiver.kind, ExprKind::If { .. }),

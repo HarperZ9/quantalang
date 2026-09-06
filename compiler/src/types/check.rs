@@ -1438,8 +1438,9 @@ impl<'ctx> TypeChecker<'ctx> {
                     .as_ref()
                     .map(|r| r.name.clone())
                     .unwrap_or_else(|| item.clone());
-                if let Some(ty) =
-                    self.ctx.lookup_module_binding(module_segs[0].as_ref(), item.as_ref())
+                if let Some(ty) = self
+                    .ctx
+                    .lookup_module_binding(module_segs[0].as_ref(), item.as_ref())
                 {
                     self.ctx.define_var(local_name, ty);
                     return;
@@ -1456,8 +1457,9 @@ impl<'ctx> TypeChecker<'ctx> {
                 }
                 // Real bindings from an in-tree `mod NAME;` win; otherwise bind
                 // every file-backed export name as an opaque value.
-                if let Some(bindings) =
-                    self.ctx.clone_module_bindings(segs[segs.len() - 1].as_ref())
+                if let Some(bindings) = self
+                    .ctx
+                    .clone_module_bindings(segs[segs.len() - 1].as_ref())
                 {
                     for (name, scheme) in bindings {
                         self.ctx.define_var(name, scheme.instantiate());
@@ -1578,8 +1580,7 @@ impl<'ctx> TypeChecker<'ctx> {
     /// name-resolution path rather than inventing an error.
     fn collect_export_names(path: &std::path::Path) -> Option<HashSet<Arc<str>>> {
         let source_text = std::fs::read_to_string(path).ok()?;
-        let source =
-            crate::lexer::SourceFile::new(path.to_string_lossy().as_ref(), source_text);
+        let source = crate::lexer::SourceFile::new(path.to_string_lossy().as_ref(), source_text);
         let mut lexer = crate::lexer::Lexer::new(&source);
         let tokens = lexer.tokenize().ok()?;
         let mut parser = crate::parser::Parser::new(&source, tokens);
@@ -1633,8 +1634,7 @@ impl<'ctx> TypeChecker<'ctx> {
                 let mod_name = m.name.name.as_ref();
                 let mod_path = dir.join(format!("{}.bld", mod_name));
                 if mod_path.exists() {
-                    let key = std::fs::canonicalize(&mod_path)
-                        .unwrap_or_else(|_| mod_path.clone());
+                    let key = std::fs::canonicalize(&mod_path).unwrap_or_else(|_| mod_path.clone());
                     if !self.loading_modules.insert(key.clone()) {
                         // Already on the load stack: fail closed with a cycle
                         // diagnostic instead of overflowing the stack.

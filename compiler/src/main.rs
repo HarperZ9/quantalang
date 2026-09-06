@@ -9309,7 +9309,13 @@ fn resolve_modules_with_prefix(
         };
 
         // Recursively resolve sub-modules within this module
-        resolve_modules_with_prefix(&mut mod_ast, &sub_source_dir, &full_prefix, ledger, visiting)?;
+        resolve_modules_with_prefix(
+            &mut mod_ast,
+            &sub_source_dir,
+            &full_prefix,
+            ledger,
+            visiting,
+        )?;
         // Done with this module's subtree; drop it from the stack so a sibling
         // branch may legitimately include the same module again (a diamond is
         // not a cycle).

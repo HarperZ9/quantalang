@@ -56,7 +56,11 @@ impl<'ctx> MirLowerer<'ctx> {
             if let Some(builder) = self.current_fn.as_mut() {
                 builder.set_current_span(stmt.span);
             }
-            self.expected_type = if is_last { block_expected.clone() } else { None };
+            self.expected_type = if is_last {
+                block_expected.clone()
+            } else {
+                None
+            };
             result = self.lower_stmt(stmt, is_last)?;
         }
 
@@ -1322,7 +1326,10 @@ impl<'ctx> MirLowerer<'ctx> {
                 if via_ptr {
                     place = place.deref();
                 }
-                Ok(Some((place.field(idx, field.name.clone(), fty.clone()), fty)))
+                Ok(Some((
+                    place.field(idx, field.name.clone(), fty.clone()),
+                    fty,
+                )))
             }
             ExprKind::TupleField {
                 expr: base, index, ..
@@ -1429,7 +1436,13 @@ impl<'ctx> MirLowerer<'ctx> {
     ) -> CodegenResult<()> {
         let builder = self.current_fn.as_mut().unwrap();
         let ptr = builder.create_local(MirType::Ptr(Box::new(place_ty)));
-        builder.assign(ptr, MirRValue::AddressOf { is_mut: true, place });
+        builder.assign(
+            ptr,
+            MirRValue::AddressOf {
+                is_mut: true,
+                place,
+            },
+        );
         builder.push_deref_assign(ptr, value);
         Ok(())
     }
@@ -1930,8 +1943,7 @@ impl<'ctx> MirLowerer<'ctx> {
                 match self.resolve_overloaded_call_name(resolved.as_ref(), &arg_tys) {
                     Some(OverloadTarget::Concrete(mangled)) => {
                         let target = self.module.find_function(mangled.as_ref());
-                        let ret_ty =
-                            target.map(|f| f.sig.ret.clone()).unwrap_or(MirType::i32());
+                        let ret_ty = target.map(|f| f.sig.ret.clone()).unwrap_or(MirType::i32());
                         let param_types: Option<Vec<MirType>> =
                             target.map(|f| f.sig.params.clone());
                         let arg_vals: Vec<_> =
@@ -6114,12 +6126,26 @@ impl<'ctx> MirLowerer<'ctx> {
         // parser for `0..10` style expressions.
         if let ExprKind::Binary { op, left, right } = &iter.kind {
             if *op == AstBinOp::Range {
-                return self
-                    .lower_for_range(pattern, Some(left), Some(right), false, body, None, label);
+                return self.lower_for_range(
+                    pattern,
+                    Some(left),
+                    Some(right),
+                    false,
+                    body,
+                    None,
+                    label,
+                );
             }
             if *op == AstBinOp::RangeInclusive {
-                return self
-                    .lower_for_range(pattern, Some(left), Some(right), true, body, None, label);
+                return self.lower_for_range(
+                    pattern,
+                    Some(left),
+                    Some(right),
+                    true,
+                    body,
+                    None,
+                    label,
+                );
             }
         }
 
@@ -6789,10 +6815,7 @@ impl<'ctx> MirLowerer<'ctx> {
         // literal (`return (a, b);`, `return vec![..];`, `return [..];`) is
         // built at the width its caller reads. Without this the elements
         // default to i32 and an i64 caller reads a corrupt, wider value.
-        let ret_expected = self
-            .current_fn
-            .as_ref()
-            .map(|b| b.return_type().clone());
+        let ret_expected = self.current_fn.as_ref().map(|b| b.return_type().clone());
         let ret_val = if let Some(expr) = value {
             let prev_expected = self.expected_type.take();
             self.expected_type = ret_expected;

@@ -410,7 +410,10 @@ mod tests {
              if b { two(); }\n\
              done();",
         );
-        assert!(errors.is_empty(), "consecutive `if` statements should parse, got: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "consecutive `if` statements should parse, got: {errors:?}"
+        );
     }
 
     #[test]
@@ -423,6 +426,9 @@ mod tests {
              let r = rand::random::<f32>();\n\
              let v = Vec::<u8>::new();",
         );
-        assert!(errors.is_empty(), "turbofish path calls should parse, got: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "turbofish path calls should parse, got: {errors:?}"
+        );
     }
 }
