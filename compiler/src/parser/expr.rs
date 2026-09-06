@@ -435,9 +435,24 @@ impl<'a> Parser<'a> {
             // =====================================================================
             TokenKind::Keyword(Keyword::If) => self.parse_if_expr(),
             TokenKind::Keyword(Keyword::Match) => self.parse_match_expr(),
-            TokenKind::Keyword(Keyword::Loop) => self.parse_loop_expr(),
-            TokenKind::Keyword(Keyword::While) => self.parse_while_expr(),
-            TokenKind::Keyword(Keyword::For) => self.parse_for_expr(),
+            TokenKind::Keyword(Keyword::Loop) => self.parse_loop_expr(None),
+            TokenKind::Keyword(Keyword::While) => self.parse_while_expr(None),
+            TokenKind::Keyword(Keyword::For) => self.parse_for_expr(None),
+
+            // A loop label: `'name: loop`, `'name: while`, `'name: for`. Only a
+            // loop may be labelled, so require a loop keyword after the `:`. The
+            // matching `break 'name` / `continue 'name` forms are parsed by
+            // `parse_break_expr` / `parse_continue_expr`.
+            TokenKind::Lifetime if matches!(self.peek().kind, TokenKind::Colon) => {
+                let label = self.expect_lifetime()?.name;
+                self.expect(&TokenKind::Colon)?;
+                match self.current_kind() {
+                    TokenKind::Keyword(Keyword::Loop) => self.parse_loop_expr(Some(label)),
+                    TokenKind::Keyword(Keyword::While) => self.parse_while_expr(Some(label)),
+                    TokenKind::Keyword(Keyword::For) => self.parse_for_expr(Some(label)),
+                    _ => Err(self.error_expected("`loop`, `while`, or `for` after loop label")),
+                }
+            }
 
             // =====================================================================
             // EFFECT SYSTEM
@@ -1544,8 +1559,10 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    /// Parse loop expression.
-    fn parse_loop_expr(&mut self) -> ParseResult<Expr> {
+    /// Parse loop expression. An optional loop label (`'name:`) is parsed by the
+    /// caller and threaded in; `break`/`continue` already accept the matching
+    /// `'name` form.
+    fn parse_loop_expr(&mut self, label: Option<Ident>) -> ParseResult<Expr> {
         let start = self.expect_keyword(Keyword::Loop)?;
         let body = self.parse_block()?;
         let span = start.merge(&body.span);
@@ -1553,19 +1570,19 @@ impl<'a> Parser<'a> {
         Ok(Expr::new(
             ExprKind::Loop {
                 body: Box::new(body),
-                label: None,
+                label,
             },
             span,
         ))
     }
 
     /// Parse while expression.
-    fn parse_while_expr(&mut self) -> ParseResult<Expr> {
+    fn parse_while_expr(&mut self, label: Option<Ident>) -> ParseResult<Expr> {
         let start = self.expect_keyword(Keyword::While)?;
 
         // Check for while let
         if self.check_keyword(Keyword::Let) {
-            return self.parse_while_let_expr(start);
+            return self.parse_while_let_expr(start, label);
         }
 
         let old_restrictions = self.restrictions;
@@ -1580,14 +1597,18 @@ impl<'a> Parser<'a> {
             ExprKind::While {
                 condition: Box::new(condition),
                 body: Box::new(body),
-                label: None,
+                label,
             },
             span,
         ))
     }
 
     /// Parse while let expression.
-    fn parse_while_let_expr(&mut self, start: crate::lexer::Span) -> ParseResult<Expr> {
+    fn parse_while_let_expr(
+        &mut self,
+        start: crate::lexer::Span,
+        label: Option<Ident>,
+    ) -> ParseResult<Expr> {
         self.expect_keyword(Keyword::Let)?;
         let pattern = self.parse_pattern()?;
         self.expect(&TokenKind::Eq)?;
@@ -1605,14 +1626,14 @@ impl<'a> Parser<'a> {
                 pattern: Box::new(pattern),
                 expr: Box::new(expr),
                 body: Box::new(body),
-                label: None,
+                label,
             },
             span,
         ))
     }
 
     /// Parse for expression.
-    fn parse_for_expr(&mut self) -> ParseResult<Expr> {
+    fn parse_for_expr(&mut self, label: Option<Ident>) -> ParseResult<Expr> {
         let start = self.expect_keyword(Keyword::For)?;
         let pattern = self.parse_pattern()?;
         self.expect_keyword(Keyword::In)?;
@@ -1630,7 +1651,7 @@ impl<'a> Parser<'a> {
                 pattern: Box::new(pattern),
                 iter: Box::new(iter),
                 body: Box::new(body),
-                label: None,
+                label,
             },
             span,
         ))
@@ -2538,6 +2559,54 @@ mod tests {
     // =========================================================================
     // EXPRESSION FORMS
     // =========================================================================
+
+    #[test]
+    fn labelled_loops_record_the_label() {
+        // A loop label (`'name:`) before `loop`/`while`/`for` is parsed and
+        // stored on the loop expression. The matching `break 'name` /
+        // `continue 'name` forms were already supported.
+        let for_expr = parse_expr_str("'outer: for i in xs { }").unwrap();
+        match &for_expr.kind {
+            ExprKind::For { label, .. } => {
+                assert_eq!(label.as_ref().map(|l| l.as_str()), Some("outer"));
+            }
+            other => panic!("expected labelled For, got {:?}", other),
+        }
+
+        let while_expr = parse_expr_str("'w: while c { }").unwrap();
+        match &while_expr.kind {
+            ExprKind::While { label, .. } => {
+                assert_eq!(label.as_ref().map(|l| l.as_str()), Some("w"));
+            }
+            other => panic!("expected labelled While, got {:?}", other),
+        }
+
+        let loop_expr = parse_expr_str("'l: loop { }").unwrap();
+        match &loop_expr.kind {
+            ExprKind::Loop { label, .. } => {
+                assert_eq!(label.as_ref().map(|l| l.as_str()), Some("l"));
+            }
+            other => panic!("expected labelled Loop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unlabelled_loop_has_no_label() {
+        // Regression: the common unlabelled form must still parse with no label,
+        // so the new lifetime branch does not perturb it.
+        let expr = parse_expr_str("for i in xs { }").unwrap();
+        match &expr.kind {
+            ExprKind::For { label, .. } => assert_eq!(*label, None),
+            other => panic!("expected For, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn label_not_followed_by_loop_is_an_error() {
+        // Only a loop may carry a label; `'x: 5` must fail closed with a
+        // diagnostic rather than mis-parse or panic.
+        assert!(parse_expr_str("'x: 5").is_err());
+    }
 
     #[test]
     fn if_else_parses() {
