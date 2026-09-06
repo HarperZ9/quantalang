@@ -31,6 +31,107 @@ static void __build_init_io(void) {
     setvbuf(stderr, NULL, _IONBF, 0);
 }
 
+// --- Numeric conversion helpers ---
+// Saturating float-to-integer conversion matching Rust's `as` semantics: NaN
+// maps to 0, out-of-range inputs clamp to the target's min/max, and in-range
+// inputs truncate toward zero. A raw C cast is undefined behavior for NaN and
+// for values outside the target range, so every float->int cast routes here.
+// Thresholds are exact powers of two (hex float literals) so the boundary is
+// decided with no rounding: any value that survives the guards truncates
+// without overflow.
+static int8_t   bl_f2i_i8 (double v){ if (v!=v) return 0; if (v>= 0x1p7 ) return INT8_MAX;   if (v<=-0x1p7 ) return INT8_MIN;   return (int8_t)v; }
+static uint8_t  bl_f2i_u8 (double v){ if (v!=v) return 0; if (v<=0.0) return 0; if (v>= 0x1p8 ) return UINT8_MAX;  return (uint8_t)v; }
+static int16_t  bl_f2i_i16(double v){ if (v!=v) return 0; if (v>= 0x1p15) return INT16_MAX;  if (v<=-0x1p15) return INT16_MIN;  return (int16_t)v; }
+static uint16_t bl_f2i_u16(double v){ if (v!=v) return 0; if (v<=0.0) return 0; if (v>= 0x1p16) return UINT16_MAX; return (uint16_t)v; }
+static int32_t  bl_f2i_i32(double v){ if (v!=v) return 0; if (v>= 0x1p31) return INT32_MAX;  if (v<=-0x1p31) return INT32_MIN;  return (int32_t)v; }
+static uint32_t bl_f2i_u32(double v){ if (v!=v) return 0; if (v<=0.0) return 0; if (v>= 0x1p32) return UINT32_MAX; return (uint32_t)v; }
+static int64_t  bl_f2i_i64(double v){ if (v!=v) return 0; if (v>= 0x1p63) return INT64_MAX;  if (v<=-0x1p63) return INT64_MIN;  return (int64_t)v; }
+static uint64_t bl_f2i_u64(double v){ if (v!=v) return 0; if (v<=0.0) return 0; if (v>= 0x1p64) return UINT64_MAX; return (uint64_t)v; }
+static __int128 bl_f2i_i128(double v){
+    if (v!=v) return 0;
+    __int128 imax = (__int128)(((unsigned __int128)1 << 127) - 1);
+    __int128 imin = -imax - 1;
+    if (v>= 0x1p127) return imax;
+    if (v<=-0x1p127) return imin;
+    return (__int128)v;
+}
+
+// Place a %e-formatted number ("[-]D[.DDD]e[+-]EE") as plain positional decimal
+// with no exponent, the way Rust's float Display renders. Writes into `out`.
+static void bl_sci_to_plain(const char* sci, char* out) {
+    const char* s = sci;
+    char* o = out;
+    if (*s == '-') { *o++ = '-'; s++; }
+    char digits[24]; int nd = 0;
+    digits[nd++] = *s++;
+    if (*s == '.') { s++; while (*s >= '0' && *s <= '9') digits[nd++] = *s++; }
+    int E = atoi(s + 1);
+    if (E >= 0) {
+        if (E + 1 >= nd) {
+            for (int i = 0; i < nd; ++i) *o++ = digits[i];
+            for (int i = 0; i < E + 1 - nd; ++i) *o++ = '0';
+        } else {
+            for (int i = 0; i < E + 1; ++i) *o++ = digits[i];
+            *o++ = '.';
+            for (int i = E + 1; i < nd; ++i) *o++ = digits[i];
+        }
+    } else {
+        *o++ = '0'; *o++ = '.';
+        for (int i = 0; i < -E - 1; ++i) *o++ = '0';
+        for (int i = 0; i < nd; ++i) *o++ = digits[i];
+    }
+    *o = '\0';
+}
+
+// Shortest round-tripping decimal for a double, rendered like Rust's Display:
+// the fewest significant digits that parse back to the same value, in plain
+// positional decimal, with "inf"/"-inf"/"NaN" for the non-finite cases and a
+// signed zero. Returns a pointer into a small rotating pool of static buffers
+// so several float arguments in one printf keep distinct text.
+static char* bl_fmt_f64(double v) {
+    static char pool[16][512];
+    static unsigned slot = 0;
+    char* out = pool[slot];
+    slot = (slot + 1u) & 15u;
+    if (v != v) { strcpy(out, "NaN"); return out; }
+    double inf = 1.0 / 0.0;
+    if (v == inf) { strcpy(out, "inf"); return out; }
+    if (v == -inf) { strcpy(out, "-inf"); return out; }
+    if (v == 0.0) { strcpy(out, signbit(v) ? "-0" : "0"); return out; }
+    char sci[64];
+    int prec = 17;
+    for (int p = 1; p <= 17; ++p) {
+        snprintf(sci, sizeof sci, "%.*e", p - 1, v);
+        if (strtod(sci, NULL) == v) { prec = p; break; }
+    }
+    snprintf(sci, sizeof sci, "%.*e", prec - 1, v);
+    bl_sci_to_plain(sci, out);
+    return out;
+}
+
+// Shortest round-tripping decimal for a float, matching Rust's f32 Display:
+// the round-trip is checked in f32 precision so 0.1_f32 prints "0.1".
+static char* bl_fmt_f32(float x) {
+    static char pool[16][512];
+    static unsigned slot = 0;
+    char* out = pool[slot];
+    slot = (slot + 1u) & 15u;
+    if (x != x) { strcpy(out, "NaN"); return out; }
+    float inf = 1.0f / 0.0f;
+    if (x == inf) { strcpy(out, "inf"); return out; }
+    if (x == -inf) { strcpy(out, "-inf"); return out; }
+    if (x == 0.0f) { strcpy(out, signbit(x) ? "-0" : "0"); return out; }
+    char sci[64];
+    int prec = 9;
+    for (int p = 1; p <= 9; ++p) {
+        snprintf(sci, sizeof sci, "%.*e", p - 1, (double)x);
+        if (strtof(sci, NULL) == x) { prec = p; break; }
+    }
+    snprintf(sci, sizeof sci, "%.*e", prec - 1, (double)x);
+    bl_sci_to_plain(sci, out);
+    return out;
+}
+
 // --- String type ---
 
 typedef struct {
@@ -334,7 +435,8 @@ static BuildString build_i64_to_string(int64_t v) {
     BuildString qs; qs.ptr = heap; qs.len = n; qs.cap = n + 1;
     return qs;
 }
-static BuildString build_f64_to_string(double v) { return build_format_f64("%g", v); }
+static BuildString build_f64_to_string(double v) { return build_format_str("%s", bl_fmt_f64(v)); }
+static BuildString build_f32_to_string(float v) { return build_format_str("%s", bl_fmt_f32(v)); }
 
 // Variadic sprintf into a heap-owned BuildString. Backs the `format!` macro:
 // the lowering builds a C printf-style format string and passes the same
@@ -766,8 +868,8 @@ static size_t build_hmap_len_i64_f64(BuildI64F64MapHandle h) { return h.inner->l
 
 static void build_print_i32(int32_t v) { printf("%d", v); }
 static void build_print_i64(int64_t v) { printf("%lld", (long long)v); }
-static void build_print_f32(float v) { printf("%g", (double)v); }
-static void build_print_f64(double v) { printf("%g", v); }
+static void build_print_f32(float v) { printf("%s", bl_fmt_f32(v)); }
+static void build_print_f64(double v) { printf("%s", bl_fmt_f64(v)); }
 static void build_print_bool(bool v) { printf("%s", v ? "true" : "false"); }
 static void build_print_str(const char* v) { printf("%s", v); }
 static void build_print_string(BuildString v) { printf("%.*s", (int)v.len, v.ptr); }

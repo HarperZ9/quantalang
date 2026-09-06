@@ -4008,6 +4008,38 @@ impl CBackend {
                 let local_name = self.local_name(place.local, locals);
                 format!("&{}", local_name)
             }
+            MirRValue::Cast {
+                kind: CastKind::FloatToInt,
+                value,
+                ty,
+            } => {
+                // A raw C cast of a float outside the target integer's range,
+                // or of NaN, is undefined behavior. Route through a saturating
+                // helper so the result matches Rust's `as` (clamp to min/max,
+                // NaN -> 0). The outer cast pins the exact target C type, which
+                // covers isize/usize/i128 whose helper returns a wider integer.
+                let v = self.value_to_c(value, locals);
+                let t = self.type_to_c(ty);
+                let helper = match ty {
+                    MirType::Int(size, signed) => match (size, signed) {
+                        (IntSize::I8, true) => "bl_f2i_i8",
+                        (IntSize::I8, false) => "bl_f2i_u8",
+                        (IntSize::I16, true) => "bl_f2i_i16",
+                        (IntSize::I16, false) => "bl_f2i_u16",
+                        (IntSize::I32, true) => "bl_f2i_i32",
+                        (IntSize::I32, false) => "bl_f2i_u32",
+                        (IntSize::I64, true) | (IntSize::ISize, true) => "bl_f2i_i64",
+                        (IntSize::I64, false) | (IntSize::ISize, false) => "bl_f2i_u64",
+                        (IntSize::I128, _) => "bl_f2i_i128",
+                    },
+                    _ => "",
+                };
+                if helper.is_empty() {
+                    format!("(({}){})", t, v)
+                } else {
+                    format!("(({}){}({}))", t, helper, v)
+                }
+            }
             MirRValue::Cast { kind: _, value, ty } => {
                 let v = self.value_to_c(value, locals);
                 let t = self.type_to_c(ty);
@@ -4411,7 +4443,9 @@ impl CBackend {
             Some(MirType::Int(IntSize::I64 | IntSize::I128 | IntSize::ISize, false)) => "%llu",
             Some(MirType::Int(_, true)) => "%d",
             Some(MirType::Int(_, false)) => "%u",
-            Some(MirType::Float(_)) => "%g",
+            // Floats print via a runtime formatter that renders Rust's Display
+            // (shortest round-tripping decimal), passed through printf as "%s".
+            Some(MirType::Float(_)) => "%s",
             Some(MirType::Bool) => "%s",
             Some(MirType::Ptr(_)) => "%p",
             Some(MirType::Struct(name)) if name.as_ref() == "BuildString" => "%s",
@@ -4429,6 +4463,13 @@ impl CBackend {
             match value {
                 MirValue::Const(MirConst::Str(idx)) => format!("__str{}", idx),
                 _ => format!("{}.ptr", rendered),
+            }
+        } else if let Some(MirType::Float(size)) = self.value_mir_type(value, locals) {
+            // Render floats with the runtime shortest-round-trip formatter so
+            // printed output matches Rust's Display instead of %g's 6 digits.
+            match size {
+                FloatSize::F32 => format!("bl_fmt_f32({})", rendered),
+                FloatSize::F64 => format!("bl_fmt_f64({})", rendered),
             }
         } else {
             rendered

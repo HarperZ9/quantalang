@@ -10,6 +10,34 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+- **Float `{}` Display matches Rust's shortest round-trip**: the
+  `println!`/`format!` lowering baked C's `%g` specifier into the format string
+  for a default `{}` float placeholder. `%g` caps output at six significant
+  digits and switches to exponent form, so `0.1 + 0.2` printed `0.3`,
+  `1234567.0` printed `1.23457e+06`, and `3.14159265358979` lost every digit
+  past the sixth. Each was a silent wrong answer. A plain `{}` on an `f32` or
+  `f64` now routes through a shortest-decimal formatter (`bl_fmt_f32` /
+  `bl_fmt_f64`) that searches for the fewest digits whose value round-trips
+  through `strtof`/`strtod` and emits plain positional decimal, so Display
+  reproduces Rust byte for byte: whole-number floats print without a trailing
+  `.0`, and `inf` / `-inf` / `NaN` / signed zero carry through. An explicit spec
+  such as `{:.3}` keeps its `%.3f` path. The f32 case uses its own formatter so
+  the shortest f32 round-trip is printed rather than the wider f64 value. One
+  end-to-end control in `compiler/tests/cli.rs` pins the f64 and f32 cases and
+  prints the `%g` values on the pre-fix binary.
+- **Float-to-int casts saturate like Rust's `as`**: the C backend lowered a
+  float-to-int cast to a raw C cast, which is undefined behaviour when the value
+  is out of the target integer's range or is NaN. On x86 an out-of-range
+  magnitude wrapped to the target `INT_MIN` and NaN produced a garbage integer,
+  both silent wrong answers. A `FloatToInt` cast now calls a per-width
+  saturating helper (`bl_f2i_i8` through `bl_f2i_i64`, their unsigned forms, and
+  `bl_f2i_i128`) that returns 0 for NaN, clamps to the target MIN/MAX outside
+  the representable range, and truncates toward zero inside it, matching Rust's
+  saturating `as`. The range thresholds use exact power-of-two hex-float
+  constants so the boundary comparison itself never rounds. One end-to-end
+  control in `compiler/tests/cli.rs` pins the positive-overflow,
+  negative-overflow, NaN, unsigned, and 64-bit paths and prints the wrapped UB
+  values on the pre-fix binary.
 - **`match` pattern tests and result type**: five codegen defects in match
   lowering are fixed, four of which produced a silent wrong answer. An
   open-ended range pattern (`100..`) compared the scrutinee against an

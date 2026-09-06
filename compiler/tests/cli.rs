@@ -13071,6 +13071,94 @@ fn float_remainder_uses_fmod_end_to_end() {
     );
 }
 
+/// Regression (false-success control): default `{}` Display on a float must
+/// print the shortest decimal that round-trips, matching Rust, not C's `%g`
+/// (which caps at 6 significant digits and switches to exponent form). The
+/// previous lowering baked `%g` into the format string, so `0.1 + 0.2` printed
+/// `0.3`, `1234567.0` printed `1.23457e+06`, and `3.14159265358979` lost every
+/// digit past the sixth. That is a silent wrong answer: the program runs and
+/// prints a plausible-but-wrong number. Each line pins one case, and the f32
+/// path is covered so its shortest-round-trip (not the f64 widening) is used.
+/// This whole block prints the `%g` values on the pre-fix binary, so it fails
+/// there and only passes once Display is corrected.
+#[test]
+fn float_display_matches_rust_shortest_roundtrip_end_to_end() {
+    if !c_backend_ready() {
+        eprintln!("skipping float-display e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let src = r#"fn main() ~ Console {
+    let a: f64 = 0.1;
+    let b: f64 = 0.2;
+    println!("{}", a + b);
+    let big: f64 = 1234567.0;
+    println!("{}", big);
+    let whole: f64 = 2.0;
+    println!("{}", whole);
+    let x: f64 = 3.14159265358979;
+    println!("{}", x);
+    let f: f32 = 1234567.0;
+    println!("{}", f);
+    let s: f32 = 0.1;
+    println!("{}", s);
+}
+"#;
+    let dir = std::env::temp_dir().join("buildlang_float_display_regress");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("float_display.bld");
+    std::fs::write(&path, src).expect("write float_display.bld");
+    let result = c_backend_run(&path);
+    assert_eq!(
+        result.stdout,
+        "0.30000000000000004\n1234567\n2\n3.14159265358979\n1234567\n0.1\n",
+        "float Display must match Rust's shortest round-trip, not C's %g"
+    );
+}
+
+/// Regression (false-success control): a float-to-int cast must saturate like
+/// Rust's `as`, not invoke C's undefined behaviour for out-of-range or NaN
+/// operands. Rust clamps an out-of-range value to the target's MIN/MAX and maps
+/// NaN to 0; a raw C cast of `1e30` to `int32_t` is UB and on x86 wraps to
+/// `INT32_MIN`, and `(int32_t)NAN` is likewise UB. That is a silent wrong
+/// answer. The seven lines pin the positive-overflow, negative-overflow, NaN,
+/// unsigned-overflow, unsigned-negative, and 64-bit-overflow paths for both
+/// signed and unsigned targets. `big`/`neg`/`nan` are computed at runtime so
+/// the cast is not constant-folded, and the pre-fix binary prints the wrapped
+/// UB values here, so the test fails there and passes only once the cast
+/// saturates.
+#[test]
+fn float_to_int_cast_saturates_like_rust_end_to_end() {
+    if !c_backend_ready() {
+        eprintln!("skipping float-cast e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let src = r#"fn main() ~ Console {
+    let m: f64 = 1000000.0;
+    let big: f64 = m * m * m * m * m;
+    let neg: f64 = 0.0 - big;
+    let zero: f64 = 0.0;
+    let nan: f64 = zero / zero;
+    println!("{}", big as i32);
+    println!("{}", neg as i32);
+    println!("{}", nan as i32);
+    println!("{}", big as u8);
+    println!("{}", neg as u8);
+    println!("{}", big as i64);
+    println!("{}", big as u64);
+}
+"#;
+    let dir = std::env::temp_dir().join("buildlang_float_cast_regress");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("float_cast.bld");
+    std::fs::write(&path, src).expect("write float_cast.bld");
+    let result = c_backend_run(&path);
+    assert_eq!(
+        result.stdout,
+        "2147483647\n-2147483648\n0\n255\n0\n9223372036854775807\n18446744073709551615\n",
+        "float-to-int cast must saturate to MIN/MAX and map NaN to 0 like Rust's as"
+    );
+}
+
 /// Regression: `break 'label` / `continue 'label` must target the named
 /// enclosing loop, not the innermost one. Labeled loops parse (parser support),
 /// but MIR lowering previously stored only the innermost loop's blocks and

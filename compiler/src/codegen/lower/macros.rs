@@ -1526,10 +1526,52 @@ impl<'ctx> MirLowerer<'ctx> {
         let mut arg_values: Vec<MirValue> = Vec::new();
         let mut arg_types: Vec<Option<MirType>> = Vec::new();
 
-        for arg_src in &arg_source_texts {
+        // Pre-scan the format string so we know, per placeholder position,
+        // whether it is a plain `{}` (default Display). A plain float placeholder
+        // is rendered through the shortest-round-trip formatter instead of C's
+        // lossy `%g`, so Display matches Rust. Explicit specs like `{:.3}` keep
+        // their `%.3f` path.
+        let plain_flags = Self::placeholder_is_plain(&format_str);
+
+        for (arg_index, arg_src) in arg_source_texts.iter().enumerate() {
             match self.parse_and_lower_macro_arg(arg_src) {
                 Ok(val) => {
                     let ty = self.type_of_value(&val);
+                    // Plain `{}` on a float: convert to a shortest-round-trip
+                    // string (0.1 + 0.2 -> 0.30000000000000004, 1234567.0 ->
+                    // 1234567) rather than emitting C's 6-significant-digit %g.
+                    if plain_flags.get(arg_index).copied().unwrap_or(false) {
+                        if let MirType::Float(size) = ty {
+                            let conv = match size {
+                                FloatSize::F32 => "build_f32_to_string",
+                                FloatSize::F64 => "build_f64_to_string",
+                            };
+                            let builder = self.current_fn.as_mut().unwrap();
+                            let sdest =
+                                builder.create_local(MirType::Struct(Arc::from("BuildString")));
+                            let cont = builder.create_block();
+                            builder.call(
+                                MirValue::Function(Arc::from(conv)),
+                                vec![val],
+                                Some(sdest),
+                                cont,
+                            );
+                            builder.switch_to_block(cont);
+                            let ptr_local =
+                                builder.create_local(MirType::Ptr(Box::new(MirType::i8())));
+                            builder.assign(
+                                ptr_local,
+                                MirRValue::FieldAccess {
+                                    base: MirValue::Local(sdest),
+                                    field_name: Arc::from("ptr"),
+                                    field_ty: MirType::Ptr(Box::new(MirType::i8())),
+                                },
+                            );
+                            arg_types.push(Some(MirType::Ptr(Box::new(MirType::i8()))));
+                            arg_values.push(MirValue::Local(ptr_local));
+                            continue;
+                        }
+                    }
                     // For BuildString values, extract .ptr for printf
                     if let MirType::Struct(ref name) = ty {
                         if name.as_ref() == "BuildString" {
@@ -1864,6 +1906,43 @@ impl<'ctx> MirLowerer<'ctx> {
         })?;
 
         self.lower_expr(&expr)
+    }
+
+    /// Walk a Rust-style format string and report, for each placeholder in
+    /// order, whether it is a plain `{}` (default Display). Escaped braces
+    /// (`{{`, `}}`) are skipped and every `{:...}` form reports `false`. The
+    /// brace bookkeeping mirrors the placeholder loop in `prepare_format_call`,
+    /// so index `i` here lines up with placeholder `i` there.
+    fn placeholder_is_plain(format_str: &str) -> Vec<bool> {
+        let mut kinds = Vec::new();
+        let mut chars = format_str.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '{' {
+                match chars.peek() {
+                    Some('{') => {
+                        chars.next();
+                    }
+                    Some('}') => {
+                        chars.next();
+                        kinds.push(true);
+                    }
+                    Some(':') => {
+                        chars.next();
+                        while let Some(&c) = chars.peek() {
+                            chars.next();
+                            if c == '}' {
+                                break;
+                            }
+                        }
+                        kinds.push(false);
+                    }
+                    _ => {}
+                }
+            } else if ch == '}' && chars.peek() == Some(&'}') {
+                chars.next();
+            }
+        }
+        kinds
     }
 
     /// Pick the correct printf format specifier based on the MIR type.
