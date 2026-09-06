@@ -4464,7 +4464,11 @@ impl<'ctx> MirLowerer<'ctx> {
 
             let is_wildcard_or_binding = matches!(
                 arm.pattern.kind,
-                ast::PatternKind::Wildcard | ast::PatternKind::Ident { .. }
+                ast::PatternKind::Wildcard
+                    | ast::PatternKind::Ident {
+                        subpattern: None,
+                        ..
+                    }
             );
             // A wildcard/binding arm still needs a test block if it has a
             // guard clause, because the guard may fail.
@@ -4510,14 +4514,21 @@ impl<'ctx> MirLowerer<'ctx> {
             } else {
                 ret
             }
-        } else if Self::is_aggregate_mir_ty(&scrutinee_ty) {
-            // Arm bodies inferred as i32/void over an aggregate scrutinee
-            // (a tuple/struct/array match that yields a scalar): the result
-            // is the scalar, not the aggregate.  Taking the aggregate type
-            // here emits C that assigns an int to an aggregate local.
-            MirType::i32()
-        } else {
+        } else if matches!(scrutinee_ty, MirType::Int(..)) {
+            // Integer scrutinee with scalar (i32-inferred) arms: the arms
+            // share the scrutinee's integer domain, so keep the scrutinee
+            // width (`match x: i64 { _ => 0 }` yields i64, not i32).
             scrutinee_ty.clone()
+        } else {
+            // Non-integer scrutinee (bool, float, tuple, struct, array) with
+            // scalar arms: the result is the scalar, not the scrutinee.  A
+            // bool scrutinee here previously typed the result `bool`, so
+            // `match b { true => 42, false => 7 }` stored 42 into a `_Bool`
+            // and printed `true` -- a silent wrong answer.  Taking an
+            // aggregate type here emits C that assigns an int to an aggregate
+            // local.  Genuine bool/aggregate arms infer their own type above
+            // and never reach this branch.
+            MirType::i32()
         };
 
         let result = {
@@ -4558,7 +4569,11 @@ impl<'ctx> MirLowerer<'ctx> {
                 // Generate the comparison based on pattern kind.
                 let is_wildcard_or_binding = matches!(
                     arm.pattern.kind,
-                    ast::PatternKind::Wildcard | ast::PatternKind::Ident { .. }
+                    ast::PatternKind::Wildcard
+                        | ast::PatternKind::Ident {
+                            subpattern: None,
+                            ..
+                        }
                 );
 
                 let cond_val = if is_wildcard_or_binding {
@@ -4794,9 +4809,45 @@ impl<'ctx> MirLowerer<'ctx> {
             }
 
             ast::PatternKind::Wildcard => Ok(values::bool(true)),
-            ast::PatternKind::Ident { .. } => Ok(values::bool(true)),
 
-            _ => Ok(values::bool(true)),
+            // A bare binding always matches; an `x @ subpat` binding matches
+            // only when the subpattern matches, so test the subpattern.
+            ast::PatternKind::Ident { subpattern, .. } => match subpattern {
+                None => Ok(values::bool(true)),
+                Some(sub) => self.lower_enum_pattern_test(sub, scrutinee_local, scrutinee_ty),
+            },
+
+            // Or-pattern over enum variants (`A | B`): match when any
+            // alternative matches. Without this arm the pattern fell through
+            // the old catch-all to an unconditional match, so the first arm
+            // shadowed every later arm (a silent wrong answer).
+            ast::PatternKind::Or(pats) if !pats.is_empty() => {
+                let mut current =
+                    self.lower_enum_pattern_test(&pats[0], scrutinee_local, scrutinee_ty)?;
+                for pat in &pats[1..] {
+                    let rhs = self.lower_enum_pattern_test(pat, scrutinee_local, scrutinee_ty)?;
+                    let builder = self.current_fn.as_mut().unwrap();
+                    let combined = builder.create_local(MirType::Bool);
+                    builder.binary_op(combined, BinOp::BitOr, current, rhs);
+                    current = values::local(combined);
+                }
+                Ok(current)
+            }
+
+            // Parenthesized pattern is transparent.
+            ast::PatternKind::Paren(inner) => {
+                self.lower_enum_pattern_test(inner, scrutinee_local, scrutinee_ty)
+            }
+
+            // Any other pattern kind against an enum scrutinee cannot be tested
+            // here. Fail closed rather than matching unconditionally, which
+            // would let this arm shadow every later arm.
+            _ => Err(CodegenError::Unsupported(format!(
+                "unsupported pattern in a match on enum `{}`; only variant \
+                 patterns, `_`, bindings, `|`-alternatives, and parentheses \
+                 are supported",
+                enum_name
+            ))),
         }
     }
 
@@ -5044,8 +5095,14 @@ impl<'ctx> MirLowerer<'ctx> {
             // Wildcard always matches.
             ast::PatternKind::Wildcard => Ok(values::bool(true)),
 
-            // Variable binding always matches (binding happens in the caller).
-            ast::PatternKind::Ident { .. } => Ok(values::bool(true)),
+            // A bare binding always matches; an `x @ subpat` binding matches
+            // only when the subpattern matches. Testing the subpattern is
+            // required, since an `@`-binding is otherwise refutable
+            // (`n @ 1..=5` must reject 100). Binding happens in the caller.
+            ast::PatternKind::Ident { subpattern, .. } => match subpattern {
+                None => Ok(values::bool(true)),
+                Some(sub) => self.lower_pattern_test(sub, scrutinee_val),
+            },
 
             // Literal patterns: emit scrutinee == literal.
             ast::PatternKind::Literal(lit) => {
@@ -5086,39 +5143,62 @@ impl<'ctx> MirLowerer<'ctx> {
                 Ok(values::local(cmp))
             }
 
-            // Range pattern: lo..=hi → scrutinee >= lo && scrutinee <= hi
+            // Range pattern: `lo..=hi` → scrutinee >= lo && scrutinee <= hi.
+            // An open end has no bound on that side, so its comparison is
+            // omitted rather than synthesized from an `i32` sentinel: an
+            // `i32::MAX` upper bound wrongly rejects an `i64` scrutinee above
+            // 2^31, and an `i32::MIN` lower bound wrongly rejects one below
+            // -2^31. `lo..` tests only the lower bound, `..hi` only the upper,
+            // and a fully open `..` matches anything.
             ast::PatternKind::Range {
                 start,
                 end,
                 inclusive,
             } => {
-                let lo_val = if let Some(lo_expr) = start {
-                    self.lower_expr(lo_expr)?
-                } else {
-                    values::i32(i32::MIN)
+                let lo_val = match start {
+                    Some(lo_expr) => Some(self.lower_expr(lo_expr)?),
+                    None => None,
                 };
-                let hi_val = if let Some(hi_expr) = end {
-                    self.lower_expr(hi_expr)?
-                } else {
-                    values::i32(i32::MAX)
+                let hi_val = match end {
+                    Some(hi_expr) => Some(self.lower_expr(hi_expr)?),
+                    None => None,
                 };
 
-                let builder = self
-                    .current_fn
-                    .as_mut()
-                    .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
+                let ge = match lo_val {
+                    Some(lo) => {
+                        let builder = self.current_fn.as_mut().ok_or_else(|| {
+                            CodegenError::Internal("No current function".to_string())
+                        })?;
+                        let ge = builder.create_local(MirType::Bool);
+                        builder.binary_op(ge, BinOp::Ge, scrutinee_val.clone(), lo);
+                        Some(values::local(ge))
+                    }
+                    None => None,
+                };
 
-                let ge = builder.create_local(MirType::Bool);
-                builder.binary_op(ge, BinOp::Ge, scrutinee_val.clone(), lo_val);
+                let le = match hi_val {
+                    Some(hi) => {
+                        let le_op = if *inclusive { BinOp::Le } else { BinOp::Lt };
+                        let builder = self.current_fn.as_mut().ok_or_else(|| {
+                            CodegenError::Internal("No current function".to_string())
+                        })?;
+                        let le = builder.create_local(MirType::Bool);
+                        builder.binary_op(le, le_op, scrutinee_val, hi);
+                        Some(values::local(le))
+                    }
+                    None => None,
+                };
 
-                let le_op = if *inclusive { BinOp::Le } else { BinOp::Lt };
-                let le = builder.create_local(MirType::Bool);
-                builder.binary_op(le, le_op, scrutinee_val, hi_val);
-
-                let result = builder.create_local(MirType::Bool);
-                builder.binary_op(result, BinOp::BitAnd, values::local(ge), values::local(le));
-
-                Ok(values::local(result))
+                match (ge, le) {
+                    (Some(ge), Some(le)) => {
+                        let builder = self.current_fn.as_mut().unwrap();
+                        let result = builder.create_local(MirType::Bool);
+                        builder.binary_op(result, BinOp::BitAnd, ge, le);
+                        Ok(values::local(result))
+                    }
+                    (Some(only), None) | (None, Some(only)) => Ok(only),
+                    (None, None) => Ok(values::bool(true)),
+                }
             }
 
             // Tuple pattern: project each element `_i` of the scrutinee and

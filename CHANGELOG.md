@@ -10,6 +10,26 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+- **`match` pattern tests and result type**: five codegen defects in match
+  lowering are fixed, four of which produced a silent wrong answer. An
+  open-ended range pattern (`100..`) compared the scrutinee against an
+  `i32::MAX` sentinel for the absent bound, so a value past that sentinel
+  failed to match; the lowering now emits only the comparisons for bounds that
+  are present, and a fully open `..` is always true. An `@`-binding tested
+  nothing and matched unconditionally, so `n @ 1..=5` accepted an out-of-range
+  value and returned it; the binder now tests the subpattern. An enum
+  or-pattern arm (`Green | Blue`) was unhandled in the enum matcher and fell
+  through a match-anything catch-all, so the first arm always won; the matcher
+  now folds the alternatives with a bitwise-or of their tests, tests an
+  `@`-binding's variant subpattern, and looks through parentheses. The
+  remaining catch-all in the enum matcher returns an `unsupported pattern`
+  error rather than silently matching, so an unhandled pattern kind fails
+  closed. Last, a match on a non-integer scrutinee took the scrutinee type as
+  the result type, so `match b { true => 42, false => 7 }` stored 42 into a
+  `_Bool` and printed `true`; the result now takes the arm type for a bool,
+  float, or aggregate scrutinee and keeps the scrutinee width for an integer
+  one. One end-to-end control in `compiler/tests/cli.rs` pins all five paths and
+  fails on the pre-fix binary.
 - **Unary complement and float remainder in the C backend**: two codegen
   defects that produced silent wrong answers or a failed compile are fixed.
   Unary complement lowered `~` and integer `!` onto a single logical-not node,

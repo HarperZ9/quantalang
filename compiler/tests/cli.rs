@@ -13203,6 +13203,60 @@ fn check_rejects_undefined_loop_label() {
     );
 }
 
+/// Regression: the match-lowering pattern tester must actually test each
+/// pattern, and the result local must take the arm type rather than the
+/// scrutinee type. Four codegen paths each produced a silent wrong answer, and
+/// one pattern kind silently matched anything. Every line below pins one path:
+///   `100..`     an open-ended range must not gate on the absent upper bound,
+///               so a large i64 matches -> 1 (was 0: the old lowering compared
+///               against an i32::MAX sentinel that the value overran).
+///   `n @ 1..=5` an `@`-binding must test its subpattern; 100 is out of range,
+///               so the arm is skipped -> -1 (was 100: the binding matched
+///               unconditionally and returned the scrutinee).
+///   `A | B`     an enum or-pattern must test each alternative; `Blue` is the
+///               second alternative -> 2 (was 1: the or-pattern was unhandled
+///               and fell through to a match-anything catch-all).
+///   `n @ E::V`  an enum `@`-binding must test its variant subpattern; `Blue`
+///               is not `Red`, so the arm is skipped -> 2 (was 1: the binding
+///               matched any variant).
+///   `match b`   a bool scrutinee's match yields the arm value, not a bool, so
+///               the result is stored as an int -> 42 (was `true`: the result
+///               local was typed `bool` and truncated 42 to 1).
+#[test]
+fn match_pattern_tests_and_result_type_compute_correctly_end_to_end() {
+    if !c_backend_ready() {
+        eprintln!("skipping match-pattern e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let src = "enum Color { Red, Green, Blue }\n\
+               fn main() ~ Console {\n\
+               let x: i64 = 5000000000;\n\
+               let r_open = match x { 100.. => 1, _ => 0 };\n\
+               println!(\"{}\", r_open);\n\
+               let y: i32 = 100;\n\
+               let r_at = match y { n @ 1..=5 => n, _ => -1 };\n\
+               println!(\"{}\", r_at);\n\
+               let a = Color::Blue;\n\
+               let r_or = match a { Color::Red => 1, Color::Green | Color::Blue => 2 };\n\
+               println!(\"{}\", r_or);\n\
+               let c = Color::Blue;\n\
+               let r_enumat = match c { n @ Color::Red => 1, _ => 2 };\n\
+               println!(\"{}\", r_enumat);\n\
+               let b: bool = true;\n\
+               let r_bool = match b { true => 42, false => 7 };\n\
+               println!(\"{}\", r_bool);\n\
+               }\n";
+    let dir = std::env::temp_dir().join("buildlang_match_pattern_regress");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("match_pattern.bld");
+    std::fs::write(&path, src).expect("write match_pattern.bld");
+    let result = c_backend_run(&path);
+    assert_eq!(
+        result.stdout, "1\n-1\n2\n2\n42\n",
+        "match pattern tests must gate on the real pattern and the result must take the arm type"
+    );
+}
+
 /// Regression: an `Option<i64>`-returning function whose result is matched must
 /// compile and run end-to-end. Previously the if-expression result local was
 /// typed `int32_t` (the `None` branch defaulted to i32), so the 64-bit Option
