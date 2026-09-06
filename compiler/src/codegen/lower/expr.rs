@@ -2349,7 +2349,19 @@ impl<'ctx> MirLowerer<'ctx> {
             MirType::Struct(n) => n.to_string(),
             MirType::Vec(_) => "BuildVecHandle".to_string(),
             MirType::Map(_, _) => "BuildMapHandle".to_string(),
-            _ => "i32".to_string(),
+            MirType::Int(_, _) | MirType::Bool => "i32".to_string(),
+            // A tuple or array element has no handle representation and no
+            // backend wrapper; fail closed rather than route it to the i32
+            // helper, whose `int32_t` parameter cannot store it (an array would
+            // decay to a truncated pointer, a tuple leak a raw C type error).
+            _ => {
+                return Some(Err(CodegenError::Unsupported(format!(
+                    "a vector of `{elem_ty}` elements is not supported yet: the Vec \
+                     runtime stores scalar (integer, float, bool, char), string, \
+                     struct, nested-vector, and map elements, not a tuple or array \
+                     element"
+                ))))
+            }
         };
 
         // Lower the remaining args (push value / get index).
@@ -3893,7 +3905,19 @@ impl<'ctx> MirLowerer<'ctx> {
                 // element is a handle struct; key the sized wrapper by its C type.
                 MirType::Vec(_) => "BuildVecHandle".to_string(),
                 MirType::Map(_, _) => "BuildMapHandle".to_string(),
-                _ => "i32".to_string(),
+                MirType::Int(_, _) | MirType::Bool => "i32".to_string(),
+                // A tuple or array element has no handle representation and no
+                // backend wrapper; every vec method on it fails closed with one
+                // diagnostic rather than routing element access to the i32
+                // helper, whose `int32_t` parameter cannot store it.
+                _ => {
+                    return Err(CodegenError::Unsupported(format!(
+                        "a vector of `{elem_ty}` elements is not supported yet: the Vec \
+                         runtime stores scalar (integer, float, bool, char), string, \
+                         struct, nested-vector, and map elements, not a tuple or array \
+                         element"
+                    )))
+                }
             };
 
             let (runtime_fn, ret_ty): (Option<String>, MirType) = match method_name {

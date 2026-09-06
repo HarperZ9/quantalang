@@ -55,24 +55,38 @@ tracked in `STATUS.md`, `README.md`, and
   (which routes to the monomorphizer before this path) passes no hint and lowers the
   argument at the default width.
 
-- **A vector of an aggregate element is rejected instead of miscompiled**: the HVec
-  runtime stores scalar and string elements only, with a build/push helper pair for
-  `f64`, `i64`, `i32`, and `str`. The element-to-helper selector defaulted every
-  unrecognised element type to the `i32` helper, whose parameter is `int32_t`, so a
-  vector whose element is a tuple, an array, a nested vector, or a user struct was
-  handed to a helper that could not store it. For an array element that was a silent
-  wrong answer: the array decayed to a pointer that `int32_t` truncated to 32 bits
-  under `-Wint-conversion`, which only warns, so `let v: Vec<[i64; 2]> = vec![[1, 2],
-  [3, 4]]` compiled and read `v[0][0]` back as a bogus value. For a tuple, struct, or
-  nested-vector element it leaked a raw C type error to the user. The selector now
-  fails closed on any aggregate element with one diagnostic naming the supported
-  element kinds. Covered by `vec_of_aggregate_element_is_rejected` (vector of array,
-  tuple, nested vector, and struct, each rejected for the unsupported-element reason)
-  and by `vec_of_scalar_element_still_builds_and_reads`, which confirms the supported
-  `i64`, `f32`, `i32`, `bool`, and string element vectors still build and read. Honest
-  null: a vector of an aggregate element is not supported at all yet. Supporting it
-  needs a byte-width HVec path plus an accessor that projects the aggregate back out,
-  not the scalar helper family.
+- **A vector of a struct, nested-vector, or map element builds through the `vec!`
+  macro, and a vector of a tuple or array element is rejected instead of
+  miscompiled**: a `Vec<T>` stores its element one of two ways. Scalars and strings
+  ride a built-in `build_hvec_*_<suffix>` family (`f64`, `i64`, `i32`, `str`); a user
+  struct, a nested vector, or a map rides a monomorphized element-sized wrapper the C
+  backend emits per element type. Three element-to-suffix tables select the helper:
+  the `vec![...]` macro, the `vec_push`/`vec_get`/`vec_pop` free functions, and the
+  `.push()`/`.get()`/`.pop()` methods. The method table already selected the wrapper
+  for a struct or nested-vector element, so `v.push(Point { .. })` built and read
+  correctly, but the macro table did not, so `let v: Vec<Point> = vec![Point { .. }]`
+  leaked a raw C type error. Worse, every table defaulted a tuple or array element to
+  the `i32` helper, whose parameter is `int32_t`: for an array that was a silent wrong
+  answer, the array decaying to a pointer that `int32_t` truncated to 32 bits under
+  `-Wint-conversion` (warn only), so `let v: Vec<[i64; 2]> = vec![[1, 2], [3, 4]]`
+  compiled and read `v[0][0]` back as a bogus value; for a tuple it leaked a raw C
+  type error. All three tables now agree: a struct, nested-vector, or map element
+  selects the backend wrapper (so the macro path matches the method path), and a tuple
+  or array element fails closed with one diagnostic. Enabling the macro path for a
+  nested vector surfaced a second defect it had been masking: `vec!` re-tokenizes each
+  element group into an anonymous source string, but the recursive lowering of an inner
+  `vec!` still sliced the original file by the outer element's span, so
+  `vec![vec![1, 2], vec![3, 4]]` pushed a stray identifier and a parse-failure `0`
+  rather than the inner literals. The fix points the codegen source at the re-tokenized
+  string while an element group lowers, then restores it, so an inner macro extracts its
+  own text; the inner pushes now carry the real `1`, `2`, `3`, `4`. Covered by
+  `vec_of_tuple_or_array_element_is_rejected` (array and tuple, on both the `vec!`
+  macro and the `Vec::new()` + `.push()` builder paths, each rejected for the
+  unsupported-element reason) and by `vec_of_supported_element_builds_and_reads`, which
+  reads back `i64`, `f32`, `i32`, `bool`, and string vectors plus struct and
+  nested-vector vectors built through both the macro and the push paths. Honest null: a
+  tuple or array element is still unsupported; it needs a wrapper that stores and
+  projects the aggregate, the same path structs and nested vectors already take.
 
 - **Compound assignment through a plain dereference reads before it stores**:
   `*p += v` and its nine siblings (`-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`,

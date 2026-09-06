@@ -13536,31 +13536,34 @@ fn main() ~ Console {
     }
 }
 
-/// Regression (vec-of-aggregate element, must-reject control). The HVec runtime
-/// stores scalar and string elements only: a `build_hvec_*_<suffix>` helper pair
-/// exists for f64, i64, i32, and str. `vec_fn_names_for_type` used to default
-/// every unrecognised element type to the i32 helper, so a vector whose element
-/// is a tuple, an array, a nested vector, or a user struct was handed to a helper
-/// whose parameter is `int32_t`. For a tuple, struct, or nested vector that leaked
-/// a raw C type error to the user. For an ARRAY element it was a silent wrong
-/// answer: the array decayed to a pointer that `int32_t` truncated to 32 bits
-/// under `-Wint-conversion`, which only warns, so the program compiled and read
-/// the element back as a bogus value. `vec_fn_names_for_type` now fails closed on
-/// any aggregate element with one honest diagnostic. Each case below must be
-/// rejected, and the assertion checks the rejection reason, not merely that the
-/// run failed, so an unrelated earlier error (a parser or checker rejection)
-/// cannot make the control pass silently. The array case is the one that ran and
-/// miscompiled on the pre-fix binary; the other three leaked C errors.
+/// Regression (vec of a tuple or array element, must-reject control). A `Vec<T>`
+/// stores its element one of two ways: scalars and strings ride a built-in
+/// `build_hvec_*_<suffix>` family (f64, i64, i32, str), and a user struct, a
+/// nested vector, or a map rides a monomorphized element-sized wrapper the C
+/// backend emits per element type. A tuple or an array element fits neither: no
+/// scalar family holds it and the backend emits no wrapper for it. Every element
+/// -> suffix table used to default such an element to the i32 family, so the
+/// element was handed to a helper whose parameter is `int32_t`. For a tuple that
+/// leaked a raw C type error; for an ARRAY element it was a silent wrong answer,
+/// the array decaying to a pointer that `int32_t` truncated to 32 bits under
+/// `-Wint-conversion` (warn only), so the program compiled and read a bogus
+/// value. The three lowering paths (the `vec![...]` macro, the `vec_push`/
+/// `vec_get`/`vec_pop` free functions, and the `.push()`/`.get()` methods) now
+/// all fail closed on a tuple or array element with one diagnostic. Each case
+/// below, on both the `vec![...]` macro path and the `Vec::new()` + `.push()`
+/// builder path, must be rejected, and the assertion checks the rejection
+/// reason, not merely that the run failed, so an unrelated earlier error (a
+/// parser or checker rejection) cannot make the control pass silently.
 #[test]
-fn vec_of_aggregate_element_is_rejected() {
+fn vec_of_tuple_or_array_element_is_rejected() {
     if !c_backend_ready() {
-        eprintln!("skipping vec-of-aggregate reject e2e: no C backend available (buildc doctor)");
+        eprintln!("skipping vec tuple/array reject e2e: no C backend available (buildc doctor)");
         return;
     }
     // (name, source, behaviour on the pre-fix binary)
     let cases: [(&str, &str, &str); 4] = [
         (
-            "vec_of_array_swa",
+            "vec_of_array_macro_swa",
             r#"fn main() ~ Console {
     let v: Vec<[i64; 2]> = vec![[1, 2], [3, 4]];
     println!("{}", v[0][0]);
@@ -13569,7 +13572,17 @@ fn vec_of_aggregate_element_is_rejected() {
             "silent wrong answer: the array decayed to a pointer truncated to int32_t",
         ),
         (
-            "vec_of_tuple",
+            "vec_of_array_push_swa",
+            r#"fn main() ~ Console {
+    let mut v: Vec<[i64; 2]> = Vec::new();
+    v.push([1, 2]);
+    println!("{}", v[0][0]);
+}
+"#,
+            "same array-element mis-store, reached through the .push() builder path",
+        ),
+        (
+            "vec_of_tuple_macro",
             r#"fn main() ~ Console {
     let v: Vec<(i64, i64)> = vec![(1, 2), (3, 4)];
     println!("{}", v[0].0);
@@ -13578,30 +13591,21 @@ fn vec_of_aggregate_element_is_rejected() {
             "leaked C type error: int32_t parameter for a Tuple_i64_i64 element",
         ),
         (
-            "vec_of_nested_vec",
+            "vec_of_tuple_push",
             r#"fn main() ~ Console {
-    let v: Vec<Vec<i64>> = vec![vec![1], vec![2]];
-    println!("{}", v[0][0]);
+    let mut v: Vec<(i64, i64)> = Vec::new();
+    v.push((1, 2));
+    println!("{}", v[0].0);
 }
 "#,
-            "leaked C type error: int32_t parameter for a vec-handle element",
-        ),
-        (
-            "vec_of_struct",
-            r#"struct Point { x: i64, y: i64 }
-fn main() ~ Console {
-    let v: Vec<Point> = vec![Point { x: 1, y: 2 }];
-    println!("{}", v[0].x);
-}
-"#,
-            "leaked C type error: int32_t parameter for a struct element",
+            "same tuple-element mis-store, reached through the .push() builder path",
         ),
     ];
-    let dir = std::env::temp_dir().join("buildlang_vec_aggregate_reject");
+    let dir = std::env::temp_dir().join("buildlang_vec_tuple_array_reject");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     for (name, src, prefix_behaviour) in cases {
         let path = dir.join(format!("{name}.bld"));
-        std::fs::write(&path, src).expect("write vec-aggregate reject case");
+        std::fs::write(&path, src).expect("write vec tuple/array reject case");
         let output = buildc()
             .arg("run")
             .arg(&path)
@@ -13609,33 +13613,37 @@ fn main() ~ Console {
             .unwrap_or_else(|err| panic!("run buildc for {name}: {err}"));
         assert!(
             !output.status.success(),
-            "vec-aggregate reject case `{name}` must fail to compile, not build a scalar-strided vec (pre-fix: {prefix_behaviour})\nstdout:\n{}\nstderr:\n{}",
+            "vec tuple/array reject case `{name}` must fail to compile, not build a scalar-strided vec (pre-fix: {prefix_behaviour})\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("the Vec runtime stores scalar"),
-            "vec-aggregate reject case `{name}` must fail for the unsupported-element reason, not an unrelated error:\n{stderr}"
+            "vec tuple/array reject case `{name}` must fail for the unsupported-element reason, not an unrelated error:\n{stderr}"
         );
     }
 }
 
-/// Regression (vec-of-aggregate rejection, no-over-rejection companion). The
-/// rejection above must not swallow the element types the HVec runtime does
-/// support. Each supported arm is pinned: i64 (the i64 helper), f32 (mapped to
-/// the f64 helper), i32 (the i32 helper), bool (also the i32 helper, read through
-/// a branch so the assertion does not depend on bool Display formatting), and a
-/// string element (the str helper). Each must still build and read the element it
-/// stored.
+/// Regression (vec supported-element control, no-over-rejection companion). The
+/// tuple/array rejection above must not swallow the element types a `Vec<T>` does
+/// support. Every supported family is pinned end to end: the scalar/string
+/// helpers (i64, f32 via the f64 helper, i32, bool via the i32 helper read
+/// through a branch so the assertion does not depend on bool Display, and a
+/// string element), a user struct, and a nested vector. The struct and
+/// nested-vector cases run through BOTH construction paths, the `vec![...]` macro
+/// (which this change taught to select the backend's element-sized wrapper,
+/// matching the method path) and the `Vec::new()` + `.push()` builder path (which
+/// already supported them), so the two paths are proven consistent, not merely
+/// individually working. Each must build and read back the element it stored.
 #[test]
-fn vec_of_scalar_element_still_builds_and_reads() {
+fn vec_of_supported_element_builds_and_reads() {
     if !c_backend_ready() {
-        eprintln!("skipping vec-scalar positive e2e: no C backend available (buildc doctor)");
+        eprintln!("skipping vec supported-element positive e2e: no C backend available (buildc doctor)");
         return;
     }
     // (name, source, expected stdout)
-    let cases: [(&str, &str, &str); 5] = [
+    let cases: [(&str, &str, &str); 9] = [
         (
             "vec_i64",
             r#"fn main() ~ Console {
@@ -13681,16 +13689,57 @@ fn vec_of_scalar_element_still_builds_and_reads() {
 "#,
             "b\n",
         ),
+        (
+            "vec_struct_macro",
+            r#"struct Point { x: i64, y: i64 }
+fn main() ~ Console {
+    let v: Vec<Point> = vec![Point { x: 1, y: 2 }, Point { x: 3, y: 4 }];
+    println!("{}", v[1].x);
+}
+"#,
+            "3\n",
+        ),
+        (
+            "vec_struct_push",
+            r#"struct Point { x: i64, y: i64 }
+fn main() ~ Console {
+    let mut v: Vec<Point> = Vec::new();
+    v.push(Point { x: 5, y: 6 });
+    println!("{}", v[0].y);
+}
+"#,
+            "6\n",
+        ),
+        (
+            "vec_nested_vec_macro",
+            r#"fn main() ~ Console {
+    let v: Vec<Vec<i64>> = vec![vec![1, 2], vec![3, 4]];
+    println!("{}", v[1][0]);
+}
+"#,
+            "3\n",
+        ),
+        (
+            "vec_nested_vec_push",
+            r#"fn main() ~ Console {
+    let mut v: Vec<Vec<i64>> = Vec::new();
+    let inner: Vec<i64> = vec![7, 8];
+    v.push(inner);
+    println!("{}", v[0][1]);
+}
+"#,
+            "8\n",
+        ),
     ];
-    let dir = std::env::temp_dir().join("buildlang_vec_scalar_positive");
+    let dir = std::env::temp_dir().join("buildlang_vec_supported_positive");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     for (name, src, expected) in cases {
         let path = dir.join(format!("{name}.bld"));
-        std::fs::write(&path, src).expect("write vec-scalar positive case");
+        std::fs::write(&path, src).expect("write vec supported-element positive case");
         let result = c_backend_run(&path);
         assert_eq!(
             result.stdout, expected,
-            "vec-scalar case `{name}` must still build and read its supported element type"
+            "vec supported-element case `{name}` must build and read its element type"
         );
     }
 }

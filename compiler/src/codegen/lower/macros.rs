@@ -1182,7 +1182,7 @@ impl<'ctx> MirLowerer<'ctx> {
             builder.switch_to_block(cont);
 
             // Push the first element
-            let push_fn_val = MirValue::Function(Arc::from(push_fn_name));
+            let push_fn_val = MirValue::Function(Arc::from(push_fn_name.as_str()));
             {
                 let builder = self.current_fn.as_mut().unwrap();
                 let cont2 = builder.create_block();
@@ -1202,7 +1202,7 @@ impl<'ctx> MirLowerer<'ctx> {
                 let val = self.parse_and_lower_token_group(group.clone());
                 self.expected_type = prev_expected;
                 let val = val?;
-                let push_fn_val = MirValue::Function(Arc::from(push_fn_name));
+                let push_fn_val = MirValue::Function(Arc::from(push_fn_name.as_str()));
                 let builder = self.current_fn.as_mut().unwrap();
                 let cont2 = builder.create_block();
                 builder.call(
@@ -1218,54 +1218,60 @@ impl<'ctx> MirLowerer<'ctx> {
         }
     }
 
-    /// Select the correct C-level vec_new / vec_push function names based on element type.
-    /// Returns the C runtime function names (not the BuildLang builtin names).
     /// Map a vec element type to its runtime build/push helper pair, or reject
-    /// the element type when no helper can store it.
+    /// the element type when the HVec runtime cannot store it.
     ///
-    /// The HVec runtime is scalar-plus-string only: a `build_hvec_*_<suffix>`
-    /// pair exists for f64 (also used for f32), i64 (also used for isize/u64),
-    /// i32 (used for the narrow integer widths, u32, char, and bool), and str.
-    /// An aggregate element (a tuple, an array, a nested vector, a user struct)
-    /// has no helper, so the i32 default used to be handed a value it cannot
-    /// take by an `int32_t` parameter. For a tuple, struct, or nested vector
-    /// that was a hard C type error leaking to the user; for an array element it
-    /// was worse, a silent miscompile, because the array decayed to a pointer
-    /// that `int32_t` truncated to 32 bits under `-Wint-conversion` and read
-    /// back as a bogus value. Fail closed here with a clear diagnostic instead.
-    /// A vector of an aggregate element is an honest gap: it needs an
-    /// element-size-generic HVec path (byte-width storage plus an accessor that
-    /// projects the aggregate back out), not the scalar helper family.
+    /// Two storage strategies back a `Vec<T>`. Scalars and strings ride a
+    /// built-in `build_hvec_*_<suffix>` family: f64 (also f32), i64 (also
+    /// isize), i32 (the narrow integer widths, u32, char, and bool), and str.
+    /// A user struct, a nested vector, or a map rides a monomorphized,
+    /// element-sized wrapper the C backend emits per element type
+    /// (`vec_elem_needs_sized_wrapper` in codegen/backend/c.rs), keyed by the
+    /// struct name or the nested handle's C type. Selecting the wrapper suffix
+    /// here keeps `vec![Point { .. }]` in step with `v.push(Point { .. })`,
+    /// which the vec method accessors already lower through the same wrapper.
     ///
-    /// Keep the supported suffixes in sync with the canonical element -> suffix
-    /// table the vec method and free-function accessors use in
-    /// codegen/lower/expr.rs, so `vec![...]` builds the same typed handle those
-    /// accessors later read.
-    fn vec_fn_names_for_type(
-        elem_ty: &MirType,
-    ) -> CodegenResult<(&'static str, &'static str)> {
-        match elem_ty {
-            MirType::Float(FloatSize::F64) | MirType::Float(FloatSize::F32) => {
-                Ok(("build_hvec_new_f64", "build_hvec_push_f64"))
-            }
-            MirType::Int(IntSize::I64, _) | MirType::Int(IntSize::ISize, _) => {
-                Ok(("build_hvec_new_i64", "build_hvec_push_i64"))
-            }
-            MirType::Struct(n) if n.as_ref() == "BuildString" => {
-                Ok(("build_hvec_new_str", "build_hvec_push_str"))
-            }
+    /// A tuple or an array element has no representation in either strategy: no
+    /// scalar family fits it and the backend emits no wrapper for it. Reject it
+    /// rather than fall through to the i32 family, which for an array element
+    /// silently miscompiled (the array decayed to a pointer truncated to
+    /// `int32_t` under `-Wint-conversion`, warn-only) and for a tuple leaked a
+    /// raw C type error. A vector of a tuple or array element is an honest gap;
+    /// it needs a wrapper that stores and projects the aggregate, the same path
+    /// structs and nested vectors already take.
+    ///
+    /// Keep the supported suffixes in sync with `hvec_elem_suffix` and
+    /// `vec_elem_needs_sized_wrapper` in codegen/backend/c.rs and with the vec
+    /// method and free-function accessor tables in codegen/lower/expr.rs, so a
+    /// `vec![...]` builds the same typed handle those accessors later read.
+    fn vec_fn_names_for_type(elem_ty: &MirType) -> CodegenResult<(String, String)> {
+        let suffix: String = match elem_ty {
+            MirType::Float(FloatSize::F64) | MirType::Float(FloatSize::F32) => "f64".to_string(),
+            MirType::Int(IntSize::I64, _) | MirType::Int(IntSize::ISize, _) => "i64".to_string(),
+            MirType::Struct(n) if n.as_ref() == "BuildString" => "str".to_string(),
             // The narrow integer widths, u32, char (lowered to u32), and bool all
             // pass to the i32 helper's `int32_t` parameter by value, so their
             // build and read strides agree.
-            MirType::Int(_, _) | MirType::Bool => {
-                Ok(("build_hvec_new_i32", "build_hvec_push_i32"))
+            MirType::Int(_, _) | MirType::Bool => "i32".to_string(),
+            // A user struct, a nested vector, or a map rides the element-sized
+            // wrapper the C backend generates; the suffix is the struct name or
+            // the nested handle's C type, matching hvec_elem_suffix.
+            MirType::Struct(n) => n.to_string(),
+            MirType::Vec(_) => "BuildVecHandle".to_string(),
+            MirType::Map(_, _) => "BuildMapHandle".to_string(),
+            _ => {
+                return Err(CodegenError::Unsupported(format!(
+                    "a vector of `{elem_ty}` elements is not supported yet: the Vec \
+                     runtime stores scalar (integer, float, bool, char), string, \
+                     struct, nested-vector, and map elements, not a tuple or array \
+                     element"
+                )))
             }
-            _ => Err(CodegenError::Unsupported(format!(
-                "a vector of `{elem_ty}` elements is not supported yet: the Vec \
-                 runtime stores scalar (integer, float, bool, char) and string \
-                 elements, not a tuple, array, struct, or nested vector element"
-            ))),
-        }
+        };
+        Ok((
+            format!("build_hvec_new_{suffix}"),
+            format!("build_hvec_push_{suffix}"),
+        ))
     }
 
     /// Extract all argument source texts from vec! macro tokens.
@@ -1375,7 +1381,21 @@ impl<'ctx> MirLowerer<'ctx> {
             Ok(new_tokens) => {
                 let mut parser = Parser::new(&sf, new_tokens);
                 match parser.parse_expr() {
-                    Ok(expr) => self.lower_expr(&expr),
+                    Ok(expr) => {
+                        // The parsed expression's token spans are relative to
+                        // `source_text` (the anonymous re-tokenized string), not
+                        // the original file. Point self.source at it while we
+                        // lower, so a nested macro that re-extracts source by
+                        // span reads the right text. Without this, an inner
+                        // vec! inside a Vec<Vec<_>> literal sliced the original
+                        // file at a stale offset and pushed a garbage element
+                        // (an unrelated identifier, then the 0 parse-failure
+                        // default). Restore the previous source afterward.
+                        let prev_source = self.source.replace(Arc::from(source_text.as_str()));
+                        let result = self.lower_expr(&expr);
+                        self.source = prev_source;
+                        result
+                    }
                     Err(_) => {
                         // Parsing failed - tokens likely have synthetic spans.
                         // Return a sensible default (0 for numerics).
