@@ -1413,22 +1413,61 @@ impl<'ctx> MirLowerer<'ctx> {
     ) -> CodegenResult<MirValue> {
         let val = self.lower_expr(value)?;
 
-        // Handle dereference assignment: `*ptr = value`
+        // Handle dereference assignment: `*ptr = value` and `*ptr OP= value`.
         if let ExprKind::Deref(inner) = &target.kind {
             let ptr_val = self.lower_expr(inner)?;
+            let ptr_ty = self.type_of_value(&ptr_val);
             let ptr_local = match &ptr_val {
                 MirValue::Local(id) => *id,
                 _ => {
-                    let ptr_ty = self.type_of_value(&ptr_val);
                     let builder = self.current_fn.as_mut().unwrap();
-                    let temp = builder.create_local(ptr_ty);
+                    let temp = builder.create_local(ptr_ty.clone());
                     builder.assign(temp, MirRValue::Use(ptr_val));
                     temp
                 }
             };
 
+            // A compound assignment (`*p += v`) reads the current pointee,
+            // applies the operator, then stores. Without the read-modify-write
+            // the operator and the load were both dropped and `*p += v` stored
+            // the bare `v`, a silent wrong answer with no diagnostic. The place
+            // `p` is evaluated once (above), so reading it back here does not
+            // re-run a side effect in the pointer expression.
+            let store_val = if op == ast::AssignOp::Assign {
+                MirRValue::Use(val)
+            } else {
+                let pointee_ty = match &ptr_ty {
+                    MirType::Ptr(pointee) => (**pointee).clone(),
+                    other => other.clone(),
+                };
+                let bin_op = match op {
+                    ast::AssignOp::AddAssign => BinOp::Add,
+                    ast::AssignOp::SubAssign => BinOp::Sub,
+                    ast::AssignOp::MulAssign => BinOp::Mul,
+                    ast::AssignOp::DivAssign => BinOp::Div,
+                    ast::AssignOp::RemAssign => BinOp::Rem,
+                    ast::AssignOp::BitAndAssign => BinOp::BitAnd,
+                    ast::AssignOp::BitOrAssign => BinOp::BitOr,
+                    ast::AssignOp::BitXorAssign => BinOp::BitXor,
+                    ast::AssignOp::ShlAssign => BinOp::Shl,
+                    ast::AssignOp::ShrAssign => BinOp::Shr,
+                    _ => BinOp::Add,
+                };
+                let builder = self.current_fn.as_mut().unwrap();
+                let cur = builder.create_local(pointee_ty.clone());
+                builder.assign(
+                    cur,
+                    MirRValue::Deref {
+                        ptr: values::local(ptr_local),
+                        pointee_ty: pointee_ty.clone(),
+                    },
+                );
+                let combined = builder.create_local(pointee_ty);
+                builder.binary_op(combined, bin_op, values::local(cur), val);
+                MirRValue::Use(values::local(combined))
+            };
             let builder = self.current_fn.as_mut().unwrap();
-            builder.push_deref_assign(ptr_local, MirRValue::Use(val));
+            builder.push_deref_assign(ptr_local, store_val);
             return Ok(values::unit());
         }
 

@@ -10,6 +10,19 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+- **Compound assignment through a plain dereference reads before it stores**:
+  `*p += v` and its nine siblings (`-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`,
+  `>>=`) lowered as `*p = v`. The dereference-assignment path never inspected the
+  operator, so the load of the current pointee and the operator itself were both
+  dropped and the bare right-hand side was stored. It was a silent wrong answer with
+  no diagnostic: `fn addv(r: &mut i64, v: i64) { *r += v; }` called on `a = 5` with
+  `v = 3` printed `3` instead of `8`, and `*r *= 7` on `6` printed `7` instead of
+  `42`. The fix reads the pointee back through the already-computed pointer (the
+  place is evaluated once, so no side effect in the pointer expression re-runs),
+  applies the mapped binary operator, then stores the result. A plain `*p = v` is
+  unchanged. Covered for arithmetic, bitwise, and shift operators, through both a
+  `&mut` parameter and a local `&mut` binding, over integer and float pointees.
+
 - **A reference whose pointee width disagrees with its storage is laid out to match
   or rejected**: the checker could infer an integer or float array's element width
   through a later borrow while codegen defaulted an unannotated integer array literal

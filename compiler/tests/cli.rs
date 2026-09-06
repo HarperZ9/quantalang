@@ -13203,6 +13203,97 @@ fn main() ~ Console {
     }
 }
 
+/// Regression (compound assignment through a plain dereference, false-success
+/// control). `*p OP= v` must read the current pointee, apply the operator, then
+/// store. The lowering dropped both the load and the operator and stored the
+/// bare right-hand side, so `*p += v` behaved as `*p = v`: a silent wrong answer
+/// with no diagnostic. Each case below ran on the pre-fix binary and printed the
+/// bare `v` in the "pre-fix" comment; the assertions pin the corrected value, so
+/// the pre-fix binary fails every case. Coverage spans the operator classes
+/// (arithmetic, bitwise, shift), both reference forms (a `&mut` parameter and a
+/// local `&mut` binding), and both an integer and a float pointee.
+#[test]
+fn compound_assign_through_plain_deref_reads_before_storing() {
+    if !c_backend_ready() {
+        eprintln!("skipping deref compound-assign e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    // (name, source, expected stdout, value the pre-fix binary printed)
+    let cases: [(&str, &str, &str, &str); 5] = [
+        (
+            "deref_compound_add_param",
+            r#"fn addv(r: &mut i64, v: i64) { *r += v; }
+fn main() ~ Console {
+    let mut a: i64 = 5;
+    addv(&mut a, 3);
+    println!("{}", a);
+}
+"#,
+            "8\n",
+            "3",
+        ),
+        (
+            "deref_compound_mul_param",
+            r#"fn mulv(r: &mut i64, v: i64) { *r *= v; }
+fn main() ~ Console {
+    let mut a: i64 = 6;
+    mulv(&mut a, 7);
+    println!("{}", a);
+}
+"#,
+            "42\n",
+            "7",
+        ),
+        (
+            "deref_compound_bitand_local",
+            r#"fn main() ~ Console {
+    let mut a: i64 = 12;
+    let p: &mut i64 = &mut a;
+    *p &= 10;
+    println!("{}", a);
+}
+"#,
+            "8\n",
+            "10",
+        ),
+        (
+            "deref_compound_shl_local",
+            r#"fn main() ~ Console {
+    let mut a: i64 = 3;
+    let p: &mut i64 = &mut a;
+    *p <<= 4;
+    println!("{}", a);
+}
+"#,
+            "48\n",
+            "4",
+        ),
+        (
+            "deref_compound_mul_float_param",
+            r#"fn scale(r: &mut f64, v: f64) { *r *= v; }
+fn main() ~ Console {
+    let mut a: f64 = 2.5;
+    scale(&mut a, 4.0);
+    println!("{}", a);
+}
+"#,
+            "10\n",
+            "4",
+        ),
+    ];
+    let dir = std::env::temp_dir().join("buildlang_deref_compound");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    for (name, src, expected, prefix_value) in cases {
+        let path = dir.join(format!("{name}.bld"));
+        std::fs::write(&path, src).expect("write deref compound case");
+        let result = c_backend_run(&path);
+        assert_eq!(
+            result.stdout, expected,
+            "deref compound case `{name}` must read-modify-write; pre-fix printed the bare `{prefix_value}`"
+        );
+    }
+}
+
 /// Regression (reference-pointee width, must-reject controls). A borrow whose
 /// pointee width disagrees with the callee parameter is a silent wrong answer:
 /// the callee stores or loads at its own width through storage laid out at a
