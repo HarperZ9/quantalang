@@ -18,6 +18,13 @@ use crate::codegen::runtime;
 
 use super::{MirLowerer, OverloadTarget};
 
+/// Owned copy of a loop label for storage in `loop_stack`, or `None` for an
+/// unlabeled loop. Kept as a free helper so every loop-lowering path records the
+/// label the same way.
+fn label_name(label: Option<&ast::Ident>) -> Option<String> {
+    label.map(|l| l.as_str().to_string())
+}
+
 impl<'ctx> MirLowerer<'ctx> {
     // =========================================================================
     // BLOCK AND STATEMENT LOWERING
@@ -5010,7 +5017,7 @@ impl<'ctx> MirLowerer<'ctx> {
     fn lower_loop(
         &mut self,
         body: &ast::Block,
-        _label: Option<&ast::Ident>,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         let builder = self
             .current_fn
@@ -5020,7 +5027,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let loop_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((loop_block, exit_block));
+        self.loop_stack
+            .push((loop_block, exit_block, label_name(label)));
 
         builder.goto(loop_block);
         builder.switch_to_block(loop_block);
@@ -5045,7 +5053,7 @@ impl<'ctx> MirLowerer<'ctx> {
         &mut self,
         condition: &ast::Expr,
         body: &ast::Block,
-        _label: Option<&ast::Ident>,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         let builder = self
             .current_fn
@@ -5056,7 +5064,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let body_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((cond_block, exit_block));
+        self.loop_stack
+            .push((cond_block, exit_block, label_name(label)));
 
         builder.goto(cond_block);
         builder.switch_to_block(cond_block);
@@ -5089,7 +5098,7 @@ impl<'ctx> MirLowerer<'ctx> {
         pattern: &ast::Pattern,
         scrutinee: &ast::Expr,
         body: &ast::Block,
-        _label: Option<&ast::Ident>,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         let builder = self
             .current_fn
@@ -5100,7 +5109,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let body_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((cond_block, exit_block));
+        self.loop_stack
+            .push((cond_block, exit_block, label_name(label)));
 
         builder.goto(cond_block);
         builder.switch_to_block(cond_block);
@@ -5192,7 +5202,7 @@ impl<'ctx> MirLowerer<'ctx> {
         pattern: &ast::Pattern,
         iter: &ast::Expr,
         body: &ast::Block,
-        _label: Option<&ast::Ident>,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         // Detect `.step_by(n)` on a range: `(start..end).step_by(n)` or `(start..=end).step_by(n)`
         if let ExprKind::MethodCall {
@@ -5211,6 +5221,7 @@ impl<'ctx> MirLowerer<'ctx> {
                         inclusive,
                         body,
                         Some(&args[0]),
+                        label,
                     );
                 }
             }
@@ -5231,6 +5242,7 @@ impl<'ctx> MirLowerer<'ctx> {
                 *inclusive,
                 body,
                 None,
+                label,
             );
         }
 
@@ -5238,10 +5250,12 @@ impl<'ctx> MirLowerer<'ctx> {
         // parser for `0..10` style expressions.
         if let ExprKind::Binary { op, left, right } = &iter.kind {
             if *op == AstBinOp::Range {
-                return self.lower_for_range(pattern, Some(left), Some(right), false, body, None);
+                return self
+                    .lower_for_range(pattern, Some(left), Some(right), false, body, None, label);
             }
             if *op == AstBinOp::RangeInclusive {
-                return self.lower_for_range(pattern, Some(left), Some(right), true, body, None);
+                return self
+                    .lower_for_range(pattern, Some(left), Some(right), true, body, None, label);
             }
         }
 
@@ -5267,13 +5281,13 @@ impl<'ctx> MirLowerer<'ctx> {
             // iteration (the body never ran).
             MirType::Vec(elem) => {
                 let elem_ty = elem.as_ref().clone();
-                return self.lower_for_vec(pattern, iter_val, elem_ty, body);
+                return self.lower_for_vec(pattern, iter_val, elem_ty, body, label);
             }
             // `for c in s.chars()` / `for c in s`: iterate the string's bytes.
             // chars()/bytes() are identity ops, so the iterable is a BuildString.
             // Previously this fell to the no-op loop (zero iterations).
             MirType::Struct(n) if n.as_ref() == "BuildString" => {
-                return self.lower_for_string(pattern, iter_val, body);
+                return self.lower_for_string(pattern, iter_val, body, label);
             }
             _ => {
                 // Not an array - try iterator protocol: call .next() in a loop.
@@ -5284,7 +5298,7 @@ impl<'ctx> MirLowerer<'ctx> {
                         .impl_methods
                         .contains_key(&(type_name.clone(), Arc::from("next")))
                     {
-                        return self.lower_for_iterator(pattern, iter_val, &iter_ty, body);
+                        return self.lower_for_iterator(pattern, iter_val, &iter_ty, body, label);
                     }
                 }
                 // No iterator protocol - emit a no-op loop
@@ -5320,7 +5334,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let incr_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((incr_block, exit_block));
+        self.loop_stack
+            .push((incr_block, exit_block, label_name(label)));
 
         builder.goto(cond_block);
         builder.switch_to_block(cond_block);
@@ -5382,6 +5397,7 @@ impl<'ctx> MirLowerer<'ctx> {
         iter_val: MirValue,
         elem_ty: MirType,
         body: &ast::Block,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         let builder = self
             .current_fn
@@ -5416,7 +5432,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let incr_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((incr_block, exit_block));
+        self.loop_stack
+            .push((incr_block, exit_block, label_name(label)));
 
         let builder = self.current_fn.as_mut().unwrap();
         builder.goto(cond_block);
@@ -5475,6 +5492,7 @@ impl<'ctx> MirLowerer<'ctx> {
         pattern: &ast::Pattern,
         iter_val: MirValue,
         body: &ast::Block,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         let byte_ty = MirType::i32();
         let builder = self
@@ -5506,7 +5524,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let body_block = builder.create_block();
         let incr_block = builder.create_block();
         let exit_block = builder.create_block();
-        self.loop_stack.push((incr_block, exit_block));
+        self.loop_stack
+            .push((incr_block, exit_block, label_name(label)));
 
         let builder = self.current_fn.as_mut().unwrap();
         builder.goto(cond_block);
@@ -5594,6 +5613,7 @@ impl<'ctx> MirLowerer<'ctx> {
         inclusive: bool,
         body: &ast::Block,
         step: Option<&ast::Expr>,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         // Lower start value (default to 0)
         let start_val = if let Some(s) = start {
@@ -5624,7 +5644,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let incr_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((incr_block, exit_block));
+        self.loop_stack
+            .push((incr_block, exit_block, label_name(label)));
 
         builder.goto(cond_block);
         builder.switch_to_block(cond_block);
@@ -5696,6 +5717,7 @@ impl<'ctx> MirLowerer<'ctx> {
         iter_val: MirValue,
         iter_ty: &MirType,
         body: &ast::Block,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         let type_name = if let MirType::Struct(ref name) = iter_ty {
             name.clone()
@@ -5752,7 +5774,8 @@ impl<'ctx> MirLowerer<'ctx> {
         let body_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        self.loop_stack.push((cond_block, exit_block));
+        self.loop_stack
+            .push((cond_block, exit_block, label_name(label)));
 
         builder.goto(cond_block);
         builder.switch_to_block(cond_block);
@@ -6169,12 +6192,19 @@ impl<'ctx> MirLowerer<'ctx> {
     fn lower_break(
         &mut self,
         value: Option<&ast::Expr>,
-        _label: Option<&ast::Ident>,
+        label: Option<&ast::Ident>,
     ) -> CodegenResult<MirValue> {
         // Break value (e.g. `break 42`) is evaluated but currently not
         // assigned to a loop result local because loops do not yet propagate
         // a result variable.  The value is lowered for side-effect correctness.
-        if let Some((_, exit_block)) = self.loop_stack.last().copied() {
+        //
+        // `break 'name` targets the nearest enclosing loop whose label matches;
+        // a bare `break` targets the innermost loop. An unresolved label is a
+        // fail-closed error rather than a silent fall-through to the innermost
+        // loop, which would compile the wrong control flow.
+        let target = self.resolve_loop_target(label, "break")?;
+
+        if let Some((_, exit_block)) = target {
             if let Some(expr) = value {
                 let _val = self.lower_expr(expr)?;
             }
@@ -6192,13 +6222,18 @@ impl<'ctx> MirLowerer<'ctx> {
         Ok(values::unit())
     }
 
-    fn lower_continue(&mut self, _label: Option<&ast::Ident>) -> CodegenResult<MirValue> {
+    fn lower_continue(&mut self, label: Option<&ast::Ident>) -> CodegenResult<MirValue> {
+        // `continue 'name` re-enters the nearest enclosing loop whose label
+        // matches; a bare `continue` re-enters the innermost loop. An unresolved
+        // label fails closed (see `lower_break`).
+        let target = self.resolve_loop_target(label, "continue")?;
+
         let builder = self
             .current_fn
             .as_mut()
             .ok_or_else(|| CodegenError::Internal("No current function".to_string()))?;
 
-        if let Some((continue_block, _)) = self.loop_stack.last().copied() {
+        if let Some((continue_block, _)) = target {
             builder.goto(continue_block);
         }
 
@@ -6206,6 +6241,37 @@ impl<'ctx> MirLowerer<'ctx> {
         builder.switch_to_block(unreachable);
 
         Ok(values::unit())
+    }
+
+    /// Resolve the `(continue_block, exit_block)` target of a `break`/`continue`.
+    ///
+    /// With a label, the nearest enclosing loop carrying that label wins, and an
+    /// unresolved label is an error (fail closed) rather than a silent fall
+    /// through to the innermost loop. Without a label, the innermost loop wins;
+    /// `None` means the statement is outside any loop, which the earlier
+    /// type-check pass already reports, so lowering leaves it as a no-op here.
+    fn resolve_loop_target(
+        &self,
+        label: Option<&ast::Ident>,
+        kw: &str,
+    ) -> CodegenResult<Option<(BlockId, BlockId)>> {
+        match label {
+            Some(l) => {
+                let name = l.as_str();
+                match self
+                    .loop_stack
+                    .iter()
+                    .rev()
+                    .find(|(_, _, lbl)| lbl.as_deref() == Some(name))
+                {
+                    Some((cont, exit, _)) => Ok(Some((*cont, *exit))),
+                    None => Err(CodegenError::Internal(format!(
+                        "{kw} to undefined loop label '{name}'"
+                    ))),
+                }
+            }
+            None => Ok(self.loop_stack.last().map(|(cont, exit, _)| (*cont, *exit))),
+        }
     }
 
     fn lower_tuple(&mut self, elems: &[ast::Expr]) -> CodegenResult<MirValue> {

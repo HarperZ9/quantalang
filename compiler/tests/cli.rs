@@ -13003,6 +13003,55 @@ fn large_unsuffixed_int_literal_not_truncated_end_to_end() {
     );
 }
 
+/// Regression: `break 'label` / `continue 'label` must target the named
+/// enclosing loop, not the innermost one. Labeled loops parse (parser support),
+/// but MIR lowering previously stored only the innermost loop's blocks and
+/// ignored the label, so `break 'outer` from an inner loop compiled to a plain
+/// innermost `break`. That is a silent wrong answer: the four programs below
+/// print 3/6/3/... instead of 1/0/3/2. Each line pins one path:
+///   a: `break 'outer` from inner-for escapes both loops on the first hit -> 1
+///   b: `continue 'outer2` restarts the outer loop before any inner count -> 0
+///   c: bare `break` still targets the innermost loop (no regression) -> 3
+///   d: `break 'w` from an inner-for to an outer *while* (cross loop-kind) -> 2
+#[test]
+fn labeled_break_continue_target_named_loop_end_to_end() {
+    if !c_backend_ready() {
+        eprintln!("skipping labeled-loop e2e: no C backend available (buildc doctor)");
+        return;
+    }
+    let src = "fn main() ~ Console {\n\
+               let mut a = 0;\n\
+               'outer: for i in 0..3 {\n\
+               for j in 0..3 { if j == 1 { break 'outer; } a = a + 1; }\n\
+               }\n\
+               println(\"{}\", a);\n\
+               let mut b = 0;\n\
+               'outer2: for i in 0..3 {\n\
+               for j in 0..3 { if j == 0 { continue 'outer2; } b = b + 1; }\n\
+               }\n\
+               println(\"{}\", b);\n\
+               let mut c = 0;\n\
+               for i in 0..3 { for j in 0..3 { if j == 1 { break; } c = c + 1; } }\n\
+               println(\"{}\", c);\n\
+               let mut d = 0;\n\
+               let mut k = 0;\n\
+               'w: while k < 3 {\n\
+               for j in 0..3 { if j == 2 { break 'w; } d = d + 1; }\n\
+               k = k + 1;\n\
+               }\n\
+               println(\"{}\", d);\n\
+               }\n";
+    let dir = std::env::temp_dir().join("buildlang_labeled_loops_regress");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("labeled_loops.bld");
+    std::fs::write(&path, src).expect("write labeled_loops.bld");
+    let result = c_backend_run(&path);
+    assert_eq!(
+        result.stdout, "1\n0\n3\n2\n",
+        "break/continue with a label must target the named loop, not the innermost"
+    );
+}
+
 /// Regression: an `Option<i64>`-returning function whose result is matched must
 /// compile and run end-to-end. Previously the if-expression result local was
 /// typed `int32_t` (the `None` branch defaulted to i32), so the 64-bit Option

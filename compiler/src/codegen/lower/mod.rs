@@ -73,8 +73,10 @@ pub struct MirLowerer<'ctx> {
     module: MirModuleBuilder,
     /// Variable to local mapping (per function).
     var_map: HashMap<Arc<str>, LocalId>,
-    /// Loop context stack (continue_block, break_block).
-    loop_stack: Vec<(BlockId, BlockId)>,
+    /// Loop context stack (continue_block, break_block, optional loop label).
+    /// The label lets `break 'name` / `continue 'name` target an enclosing loop
+    /// instead of the innermost one.
+    loop_stack: Vec<(BlockId, BlockId, Option<String>)>,
     /// Current function builder.
     current_fn: Option<MirBuilder>,
     /// Source code (for extracting token text in macro expansion).
