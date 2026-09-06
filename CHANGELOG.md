@@ -10,6 +10,8 @@ tracked in `STATUS.md`, `README.md`, and
 
 ## Unreleased
 
+## 1.3.0 - 2026-09-06 - fail-closed codegen memory-safety
+
 - **A non-exhaustive scalar `match` is caught at compile time where coverage can
   be proven, and aborts with a clean panic at run time where it cannot, instead
   of returning a stale value**: `match` lowering left the no-arm-matched path
